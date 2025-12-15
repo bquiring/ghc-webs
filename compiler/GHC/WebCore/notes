@@ -1,0 +1,172 @@
+{-
+
+compiler/Driver/Main.hs
+main driver
+"hscCompileCoreExpr'" compiles core to bytecode and calls the simplifier
+GHC.Driver.Config.Core.Opt.Simplify ( initSimplifyExprOpts )
+compiler/GHC/Driver/Config/Core/Opt/Simplify.hs
+
+I think modifying hscCompileCoreExpr is the best solution, so I can insert dumping code as well
+
+compiler flag "ddump-simpl" dumps Core
+this gets translated into the option Opt_D_dump_simpl
+
+identifiers are usually in GHC/Types/Id.hs
+To make a new local identifier use
+mkSysLocalM :: MonadUnique m => FastString -> Mult -> Type -> m Id
+For global variables, see 
+mkGlobalId :: IdDetails -> Name -> Type -> IdInfo -> Id
+mkVanillaGlobal :: HasDebugCallStack => Name -> Type -> Id
+GHC/Types/Var.hs   mkGlobalVar
+
+GHC/Types/Id/Info.hs
+  | WorkerLikeId [CbvMark]
+        -- ^ An 'Id' for a worker like function, which might expect some arguments to be
+        -- passed both evaluated and tagged.
+
+data DataCon  from  DataCon.hs
+- dcOrigArgTys :: [Scaled Type]
+- dcOrigResTy :: Type
+- dcPromoted :: TyCon
+probably don't need to change these
+- dcRepTyCon  :: TyCon
+- dcRepType   :: Type
+need to change these
+
+
+data TyCon  from  TyCon.hs
+- tyConNullaryTy :: Type
+- tyConDetails :: !TyConDetails
+
+data TyConDetails  from  TyCon.hs
+doesn't seem to contain anything I need to change
+
+I don't think we can change datatype representation or anything, there's a lot of extra annotations for that
+
+
+GHC/WebCore/TyCo/Rep.hs
+data Type = TyVarTy | AppTy | TyConApp | ForallTy | FunTy | LitTy | CastTy | CoercionTy
+
+GHC/WebCore/TyCo/Rep.hs
+data Coercion
+  = -- Refl :: _ -> N
+    Refl Type  -- See Note [Refl invariant]
+  | GRefl Role Type MCoercionN  -- See Note [Refl invariant]
+  | TyConAppCo Role TyCon [Coercion]    -- lift TyConApp
+  | AppCo Coercion CoercionN             -- lift AppTy
+  | ForAllCo
+      { fco_tcv  :: TyCoVar
+      , fco_visL :: !ForAllTyFlag -- Visibility of coercionLKind
+      , fco_visR :: !ForAllTyFlag -- Visibility of coercionRKind
+                                  -- See (FC7) of Note [ForAllCo]
+      , fco_kind :: KindCoercion
+      , fco_body :: Coercion }
+  | FunCo  -- FunCo :: "e" -> N/P -> e -> e -> e
+        { fco_role         :: Role
+        , fco_afl          :: FunTyFlag   -- Arrow for coercionLKind
+        , fco_afr          :: FunTyFlag   -- Arrow for coercionRKind
+        , fco_mult         :: CoercionN
+        , fco_arg, fco_res :: Coercion }
+  -- These are special
+  | CoVarCo CoVar      -- :: _ -> (N or R)
+  | AxiomCo CoAxiomRule [Coercion]
+  | UnivCo  -- See Note [UnivCo]
+      { uco_prov         :: UnivCoProvenance
+      , uco_role         :: Role
+      , uco_lty, uco_rty :: Type
+      , uco_deps         :: [Coercion]  -- Coercions on which it depends
+      }
+  | SymCo Coercion             -- :: e -> e
+  | TransCo Coercion Coercion  -- :: e -> e -> e
+  | SelCo CoSel Coercion  -- See Note [SelCo]
+  | LRCo   LeftOrRight CoercionN     -- Decomposes (t_left t_right)
+  | InstCo Coercion CoercionN
+  | KindCo Coercion
+  | SubCo CoercionN                  -- Turns a ~N into a ~R
+  | HoleCo CoercionHole
+
+
+I wonder if we could just use vanilla Core, but convert all arrow types to a different type constructor (containing a web, input type, output type)
+
+Actually, I think I will have to do that, since identifiers package their type up (or kind, which is the same as type Core/TyCo/Rep.hs)
+
+
+
+mkWeb n = n
+
+mkWeb n = mkGlobalId Id.Info.VanillaId ?name ?type Id.Info.vanillaIdInfo
+
+
+fusion done entirely in rewriting rules
+rewriting rules do most of the simplications actually
+
+https://downloads.haskell.org/ghc/latest/docs/users_guide/using-optimisation.html
+https://wiki.haskell.org/Performance/GHC
+https://stackoverflow.com/questions/12653787/what-optimizations-can-ghc-be-expected-to-perform-reliably
+https://gitlab.haskell.org/ghc/ghc/-/wikis/commentary/compiler/hsc-main
+https://gitlab.haskell.org/ghc/ghc/-/wikis/commentary/compiler/opt-ordering
+
+https://www.quora.com/What-are-the-%E2%80%98cleverest%E2%80%99-optimizations-that-GHC-makes-What-makes-it-clever-how-does-it-improve-performance-and-what-does-the-optimization-transform-code-into
+https://www.microsoft.com/en-us/research/publication/secrets-of-the-glasgow-haskell-compiler-inliner/?from=https://research.microsoft.com/en-us/um/people/simonpj/Papers/inlining/&type=exact
+https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.57.1581
+https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.50.231
+
+
+
+
+
+~/projects/compiler-references/ghc/compiler/GHC/Core.hs
+
+
+https://downloads.haskell.org/ghc/9.0.1/docs/html/libraries/ghc-9.0.1/GHC-Core.html#g:1
+https://downloads.haskell.org/ghc/9.0.1/docs/html/libraries/ghc-9.0.1/GHC-Hs-Expr.html#g:1
+https://downloads.haskell.org/ghc/9.0.1/docs/html/libraries/ghc-9.0.1/GHC-Hs-Expr.html#t:HsExpr
+
+
+https://www.youtube.com/watch?v=fdyh3YQ-ZWI
+https://www.youtube.com/watch?v=yRVjR9XcuPU
+https://www.youtube.com/watch?v=m_HX4hyOuog
+https://www.youtube.com/watch?v=XiTO1EGKrhE
+
+https://www.stephendiehl.com/posts/ghc_03/
+
+https://gitlab.haskell.org/ghc/ghc/-/blob/master/compiler/GHC/Core/Opt/CallArity.hs
+https://www.joachim-breitner.de/publications/CallArity-TFP.pdf
+https://gitlab.haskell.org/ghc/ghc/-/wikis/demand-analysis
+https://gitlab.haskell.org/ghc/ghc/-/wikis/commentary/compiler/demand
+https://www.microsoft.com/en-us/research/wp-content/uploads/2017/03/demand-jfp-draft.pdf
+https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.646.8707&rep=rep1&type=pdf
+
+
+https://ghc.dev/
+
+plan:
+(1) insert webs as a standalone pass over the Core IR
+(2) create a copy of Core, WebCore, with webs on lambdas, applications, functions
+(3) copy the type checker and add web inference to it to inject Core -> WebCore
+(4) print web information
+(5) do any transforms
+(6) erase back to Core
+
+
+
+
+https://hackage.haskell.org/package/ghc-9.10.1/docs/src/GHC.Core.Lint.html
+contains the type checker
+- LintM is the result type of the type checker, typically resulting in a 'result type' "LintedType" and some kind of environment "UsageEnv"
+- it seems like variables are annotated with their type "lintBinder"
+- the main type checking function is "lintCoreExpr"
+Plan:
+- add WebID * WebID result to LintM argument
+- bubble these up during type checking
+- the only unification call is "tcUnifyTysFG"
+  + actually, this is only called in "lintCoercion"?
+- "lintValApp" is called during the App case of "lintCoreExpr"
+  + it calls "ensureEqTys" which calls "`eqType`"
+  + which is defined in https://hackage.haskell.org/package/ghc-9.10.1/docs/src/GHC.Core.TyCo.Compare.html
+- "ensureEqTys" during "lintCoercion". probably need to define my own "`eqType`" that collects web constraints
+
+
+if it's not Blue and we start fetching fields that should be in a Blue constructor, we may die horribly
+
+}-
