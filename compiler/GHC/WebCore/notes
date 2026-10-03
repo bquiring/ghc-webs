@@ -19,6 +19,13 @@ mkGlobalId :: IdDetails -> Name -> Type -> IdInfo -> Id
 mkVanillaGlobal :: HasDebugCallStack => Name -> Type -> Id
 GHC/Types/Var.hs   mkGlobalVar
 
+to build: ./hadrian/build
+
+AST: GHC/Core.hs
+
+GHC/Core/DataCon
+Note [Data constructor workers and wrappers]
+
 GHC/Types/Id/Info.hs
   | WorkerLikeId [CbvMark]
         -- ^ An 'Id' for a worker like function, which might expect some arguments to be

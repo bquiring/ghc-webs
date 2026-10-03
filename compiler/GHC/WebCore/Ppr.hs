@@ -48,7 +48,6 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Types.SrcLoc ( pprUserRealSpan )
 import GHC.Types.Tickish
-import GHC.Core.Web
 
 {-
 ************************************************************************
@@ -208,14 +207,6 @@ ppr_expr add_par expr@(Lam _ _)
     hang (text "\\" <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
          2 (pprCoreExpr body)
 
-ppr_expr add_par expr@(LamW w _ _)
-  = let
-        (bndrs, body) = collectBinders expr
-    in
-    add_par $
-    hang (text "\\" <+> pprWeb w <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
-         2 (pprCoreExpr body)
-
 ppr_expr add_par expr@(App {})
   = sdocOption sdocSuppressTypeApplications $ \supp_ty_app ->
     case collectArgs expr of { (fun, args) ->
@@ -230,39 +221,6 @@ ppr_expr add_par expr@(App {})
           | null args' = id
           | otherwise  = add_par
     in
-    case fun of
-        Var f -> case isDataConWorkId_maybe f of
-                        -- Notice that we print the *worker*
-                        -- for tuples in paren'd format.
-                   Just dc | saturated
-                           , Just sort <- tyConTuple_maybe tc
-                           -> tupleParens sort pp_tup_args
-                           where
-                             tc        = dataConTyCon dc
-                             saturated = val_args `lengthIs` idArity f
-
-                   _ -> parens (hang fun_doc 2 pp_args)
-                   where
-                     fun_doc = ppr_id_occ noParens f
-
-        _ -> parens (hang (pprParendExpr fun) 2 pp_args)
-    }
-
-ppr_expr add_par expr@(AppW w _ _)
-  = sdocOption sdocSuppressTypeApplications $ \supp_ty_app ->
-    case collectArgs expr of { (fun, args) ->
-    let
-        pp_args     = sep (map pprArg args)
-        val_args    = dropWhile isTypeArg args   -- Drop the type arguments for tuples
-        pp_tup_args = pprWithCommas pprCoreExpr val_args
-        args'
-          | supp_ty_app = val_args
-          | otherwise   = args
-        parens
-          | null args' = id
-          | otherwise  = add_par
-    in
-    pprWeb w <+>
     case fun of
         Var f -> case isDataConWorkId_maybe f of
                         -- Notice that we print the *worker*

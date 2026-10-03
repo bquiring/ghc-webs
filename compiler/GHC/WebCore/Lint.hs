@@ -23,8 +23,6 @@ module GHC.Core.Lint (
     lintPassResult, lintExpr,
     lintAnnots, lintAxioms,
 
-    lintCoreBindingsForWebs,
-
     -- ** Debug output
     EndPassConfig (..),
     endPassIO,
@@ -107,8 +105,6 @@ import Data.List.NonEmpty ( NonEmpty(..), groupWith, nonEmpty )
 import Data.Maybe
 import Data.IntMap.Strict ( IntMap )
 import qualified Data.IntMap.Strict as IntMap ( lookup, keys, empty, fromList )
-
-import GHC.Core.Web
 
 {-
 Note [Core Lint guarantee]
@@ -325,7 +321,7 @@ message is printed on stderr rather than stdout (#13342).
 ************************************************************************
 -}
 
-type WebConstraints = [(Web, Web)]
+type WebConstraints = [Web * Web]
 
 -- | Configuration for boilerplate operations at the end of a
 -- compilation pass producing Core.
@@ -502,65 +498,6 @@ lintCoreBindings' cfg binds
                filter isExternalName $ map Var.varName binders
     ord_ext n = (nameModule n, nameOccName n)
 
-initL' :: LintConfig
-      -> LintM a            -- ^ Action to run
-      -> LResult a
-initL' cfg m
-  = unLintM m env (emptyBag, emptyBag)
-  where
-    vars = l_vars cfg
-    env = LE { le_flags   = l_flags cfg
-             , le_subst   = mkEmptySubst (mkInScopeSetList vars)
-             , le_in_vars = mkVarEnv [ (v,(v, varType v)) | v <- vars ]
-             , le_joins   = emptyVarSet
-             , le_loc     = []
-             , le_ue_aliases = emptyNameEnv
-             , le_platform = l_platform cfg
-             , le_diagOpts = l_diagOpts cfg
-             }
-
-lintCoreBindingsForWebs  :: LintConfig -> CoreProgram -> WebConstraints
---   Returns (warnings, errors)
--- If you edit this function, you may need to update the GHC formalism
--- See Note [GHC Formalism]
-lintCoreBindingsForWebs cfg binds
-  = case result of
-      (# JustUB (_, res), _ #) -> 
-        let webCons_list = map snd res in
-        concat webCons_list
-      _ -> []
-  where
-    result = initL' cfg $ 
-      addLoc TopLevelBindings           $
-      do { -- Check that all top-level binders are distinct
-         -- We do not allow  [NonRec x=1, NonRec y=x, NonRec x=2]
-         -- because of glomming; see Note [Glomming] in GHC.Core.Opt.OccurAnal
-         checkL (null dups) (dupVars dups)
-
-         -- Check for External top level binders with the same M.n name
-       ; checkL (null ext_dups) (dupExtVars ext_dups)
-
-         -- Typecheck the bindings
-       ; lintRecBindings TopLevel all_pairs $ \_ ->
-         return () }
-    all_pairs = flattenBinds binds
-     -- Put all the top-level binders in scope at the start
-     -- This is because rewrite rules can bring something
-     -- into use 'unexpectedly'; see Note [Glomming] in "GHC.Core.Opt.OccurAnal"
-    binders = map fst all_pairs
-
-    (_, dups) = removeDups compare binders
-
-    -- ext_dups checks for names with different uniques
-    -- but the same External name M.n.  We don't
-    -- allow this at top level:
-    --    M.n{r3}  = ...
-    --    M.n{r29} = ...
-    -- because they both get the same linker symbol
-    ext_dups = snd $ removeDupsOn ord_ext $
-               filter isExternalName $ map Var.varName binders
-    ord_ext n = (nameModule n, nameOccName n)
-
 {-
 ************************************************************************
 *                                                                      *
@@ -623,7 +560,7 @@ Check a core binding, returning the list of variables bound.
 -- Let
 
 lintRecBindings :: TopLevelFlag -> [(Id, CoreExpr)]
-                -> ([OutId] -> LintM a) -> LintM (a, [(UsageEnv, WebConstraints)])
+                -> ([OutId] -> LintM a) -> LintM (a, [UsageEnv])
 lintRecBindings top_lvl pairs thing_inside
   = lintIdBndrs top_lvl bndrs $ \ bndrs' ->
     do { ues <- zipWithM lint_pair bndrs' rhss
@@ -633,15 +570,15 @@ lintRecBindings top_lvl pairs thing_inside
     (bndrs, rhss) = unzip pairs
     lint_pair bndr' rhs
       = addLoc (RhsOf bndr') $
-        do { (rhs_ty, ue, webCons) <- lintRhs bndr' rhs         -- Check the rhs
+        do { (rhs_ty, ue) <- lintRhs bndr' rhs         -- Check the rhs
            ; lintLetBind top_lvl Recursive bndr' rhs rhs_ty
-           ; return (ue, webCons) }
+           ; return ue }
 
-lintLetBody :: LintLocInfo -> [OutId] -> CoreExpr -> LintM (OutType, UsageEnv, WebConstraints)
+lintLetBody :: LintLocInfo -> [OutId] -> CoreExpr -> LintM (OutType, UsageEnv)
 lintLetBody loc bndrs body
-  = do { (body_ty, body_ue, webCons) <- addLoc loc (lintCoreExpr body)
+  = do { (body_ty, body_ue) <- addLoc loc (lintCoreExpr body)
        ; mapM_ (lintJoinBndrType body_ty) bndrs
-       ; return (body_ty, body_ue, webCons) }
+       ; return (body_ty, body_ue) }
 
 lintLetBind :: TopLevelFlag -> RecFlag -> OutId
               -> CoreExpr -> OutType -> LintM ()
@@ -750,18 +687,17 @@ lintRhs _bndr rhs = fmap lf_check_static_ptrs getLintFlags >>= go
   where
     -- Allow occurrences of 'makeStatic' at the top-level but produce errors
     -- otherwise.
-    go :: StaticPtrCheck -> LintM (OutType, UsageEnv, WebConstraints)
+    go :: StaticPtrCheck -> LintM (OutType, UsageEnv)
     go AllowAtTopLevel
       | (binders0, rhs') <- collectTyBinders rhs
       , Just (fun, t, info, e) <- collectMakeStaticArgs rhs'
       = markAllJoinsBad $
         foldr
         -- imitate @lintCoreExpr (Lam ...)@
-        (lintLambda Nothing)
+        lintLambda web0 -- FIXME-WEB
         -- imitate @lintCoreExpr (App ...)@
-        (do { (fun_ty, ue, webCons) <- lintCoreExpr fun
-            ; (arg_ty, (arg_ue, webCons')) <- lintCoreArgs Nothing (fun_ty, (ue, webCons)) [Type t, info, e]
-            ; return (arg_ty, arg_ue, webCons') }
+        (do fun_result <- lintCoreExpr fun
+            lintCoreArgs None fun_result [Type t, info, e]
         )
         binders0
     go _ = markAllJoinsBad $ lintCoreExpr rhs
@@ -773,8 +709,7 @@ lintJoinLams join_arity enforce rhs
   = go join_arity rhs
   where
     go 0 expr            = lintCoreExpr expr
-    go n (Lam var body)  = lintLambda Nothing var $ go (n-1) body
-    go n (LamW web var body)  = lintLambda (Just web) var $ go (n-1) body
+    go n (Lam web var body)  = lintLambda var web $ go (n-1) body
     go n expr | Just bndr <- enforce -- Join point with too few RHS lambdas
               = failWithL $ mkBadJoinArityMsg bndr join_arity n rhs
               | otherwise -- Future join point, not yet eta-expanded
@@ -786,12 +721,10 @@ lintIdUnfolding bndr bndr_ty uf
   | isStableUnfolding uf
   , Just rhs <- maybeUnfoldingTemplate uf
   = do { ty <- fst <$> (if isCompulsoryUnfolding uf
-                        then do { (ty, ue, webCons) <- noFixedRuntimeRepChecks $ lintRhs bndr rhs
-                                ; return (ty, (ue, webCons)) }
+                        then noFixedRuntimeRepChecks $ lintRhs bndr rhs
             --               ^^^^^^^^^^^^^^^^^^^^^^^
             -- See Note [Checking for representation polymorphism]
-                        else do { (ty, ue, webCons) <- lintRhs bndr rhs
-                                ; return (ty, (ue, webCons)) })
+                        else lintRhs bndr rhs)
        ; ensureEqTys bndr_ty ty (mkRhsMsg bndr (text "unfolding") ty) }
 lintIdUnfolding  _ _ _
   = return ()       -- Do not Lint unstable unfoldings, because that leads
@@ -932,7 +865,7 @@ that: it really is a value, albeit a zero-bit value.
 ************************************************************************
 -}
 
-lintCoreExpr :: InExpr -> LintM (OutType, UsageEnv, WebConstraints)
+lintCoreExpr :: InExpr -> LintM (OutType, UsageEnv)
 -- The returned type has the substitution from the monad
 -- already applied to it:
 --      lintCoreExpr e subst = exprType (subst e)
@@ -943,27 +876,27 @@ lintCoreExpr :: InExpr -> LintM (OutType, UsageEnv, WebConstraints)
 -- See Note [GHC Formalism]
 
 lintCoreExpr (Var var)
-  = do { (var_ty, ue, webCons) <- lintIdOcc var 0
+  = do {  (var_ty, ue) <- lintIdOcc var 0
            -- See Note [Linting representation-polymorphic builtins]
        ; checkRepPolyBuiltin (Var var) [] var_ty
            --checkDataToTagPrimOpTyCon (Var var) []
-       ; return (var_ty, ue, webCons) }
+       ; return (var_ty, ue) }
 
 lintCoreExpr (Lit lit)
-  = return (literalType lit, zeroUE, [])
+  = return (literalType lit, zeroUE)
 
 lintCoreExpr (Cast expr co)
   = do { (expr_ty, ue, webCons) <- markAllJoinsBad (lintCoreExpr expr)
             -- markAllJoinsBad: see Note [Join points and casts]
 
        -- FIXME-WEB constraints from the coercions
-       ; () <- lintCoercion co
+       ; (_, webCons') <- lintCoercion co
        ; lintRole co Representational (coercionRole co)
        ; Pair from_ty to_ty <- substCoKindM co
        ; checkValueType (typeKind to_ty) $
          text "target of cast" <+> quotes (ppr co)
        ; ensureEqTys from_ty expr_ty (mkCastErr expr co from_ty expr_ty)
-       ; return (to_ty, ue, webCons {-++ webCons'-}) }
+       ; return (to_ty, ue, webCons ++ webCons') }
 
 lintCoreExpr (Tick tickish expr)
   = do { case tickish of
@@ -999,9 +932,9 @@ lintCoreExpr (Let (NonRec bndr rhs) body)
          -- Now lint the binder
        ; lintBinder LetBind bndr $ \bndr' ->
     do { lintLetBind NotTopLevel NonRecursive bndr' rhs rhs_ty
-       ; (body_ty, ue, webCons') <- addAliasUE bndr' let_ue $
-         lintLetBody (BodyOfLet bndr') [bndr'] body
-       ; return (body_ty, ue, webCons ++ webCons')} }
+       ; addAliasUE bndr' let_ue $
+         lintLetBody (BodyOfLet bndr') [bndr'] body $ \(body_ty, ue, webCons') ->
+         (body_ty, ue, webCons ++ webCons')} }
 
   | otherwise
   = failWithL (mkLetErr bndr rhs)       -- Not quite accurate
@@ -1019,46 +952,38 @@ lintCoreExpr e@(Let (Rec pairs) body)
           mkInconsistentRecMsg bndrs
 
           -- See Note [Multiplicity of let binders] in Var
-        ; ((body_type, body_ue, webCons), ues_webCons') <-
+        ; ((body_type, body_ue), ues, webCons) <-
             lintRecBindings NotTopLevel pairs $ \ bndrs' ->
             lintLetBody (BodyOfLetRec bndrs') bndrs' body
-            
-        ; let ues = map fst ues_webCons' in
-           let webCons' = concat (map snd ues_webCons') in  
-            return (body_type, body_ue  `addUE` scaleUE ManyTy (foldr1WithDefault zeroUE addUE ues), webCons ++ webCons') }
+        ; return (body_type, body_ue  `addUE` scaleUE ManyTy (foldr1WithDefault zeroUE addUE ues, webCons)) }
   where
     bndrs = map fst pairs
 
-lintCoreExpr (App f arg) = lintCoreExpr (AppW WBorder f arg)
-
-lintCoreExpr e@(AppW web _ _)
+lintCoreExpr e@(App web _ _)
   | Var fun <- fun
   , fun `hasKey` runRWKey
     -- See Note [Linting of runRW#]
     -- N.B. we may have an over-saturated application of the form:
     --   runRW (\s -> \x -> ...) y
   , ty_arg1 : ty_arg2 : cont_arg : rest <- args
-  = do { let lint_rw_cont :: CoreArg -> Mult -> (UsageEnv, WebConstraints) -> LintM (OutType, (UsageEnv, WebConstraints))
-             lint_rw_cont (Lam var body) mult (fun_ue, webCons) = lint_rw_cont (LamW WBorder var body) mult (fun_ue, webCons)
-             lint_rw_cont expr@(LamW web' _ _) mult (fun_ue, webCons)
+  = do { let lint_rw_cont :: CoreArg -> Mult -> (UsageEnv, WebConstraints) -> LintM (OutType, UsageEnv, WebConstraints)
+             lint_rw_cont expr@(Lam web' _ _) mult (fun_ue, webCons)
                 = do { (arg_ty, arg_ue, webCons') <- lintJoinLams 1 (Just fun) expr
                      ; let app_ue = addUE fun_ue (scaleUE mult arg_ue)
-                     ; return (arg_ty, (app_ue, {- [(web, web')] ++ -} webCons ++ webCons')) }
+                     ; return (arg_ty, app_ue, {- [(web, web')] ++ -} webCons ++ webCons') }
 
              lint_rw_cont expr mult ue
                 = lintValArg expr mult ue
              -- TODO: Look through ticks?
 
-       ; runrw_pr <- lintApp (text "runRW# expression") Nothing
+       ; runrw_pr <- lintApp (text "runRW# expression")
                                lintTyArg lint_rw_cont
-                               (idType fun) [ty_arg1,ty_arg2,cont_arg] (zeroUE, [])
-       ; (out_ty, (ue, webCons)) <- lintCoreArgs (Just web) runrw_pr rest 
-       ; return (out_ty, ue, webCons)
-       }
+                               (idType fun) [ty_arg1,ty_arg2,cont_arg] zeroUE
+       ; lintCoreArgs (Some web) runrw_pr rest }
 
   | otherwise
-  = do { (fun_ty, ue, webCons) <- lintCoreFun fun (length args)
-       ; (app_ty, (app_ue, webCons)) <- lintCoreArgs (Just web) (fun_ty, (ue, webCons)) args
+  = do { fun_pair <- lintCoreFun fun (length args) web
+       ; (app_ty, (app_ue, webCons)) <- lintCoreArgs fun_pair args
 
        -- See Note [Linting representation-polymorphic builtins]
        ; checkRepPolyBuiltin fun args app_ty
@@ -1083,13 +1008,9 @@ lintCoreExpr e@(AppW web _ _)
       -- Sadly this was not quite enough. So we now also accept things that CorePrep will allow.
       -- See Note [Ticks and mandatory eta expansion]
 
-lintCoreExpr (Lam var expr) 
+lintCoreExpr (Lam web var expr)
   = markAllJoinsBad $
-    lintLambda Nothing var $ lintCoreExpr expr
-
-lintCoreExpr (LamW web var expr)
-  = markAllJoinsBad $
-    lintLambda (Just web) var $ lintCoreExpr expr
+    lintLambda var web $ lintCoreExpr expr
 
 lintCoreExpr (Case scrut var alt_ty alts)
   = lintCaseExpr scrut var alt_ty alts
@@ -1102,11 +1023,11 @@ lintCoreExpr (Coercion co)
   -- See Note [Coercions in terms]
   = do { addLoc (InCo co) $ lintCoercion co
        ; ty <- substTyM (coercionType co)
-       ; return (ty, zeroUE, []) }
+       ; return (ty, zeroUE) }
 
 ----------------------
 lintIdOcc :: InId -> Int -- Number of arguments (type or value) being passed
-          -> LintM (OutType, UsageEnv, WebConstraints) -- returns type of the *variable*
+          -> LintM (OutType, UsageEnv) -- returns type of the *variable*
 lintIdOcc in_id nargs
   = addLoc (OccOf in_id) $
     do  { checkL (isNonCoVarId in_id)
@@ -1142,50 +1063,35 @@ lintIdOcc in_id nargs
         ; checkJoinOcc in_id nargs
         ; usage <- varCallSiteUsage in_id
 
-        ; return (out_ty, usage, []) }
+        ; return (out_ty, usage) }
 
 
 
 lintCoreFun :: CoreExpr
             -> Int                          -- Number of arguments (type or val) being passed
+            -> Web                          -- Web of the function
             -> LintM (OutType, UsageEnv, WebConstraints) -- Returns type of the *function*
 lintCoreFun (Var var) nargs
   = lintIdOcc var nargs
 
-lintCoreFun (Lam var body) nargs
+lintCoreFun (Lam web var body) nargs
   -- Act like lintCoreExpr of Lam, but *don't* call markAllJoinsBad;
   -- See Note [Beta redexes]
   | nargs /= 0
-  = lintLambda Nothing var $ lintCoreFun body (nargs - 1)
-
-lintCoreFun (LamW web var body) nargs
-  -- Act like lintCoreExpr of Lam, but *don't* call markAllJoinsBad;
-  -- See Note [Beta redexes]
-  | nargs /= 0
-  = lintLambda (Just web) var $ lintCoreFun body (nargs - 1)
+  = lintLambda var web $ lintCoreFun body (nargs - 1)
 
 lintCoreFun expr nargs
   = markAllJoinsBadIf (nargs /= 0) $
       -- See Note [Join points are less general than the paper]
     lintCoreExpr expr
 ------------------
-lintLambda :: Maybe Web -> Var -> LintM (Type, UsageEnv, WebConstraints) -> LintM (Type, UsageEnv, WebConstraints)
-lintLambda wo var lintBody =
+lintLambda :: Var -> Web -> LintM (Type, UsageEnv, WebConstraints) -> LintM (Type, UsageEnv, WebConstraints)
+lintLambda var web lintBody =
     addLoc (LambdaBodyOf var) $
     lintBinder LambdaBind var $ \ var' ->
     do { (body_ty, ue, webCons) <- lintBody
        ; ue' <- checkLinearity ue var'
-       ; let fun_ty = case wo of
-                  Just web -> let mult = (idMult var') in
-                              let arg_ty = (idType var') in
-                              let res_ty = body_ty in
-                              let af = chooseFunTyFlag arg_ty res_ty in
-                              let mult_ok = isVisibleFunArg af || isManyTy mult in
-                              FunWTy { ft_web = web, ft_af = af, ft_arg = arg_ty, ft_res = res_ty
-                                     , ft_mult = assertPpr mult_ok (ppr [mult, arg_ty, res_ty]) $
-                                      mult }
-                  Nothing -> mkLamType var' body_ty
-       ; return (fun_ty, ue', webCons) }
+       ; return (mkLamType web var' body_ty, ue', webCons) }
 ------------------
 checkDeadIdOcc :: Id -> LintM ()
 -- Occurrences of an Id should never be dead....
@@ -1554,10 +1460,10 @@ subtype of the required type, as one would expect.
 -- Takes the functions type and arguments as argument.
 -- Returns the *result* of applying the function to arguments.
 -- e.g. f :: Int -> Bool -> Int would return `Int` as result type.
-lintCoreArgs  :: Maybe Web -> (OutType, (UsageEnv, WebConstraints)) -> [InExpr] -> LintM (OutType, (UsageEnv, WebConstraints))
-lintCoreArgs web (fun_ty, (fun_ue, webCons)) args
-  = lintApp (text "expression") web
-              lintTyArg lintValArg fun_ty args (fun_ue, webCons)
+lintCoreArgs  :: Web -> (OutType, (UsageEnv, WebConstraints)) -> [InExpr] -> LintM (OutType, (UsageEnv, WebConstraints))
+lintCoreArgs web (fun_ty, fun_ue) args
+  = lintApp (text "expression") (Some web)
+              lintTyArg lintValArg fun_ty args fun_ue
 
 lintTyArg :: InExpr -> LintM OutType
 
@@ -1570,7 +1476,7 @@ lintTyArg (Type arg_ty)
 lintTyArg arg
   = failWithL (hang (text "Expected type argument but found") 2 (ppr arg))
 
-lintValArg  :: InExpr -> Mult -> (UsageEnv, WebConstraints) -> LintM (OutType, (UsageEnv, WebConstraints))
+lintValArg  :: InExpr -> Mult -> UsageEnv -> LintM (OutType, (UsageEnv, WebConstraints))
 lintValArg arg mult (fun_ue, webCons)
   = do { (arg_ty, arg_ue, webCons') <- markAllJoinsBad $ lintCoreExpr arg
            -- See Note [Representation polymorphism invariants] in GHC.Core
@@ -1585,7 +1491,7 @@ lintValArg arg mult (fun_ue, webCons)
                       <+> parens (ppr arg_ty <+> dcolon <+> ppr (typeKind arg_ty))) }
 
        ; let app_ue = addUE fun_ue (scaleUE mult arg_ue)
-       ; return (arg_ty, (app_ue, webCons ++ webCons')) }
+       ; return (arg_ty, app_ue, webCons ++ webCons') }
 
 -----------------
 lintAltBinders :: UsageEnv
@@ -1684,12 +1590,12 @@ lintTyKind tyvar arg_ty
 ************************************************************************
 -}
 
-lintCaseExpr :: CoreExpr -> InId -> InType -> [CoreAlt] -> LintM (OutType, UsageEnv, WebConstraints)
+lintCaseExpr :: CoreExpr -> InId -> InType -> [CoreAlt] -> LintM (OutType, UsageEnv)
 lintCaseExpr scrut case_bndr alt_ty alts
   = do { let e = Case scrut case_bndr alt_ty alts   -- Just for error messages
 
        -- Check the scrutinee
-       ; (scrut_ty', scrut_ue, webCons) <- markAllJoinsBad $ lintCoreExpr scrut
+       ; (scrut_ty', scrut_ue) <- markAllJoinsBad $ lintCoreExpr scrut
             -- See Note [Join points are less general than the paper]
             -- in GHC.Core
 
@@ -1709,11 +1615,9 @@ lintCaseExpr scrut case_bndr alt_ty alts
          -- See GHC.Core Note [Case expression invariants] item (7)
 
        ; -- Check the alternatives
-       ; alt_ues_webCons' <- mapM (lintCoreAlt case_bndr' scrut_ty' scrut_mult alt_ty') alts
-       ; let alt_ues = map fst alt_ues_webCons'
-       ; let webCons' = concat (map snd alt_ues_webCons')
+       ; alt_ues <- mapM (lintCoreAlt case_bndr' scrut_ty' scrut_mult alt_ty') alts
        ; let case_ue = (scaleUE scrut_mult scrut_ue) `addUE` supUEs alt_ues
-       ; return (alt_ty', case_ue, webCons ++ webCons') } }
+       ; return (alt_ty', case_ue) } }
 
 checkCaseAlts :: InExpr -> InExpr -> OutType -> [CoreAlt] -> LintM ()
 -- a) Check that the alts are non-empty
@@ -1789,11 +1693,11 @@ checkCaseAlts e scrut scrut_ty alts
                         Nothing    -> False
                         Just tycon -> isPrimTyCon tycon
 
-lintAltExpr :: CoreExpr -> OutType -> LintM (UsageEnv, WebConstraints)
+lintAltExpr :: CoreExpr -> OutType -> LintM UsageEnv
 lintAltExpr expr ann_ty
-  = do { (actual_ty, ue, webCons) <- lintCoreExpr expr
+  = do { (actual_ty, ue) <- lintCoreExpr expr
        ; ensureEqTys actual_ty ann_ty (mkCaseAltMsg expr actual_ty ann_ty)
-       ; return (ue, webCons) }
+       ; return ue }
          -- See GHC.Core Note [Case expression invariants] item (6)
 
 lintCoreAlt :: OutId         -- Case binder
@@ -1801,17 +1705,17 @@ lintCoreAlt :: OutId         -- Case binder
             -> Mult          -- Multiplicity of scrutinee
             -> OutType       -- Type of the alternative
             -> CoreAlt
-            -> LintM (UsageEnv, WebConstraints)
+            -> LintM UsageEnv
 -- If you edit this function, you may need to update the GHC formalism
 -- See Note [GHC Formalism]
 lintCoreAlt case_bndr _ scrut_mult alt_ty (Alt DEFAULT args rhs) =
   do { lintL (null args) (mkDefaultArgsMsg args)
-     ; (rhs_ue, webCons) <- lintAltExpr rhs alt_ty
+     ; rhs_ue <- lintAltExpr rhs alt_ty
      ; let (case_bndr_usage, rhs_ue') = popUE rhs_ue case_bndr
            err_msg = vcat [ text "Linearity failure in the DEFAULT clause:" <+> ppr case_bndr
                           , ppr case_bndr_usage <+> text "⊈" <+> ppr scrut_mult ]
      ; ensureSubUsage case_bndr_usage scrut_mult err_msg
-     ; return (rhs_ue', webCons) }
+     ; return rhs_ue' }
 
 lintCoreAlt case_bndr scrut_ty _ alt_ty (Alt (LitAlt lit) args rhs)
   | litIsLifted lit
@@ -1819,15 +1723,15 @@ lintCoreAlt case_bndr scrut_ty _ alt_ty (Alt (LitAlt lit) args rhs)
   | otherwise
   = do { lintL (null args) (mkDefaultArgsMsg args)
        ; ensureEqTys lit_ty scrut_ty (mkBadPatMsg lit_ty scrut_ty)
-       ; (rhs_ue, webCons) <- lintAltExpr rhs alt_ty
-       ; return (deleteUE rhs_ue case_bndr, webCons) -- No need for linearity checks
+       ; rhs_ue <- lintAltExpr rhs alt_ty
+       ; return (deleteUE rhs_ue case_bndr) -- No need for linearity checks
        }
   where
     lit_ty = literalType lit
 
 lintCoreAlt case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt con) args rhs)
   | isNewTyCon (dataConTyCon con)
-  = (zeroUE, []) <$ addErrL (mkNewTyDataConAltMsg scrut_ty alt)
+  = zeroUE <$ addErrL (mkNewTyDataConAltMsg scrut_ty alt)
   | Just (tycon, tycon_arg_tys) <- splitTyConApp_maybe scrut_ty
   = addLoc (CaseAlt alt) $  do
     { checkTypeDataConOcc "pattern" con
@@ -1843,16 +1747,16 @@ lintCoreAlt case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt con) args rh
 
         -- And now bring the new binders into scope
     ; lintBinders CasePatBind args $ \ args' -> do
-      { (rhs_ue, webCons) <- lintAltExpr rhs alt_ty
+      { rhs_ue <- lintAltExpr rhs alt_ty
       ; rhs_ue' <- addLoc (CasePat alt) $
                    lintAltBinders rhs_ue case_bndr scrut_ty con_payload_ty
                                   (zipEqual multiplicities  args')
-      ; return $ (deleteUE rhs_ue' case_bndr, webCons)
+      ; return $ deleteUE rhs_ue' case_bndr
       }
    }
 
   | otherwise   -- Scrut-ty is wrong shape
-  = (zeroUE, []) <$ addErrL (mkBadAltMsg scrut_ty alt)
+  = zeroUE <$ addErrL (mkBadAltMsg scrut_ty alt)
 
 {-
 Note [Validating multiplicities in a case]
@@ -2098,14 +2002,6 @@ lintType ty@(FunTy af tw t1 t2)
        ; lintType tw
        ; lintArrow (text "type or kind" <+> quotes (ppr ty)) af t1 t2 tw }
 
--- arrows can related *unlifted* kinds, so this has to be separate from
--- a dependent forall.
-lintType ty@(FunWTy web af tw t1 t2)
-  = do { lintType t1
-       ; lintType t2
-       ; lintType tw
-       ; lintArrow (text "type or kind" <+> quotes (ppr ty)) af t1 t2 tw }
-
 lintType ty@(ForAllTy {})
   = go [] ty
   where
@@ -2232,8 +2128,7 @@ lint_co_app co = lint_tyco_app (text "coercion" <+> quotes (ppr co))
 lint_tyco_app :: SDoc -> OutKind -> [InType] -> LintM ()
 lint_tyco_app msg fun_kind arg_tys
     -- See Note [Avoiding compiler perf traps when constructing error messages.]
-  = do { _ <- lintApp msg Nothing
-                      (\ty     -> do { lintType ty; substTyM ty })
+  = do { _ <- lintApp msg (\ty     -> do { lintType ty; substTyM ty })
                             (\ty _ _ -> do { lintType ty; ki <- substTyM (typeKind ty); return (ki,()) })
                             fun_kind arg_tys ()
        ; return () }
@@ -2241,7 +2136,7 @@ lint_tyco_app msg fun_kind arg_tys
 ----------------
 lintApp :: forall in_a acc. Outputable in_a =>
              SDoc
-          -> Maybe Web
+          -> Option Web
           -> (in_a -> LintM OutType)                        -- Lint the thing and return its value
           -> (in_a -> Mult -> acc -> LintM (OutKind, acc))  -- Lint the thing and return its type
           -> OutType
@@ -2264,7 +2159,7 @@ lintApp :: forall in_a acc. Outputable in_a =>
 {-# INLINE lintApp #-}    -- INLINE: very few call sites;
                           -- not recursive; specialised at its call sites
 
-lintApp msg wo {- FIXME: WEB -} lint_forall_arg lint_arrow_arg !orig_fun_ty all_args acc
+lintApp msg wo lint_forall_arg lint_arrow_arg !orig_fun_ty all_args acc
     = do { !in_scope <- getInScope
          -- We need the in_scope set to satisfy the invariant in
          -- Note [The substitution invariant] in GHC.Core.TyCo.Subst
@@ -2290,10 +2185,7 @@ lintApp msg wo {- FIXME: WEB -} lint_forall_arg lint_arrow_arg !orig_fun_ty all_
                                 2 (ppr arg' <+> dcolon <+> ppr karg'))
                       ; go subst' body_ty acc args }
 
-               go subst (FunTy x mult exp_arg_ty res_ty) acc (arg:args)
-                 = go subst (FunWTy WBorder x mult exp_arg_ty res_ty) acc (arg:args)
-
-               go subst fun_ty@(FunWTy web _ mult exp_arg_ty res_ty) acc (arg:args)
+               go subst fun_ty@(FunTy web _ mult exp_arg_ty res_ty) acc (arg:args)
          -- FIXME-WEB wo web
                  = do { (arg_ty, acc') <- lint_arrow_arg arg (substTy subst mult) acc
                       ; ensureEqTys (substTy subst exp_arg_ty) arg_ty $
@@ -2341,8 +2233,8 @@ lintCoreRule fun fun_ty rule@(Rule { ru_name = name, ru_bndrs = bndrs
                                    , ru_args = args, ru_rhs = rhs })
   = lintBinders LambdaBind bndrs $ \ _ ->
   -- FIXME-WEB
-    do { (lhs_ty, _) <- lintCoreArgs Nothing (fun_ty, (zeroUE, [])) args
-       ; (rhs_ty, _, _) <- case idJoinPointHood fun of
+    do { (lhs_ty, _) <- lintCoreArgs FIXME:web (fun_ty, zeroUE) args
+       ; (rhs_ty, _) <- case idJoinPointHood fun of
                      JoinPoint join_arity
                        -> do { checkL (args `lengthIs` join_arity) $
                                 mkBadJoinPointRuleMsg fun join_arity rule

@@ -81,8 +81,6 @@ import GHC.Types.Var.Set( elemVarSet )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 
-import GHC.Core.Web
-
 -- others
 import GHC.Builtin.Names
 
@@ -172,19 +170,7 @@ data Type
                                  --      ft_arg and ft_res
                                  -- Note [FunTyFlag] in GHC.Types.Var
 
-     , ft_mult :: Mult           -- Multiplicity; always Many for (=>) and (==>)
-     , ft_arg  :: Type           -- Argument type
-     , ft_res  :: Type }         -- Result type
-
-  | FunWTy      -- ^ FUN m t1 t2   Very common, so an important special case
-                -- See Note [Function types]
-     { 
-      ft_web :: Web           -- The web of the function arrow
-     ,ft_af   :: FunTyFlag    -- Is this (->/FUN) or (=>) or (==>)?
-                                 -- This info is fully specified by the kinds in
-                                 --      ft_arg and ft_res
-                                 -- Note [FunTyFlag] in GHC.Types.Var
-
+     , web :: WebId
      , ft_mult :: Mult           -- Multiplicity; always Many for (=>) and (==>)
      , ft_arg  :: Type           -- Argument type
      , ft_res  :: Type }         -- Result type

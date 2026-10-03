@@ -43,7 +43,6 @@ import GHC.Core.TyCo.FVs
 import GHC.Core.Class
 import GHC.Core.Predicate( scopedSort )
 import GHC.Core.Multiplicity( pprArrowWithMultiplicity )
-import GHC.Core.Web
 
 import GHC.Types.Var
 
@@ -241,16 +240,6 @@ debug_ppr_ty _ (TyVarTy tv)
 debug_ppr_ty prec (FunTy { ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = res })
   = maybeParen prec funPrec $
     sep [debug_ppr_ty funPrec arg, arr <+> debug_ppr_ty prec res]
-  where
-    arr = pprArrowWithMultiplicity af $
-          case mult of
-            OneTy  -> Left True
-            ManyTy -> Left False
-            _      -> Right (debug_ppr_ty appPrec mult)
-
-debug_ppr_ty prec (FunWTy { ft_web, ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = res })
-  = maybeParen prec funPrec $
-    sep [debug_ppr_ty funPrec arg, arr <+> pprWeb ft_web <+> debug_ppr_ty prec res]
   where
     arr = pprArrowWithMultiplicity af $
           case mult of

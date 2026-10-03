@@ -3,6 +3,10 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
+{-
+  Core, but with web annotations
+-}
+
 {-# LANGUAGE NoPolyKinds #-}
 
 -- | GHC.Core holds all the main data types for use by for the Glasgow Haskell Compiler midsection
@@ -121,8 +125,6 @@ import qualified Data.List.NonEmpty as NE
 import Data.Word
 
 import Control.DeepSeq
-
-import GHC.Core.Web
 
 infixl 4 `mkApps`, `mkTyApps`, `mkVarApps`, `App`, `mkCoApps`
 -- Left associative, so that we can say (f `mkTyApps` xs `mkVarApps` ys)
@@ -250,15 +252,14 @@ is better for at least three reasons:
       data Ex = forall a. Ex a.
 -}
 
+type Web = int
 -- If you edit this type, you may need to update the GHC formalism
 -- See Note [GHC Formalism] in GHC.Core.Lint
 data Expr b
   = Var   Id
   | Lit   Literal
-  | App   (Expr b) (Arg b)
-  | AppW  Web (Expr b) (Arg b)
-  | Lam   b (Expr b)
-  | LamW  Web b (Expr b)
+  | App   Web (Expr b) (Arg b)
+  | Lam   Web b (Expr b)
   | Let   (Bind b) (Expr b)
   | Case  (Expr b) b Type [Alt b]   -- See Note [Case expression invariants]
                                     -- and Note [Why does Case have a 'Type' field?]
@@ -1939,8 +1940,8 @@ deTagExpr (Var v)                   = Var v
 deTagExpr (Lit l)                   = Lit l
 deTagExpr (Type ty)                 = Type ty
 deTagExpr (Coercion co)             = Coercion co
-deTagExpr (App e1 e2)               = App (deTagExpr e1) (deTagExpr e2)
-deTagExpr (Lam (TB b _) e)          = Lam b (deTagExpr e)
+deTagExpr (App w e1 e2)               = App w (deTagExpr e1) (deTagExpr e2)
+deTagExpr (Lam w (TB b _) e)          = Lam w b (deTagExpr e)
 deTagExpr (Let bind body)           = Let (deTagBind bind) (deTagExpr body)
 deTagExpr (Case e (TB b _) ty alts) = Case (deTagExpr e) b ty (map deTagAlt alts)
 deTagExpr (Tick t e)                = Tick t (deTagExpr e)
@@ -1963,28 +1964,28 @@ deTagAlt (Alt con bndrs rhs) = Alt con [b | TB b _ <- bndrs] (deTagExpr rhs)
 
 -- | Apply a list of argument expressions to a function expression in a nested fashion. Prefer to
 -- use 'GHC.Core.Make.mkCoreApps' if possible
-mkApps    :: Expr b -> [Arg b]  -> Expr b
+mkApps    :: Web -> Expr b -> [Arg b]  -> Expr b
 -- | Apply a list of type argument expressions to a function expression in a nested fashion
-mkTyApps  :: Expr b -> [Type]   -> Expr b
+mkTyApps  :: Web -> Expr b -> [Type]   -> Expr b
 -- | Apply a list of coercion argument expressions to a function expression in a nested fashion
-mkCoApps  :: Expr b -> [Coercion] -> Expr b
+mkCoApps  :: Web -> Expr b -> [Coercion] -> Expr b
 -- | Apply a list of type or value variables to a function expression in a nested fashion
-mkVarApps :: Expr b -> [Var] -> Expr b
+mkVarApps :: Web -> Expr b -> [Var] -> Expr b
 -- | Apply a list of argument expressions to a data constructor in a nested fashion. Prefer to
 -- use 'GHC.Core.Make.mkCoreConApps' if possible
-mkConApp      :: DataCon -> [Arg b] -> Expr b
+mkConApp      :: Web -> DataCon -> [Arg b] -> Expr b
 
-mkApps    f args = foldl' App                       f args
-mkCoApps  f args = foldl' (\ e a -> App e (Coercion a)) f args
-mkVarApps f vars = foldl' (\ e a -> App e (varToCoreExpr a)) f vars
-mkConApp con args = mkApps (Var (dataConWorkId con)) args
+mkApps    w f args = foldl' (App w)                       f args
+mkCoApps  w f args = foldl' (\ e a -> App w e (Coercion a)) f args
+mkVarApps w f vars = foldl' (\ e a -> App w e (varToCoreExpr a)) f vars
+mkConApp w con args = mkApps w (Var (dataConWorkId con)) args
 
-mkTyApps  f args = foldl' (\ e a -> App e (mkTyArg a)) f args
+mkTyApps  w f args = foldl' (\ e a -> App w e (mkTyArg a)) f args
 
 mkConApp2 :: DataCon -> [Type] -> [Var] -> Expr b
-mkConApp2 con tys arg_ids = Var (dataConWorkId con)
-                            `mkApps` map Type tys
-                            `mkApps` map varToCoreExpr arg_ids
+mkConApp2 w con tys arg_ids = Var (dataConWorkId con)
+                            `mkApps` w map Type tys
+                            `mkApps` w map varToCoreExpr arg_ids
 
 mkTyArg :: Type -> Expr b
 mkTyArg ty
@@ -2189,19 +2190,19 @@ collectNBinders :: JoinArity -> Expr b -> ([b], Expr b)
 collectBinders expr
   = go [] expr
   where
-    go bs (Lam b e) = go (b:bs) e
+    go bs (Lam w b e) = go (b:bs) e
     go bs e          = (reverse bs, e)
 
 collectTyBinders expr
   = go [] expr
   where
-    go tvs (Lam b e) | isTyVar b = go (b:tvs) e
+    go tvs (Lam w b e) | isTyVar b = go (b:tvs) e
     go tvs e                     = (reverse tvs, e)
 
 collectValBinders expr
   = go [] expr
   where
-    go ids (Lam b e) | isId b = go (b:ids) e
+    go ids (Lam w b e) | isId b = go (b:ids) e
     go ids body               = (reverse ids, body)
 
 collectTyAndValBinders expr
@@ -2214,7 +2215,7 @@ collectNBinders orig_n orig_expr
   = go orig_n [] orig_expr
   where
     go 0 bs expr      = (reverse bs, expr)
-    go n bs (Lam b e) = go (n-1) (b:bs) e
+    go n bs (Lam w b e) = go (n-1) (b:bs) e
     go _ _  _         = pprPanic "collectNBinders" $ int orig_n
 
 -- | Strip off exactly N leading value lambdas
@@ -2235,7 +2236,7 @@ collectArgs :: Expr b -> (Expr b, [Arg b])
 collectArgs expr
   = go expr []
   where
-    go (App f a) as = go f (a:as)
+    go (App w f a) as = go f (a:as)
     go e         as = (e, as)
 
 -- | Takes a nested application expression and returns the function
@@ -2244,7 +2245,7 @@ collectValArgs :: Expr b -> (Expr b, [Arg b])
 collectValArgs expr
   = go expr []
   where
-    go (App f a) as
+    go (App w f a) as
       | isValArg a  = go f (a:as)
       | otherwise   = go f as
     go e         as = (e, as)
@@ -2257,7 +2258,7 @@ collectFunSimple expr
   where
     go expr' =
       case expr' of
-        App f _a    -> go f
+        App w f _a    -> go f
         Tick _t e   -> go e
         Cast e _co  -> go e
         e           -> e
@@ -2267,7 +2268,7 @@ collectFunSimple expr
 wrapLamBody :: (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
 wrapLamBody f expr = go expr
   where
-  go (Lam v body) = Lam v $ go body
+  go (Lam w v body) = Lam w v $ go body
   go expr = f expr
 
 -- | Attempt to remove the last N arguments of a function call.
@@ -2277,7 +2278,7 @@ stripNArgs :: Word -> Expr a -> Maybe (Expr a)
 stripNArgs !n (Tick _ e) = stripNArgs n e
 stripNArgs n (Cast f _) = stripNArgs n f
 stripNArgs 0 e = Just e
-stripNArgs n (App f _) = stripNArgs (n - 1) f
+stripNArgs n (App w f _) = stripNArgs (n - 1) f
 stripNArgs _ _ = Nothing
 
 -- | Like @collectArgs@, but also looks through floatable
@@ -2287,7 +2288,7 @@ collectArgsTicks :: (CoreTickish -> Bool) -> Expr b
 collectArgsTicks skipTick expr
   = go expr [] []
   where
-    go (App f a)  as ts = go f (a:as) ts
+    go (App w f a)  as ts = go f (a:as) ts
     go (Tick t e) as ts
       | skipTick t      = go e as (t:ts)
     go e          as ts = (e, as, reverse ts)
@@ -2301,7 +2302,7 @@ collectArgsTicks skipTick expr
 ************************************************************************
 
 At one time we optionally carried type arguments through to runtime.
-@isRuntimeVar v@ returns if (Lam v _) really becomes a lambda at runtime,
+@isRuntimeVar v@ returns if (Lam w v _) really becomes a lambda at runtime,
 i.e. if type applications are actual lambdas because types are kept around
 at runtime.  Similarly isRuntimeArg.
 -}
@@ -2362,8 +2363,8 @@ type AnnExpr bndr annot = (annot, AnnExpr' bndr annot)
 data AnnExpr' bndr annot
   = AnnVar      Id
   | AnnLit      Literal
-  | AnnLam      bndr (AnnExpr bndr annot)
-  | AnnApp      (AnnExpr bndr annot) (AnnExpr bndr annot)
+  | AnnLam      Web bndr (AnnExpr bndr annot)
+  | AnnApp      Web (AnnExpr bndr annot) (AnnExpr bndr annot)
   | AnnCase     (AnnExpr bndr annot) bndr Type [AnnAlt bndr annot]
   | AnnLet      (AnnBind bndr annot) (AnnExpr bndr annot)
   | AnnCast     (AnnExpr bndr annot) (annot, Coercion)
@@ -2386,7 +2387,7 @@ collectAnnArgs :: AnnExpr b a -> (AnnExpr b a, [AnnExpr b a])
 collectAnnArgs expr
   = go expr []
   where
-    go (_, AnnApp f a) as = go f (a:as)
+    go (_, AnnApp w f a) as = go f (a:as)
     go e               as = (e, as)
 
 collectAnnArgsTicks :: (CoreTickish -> Bool) -> AnnExpr b a
@@ -2394,7 +2395,7 @@ collectAnnArgsTicks :: (CoreTickish -> Bool) -> AnnExpr b a
 collectAnnArgsTicks tickishOk expr
   = go expr [] []
   where
-    go (_, AnnApp f a)  as ts = go f (a:as) ts
+    go (_, AnnApp w f a)  as ts = go f (a:as) ts
     go (_, AnnTick t e) as ts | tickishOk t
                               = go e as (t:ts)
     go e                as ts = (e, as, reverse ts)
@@ -2407,8 +2408,8 @@ deAnnotate' (AnnType t)           = Type t
 deAnnotate' (AnnCoercion co)      = Coercion co
 deAnnotate' (AnnVar  v)           = Var v
 deAnnotate' (AnnLit  lit)         = Lit lit
-deAnnotate' (AnnLam  binder body) = Lam binder (deAnnotate body)
-deAnnotate' (AnnApp  fun arg)     = App (deAnnotate fun) (deAnnotate arg)
+deAnnotate' (AnnLam  w binder body) = Lam w binder (deAnnotate body)
+deAnnotate' (AnnApp  w fun arg)   = App w (deAnnotate fun) (deAnnotate arg)
 deAnnotate' (AnnCast e (_,co))    = Cast (deAnnotate e) co
 deAnnotate' (AnnTick tick body)   = Tick tick (deAnnotate body)
 
@@ -2429,7 +2430,7 @@ collectAnnBndrs :: AnnExpr bndr annot -> ([bndr], AnnExpr bndr annot)
 collectAnnBndrs e
   = collect [] e
   where
-    collect bs (_, AnnLam b body) = collect (b:bs) body
+    collect bs (_, AnnLam w b body) = collect (b:bs) body
     collect bs body               = (reverse bs, body)
 
 -- | As 'collectNBinders' but for 'AnnExpr' rather than 'Expr'
@@ -2438,5 +2439,5 @@ collectNAnnBndrs orig_n e
   = collect orig_n [] e
   where
     collect 0 bs body               = (reverse bs, body)
-    collect n bs (_, AnnLam b body) = collect (n-1) (b:bs) body
+    collect n bs (_, AnnLam w b body) = collect (n-1) (b:bs) body
     collect _ _  _                  = pprPanic "collectNBinders" $ int orig_n
