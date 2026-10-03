@@ -1,13 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-} -- used to pass the phase to ppr_mult_ann since MultAnn is a type family
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -38,23 +30,30 @@ import Language.Haskell.Syntax.Expr( LHsExpr )
 import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, pprLExpr, pprFunBind, pprPatBind )
 import {-# SOURCE #-} GHC.Hs.Pat  (pprLPat )
 
-import GHC.Data.BooleanFormula ( LBooleanFormula, pprBooleanFormulaNormal )
-import GHC.Types.Tickish
 import GHC.Hs.Extension
-import GHC.Parser.Annotation
 import GHC.Hs.Type
+import GHC.Hs.ImpExp ()
+import GHC.Hs.Lit
+
 import GHC.Tc.Types.Evidence
+
 import GHC.Core.Type
+
+import GHC.Parser.Annotation
+
+import GHC.Types.Tickish
 import GHC.Types.Name.Set
 import GHC.Types.Basic
+import GHC.Types.InlinePragma
 import GHC.Types.SourceText
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Var
 import GHC.Types.Name
 
+import GHC.Data.BooleanFormula ( LBooleanFormula, pprBooleanFormulaNormal )
+
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Misc ((<||>))
 
 import Data.Function
 import Data.List (sortBy)
@@ -73,23 +72,23 @@ Global bindings (where clauses)
 -- the ...LR datatypes are parameterized by two id types,
 -- one for the left and one for the right.
 
-type instance XHsValBinds      (GhcPass pL) (GhcPass pR) = EpAnn (AnnList (EpToken "where"))
-type instance XHsIPBinds       (GhcPass pL) (GhcPass pR) = EpAnn (AnnList (EpToken "where"))
+type instance XHsValBinds      (GhcPass pL) (GhcPass pR) = (EpAnn AnnList, EpToken "where")
+type instance XHsIPBinds       (GhcPass pL) (GhcPass pR) = (EpAnn AnnList, EpToken "where")
 type instance XEmptyLocalBinds (GhcPass pL) (GhcPass pR) = NoExtField
 type instance XXHsLocalBindsLR (GhcPass pL) (GhcPass pR) = DataConCantHappen
 
 -- ---------------------------------------------------------------------
--- Deal with ValBindsOut
+type instance XValBinds    (GhcPass pL) (GhcPass pR) = NoExtField
 
--- TODO: make this the only type for ValBinds
-data NHsValBindsLR idL
-  = NValBinds
-      [(RecFlag, LHsBinds idL)]
-      [LSig GhcRn]
+type instance XXValBindsLR (GhcPass pL) _ = HsValBindGroups pL
 
-type instance XValBinds    (GhcPass pL) (GhcPass pR) = AnnSortKey BindTag
-type instance XXValBindsLR (GhcPass pL) pR
-            = NHsValBindsLR (GhcPass pL)
+data HsValBindGroups p   -- Divided into strongly connected components
+  = HsVBG [HsValBindGroup (GhcPass p)] [LSig GhcRn]
+
+type family HsValBindGroup p
+type instance HsValBindGroup GhcPs = ()
+type instance HsValBindGroup GhcRn = (RecFlag, LHsBinds GhcRn)
+type instance HsValBindGroup GhcTc = (RecFlag, LHsBinds GhcTc)
 
 -- ---------------------------------------------------------------------
 
@@ -118,10 +117,14 @@ type instance XFunBind    (GhcPass pL) GhcTc = (HsWrapper, [CoreTickish])
 
 type instance XPatBind    GhcPs (GhcPass pR) = NoExtField
 type instance XPatBind    GhcRn (GhcPass pR) = NameSet -- See Note [Bind free vars]
-type instance XPatBind    GhcTc (GhcPass pR) =
-    ( Type                  -- Type of the GRHSs
-    , ( [CoreTickish]       -- Ticks to put on the rhs, if any
-      , [[CoreTickish]] ) ) -- and ticks to put on the bound variables.
+type instance XPatBind    GhcTc (GhcPass pR) = XPatBindTc
+
+data XPatBindTc = XPatBindTc
+  { patBindGRHSType :: Type -- ^ Type of the GRHSs
+  , patBindRHSTicks :: [CoreTickish] -- ^ Ticks to put on the rhs
+  , patBindVarsTicks :: [[CoreTickish]] -- ^ Ticks to put on the bound variables
+  , patBindMult :: Mult -- ^ Multiplicity, given by a modifier or inferred
+  }
 
 type instance XVarBind (GhcPass pL) (GhcPass pR) = XVarBindGhc pL pR
 type family XVarBindGhc pL pR where
@@ -143,24 +146,17 @@ type instance XXPatSynBind (GhcPass idL) (GhcPass idR) = DataConCantHappen
 data AnnPSB
   = AnnPSB {
       ap_pattern :: EpToken "pattern",
-      ap_openc   :: Maybe (EpToken "{"),
-      ap_closec  :: Maybe (EpToken "}"),
       ap_larrow  :: Maybe (EpUniToken "<-" "←"),
-      ap_equal   :: Maybe (EpToken "=")
+      ap_equal   :: Maybe (EpToken "="),
+      ap_where   :: Maybe (EpToken "where")
     } deriving Data
 
 instance NoAnn AnnPSB where
-  noAnn = AnnPSB noAnn noAnn noAnn noAnn noAnn
+  noAnn = AnnPSB noAnn noAnn noAnn noAnn
 
-setTcMultAnn :: Mult -> HsMultAnn GhcRn -> HsMultAnn GhcTc
-setTcMultAnn mult (HsLinearAnn _)   = HsLinearAnn mult
-setTcMultAnn mult (HsExplicitMult _ p) = HsExplicitMult mult p
-setTcMultAnn mult (HsUnannotated _) = HsUnannotated mult
-
-getTcMultAnn :: HsMultAnn GhcTc -> Mult
-getTcMultAnn (HsLinearAnn mult)   = mult
-getTcMultAnn (HsExplicitMult mult _) = mult
-getTcMultAnn (HsUnannotated mult) = mult
+instance HasLoc (ValBind (GhcPass p) (GhcPass p)) where
+  getHasLoc (VbBind b) = getHasLoc b
+  getHasLoc (VbSig  s) = getHasLoc s
 
 -- ---------------------------------------------------------------------
 
@@ -431,11 +427,12 @@ c) Deciding whether the binding can be used in static forms
      GHC.Tc.Gen.Bind.isClosedBndrGroup).
 
 Specifically,
-
   * it includes all free vars that are defined in this module
     (including top-level things and lexically scoped type variables)
 
   * it excludes imported vars; this is just to keep the set smaller
+
+  * in a recursive group, it /includes/ variables bound in the same group
 
   * Before renaming, and after typechecking, the field is unused;
     it's just an error thunk
@@ -449,18 +446,24 @@ instance (OutputableBndrId pl, OutputableBndrId pr)
 
 instance (OutputableBndrId pl, OutputableBndrId pr)
         => Outputable (HsValBindsLR (GhcPass pl) (GhcPass pr)) where
-  ppr (ValBinds _ binds sigs)
-   = pprDeclList (pprLHsBindsForUser binds sigs)
+  ppr (ValBinds _ binds)
+   = pprDeclList (pprLHsBindsForUser' binds)
 
-  ppr (XValBindsLR (NValBinds sccs sigs))
+  ppr (XValBindsLR (HsVBG bs sigs))
     = getPprDebug $ \case
-        -- Print with sccs showing
-        True  -> vcat (map ppr sigs) $$ vcat (map ppr_scc sccs)
-        False -> pprDeclList (pprLHsBindsForUser (concat (map snd sccs)) sigs)
-   where
-     ppr_scc (rec_flag, binds) = pp_rec rec_flag <+> pprLHsBinds binds
-     pp_rec Recursive    = text "rec"
-     pp_rec NonRecursive = text "nonrec"
+        False -> pprDeclList (pprLHsBindsForUser (concat (map snd prs)) sigs)
+        True  -> -- Print with sccs showing
+                 vcat (map ppr sigs) $$ vcat (map ppr_scc prs)
+    where
+      prs :: [(RecFlag, LHsBinds (GhcPass pl))]
+      prs = case ghcPass @pl of
+              GhcPs -> []
+              GhcRn -> bs
+              GhcTc -> bs
+
+      ppr_scc (rec_flag, binds) = pp_rec rec_flag <+> pprLHsBinds binds
+      pp_rec Recursive    = text "rec"
+      pp_rec NonRecursive = text "nonrec"
 
 pprLHsBinds :: (OutputableBndrId idL, OutputableBndrId idR)
             => LHsBindsLR (GhcPass idL) (GhcPass idR) -> SDoc
@@ -488,6 +491,21 @@ pprLHsBindsForUser binds sigs
 
     sort_by_loc decls = sortBy (SrcLoc.leftmost_smallest `on` fst) decls
 
+pprLHsBindsForUser' :: (OutputableBndrId idL, OutputableBndrId idR)
+     => [ValBind (GhcPass idL) (GhcPass idR)] -> [SDoc]
+--  pprLHsBindsForUser is different to pprLHsBinds because
+--  a) No braces: 'let' and 'where' include a list of HsBindGroups
+--     and we don't want several groups of bindings each
+--     with braces around
+--  b) Sort by location before printing
+--  c) Include signatures
+pprLHsBindsForUser' binds
+  = map ppr_bind binds
+  where
+    ppr_bind (VbBind b) = ppr b
+    ppr_bind (VbSig s) = ppr s
+
+
 pprDeclList :: [SDoc] -> SDoc   -- Braces with a space
 -- Print a bunch of declarations
 -- One could choose  { d1; d2; ... }, using 'sep'
@@ -508,12 +526,13 @@ eqEmptyLocalBinds (EmptyLocalBinds _) = True
 eqEmptyLocalBinds _                   = False
 
 isEmptyValBinds :: HsValBindsLR (GhcPass a) (GhcPass b) -> Bool
-isEmptyValBinds (ValBinds _ ds sigs)  = isEmptyLHsBinds ds && null sigs
-isEmptyValBinds (XValBindsLR (NValBinds ds sigs)) = null ds && null sigs
+isEmptyValBinds (ValBinds _ binds)  = null binds
+isEmptyValBinds (XValBindsLR (HsVBG ds sigs)) = null ds && null sigs
 
-emptyValBindsIn, emptyValBindsOut :: HsValBindsLR (GhcPass a) (GhcPass b)
-emptyValBindsIn  = ValBinds NoAnnSortKey [] []
-emptyValBindsOut = XValBindsLR (NValBinds [] [])
+emptyValBindsIn :: HsValBindsLR (GhcPass a) (GhcPass b)
+emptyValBindsIn  = ValBinds noExtField []
+emptyValBindsRn :: HsValBindsLR GhcRn GhcRn
+emptyValBindsRn  = XValBindsLR (HsVBG [] [])
 
 emptyLHsBinds :: LHsBindsLR (GhcPass idL) idR
 emptyLHsBinds = []
@@ -521,14 +540,21 @@ emptyLHsBinds = []
 isEmptyLHsBinds :: LHsBindsLR (GhcPass idL) idR -> Bool
 isEmptyLHsBinds = null
 
+hsValBindGroupsBinds :: forall p. IsPass p
+                     => [HsValBindGroup (GhcPass p)] -> [LHsBind (GhcPass p)]
+hsValBindGroupsBinds binds
+  = case ghcPass @p of
+              GhcPs -> []
+              GhcRn -> concatMap snd binds
+              GhcTc -> concatMap snd binds
+
 ------------
 plusHsValBinds :: HsValBinds (GhcPass a) -> HsValBinds (GhcPass a)
                -> HsValBinds(GhcPass a)
-plusHsValBinds (ValBinds _ ds1 sigs1) (ValBinds _ ds2 sigs2)
-  = ValBinds NoAnnSortKey (ds1 ++ ds2) (sigs1 ++ sigs2)
-plusHsValBinds (XValBindsLR (NValBinds ds1 sigs1))
-               (XValBindsLR (NValBinds ds2 sigs2))
-  = XValBindsLR (NValBinds (ds1 ++ ds2) (sigs1 ++ sigs2))
+plusHsValBinds (ValBinds _ ds1) (ValBinds _ ds2)
+  = ValBinds noExtField (ds1 ++ ds2)
+plusHsValBinds (XValBindsLR (HsVBG ds1 ss1)) (XValBindsLR (HsVBG ds2 ss2))
+  = XValBindsLR (HsVBG (ds1++ds2) (ss1++ss2))
 plusHsValBinds _ _
   = panic "HsBinds.plusHsValBinds"
 
@@ -540,8 +566,8 @@ ppr_monobind :: forall idL idR.
                 (OutputableBndrId idL, OutputableBndrId idR)
              => HsBindLR (GhcPass idL) (GhcPass idR) -> SDoc
 
-ppr_monobind (PatBind { pat_lhs = pat, pat_mult = mult_ann, pat_rhs = grhss })
-  = pprHsMultAnn @idL mult_ann
+ppr_monobind (PatBind { pat_lhs = pat, pat_mods = mods, pat_rhs = grhss })
+  = pprLHsModifiers mods
     <+> pprPatBind pat grhss
 ppr_monobind (VarBind { var_id = var, var_rhs = rhs })
   = sep [pprBndr CasePatBind var, nest 2 $ equals <+> pprExpr (unLoc rhs)]
@@ -606,19 +632,19 @@ instance (OutputableBndrId l, OutputableBndrId r)
       ppr_simple syntax = syntax <+> pprLPat pat
 
       ppr_details = case details of
-          InfixCon v1 v2 -> hsep [ppr_v v1, pprInfixOcc psyn, ppr_v  v2]
+          InfixCon _ v1 v2 -> hsep [ppr_v v1, pprInfixOcc psyn, ppr_v  v2]
             where
                 ppr_v v = case ghcPass @r of
                     GhcPs -> ppr v
                     GhcRn -> ppr v
                     GhcTc -> ppr v
-          PrefixCon vs   -> hsep (pprPrefixOcc psyn : map ppr_v vs)
+          PrefixCon _ vs   -> hsep (pprPrefixOcc psyn : map ppr_v vs)
             where
                 ppr_v v = case ghcPass @r of
                     GhcPs -> ppr v
                     GhcRn -> ppr v
                     GhcTc -> ppr v
-          RecCon vs      -> pprPrefixOcc psyn
+          RecCon _ vs      -> pprPrefixOcc psyn
                             <> braces (sep (punctuate comma (map ppr_v vs)))
             where
                 ppr_v v = case ghcPass @r of
@@ -715,9 +741,7 @@ type instance XXSig             GhcPs = DataConCantHappen
 type instance XXSig             GhcRn = IdSig
 type instance XXSig             GhcTc = IdSig
 
-type instance XFixitySig  GhcPs = NamespaceSpecifier
-type instance XFixitySig  GhcRn = NamespaceSpecifier
-type instance XFixitySig  GhcTc = NoExtField
+type instance XFixitySig  (GhcPass p) = NoExtField
 type instance XXFixitySig (GhcPass p) = DataConCantHappen
 
 data AnnSpecSig
@@ -734,55 +758,14 @@ instance NoAnn AnnSpecSig where
 data ActivationAnn
   = ActivationAnn {
       aa_openc  :: EpToken "[",
+      aa_phase  :: SourceText,
       aa_closec :: EpToken "]",
       aa_tilde  :: Maybe (EpToken "~"),
       aa_val    :: Maybe EpaLocation
     } deriving (Data, Eq)
 
 instance NoAnn ActivationAnn where
-  noAnn = ActivationAnn noAnn noAnn noAnn noAnn
-
-
--- | Optional namespace specifier for fixity signatures,
---  WARNINIG and DEPRECATED pragmas.
---
--- Examples:
---
---   {-# WARNING in "x-partial" data Head "don't use this pattern synonym" #-}
---                            -- ↑ DataNamespaceSpecifier
---
---   {-# DEPRECATED type D "This type was deprecated" #-}
---                -- ↑ TypeNamespaceSpecifier
---
---   infixr 6 data $
---          -- ↑ DataNamespaceSpecifier
-data NamespaceSpecifier
-  = NoNamespaceSpecifier
-  | TypeNamespaceSpecifier (EpToken "type")
-  | DataNamespaceSpecifier (EpToken "data")
-  deriving (Eq, Data)
-
--- | Check if namespace specifiers overlap, i.e. if they are equal or
--- if at least one of them doesn't specify a namespace
-overlappingNamespaceSpecifiers :: NamespaceSpecifier -> NamespaceSpecifier -> Bool
-overlappingNamespaceSpecifiers NoNamespaceSpecifier _ = True
-overlappingNamespaceSpecifiers _ NoNamespaceSpecifier = True
-overlappingNamespaceSpecifiers TypeNamespaceSpecifier{} TypeNamespaceSpecifier{} = True
-overlappingNamespaceSpecifiers DataNamespaceSpecifier{} DataNamespaceSpecifier{} = True
-overlappingNamespaceSpecifiers _ _ = False
-
--- | Check if namespace is covered by a namespace specifier:
---     * NoNamespaceSpecifier covers both namespaces
---     * TypeNamespaceSpecifier covers the type namespace only
---     * DataNamespaceSpecifier covers the data namespace only
-coveredByNamespaceSpecifier :: NamespaceSpecifier -> NameSpace -> Bool
-coveredByNamespaceSpecifier NoNamespaceSpecifier = const True
-coveredByNamespaceSpecifier TypeNamespaceSpecifier{} = isTcClsNameSpace <||> isTvNameSpace
-coveredByNamespaceSpecifier DataNamespaceSpecifier{} = isValNameSpace
-instance Outputable NamespaceSpecifier where
-  ppr NoNamespaceSpecifier = empty
-  ppr TypeNamespaceSpecifier{} = text "type"
-  ppr DataNamespaceSpecifier{} = text "data"
+  noAnn = ActivationAnn noAnn NoSourceText noAnn noAnn noAnn
 
 -- | A type signature in generated code, notably the code
 -- generated for record selectors. We simply record the desired Id
@@ -824,7 +807,7 @@ data TcSpecPrag
       -- ^ 'Id' to be specialised
       HsWrapper
       -- ^ wrapper that specialises the polymorphic function
-      InlinePragma
+      (InlinePragma GhcTc)
       -- ^ inlining spec for the specialised function
    -- | New-form specialise pragma
    | SpecPragE
@@ -836,7 +819,7 @@ data TcSpecPrag
         -- Note that 'spe_fn_nm' may differ from @'idName' 'spe_fn_id'@
         -- in the case of instance methods, where the 'Name' is the
         -- class-op selector but the 'spe_fn_id' is that for the local method
-     , spe_inl   :: InlinePragma
+     , spe_inl   :: InlinePragma GhcTc
         -- ^ (optional) INLINE annotation and activation phase annotation
 
      , spe_bndrs :: [Var]
@@ -859,30 +842,33 @@ isDefaultMethod (SpecPrags {})  = False
 instance OutputableBndrId p => Outputable (Sig (GhcPass p)) where
     ppr sig = ppr_sig sig
 
-ppr_sig :: forall p. OutputableBndrId p
+ppr_sig :: forall p. (IsPass p, OutputableBndrId p)
         => Sig (GhcPass p) -> SDoc
-ppr_sig (TypeSig _ vars ty)  = pprVarSig (map unLoc vars) (ppr ty)
+ppr_sig (TypeSig _ mods vars ty) =
+  pprLHsModifiers mods $$ pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (ClassOpSig _ is_deflt vars ty)
   | is_deflt                 = text "default" <+> pprVarSig (map unLoc vars) (ppr ty)
   | otherwise                = pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (FixSig _ fix_sig)   = ppr fix_sig
 
-ppr_sig (SpecSig _ var ty inl@(InlinePragma { inl_src = src, inl_inline = spec }))
-  = pragSrcBrackets (inlinePragmaSource inl) pragmaSrc $
+ppr_sig (SpecSig _ var ty inl@(InlinePragma { inl_inline = spec }))
+  = pragSrcBrackets srcTxt pragmaSrc $
     pprSpec (unLoc var) (interpp'SP ty) inl
     where
+      srcTxt = inlinePragmaSource inl
       pragmaSrc = case spec of
-        NoUserInlinePrag -> "{-# " ++ extractSpecPragName src
-        _                -> "{-# " ++ extractSpecPragName src  ++ "_INLINE"
+        NoUserInlinePrag -> "{-# " ++ extractSpecPragName srcTxt
+        _                -> "{-# " ++ extractSpecPragName srcTxt  ++ "_INLINE"
 
-ppr_sig (SpecSigE _ bndrs spec_e inl@(InlinePragma { inl_src = src, inl_inline = spec }))
-  = pragSrcBrackets (inlinePragmaSource inl) pragmaSrc $
+ppr_sig (SpecSigE _ bndrs spec_e inl@(InlinePragma { inl_inline = spec }))
+  = pragSrcBrackets srcTxt pragmaSrc $
     pp_inl <+> hang (ppr bndrs) 2 (pprLExpr spec_e)
   where
+    srcTxt = inlinePragmaSource inl
     -- SPECIALISE or SPECIALISE_INLINE
     pragmaSrc = case spec of
-      NoUserInlinePrag -> "{-# " ++ extractSpecPragName src
-      _                -> "{-# " ++ extractSpecPragName src  ++ "_INLINE"
+      NoUserInlinePrag -> "{-# " ++ extractSpecPragName srcTxt
+      _                -> "{-# " ++ extractSpecPragName srcTxt  ++ "_INLINE"
 
     pp_inl | isDefaultInlinePragma inl = empty
            | otherwise = pprInline inl
@@ -955,13 +941,8 @@ extractSpecPragName srcTxt =  case (words $ show srcTxt) of
 
 instance OutputableBndrId p
        => Outputable (FixitySig (GhcPass p)) where
-  ppr (FixitySig ns_spec names fixity) = sep [ppr fixity, ppr_ns_spec, pprops]
+  ppr (FixitySig _ ns_spec names fixity) = sep [ppr fixity, ppr ns_spec, pprops]
     where
-      ppr_ns_spec =
-        case ghcPass @p of
-          GhcPs -> ppr ns_spec
-          GhcRn -> ppr ns_spec
-          GhcTc -> empty
       pprops = hsep $ punctuate comma (map (pprInfixOcc . unLoc) names)
 
 pragBrackets :: SDoc -> SDoc
@@ -978,7 +959,7 @@ pprVarSig vars pp_ty = sep [pprvars <+> dcolon, nest 2 pp_ty]
   where
     pprvars = hsep $ punctuate comma (map pprPrefixOcc vars)
 
-pprSpec :: (OutputableBndr id) => id -> SDoc -> InlinePragma -> SDoc
+pprSpec :: forall id p. (IsPass p, OutputableBndr id) => id -> SDoc -> InlinePragma (GhcPass p) -> SDoc
 pprSpec var pp_ty inl = pp_inl <+> pprVarSig [var] pp_ty
   where
     pp_inl | isDefaultInlinePragma inl = empty
@@ -990,9 +971,10 @@ pprTcSpecPrags (SpecPrags ps)  = vcat (map (ppr . unLoc) ps)
 
 instance Outputable TcSpecPrag where
   ppr (SpecPrag var _ inl)
-    = text (extractSpecPragName $ inl_src inl) <+> pprSpec var (text "<type>") inl
+    = text (extractSpecPragName $ inlinePragmaSource inl)
+       <+> pprSpec var (text "<type>") inl
   ppr (SpecPragE { spe_bndrs = bndrs, spe_call = spec_e, spe_inl = inl })
-    = text (extractSpecPragName $ inl_src inl)
+    = text (extractSpecPragName $ inlinePragmaSource inl)
        <+> hang (ppr bndrs) 2 (pprLExpr spec_e)
 
 pprMinimalSig :: OutputableBndrId p  => LBooleanFormula (GhcPass p) -> SDoc
@@ -1058,4 +1040,4 @@ type instance Anno (RuleBndr (GhcPass p)) = EpAnnCO
 
 type instance Anno (FixitySig (GhcPass p)) = SrcSpanAnnA
 
-type instance Anno StringLiteral = EpAnnCO
+type instance Anno (StringLiteral (GhcPass p)) = SrcSpanAnnA

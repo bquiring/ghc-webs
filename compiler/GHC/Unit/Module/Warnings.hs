@@ -1,15 +1,8 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
+
+-- Eq instances for WarningTxt, InWarningCategory
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- | Warnings for a module
 module GHC.Unit.Module.Warnings
@@ -48,16 +41,14 @@ where
 
 import GHC.Prelude
 
-import GHC.Data.FastString (FastString, mkFastString, unpackFS)
 import GHC.Types.SourceText
 import GHC.Types.Name.Occurrence
 import GHC.Types.Name.Env
 import GHC.Types.Name (Name)
 import GHC.Types.SrcLoc
-import GHC.Types.Unique
-import GHC.Types.Unique.Set
 import GHC.Hs.Doc
 import GHC.Hs.Extension
+import GHC.Hs.Lit
 import GHC.Parser.Annotation
 
 import GHC.Utils.Outputable
@@ -65,82 +56,22 @@ import GHC.Utils.Binary
 import GHC.Unicode
 
 import Language.Haskell.Syntax.Extension
+import Language.Haskell.Syntax.Decls
+import Language.Haskell.Syntax.Text
 
-import Data.Data
 import Data.List (isPrefixOf)
-import GHC.Generics ( Generic )
-import Control.DeepSeq
+import qualified Data.Set as S
 
 
-{-
-Note [Warning categories]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-See GHC Proposal 541 for the design of the warning categories feature:
-https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0541-warning-pragmas-with-categories.rst
-
-A WARNING pragma may be annotated with a category such as "x-partial" written
-after the 'in' keyword, like this:
-
-    {-# WARNING in "x-partial" head "This function is partial..." #-}
-
-This is represented by the 'Maybe (Located WarningCategory)' field in
-'WarningTxt'.  The parser will accept an arbitrary string as the category name,
-then the renamer (in 'rnWarningTxt') will check it contains only valid
-characters, so we can generate a nicer error message than a parse error.
-
-The corresponding warnings can then be controlled with the -Wx-partial,
--Wno-x-partial, -Werror=x-partial and -Wwarn=x-partial flags.  Such a flag is
-distinguished from an 'unrecognisedWarning' by the flag parser testing
-'validWarningCategory'.  The 'x-' prefix means we can still usually report an
-unrecognised warning where the user has made a mistake.
-
-A DEPRECATED pragma may not have a user-defined category, and is always treated
-as belonging to the special category 'deprecations'.  Similarly, a WARNING
-pragma without a category belongs to the 'deprecations' category.
-Thus the '-Wdeprecations' flag will enable all of the following:
-
-    {-# WARNING in "deprecations" foo "This function is deprecated..." #-}
-    {-# WARNING foo "This function is deprecated..." #-}
-    {-# DEPRECATED foo "This function is deprecated..." #-}
-
-The '-Wwarnings-deprecations' flag is supported for backwards compatibility
-purposes as being equivalent to '-Wdeprecations'.
-
-The '-Wextended-warnings' warning group collects together all warnings with
-user-defined categories, so they can be enabled or disabled
-collectively. Moreover they are treated as being part of other warning groups
-such as '-Wdefault' (see 'warningGroupIncludesExtendedWarnings').
-
-'DynFlags' and 'DiagOpts' each contain a set of enabled and a set of fatal
-warning categories, just as they do for the finite enumeration of 'WarningFlag's
-built in to GHC.  These are represented as 'WarningCategorySet's to allow for
-the possibility of them being infinite.
-
--}
-
-data InWarningCategory
-  = InWarningCategory
-    { iwc_in :: !(EpToken "in"),
-      iwc_st :: !SourceText,
-      iwc_wc :: (LocatedE WarningCategory)
-    } deriving Data
-
-fromWarningCategory :: WarningCategory -> InWarningCategory
-fromWarningCategory wc = InWarningCategory noAnn NoSourceText (noLocA wc)
-
-
--- See Note [Warning categories]
-newtype WarningCategory = WarningCategory FastString
-  deriving stock Data
-  deriving newtype (Binary, Eq, Outputable, Show, Uniquable, NFData)
-
-mkWarningCategory :: FastString -> WarningCategory
-mkWarningCategory = WarningCategory
+fromWarningCategory ::
+  HasAnnotation (Anno WarningCategory) =>
+  WarningCategory -> InWarningCategory (GhcPass p)
+fromWarningCategory wc = InWarningCategory (noAnn, NoSourceText) (noLocA wc)
 
 -- | The @deprecations@ category is used for all DEPRECATED pragmas and for
 -- WARNING pragmas that do not specify a category.
 defaultWarningCategory :: WarningCategory
-defaultWarningCategory = mkWarningCategory (mkFastString "deprecations")
+defaultWarningCategory = mkWarningCategory (packHText "deprecations")
 
 -- | Is this warning category allowed to appear in user-defined WARNING pragmas?
 -- It must either be the known category @deprecations@, or be a custom category
@@ -150,9 +81,8 @@ validWarningCategory :: WarningCategory -> Bool
 validWarningCategory cat@(WarningCategory c) =
     cat == defaultWarningCategory || ("x-" `isPrefixOf` s && all is_allowed s)
   where
-    s = unpackFS c
+    s = unpackHText c
     is_allowed c = isAlphaNum c || c == '\'' || c == '-'
-
 
 -- | A finite or infinite set of warning categories.
 --
@@ -162,107 +92,115 @@ validWarningCategory cat@(WarningCategory c) =
 -- represent it as either a finite set of categories, or a cofinite set (where
 -- we store the complement).
 data WarningCategorySet =
-    FiniteWarningCategorySet   (UniqSet WarningCategory)
+    FiniteWarningCategorySet   (S.Set WarningCategory)
       -- ^ The set of warning categories is the given finite set.
-  | CofiniteWarningCategorySet (UniqSet WarningCategory)
+  | CofiniteWarningCategorySet (S.Set WarningCategory)
       -- ^ The set of warning categories is infinite, so the constructor stores
       -- its (finite) complement.
 
 -- | The empty set of warning categories.
 emptyWarningCategorySet :: WarningCategorySet
-emptyWarningCategorySet = FiniteWarningCategorySet emptyUniqSet
+emptyWarningCategorySet = FiniteWarningCategorySet S.empty
 
 -- | The set consisting of all possible warning categories.
 completeWarningCategorySet :: WarningCategorySet
-completeWarningCategorySet = CofiniteWarningCategorySet emptyUniqSet
+completeWarningCategorySet = CofiniteWarningCategorySet S.empty
 
 -- | Is this set empty?
 nullWarningCategorySet :: WarningCategorySet -> Bool
-nullWarningCategorySet (FiniteWarningCategorySet s) = isEmptyUniqSet s
+nullWarningCategorySet (FiniteWarningCategorySet s) = S.null s
 nullWarningCategorySet CofiniteWarningCategorySet{} = False
 
 -- | Does this warning category belong to the set?
 elemWarningCategorySet :: WarningCategory -> WarningCategorySet -> Bool
-elemWarningCategorySet c (FiniteWarningCategorySet   s) =      c `elementOfUniqSet` s
-elemWarningCategorySet c (CofiniteWarningCategorySet s) = not (c `elementOfUniqSet` s)
+elemWarningCategorySet c (FiniteWarningCategorySet   s) =      c `S.member` s
+elemWarningCategorySet c (CofiniteWarningCategorySet s) = not (c `S.member` s)
 
 -- | Insert an element into a warning category set.
 insertWarningCategorySet :: WarningCategory -> WarningCategorySet -> WarningCategorySet
-insertWarningCategorySet c (FiniteWarningCategorySet   s) = FiniteWarningCategorySet   (addOneToUniqSet   s c)
-insertWarningCategorySet c (CofiniteWarningCategorySet s) = CofiniteWarningCategorySet (delOneFromUniqSet s c)
+insertWarningCategorySet c (FiniteWarningCategorySet   s) = FiniteWarningCategorySet   (S.insert c s)
+insertWarningCategorySet c (CofiniteWarningCategorySet s) = CofiniteWarningCategorySet (S.delete c s)
 
 -- | Delete an element from a warning category set.
 deleteWarningCategorySet :: WarningCategory -> WarningCategorySet -> WarningCategorySet
-deleteWarningCategorySet c (FiniteWarningCategorySet   s) = FiniteWarningCategorySet   (delOneFromUniqSet s c)
-deleteWarningCategorySet c (CofiniteWarningCategorySet s) = CofiniteWarningCategorySet (addOneToUniqSet   s c)
+deleteWarningCategorySet c (FiniteWarningCategorySet   s) = FiniteWarningCategorySet   (S.delete c s)
+deleteWarningCategorySet c (CofiniteWarningCategorySet s) = CofiniteWarningCategorySet (S.insert c s)
 
 type LWarningTxt pass = XRec pass (WarningTxt pass)
 
--- | Warning Text
---
--- reason/explanation from a WARNING or DEPRECATED pragma
-data WarningTxt pass
-   = WarningTxt
-      (Maybe (LocatedE InWarningCategory))
-        -- ^ Warning category attached to this WARNING pragma, if any;
-        -- see Note [Warning categories]
-      SourceText
-      [LocatedE (WithHsDocIdentifiers StringLiteral pass)]
-   | DeprecatedTxt
-      SourceText
-      [LocatedE (WithHsDocIdentifiers StringLiteral pass)]
-  deriving Generic
-
 -- | To which warning category does this WARNING or DEPRECATED pragma belong?
 -- See Note [Warning categories].
-warningTxtCategory :: WarningTxt pass -> WarningCategory
-warningTxtCategory (WarningTxt (Just (L _ (InWarningCategory _  _ (L _ cat)))) _ _) = cat
+warningTxtCategory :: WarningTxt (GhcPass p) -> WarningCategory
+warningTxtCategory (WarningTxt _ (Just (L _ (InWarningCategory _ (L _ cat)))) _) = cat
 warningTxtCategory _ = defaultWarningCategory
 
+
 -- | The message that the WarningTxt was specified to output
-warningTxtMessage :: WarningTxt p -> [LocatedE (WithHsDocIdentifiers StringLiteral p)]
-warningTxtMessage (WarningTxt _ _ m) = m
+warningTxtMessage ::
+  WarningTxt (GhcPass p) ->
+  [LocatedA (WithHsDocIdentifiers (StringLiteral (GhcPass p)) (GhcPass p))]
+warningTxtMessage (WarningTxt  _ _ m) = m
 warningTxtMessage (DeprecatedTxt _ m) = m
 
 -- | True if the 2 WarningTxts have the same category and messages
-warningTxtSame :: WarningTxt p1 -> WarningTxt p2 -> Bool
+warningTxtSame :: WarningTxt (GhcPass p) -> WarningTxt (GhcPass p) -> Bool
 warningTxtSame w1 w2
   = warningTxtCategory w1 == warningTxtCategory w2
   && literal_message w1 == literal_message w2
   && same_type
   where
-    literal_message :: WarningTxt p -> [StringLiteral]
+    literal_message :: WarningTxt (GhcPass p) -> [StringLiteral (GhcPass p)]
     literal_message = map (hsDocString . unLoc) . warningTxtMessage
     same_type | DeprecatedTxt {} <- w1, DeprecatedTxt {} <- w2 = True
-              | WarningTxt {} <- w1, WarningTxt {} <- w2       = True
+              | WarningTxt    {} <- w1, WarningTxt {} <- w2    = True
               | otherwise                                      = False
 
-deriving instance Eq InWarningCategory
+instance Outputable (InWarningCategory (GhcPass pass)) where
+  ppr (InWarningCategory _ wt) = text "in" <+> doubleQuotes (ppr wt)
 
-deriving instance (Eq (IdP pass)) => Eq (WarningTxt pass)
-deriving instance (Data pass, Data (IdP pass)) => Data (WarningTxt pass)
+type instance XDeprecatedTxt       (GhcPass _) = (SourceText, AnnWarningTxt)
+type instance XWarningTxt          (GhcPass _) = (SourceText, AnnWarningTxt)
+type instance XXWarningTxt         (GhcPass _) = DataConCantHappen
+type instance XInWarningCategory   (GhcPass _) = (EpToken "in", SourceText)
+type instance XXInWarningCategory  (GhcPass _) = DataConCantHappen
 
-type instance Anno (WarningTxt (GhcPass pass)) = SrcSpanAnnP
+type instance Anno (WithHsDocIdentifiers (StringLiteral pass) pass) = SrcSpanAnnA
+type instance Anno (InWarningCategory (GhcPass pass)) = SrcSpanAnnA
+type instance Anno (WarningCategory) = SrcSpanAnnA
+type instance Anno (WarningTxt (GhcPass pass)) = SrcSpanAnnA
 
-instance Outputable InWarningCategory where
-  ppr (InWarningCategory _ _ wt) = text "in" <+> doubleQuotes (ppr wt)
+deriving stock instance Eq (WarningTxt GhcPs)
+deriving stock instance Eq (WarningTxt GhcRn)
+deriving stock instance Eq (WarningTxt GhcTc)
 
+deriving stock instance Eq (InWarningCategory GhcPs)
+deriving stock instance Eq (InWarningCategory GhcRn)
+deriving stock instance Eq (InWarningCategory GhcTc)
 
-instance Outputable (WarningTxt pass) where
-    ppr (WarningTxt mcat lsrc ws)
+-- TODO: Move to respecitive type-class definition modules after removing
+-- the Language.Haskell.Syntax.Decls module's dependency on GHC.Hs.Doc.
+-- Subsequently, create a Language.Haskell.Syntax.Decls.Warnings sub-module
+-- with the "warning declaration" types and have Language.Haskell.Syntax.Decls
+-- re-export Language.Haskell.Syntax.Decls.Warnings. This will prevent cyclic
+-- import, but it will only work once GHC.Hs.Doc is no longer a GHC dependency.
+deriving instance Binary WarningCategory
+
+deriving instance Outputable WarningCategory
+
+instance Outputable (WarningTxt (GhcPass pass)) where
+    ppr (WarningTxt lsrc mcat ws)
       = case lsrc of
-            NoSourceText   -> pp_ws ws
-            SourceText src -> ftext src <+> ctg_doc <+> pp_ws ws <+> text "#-}"
+            (NoSourceText, _)   -> pp_ws ws
+            (SourceText src, _) -> ftext src <+> ctg_doc <+> pp_ws ws <+> text "#-}"
         where
           ctg_doc = maybe empty (\ctg -> ppr ctg) mcat
 
-
-    ppr (DeprecatedTxt lsrc  ds)
+    ppr (DeprecatedTxt lsrc ds)
       = case lsrc of
-          NoSourceText   -> pp_ws ds
-          SourceText src -> ftext src <+> pp_ws ds <+> text "#-}"
+          (NoSourceText, _)   -> pp_ws ds
+          (SourceText src, _) -> ftext src <+> pp_ws ds <+> text "#-}"
 
-pp_ws :: [LocatedE (WithHsDocIdentifiers StringLiteral pass)] -> SDoc
+pp_ws :: [LocatedA (WithHsDocIdentifiers (StringLiteral (GhcPass p)) (GhcPass p))] -> SDoc
 pp_ws [l] = ppr $ unLoc l
 pp_ws ws
   = text "["
@@ -270,12 +208,12 @@ pp_ws ws
     <+> text "]"
 
 
-pprWarningTxtForMsg :: WarningTxt p -> SDoc
+pprWarningTxtForMsg :: WarningTxt (GhcPass pass) -> SDoc
 pprWarningTxtForMsg (WarningTxt _ _ ws)
-                     = doubleQuotes (vcat (map (ftext . sl_fs . hsDocString . unLoc) ws))
+                     = doubleQuotes (vcat (map (ppr . sl_fs . hsDocString . unLoc) ws))
 pprWarningTxtForMsg (DeprecatedTxt _ ds)
                      = text "Deprecated:" <+>
-                       doubleQuotes (vcat (map (ftext . sl_fs . hsDocString . unLoc) ds))
+                       doubleQuotes (vcat (map (ppr . sl_fs . hsDocString . unLoc) ds))
 
 
 -- | Warning information from a module
@@ -315,8 +253,6 @@ type DeclWarnOccNames pass = [(OccName, WarningTxt pass)]
 
 -- | Names that are deprecated as exports
 type ExportWarnNames pass = [(Name, WarningTxt pass)]
-
-deriving instance Eq (IdP pass) => Eq (Warnings pass)
 
 emptyWarn :: Warnings p
 emptyWarn = WarnSome [] []

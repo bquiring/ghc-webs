@@ -1,9 +1,8 @@
-{-# LANGUAGE RankNTypes #-}
-
 -- | The Name Cache
 module GHC.Types.Name.Cache
   ( NameCache (..)
   , newNameCache
+  , newNameCacheWith
   , initNameCache
   , takeUniqFromNameCache
   , updateNameCache'
@@ -26,12 +25,14 @@ import GHC.Prelude
 import GHC.Unit.Module
 import GHC.Types.Name
 import GHC.Types.Unique.Supply
-import GHC.Builtin.Types
-import GHC.Builtin.Names
-import GHC.Builtin.Utils
+import GHC.Types.Unique (uniqueTag)
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Misc( HasDebugCallStack )
 
 import Control.Applicative
 import Control.Concurrent.MVar
@@ -90,7 +91,7 @@ So we deal with them in lookupOrigNameCache by means of isInfiniteFamilyOrigName
 
 At the same time, simple finite built-in names (`[]`, `:`, `->`) can be put in
 the OrigNameCache without any issues (they end up there because they're
-knownKeyNames). It doesn't matter that they're built-in syntax.
+wiredInNames). It doesn't matter that they're built-in syntax.
 
 One might wonder: what's the point of having any built-in syntax in the
 OrigNameCache at all?  Good question; after all,
@@ -100,16 +101,21 @@ OrigNameCache at all?  Good question; after all,
   3) Loading of interface files encodes names via Uniques, as detailed in
      Note [Symbol table representation of names] in GHC.Iface.Binary
 
-It turns out that we end up looking up built-in syntax in the cache when we
-generate Haddock documentation. E.g. if we don't find tuple data constructors
-there, hyperlinks won't work as expected. Test case: haddockHtmlTest (Bug923.hs)
+
+However note that:
+  1) It turns out that we end up looking up built-in syntax in the cache when
+     we generate Haddock documentation. E.g. if we don't find tuple data
+     constructors there, hyperlinks won't work as expected. Test case:
+     haddockHtmlTest (Bug923.hs)
+  2) HIE de-serialization relies on wired-in names, including built-in syntax,
+     being present in the OrigNameCache.
 -}
 
 -- | The NameCache makes sure that there is just one Unique assigned for
 -- each original name; i.e. (module-name, occ-name) pair and provides
 -- something of a lookup mechanism for those names.
 data NameCache = NameCache
-  { nsUniqChar :: {-# UNPACK #-} !Char
+  { nsUniqChar :: {-# UNPACK #-} !Char -- See Note [Performance implications of UniqueTag]
   , nsNames    :: {-# UNPACK #-} !(MVar OrigNameCache)
   }
 
@@ -117,34 +123,50 @@ data NameCache = NameCache
 type OrigNameCache   = ModuleEnv (OccEnv Name)
 
 takeUniqFromNameCache :: NameCache -> IO Unique
-takeUniqFromNameCache (NameCache c _) = uniqFromTag c
+takeUniqFromNameCache (NameCache c _) = uniqFromTagGrimily c
 
 lookupOrigNameCache :: OrigNameCache -> Module -> OccName -> Maybe Name
 lookupOrigNameCache nc mod occ = lookup_infinite <|> lookup_normal
   where
-    -- See Note [Known-key names], 3(c) in GHC.Builtin.Names
+    -- See Note [Overview of known entities]
     -- and Note [Infinite families of known-key names]
     lookup_infinite = isInfiniteFamilyOrigName_maybe mod occ
     lookup_normal = do
       occ_env <- lookupModuleEnv nc mod
       lookupOccEnv occ_env occ
 
-extendOrigNameCache' :: OrigNameCache -> Name -> OrigNameCache
+extendOrigNameCache' :: HasDebugCallStack => OrigNameCache -> Name -> OrigNameCache
 extendOrigNameCache' nc name
   = assertPpr (isExternalName name) (ppr name) $
     extendOrigNameCache nc (nameModule name) (nameOccName name) name
 
-extendOrigNameCache :: OrigNameCache -> Module -> OccName -> Name -> OrigNameCache
+extendOrigNameCache :: HasDebugCallStack => OrigNameCache -> Module -> OccName -> Name -> OrigNameCache
 extendOrigNameCache nc mod occ name
-  = extendModuleEnvWith combine nc mod (unitOccEnv occ name)
+  = -- pprTrace "extendOrigNameCache" (ppr name $$ callStackDoc)
+    extendModuleEnvWith combine nc mod (unitOccEnv occ name)
   where
     combine _ occ_env = extendOccEnv occ_env occ name
 
-newNameCache :: Char -> OrigNameCache -> IO NameCache
-newNameCache c nc = NameCache c <$> newMVar nc
+-- | Initialize a new name cache
+newNameCache :: IO NameCache
+newNameCache = newNameCacheWith HscTag knownKeysOrigNameCache
 
-initNameCache :: Char -> [Name] -> IO NameCache
-initNameCache c names = newNameCache c (initOrigNames names)
+-- | This is a version of `newNameCache` that lets you supply your
+-- own unique tag and set of known key names. This can go wrong if the tag
+-- supplied is one reserved by GHC for internal purposes. See #26055 for
+-- an example.
+--
+-- Use `newNameCache` when possible.
+newNameCacheWith :: UniqueTag -> OrigNameCache -> IO NameCache
+newNameCacheWith ut nc = NameCache (uniqueTag ut) <$> newMVar nc
+{-# INLINE newNameCacheWith #-}
+
+-- | This takes a tag for uniques to be generated and the list of knownKeyNames
+-- These must be initialized properly to ensure that names generated from this
+-- NameCache do not conflict with known key names.
+{-# DEPRECATED initNameCache "Use `newNameCache` or `newNameCacheWith` instead" #-}
+initNameCache :: UniqueTag -> [Name] -> IO NameCache
+initNameCache c names = newNameCacheWith c (initOrigNames names)
 
 initOrigNames :: [Name] -> OrigNameCache
 initOrigNames names = foldl' extendOrigNameCache' emptyModuleEnv names
@@ -179,7 +201,7 @@ updateNameCache name_cache !_mod !_occ upd_fn
 
 {-# NOINLINE knownKeysOrigNameCache #-}
 knownKeysOrigNameCache :: OrigNameCache
-knownKeysOrigNameCache = initOrigNames knownKeyNames
+knownKeysOrigNameCache = initOrigNames wiredInNames
 
 isKnownOrigName_maybe :: Module -> OccName -> Maybe Name
 isKnownOrigName_maybe = lookupOrigNameCache knownKeysOrigNameCache

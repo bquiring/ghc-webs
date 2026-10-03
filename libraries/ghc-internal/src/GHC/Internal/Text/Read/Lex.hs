@@ -40,8 +40,10 @@ import GHC.Internal.Text.ParserCombinators.ReadP
 
 import GHC.Internal.Base
 import GHC.Internal.Char
+import GHC.Internal.Err( errorWithoutStackTrace )
 import GHC.Internal.Num( Num(..), Integer )
-import GHC.Internal.Show( Show(..) )
+import GHC.Internal.Prim( seq )
+import GHC.Internal.Show
 import GHC.Internal.Unicode
   ( GeneralCategory(..), generalCategory, isSpace, isAlpha, isAlphaNum )
 import GHC.Internal.Real( Rational, (%), fromIntegral, Integral,

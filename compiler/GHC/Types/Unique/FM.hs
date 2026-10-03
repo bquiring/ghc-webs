@@ -20,9 +20,6 @@ and ``addToUFM\_C'' and ``Data.IntMap.insertWith'' differ in the order
 of arguments of combining function.
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 {-# OPTIONS_GHC -Wall #-}
 
@@ -41,17 +38,21 @@ module GHC.Types.Unique.FM (
         listToUFM_C,
         listToIdentityUFM,
         addToUFM,addToUFM_C,addToUFM_Acc,addToUFM_L,
+        strictAddToUFM_C,
         addListToUFM,addListToUFM_C,
         addToUFM_Directly,
         addListToUFM_Directly,
-        adjustUFM, alterUFM, alterUFM_Directly,
-        adjustUFM_Directly,
+        adjustUFM, adjustUFM_Directly,
+        upsertUFM, strictUpsertUFM,
+        alterUFM, alterUFM_L, alterUFM_Directly,
         delFromUFM,
         delFromUFM_Directly,
         delListFromUFM,
         delListFromUFM_Directly,
         plusUFM,
+        strictPlusUFM,
         plusUFM_C,
+        strictPlusUFM_C, strictPlusUFM_C_Directly,
         plusUFM_CD,
         plusUFM_CD2,
         mergeUFM,
@@ -63,6 +64,7 @@ module GHC.Types.Unique.FM (
         minusUFM_C,
         intersectUFM,
         intersectUFM_C,
+        strictIntersectUFM_C,
         disjointUFM,
         equalKeysUFM,
         diffUFM,
@@ -175,9 +177,21 @@ addToUFM_C
   -> UniqFM key elt       -- ^ old
   -> key -> elt           -- ^ new
   -> UniqFM key elt       -- ^ result
+{-# SPECIALISE addToUFM_C :: (elt -> elt -> elt) -> UniqFM Unique elt
+                          -> Unique -> elt -> UniqFM Unique elt #-}
 -- Arguments of combining function of M.insertWith and addToUFM_C are flipped.
 addToUFM_C f (UFM m) k v =
   UFM (M.insertWith (flip f) (getKey $ getUnique k) v m)
+
+strictAddToUFM_C
+  :: Uniquable key
+  => (elt -> elt -> elt)  -- ^ old -> new -> result
+  -> UniqFM key elt       -- ^ old
+  -> key -> elt           -- ^ new
+  -> UniqFM key elt       -- ^ result
+-- Arguments of combining function of MS.insertWith and strictAddToUFM_C are flipped.
+strictAddToUFM_C f (UFM m) k v =
+  UFM (MS.insertWith (flip f) (getKey $ getUnique k) v m)
 
 addToUFM_Acc
   :: Uniquable key
@@ -186,6 +200,8 @@ addToUFM_Acc
   -> UniqFM key elts        -- old
   -> key -> elt             -- new
   -> UniqFM key elts        -- result
+{-# SPECIALISE addToUFM_Acc :: (elt -> elts -> elts) -> (elt->elts) -> UniqFM Unique elts
+                            -> Unique -> elt -> UniqFM Unique elts #-}
 addToUFM_Acc exi new (UFM m) k v =
   UFM (M.insertWith (\_new old -> exi v old) (getKey $ getUnique k) (new v) m)
 
@@ -214,6 +230,32 @@ alterUFM
   -> key                       -- ^ new
   -> UniqFM key elt            -- ^ result
 alterUFM f (UFM m) k = UFM (M.alter f (getKey $ getUnique k) m)
+
+upsertUFM
+  :: Uniquable key
+  => (Maybe elt -> elt)      -- ^ How to adjust
+  -> UniqFM key elt          -- ^ old
+  -> key                     -- ^ new
+  -> UniqFM key elt          -- ^ result
+upsertUFM f (UFM m) k = UFM (M.upsert f (getKey $ getUnique k) m)
+
+strictUpsertUFM
+  :: Uniquable key
+  => (Maybe elt -> elt)      -- ^ How to adjust
+  -> UniqFM key elt          -- ^ old
+  -> key                     -- ^ new
+  -> UniqFM key elt          -- ^ result
+strictUpsertUFM f (UFM m) k = UFM (MS.upsert f (getKey $ getUnique k) m)
+
+alterUFM_L
+  :: Uniquable key
+  => (Maybe elt -> Maybe elt)    -- ^ How to adjust
+  -> UniqFM key elt              -- ^ old
+  -> key                         -- ^ new
+  -> (Maybe elt, UniqFM key elt) -- ^ result
+alterUFM_L f (UFM m) k =
+  let (r, m') = (M.alterLookup f (getKey $ getUnique k) m)
+  in (r, UFM m')
 
 alterUFM_Directly
   :: (Maybe elt -> Maybe elt)  -- ^ How to adjust
@@ -251,15 +293,26 @@ delListFromUFM_Directly = foldl' delFromUFM_Directly
 delFromUFM_Directly :: UniqFM key elt -> Unique -> UniqFM key elt
 delFromUFM_Directly (UFM m) u = UFM (M.delete (getKey u) m)
 
--- Bindings in right argument shadow those in the left
+-- | Bindings in right argument shadow those in the left.
+--
+-- Unlike containers this union is right-biased for historic reasons.
 plusUFM :: UniqFM key elt -> UniqFM key elt -> UniqFM key elt
--- M.union is left-biased, plusUFM should be right-biased.
 plusUFM (UFM x) (UFM y) = UFM (M.union y x)
      -- Note (M.union y x), with arguments flipped
      -- M.union is left-biased, plusUFM should be right-biased.
 
+-- | Right biased
+strictPlusUFM :: UniqFM key elt -> UniqFM key elt -> UniqFM key elt
+strictPlusUFM (UFM x) (UFM y) = UFM (MS.union y x)
+
 plusUFM_C :: (elt -> elt -> elt) -> UniqFM key elt -> UniqFM key elt -> UniqFM key elt
 plusUFM_C f (UFM x) (UFM y) = UFM (M.unionWith f x y)
+
+strictPlusUFM_C :: (elt -> elt -> elt) -> UniqFM key elt -> UniqFM key elt -> UniqFM key elt
+strictPlusUFM_C f (UFM x) (UFM y) = UFM (MS.unionWith f x y)
+
+strictPlusUFM_C_Directly :: (Unique -> elt -> elt -> elt) -> UniqFM key elt -> UniqFM key elt -> UniqFM key elt
+strictPlusUFM_C_Directly f (UFM x) (UFM y) = UFM (MS.unionWithKey (f . mkUniqueGrimily) x y)
 
 -- | `plusUFM_CD f m1 d1 m2 d2` merges the maps using `f` as the
 -- combinding function and `d1` resp. `d2` as the default value if
@@ -370,6 +423,13 @@ intersectUFM_C
   -> UniqFM key elt2
   -> UniqFM key elt3
 intersectUFM_C f (UFM x) (UFM y) = UFM (M.intersectionWith f x y)
+
+strictIntersectUFM_C
+  :: (elt1 -> elt2 -> elt3)
+  -> UniqFM key elt1
+  -> UniqFM key elt2
+  -> UniqFM key elt3
+strictIntersectUFM_C f (UFM x) (UFM y) = UFM (MS.intersectionWith f x y)
 
 disjointUFM :: UniqFM key elt1 -> UniqFM key elt2 -> Bool
 disjointUFM (UFM x) (UFM y) = M.disjoint x y

@@ -9,8 +9,7 @@ import Control.Monad.Trans.Class
 import Control.Monad.Trans.Maybe
 import qualified Data.ByteString as BS
 import Data.List (isPrefixOf, isSuffixOf)
-import GHC.Data.Bag (bagToList)
-import GHC.Data.FastString (mkFastString)
+import GHC.Data.FastString (mkFastString, mkFastStringShortText)
 import GHC.Data.StringBuffer (StringBuffer, atEnd)
 import GHC.Parser.Errors.Ppr ()
 import GHC.Parser.Lexer as Lexer
@@ -24,15 +23,13 @@ import GHC.Parser.Lexer as Lexer
   , lexer
   )
 import qualified GHC.Types.Error as E
-import GHC.Types.SourceText
 import GHC.Types.SrcLoc
-import GHC.Utils.Error (pprLocMsgEnvelopeDefault)
-import GHC.Utils.Outputable (SDocContext, text, ($$))
-import qualified GHC.Utils.Outputable as Outputable
-import GHC.Utils.Panic (panic)
+import GHC.Utils.Error (panicMessage)
 
 import Haddock.Backends.Hyperlinker.Types as T
 import Haddock.GhcUtils
+
+import Language.Haskell.Syntax.Lit
 
 -- | Turn source code string into a stream of more descriptive tokens.
 --
@@ -40,19 +37,14 @@ import Haddock.GhcUtils
 -- whitespace, and CPP).
 parse
   :: ParserOpts
-  -> SDocContext
   -> FilePath
   -- ^ Path to the source of this module
   -> BS.ByteString
   -- ^ Raw UTF-8 encoded source of this module
   -> [T.Token]
-parse parserOpts sDocContext fpath bs = case unP (go False []) initState of
+parse parserOpts fpath bs = case unP (go False []) initState of
   POk _ toks -> reverse toks
-  PFailed pst ->
-    let err : _ = bagToList (E.getMessages $ getPsErrorMessages pst)
-     in panic $
-          Outputable.renderWithContext sDocContext $
-            text "Hyperlinker parse error:" $$ pprLocMsgEnvelopeDefault err
+  PFailed pst -> panicMessage "Hyperlinker parse error:" (E.getMessages $ getPsErrorMessages pst)
   where
     initState = initParserState parserOpts buf start
     buf = stringBufferFromByteString bs
@@ -105,10 +97,13 @@ parse parserOpts sDocContext fpath bs = case unP (go False []) initState of
     parsePlainTok inPrag = do
       (bInit, lInit) <- lift getInput
       L sp tok <- tryP (Lexer.lexer False return)
-      (bEnd, _) <- lift getInput
       case sp of
-        UnhelpfulSpan _ -> pure ([], False) -- pretend the token never existed
-        RealSrcSpan rsp _ -> do
+        RealSrcSpan rsp _ -> tryParse inPrag rsp bInit lInit sp tok
+        GeneratedSrcSpan (OrigSpan rsp) -> tryParse inPrag rsp bInit lInit sp tok
+        _ -> pure ([], False) -- pretend the token never existed
+
+    tryParse inPrag rsp bInit lInit sp tok = do
+          (bEnd, _) <- lift getInput
           let typ = if inPrag then TkPragma else classify tok
               RealSrcLoc lStart _ = srcSpanStart sp -- safe since @sp@ is real
               (spaceBStr, bStart) = spanPosition lInit lStart bInit
@@ -118,10 +113,10 @@ parse parserOpts sDocContext fpath bs = case unP (go False []) initState of
             -- Update internal line + file position if this is a LINE pragma
             ITline_prag _ -> tryOrElse (bEnd, inPragDef) $ do
               L _ (ITinteger (IL{il_value = line})) <- tryP wrappedLexer
-              L _ (ITstring _ file) <- tryP wrappedLexer
+              L _ (ITstring _ _ file) <- tryP wrappedLexer
               L spF ITclose_prag <- tryP wrappedLexer
 
-              let newLoc = mkRealSrcLoc file (fromIntegral line - 1) (srcSpanEndCol spF)
+              let newLoc = mkRealSrcLoc (mkFastStringShortText file) (fromIntegral line - 1) (srcSpanEndCol spF)
               (bEnd'', _) <- lift getInput
               lift $ setInput (bEnd'', newLoc)
 
@@ -322,7 +317,6 @@ classify tok =
     ITlabelvarid{} -> TkUnknown
     ITchar{} -> TkChar
     ITstring{} -> TkString
-    ITstringMulti{} -> TkString
     ITinteger{} -> TkNumber
     ITrational{} -> TkNumber
     ITprimchar{} -> TkChar

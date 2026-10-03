@@ -5,8 +5,6 @@
 -}
 
 
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module GHC.Stg.Pipeline
@@ -37,6 +35,7 @@ import GHC.Utils.Error
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Supply
+import GHC.Types.Unique (uniqueTag)
 import GHC.Utils.Outputable
 import GHC.Utils.Logger
 import Control.Monad
@@ -67,12 +66,12 @@ newtype StgM a = StgM { _unStgM :: ReaderT Char IO a }
 
 instance MonadUnique StgM where
   getUniqueSupplyM = StgM $ do { tag <- ask
-                               ; liftIO $! mkSplitUniqSupply tag}
+                               ; liftIO $! mkSplitUniqSupplyGrimily tag}
   getUniqueM = StgM $ do { tag <- ask
-                         ; liftIO $! uniqFromTag tag}
+                         ; liftIO $! uniqFromTagGrimily tag}
 
-runStgM :: Char -> StgM a -> IO a
-runStgM mask (StgM m) = runReaderT m mask
+runStgM :: UniqueTag -> StgM a -> IO a
+runStgM mask (StgM m) = runReaderT m (uniqueTag mask)
 
 stg2stg :: Logger
         -> [Var]                     -- ^ extra vars in scope from GHCi
@@ -85,7 +84,7 @@ stg2stg logger extra_vars opts this_mod binds
         ; stg_linter False "StgFromCore" binds
         ; showPass logger "Stg2Stg"
         -- Do the main business!
-        ; binds' <- runStgM 'g' $
+        ; binds' <- runStgM StgPTag $
             foldM (do_stg_pass this_mod) binds (stgPipeline_phases opts)
 
           -- Dependency sort the program as last thing. The program needs to be
@@ -144,7 +143,7 @@ stg2stg logger extra_vars opts this_mod binds
           StgUnarise -> do
             us <- getUniqueSupplyM
             liftIO (stg_linter False "Pre-unarise" binds)
-            let binds' = {-# SCC "StgUnarise" #-} unarise us (stgPipeline_allowTopLevelConApp opts this_mod) binds
+            let binds' = {-# SCC "StgUnarise" #-} unarise (stgPlatform opts) us (stgPipeline_allowTopLevelConApp opts this_mod) binds
             liftIO (dump_when Opt_D_dump_stg_unarised "Unarised STG:" binds')
             liftIO (stg_linter True "Unarise" binds')
             return binds'

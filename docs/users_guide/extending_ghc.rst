@@ -179,7 +179,7 @@ GHC's intermediate language, Core. Plugins are suitable for experimental
 analysis or optimization, and require no changes to GHC's source code to
 use.
 
-Plugins cannot optimize/inspect C-\\-, nor can they implement things like
+Plugins cannot optimize/inspect C-\-, nor can they implement things like
 parser/front-end modifications like GCC, apart from limited changes to
 the constraint solver. If you feel strongly that any of these
 restrictions are too onerous,
@@ -304,7 +304,7 @@ Alternatively, core plugins can be specified with Template Haskell.
 
    addCorePlugin "Foo.Plugin"
 
-This inserts the plugin as a core-to-core pass. Unlike `-fplugin=(module)`,
+This inserts the plugin as a core-to-core pass. Unlike :ghc-flag:`-fplugin=⟨module⟩`,
 the plugin module can't reside in the same package as the module calling
 :th-ref:`Language.Haskell.TH.Syntax.addCorePlugin`. This way, the
 implementation can expect the plugin to be built by the time
@@ -640,10 +640,11 @@ is defined thus:
 ::
 
     data TcPlugin = forall s . TcPlugin
-      { tcPluginInit    :: TcPluginM s
-      , tcPluginSolve   :: s -> TcPluginSolver
-      , tcPluginRewrite :: s -> UniqFM TyCon TcPluginRewriter
-      , tcPluginStop    :: s -> TcPluginM ()
+      { tcPluginInit     :: TcPluginM s
+      , tcPluginSolve    :: s -> TcPluginSolver
+      , tcPluginRewrite  :: s -> UniqFM TyCon TcPluginRewriter
+      , tcPluginPostTc   :: s -> TcPluginM ()
+      , tcPluginShutdown :: s -> IO ()
       }
 
     type TcPluginSolver = EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginSolveResult
@@ -691,9 +692,22 @@ The basic idea is as follows:
    Given constraints. The plugin can then specify a rewriting for this
    type family application, if desired.
 
--  Finally, GHC calls ``tcPluginStop`` after constraint solving is
-   finished, allowing the plugin to dispose of any resources it has
-   allocated (e.g. terminating the SMT solver process).
+-  At the end of typechecking the module, GHC calls ``tcPluginPostTc``. This
+   gives the plugin an opportunity to inspect the final typechecker state (the
+   ``TcGblEnv`` and ``TcLclEnv``) and modify any mutable fields.  
+
+   (This somewhat overlaps in functionality with ``typeCheckResultAction`` plugins,
+   see :ref:`source-plugins`. The difference is that typechecker plugins thread
+   through state using the ``s`` parameter to ``TcPlugin``, which has no direct
+   equivalent with ``typecheckResultAction``.)
+
+-  Finally, GHC calls ``tcPluginShutdown`` after constraint solving is finished,
+   allowing the plugin to dispose of any resources it has allocated
+   (e.g. terminating the SMT solver process).
+
+   Note that this happens at the end of **desugaring** (instead of at the end
+   of typechecking as one might naively expect), because the pattern-match
+   checker runs in the desugarer and can invoke the constraint solver.
 
 Plugin code runs in the ``TcPluginM`` monad, which provides a restricted
 interface to GHC API functionality that is relevant for typechecker
@@ -786,7 +800,7 @@ Here
 
 For soundness, it is very important to include the ``gcvs``; otherwise
 GHC may transform the program into a form that seg-faults.
-See #23923 for a long dicussion.
+See :ghc-ticket:`23923` for a long dicussion.
 
 Evidence is required also when creating new Given constraints, which are
 usually implied by old ones. It is not uncommon that the evidence of a new
@@ -1449,11 +1463,13 @@ Defaulting plugins have a single access point in the `GHC.Tc.Types` module
         -- ^ Initialize plugin, when entering type-checker.
       , dePluginRun :: s -> FillDefaulting
         -- ^ Default some types
-      , dePluginStop :: s -> TcPluginM ()
-       -- ^ Clean up after the plugin, when exiting the type-checker.
+      , dePluginPostTc :: s -> TcPluginM ()
+        -- ^ Action to run at the end of typechecking a module.
+      , dePluginShutdown :: s -> IO ()
+       -- ^ Clean up after the plugin, once GHC is done processing a module.
       }
 
-The plugin has type ``WantedConstraints -> [DefaultingProposal]``.
+The "plugin run action" has type ``WantedConstraints -> [DefaultingProposal]``.
 
 * It is given the currently unsolved constraints.
 * It returns a list of independent "defaulting proposals".
@@ -1719,7 +1735,7 @@ constructor from version 9.4 with the corresponding value from 9.6:
 +-----------------+------------------------+
 | ``ViaC``        | ``viaCBackend``        |
 +-----------------+------------------------+
-| ``Interpreter`` | ``interpreterBackend`` |
+| ``Interpreter`` | ``bytecodeBackend``    |
 +-----------------+------------------------+
 | ``NoBackend``   | ``noBackend``          |
 +-----------------+------------------------+

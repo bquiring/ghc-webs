@@ -1,7 +1,3 @@
-
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- | Utility module for the pattern-match coverage checker.
 module GHC.HsToCore.Pmc.Utils (
 
@@ -93,7 +89,7 @@ exhaustiveWarningFlag (ArrowMatchCtxt c) = arrowMatchContextExhaustiveWarningFla
 exhaustiveWarningFlag RecUpd             = Just Opt_WarnIncompletePatternsRecUpd
 exhaustiveWarningFlag LazyPatCtx         = Just Opt_WarnIncompleteUniPatterns
 exhaustiveWarningFlag ThPatSplice        = Nothing
-exhaustiveWarningFlag PatSyn             = Nothing
+exhaustiveWarningFlag PatSynCtx          = Nothing
 exhaustiveWarningFlag ThPatQuote         = Nothing
 -- Don't warn about incomplete patterns in list comprehensions, pattern guards
 -- etc. They are often *supposed* to be incomplete

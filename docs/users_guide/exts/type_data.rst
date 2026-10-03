@@ -33,7 +33,8 @@ either an ordinary algebraic data type or a GADT, prefixed with the keyword
 ``type``, except that it may not contain
 a datatype context (even with :extension:`DatatypeContexts`),
 labelled fields,
-strictness flags, or
+:ref:`strictness <strict-haskell>`, :ref:`unpackedness <unpack-pragma>` or
+:ref:`multiplicity <linear-types>` annotations, or
 a ``deriving`` clause.
 
 The only constraints permitted in the types of constructors are
@@ -46,7 +47,7 @@ Because ``type data`` declarations introduce type constructors, they do
 not permit constructors with the same names as types, so the following
 declaration is invalid: ::
 
-    type data T = T     // Invalid
+    type data T = T     -- Invalid
 
 The compiler will reject this declaration, because the type constructor
 ``T`` is defined twice (as the datatype being defined and as a type
@@ -57,4 +58,4 @@ recursively, as in the ``Nat`` example above, but its constructors may not
 be used in types within the same mutually recursive group of declarations,
 so the following is forbidden: ::
 
-    type data T f = K (f (K Int))  // Invalid
+    type data T f = K (f (K Int))  -- Invalid

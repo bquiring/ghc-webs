@@ -60,7 +60,7 @@ bar
   x = R1;  // the calling convention is explicit: better be careful
            // that this works on all platforms!
 
-  jump %ENTRY_CODE(Sp(0))
+  jump %ENTRY_CODE(Sp(0))[];
 }
 
 Here is a list of rules for high-level and low-level code.  If you
@@ -232,8 +232,6 @@ See Note [Heap memory barriers] in SMP.h for details.
 ----------------------------------------------------------------------------- -}
 
 {
-{-# LANGUAGE TupleSections #-}
-
 module GHC.Cmm.Parser ( parseCmmFile, CmmParserConfig(..) ) where
 
 import GHC.Prelude
@@ -374,6 +372,8 @@ import qualified Data.ByteString.Char8 as BS8
         'return'        { L _ (CmmT_return) }
         'returns'       { L _ (CmmT_returns) }
         'import'        { L _ (CmmT_import) }
+        'extern'        { L _ (CmmT_extern) }
+        'DATA'          { L _ (CmmT_DATA) }
         'switch'        { L _ (CmmT_switch) }
         'case'          { L _ (CmmT_case) }
         'default'       { L _ (CmmT_default) }
@@ -645,18 +645,42 @@ importNames
 importName
         :: { (FastString,  CLabel) }
 
-        -- A label imported without an explicit packageId.
-        --      These are taken to come from some foreign, unnamed package.
+        -- A code label imported from within the same shared library.
         : NAME
-        { ($1, mkForeignLabel $1 ForeignLabelInExternalPackage IsFunction) }
+        { ($1, mkForeignLabel $1 ForeignLabelInThisPackage IsFunction) }
 
-        -- as previous 'NAME', but 'IsData'
+        -- A data label imported from within the same shared library.
+        | 'DATA' NAME
+        { ($2, mkForeignLabel $2 ForeignLabelInThisPackage IsData) }
+
+        -- CLOSURE is a historical alias for DATA in this context.
         | 'CLOSURE' NAME
-        { ($2, mkForeignLabel $2 ForeignLabelInExternalPackage IsData) }
+        { ($2, mkForeignLabel $2 ForeignLabelInThisPackage IsData) }
 
-        -- A label imported with an explicit UnitId.
+        -- A code label imported from another unamed shared library. These may
+        -- come from a foreign shared library, or from the shared library for
+        -- an unnamed Haskell package. This corresponds on Windows/PE to
+        -- __declspec(dllimport) in C.
+        | 'extern' NAME
+        { ($2, mkForeignLabel $2 ForeignLabelInExternalPackage IsFunction) }
+
+        -- A data label imported from another unamed shared library.
+        -- This corresponds on Windows/PE to __declspec(dllimport) in C (but
+        -- cmm doesn't know about data vs function symbols so we have to say).
+        | 'extern' 'DATA' NAME
+        { ($3, mkForeignLabel $3 ForeignLabelInExternalPackage IsData) }
+
+        -- A code label imported from the shared library for a Haskell package
+        -- with the given UnitId. Such labels behave as local when used within
+        -- the specified unit, or as extern otherwise.
         | STRING NAME
-        { ($2, mkCmmCodeLabel (UnitId (mkFastString $1)) $2) }
+        { ($2, mkForeignLabel $2 (ForeignLabelInPackage (UnitId (mkFastString $1))) IsFunction) }
+
+        -- A data label imported from the shared library for a Haskell package
+        -- with the given UnitId. Such labels behave as local when used within
+        -- the specified unit, or as extern otherwise.
+        | STRING 'DATA' NAME
+        { ($3, mkForeignLabel $3 (ForeignLabelInPackage (UnitId (mkFastString $1))) IsData) }
 
 
 names   :: { [FastString] }
@@ -721,6 +745,8 @@ stmt    :: { CmmParse () }
                 { doCall $2 [] $4 }
         | '(' formals ')' '=' 'call' expr '(' exprs0 ')' ';'
                 { doCall $6 $2 $8 }
+        -- NB: bool_expr most be a *boolean* expression: A comparison machOp or 1/0 word literals.
+        -- We don't allow arbitrary expressions as conditions (See GHC.Cmm.Lint.checkCond:checkCond, #27543).
         | 'if' bool_expr cond_likely 'goto' NAME
                 { do l <- lookupLabel $5; cmmRawIf $2 l $3 }
         | 'if' bool_expr cond_likely '{' body '}' else
@@ -870,7 +896,7 @@ expr    :: { CmmParse CmmExpr }
 
 expr0   :: { CmmParse CmmExpr }
         : INT   maybe_ty         { return (CmmLit (CmmInt $1 (typeWidth $2))) }
-        | FLOAT maybe_ty         { return (CmmLit (CmmFloat $1 (typeWidth $2))) }
+        | FLOAT maybe_ty         { return (CmmLit (mkCmmFloatLit $1 (typeWidth $2))) }
         | STRING                 { do s <- code (newStringCLit $1);
                                       return (CmmLit s) }
         | reg                    { $1 }
@@ -980,7 +1006,7 @@ section "data"      = Data
 section "rodata"    = ReadOnlyData
 section "relrodata" = RelocatableReadOnlyData
 section "bss"       = UninitialisedData
-section s           = OtherSection s
+section s           = panic ("CmmParse: unknown section type: " ++ s)
 
 mkString :: String -> CmmStatic
 mkString s = CmmString (BS8.pack s)
@@ -1186,9 +1212,10 @@ callishMachOps platform = listToUFM $
     , allWidths "pext" MO_Pext
     , allWidths "cmpxchg" MO_Cmpxchg
     , allWidths "xchg" MO_Xchg
-    , allWidths "load_relaxed" (\w -> MO_AtomicRead w MemOrderAcquire)
+    , allWidths "load_relaxed" (\w -> MO_AtomicRead w MemOrderRelaxed)
     , allWidths "load_acquire" (\w -> MO_AtomicRead w MemOrderAcquire)
     , allWidths "load_seqcst" (\w -> MO_AtomicRead w MemOrderSeqCst)
+    , allWidths "store_relaxed" (\w -> MO_AtomicWrite w MemOrderRelaxed)
     , allWidths "store_release" (\w -> MO_AtomicWrite w MemOrderRelease)
     , allWidths "store_seqcst" (\w -> MO_AtomicWrite w MemOrderSeqCst)
     , allWidths "fetch_add" (\w -> MO_AtomicRMW w AMO_Add)
@@ -1321,6 +1348,7 @@ stmtMacros = listToUFM [
   ( fsLit "PROF_HEADER_CREATE",     \[e] -> profHeaderCreate e ),
 
   ( fsLit "PUSH_UPD_FRAME",        \[sp,e] -> emitPushUpdateFrame sp e ),
+  ( fsLit "PUSH_BH_UPD_FRAME",     \[sp,e] -> emitPushBHUpdateFrame sp e ),
   ( fsLit "SET_HDR",               \[ptr,info,ccs] ->
                                         emitSetDynHdr ptr info ccs ),
   ( fsLit "TICK_ALLOC_PRIM",       \[hdr,goods,slop] ->
@@ -1335,6 +1363,10 @@ stmtMacros = listToUFM [
 emitPushUpdateFrame :: CmmExpr -> CmmExpr -> FCode ()
 emitPushUpdateFrame sp e = do
   emitUpdateFrame sp mkUpdInfoLabel e
+
+emitPushBHUpdateFrame :: CmmExpr -> CmmExpr -> FCode ()
+emitPushBHUpdateFrame sp e = do
+  emitUpdateFrame sp mkBHUpdInfoLabel e
 
 pushStackFrame :: [CmmParse CmmExpr] -> CmmParse () -> CmmParse ()
 pushStackFrame fields body = do

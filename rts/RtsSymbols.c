@@ -9,6 +9,8 @@
 #include "ghcplatform.h"
 #include "Rts.h"
 #include "RtsSymbols.h"
+#include "LinkerInternals.h"
+#include "PathUtils.h"
 
 #include "TopHandler.h"
 #include "HsFFI.h"
@@ -30,6 +32,7 @@
 #include <shfolder.h> /* SHGetFolderPathW */
 #include "IOManager.h"
 #include "win32/AsyncWinIO.h"
+#include "win32/AsyncMIO.h"
 #endif
 
 #if defined(openbsd_HOST_OS)
@@ -50,6 +53,20 @@ extern char **environ;
 
 /* -----------------------------------------------------------------------------
  * Symbols to be inserted into the RTS symbol table.
+ *
+ * Note [Naming Scheme for Symbol Macros]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * SymI_*: symbol is internal to the RTS. It resides in an object
+ *         file/library that is linked into the RTS library (as a static
+ *         archive or dynamic shared library).
+ * SymE_*: symbol is external to the RTS library. It might be linked
+ *         dynamically.
+ *
+ * Sym*_HasProto  : the symbol prototype is imported in an include file
+ *                  or defined explicitly
+ * Sym*_NeedsProto: the symbol is undefined and we add a dummy
+ *                  default proto extern void sym(void);
  */
 
 #define Maybe_Stable_Names      SymI_HasProto(stg_mkWeakzh)                   \
@@ -161,13 +178,14 @@ extern char **environ;
       SymI_HasProto(stg_asyncWritezh)                    \
       SymI_HasProto(stg_asyncDoProczh)                   \
       SymI_HasProto(rts_InstallConsoleEvent)             \
-      SymI_HasProto(rts_IOManagerIsWin32Native)          \
+      SymI_HasDataProto(rts_IOManagerIsWin32Native)          \
       SymI_HasProto(rts_ConsoleHandlerDone)              \
       SymI_NeedsProto(__mingw_module_is_dll)             \
       RTS_WIN64_ONLY(SymI_NeedsProto(___chkstk_ms))      \
       SymI_HasProto(__stdio_common_vswprintf_s)          \
       SymI_HasProto(__stdio_common_vswprintf)            \
       SymI_HasProto(_errno)                              \
+      SymI_HasProto(rts_EINTR)                           \
       /* see Note [Symbols for MinGW's printf] */        \
       SymI_HasProto(_lock_file)                          \
       SymI_HasProto(_unlock_file)                        \
@@ -247,7 +265,6 @@ extern char **environ;
 #define RTS_USER_SIGNALS_SYMBOLS        \
    SymI_HasProto(setIOManagerControlFd) \
    SymI_HasProto(setTimerManagerControlFd) \
-   SymI_HasProto(setIOManagerWakeupFd)  \
    SymI_HasProto(blockUserSignals)      \
    SymI_HasProto(unblockUserSignals)
 #else
@@ -435,17 +452,9 @@ extern char **environ;
 
 // On most platforms, the garbage collector rewrites references
 //      to small integer and char objects to a set of common, shared ones.
-//
-// We don't do this when compiling to Windows DLLs at the moment because
-//      it doesn't support cross package data references well.
-//
-#if defined(COMPILING_WINDOWS_DLL)
-#define RTS_INTCHAR_SYMBOLS
-#else
 #define RTS_INTCHAR_SYMBOLS                             \
       SymI_HasProto(stg_CHARLIKE_closure)               \
       SymI_HasProto(stg_INTLIKE_closure)
-#endif
 
 #if defined(PROFILING)
 #define RTS_PROF_SYMBOLS                        \
@@ -472,6 +481,7 @@ extern char **environ;
       RTS_PROF_SYMBOLS                                                  \
       RTS_LIBDW_SYMBOLS                                                 \
       SymI_HasProto(StgReturn)                                          \
+      SymI_HasDataProto(ghc_hs_iface)                                       \
       SymI_HasDataProto(stg_gc_noregs)                                      \
       SymI_HasDataProto(stg_ret_v_info)                                     \
       SymI_HasDataProto(stg_ret_p_info)                                     \
@@ -480,7 +490,16 @@ extern char **environ;
       SymI_HasDataProto(stg_ret_d_info)                                     \
       SymI_HasDataProto(stg_ret_l_info)                                     \
       SymI_HasDataProto(stg_ret_t_info)                                     \
-      SymI_HasDataProto(stg_ctoi_t)                                         \
+      SymI_HasDataProto(stg_ctoi_t_info)                                    \
+      SymI_HasDataProto(stg_ctoi_t0_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t1_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t2_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t3_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t4_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t5_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t6_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t7_info)                                   \
+      SymI_HasDataProto(stg_ctoi_t8_info)                                   \
       SymI_HasDataProto(stg_primcall_info)                                  \
       SymI_HasDataProto(stg_gc_prim_p)                                      \
       SymI_HasDataProto(stg_gc_prim_pp)                                     \
@@ -495,6 +514,11 @@ extern char **environ;
       SymI_HasDataProto(stg_gc_pp)                                          \
       SymI_HasDataProto(stg_gc_ppp)                                         \
       SymI_HasDataProto(stg_gc_pppp)                                        \
+      SymI_HasDataProto(stg_gc_ppppp)                                       \
+      SymI_HasDataProto(stg_gc_ip)                                          \
+      SymI_HasDataProto(stg_gc_pi)                                          \
+      SymI_HasDataProto(stg_gc_ii)                                          \
+      SymI_HasDataProto(stg_gc_bpp)                                         \
       SymI_HasDataProto(__stg_gc_fun)                                       \
       SymI_HasDataProto(stg_gc_fun_info)                                    \
       SymI_HasDataProto(stg_yield_noregs)                                   \
@@ -515,7 +539,12 @@ extern char **environ;
       SymI_HasProto(__word_encodeFloat)                                 \
       SymI_HasDataProto(stg_atomicallyzh)                                   \
       SymI_HasProto(barf)                                               \
+      SymI_HasProto(startEventLogging)                                  \
+      SymI_HasProto(endEventLogging)                                    \
       SymI_HasProto(flushEventLog)                                      \
+      SymI_HasProto(flushEventLog)                                      \
+      SymI_HasProto(getTraceFlag)                                       \
+      SymI_HasProto(setTraceFlag)                                       \
       SymI_HasProto(deRefStablePtr)                                     \
       SymI_HasProto(debugBelch)                                         \
       SymI_HasProto(errorBelch)                                         \
@@ -527,6 +556,7 @@ extern char **environ;
       SymI_HasDataProto(stg_catchRetryzh)                                   \
       SymI_HasDataProto(stg_catchSTMzh)                                     \
       SymI_HasDataProto(stg_clearCCSzh)                                     \
+      SymI_HasDataProto(stg_annotateStackzh)                                \
       SymI_HasDataProto(stg_compactAddWithSharingzh)                        \
       SymI_HasDataProto(stg_compactAddzh)                                   \
       SymI_HasDataProto(stg_compactNewzh)                                   \
@@ -595,6 +625,7 @@ extern char **environ;
       SymI_HasProto(hs_free_fun_ptr)                                    \
       SymI_HasProto(hs_hpc_rootModule)                                  \
       SymI_HasProto(hs_hpc_module)                                      \
+      SymI_HasProto(startupHpc)                                         \
       SymI_HasProto(hs_thread_done)                                     \
       SymI_HasProto(hs_try_putmvar)                                     \
       SymI_HasProto(hs_try_putmvar_with_value)                          \
@@ -640,6 +671,7 @@ extern char **environ;
       SymI_HasDataProto(stg_casSmallArrayzh)                                \
       SymI_HasDataProto(stg_copyArray_barrier)                              \
       SymI_HasDataProto(stg_newBCOzh)                                       \
+      SymI_HasDataProto(stg_newConAppObjzh)                                 \
       SymI_HasDataProto(stg_newByteArrayzh)                                 \
       SymI_HasDataProto(stg_casIntArrayzh)                                  \
       SymI_HasDataProto(stg_casInt8Arrayzh)                                 \
@@ -649,9 +681,6 @@ extern char **environ;
       SymI_HasDataProto(stg_newMVarzh)                                      \
       SymI_HasDataProto(stg_newMutVarzh)                                    \
       SymI_HasDataProto(stg_newTVarzh)                                      \
-      SymI_HasDataProto(stg_readIOPortzh)                                   \
-      SymI_HasDataProto(stg_writeIOPortzh)                                  \
-      SymI_HasDataProto(stg_newIOPortzh)                                    \
       SymI_HasDataProto(stg_noDuplicatezh)                                  \
       SymI_HasDataProto(stg_atomicModifyMutVar2zh)                          \
       SymI_HasDataProto(stg_atomicModifyMutVarzuzh)                         \
@@ -664,7 +693,7 @@ extern char **environ;
       SymI_HasDataProto(stg_isMutableByteArrayWeaklyPinnedzh)               \
       SymI_HasDataProto(stg_shrinkMutableByteArrayzh)                       \
       SymI_HasDataProto(stg_resizzeMutableByteArrayzh)                      \
-      SymI_HasDataProto(stg_shrinkSmallMutableArrayzh)                       \
+      SymI_HasDataProto(stg_shrinkSmallMutableArrayzh)                      \
       SymI_HasProto(newSpark)                                           \
       SymI_HasProto(updateRemembSetPushThunk)                             \
       SymI_HasProto(updateRemembSetPushThunk_)                            \
@@ -687,6 +716,7 @@ extern char **environ;
       SymI_HasDataProto(stg_readTVarIOzh)                                   \
       SymI_HasProto(resumeThread)                                       \
       SymI_HasProto(setNumCapabilities)                                 \
+      SymI_HasProto(performTryPutMVar)                                  \
       SymI_HasProto(getNumberOfProcessors)                              \
       SymI_HasProto(resolveObjs)                                        \
       SymI_HasDataProto(stg_retryzh)                                        \
@@ -878,7 +908,6 @@ extern char **environ;
       SymI_HasDataProto(stg_takeMVarzh)                                     \
       SymI_HasDataProto(stg_readMVarzh)                                     \
       SymI_HasDataProto(stg_threadStatuszh)                                 \
-      SymI_HasDataProto(stg_tryPutMVarzh)                                   \
       SymI_HasDataProto(stg_tryTakeMVarzh)                                  \
       SymI_HasDataProto(stg_tryReadMVarzh)                                  \
       SymI_HasDataProto(stg_unmaskAsyncExceptionszh)                        \
@@ -905,7 +934,7 @@ extern char **environ;
       SymI_HasProto(freeExecPage)                                       \
       SymI_HasProto(getAllocations)                                     \
       SymI_HasProto(revertCAFs)                                         \
-      SymI_HasProto(RtsFlags)                                           \
+      SymI_HasDataProto(RtsFlags)                                           \
       SymI_NeedsDataProto(rts_breakpoint_io_action)                     \
       SymI_NeedsDataProto(rts_stop_next_breakpoint)                     \
       SymI_NeedsDataProto(rts_stop_on_exception)                        \
@@ -916,9 +945,9 @@ extern char **environ;
       SymI_NeedsProto(rts_enableStopAfterReturn)                        \
       SymI_NeedsProto(rts_disableStopAfterReturn)                       \
       SymI_HasProto(stopTimer)                                          \
-      SymI_HasProto(n_capabilities)                                     \
-      SymI_HasProto(max_n_capabilities)                                 \
-      SymI_HasProto(enabled_capabilities)                               \
+      SymI_HasDataProto(n_capabilities)                                     \
+      SymI_HasDataProto(max_n_capabilities)                                 \
+      SymI_HasDataProto(enabled_capabilities)                               \
       SymI_HasDataProto(stg_traceEventzh)                                   \
       SymI_HasDataProto(stg_traceMarkerzh)                                  \
       SymI_HasDataProto(stg_traceBinaryEventzh)                             \
@@ -953,7 +982,6 @@ extern char **environ;
       SymI_HasProto(lookupIPE)                                          \
       SymI_HasProto(sendCloneStackMessage)                              \
       SymI_HasProto(cloneStack)                                         \
-      SymI_HasProto(decodeClonedStack)                                  \
       SymI_HasProto(stg_newPromptTagzh)                                 \
       SymI_HasProto(stg_promptzh)                                       \
       SymI_HasProto(stg_control0zh)                                     \
@@ -974,7 +1002,7 @@ extern char **environ;
       RTS_INTCHAR_SYMBOLS
 
 // 64-bit support functions in libgcc.a
-#if defined(__GNUC__) && SIZEOF_VOID_P <= 4 && !defined(_ABIN32)
+#if SIZEOF_VOID_P <= 4 && !defined(_ABIN32)
 #define RTS_LIBGCC_SYMBOLS                             \
       SymI_NeedsProto(__divdi3)                        \
       SymI_NeedsProto(__udivdi3)                       \
@@ -985,7 +1013,7 @@ extern char **environ;
       SymI_NeedsProto(__ashrdi3)                       \
       SymI_NeedsProto(__lshrdi3)                       \
       SymI_NeedsProto(__fixunsdfdi)
-#elif defined(__GNUC__) && SIZEOF_VOID_P == 8
+#elif SIZEOF_VOID_P == 8
 #define RTS_LIBGCC_SYMBOLS                             \
       SymI_NeedsProto(__udivti3)                       \
       SymI_NeedsProto(__umodti3)
@@ -1027,23 +1055,137 @@ extern char **environ;
 #define RTS_FINI_ARRAY_SYMBOLS
 #endif
 
-/* entirely bogus claims about types of these symbols */
-#define SymI_NeedsProto(vvv)  extern void vvv(void);
-#define SymI_NeedsDataProto(vvv)  extern StgWord vvv[];
-#if defined(COMPILING_WINDOWS_DLL)
-#define SymE_HasProto(vvv)    SymE_HasProto(vvv);
-#  if defined(x86_64_HOST_ARCH)
-#    define SymE_NeedsProto(vvv)    extern void __imp_ ## vvv (void);
-#    define SymE_NeedsDataProto(vvv) SymE_NeedsProto(vvv)
-#  else
-#    define SymE_NeedsProto(vvv)    extern void _imp__ ## vvv (void);
-#    define SymE_NeedsDataProto(vvv) SymE_NeedsProto(vvv)
-#  endif
+#define SymI_HasProtoAllSizes(symbol)                \
+      SymI_HasProto(symbol##8)                       \
+      SymI_HasProto(symbol##16)                      \
+      SymI_HasProto(symbol##32)                      \
+      SymI_HasProto(symbol##64)
+
+#if !defined(arm_HOST_ARCH)
+#define RTS_ATOMICS_SYMBOLS                          \
+      SymI_HasProtoAllSizes(hs_atomic_add)           \
+      SymI_HasProtoAllSizes(hs_atomic_sub)           \
+      SymI_HasProtoAllSizes(hs_atomic_and)           \
+      SymI_HasProtoAllSizes(hs_atomic_nand)          \
+      SymI_HasProtoAllSizes(hs_atomic_or)            \
+      SymI_HasProtoAllSizes(hs_atomic_xor)           \
+      SymI_HasProtoAllSizes(hs_cmpxchg)              \
+      SymI_HasProtoAllSizes(hs_xchg)                 \
+      SymI_HasProtoAllSizes(hs_atomicread)           \
+      SymI_HasProtoAllSizes(hs_atomicwrite)
 #else
-#define SymE_NeedsProto(vvv)  SymI_NeedsProto(vvv);
-#define SymE_NeedsDataProto(vvv)  SymI_NeedsDataProto(vvv);
-#define SymE_HasProto(vvv)    SymI_HasProto(vvv);
+// No atomics on arm32. See e9abcad4cc3
+#define RTS_ATOMICS_SYMBOLS
 #endif
+
+// In rts/longlong.c
+#if WORD_SIZE_IN_BITS < 64
+#define RTS_SYMBOLS_LONGLONG                        \
+      SymI_HasProto(hs_eq64)                        \
+      SymI_HasProto(hs_ne64)                        \
+      SymI_HasProto(hs_gtWord64)                    \
+      SymI_HasProto(hs_geWord64)                    \
+      SymI_HasProto(hs_ltWord64)                    \
+      SymI_HasProto(hs_leWord64)                    \
+      SymI_HasProto(hs_gtInt64)                     \
+      SymI_HasProto(hs_geInt64)                     \
+      SymI_HasProto(hs_ltInt64)                     \
+      SymI_HasProto(hs_leInt64)                     \
+      SymI_HasProto(hs_neg64)                       \
+      SymI_HasProto(hs_add64)                       \
+      SymI_HasProto(hs_sub64)                       \
+      SymI_HasProto(hs_mul64)                       \
+      SymI_HasProto(hs_remWord64)                   \
+      SymI_HasProto(hs_quotWord64)                  \
+      SymI_HasProto(hs_remInt64)                    \
+      SymI_HasProto(hs_quotInt64)                   \
+      SymI_HasProto(hs_and64)                       \
+      SymI_HasProto(hs_or64)                        \
+      SymI_HasProto(hs_xor64)                       \
+      SymI_HasProto(hs_not64)                       \
+      SymI_HasProto(hs_uncheckedShiftL64)           \
+      SymI_HasProto(hs_uncheckedShiftRL64)          \
+      SymI_HasProto(hs_uncheckedIShiftRA64)         \
+      SymI_HasProto(hs_intToInt64)                  \
+      SymI_HasProto(hs_int64ToInt)                  \
+      SymI_HasProto(hs_wordToWord64)                \
+      SymI_HasProto(hs_word64ToWord)
+#else
+#define RTS_SYMBOLS_LONGLONG
+#endif
+
+// rts/prim/vectorQuotRem.c and rts/prim/int64x2minmax
+#if defined(__SSE2__)
+#define RTS_SYMBOLS_VECTORQUOTREM                    \
+      SymI_HasProto(hs_quotInt8X16)                  \
+      SymI_HasProto(hs_quotInt16X8)                  \
+      SymI_HasProto(hs_quotInt32X4)                  \
+      SymI_HasProto(hs_quotInt64X2)                  \
+      SymI_HasProto(hs_quotWord8X16)                 \
+      SymI_HasProto(hs_quotWord16X8)                 \
+      SymI_HasProto(hs_quotWord32X4)                 \
+      SymI_HasProto(hs_quotWord64X2)                 \
+      SymI_HasProto(hs_remInt8X16)                   \
+      SymI_HasProto(hs_remInt16X8)                   \
+      SymI_HasProto(hs_remInt32X4)                   \
+      SymI_HasProto(hs_remInt64X2)                   \
+      SymI_HasProto(hs_remWord8X16)                  \
+      SymI_HasProto(hs_remWord16X8)                  \
+      SymI_HasProto(hs_remWord32X4)                  \
+      SymI_HasProto(hs_remWord64X2)
+#define RTS_SYMBOLS_INT64X2MINMAX                    \
+      SymI_HasProto(hs_minInt64X2)                   \
+      SymI_HasProto(hs_maxInt64X2)                   \
+      SymI_HasProto(hs_minWord64X2)                  \
+      SymI_HasProto(hs_maxWord64X2)
+#else
+#define RTS_SYMBOLS_VECTORQUOTREM
+#define RTS_SYMBOLS_INT64X2MINMAX
+#endif
+
+// Symbols on files in rts/prim/*
+#define RTS_SYMBOLS_PRIM                             \
+      RTS_ATOMICS_SYMBOLS                            \
+      RTS_SYMBOLS_INT64X2MINMAX                      \
+      RTS_SYMBOLS_LONGLONG                           \
+      RTS_SYMBOLS_VECTORQUOTREM                      \
+      SymI_HasProtoAllSizes(hs_bitrev)               \
+      SymI_HasProto(hs_bswap16)                      \
+      SymI_HasProto(hs_bswap32)                      \
+      SymI_HasProto(hs_bswap64)                      \
+      SymI_HasProtoAllSizes(hs_clz)                  \
+      SymI_HasProtoAllSizes(hs_ctz)                  \
+      SymI_HasProto(hs_mulIntMayOflo)                \
+      SymI_HasProtoAllSizes(hs_pdep)                 \
+      SymI_HasProtoAllSizes(hs_pext)                 \
+      SymI_HasProtoAllSizes(hs_pext)                 \
+      SymI_HasProto(hs_popcnt)                       \
+      SymI_HasProtoAllSizes(hs_popcnt)               \
+      SymI_HasProto(hs_word2float32)                 \
+      SymI_HasProto(hs_word2float64)
+
+
+/* Declare prototypes for the symbols that need it, so we can refer
+ * to them in the rtsSyms table below.
+ *
+ * In particular, for the external ones (SymE_*) we use the dllimport attribute
+ * to indicate that (on Windows) they come from external DLLs. This attribute
+ * is ignored on other platforms.
+ *
+ * The claims about the types of these symbols are entirely bogus.
+ */
+#if defined(mingw32_HOST_OS) && defined(DYNAMIC)
+#define DLLIMPORT __attribute__((dllimport))
+#else
+#define DLLIMPORT /**/
+#endif
+
+#define SymI_NeedsProto(vvv)      extern           void vvv(void);
+#define SymI_NeedsDataProto(vvv)  extern           StgWord vvv[];
+#define SymE_NeedsProto(vvv)      extern DLLIMPORT void vvv(void);
+#define SymE_NeedsDataProto(vvv)  extern DLLIMPORT StgWord vvv[];
+
+#define SymE_HasProto(vvv) /**/
 #define SymI_HasProto(vvv) /**/
 #define SymI_HasDataProto(vvv) /**/
 #define SymI_HasProto_redirect(vvv,xxx,strength,ty) /**/
@@ -1060,6 +1202,7 @@ RTS_ARCH_LIBGCC_SYMBOLS
 RTS_FINI_ARRAY_SYMBOLS
 RTS_LIBFFI_SYMBOLS
 RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
+RTS_SYMBOLS_PRIM
 
 #undef SymI_NeedsProto
 #undef SymI_NeedsDataProto
@@ -1071,14 +1214,16 @@ RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
 #undef SymE_NeedsProto
 #undef SymE_NeedsDataProto
 
+/* See Note [Naming Scheme for Symbol Macros] */
+
 #define SymI_HasProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
                     (void*)(&(vvv)), STRENGTH_NORMAL, SYM_TYPE_CODE },
 #define SymI_HasDataProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
                     (void*)(&(vvv)), STRENGTH_NORMAL, SYM_TYPE_DATA },
 #define SymE_HasProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
-            (void*)DLL_IMPORT_DATA_REF(vvv), STRENGTH_NORMAL, SYM_TYPE_CODE },
+            (void*)(&(vvv)), STRENGTH_NORMAL, SYM_TYPE_CODE },
 #define SymE_HasDataProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
-            (void*)DLL_IMPORT_DATA_REF(vvv), STRENGTH_NORMAL, SYM_TYPE_DATA },
+            (void*)(&(vvv)), STRENGTH_NORMAL, SYM_TYPE_DATA },
 
 #define SymI_NeedsProto(vvv) SymI_HasProto(vvv)
 #define SymI_NeedsDataProto(vvv) SymI_HasDataProto(vvv)
@@ -1091,7 +1236,16 @@ RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
     { MAYBE_LEADING_UNDERSCORE_STR(#vvv),    \
       (void*)(&(xxx)), strength, ty },
 
-RtsSymbolVal rtsSyms[] = {
+
+
+/* Initialize (if not already initialized) and return an array of symbols with stuff from the RTS. */
+void initLinkerRtsSyms (StrHashTable *symhash) {
+    /* The address of data symbols with the dllimport attribute are not
+     * compile-time constants and so cannot be used in constant initialisers.
+     * For this reason, rtsSyms is a local variable within this function
+     * rather than a global constant (as it was historically).
+     */
+    const RtsSymbolVal rtsSyms[] = {
       RTS_SYMBOLS
       RTS_RET_SYMBOLS
       RTS_POSIX_ONLY_SYMBOLS
@@ -1103,9 +1257,23 @@ RtsSymbolVal rtsSyms[] = {
       RTS_FINI_ARRAY_SYMBOLS
       RTS_LIBFFI_SYMBOLS
       RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
+      RTS_SYMBOLS_PRIM
       SymI_HasDataProto(nonmoving_write_barrier_enabled)
       { 0, 0, STRENGTH_NORMAL, SYM_TYPE_CODE } /* sentinel */
-};
+    };
+
+    IF_DEBUG(linker, debugBelch("populating linker symbol table with built-in RTS symbols\n"));
+    for (const RtsSymbolVal *sym = rtsSyms; sym->lbl != NULL; sym++) {
+        IF_DEBUG(linker, debugBelch("initLinker: inserting rts symbol %s, %p\n", sym->lbl, sym->addr));
+        if (! ghciInsertSymbolTable(WSTR("(GHCi built-in symbols)"),
+                                    symhash, sym->lbl, sym->addr,
+                                    sym->strength, sym->type, 0, NULL)) {
+            barf("ghciInsertSymbolTable failed");
+        }
+    }
+    IF_DEBUG(linker, debugBelch("done with built-in RTS symbols\n"));
+}
+
 
 
 // Note [Extra RTS symbols]

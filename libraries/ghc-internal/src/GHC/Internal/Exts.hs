@@ -5,7 +5,6 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE Unsafe #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}
 
 -----------------------------------------------------------------------------
@@ -60,7 +59,7 @@ module GHC.Internal.Exts
         -- ** Pointer types
         Ptr(..), FunPtr(..),
 
-        -- ** Other primitive types
+        -- ** Other primitive types and strings
         module GHC.Internal.Types,
 
         -- ** Legacy interface for arrays of arrays
@@ -91,7 +90,6 @@ module GHC.Internal.Exts
         sameMVar#,
         sameMutVar#,
         sameTVar#,
-        sameIOPort#,
         samePromptTag#,
 
         -- ** Compat wrapper
@@ -117,14 +115,6 @@ module GHC.Internal.Exts
         -- * Strings
         -- ** Overloaded string literals
         IsString(..),
-
-        -- ** CString
-        unpackCString#,
-        unpackAppendCString#,
-        unpackFoldrCString#,
-        unpackCStringUtf8#,
-        unpackNBytes#,
-        cstringLength#,
 
         -- * Debugging
         -- ** Breakpoints
@@ -163,14 +153,35 @@ module GHC.Internal.Exts
 
         -- * The maximum tuple size
         maxTupleSize,
+
+        -- * Boxing values of any runtime representation
+        Box,
        ) where
+
+import GHC.Internal.Base
 
 import GHC.Internal.Prim hiding ( coerce, dataToTagSmall#, dataToTagLarge#, whereFrom# )
   -- Hide dataToTagLarge# because it is expected to break for
   -- GHC-internal reasons in the near future, and shouldn't
   -- be exposed from base (not even GHC.Exts)
   -- whereFrom# is similarly internal.
+import GHC.Internal.Prim.PtrEq (
+    reallyUnsafePtrEquality,
+    unsafePtrEquality#,
+    eqStableName#,
+    sameArray#,
+    sameMutableArray#,
+    sameSmallArray#,
+    sameSmallMutableArray#,
+    sameByteArray#,
+    sameMutableByteArray#,
+    sameMVar#,
+    sameMutVar#,
+    sameTVar#,
+    samePromptTag#,
+  )
 
+import GHC.Internal.Magic.Dict (WithDict(..))
 import GHC.Internal.Types
   hiding ( IO   -- Exported from "GHC.IO"
          , Type -- Exported from "Data.Kind"
@@ -306,11 +317,12 @@ import GHC.Internal.Types
          Sum61#,
          Sum62#,
          Sum63#,
+         Sum64#,
   )
-import qualified GHC.Internal.Prim.Ext
+import GHC.Internal.Prim.Ext
 import GHC.Internal.ArrayArray
-import GHC.Internal.Base hiding ( coerce )
-import GHC.Internal.IO (seq#)
+import GHC.Internal.Err ( errorWithoutStackTrace )
+import GHC.Internal.IO ( seq# )
 import GHC.Internal.Ptr
 import GHC.Internal.Stack
 import GHC.Internal.IsList (IsList(..)) -- for re-export
@@ -318,14 +330,11 @@ import GHC.Internal.IsList (IsList(..)) -- for re-export
 import qualified GHC.Internal.Data.Coerce
 import GHC.Internal.Data.String
 import GHC.Internal.Data.OldList
-import GHC.Internal.Data.Data
 import GHC.Internal.Data.Ord
 import qualified GHC.Internal.Debug.Trace
 import GHC.Internal.Unsafe.Coerce ( unsafeCoerce# ) -- just for re-export
-
--- XXX This should really be in Data.Tuple, where the definitions are
-maxTupleSize :: Int
-maxTupleSize = 64
+import GHC.Internal.Tuple (maxTupleSize)
+import GHC.Internal.Box (Box)
 
 -- | 'the' ensures that all the elements of the list are identical
 -- and then returns that unique element
@@ -385,8 +394,7 @@ traceEvent = GHC.Internal.Debug.Trace.traceEventIO
 -- entire ghc package at runtime
 
 data SpecConstrAnnotation = NoSpecConstr | ForceSpecConstr
-                deriving ( Data -- ^ @since base-4.3.0.0
-                         , Eq   -- ^ @since base-4.3.0.0
+                deriving ( Eq   -- ^ @since base-4.3.0.0
                          )
 
 
@@ -445,27 +453,3 @@ resizeSmallMutableArray# arr0 szNew a s0 =
           (# s2, arr1 #) -> case copySmallMutableArray# arr0 0# arr1 0# szOld s2 of
             s3 -> (# s3, arr1 #)
         else (# s1, arr0 #)
-
--- | Semantically, @considerAccessible = True@. But it has special meaning
--- to the pattern-match checker, which will never flag the clause in which
--- 'considerAccessible' occurs as a guard as redundant or inaccessible.
--- Example:
---
--- > case (x, x) of
--- >   (True,  True)  -> 1
--- >   (False, False) -> 2
--- >   (True,  False) -> 3 -- Warning: redundant
---
--- The pattern-match checker will warn here that the third clause is redundant.
--- It will stop doing so if the clause is adorned with 'considerAccessible':
---
--- > case (x, x) of
--- >   (True,  True)  -> 1
--- >   (False, False) -> 2
--- >   (True,  False) | considerAccessible -> 3 -- No warning
---
--- Put 'considerAccessible' as the last statement of the guard to avoid get
--- confusing results from the pattern-match checker, which takes \"consider
--- accessible\" by word.
-considerAccessible :: Bool
-considerAccessible = True

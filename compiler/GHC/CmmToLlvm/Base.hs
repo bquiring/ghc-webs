@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DerivingVia #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -281,12 +280,13 @@ data LlvmEnv = LlvmEnv
   , envConfig    :: !LlvmCgConfig    -- ^ Configuration for LLVM code gen
   , envLogger    :: !Logger          -- ^ Logger
   , envOutput    :: BufHandle        -- ^ Output buffer
-  , envTag       :: !Char            -- ^ Tag for creating unique values
+  , envTag       :: {-# UNPACK #-} !Char -- ^ Tag for creating unique values
+                                         -- See Note [Performance implications of UniqueTag]
   , envFreshMeta :: MetaId           -- ^ Supply of fresh metadata IDs
   , envUniqMeta  :: UniqFM Unique MetaId   -- ^ Global metadata nodes
   , envFunMap    :: LlvmEnvMap       -- ^ Global functions so far, with type
   , envAliases   :: UniqSet LMString -- ^ Globals that we had to alias, see [Llvm Forward References]
-  , envUsedVars  :: [LlvmVar]        -- ^ Pointers to be added to llvm.used (see @cmmUsedLlvmGens@)
+  , envUsedVars  :: [LlvmVar]        -- ^ Pointers to be added to llvm.compiler.used (see @cmmUsedLlvmGens@)
 
     -- the following get cleared for every function (see @withClearVars@)
   , envVarMap    :: LlvmEnvMap       -- ^ Local variables so far, with type
@@ -318,7 +318,7 @@ instance DSM.MonadGetUnique LlvmM where
     tag <- getEnv envTag
     liftUDSMT $! do
       uq <- DSM.getUniqueM
-      return (newTagUnique uq tag)
+      return (newTagUniqueGrimily uq tag)
 
 -- | Lifting of IO actions. Not exported, as we want to encapsulate IO.
 liftIO :: IO a -> LlvmM a
@@ -344,7 +344,7 @@ runLlvm logger cfg ver out us m = do
                       , envConfig    = cfg
                       , envLogger    = logger
                       , envOutput    = out
-                      , envTag       = 'n'
+                      , envTag       = uniqueTag CodeGenTag
                       , envFreshMeta = MetaId 0
                       , envUniqMeta  = emptyUFM
                       }

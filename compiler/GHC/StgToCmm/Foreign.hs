@@ -48,13 +48,14 @@ import GHC.Cmm.CLabel
 import GHC.Runtime.Heap.Layout
 import GHC.Types.ForeignCall
 import GHC.Data.Maybe
+import GHC.Data.FastString (mkFastStringShortText)
 import GHC.Utils.Panic
 import GHC.Types.Basic
 import GHC.Types.Unique.DSM
 import GHC.Unit.Types
 
 import GHC.Core.TyCo.Rep
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Prim
 import GHC.Utils.Misc (zipEqual)
 
 import Control.Monad
@@ -78,20 +79,19 @@ cgForeignCall (CCall (CCallSpec target cconv safety)) typ stg_args res_ty
         ; (res_regs, res_hints) <- newUnboxedTupleRegs res_ty
         ; let ((call_args, arg_hints), cmm_target)
                 = case target of
-                   StaticTarget _ _   _      False ->
-                       panic "cgForeignCall: unexpected FFI value import"
-                   StaticTarget _ lbl mPkgId True
-                     -> let labelSource
-                                = case mPkgId of
-                                        Nothing         -> ForeignLabelInThisPackage
-                                        Just pkgId      -> ForeignLabelInPackage (toUnitId pkgId)
+                    StaticTarget _ _ ForeignValue ->
+                        panic "cgForeignCall: unexpected FFI value import"
+                    StaticTarget ext lbl ForeignFunction ->
+                        let labelSource = case staticTargetUnit ext of
+                              TargetIsInThisUnit  -> ForeignLabelInThisPackage
+                              TargetIsInThat unit -> ForeignLabelInPackage $ toUnitId unit
                         in  ( unzip cmm_args
-                            , CmmLit (CmmLabel
-                                        (mkForeignLabel lbl labelSource IsFunction)))
+                            , CmmLit
+                              (CmmLabel (mkForeignLabel (mkFastStringShortText lbl) labelSource IsFunction)))
 
-                   DynamicTarget    ->  case cmm_args of
-                                           (fn,_):rest -> (unzip rest, fn)
-                                           [] -> panic "cgForeignCall []"
+                    DynamicTarget{} -> case cmm_args of
+                       (fn,_):rest -> (unzip rest, fn)
+                       [] -> panic "cgForeignCall []"
               fc = ForeignConvention cconv arg_hints res_hints CmmMayReturn
               call_target = ForeignTarget cmm_target fc
 
@@ -622,7 +622,7 @@ openNursery profile tso = do
                (CmmMachOp (mo_wordMul platform)
                  [ CmmMachOp (MO_SS_Conv W32 (wordWidth platform))
                      [CmmLoad (nursery_bdescr_blocks platform cnreg) b32 NaturallyAligned]
-                 , mkIntExpr platform (pc_BLOCK_SIZE (platformConstants platform))
+                 , mkIntExpr platform (toTargetInt (pc_BLOCK_SIZE (platformConstants platform)))
                  ])
                (-1)
              )

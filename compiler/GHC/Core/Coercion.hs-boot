@@ -1,5 +1,3 @@
-{-# LANGUAGE FlexibleContexts #-}
-
 module GHC.Core.Coercion where
 
 import GHC.Prelude
@@ -16,7 +14,7 @@ import GHC.Utils.Misc
 mkReflCo :: Role -> Type -> Coercion
 mkTyConAppCo :: HasDebugCallStack => Role -> TyCon -> [Coercion] -> Coercion
 mkAppCo :: Coercion -> Coercion -> Coercion
-mkForAllCo :: HasDebugCallStack => TyCoVar -> ForAllTyFlag -> ForAllTyFlag -> Coercion -> Coercion -> Coercion
+mkForAllCo :: HasDebugCallStack => TyCoVar -> ForAllTyFlag -> ForAllTyFlag -> MCoercion -> Coercion -> Coercion
 mkFunCo      :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkNakedFunCo :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkFunCo2     :: Role -> FunTyFlag -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
@@ -37,7 +35,6 @@ mkAxiomCo :: CoAxiomRule -> [Coercion] -> Coercion
 
 funRole :: Role -> FunSel -> Role
 
-isGReflCo :: Coercion -> Bool
 isReflCo :: Coercion -> Bool
 isReflexiveCo :: Coercion -> Bool
 decomposePiCos :: HasDebugCallStack => Coercion -> Pair Type -> [Type] -> ([Coercion], Coercion)

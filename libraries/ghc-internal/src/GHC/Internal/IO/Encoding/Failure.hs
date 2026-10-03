@@ -25,12 +25,13 @@ module GHC.Internal.IO.Encoding.Failure (
     recoverDecode#, recoverEncode#,
   ) where
 
-import GHC.Internal.IO
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.IO.Buffer
 import GHC.Internal.IO.Exception
-
-import GHC.Internal.Base
 import GHC.Internal.Char
+import GHC.Internal.Maybe ( Maybe(..) )
+import GHC.Internal.Prim ( RealWorld, State# )
 import GHC.Internal.Word
 import GHC.Internal.Show
 import GHC.Internal.Num

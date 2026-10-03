@@ -6,6 +6,7 @@
 {-# LANGUAGE GADTs #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Exception.Context
@@ -35,7 +36,8 @@ module GHC.Internal.Exception.Context
     ) where
 
 import GHC.Internal.Data.OldList (intersperse)
-import GHC.Internal.Base (($), map, (++), return, String, Maybe(..), Semigroup(..), Monoid(..))
+import GHC.Internal.Base
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Show (Show(..))
 import GHC.Internal.Data.Typeable.Internal (Typeable, typeRep, eqTypeRep)
 import GHC.Internal.Data.Type.Equality ( (:~~:)(HRefl) )
@@ -64,7 +66,7 @@ instance Monoid ExceptionContext where
 emptyExceptionContext :: ExceptionContext
 emptyExceptionContext = ExceptionContext []
 
--- | Construct a singleton 'ExceptionContext' from an 'ExceptionAnnotation'.
+-- | Add an 'ExceptionAnnotation' to a given 'ExceptionContext'.
 --
 -- @since base-4.20.0.0
 addExceptionAnnotation :: ExceptionAnnotation a => a -> ExceptionContext -> ExceptionContext

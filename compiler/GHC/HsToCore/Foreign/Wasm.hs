@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.HsToCore.Foreign.Wasm
@@ -13,9 +13,11 @@ import Data.List
   )
 import Data.List qualified
 import Data.Maybe
-import GHC.Builtin.Names
-import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.Modules( mkGhcInternalModule )
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs( bindIOIdOcc, returnIOIdOcc, ioDataConOcc )
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Prim
 import GHC.Core
 import GHC.Core.Coercion
 import GHC.Core.DataCon
@@ -42,10 +44,9 @@ import GHC.Types.Name
 import GHC.Types.SourceText
 import GHC.Types.SrcLoc
 import GHC.Types.Var
-import GHC.Unit
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import Language.Haskell.Syntax.Basic
+import Language.Haskell.Syntax.Text
 
 data Synchronicity = Sync | Async
   deriving (Eq)
@@ -53,16 +54,17 @@ data Synchronicity = Sync | Async
 dsWasmJSImport ::
   Id ->
   Coercion ->
-  CImportSpec ->
+  CImportSpec GhcTc ->
   Safety ->
   DsM ([Binding], CHeader, CStub, [Id])
-dsWasmJSImport id co (CFunction (StaticTarget _ js_src mUnitId _)) safety
-  | js_src == "wrapper" = dsWasmJSDynamicExport Async id co mUnitId
-  | js_src == "wrapper sync" = dsWasmJSDynamicExport Sync id co mUnitId
+dsWasmJSImport id co (CFunction (StaticTarget stExt (unpackHText -> js_src) _)) safety
+  | js_src == "wrapper" = dsWasmJSDynamicExport Async id co unitId
+  | js_src == "wrapper sync" = dsWasmJSDynamicExport Sync id co unitId
   | otherwise = do
-      (bs, h, c) <- dsWasmJSStaticImport id co (unpackFS js_src) mUnitId sync
+      (bs, h, c) <- dsWasmJSStaticImport id co js_src unitId sync
       pure (bs, h, c, [])
   where
+    unitId = staticTargetUnit stExt
     sync = case safety of
       PlayRisky -> Sync
       _ -> Async
@@ -131,10 +133,10 @@ dsWasmJSDynamicExport ::
   Synchronicity ->
   Id ->
   Coercion ->
-  Maybe Unit ->
+  CCallStaticTargetUnit ->
   DsM ([Binding], CHeader, CStub, [Id])
-dsWasmJSDynamicExport sync fn_id co mUnitId = do
-  sp_tycon <- dsLookupTyCon stablePtrTyConName
+dsWasmJSDynamicExport sync fn_id co unitId = do
+  sp_tycon <- dsLookupKnownKeyTyCon stablePtrTyConKey
   let ty = coercionLKind co
       (tv_bndrs, fun_ty) = tcSplitForAllTyVarBinders ty
       ([Scaled ManyTy arg_ty], io_jsval_ty) = tcSplitFunTys fun_ty
@@ -183,7 +185,7 @@ dsWasmJSDynamicExport sync fn_id co mUnitId = do
       adjustor_id
       (mkRepReflCo adjustor_ty)
       adjustor_js_src
-      mUnitId
+      unitId
       Sync
   mkJSCallback_id <-
     lookupGhcInternalVarId
@@ -224,6 +226,25 @@ FFI types aren't supported, but it's the simplest way to implement it,
 especially since leaving all the boxing/unboxing business to C unifies
 the implementation of JSFFI imports and exports
 (rts_mkJSVal/rts_getJSVal).
+
+We don't support unboxed FFI types like Int# etc. But we do support
+one kind of unlifted FFI type for JSFFI import arguments:
+ByteArray#/MutableByteArray#. The semantics is the same in C: the
+pointer to the ByteArray# payload is passed instead of the ByteArray#
+closure itself. This allows efficient zero-copy data exchange between
+Haskell and JavaScript using unpinned ByteArray#, and the following
+conditions must be met:
+
+- The JSFFI import itself must be a sync import marked as unsafe
+- The JavaScript code must not re-enter Haskell when a ByteArray# is
+  passed as argument
+
+There's no magic in the handling of ByteArray#/MutableByteArray#
+arguments. When generating C stub, we treat them like Ptr that points
+to the payload, just without the rts_getPtr() unboxing call. After
+lowering to C import, the backend takes care of adding the offset, see
+add_shim in GHC.StgToCmm.Foreign and
+Note [Unlifted boxed arguments to foreign calls].
 
 Now, each sync import calls a generated C function with a unique
 symbol. The C function uses rts_get* to unbox the arguments, call into
@@ -289,10 +310,10 @@ dsWasmJSStaticImport ::
   Id ->
   Coercion ->
   String ->
-  Maybe Unit ->
+  CCallStaticTargetUnit ->
   Synchronicity ->
   DsM ([Binding], CHeader, CStub)
-dsWasmJSStaticImport fn_id co js_src' mUnitId sync = do
+dsWasmJSStaticImport fn_id co js_src' unitId sync = do
   cfun_name <- uniqueCFunName
   let ty = coercionLKind co
       (tvs, fun_ty) = tcSplitForAllInvisTyVars ty
@@ -311,20 +332,21 @@ dsWasmJSStaticImport fn_id co js_src' mUnitId sync = do
             js_src'
   case sync of
     Sync -> do
-      rhs <- importBindingRHS mUnitId cfun_name tvs arg_tys orig_res_ty id
+      rhs <- importBindingRHS unitId cfun_name tvs arg_tys orig_res_ty id
       pure
         ( [(fn_id, Cast rhs co)],
           CHeader commonCDecls,
           importCStub Sync cfun_name (map scaledThing arg_tys) res_ty js_src
         )
     Async -> do
-      err_msg <- mkStringExpr $ js_src
-      io_tycon <- dsLookupTyCon ioTyConName
+      mk_str <- getMkStringIds dsLookupKnownKeyId
+      let err_msg = mkStringExprWith mk_str js_src
+      io_tycon <- dsLookupKnownKeyTyCon ioTyConKey
       jsval_ty <-
         mkTyConTy
           <$> lookupGhcInternalTyCon "GHC.Internal.Wasm.Prim.Types" "JSVal"
-      bindIO_id <- dsLookupGlobalId bindIOName
-      returnIO_id <- dsLookupGlobalId returnIOName
+      bindIO_id   <- dsLookupKnownOccId bindIOIdOcc
+      returnIO_id <- dsLookupKnownOccId returnIOIdOcc
       promise_id <- newSysLocalMDs jsval_ty
       blockPromise_id <-
         lookupGhcInternalVarId
@@ -340,7 +362,7 @@ dsWasmJSStaticImport fn_id co js_src' mUnitId sync = do
           "unsafeDupablePerformIO"
       rhs <-
         importBindingRHS
-          mUnitId
+          unitId
           cfun_name
           tvs
           arg_tys
@@ -380,14 +402,14 @@ uniqueCFunName = do
   mkWrapperName cfun_num "ghc_wasm_jsffi" ""
 
 importBindingRHS ::
-  Maybe Unit ->
+  CCallStaticTargetUnit ->
   FastString ->
   [TyVar] ->
   [Scaled Type] ->
   Type ->
   (CoreExpr -> CoreExpr) ->
   DsM CoreExpr
-importBindingRHS mUnitId cfun_name tvs arg_tys orig_res_ty res_trans = do
+importBindingRHS unitId cfun_name tvs arg_tys orig_res_ty res_trans = do
   ccall_uniq <- newUnique
   args_unevaled <- newSysLocalsDs arg_tys
   args_evaled <- newSysLocalsDs arg_tys
@@ -428,7 +450,7 @@ importBindingRHS mUnitId cfun_name tvs arg_tys orig_res_ty res_trans = do
         lookupGhcInternalVarId
           "GHC.Internal.IO.Unsafe"
           "unsafeDupablePerformIO"
-      io_data_con <- dsLookupDataCon ioDataConName
+      io_data_con <- dsLookupKnownOccDataCon ioDataConOcc
       let ccall_res_ty = mkTupleTy Unboxed [realWorldStatePrimTy, orig_res_ty]
           toIOCon = dataConWorkId io_data_con
           wrap the_call =
@@ -441,12 +463,16 @@ importBindingRHS mUnitId cfun_name tvs arg_tys orig_res_ty res_trans = do
   let cfun_fcall =
         CCall
           ( CCallSpec
-              (StaticTarget NoSourceText cfun_name mUnitId True)
+              (StaticTarget stExt (fastStringToShortText cfun_name) ForeignFunction)
               CCallConv
               -- Same even for foreign import javascript unsafe, for
               -- the sake of re-entrancy.
               PlaySafe
           )
+      stExt = StaticTargetGhc
+        { staticTargetLabel = NoSourceText
+        , staticTargetUnit  = unitId
+        }
       call_app =
         mkFCall ccall_uniq cfun_fcall (map Var args_evaled) ccall_action_ty
       rhs =
@@ -518,8 +544,9 @@ importCStub sync cfun_name arg_tys res_ty js_src = CStub c_doc [] []
     cfun_ret
       | res_ty `eqType` unitTy = cfun_call_import <> semi
       | otherwise = text "return" <+> cfun_call_import <> semi
-    cfun_make_arg arg_ty arg_val =
-      text ("rts_get" ++ ffiType arg_ty) <> parens arg_val
+    cfun_make_arg arg_ty arg_val
+      | isByteArrayPrimTy arg_ty = arg_val
+      | otherwise = text ("rts_get" ++ ffiType arg_ty) <> parens arg_val
     cfun_make_ret ret_val
       | res_ty `eqType` unitTy = ret_val
       | otherwise =
@@ -544,7 +571,11 @@ importCStub sync cfun_name arg_tys res_ty js_src = CStub c_doc [] []
       | res_ty `eqType` unitTy = text "void"
       | otherwise = text "HaskellObj"
     cfun_arg_list =
-      [text "HaskellObj" <+> char 'a' <> int n | n <- [1 .. length arg_tys]]
+      [ text (if isByteArrayPrimTy arg_ty then "HsPtr" else "HaskellObj")
+          <+> char 'a'
+          <> int n
+      | (arg_ty, n) <- zip arg_tys [1 ..]
+      ]
     cfun_args = case cfun_arg_list of
       [] -> text "void"
       _ -> hsep $ punctuate comma cfun_arg_list
@@ -604,7 +635,7 @@ dsWasmJSExport ::
   DsM (CHeader, CStub, String, [Id], [Binding])
 dsWasmJSExport fn_id co str = dsWasmJSExport' sync (Just fn_id) co ext_name
   where
-    (sync, ext_name) = case words $ unpackFS str of
+    (sync, ext_name) = case words $ unpackHText str of
       [ext_name] -> (Async, ext_name)
       [ext_name, "sync"] -> (Sync, ext_name)
       _ -> panic "dsWasmJSExport: unrecognized label string"
@@ -664,7 +695,7 @@ dsWasmJSExport' sync m_fn_id co ext_name = do
         -- again here.
         Sync -> [finally_id, flushStdHandles_id]
         Async -> [top_handler_id, promiseRes_id]
-      extern_closure_decls = vcat $ map mk_extern_closure_decl gc_root_closures
+      extern_closure_decls = vcat $ map mk_extern_closure_decl $ top_handler_id : gc_root_closures
       cstub_attr =
         text "__attribute__"
           <> parens
@@ -747,8 +778,18 @@ lookupGhcInternalTyCon m t = do
   n <- lookupOrig (mkGhcInternalModule m) (mkTcOcc t)
   dsLookupTyCon n
 
+isByteArrayPrimTy :: Type -> Bool
+isByteArrayPrimTy ty
+  | Just tc <- tyConAppTyCon_maybe ty,
+    tc == byteArrayPrimTyCon || tc == mutableByteArrayPrimTyCon =
+      True
+  | otherwise =
+      False
+
 ffiType :: Type -> String
-ffiType = occNameString . getOccName . fst . splitTyConApp
+ffiType ty
+  | isByteArrayPrimTy ty = "Ptr"
+  | otherwise = occNameString $ getOccName $ tyConAppTyCon ty
 
 commonCDecls :: SDoc
 commonCDecls =

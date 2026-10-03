@@ -370,7 +370,8 @@ void nonmovingBeginFlush(Task *task)
 bool nonmovingWaitForFlush(void)
 {
     ACQUIRE_LOCK(&upd_rem_set_lock);
-    debugTrace(DEBUG_nonmoving_gc, "Flush count %d", upd_rem_set_flush_count);
+    debugTrace(DEBUG_nonmoving_gc, "Flush count %" FMT_Word,
+                                   upd_rem_set_flush_count);
     bool finished = upd_rem_set_flush_count == getNumCapabilities();
     if (!finished) {
         waitCondition(&upd_rem_set_flushed_cond, &upd_rem_set_lock);
@@ -606,7 +607,7 @@ static
 bool check_in_nonmoving_heap(StgClosure *p) {
     if (HEAP_ALLOCED_GC(p)) {
         // This works for both large and small objects:
-        return Bdescr((P_)p)->flags & BF_NONMOVING;
+        return block_get_flags(Bdescr((P_)p)) & BF_NONMOVING;
     } else {
         return true; // a static object
     }
@@ -619,7 +620,7 @@ inline void updateRemembSetPushThunk(Capability *cap, StgThunk *thunk)
 {
     const StgInfoTable *info;
     do {
-        info = *(StgInfoTable* volatile*) &thunk->header.info;
+        info = (StgInfoTable*) RELAXED_LOAD(&thunk->header.info);
     } while (info == &stg_WHITEHOLE_info);
 
     const StgThunkInfoTable *thunk_info = THUNK_INFO_PTR_TO_STRUCT(info);
@@ -722,13 +723,14 @@ STATIC_INLINE bool needs_upd_rem_set_mark(StgClosure *p)
 {
     // TODO: Deduplicate with mark_closure
     bdescr *bd = Bdescr((StgPtr) p);
+    uint16_t flags = block_get_flags(bd);
     if (bd->gen != oldest_gen) {
         return false;
-    } else if (bd->flags & BF_LARGE) {
-        if (! (bd->flags & BF_NONMOVING_SWEEPING)) {
+    } else if (flags & BF_LARGE) {
+        if (! (flags & BF_NONMOVING_SWEEPING)) {
             return false;
         } else {
-            return ! (bd->flags & BF_MARKED);
+            return ! (flags & BF_MARKED);
         }
     } else {
         struct NonmovingSegment *seg = nonmovingGetSegment((StgPtr) p);
@@ -740,8 +742,8 @@ STATIC_INLINE bool needs_upd_rem_set_mark(StgClosure *p)
 static void finish_upd_rem_set_mark_large(bdescr* bd) {
     // Someone else may have already marked it.
     ACQUIRE_LOCK(&nonmoving_large_objects_mutex);
-    if (! (bd->flags & BF_MARKED)) {
-        bd->flags |= BF_MARKED;
+    if (! (block_get_flags(bd) & BF_MARKED)) {
+        block_set_flag(bd, BF_MARKED);
         dbl_link_remove(bd, &nonmoving_large_objects);
         dbl_link_onto(bd, &nonmoving_marked_large_objects);
         n_nonmoving_large_blocks -= bd->blocks;
@@ -754,7 +756,7 @@ static void finish_upd_rem_set_mark_large(bdescr* bd) {
 STATIC_INLINE void finish_upd_rem_set_mark(StgClosure *p)
 {
     bdescr *bd = Bdescr((StgPtr) p);
-    if (bd->flags & BF_LARGE) {
+    if (block_get_flags(bd) & BF_LARGE) {
         // This function is extracted so that this function can be inline
         finish_upd_rem_set_mark_large(bd);
     } else {
@@ -1054,16 +1056,10 @@ trace_tso (MarkQueue *queue, StgTSO *tso)
     if (tso->label != NULL) {
         markQueuePushClosure_(queue, (StgClosure *) tso->label);
     }
-    switch (ACQUIRE_LOAD(&tso->why_blocked)) {
-    case BlockedOnMVar:
-    case BlockedOnMVarRead:
-    case BlockedOnBlackHole:
-    case BlockedOnMsgThrowTo:
-    case NotBlocked:
+    if (IsBlockInfoClosure(ACQUIRE_LOAD(&tso->why_blocked))) {
+        /* This also follows the block_info.prev back-link in
+         * the NotBlocked case, which may not be necessary. */
         markQueuePushClosure_(queue, tso->block_info.closure);
-        break;
-    default:
-        break;
     }
 }
 
@@ -1180,6 +1176,7 @@ trace_stack_ (MarkQueue *queue, StgPtr sp, StgPtr spBottom)
         case STOP_FRAME:
         case CATCH_FRAME:
         case RET_SMALL:
+        case ANN_FRAME:
         {
             StgWord bitmap = BITMAP_BITS(info->i.layout.bitmap);
             StgWord size   = BITMAP_SIZE(info->i.layout.bitmap);
@@ -1342,7 +1339,7 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
             goto done;
 
         case WHITEHOLE:
-            while (*(StgInfoTable* volatile*) &p->header.info == &stg_WHITEHOLE_info)
+            while (RELAXED_LOAD(&p->header.info) == &stg_WHITEHOLE_info)
 #if defined(PARALLEL_GC)
                 busy_wait_nop()
 #endif
@@ -1376,35 +1373,36 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
 
     // N.B. only the first block of a compact region is guaranteed to carry
     // BF_NONMOVING; consequently we must separately check for BF_COMPACT.
-    if (bd->flags & (BF_COMPACT | BF_NONMOVING)) {
+    const uint16_t flags = block_get_flags(bd);
+    if (flags & (BF_COMPACT | BF_NONMOVING)) {
 
-        if (bd->flags & BF_COMPACT) {
+        if (flags & BF_COMPACT) {
             StgCompactNFData *str = objectGetCompact((StgClosure*)p);
             bd = Bdescr((P_)str);
 
-            if (! (bd->flags & BF_NONMOVING_SWEEPING)) {
+            if (! (flags & BF_NONMOVING_SWEEPING)) {
                 // Not in the snapshot
                 return;
             }
 
-            if (! (bd->flags & BF_MARKED)) {
+            if (! (flags & BF_MARKED)) {
                 dbl_link_remove(bd, &nonmoving_compact_objects);
                 dbl_link_onto(bd, &nonmoving_marked_compact_objects);
                 StgWord blocks = str->totalW / BLOCK_SIZE_W;
                 n_nonmoving_compact_blocks -= blocks;
                 n_nonmoving_marked_compact_blocks += blocks;
-                bd->flags |= BF_MARKED;
+                block_set_flag(bd, BF_MARKED);
             }
 
             // N.B. the object being marked is in a compact region so by
             // definition there is no need to do any tracing here.
             goto done;
-        } else if (bd->flags & BF_LARGE) {
-            if (! (bd->flags & BF_NONMOVING_SWEEPING)) {
+        } else if (flags & BF_LARGE) {
+            if (! (flags & BF_NONMOVING_SWEEPING)) {
                 // Not in the snapshot
                 goto done;
             }
-            if (bd->flags & BF_MARKED) {
+            if (flags & BF_MARKED) {
                 goto done;
             }
         } else {
@@ -1666,9 +1664,42 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
     case SMALL_MUT_ARR_PTRS_FROZEN_CLEAN:
     case SMALL_MUT_ARR_PTRS_FROZEN_DIRTY: {
         StgSmallMutArrPtrs *arr = (StgSmallMutArrPtrs *) p;
-        for (StgWord i = 0; i < arr->ptrs; i++) {
-            StgClosure **field = &arr->payload[i];
-            markQueuePushClosure(queue, ACQUIRE_LOAD(field), field);
+        StgWord n = arr->ptrs;
+        if (n == 0) break;
+
+        for (StgWord i = 0; i < n; i++) {
+            StgClosure *c = ACQUIRE_LOAD(&arr->payload[i]);
+            // If NULL or -1, we know the rest is slop
+            if (c == NULL || c == (StgClosure *)(-1)) break;
+            // A valid skip count at position i must satisfy
+            //   i + skip <= n-1  (sentinel at i-1, count at i, skip more words)
+            // i.e. skip < n-i.  If c is out of that range it cannot be a skip
+            // count, so we must have read a valid closure pointer.
+            bool maybe_slop_count = (StgWord)c < n - i;
+            if (maybe_slop_count && i != 0) {
+                // Otherwise re-read the previous element: the mutator may have
+                // written -1 there after we last saw it, making the current
+                // word the skip count rather than a valid closure pointer.
+                //
+                // The ACQUIRE_LOAD of payload[i] above synchronizes with the
+                // RELEASE_STORE in writeSlopMarker, so a RELAXED_LOAD suffices
+                // here; see Note [Slop marker memory ordering] in
+                // rts/include/rts/storage/ClosureMacros.h.
+                if (RELAXED_LOAD(&arr->payload[i-1]) == (StgClosure *)(-1)) break;
+            }
+
+            // Track origin so indirections reached through array elements get
+            // short-cut (see Note [Origin references in the nonmoving
+            // collector] in NonMovingMark.h), but only when c cannot be a skip
+            // count, i.e. c >= n-i.
+            // The collapse rewrites the cell with a CAS that fires only if it
+            // still holds c; restricting to c >= n-i guarantees c differs from
+            // any skip count the mutator could write at this cell while
+            // concurrently shrinking the array, so the CAS can never clobber a
+            // slop marker. Real heap addresses are far above n, so in practice
+            // every element is still short-cut.
+            StgClosure **origin = maybe_slop_count ? NULL : &arr->payload[i];
+            markQueuePushClosure(queue, c, origin);
         }
         break;
     }
@@ -1712,7 +1743,7 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
         break;
 
     case WHITEHOLE:
-        while (*(StgInfoTable* volatile*) &p->header.info == &stg_WHITEHOLE_info);
+        while ((StgInfoTable *) RELAXED_LOAD(&p->header.info) == &stg_WHITEHOLE_info);
         goto try_again;
 
     case COMPACT_NFDATA:
@@ -1736,24 +1767,25 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
      * the object's pointers since in the case of marking stacks there may be a
      * mutator waiting for us to finish so it can start execution.
      */
-    if (bd->flags & BF_LARGE) {
+    uint16_t bd_flags = block_get_flags(bd);
+    if (bd_flags & BF_LARGE) {
         /* Marking a large object isn't idempotent since we move it to
          * nonmoving_marked_large_objects; to ensure that we don't repeatedly
          * mark a large object, we only set BF_MARKED on large objects in the
          * nonmoving heap while holding nonmoving_large_objects_mutex
          */
         ACQUIRE_LOCK(&nonmoving_large_objects_mutex);
-        if (! (bd->flags & BF_MARKED)) {
+        if (! (bd_flags & BF_MARKED)) {
             // Remove the object from nonmoving_large_objects and link it to
             // nonmoving_marked_large_objects
             dbl_link_remove(bd, &nonmoving_large_objects);
             dbl_link_onto(bd, &nonmoving_marked_large_objects);
             n_nonmoving_large_blocks -= bd->blocks;
             n_nonmoving_marked_large_blocks += bd->blocks;
-            bd->flags |= BF_MARKED;
+            block_set_flag(bd, BF_MARKED);
         }
         RELEASE_LOCK(&nonmoving_large_objects_mutex);
-    } else if (bd->flags & BF_NONMOVING) {
+    } else if (bd_flags & BF_NONMOVING) {
         // TODO: Kill repetition
         struct NonmovingSegment *seg = nonmovingGetSegment((StgPtr) p);
         nonmoving_block_idx block_idx = nonmovingGetBlockIdx((StgPtr) p);
@@ -1768,7 +1800,7 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
     }
 
 done:
-    if (origin != NULL && (!HEAP_ALLOCED(p) || bd->flags & BF_NONMOVING)) {
+    if (origin != NULL && (!HEAP_ALLOCED(p) || block_get_flags(bd) & BF_NONMOVING)) {
         if (UNTAG_CLOSURE((StgClosure*)p0) != p && *origin == p0) {
             if (cas((StgVolatilePtr)origin, (StgWord)p0, (StgWord)TAG_CLOSURE(tag, p)) == (StgWord)p0) {
                 // debugBelch("Thunk optimization successful\n");
@@ -1841,7 +1873,8 @@ nonmovingMark (MarkBudget* budget, MarkQueue *queue)
                 RELEASE_SM_LOCK;
             } else {
                 // Nothing more to do
-                debugTrace(DEBUG_nonmoving_gc, "Finished mark pass: %d", count);
+                debugTrace(DEBUG_nonmoving_gc,
+                           "Finished mark pass: %" FMT_Word64, count);
                 traceConcMarkEnd(count);
                 return;
             }
@@ -1865,19 +1898,20 @@ bool nonmovingIsAlive (StgClosure *p)
     }
 
     bdescr *bd = Bdescr((P_)p);
+    uint16_t bd_flags = block_get_flags(bd);
 
     // All non-static objects in the non-moving heap should be marked as
     // BF_NONMOVING
-    ASSERT(bd->flags & BF_NONMOVING);
+    ASSERT(bd_flags & BF_NONMOVING);
 
-    if (bd->flags & (BF_COMPACT | BF_LARGE)) {
-        if (bd->flags & BF_COMPACT) {
+    if (bd_flags & (BF_COMPACT | BF_LARGE)) {
+        if (bd_flags & BF_COMPACT) {
             StgCompactNFData *str = objectGetCompact((StgClosure*)p);
             bd = Bdescr((P_)str);
         }
-        return (bd->flags & BF_NONMOVING_SWEEPING) == 0
+        return (bd_flags & BF_NONMOVING_SWEEPING) == 0
                    // the large object wasn't in the snapshot and therefore wasn't marked
-            || (bd->flags & BF_MARKED) != 0;
+            || (bd_flags & BF_MARKED) != 0;
                    // The object was marked
     } else {
         struct NonmovingSegment *seg = nonmovingGetSegment((StgPtr) p);
@@ -1931,8 +1965,8 @@ static bool nonmovingIsNowAlive (StgClosure *p)
     }
 
     bdescr *bd = Bdescr((P_)p);
+    const uint16_t flags = block_get_flags(bd);
 
-    const uint16_t flags = bd->flags;
     if (flags & BF_LARGE) {
         if (flags & BF_PINNED && !(flags & BF_NONMOVING)) {
             // In this case we have a pinned object living in a non-full
@@ -1942,15 +1976,15 @@ static bool nonmovingIsNowAlive (StgClosure *p)
             return true;
         }
 
-        ASSERT(bd->flags & BF_NONMOVING);
-        return (bd->flags & BF_NONMOVING_SWEEPING) == 0
+        ASSERT(flags & BF_NONMOVING);
+        return (flags & BF_NONMOVING_SWEEPING) == 0
                    // the large object wasn't in the snapshot and therefore wasn't marked
-            || (bd->flags & BF_MARKED) != 0;
+            || (flags & BF_MARKED) != 0;
                    // The object was marked
     } else {
         // All non-static objects in the non-moving heap should be marked as
         // BF_NONMOVING.
-        ASSERT(bd->flags & BF_NONMOVING);
+        ASSERT(flags & BF_NONMOVING);
 
         struct NonmovingSegment *seg = nonmovingGetSegment((StgPtr) p);
         StgClosure *snapshot_loc =
@@ -2013,7 +2047,10 @@ bool nonmovingTidyWeaks (struct MarkQueue_ *queue)
 
         // See Note [Weak pointer processing and the non-moving GC] in
         // MarkWeak.c
-        bool key_in_nonmoving = HEAP_ALLOCED_GC(w->key) && Bdescr((StgPtr) w->key)->flags & BF_NONMOVING;
+        bool key_in_nonmoving =
+               HEAP_ALLOCED_GC(w->key) &&
+               block_get_flags(Bdescr((StgPtr) w->key)) & BF_NONMOVING;
+
         if (!key_in_nonmoving || nonmovingIsNowAlive(w->key)) {
             nonmovingMarkLiveWeak(queue, w);
             did_work = true;

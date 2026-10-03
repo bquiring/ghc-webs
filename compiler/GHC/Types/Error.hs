@@ -1,13 +1,5 @@
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 module GHC.Types.Error
@@ -26,7 +18,7 @@ module GHC.Types.Error
 
    -- * Classifying Messages
 
-   , MessageClass (..)
+   , MessageClass (MCDiagnostic, ..)
    , Severity (..)
    , Diagnostic (..)
    , UnknownDiagnostic (..)
@@ -72,6 +64,7 @@ module GHC.Types.Error
    , pprMessageBag
    , mkLocMessage
    , mkLocMessageWarningGroups
+   , formatDiagnostic
    , getCaretDiagnostic
 
    , jsonDiagnostic
@@ -120,6 +113,7 @@ import Data.Maybe ( maybeToList )
 import Data.Typeable ( Typeable )
 import Numeric.Natural ( Natural )
 import Text.Printf ( printf )
+import Language.Haskell.Syntax.Text
 
 {- Note [Messages]
 ~~~~~~~~~~~~~~~~~~
@@ -238,8 +232,6 @@ class HasDefaultDiagnosticOpts opts where
 
 defaultDiagnosticOpts :: forall opts . HasDefaultDiagnosticOpts (DiagnosticOpts opts) => DiagnosticOpts opts
 defaultDiagnosticOpts = defaultOpts @(DiagnosticOpts opts)
-
-
 
 
 -- | A class identifying a diagnostic.
@@ -491,20 +483,29 @@ data MessageClass
     -- ^ Log messages intended for end users.
     -- No file\/line\/column stuff.
 
-  | MCDiagnostic Severity ResolvedDiagnosticReason (Maybe DiagnosticCode)
+  | InternalMCDiagnostic Severity ResolvedDiagnosticReason (Maybe DiagnosticCode)
     -- ^ Diagnostics from the compiler. This constructor is very powerful as
     -- it allows the construction of a 'MessageClass' with a completely
     -- arbitrary permutation of 'Severity' and 'DiagnosticReason'. As such,
-    -- users are encouraged to use the 'mkMCDiagnostic' smart constructor
+    -- users are encouraged to use higher level primitives
     -- instead. Use this constructor directly only if you need to construct
     -- and manipulate diagnostic messages directly, for example inside
     -- 'GHC.Utils.Error'. In all the other circumstances, /especially/ when
-    -- emitting compiler diagnostics, use the smart constructor.
+    -- emitting compiler diagnostics, use higher level primitives.
+    --
+    -- For deconstruction use `MCDiagnostic`.
     --
     -- The @Maybe 'DiagnosticCode'@ field carries a code (if available) for
     -- this diagnostic. If you are creating a message not tied to any
     -- error-message type, then use Nothing. In the long run, this really
     -- should always have a 'DiagnosticCode'. See Note [Diagnostic codes].
+    --
+{-# WARNING in "x-InternalMCDiagnostic" InternalMCDiagnostic
+    "This is an internal constructor.  Use `MCDiagnostic` or `GHC.Driver.Errors.printMessages` instead." #-}
+
+{-# COMPLETE MCOutput, MCFatal, MCInteractive, MCDump, MCInfo, MCDiagnostic #-}
+pattern MCDiagnostic :: Severity -> ResolvedDiagnosticReason -> Maybe DiagnosticCode -> MessageClass
+pattern MCDiagnostic severity reason code <- InternalMCDiagnostic severity reason code
 
 {-
 Note [Suppressing Messages]
@@ -557,15 +558,6 @@ instance ToJson Severity where
   json SevIgnore = JSString "Ignore"
   json SevWarning = JSString "Warning"
   json SevError = JSString "Error"
-
-instance ToJson MessageClass where
-  json MCOutput = JSString "MCOutput"
-  json MCFatal  = JSString "MCFatal"
-  json MCInteractive = JSString "MCInteractive"
-  json MCDump = JSString "MCDump"
-  json MCInfo = JSString "MCInfo"
-  json (MCDiagnostic sev reason code) =
-    JSString $ renderWithContext defaultSDocContext (ppr $ text "MCDiagnostic" <+> ppr sev <+> ppr reason <+> ppr code)
 
 instance ToJson DiagnosticCode where
   json c = JSInt (fromIntegral (diagnosticCodeNumber c))
@@ -627,7 +619,7 @@ jsonDiagnostic rendered m = JSObject $ [
               ]
           WarningWithCategory (WarningCategory cat) ->
             Just $ JSObject
-              [ ("category", JSString $ unpackFS cat)
+              [ ("category", JSString $ unpackHText cat)
               ]
 
 instance Show (MsgEnvelope DiagnosticMessage) where
@@ -656,32 +648,51 @@ mkLocMessageWarningGroups
   -> SrcSpan                            -- ^ location
   -> SDoc                               -- ^ message
   -> SDoc
-  -- Always print the location, even if it is unhelpful.  Error messages
-  -- are supposed to be in a standard format, and one without a location
-  -- would look strange.  Better to say explicitly "<no location info>".
 mkLocMessageWarningGroups show_warn_groups msg_class locn msg
-    = sdocOption sdocColScheme $ \col_scheme ->
-      let locn' = sdocOption sdocErrorSpans $ \case
-                     True  -> ppr locn
-                     False -> ppr (srcSpanStart locn)
-
+  = case msg_class of
+    MCDiagnostic severity reason code -> formatDiagnostic show_warn_groups locn severity reason code msg
+    _ -> sdocOption sdocColScheme $ \col_scheme ->
+      let
           msg_colour = getMessageClassColour msg_class col_scheme
-          col = coloured msg_colour . text
 
           msg_title = coloured msg_colour $
             case msg_class of
-              MCDiagnostic SevError   _ _ -> text "error"
-              MCDiagnostic SevWarning _ _ -> text "warning"
               MCFatal                     -> text "fatal"
               _                           -> empty
 
-          warning_flag_doc =
-            case msg_class of
-              MCDiagnostic sev reason _code
-                | Just msg <- flag_msg sev (resolvedDiagnosticReason reason)
-                  -> brackets msg
-              _   -> empty
+      in formatLocMessageWarningGroups locn msg_title empty empty msg
 
+formatDiagnostic
+  :: Bool                               -- ^ Print warning groups?
+  -> SrcSpan                            -- ^ location
+  -> Severity
+  -> ResolvedDiagnosticReason
+  -> Maybe DiagnosticCode
+  -> SDoc                               -- ^ message
+  -> SDoc
+formatDiagnostic show_warn_groups locn severity reason code msg
+    = sdocOption sdocColScheme $ \col_scheme ->
+      let
+          msg_colour :: Col.PprColour
+          msg_colour = getSeverityColour severity col_scheme
+
+          col :: String -> SDoc
+          col = coloured msg_colour . text
+
+          msg_title :: SDoc
+          msg_title = coloured msg_colour $
+            case severity of
+              SevError -> text "error"
+              SevWarning -> text "warning"
+              SevIgnore -> empty
+
+          warning_flag_doc :: SDoc
+          warning_flag_doc =
+            case flag_msg severity (resolvedDiagnosticReason reason) of
+              Nothing -> empty
+              Just msg -> brackets msg
+
+          ppr_with_hyperlink :: DiagnosticCode -> SDoc
           ppr_with_hyperlink code =
             -- this is a bit hacky, but we assume that if the terminal supports colors
             -- then it should also support links
@@ -691,10 +702,11 @@ mkLocMessageWarningGroups show_warn_groups msg_class locn msg
                  then ppr $ LinkedDiagCode code
                  else ppr code
 
+          code_doc :: SDoc
           code_doc =
-            case msg_class of
-              MCDiagnostic _ _ (Just code) -> brackets (ppr_with_hyperlink code)
-              _                            -> empty
+            case code of
+              Just code -> brackets (ppr_with_hyperlink code)
+              Nothing -> empty
 
           flag_msg :: Severity -> DiagnosticReason -> Maybe SDoc
           flag_msg SevIgnore _                 = Nothing
@@ -725,13 +737,35 @@ mkLocMessageWarningGroups show_warn_groups msg_class locn msg
               vcat [ text "locn:" <+> ppr locn
                    , text "msg:" <+> ppr msg ]
 
+          warn_flag_grp :: [WarningGroup] -> SDoc
           warn_flag_grp groups
               | show_warn_groups, not (null groups)
                           = text $ "(in " ++ intercalate ", " (map (("-W"++) . warningGroupName) groups) ++ ")"
               | otherwise = empty
 
+      in formatLocMessageWarningGroups locn msg_title code_doc warning_flag_doc msg
+
+formatLocMessageWarningGroups
+  :: SrcSpan                            -- ^ location
+  -> SDoc                               -- ^ title
+  -> SDoc                               -- ^ diagnostic code
+  -> SDoc                               -- ^ warning groups
+  -> SDoc                               -- ^ message
+  -> SDoc
+formatLocMessageWarningGroups locn msg_title code_doc warning_flag_doc msg
+    = sdocOption sdocColScheme $ \col_scheme ->
+      let
+          -- Always print the location, even if it is unhelpful.  Error messages
+          -- are supposed to be in a standard format, and one without a location
+          -- would look strange.  Better to say explicitly "<no location info>".
+          locn' :: SDoc
+          locn' = sdocOption sdocErrorSpans $ \case
+                     True  -> ppr locn
+                     False -> ppr (srcSpanStart locn)
+
           -- Add prefixes, like    Foo.hs:34: warning:
           --                           <the warning message>
+          header :: SDoc
           header = locn' <> colon <+>
                    msg_title <> colon <+>
                    code_doc <+> warning_flag_doc
@@ -741,13 +775,17 @@ mkLocMessageWarningGroups show_warn_groups msg_class locn msg
                         msg)
 
 getMessageClassColour :: MessageClass -> Col.Scheme -> Col.PprColour
-getMessageClassColour (MCDiagnostic SevError _reason _code)   = Col.sError
-getMessageClassColour (MCDiagnostic SevWarning _reason _code) = Col.sWarning
+getMessageClassColour (MCDiagnostic severity _reason _code)   = getSeverityColour severity
 getMessageClassColour MCFatal                                 = Col.sFatal
 getMessageClassColour _                                       = const mempty
 
+getSeverityColour :: Severity -> Col.Scheme -> Col.PprColour
+getSeverityColour severity = case severity of
+  SevError -> Col.sError
+  SevWarning -> Col.sWarning
+  SevIgnore -> const mempty
+
 getCaretDiagnostic :: MessageClass -> SrcSpan -> IO SDoc
-getCaretDiagnostic _ (UnhelpfulSpan _) = pure empty
 getCaretDiagnostic msg_class (RealSrcSpan span _) =
   caretDiagnostic <$> getSrcLine (srcSpanFile span) row
   where
@@ -821,7 +859,7 @@ getCaretDiagnostic msg_class (RealSrcSpan span _) =
         caretEllipsis | multiline = "..."
                       | otherwise = ""
         caretLine = replicate start ' ' ++ replicate width '^' ++ caretEllipsis
-
+getCaretDiagnostic _ _ = pure empty
 --
 -- Queries
 --

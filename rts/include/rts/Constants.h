@@ -57,11 +57,12 @@
 #define MAX_SPEC_CONSTR_SIZE   2
 
 /* Range of built-in table of static small int-like and char-like closures.
+ * Range is inclusive of both minimum and maximum.
  *
  *   NB. This corresponds with the number of actual INTLIKE/CHARLIKE
  *   closures defined in rts/StgMiscClosures.cmm.
  */
-#define MAX_INTLIKE             255
+#define MAX_INTLIKE             255 /* See #16961 for why 255 */
 #define MIN_INTLIKE             (-16)
 
 #define MAX_CHARLIKE            255
@@ -116,16 +117,14 @@
    How large is the stack frame saved by StgRun?
    world.  Used in StgCRun.c.
 
-   The size has to be enough to save the registers (see StgCRun)
-   plus padding if the result is not 16 byte aligned.
-   See the Note [Stack Alignment on X86] in StgCRun.c for details.
+   The size has to be enough to save the registers (see StgCRun).
 
    -------------------------------------------------------------------------- */
 #if defined(x86_64_HOST_ARCH)
 #  if defined(mingw32_HOST_OS)
 #    define STG_RUN_STACK_FRAME_SIZE 240
 #  else
-#    define STG_RUN_STACK_FRAME_SIZE 48
+#    define STG_RUN_STACK_FRAME_SIZE 56
 #  endif
 #endif
 
@@ -249,33 +248,86 @@
 
 /*
  * Constants for the why_blocked field of a TSO
- * NB. keep these in sync with GHC/Conc/Sync.hs: threadStatus
+ *
+ * These say why the TSO is blocked, and also act as the tag for the
+ * block_info union. The comment for each tag below says which member
+ * of the block_info union is used.
+ *
+ * We also use the why_blocked to determine if the block_info contains
+ * a closure or not. There are three classes of tag:
+ * 1. why_blocked tags where block_info is always a closure;
+ * 2. why_blocked tags where block_info is never a closure;
+ * 3. why_blocked tags where block_info is sometimes a closure;
+ *
+ * We use the following encoding scheme for the three classes above:
+ * 1. the tag value has bits 3 and 4 unset (values 0..7);
+ * 2. the tag value has bit 3 set (values 8..15); and
+ * 3. the tag value has bit 4 set when it is not a closure and unset
+ *    when it is a closure.
+ *
+ * This scheme makes it cheap and simple to check if the GC needs to
+ * look at the block_info.closure.
+ *
+ * The reason for the encoding using 2 marker bits rather than 1 is
+ * that it minimises the cases in the code that need to use or check
+ * the tag bits. The only tags in class 3 are BlockedOn{Read,Write
+ * Delay} which are used by in-RTS I/O managers, and the only ones that
+ * need to use block_info members that are not a closure are the legacy
+ * I/O managers select and win32-legacy. So when these I/O managers are
+ * removed then we can simplify the encoding.
  */
-#define NotBlocked          0
-#define BlockedOnMVar       1
-#define BlockedOnMVarRead   14 /* TODO: renumber me, see #9003 */
-#define BlockedOnBlackHole  2
-#define BlockedOnRead       3
-#define BlockedOnWrite      4
-#define BlockedOnDelay      5
-#define BlockedOnSTM        6
+#define BlockInfoForceNonClosure 16
+#define UntagWhyBlocked(why) ((why) & 15)
+#define IsBlockInfoClosure(why) (((why) & 24) == 0)
+/*
+ * In the threaded RTS there is an invariant that the block_info union
+ * is always a valid GC closure. To ensure this, the tags that use
+ * block_info.unused, always set it to END_TSO_QUEUE. The non-closure
+ * why_blocked tags are only used by I/O managers on the non-threaded
+ * RTS. New in-RTS I/O managers use the AIOP and TimeoutQueue mechanism
+ * which are closures.
+ *
+ * Note: keep these in sync with GHC/Conc/Sync.hs: threadStatus
+ * Note: keep these in sync with Schedule.c: eventlogThreadStatusBlocked which
+ * converts the constants here to the ones used in the eventlog.
+ * Note: keep the encoding here in sync with parseWhyBlocked in ghc-heap
+ */
+#define NotBlocked          0 /* Uses block_info.prev */
+#define BlockedOnMVar       1 /* Uses block_info.mvar */
+#define BlockedOnMVarRead   2 /* Uses block_info.mvar */
+#define BlockedOnBlackHole  3 /* Uses block_info.bh */
+#define BlockedOnMsgThrowTo 4 /* Uses block_info.throwto */
+#define BlockedOnRead       5 /* Uses block_info.aiop
+                                 or with BlockInfoForceNonClosure
+                                 uses .fd or .async_reqID */
+#define BlockedOnWrite      6 /* Uses block_info.aiop
+                                 or with BlockInfoForceNonClosure
+                                 uses .fd or .async_reqID */
+#define BlockedOnDelay      7 /* Uses block_info.timeout
+                                 or with BlockInfoForceNonClosure
+                                 uses .target */
 
-/* Win32 only: */
-#define BlockedOnDoProc     7
+#define BlockedOnSTM                  8 /* Uses block_info.unused */
+#define BlockedOnCCall                9 /* Uses block_info.unused */
+#define BlockedOnCCall_Interruptible 10 /* Uses block_info.unused
+                                         * Same as BlockedOnCCall but permits
+                                         * killing the worker thread */
+#define ThreadMigrating              11 /* Uses block_info.unused */
+#define BlockedOnDoProc              12 /* Uses block_info.async_reqID */
 
-/* Only relevant for THREADED_RTS: */
-#define BlockedOnCCall      10
-#define BlockedOnCCall_Interruptible 11
-   /* same as above but permit killing the worker thread */
+/* Reserved values, not values that why_blocked currently use. They
+ * are used in primop stg_threadStatuszh and must not overlap with
+ * other why_blocked status values. They could be changed, if the
+ * threadStatus in ghc-internal is updated too.
+ */
+#define BlockedThreadComplete 16
+#define BlockedThreadKilled   17
 
-/* Involved in a message sent to tso->msg_cap */
-#define BlockedOnMsgThrowTo 12
+/* Next available non-closure why_blocked tag numbers are: 13,14,15
+ * For more closure tag numbers, shift up all the non-closure ones
+ * and adjust the BlockInfoForceNonClosure tag and related macros.
+ * If we reach BlockInfoForceNonClosure then shift that up. */
 
-/* The thread is not on any run queues, but can be woken up
-   by tryWakeupThread() */
-#define ThreadMigrating     13
-
-/* Next number is 15.  */
 
 /*
  * These constants are returned to the scheduler by a thread that has
@@ -287,6 +339,7 @@
 #define ThreadYielding 3
 #define ThreadBlocked  4
 #define ThreadFinished 5
+/* If this is ever extended, also adjust the eventlogStopStatus mapping */
 
 /*
  * Flags for the tso->flags field.
@@ -371,3 +424,35 @@
  * It is known that maximum length of uint32_t in string is 10 chars (4294967295) + 1 NULL.
  */
 #define CLOSURE_DESC_BUFFER_SIZE 11
+
+/* -----------------------------------------------------------------------------
+   Constants for closures that -- depending on the word size -- have different
+   numbers of non-pointer fields.
+
+   These help ensure consistency between the CMM INFO_TABLE_CONSTR declarations
+   in StgMiscClosures.cmm and the C structure definitions in Closures.h, by
+   lettting us assert the overall C struct size.
+
+   TODO: Ideally we would have a general solution that ensures the CMM
+   declarations match the actual C struct definitions for all closure types.
+   This is a partial solution for the tricky cases.
+   -------------------------------------------------------------------------- */
+
+#define stg_TIMEOUT_QUEUE_NUM_PTRS 4
+#if SIZEOF_VOID_P == 4
+#if defined(wasm32_HOST_ARCH)
+/* ABI struct alignment rules on wasm. See struct StgTimeoutQueue comments. */
+#define stg_TIMEOUT_QUEUE_NUM_NONPTRS 5
+#else
+#define stg_TIMEOUT_QUEUE_NUM_NONPTRS 4
+#endif
+#else
+#define stg_TIMEOUT_QUEUE_NUM_NONPTRS 2
+#endif
+
+#define stg_ASYNCIOOP_NUM_PTRS 2
+#if SIZEOF_VOID_P == 4
+#define stg_ASYNCIOOP_NUM_NONPTRS 4
+#else
+#define stg_ASYNCIOOP_NUM_NONPTRS 2
+#endif

@@ -1,7 +1,3 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic DsMessage
 
@@ -186,6 +182,8 @@ instance Diagnostic DsMessage where
                -> mkMsg "Exotic literal" (ppr lit)
              ThExoticPattern pat
                -> mkMsg "Exotic pattern" (ppr pat)
+             ThUnsupportedTyLit lit
+               -> mkMsg "Unsupported type literal" (ppr lit)
              ThGuardedLambdas m
                -> mkMsg "Guarded lambdas" (pprMatch m)
              ThNegativeOverloadedPatterns pat
@@ -201,6 +199,10 @@ instance Diagnostic DsMessage where
                -> mkMsg "Non-linear fields in data constructors" empty
              ThDataConVisibleForall
                -> mkMsg "Visible forall in data constructors" empty
+             ThUnexpectedModifier mods
+               -> mkMsg "Modifier" $ text "At most one modifier is supported" $$ pprLHsModifiers mods
+             ThUnexpectedModifierExpr mods
+               -> mkMsg "Modifier" $ text "At most one modifier is supported" $$ pprLHsModifiers mods
          where
            mkMsg what doc =
              mkSimpleDecorated $
@@ -246,7 +248,7 @@ instance Diagnostic DsMessage where
               <+> text "may fail for the following constructors:")
            2
            (hsep $ punctuate comma $
-            map ppr (take maxCons cons) ++ [ text "..." | lengthExceeds cons maxCons ])
+            map ppr (take maxCons cons) ++ [ ellipsis | lengthExceeds cons maxCons ])
 
   diagnosticReason = \case
     DsUnknownMessage m          -> diagnosticReason m
@@ -338,7 +340,7 @@ badMonadBind elt_ty
 -- Print a single clause (for redundant/with-inaccessible-rhs)
 pprEqn :: HsMatchContextRn -> SDoc -> String -> SDoc
 pprEqn ctx q txt = pprContext True ctx (text txt) $ \f ->
-  f (q <+> matchSeparator ctx <+> text "...")
+  f (q <+> matchSeparator ctx <+> ellipsis)
 
 pprContext :: Bool -> HsMatchContextRn -> SDoc -> ((SDoc -> SDoc) -> SDoc) -> SDoc
 pprContext singular kind msg rest_of_msg_fun
@@ -357,5 +359,5 @@ pprContext singular kind msg rest_of_msg_fun
 
 dots :: Int -> [a] -> SDoc
 dots maxPatterns qs
-    | qs `lengthExceeds` maxPatterns = text "..."
+    | qs `lengthExceeds` maxPatterns = ellipsis
     | otherwise                      = empty

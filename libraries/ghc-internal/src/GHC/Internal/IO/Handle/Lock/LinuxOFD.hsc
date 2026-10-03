@@ -20,20 +20,23 @@ import GHC.Internal.Types ()
 #include <unistd.h>
 #include <fcntl.h>
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Data.Function
 import GHC.Internal.Data.Functor
 import GHC.Internal.Foreign.C.Error
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.Marshal.Utils
 import GHC.Internal.Foreign.Storable
-import GHC.Internal.Base
 import GHC.Internal.IO.Exception
 import GHC.Internal.IO.FD
 import GHC.Internal.IO.Handle.FD
 import GHC.Internal.IO.Handle.Lock.Common
 import GHC.Internal.IO.Handle.Types (Handle)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Ptr
 import GHC.Internal.System.Posix.Types (COff, CPid)
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 -- Linux open file descriptor locking.
 --

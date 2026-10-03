@@ -214,6 +214,7 @@ module GHC.Internal.Data.List
 
    ) where
 
+import GHC.Internal.Base hiding( foldr )
 import GHC.Internal.Data.Foldable
 import GHC.Internal.Data.Traversable
 
@@ -222,9 +223,6 @@ import GHC.Internal.Data.OldList hiding
       foldl, foldl1, foldl', foldr, foldr1, mapAccumL,
       mapAccumR, maximum, maximumBy, minimum, minimumBy,
       length, notElem, null, or, product, sum )
-
-import GHC.Internal.Base ( Bool(..), Eq((==)), otherwise )
-import GHC.Internal.List (List)
 
 -- | The 'isSubsequenceOf' function takes two lists and returns 'True' if all
 -- the elements of the first list occur, in order, in the second. The

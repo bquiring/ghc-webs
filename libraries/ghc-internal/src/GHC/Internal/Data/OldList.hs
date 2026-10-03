@@ -213,15 +213,17 @@ module GHC.Internal.Data.OldList
 
    ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Data.Bits        ( (.&.) )
+import GHC.Internal.Err ( errorWithoutStackTrace )
+import GHC.Internal.Prim ( seq, (+#) )
 import GHC.Internal.Unicode      ( isSpace )
 import GHC.Internal.Data.Tuple       ( fst, snd )
-
 import GHC.Internal.Num
 import GHC.Internal.Real
 import GHC.Internal.List
-import GHC.Internal.Base
+import GHC.Internal.Stack.Types as Rebindable
 
 infix 5 \\ -- comment to fool cpp: https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/phases.html#cpp-and-string-gaps
 
@@ -494,21 +496,16 @@ dropLengthMaybe (_:x') (_:y') = dropLengthMaybe x' y'
 isInfixOf               :: (Eq a) => [a] -> [a] -> Bool
 isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
 
--- | \(\mathcal{O}(n^2)\). The 'nub' function removes duplicate elements from a
+-- | The 'nub' function removes duplicate elements from a
 -- list. In particular, it keeps only the first occurrence of each element. (The
 -- name 'nub' means \`essence\'.) It is a special case of 'nubBy', which allows
 -- the programmer to supply their own equality test.
 --
+-- This function knows too little about the elements to be efficient.
+-- Its asymptotic complexity is
+-- /O/(/n/ ⋅ /d/), where /d/ is the number of distinct elements in the list.
 --
--- If there exists @instance Ord a@, it's faster to use `nubOrd` from the `containers` package
--- ([link to the latest online documentation](https://hackage.haskell.org/package/containers/docs/Data-Containers-ListUtils.html#v:nubOrd)),
--- which takes only \(\mathcal{O}(n \log d)\) time where `d` is the number of
--- distinct elements in the list.
---
--- Another approach to speed up 'nub' is to use
--- 'map' @Data.List.NonEmpty.@'Data.List.NonEmpty.head' . @Data.List.NonEmpty.@'Data.List.NonEmpty.group' . 'sort',
--- which takes \(\mathcal{O}(n \log n)\) time, requires @instance Ord a@ and doesn't
--- preserve the order.
+-- If there exists @instance Ord a@, it's faster to use 'Data.List.nubOrd'.
 --
 -- ==== __Examples__
 --
@@ -581,7 +578,7 @@ delete                  =  deleteBy (==)
 --
 -- >>> deleteBy (/=) 5 [5, 5, 4, 3, 5, 2]
 -- [5,5,3,5,2]
-deleteBy                :: (a -> a -> Bool) -> a -> [a] -> [a]
+deleteBy                :: (a -> b -> Bool) -> a -> [b] -> [b]
 deleteBy _  _ []        = []
 deleteBy eq x (y:ys)    = if x `eq` y then ys else y : deleteBy eq x ys
 
@@ -1347,7 +1344,7 @@ unzip7          =  foldr (\(a,b,c,d,e,f,g) ~(as,bs,cs,ds,es,fs,gs) ->
 --
 -- >>> deleteFirstsBy (/=) [1..10] [1, 3, 5]
 -- [4,5,6,7,8,9,10]
-deleteFirstsBy          :: (a -> a -> Bool) -> [a] -> [a] -> [a]
+deleteFirstsBy          :: (a -> b -> Bool) -> [b] -> [a] -> [b]
 deleteFirstsBy eq       =  foldl (flip (deleteBy eq))
 
 -- | The 'group' function takes a list and returns a list of lists such

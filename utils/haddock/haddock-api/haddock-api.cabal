@@ -51,6 +51,7 @@ common extensions
     StrictData
     TypeApplications
     TypeOperators
+    OverloadedStrings
 
   default-language:   Haskell2010
 
@@ -78,11 +79,12 @@ library
     build-depends: ghc-paths       ^>= 0.1.0.12
 
   -- this package typically supports only single major versions
-  build-depends: base             >= 4.16 && < 4.23
-               , ghc             ^>= 9.15
+  build-depends: base             >= 4.16 && < 4.24
+               , ghc             ^>= 10.1
                , haddock-library ^>= 1.11
-               , xhtml           ^>= 3000.2.2
+               , xhtml           ^>= 3000.4.0.0
                , parsec          ^>= 3.1.13.0
+               , text             >= 2.0 && < 2.2
 
   -- Versions for the dependencies below are transitively pinned by
   -- the non-reinstallable `ghc` package and hence need no version
@@ -96,7 +98,9 @@ library
                , filepath
                , ghc-boot
                , mtl
+               , semaphore-compat
                , transformers
+               , text
 
   hs-source-dirs: src
 
@@ -137,7 +141,6 @@ library
     Haddock.Backends.Xhtml.Types
     Haddock.Backends.Xhtml.Utils
     Haddock.Backends.LaTeX
-    Haddock.Backends.HaddockDB
     Haddock.Backends.Hoogle
     Haddock.Backends.Hyperlinker
     Haddock.Backends.Hyperlinker.Parser
@@ -212,7 +215,7 @@ test-suite spec
   build-depends: ghc             ^>= 9.7
                , ghc-paths       ^>= 0.1.0.12
                , haddock-library ^>= 1.11
-               , xhtml           ^>= 3000.2.2
+               , xhtml           ^>= 3000.4.0.0
                , hspec           ^>= 2.9
                , parsec          ^>= 3.1.13.0
                , QuickCheck      >= 2.11  && ^>= 2.14

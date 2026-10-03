@@ -1,5 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Interacting with the iserv interpreter, whether it is running on an
@@ -18,6 +17,7 @@ module GHC.Runtime.Interpreter
   , mallocData
   , createBCOs
   , addSptEntry
+  , addHpcModule
   , mkCostCentres
   , costCentreStackInfo
   , newBreakArray
@@ -38,7 +38,7 @@ module GHC.Runtime.Interpreter
   , lookupSymbol
   , lookupSymbolInDLL
   , lookupClosure
-  , loadDLL
+  , loadDLLs
   , loadArchive
   , loadObj
   , unloadObj
@@ -86,11 +86,13 @@ import GHC.Data.FastString
 
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
+import GHC.Types.Error
 
 import GHC.Utils.Panic
 import GHC.Utils.Exception as Ex
-import GHC.Utils.Outputable(brackets, ppr, showSDocUnsafe)
+import GHC.Utils.Outputable
 import GHC.Utils.Fingerprint
+import GHC.Utils.Logger (Logger, logMsg)
 
 import GHC.Unit.Module
 import GHC.Unit.Home.ModInfo
@@ -106,14 +108,14 @@ import Control.Monad.IO.Class
 import Control.Monad.Catch as MC (mask)
 import Data.Binary
 import Data.ByteString (ByteString)
-import Foreign hiding (void)
+import qualified Data.ByteString.Short as SBS
 import qualified GHC.Exts.Heap as Heap
 import GHC.Stack.CCS (CostCentre,CostCentreStack)
 import System.Directory
 import System.Process
 import qualified GHC.InfoProv as InfoProv
 
-import GHC.Builtin.Names
+import GHC.Builtin.Modules( gHC_PRIM, gHC_PRIMOPWRAPPERS )
 import GHC.Types.Name
 import qualified GHC.Unit.Home.Graph as HUG
 
@@ -351,9 +353,15 @@ evalStringToIOString interp fhv str =
 mallocData :: Interp -> ByteString -> IO (RemotePtr ())
 mallocData interp bs = interpCmd interp (MallocData bs)
 
-mkCostCentres :: Interp -> String -> [(String,String)] -> IO [RemotePtr CostCentre]
-mkCostCentres interp mod ccs =
-  interpCmd interp (MkCostCentres mod ccs)
+mkCostCentres :: Interp -> FastString -> [(SBS.ShortByteString, SBS.ShortByteString)] -> IO [RemotePtr CostCentre]
+mkCostCentres interp mod ccs = do
+  rp <- modifyMVar (interpStringCache interp) $ \fs_env ->
+    case lookupFsEnv fs_env mod of
+      Just rp -> pure (fs_env, rp)
+      Nothing -> do
+        rp <- fmap head $ interpCmd interp $ MallocStrings [bytesFS mod]
+        pure (extendFsEnv fs_env mod rp, rp)
+  interpCmd interp $ MkCostCentres rp ccs
 
 -- | Create a set of BCOs that may be mutually recursive.
 createBCOs :: Interp -> [ResolvedBCO] -> IO [HValueRef]
@@ -364,6 +372,10 @@ addSptEntry :: Interp -> Fingerprint -> ForeignHValue -> IO ()
 addSptEntry interp fpr ref =
   withForeignRef ref $ \val ->
     interpCmd interp (AddSptEntry fpr val)
+
+addHpcModule :: Interp -> SBS.ShortByteString -> Int -> Int -> SBS.ShortByteString -> IO ()
+addHpcModule interp modLabel tickNo hash tickboxes  =
+  interpCmd interp (AddHpcModule modLabel tickNo hash tickboxes)
 
 costCentreStackInfo :: Interp -> RemotePtr CostCentreStack -> IO [String]
 costCentreStackInfo interp ccs =
@@ -402,17 +414,17 @@ whereFrom interp ref =
     interpCmd interp (WhereFrom hval)
 
 -- | Send a Seq message to the iserv process to force a value      #2950
-seqHValue :: Interp -> UnitEnv -> ForeignHValue -> IO (EvalResult ())
-seqHValue interp unit_env ref =
+seqHValue :: Interp -> UnitEnv -> Logger -> ForeignHValue -> IO (EvalResult ())
+seqHValue interp unit_env logger ref =
   withForeignRef ref $ \hval -> do
     status <- interpCmd interp (Seq hval)
-    handleSeqHValueStatus interp unit_env status
+    handleSeqHValueStatus interp unit_env logger status
 
 evalBreakpointToId :: EvalBreakpoint -> InternalBreakpointId
 evalBreakpointToId eval_break =
   let
     mkUnitId u = fsToUnit $ mkFastStringShortByteString u
-    toModule u n = mkModule (mkUnitId u) (mkModuleName n)
+    toModule u n = mkModule (mkUnitId u) (mkModuleNameFS (mkFastStringShortByteString n))
   in
     InternalBreakpointId
       { ibi_info_mod   = toModule (eb_info_mod_unit eval_break) (eb_info_mod eval_break)
@@ -420,16 +432,15 @@ evalBreakpointToId eval_break =
       }
 
 -- | Process the result of a Seq or ResumeSeq message.             #2950
-handleSeqHValueStatus :: Interp -> UnitEnv -> EvalStatus () -> IO (EvalResult ())
-handleSeqHValueStatus interp unit_env eval_status =
+handleSeqHValueStatus :: Interp -> UnitEnv -> Logger -> EvalStatus () -> IO (EvalResult ())
+handleSeqHValueStatus interp unit_env logger eval_status =
   case eval_status of
     (EvalBreak _ maybe_break resume_ctxt _) -> do
       -- A breakpoint was hit; inform the user and tell them
       -- which breakpoint was hit.
       resume_ctxt_fhv <- liftIO $ mkFinalizedHValue interp resume_ctxt
-
-      let put x = putStrLn ("*** Ignoring breakpoint " ++ (showSDocUnsafe x))
-      let nothing_case = put $ brackets . ppr $ mkGeneralSrcSpan (fsLit "<unknown>")
+      let put loc = logMsg logger MCOutput loc ("*** Ignoring breakpoint" <+> brackets (ppr loc))
+      let nothing_case = put noSrcSpan
       case maybe_break of
         Nothing -> nothing_case
           -- Nothing case - should not occur!
@@ -446,13 +457,12 @@ handleSeqHValueStatus interp unit_env eval_status =
             -- Nothing case - should not occur! We should have the appropriate
             -- breakpoint information
             Nothing -> nothing_case
-            Just modbreaks -> put . brackets . ppr =<<
-              getBreakLoc (readIModModBreaks hug) ibi modbreaks
+            Just modbreaks -> put =<< getBreakLoc (readIModModBreaks hug) ibi modbreaks
 
       -- resume the seq (:force) processing in the iserv process
       withForeignRef resume_ctxt_fhv $ \hval -> do
         status <- interpCmd interp (ResumeSeq hval)
-        handleSeqHValueStatus interp unit_env status
+        handleSeqHValueStatus interp unit_env logger status
     (EvalComplete _ r) -> return r
 
 
@@ -462,31 +472,31 @@ handleSeqHValueStatus interp unit_env eval_status =
 initObjLinker :: Interp -> IO ()
 initObjLinker interp = interpCmd interp InitLinker
 
-lookupSymbol :: Interp -> InterpSymbol s -> IO (Maybe (Ptr ()))
+lookupSymbol :: Interp -> InterpSymbol s -> IO (Maybe (RemotePtr ()))
 lookupSymbol interp str = withSymbolCache interp str $
   case interpInstance interp of
 #if defined(HAVE_INTERNAL_INTERPRETER)
-    InternalInterp -> fmap fromRemotePtr <$> run (LookupSymbol (unpackFS (interpSymbolToCLabel str)))
+    InternalInterp -> run (LookupSymbol (fastStringToShortByteString (interpSymbolToCLabel str)))
 #endif
     ExternalInterp ext -> case ext of
-      ExtIServ i -> withIServ i $ \inst -> fmap fromRemotePtr <$> do
+      ExtIServ i -> withIServ i $ \inst -> do
         uninterruptibleMask_ $
-          sendMessage inst (LookupSymbol (unpackFS (interpSymbolToCLabel str)))
+          sendMessage inst (LookupSymbol (fastStringToShortByteString (interpSymbolToCLabel str)))
       ExtJS {} -> pprPanic "lookupSymbol not supported by the JS interpreter" (ppr str)
-      ExtWasm i -> withWasmInterp i $ \inst -> fmap fromRemotePtr <$> do
+      ExtWasm i -> withWasmInterp i $ \inst -> do
         uninterruptibleMask_ $
-          sendMessage inst (LookupSymbol (unpackFS (interpSymbolToCLabel str)))
+          sendMessage inst (LookupSymbol (fastStringToShortByteString (interpSymbolToCLabel str)))
 
-lookupSymbolInDLL :: Interp -> RemotePtr LoadedDLL -> InterpSymbol s -> IO (Maybe (Ptr ()))
+lookupSymbolInDLL :: Interp -> RemotePtr LoadedDLL -> InterpSymbol s -> IO (Maybe (RemotePtr ()))
 lookupSymbolInDLL interp dll str = withSymbolCache interp str $
   case interpInstance interp of
 #if defined(HAVE_INTERNAL_INTERPRETER)
-    InternalInterp -> fmap fromRemotePtr <$> run (LookupSymbolInDLL dll (unpackFS (interpSymbolToCLabel str)))
+    InternalInterp -> run (LookupSymbolInDLL dll (fastStringToShortByteString (interpSymbolToCLabel str)))
 #endif
     ExternalInterp ext -> case ext of
-      ExtIServ i -> withIServ i $ \inst -> fmap fromRemotePtr <$> do
+      ExtIServ i -> withIServ i $ \inst -> do
         uninterruptibleMask_ $
-          sendMessage inst (LookupSymbolInDLL dll (unpackFS (interpSymbolToCLabel str)))
+          sendMessage inst (LookupSymbolInDLL dll (fastStringToShortByteString (interpSymbolToCLabel str)))
       ExtJS {} -> pprPanic "lookupSymbol not supported by the JS interpreter" (ppr str)
       -- wasm dyld doesn't track which symbol comes from which .so
       ExtWasm {} -> lookupSymbol interp str
@@ -520,7 +530,7 @@ interpSymbolToCLabel s = eliminateInterpSymbol s interpretedInterpSymbol $ \is -
 
 lookupClosure :: Interp -> InterpSymbol s -> IO (Maybe HValueRef)
 lookupClosure interp str =
-  interpCmd interp (LookupClosure (unpackFS (interpSymbolToCLabel str)))
+  interpCmd interp (LookupClosure (fastStringToShortByteString (interpSymbolToCLabel str)))
 
 -- | 'withSymbolCache' tries to find a symbol in the 'interpLookupSymbolCache'
 -- which maps symbols to the address where they are loaded.
@@ -530,11 +540,11 @@ lookupClosure interp str =
 withSymbolCache :: Interp
                 -> InterpSymbol s
                 -- ^ The symbol we are looking up in the cache
-                -> IO (Maybe (Ptr ()))
+                -> IO (Maybe (RemotePtr ()))
                 -- ^ An action which determines the address of the symbol we
                 -- are looking up in the cache, which is run if there is a
                 -- cache miss. The result will be cached.
-                -> IO (Maybe (Ptr ()))
+                -> IO (Maybe (RemotePtr ()))
 withSymbolCache interp str determine_addr = do
 
   -- Profiling of GHCi showed a lot of time and allocation spent
@@ -559,13 +569,13 @@ withSymbolCache interp str determine_addr = do
 purgeLookupSymbolCache :: Interp -> IO ()
 purgeLookupSymbolCache interp = purgeInterpSymbolCache (interpSymbolCache interp)
 
--- | loadDLL loads a dynamic library using the OS's native linker
+-- | 'loadDLLs' loads dynamic libraries using the OS's native linker
 -- (i.e. dlopen() on Unix, LoadLibrary() on Windows).  It takes either
--- an absolute pathname to the file, or a relative filename
--- (e.g. "libfoo.so" or "foo.dll").  In the latter case, loadDLL
--- searches the standard locations for the appropriate library.
-loadDLL :: Interp -> String -> IO (Either String (RemotePtr LoadedDLL))
-loadDLL interp str = interpCmd interp (LoadDLL str)
+-- absolute pathnames to the files, or relative filenames
+-- (e.g. "libfoo.so" or "foo.dll").  In the latter case, 'loadDLLs'
+-- searches the standard locations for the appropriate libraries.
+loadDLLs :: Interp -> [String] -> IO (Either String [RemotePtr LoadedDLL])
+loadDLLs interp strs = interpCmd interp (LoadDLLs strs)
 
 loadArchive :: Interp -> String -> IO ()
 loadArchive interp path = do
@@ -588,13 +598,13 @@ unloadObj interp path = do
 -- GHC process, so we must make paths absolute before sending them
 -- over.
 
-addLibrarySearchPath :: Interp -> String -> IO (Ptr ())
+addLibrarySearchPath :: Interp -> String -> IO (RemotePtr ())
 addLibrarySearchPath interp str =
-  fromRemotePtr <$> interpCmd interp (AddLibrarySearchPath str)
+  interpCmd interp (AddLibrarySearchPath str)
 
-removeLibrarySearchPath :: Interp -> Ptr () -> IO Bool
+removeLibrarySearchPath :: Interp -> RemotePtr () -> IO Bool
 removeLibrarySearchPath interp p =
-  interpCmd interp (RemoveLibrarySearchPath (toRemotePtr p))
+  interpCmd interp (RemoveLibrarySearchPath p)
 
 resolveObjs :: Interp -> IO SuccessFlag
 resolveObjs interp = successIf <$> interpCmd interp ResolveObjs
@@ -761,4 +771,3 @@ readIModModBreaks hug mod = imodBreaks_modBreaks . expectJust <$> readIModBreaks
 fromEvalResult :: EvalResult a -> IO a
 fromEvalResult (EvalException e) = throwIO (fromSerializableException e)
 fromEvalResult (EvalSuccess a) = return a
-

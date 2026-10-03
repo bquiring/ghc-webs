@@ -34,10 +34,10 @@ import GHC.Iface.Syntax
 import GHC.Iface.Recomp
 import GHC.Iface.Load
 import GHC.Iface.Ext.Fields
+import GHC.HsToCore.Breakpoints.Types (ModBreaks)
 
 import GHC.CoreToIface
 
-import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
@@ -122,11 +122,12 @@ mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
          , mg_safe_haskell = safe_mode
          , mg_trust_pkg    = self_trust
          , mg_docs         = docs
+         , mg_modBreaks    = modBreaks
          }
   = do
       self_recomp <- traverse (mkSelfRecomp hsc_env this_mod (ms_hs_hash mod_summary)) usages
       return $ mkIface_ hsc_env this_mod core_prog hsc_src deps rdr_env import_decls fix_env warns self_trust
-                safe_mode self_recomp docs mod_details
+                safe_mode self_recomp docs mod_details modBreaks
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
 -- generator produced information.
@@ -228,9 +229,10 @@ mkIfaceTc :: HscEnv
           -> ModDetails         -- gotten from mkBootModDetails, probably
           -> ModSummary
           -> Maybe CoreProgram
+          -> Maybe ModBreaks
           -> TcGblEnv           -- Usages, deprecations, etc
           -> IO ModIface
-mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
+mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program mb_modBreaks
   tc_result@TcGblEnv{ tcg_mod = this_mod,
                       tcg_src = hsc_src,
                       tcg_imports = imports,
@@ -239,16 +241,16 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
                       tcg_fix_env = fix_env,
                       tcg_warns = warns
                     }
-  = do
-          let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
-          let home_unit = hsc_home_unit hsc_env
+  = do    let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
+          let home_unit     = hsc_home_unit hsc_env
+          let dflags        = ms_hspp_opts mod_summary
           let deps = mkDependencies home_unit
                                     (tcg_mod tc_result)
                                     (tcg_imports tc_result)
                                     (map mi_module pluginModules)
 
           usage <- mkRecompUsageInfo hsc_env tc_result
-          docs <- extractDocs (ms_hspp_opts mod_summary) tc_result
+          docs  <- extractDocs dflags tc_result
           self_recomp <- traverse (mkSelfRecomp hsc_env this_mod (ms_hs_hash mod_summary)) usage
 
           let partial_iface = mkIface_ hsc_env
@@ -258,6 +260,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
                    (imp_trust_own_pkg imports) safe_mode self_recomp
                    docs
                    mod_details
+                   mb_modBreaks
 
           mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
 
@@ -269,6 +272,7 @@ mkRecompUsageInfo hsc_env tc_result = do
     else do
      let used_names = mkUsedNames tc_result
      dep_files <- (readIORef (tcg_dependent_files tc_result))
+     dep_dirs  <- (readIORef (tcg_dependent_dirs tc_result))
      (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
      let uc = initUsageConfig hsc_env
          plugins = hsc_plugins hsc_env
@@ -289,6 +293,7 @@ mkRecompUsageInfo hsc_env tc_result = do
           (tcg_import_decls tc_result)
           used_names
           dep_files
+          dep_dirs
           (tcg_merged tc_result)
           needed_links
           needed_pkgs
@@ -302,6 +307,7 @@ mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> Maybe IfaceSelfRecomp
          -> Maybe Docs
          -> ModDetails
+         -> Maybe ModBreaks
          -> PartialModIface
 mkIface_ hsc_env
          this_mod core_prog hsc_src deps rdr_env import_decls fix_env src_warns
@@ -319,16 +325,17 @@ mkIface_ hsc_env
 --      only at the TypeEnv.  The previous Tidy phase has
 --      put exactly the info into the TypeEnv that we want
 --      to expose in the interface
-
+        modBreaks
   = do
     let home_unit    = hsc_home_unit hsc_env
         semantic_mod = homeModuleNameInstantiation home_unit (moduleName this_mod)
         entities = typeEnvElts type_env
-        show_linear_types = xopt LangExt.LinearTypes (hsc_dflags hsc_env)
 
-        simplified_core = if gopt Opt_WriteIfSimplifiedCore dflags then Just (IfaceSimplifiedCore [ toIfaceTopBind b | b <- core_prog ] emptyIfaceForeign)
-                                                                   else Nothing
-        decls  = [ tyThingToIfaceDecl show_linear_types entity
+        simplified_core =
+          if gopt Opt_WriteIfSimplifiedCore dflags
+          then Just (IfaceSimplifiedCore [ toIfaceTopBind b | b <- core_prog ] modBreaks emptyIfaceForeign)
+          else Nothing
+        decls  = [ tyThingToIfaceDecl entity
                  | entity <- entities,
                    let name = getName entity,
                    not (isImplicitTyThing entity),
@@ -470,13 +477,14 @@ coreRuleToIfaceRule (Rule { ru_name = name, ru_fn = fn,
                             ru_act = act, ru_bndrs = bndrs,
                             ru_args = args, ru_rhs = rhs,
                             ru_orphan = orph, ru_auto = auto })
-  = IfaceRule { ifRuleName  = name, ifActivation = act,
-                ifRuleBndrs = map toIfaceBndr bndrs,
-                ifRuleHead  = fn,
-                ifRuleArgs  = map do_arg args,
-                ifRuleRhs   = toIfaceExpr rhs,
-                ifRuleAuto  = auto,
-                ifRuleOrph  = orph }
+  = IfaceRule { ifRuleName   = name,
+                ifActivation = act,
+                ifRuleBndrs  = map toIfaceBndr bndrs,
+                ifRuleHead   = fn,
+                ifRuleArgs   = map do_arg args,
+                ifRuleRhs    = toIfaceExpr rhs,
+                ifRuleAuto   = auto,
+                ifRuleOrph   = orph }
   where
         -- For type args we must remove synonyms from the outermost
         -- level.  Reason: so that when we read it back in we'll
@@ -527,6 +535,8 @@ mkIfaceImports = map go
       = IfaceImport decl (ImpIfaceExplicit (sortAvails env) (nameSetElemsStable parents_of_implicits))
     go (ImpUserSpec decl (ImpUserEverythingBut ns))
       = IfaceImport decl (ImpIfaceEverythingBut (nameSetElemsStable ns))
+    go (ImpUserSpec decl ImpUserDependOnly)
+      = IfaceImport decl ImpIfaceDependOnly
 
 mkIfaceExports :: [AvailInfo] -> [IfaceExport] -- Sort to make canonical
 mkIfaceExports as = case sortAvails as of DefinitelyDeterministicAvails sas -> sas

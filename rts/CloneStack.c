@@ -26,11 +26,6 @@
 #include <string.h>
 
 
-static StgWord getStackFrameCount(StgStack* stack);
-static StgWord getStackChunkClosureCount(StgStack* stack);
-static StgArrBytes* allocateByteArray(Capability *cap, StgWord bytes);
-static void copyPtrsToArray(StgArrBytes* arr, StgStack* stack);
-
 static StgStack* cloneStackChunk(Capability* capability, const StgStack* stack)
 {
   StgWord spOffset = stack->sp - stack->stack;
@@ -89,15 +84,32 @@ void sendCloneStackMessage(StgTSO *tso, HsStablePtr mvar) {
   sendMessage(srcCapability, tso->cap, (Message *)msg);
 }
 
-void handleCloneStackMessage(MessageCloneStack *msg){
-  StgStack* newStackClosure = cloneStack(msg->tso->cap, msg->tso->stackobj);
+// The cap argument is the capability which is handling the CloneStack message
+void handleCloneStackMessage(Capability *cap, MessageCloneStack *msg){
+  // We must check that the current owner of the thread we want to clone the stack for
+  // is still this capability.
+  // See Note [TSO owner may change in between Msg being sent and received]
+  Capability *owner = RELAXED_LOAD(&msg->tso->cap);
+  if (owner != cap) {
+    // The target TSO may have migrated after the message was queued on the old
+    // capability. In that case we must forward the request to the current
+    // owner; otherwise we would race with another capability mutating the
+    // stack while we clone it.
+    sendMessage(cap, owner, (Message *)msg);
+    return;
+  }
+
+  // At this point the executing capability owns the TSO, so it is the only
+  // capability that may safely inspect the live stack and the one whose
+  // allocator we must use for the cloned StgStack closure.
+  StgStack* newStackClosure = cloneStack(cap, msg->tso->stackobj);
 
   // Lift StackSnapshot# to StackSnapshot by applying it's constructor.
   // This is necessary because performTryPutMVar() puts the closure onto the
   // stack for evaluation and stacks can not be evaluated (entered).
-  HaskellObj result = rts_apply(msg->tso->cap, StackSnapshot_constructor_closure, (HaskellObj) newStackClosure);
+  HaskellObj result = rts_apply(cap, StackSnapshot_constructor_closure, (HaskellObj) newStackClosure);
 
-  bool putMVarWasSuccessful = performTryPutMVar(msg->tso->cap, msg->result, result);
+  bool putMVarWasSuccessful = performTryPutMVar(cap, msg->result, result);
 
   if(!putMVarWasSuccessful) {
     barf("Can't put stack cloning result into MVar.");
@@ -112,94 +124,3 @@ void sendCloneStackMessage(StgTSO *tso STG_UNUSED, HsStablePtr mvar STG_UNUSED) 
 }
 
 #endif // end !defined(THREADED_RTS)
-
-// Creates a MutableArray# (Haskell representation) that contains a
-// InfoProvEnt* for every stack frame on the given stack. Thus, the size of the
-// array is the count of stack frames.
-// Each InfoProvEnt* is looked up by lookupIPE(). If there's no IPE for a stack
-// frame it's represented by null.
-StgArrBytes* decodeClonedStack(Capability *cap, StgStack* stack) {
-  StgWord closureCount = getStackFrameCount(stack);
-
-  StgArrBytes* array = allocateByteArray(cap, sizeof(StgInfoTable*) * closureCount);
-
-  copyPtrsToArray(array, stack);
-
-  return array;
-}
-
-// Count the stack frames that are on the given stack.
-// This is the sum of all stack frames in all stack chunks of this stack.
-StgWord getStackFrameCount(StgStack* stack) {
-  StgWord closureCount = 0;
-  StgStack *last_stack = stack;
-  while (true) {
-    closureCount += getStackChunkClosureCount(last_stack);
-
-    // check whether the stack ends in an underflow frame
-    StgUnderflowFrame *frame = (StgUnderflowFrame *) (last_stack->stack
-      + last_stack->stack_size - sizeofW(StgUnderflowFrame));
-    if (frame->info == &stg_stack_underflow_frame_d_info
-      ||frame->info == &stg_stack_underflow_frame_v16_info
-      ||frame->info == &stg_stack_underflow_frame_v32_info
-      ||frame->info == &stg_stack_underflow_frame_v64_info) {
-      last_stack = frame->next_chunk;
-    } else {
-      break;
-    }
-  }
-  return closureCount;
-}
-
-StgWord getStackChunkClosureCount(StgStack* stack) {
-    StgWord closureCount = 0;
-    StgPtr sp = stack->sp;
-    StgPtr spBottom = stack->stack + stack->stack_size;
-    for (; sp < spBottom; sp += stack_frame_sizeW((StgClosure *)sp)) {
-      closureCount++;
-    }
-
-    return closureCount;
-}
-
-// Allocate and initialize memory for a ByteArray# (Haskell representation).
-StgArrBytes* allocateByteArray(Capability *cap, StgWord bytes) {
-  // Idea stolen from PrimOps.cmm:stg_newArrayzh()
-  StgWord words = sizeofW(StgArrBytes) + bytes;
-
-  StgArrBytes* array = (StgArrBytes*) allocate(cap, words);
-
-  SET_HDR(array, &stg_ARR_WORDS_info, CCS_SYSTEM);
-  array->bytes  = bytes;
-  return array;
-}
-
-static void copyPtrsToArray(StgArrBytes* arr, StgStack* stack) {
-  StgWord index = 0;
-  StgStack *last_stack = stack;
-  const StgInfoTable **result = (const StgInfoTable **) arr->payload;
-  while (true) {
-    StgPtr sp = last_stack->sp;
-    StgPtr spBottom = last_stack->stack + last_stack->stack_size;
-    for (; sp < spBottom; sp += stack_frame_sizeW((StgClosure *)sp)) {
-      const StgInfoTable* infoTable = ((StgClosure *)sp)->header.info;
-      result[index] = infoTable;
-      index++;
-    }
-
-    // Ensure that we didn't overflow the result array
-    ASSERT(index-1 < arr->bytes / sizeof(StgInfoTable*));
-
-    // check whether the stack ends in an underflow frame
-    StgUnderflowFrame *frame = (StgUnderflowFrame *) (last_stack->stack
-      + last_stack->stack_size - sizeofW(StgUnderflowFrame));
-    if (frame->info == &stg_stack_underflow_frame_d_info
-      ||frame->info == &stg_stack_underflow_frame_v16_info
-      ||frame->info == &stg_stack_underflow_frame_v32_info
-      ||frame->info == &stg_stack_underflow_frame_v64_info) {
-      last_stack = frame->next_chunk;
-    } else {
-      break;
-    }
-  }
-}

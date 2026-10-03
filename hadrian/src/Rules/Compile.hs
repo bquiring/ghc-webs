@@ -8,7 +8,7 @@ import Hadrian.Oracles.TextFile
 import Base
 import Context as C
 import Expression
-import Oracles.Flag (platformSupportsSharedLibs)
+import Oracles.Flag (targetSupportsSharedLibs)
 import Rules.Generate
 import Settings
 import Target
@@ -59,14 +59,19 @@ compilePackage rs = do
       -- When building dynamically we depend on the static rule if shared libs
       -- are supported, because it will add the -dynamic-too flag when
       -- compiling to build the dynamic files alongside the static files
-      ( root -/- "**/build/**/*.dyn_o" :& root -/- "**/build/**/*.dyn_hi" :& Nil )
+      forM_ wayPats $ \wayPat -> ( root -/- ("**/build/**/*." ++ wayPat ++ "dyn_o") :& root -/- ("**/build/**/*." ++ wayPat ++ "dyn_hi") :& Nil )
         &%> \ ( dyn_o :& _dyn_hi :& _ ) -> do
-          p <- platformSupportsSharedLibs
+
+          b@(BuildPath _root stage _path _o)
+            <- parsePath (parseBuildObject root) "<object file path parser>" dyn_o
+          p <- targetSupportsSharedLibs stage
           if p
             then do
+               let ctx = objectContext b
+                   way = removeWayUnit Dynamic $ C.way ctx
                -- We `need` ".o/.hi" because GHC is called with `-dynamic-too`
                -- and builds ".dyn_o/.dyn_hi" too.
-               changed <- needHasChanged [dyn_o -<.> "o", dyn_o -<.> "hi"]
+               changed <- needHasChanged [dyn_o -<.> osuf way, dyn_o -<.> hisuf way]
 
                -- If for some reason a previous Hadrian execution has been
                -- interrupted after the rule for .o/.hi generation has completed
@@ -282,8 +287,11 @@ needDependencies lang context@Context {..} src depFile = do
             discover   -- Continue the discovery process
 
     -- We need to pass different flags to cc depending on whether the
-    -- file to compile is a .c or a .cpp file
-    depType = if lang == Cxx then CxxDep else CDep
+    -- file to compile is a .c or a .cpp or a .S file
+    depType = case lang of
+                Cxx -> CxxDep
+                Asm -> AsmDep
+                _   -> CDep
 
     parseFile :: FilePath -> Action [String]
     parseFile file = do

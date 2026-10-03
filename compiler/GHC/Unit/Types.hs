@@ -1,10 +1,3 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 -- | Unit & Module types
 --
 -- This module is used to resolve the loops between Unit and Module types
@@ -21,6 +14,9 @@ module GHC.Unit.Types
    , pprModule
    , pprInstantiatedModule
    , moduleFreeHoles
+
+     -- ** Module lookups
+   , ModuleLookupScope (..)
 
      -- * Units
    , IsUnitId
@@ -106,7 +102,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS.Char8
 
 import Language.Haskell.Syntax.Module.Name
-import Language.Haskell.Syntax.ImpExp (IsBootInterface(..))
+import Language.Haskell.Syntax.ImpExp.IsBoot (IsBootInterface(..))
 
 ---------------------------------------------------------------------
 -- MODULES
@@ -136,6 +132,23 @@ type HomeUnitModule  = GenModule UnitId
 -- | An `InstantiatedModule` is a 'Module' whose unit is identified with an `InstantiatedUnit`.
 type InstantiatedModule = GenModule InstantiatedUnit
 
+-- | Which modules a lookup of a 'ModuleName' is allowed to resolve to.
+data ModuleLookupScope
+  = LookupUser
+    -- ^ Only lookup modules the user is allowed to import.
+    --
+    -- Use this to resolve a user-written import declaration.
+  | LookupSystem
+    -- ^ A system lookup: allow looking up modules that are hidden, provided
+    -- that the unit providing them is itself visible.
+    --
+    -- Use this to resolve a dependency GHC itself introduced.
+  deriving stock Eq
+
+instance Outputable ModuleLookupScope where
+  ppr = \case
+    LookupUser   -> text "user"
+    LookupSystem -> text "system"
 
 mkModule :: u -> ModuleName -> GenModule u
 mkModule = Module
@@ -257,9 +270,7 @@ data GenUnit uid
 --
 -- This unit may be indefinite or not (i.e. with remaining holes or not). If it
 -- is definite, we don't know if it has already been compiled and installed in a
--- database. Nevertheless, we have a mechanism called "improvement" to try to
--- match a fully instantiated unit with existing compiled and installed units:
--- see Note [VirtUnit to RealUnit improvement].
+-- database.
 --
 -- An indefinite unit identifier pretty-prints to something like
 -- @p[H=<H>,A=aimpl:A>]@ (@p@ is the 'UnitId', and the
@@ -587,7 +598,7 @@ had used @-ignore-package@).
 The affected packages are compiled with, e.g., @-this-unit-id base@, so that
 the symbols in the object files have the unversioned unit id in their name.
 
-Make sure you change 'GHC.Unit.State.findWiredInUnits' if you add an entry here.
+Make sure you change 'wiredInUnitIds' if you add an entry here.
 
 -}
 
@@ -597,7 +608,7 @@ ghcInternalUnitId, rtsUnitId,
 ghcInternalUnit, rtsUnit,
   mainUnit, thisGhcUnit, interactiveUnit, interactiveGhciUnit, interactiveSessionUnit :: Unit
 
-ghcInternalUnitId = UnitId (fsLit "ghc-internal")
+ghcInternalUnitId = UnitId (fsLit "ghc-internal") -- See Note [About units], section "Wired-in units"
 rtsUnitId         = UnitId (fsLit "rts")
 thisGhcUnitId     = UnitId (fsLit cProjectUnitId) -- See Note [GHC's Unit Id]
 interactiveUnitId = UnitId (fsLit "interactive")
@@ -664,7 +675,7 @@ be it either hadrian or cabal, knows exactly the unit-id it passed with -this-un
 
 Note that we also ensure the ghc's unit key matches its unit id, both when
 hadrian or cabal is building ghc. This way, we no longer need to add `ghc` to
-the WiringMap, and that's why 'wiredInUnitIds' no longer includes
+the WireMap, and that's why 'wiredInUnitIds' no longer includes
 'thisGhcUnitId'.
 -}
 

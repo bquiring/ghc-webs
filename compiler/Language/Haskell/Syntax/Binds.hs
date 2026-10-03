@@ -1,9 +1,3 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -26,17 +20,18 @@ import {-# SOURCE #-} Language.Haskell.Syntax.Expr
   ( LHsExpr
   , MatchGroup
   , GRHSs )
-import {-# SOURCE #-} Language.Haskell.Syntax.Pat( LPat )
+import {-# SOURCE #-} Language.Haskell.Syntax.Pat(LPat)
+import Language.Haskell.Syntax.Basic (Fixity)
+import Language.Haskell.Syntax.Binds.InlinePragma (InlinePragma)
 import Language.Haskell.Syntax.BooleanFormula (LBooleanFormula)
 import Language.Haskell.Syntax.Extension
+import Language.Haskell.Syntax.Lit (StringLiteral)
 import Language.Haskell.Syntax.Type
-import Language.Haskell.Syntax.Basic ( Fixity )
-
-import GHC.Types.Basic (InlinePragma)
-import GHC.Types.SourceText (StringLiteral)
+import Language.Haskell.Syntax.ImpExp (NamespaceSpecifier)
 
 import Data.Bool
 import Data.Maybe
+import Data.List
 
 {-
 ************************************************************************
@@ -102,7 +97,7 @@ data HsValBindsLR idL idR
     -- Recursive by default
     ValBinds
         (XValBinds idL idR)
-        (LHsBindsLR idL idR) [LSig idR]
+        [ValBind idL idR]
 
     -- | Value Bindings Out
     --
@@ -110,6 +105,10 @@ data HsValBindsLR idL idR
     -- later bindings in the list may depend on earlier ones.
   | XValBindsLR
       !(XXValBindsLR idL idR)
+
+data ValBind idL idR
+  = VbBind (LHsBindLR idL idR)
+  | VbSig (LSig idR)
 
 -- ---------------------------------------------------------------------
 
@@ -159,24 +158,22 @@ other interesting cases. Namely,
     (x) = e
     x :: Ty = e
 
-Note [Multiplicity annotations]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Multiplicity annotations are stored in the pat_mult field on PatBinds,
-represented by the HsMultAnn data type
+Note [Modifiers on bindings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Modifiers on bindings are stored in the pat_mods field on PatBinds. During
+typechecking, the multiplicity (given by a modifier, or inferred) is stored in
+the XPatBind binding point.
 
-  HsNoMultAnn <=> no annotation in the source file
-  HsPct1Ann   <=> the %1 annotation
-  HsMultAnn   <=> the %t annotation, where `t` is some type
+We don't need to store a multiplicity or modifiers on FunBinds, because:
+- let %1 x = … is parsed as a PatBind. So we don't need an annotation on
+  FunBinds before typechecking.
+- the multiplicity that the typechecker infers for a FunBind is stored in the
+  binder's Var for the desugarer to use. It's only relevant for strict FunBinds,
+  see Wrinkle 1 in Note [Desugar Strict binds] in GHC.HsToCore.Binds as, in
+  Core, let expressions don't have multiplicity annotations.
 
-In case of HsNoMultAnn the typechecker infers a multiplicity.
-
-We don't need to store a multiplicity on FunBinds:
-- let %1 x = … is parsed as a PatBind. So we don't need an annotation before
-  typechecking.
-- the multiplicity that the typechecker infers is stored in the binder's Var for
-  the desugarer to use. It's only relevant for strict FunBinds, see Wrinkle 1 in
-  Note [Desugar Strict binds] in GHC.HsToCore.Binds as, in Core, let expressions
-  don't have multiplicity annotations.
+See also Note [Modifiers on patterns vs bindings] in
+Language.Haskell.Syntax.Pat.
 -}
 
 -- | Haskell Binding with separate Left and Right id's
@@ -218,8 +215,8 @@ data HsBindLR idL idR
   | PatBind {
         pat_ext    :: XPatBind idL idR,
         pat_lhs    :: LPat idL,
-        pat_mult   :: HsMultAnn idL,
-        -- ^ See Note [Multiplicity annotations].
+        pat_mods   :: [LHsModifier idL],
+        -- ^ See Note [Modifiers on bindings].
         pat_rhs    :: GRHSs idR (LHsExpr idR)
     }
 
@@ -233,7 +230,7 @@ data HsBindLR idL idR
         var_rhs    :: LHsExpr idR    -- ^ Located only for consistency
     }
 
-  -- | Patterns Synonym Binding
+  -- | Pattern Synonym Binding
   | PatSynBind
         (XPatSynBind idL idR)
         (PatSynBind idL idR)
@@ -250,6 +247,26 @@ data PatSynBind idL idR
           psb_dir  :: HsPatSynDir idR          -- ^ Directionality
      }
    | XPatSynBind !(XXPatSynBind idL idR)
+
+
+val_binds :: [ValBind idL idR] -> [LHsBindLR idL idR]
+val_binds binds = concatMap get_bind binds
+  where
+    get_bind (VbBind b) = [b]
+    get_bind (VbSig _) = []
+
+val_sigs :: [ValBind idL idR] -> [LSig idR]
+val_sigs binds = concatMap get_sig binds
+  where
+    get_sig (VbBind _) = []
+    get_sig (VbSig s) = [s]
+
+val_binds_and_sigs :: [ValBind idL idR] -> ([LHsBindLR idL idR], [LSig idR])
+val_binds_and_sigs binds = go binds [] []
+  where
+    go [] bs ss = (reverse bs, reverse ss)
+    go ((VbBind b):ds) bs ss = go ds (b:bs) ss
+    go ((VbSig  s):ds) bs ss = go ds bs (s:ss)
 
 {-
 ************************************************************************
@@ -311,6 +328,7 @@ data Sig pass
       -- more specific.
     TypeSig
        (XTypeSig pass)
+       [LHsModifier pass]    -- Attached modifiers
        [LIdP pass]           -- LHS of the signature; e.g.  f,g,h :: blah
        (LHsSigWcType pass)   -- RHS of the signature; can have wildcards
 
@@ -338,8 +356,8 @@ data Sig pass
         --
         -- > {#- INLINE f #-}
   | InlineSig   (XInlineSig pass)
-                (LIdP pass)        -- Function name
-                InlinePragma       -- Never defaultInlinePragma
+                (LIdP pass)         -- Function name
+                (InlinePragma pass) -- Never defaultInlinePragma
 
         -- | An old-form specialisation pragma
         --
@@ -347,11 +365,11 @@ data Sig pass
         --
         -- NB: this constructor is deprecated and will be removed in GHC 9.18 (#25540)
   | SpecSig     (XSpecSig pass)
-                (LIdP pass)        -- Specialise a function or datatype  ...
-                [LHsSigType pass]  -- ... to these types
-                InlinePragma       -- The pragma on SPECIALISE_INLINE form.
-                                   -- If it's just defaultInlinePragma, then we said
-                                   --    SPECIALISE, not SPECIALISE_INLINE
+                (LIdP pass)         -- Specialise a function or datatype  ...
+                [LHsSigType pass]   -- ... to these types
+                (InlinePragma pass) -- The pragma on SPECIALISE_INLINE form.
+                                    -- If it's just defaultInlinePragma, then we said
+                                    --    SPECIALISE, not SPECIALISE_INLINE
 
         -- | A new-form specialisation pragma (see GHC Proposal #493)
         --   e.g.  {-# SPECIALISE f @Int 1 :: Int -> Int #-}
@@ -359,7 +377,7 @@ data Sig pass
   | SpecSigE    (XSpecSigE pass)
                 (RuleBndrs pass)
                 (LHsExpr pass)     -- Expression to specialise
-                InlinePragma
+                (InlinePragma pass)
                 -- The expression should be of form
                 --     f a1 ... an [ :: sig ]
                 -- with an optional type signature
@@ -387,7 +405,7 @@ data Sig pass
 
   | SCCFunSig  (XSCCFunSig pass)
                (LIdP pass)    -- Function name
-               (Maybe (XRec pass StringLiteral))
+               (Maybe (XRec pass (StringLiteral pass)))
        -- | A complete match pragma
        --
        -- > {-# COMPLETE C, D [:: T] #-}
@@ -404,7 +422,7 @@ data Sig pass
 type LFixitySig pass = XRec pass (FixitySig pass)
 
 -- | Fixity Signature
-data FixitySig pass = FixitySig (XFixitySig pass) [LIdP pass] Fixity
+data FixitySig pass = FixitySig (XFixitySig pass) (NamespaceSpecifier pass) [LIdP pass] Fixity
                     | XFixitySig !(XXFixitySig pass)
 
 isFixityLSig :: forall p. UnXRec p => LSig p -> Bool
@@ -442,7 +460,7 @@ isInlineLSig _                    = False
 
 isMinimalLSig :: forall p. UnXRec p => LSig p -> Bool
 isMinimalLSig (unXRec @p -> MinimalSig {}) = True
-isMinimalLSig _                               = False
+isMinimalLSig _                            = False
 
 isSCCFunSig :: forall p. UnXRec p => LSig p -> Bool
 isSCCFunSig (unXRec @p -> SCCFunSig {}) = True
@@ -495,7 +513,7 @@ collectRuleBndrSigTys bndrs = [ty | RuleBndrSig _ _ ty <- bndrs]
 -}
 
 -- | Haskell Pattern Synonym Details
-type HsPatSynDetails pass = HsConDetails (LIdP pass) [RecordPatSynField pass]
+type HsPatSynDetails pass = HsConDetails pass (LIdP pass) [RecordPatSynField pass]
 
 -- See Note [Record PatSyn Fields]
 -- | Record Pattern Synonym Field

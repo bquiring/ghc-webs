@@ -1,7 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE StandaloneDeriving #-}
-
 module GHC.Driver.Errors.Types (
     GhcMessage(..)
   , AnyGhcDiagnostic
@@ -41,6 +37,7 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Generics ( Generic )
 
+import System.Semaphore ( SemaphoreError )
 import GHC.Tc.Errors.Types
 import GHC.Iface.Errors.Types
 
@@ -372,7 +369,7 @@ data DriverMessage where
 
   DriverRedirectedNoMain :: !ModuleName -> DriverMessage
 
-  DriverHomePackagesNotClosed :: ![UnitId] -> DriverMessage
+  DriverHomePackagesNotClosed :: ![(UnitId, UnitId)] -> DriverMessage
 
   DriverInterfaceError :: !IfaceMessage -> DriverMessage
 
@@ -411,6 +408,28 @@ data DriverMessage where
 
   -}
   DriverNoConfiguredLLVMToolchain :: DriverMessage
+
+  {- |
+  DriverMissingLinkableForModule is an error that occurs if a module is missing a linkable
+  which is needed for creating a library.
+
+
+    Test cases: bytecode-object22
+
+  -}
+
+  DriverMissingLinkableForModule :: ![Module] -> DriverMessage
+
+  {-| DriverSemaphoreOpenFailure is a warning that occurs when GHC fails to
+      open the semaphore specified by @-jsem@, e.g. the socket does not
+      exist, the protocol version is incompatible, or a system error
+      occurred.  GHC ignores @-jsem@ and compiles sequentially.
+
+      The 'BuildingCabalPackage' flag controls whether the diagnostic
+      hint suggests upgrading @cabal-install@ (it only does so when GHC
+      is invoked by Cabal).
+  -}
+  DriverSemaphoreOpenFailure :: !BuildingCabalPackage -> !SemaphoreError -> DriverMessage
 
 deriving instance Generic DriverMessage
 

@@ -1,3 +1,13 @@
+{-# OPTIONS_GHC -fspec-constr-threshold=1200 #-}
+  -- This threshold (smaller than the default 2000) avoids SpecConstr from firing
+  -- on the inner loop of GHC.Core.Reduction.simplifyArgsWorker (inlined into
+  -- this module) based on a 'LiftingContext' argument, as this causes
+  -- significant reboxing (regressing compile-time allocations in T9872d by ~4%),
+  -- as per #27628.
+  --
+  -- The 1200 threshold was chosen to avoid this issue while still allowing
+  -- beneficial SpecConstr to fire in the rest of the module.
+
 module GHC.Tc.Solver.Rewrite(
    rewrite, rewriteForErrors, rewriteArgsNom,
    rewriteType
@@ -6,12 +16,9 @@ module GHC.Tc.Solver.Rewrite(
 import GHC.Prelude
 
 import GHC.Core.TyCo.Ppr ( pprTyVar )
-import GHC.Tc.Types ( TcGblEnv(tcg_tc_plugin_rewriters),
-                      TcPluginRewriter, TcPluginRewriteResult(..),
-                      RewriteEnv(..),
-                      runTcPluginM )
+import GHC.Tc.Types
 import GHC.Tc.Types.Constraint
-import GHC.Tc.Types.CtLoc( CtLoc, bumpCtLocDepth )
+import GHC.Tc.Types.CtLoc( CtLoc, resetCtLocDepth )
 import GHC.Core.Predicate
 import GHC.Tc.Utils.TcType
 import GHC.Core.Type
@@ -25,6 +32,7 @@ import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Driver.DynFlags
+import GHC.Tc.Utils.Monad (rewriterTcMPlugins)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Tc.Solver.Monad as TcS
@@ -34,7 +42,7 @@ import GHC.Data.Maybe
 import GHC.Exts (oneShot)
 import Control.Monad
 import Control.Applicative (liftA3)
-import GHC.Builtin.Types (tYPETyCon)
+import GHC.Builtin.WiredIn.Types (tYPETyCon)
 import Data.List ( find )
 import GHC.Data.List.Infinite (Infinite)
 import GHC.Data.Bag( listToBag )
@@ -80,17 +88,18 @@ liftTcS thing_inside
 
 -- convenient wrapper when you have a CtEvidence describing
 -- the rewriting operation
-runRewriteCtEv :: CtEvidence -> RewriteM a -> TcS (a, RewriterSet)
+runRewriteCtEv :: CtEvidence -> RewriteM a -> TcS (a, CoHoleSet)
 runRewriteCtEv ev
   = runRewrite (ctEvLoc ev) (ctEvFlavour ev) (ctEvRewriteEqRel ev)
 
 -- Run thing_inside (which does the rewriting)
 -- Also returns the set of Wanteds which rewrote a Wanted;
--- See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
-runRewrite :: CtLoc -> CtFlavour -> EqRel -> RewriteM a -> TcS (a, RewriterSet)
+-- See Note [Wanteds rewrite Wanteds: rewriter-sets] in GHC.Tc.Types.Constraint
+runRewrite :: CtLoc -> CtFlavour -> EqRel -> RewriteM a -> TcS (a, CoHoleSet)
 runRewrite loc flav eq_rel thing_inside
-  = do { rewriters_ref <- newTcRef emptyRewriterSet
-       ; let fmode = RE { re_loc       = loc
+  = do { rewriters_ref <- newTcRef emptyCoHoleSet
+       ; let fmode = RE { re_loc       = resetCtLocDepth loc
+                            -- Start reducing from zero
                         , re_flavour   = flav
                         , re_eq_rel    = eq_rel
                         , re_rewriters = rewriters_ref }
@@ -125,14 +134,6 @@ getFlavourRole
        ; eq_rel <- getEqRel
        ; return (flavour, eq_rel) }
 
-getLoc :: RewriteM CtLoc
-getLoc = getRewriteEnvField re_loc
-
-checkStackDepth :: Type -> RewriteM ()
-checkStackDepth ty
-  = do { loc <- getLoc
-       ; liftTcS $ checkReductionDepth loc ty }
-
 -- | Change the 'EqRel' in a 'RewriteM'.
 setEqRel :: EqRel -> RewriteM a -> RewriteM a
 setEqRel new_eq_rel thing_inside
@@ -142,17 +143,18 @@ setEqRel new_eq_rel thing_inside
     else runRewriteM thing_inside (env { re_eq_rel = new_eq_rel })
 {-# INLINE setEqRel #-}
 
-bumpDepth :: RewriteM a -> RewriteM a
-bumpDepth (RewriteM thing_inside)
+bumpReductionDepthRM :: Type -> RewriteM a -> RewriteM a
+bumpReductionDepthRM ty (RewriteM thing_inside)
   = mkRewriteM $ \env -> do
-      -- bumpDepth can be called a lot during rewriting so we force the
-      -- new env to avoid accumulating thunks.
-      { let !env' = env { re_loc = bumpCtLocDepth (re_loc env) }
+      { loc' <- TcS.bumpReductionDepth (re_loc env) ty
+      ; let !env' = env { re_loc = loc' }
+            -- !env: bumpReductionDepth can be called a lot during rewriting
+            -- so we force the new env to avoid accumulating thunks
       ; thing_inside env' }
 
 recordRewriter :: CtEvidence -> RewriteM ()
 -- Record that we have rewritten the target with this (equality) evidence
--- See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
+-- See Note [Wanteds rewrite Wanteds: rewriter-sets] in GHC.Tc.Types.Constraint
 -- Precondition: the CtEvidence is for an equality constraint
 recordRewriter (CtGiven {})
   = return ()
@@ -224,9 +226,9 @@ a better error message anyway.)
 -- If (xi, co, rewriters) <- rewrite mode ev ty, then co :: xi ~r ty
 -- where r is the role in @ev@.
 -- `rewriters` is the set of coercion holes that have been used to rewrite
--- See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
+-- See Note [Wanteds rewrite Wanteds: rewriter-sets] in GHC.Tc.Types.Constraint
 rewrite :: CtEvidence -> TcType
-        -> TcS (Reduction, RewriterSet)
+        -> TcS (Reduction, CoHoleSet)
 rewrite ev ty
   = do { traceTcS "rewrite {" (ppr ty)
        ; result@(redn, _) <- runRewriteCtEv ev (rewrite_one ty)
@@ -239,7 +241,7 @@ rewrite ev ty
 -- for error messages. (This was important when we flirted with rewriting
 -- newtypes but perhaps less so now.)
 rewriteForErrors :: CtEvidence -> TcType
-                 -> TcS (Reduction, RewriterSet)
+                 -> TcS (Reduction, CoHoleSet)
 rewriteForErrors ev ty
   = do { traceTcS "rewriteForErrors {" (ppr ty)
        ; result@(redn, rewriters) <-
@@ -251,7 +253,7 @@ rewriteForErrors ev ty
 
 -- See Note [Rewriting]
 rewriteArgsNom :: CtEvidence -> TyCon -> [TcType]
-               -> TcS (Reductions, RewriterSet)
+               -> TcS (Reductions, CoHoleSet)
 -- Externally-callable, hence runRewrite
 -- Rewrite a vector of types all at once; in fact they are
 -- always the arguments of type family or class, so
@@ -261,7 +263,7 @@ rewriteArgsNom :: CtEvidence -> TyCon -> [TcType]
 -- The kind of T args must be constant (i.e. not depend on the args)
 --
 -- Final return value returned which Wanteds rewrote another Wanted
--- See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
+-- See Note [Wanteds rewrite Wanteds: rewriter-sets] in GHC.Tc.Types.Constraint
 rewriteArgsNom ev tc tys
   = do { traceTcS "rewrite_args {" (vcat (map ppr tys))
        ; (ArgsReductions redns@(Reductions _ tys') kind_co, rewriters)
@@ -584,7 +586,7 @@ rewrite_co co = liftTcS $ zonkCo co
 -- | Rewrite a reduction, composing the resulting coercions.
 rewrite_reduction :: Reduction -> RewriteM Reduction
 rewrite_reduction (Reduction co xi)
-  = do { redn <- bumpDepth $ rewrite_one xi
+  = do { redn <- rewrite_one xi
        ; return $ co `mkTransRedn` redn }
 
 -- rewrite (nested) AppTys
@@ -799,10 +801,8 @@ rewrite_fam_app tc tys  -- Can be over-saturated
 -- See Note [How to normalise a family application]
 rewrite_exact_fam_app :: TyCon -> [TcType] -> RewriteM Reduction
 rewrite_exact_fam_app tc tys
-  = do { checkStackDepth (mkTyConApp tc tys)
-
-       -- Query the typechecking plugins for all their rewriting functions
-       -- which apply to a type family application headed by the TyCon 'tc'.
+  = do { -- Query the typechecking plugins for all their rewriting functions
+         -- which apply to a type family application headed by the TyCon 'tc'.
        ; tc_rewriters <- getTcPluginRewritersForTyCon tc
 
        -- STEP 1. Try to reduce without reducing arguments first.
@@ -884,7 +884,8 @@ rewrite_exact_fam_app tc tys
            -> Reduction -> RewriteM Reduction
     finish use_cache redn
       = do { -- rewrite the result: FINISH 1
-             final_redn <- rewrite_reduction redn
+             final_redn <- bumpReductionDepthRM (mkTyConApp tc tys) $
+                           rewrite_reduction redn
            ; eq_rel <- getEqRel
 
              -- extend the cache: FINISH 2
@@ -927,7 +928,9 @@ try_to_reduce tc tys tc_rewriters
 -- headed by the given 'TyCon`.
 getTcPluginRewritersForTyCon :: TyCon -> RewriteM [TcPluginRewriter]
 getTcPluginRewritersForTyCon tc
-  = liftTcS $ do { rewriters <- tcg_tc_plugin_rewriters <$> getGblEnv
+  = liftTcS $ do { tcg_env <- getGblEnv
+                 ; plugins <- readTcRef (tcg_plugins tcg_env)
+                 ; let rewriters = rewriterTcMPlugins plugins
                  ; return (lookupWithDefaultUFM rewriters [] tc) }
 
 -- Run a collection of rewriting functions obtained from type-checking plugins,
@@ -1030,7 +1033,8 @@ rewrite_tyvar2 tv fr@(_, eq_rel)
                         vcat [ ppr tv <+> equals <+> ppr rhs_ty
                              , ppr ctev ]
                    ; recordRewriter ctev
-                         -- See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
+                         -- See Note [Wanteds rewrite Wanteds: rewriter-sets]
+                         -- in GHC.Tc.Types.Constraint
 
                    ; let rewriting_co1 = ctEvCoercion ctev
                          rewriting_co  = case (ct_eq_rel, eq_rel) of

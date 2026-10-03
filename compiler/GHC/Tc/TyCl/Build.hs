@@ -9,7 +9,8 @@
 module GHC.Tc.TyCl.Build (
         buildDataCon,
         buildPatSyn,
-        TcMethInfo, MethInfo, buildClass,
+        TcMethInfo, MethInfo,
+        buildClass, buildAbstractClass,
         mkNewTyConRhs,
         newImplicitBinder, newTyConRepName
     ) where
@@ -17,7 +18,7 @@ module GHC.Tc.TyCl.Build (
 import GHC.Prelude
 
 import GHC.Iface.Env
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
@@ -57,13 +58,13 @@ mkNewTyConRhs tycon_name tycon con
                              nt_rhs       = rhs_ty,
                              nt_etad_rhs  = (etad_tvs, etad_rhs),
                              nt_co        = nt_ax,
-                             nt_fixed_rep = isFixedRuntimeRepKind res_kind } ) }
+                             nt_fixed_rep = fixed_rep } ) }
                              -- Coreview looks through newtypes with a Nothing
                              -- for nt_co, or uses explicit coercions otherwise
   where
-    tvs      = tyConTyVars tycon
-    roles    = tyConRoles tycon
-    res_kind = tyConResKind tycon
+    tvs       = tyConTyVars tycon
+    roles     = tyConRoles tycon
+    fixed_rep = isFixedRuntimeRepKind $ tyConResKind tycon
     rhs_ty
       -- Only try if the newtype is actually valid (see "otherwise" below).
       | [Scaled _ arg_ty] <- dataConRepArgTys con
@@ -177,6 +178,7 @@ buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
         -- code, which (for Haskell source anyway) will be in the DataName name
         -- space, and puts it into the VarName name space
 
+        ; platform <- getPlatform
         ; traceIf (text "buildDataCon 1" <+> ppr src_name)
         ; us <- newUniqueSupply
         ; let stupid_ctxt = mkDataConStupidTheta rep_tycon (map scaledThing arg_tys) univ_tvs
@@ -191,7 +193,7 @@ buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
                                    stupid_ctxt dc_wrk dc_rep
               dc_wrk = mkDataConWorkId work_name data_con
               (dc_rep, impl_bangs, str_marks) =
-                 initUs_ us (mkDataConRep dc_bang_opts fam_envs wrap_name data_con)
+                 initUs_ us (mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con)
 
         ; traceIf (text "buildDataCon 2" <+> ppr src_name)
         ; return data_con }
@@ -288,29 +290,18 @@ type MethInfo       -- A temporary intermediate, to communicate
          --    for the generic default method, spat out by checkValidClass
 
 buildClass :: Name  -- Name of the class/tycon (they have the same Name)
+           -> Kind
            -> [TyConBinder]                -- Of the tycon
            -> [Role]
            -> [FunDep TyVar]               -- Functional dependencies
-           -- Super classes, associated types, method info, minimal complete def.
-           -- This is Nothing if the class is abstract.
-           -> Maybe (KnotTied ThetaType, [ClassATItem], [KnotTied MethInfo], ClassMinimalDef)
+           -> KnotTied ThetaType     -- Superclasess
+           -> [ClassATItem]          -- Associated types
+           -> [KnotTied MethInfo]    -- Methods
+           -> ClassMinimalDef        -- Minimal complete definition
+           -> Bool                   -- True <=> is a unary class
            -> TcRnIf m n Class
 
-buildClass tycon_name binders roles fds Nothing
-  = fixM  $ \ rec_clas ->       -- Only name generation inside loop
-    do  { traceIf (text "buildClass")
-
-        ; tc_rep_name  <- newTyConRepName tycon_name
-        ; let univ_tvs = binderVars binders
-              tycon = mkClassTyCon tycon_name binders roles
-                                   AbstractTyCon
-                                   rec_clas tc_rep_name
-              result = mkAbstractClass tycon_name univ_tvs fds tycon
-        ; traceIf (text "buildClass" <+> ppr tycon)
-        ; return result }
-
-buildClass tycon_name binders roles fds
-           (Just (sc_theta, at_items, sig_stuff, mindef))
+buildClass tycon_name kind binders roles fds sc_theta at_items sig_stuff mindef unary_class
   = fixM  $ \ rec_clas ->       -- Only name generation inside loop
     do  { traceIf (text "buildClass")
 
@@ -333,18 +324,7 @@ buildClass tycon_name binders roles fds
               -- (We used to call them D_C, but now we can have two different
               --  superclasses both called C!)
 
-        ; let use_newtype = isSingleton (sc_theta ++ op_tys)
-                -- Use a newtype if the data constructor
-                --   (a) has exactly one value field
-                --       i.e. exactly one operation or superclass taken together
-                --   (b) that value is of lifted type (which they always are, because
-                --       we box equality superclasses)
-                -- See Note [Class newtypes and equality predicates]
-                --
-                -- In the case of
-                --     class C a => D a
-                -- we use a newtype, but with one superclass and no arguments
-              args       = sc_sel_names ++ op_names
+        ; let args       = sc_sel_names ++ op_names
               op_tys     = [ty | (_,ty,_) <- sig_stuff]
               op_names   = [op | (op,_,_) <- sig_stuff]
               rec_tycon  = classTyCon rec_clas
@@ -370,17 +350,16 @@ buildClass tycon_name binders roles fds
                                    rec_tycon
                                    (mkTyConTagMap rec_tycon)
 
-        ; rhs <- case () of
-                  _ | use_newtype
-                    -> mkNewTyConRhs tycon_name rec_tycon dict_con
-                    | isCTupleTyConName tycon_name
-                    -> return (TupleTyCon { data_con = dict_con
-                                          , tup_sort = ConstraintTuple })
-                    | otherwise
-                    -> return (mkDataTyConRhs [dict_con])
+        ; let rhs | unary_class
+                  = UnaryClassTyCon dict_con
+                  | isCTupleTyConName tycon_name
+                  = TupleTyCon { data_con = dict_con
+                               , tup_sort = ConstraintTuple }
+                  | otherwise
+                  = mkDataTyConRhs [dict_con]
 
-        ; let { tycon = mkClassTyCon tycon_name binders roles
-                                     rhs rec_clas tc_rep_name
+              tycon = mkClassTyCon tycon_name kind binders roles
+                                   rhs rec_clas tc_rep_name
                 -- A class can be recursive, and in the case of newtypes
                 -- this matters.  For example
                 --      class C a where { op :: C b => a -> b -> Int }
@@ -390,10 +369,10 @@ buildClass tycon_name binders roles fds
                 -- newtype like a synonym, but that will lead to an infinite
                 -- type]
 
-              ; result = mkClass tycon_name univ_tvs fds
-                                 sc_theta sc_sel_ids at_items
-                                 op_items mindef tycon
-              }
+              result = mkClass tycon_name univ_tvs fds
+                               sc_theta sc_sel_ids at_items
+                               op_items mindef tycon
+
         ; traceIf (text "buildClass" <+> ppr tycon)
         ; return result }
   where
@@ -415,23 +394,25 @@ buildClass tycon_name binders roles fds
       = do { dm_name <- newImplicitBinderLoc op_name mkDefaultMethodOcc loc
            ; return (Just (dm_name, GenericDM dm_ty)) }
 
-{-
-Note [Class newtypes and equality predicates]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider
-        class (a ~ F b) => C a b where
-          op :: a -> b
+buildAbstractClass :: Name
+                   -> Kind
+                   -> [TyConBinder]
+                   -> [Role]
+                   -> [FunDep TyVar]
+                   -> TcRnIf m n Class
 
-We cannot represent this by a newtype, even though it's not
-existential, because there are two value fields (the equality
-predicate and op. See #2238
+buildAbstractClass tycon_name kind binders roles fds
+  = fixM  $ \ rec_clas ->       -- Only name generation inside loop
+    do  { traceIf (text "buildClass")
 
-Moreover,
-          class (a ~ F b) => C a b where {}
-Here we can't use a newtype either, even though there is only
-one field, because equality predicates are unboxed, and classes
-are boxed.
--}
+        ; tc_rep_name  <- newTyConRepName tycon_name
+        ; let univ_tvs = binderVars binders
+              tycon = mkClassTyCon tycon_name kind binders roles
+                                   AbstractTyCon
+                                   rec_clas tc_rep_name
+              result = mkAbstractClass tycon_name univ_tvs fds tycon
+        ; traceIf (text "buildClass" <+> ppr tycon)
+        ; return result }
 
 newImplicitBinder :: Name                       -- Base name
                   -> (OccName -> OccName)       -- Occurrence name modifier
@@ -449,7 +430,7 @@ newImplicitBinderLoc :: Name                       -- Base name
 -- Just the same, but lets you specify the SrcSpan
 newImplicitBinderLoc base_name mk_sys_occ loc
   | Just mod <- nameModule_maybe base_name
-  = newGlobalBinder mod occ loc
+  = newGlobalBinder mod occ Nothing loc
   | otherwise           -- When typechecking a [d| decl bracket |],
                         -- TH generates types, classes etc with Internal names,
                         -- so we follow suit for the implicit binders
@@ -463,6 +444,6 @@ newTyConRepName :: Name -> TcRnIf gbl lcl TyConRepName
 newTyConRepName tc_name
   | Just mod <- nameModule_maybe tc_name
   , (mod, occ) <- tyConRepModOcc mod (nameOccName tc_name)
-  = newGlobalBinder mod occ noSrcSpan
+  = newGlobalBinder mod occ Nothing noSrcSpan
   | otherwise
   = newImplicitBinder tc_name mkTyConRepOcc

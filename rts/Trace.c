@@ -8,6 +8,7 @@
 
 // external headers
 #include "Rts.h"
+#include "ghcversion.h"
 
 // internal headers
 #include "Trace.h"
@@ -28,14 +29,59 @@
 #include <unistd.h>
 #endif
 
-// events
-uint8_t TRACE_sched;
-uint8_t TRACE_gc;
-uint8_t TRACE_nonmoving_gc;
-uint8_t TRACE_spark_sampled;
-uint8_t TRACE_spark_full;
-uint8_t TRACE_user;
-uint8_t TRACE_cap;
+RUNTIME_TRACE_FLAG_CACHE RuntimeTraceFlagCache = {0};
+
+bool getTraceFlag(RUNTIME_TRACE_FLAG flag) {
+  switch (flag) {
+  case TRACE_SCHEDULER:
+    return RuntimeTraceFlagCache.scheduler;
+  case TRACE_GC:
+    return RuntimeTraceFlagCache.gc;
+  case TRACE_NONMOVING_GC:
+    return RuntimeTraceFlagCache.nonmoving_gc;
+  case TRACE_SPARK_SAMPLED:
+    return RuntimeTraceFlagCache.spark_sampled;
+  case TRACE_SPARK_FULL:
+    return RuntimeTraceFlagCache.spark_full;
+  case TRACE_USER:
+    return RuntimeTraceFlagCache.user;
+  case TRACE_CAP:
+    return RuntimeTraceFlagCache.cap;
+  case TRACE_IPE:
+    return RuntimeTraceFlagCache.ipe;
+  default:
+    return false;
+  }
+}
+
+void setTraceFlag(RUNTIME_TRACE_FLAG flag, bool value) {
+  switch (flag) {
+  case TRACE_SCHEDULER:
+    RuntimeTraceFlagCache.scheduler = value;
+    break;
+  case TRACE_GC:
+    RuntimeTraceFlagCache.gc = value;
+    break;
+  case TRACE_NONMOVING_GC:
+    RuntimeTraceFlagCache.nonmoving_gc = value;
+    break;
+  case TRACE_SPARK_SAMPLED:
+    RuntimeTraceFlagCache.spark_sampled = value;
+    break;
+  case TRACE_SPARK_FULL:
+    RuntimeTraceFlagCache.spark_full = value;
+    break;
+  case TRACE_USER:
+    RuntimeTraceFlagCache.user = value;
+    break;
+  case TRACE_CAP:
+    RuntimeTraceFlagCache.cap = value;
+    break;
+  case TRACE_IPE:
+    RuntimeTraceFlagCache.ipe = value;
+    break;
+  }
+}
 
 #if defined(THREADED_RTS)
 static Mutex trace_utx;
@@ -50,43 +96,47 @@ static void traceCap_stderr(Capability *cap, char *msg, ...);
  --------------------------------------------------------------------------- */
 
 /*
- * Update the TRACE_* globals. Must be called whenever RtsFlags.TraceFlags is
- * modified.
+ * Initialise the runtime trace flags from RtsFlags.TraceFlags.
  */
-static void updateTraceFlagCache (void)
-{
-    // -Ds turns on scheduler tracing too
-    TRACE_sched =
-        RtsFlags.TraceFlags.scheduler ||
-        RtsFlags.DebugFlags.scheduler;
+static void updateTraceFlagCache(void) {
+  // -Ds turns on scheduler tracing too
+  RuntimeTraceFlagCache.scheduler =
+    RtsFlags.TraceFlags.scheduler ||
+    RtsFlags.DebugFlags.scheduler;
 
-    // -Dg turns on gc tracing too
-    TRACE_gc =
-        RtsFlags.TraceFlags.gc ||
-        RtsFlags.DebugFlags.gc ||
-        RtsFlags.DebugFlags.scheduler;
+  // -Dg turns on gc tracing too
+  RuntimeTraceFlagCache.gc =
+    RtsFlags.TraceFlags.gc ||
+    RtsFlags.DebugFlags.gc ||
+    RtsFlags.DebugFlags.scheduler;
 
-    TRACE_nonmoving_gc =
-        RtsFlags.TraceFlags.nonmoving_gc;
+  RuntimeTraceFlagCache.nonmoving_gc =
+    RtsFlags.TraceFlags.nonmoving_gc;
 
-    TRACE_spark_sampled =
-        RtsFlags.TraceFlags.sparks_sampled;
+  RuntimeTraceFlagCache.spark_sampled =
+    RtsFlags.TraceFlags.sparks_sampled;
 
-    // -Dr turns on full spark tracing
-    TRACE_spark_full =
-        RtsFlags.TraceFlags.sparks_full ||
-        RtsFlags.DebugFlags.sparks;
+  // -Dr turns on full spark tracing
+  RuntimeTraceFlagCache.spark_full =
+      RtsFlags.TraceFlags.sparks_full ||
+      RtsFlags.DebugFlags.sparks;
 
-    TRACE_user =
-        RtsFlags.TraceFlags.user;
+  RuntimeTraceFlagCache.user =
+    RtsFlags.TraceFlags.user;
 
-    // We trace cap events if we're tracing anything else
-    TRACE_cap =
-        TRACE_sched ||
-        TRACE_gc ||
-        TRACE_spark_sampled ||
-        TRACE_spark_full ||
-        TRACE_user;
+  // -DI turns on IPE tracing too
+  RuntimeTraceFlagCache.ipe =
+      RtsFlags.TraceFlags.ipe ||
+      RtsFlags.DebugFlags.ipe;
+
+  // We trace cap events if we're tracing anything else
+  RuntimeTraceFlagCache.cap =
+    TRACE_sched ||
+    TRACE_gc ||
+    TRACE_spark_sampled ||
+    TRACE_spark_full ||
+    TRACE_user ||
+    TRACE_ipe;
 }
 
 void initTracing (void)
@@ -168,24 +218,20 @@ static void tracePreface (void)
 
 #if defined(DEBUG)
 static char *thread_stop_reasons[] = {
-    [HeapOverflow] = "heap overflow",
-    [StackOverflow] = "stack overflow",
-    [ThreadYielding] = "yielding",
-    [ThreadBlocked] = "blocked",
-    [ThreadFinished] = "finished",
-    [THREAD_SUSPENDED_FOREIGN_CALL] = "suspended while making a foreign call",
-    [6 + BlockedOnMVar]         = "blocked on an MVar",
-    [6 + BlockedOnMVarRead]     = "blocked on an atomic MVar read",
-    [6 + BlockedOnBlackHole]    = "blocked on a black hole",
-    [6 + BlockedOnRead]         = "blocked on a read operation",
-    [6 + BlockedOnWrite]        = "blocked on a write operation",
-    [6 + BlockedOnDelay]        = "blocked on a delay operation",
-    [6 + BlockedOnSTM]          = "blocked on STM",
-    [6 + BlockedOnDoProc]       = "blocked on asyncDoProc",
-    [6 + BlockedOnCCall]        = "blocked on a foreign call",
-    [6 + BlockedOnCCall_Interruptible] = "blocked on a foreign call (interruptible)",
-    [6 + BlockedOnMsgThrowTo]   =  "blocked on throwTo",
-    [6 + ThreadMigrating]       =  "migrating"
+    [STOP_THREAD_HeapOverflow]        = "heap overflow",
+    [STOP_THREAD_StackOverflow]       = "stack overflow",
+    [STOP_THREAD_ThreadYielding]      = "yielding",
+    [STOP_THREAD_ThreadFinished]      = "finished",
+    [STOP_THREAD_ForeignCall]         = "suspended while making a foreign call",
+    [STOP_THREAD_BlockedOnMVar]       = "blocked on an MVar",
+    [STOP_THREAD_BlockedOnMVarRead]   = "blocked on an atomic MVar read",
+    [STOP_THREAD_BlockedOnBlackHole]  = "blocked on a black hole",
+    [STOP_THREAD_BlockedOnRead]       = "blocked on a read operation",
+    [STOP_THREAD_BlockedOnWrite]      = "blocked on a write operation",
+    [STOP_THREAD_BlockedOnDelay]      = "blocked on a delay operation",
+    [STOP_THREAD_BlockedOnSTM]        = "blocked on STM",
+    [STOP_THREAD_BlockedOnDoProc]     = "blocked on asyncDoProc",
+    [STOP_THREAD_BlockedOnMsgThrowTo] = "blocked on throwTo"
 };
 #endif
 
@@ -229,10 +275,10 @@ static void traceSchedEvent_stderr (Capability *cap, EventTypeNum tag,
         break;
 
     case EVENT_STOP_THREAD:     // (cap, thread, status)
-        if (info1 == 6 + BlockedOnBlackHole) {
+        if (info1 == STOP_THREAD_BlockedOnBlackHole) {
             debugBelch("cap %d: thread %" FMT_Word "[\"%.*s\"]" " stopped (blocked on black hole owned by thread %lu)\n",
                        cap->no, (W_)tso->id, threadLabelLen, threadLabel, (long)info2);
-        } else if (info1 == StackOverflow) {
+        } else if (info1 == STOP_THREAD_StackOverflow) {
             debugBelch("cap %d: thread %" FMT_Word "[\"%.*s\"]"
                        " stopped (stack overflow, size %lu)\n",
                       cap->no, (W_)tso->id, threadLabelLen, threadLabel, (long)info2);
@@ -503,7 +549,7 @@ void traceOSProcessInfo_(void) {
 #endif
         {
             char buf[256];
-            snprintf(buf, sizeof(buf), "GHC-%s %s", ProjectVersion, RtsWay);
+            snprintf(buf, sizeof(buf), "GHC-%s %s", __GLASGOW_HASKELL_FULL_VERSION__, RtsWay);
             postCapsetStrEvent(EVENT_RTS_IDENTIFIER,
                                CAPSET_OSPROCESS_DEFAULT,
                                buf);
@@ -681,10 +727,12 @@ void traceHeapProfSampleString(const char *label, StgWord residency)
     }
 }
 
+// The TRACE_ipe test happens in dumpIPEToEventLog.
 void traceIPE(const InfoProvEnt *ipe)
 {
 #if defined(DEBUG)
-    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR
+        && RtsFlags.DebugFlags.ipe) {
         ACQUIRE_LOCK(&trace_utx);
 
         char closure_desc_buf[CLOSURE_DESC_BUFFER_SIZE] = {};
@@ -705,7 +753,7 @@ void traceIPE(const InfoProvEnt *ipe)
 }
 
 #if defined(PROFILING)
-void traceHeapProfCostCentre(StgWord32 ccID,
+void traceHeapProfCostCentre(StgInt ccID,
                              const char *label,
                              const char *module,
                              const char *srcloc,
@@ -878,59 +926,65 @@ void traceThreadLabel_(Capability *cap,
     }
 }
 
-void traceConcMarkBegin(void)
+void traceNonmovingGcEvent_ (EventTypeNum tag)
 {
-    if (eventlog_enabled)
-        postEventNoCap(EVENT_CONC_MARK_BEGIN);
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* nothing - no string representation for nonmoving GC events  */
+    } else
+#endif
+    {
+        /* currently most non-moving GC events are nullary events */
+        postEventNoCap(tag);
+    }
 }
 
-void traceConcMarkEnd(StgWord32 marked_obj_count)
+void traceConcMarkEnd_(StgWord32 marked_obj_count)
 {
-    if (eventlog_enabled)
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* nothing - no string representation for nonmoving GC events  */
+    } else
+#endif
+    {
         postConcMarkEnd(marked_obj_count);
+    }
 }
 
-void traceConcSyncBegin(void)
+void traceConcUpdRemSetFlush_(Capability *cap)
 {
-    if (eventlog_enabled)
-        postEventNoCap(EVENT_CONC_SYNC_BEGIN);
-}
-
-void traceConcSyncEnd(void)
-{
-    if (eventlog_enabled)
-        postEventNoCap(EVENT_CONC_SYNC_END);
-}
-
-void traceConcSweepBegin(void)
-{
-    if (eventlog_enabled)
-        postEventNoCap(EVENT_CONC_SWEEP_BEGIN);
-}
-
-void traceConcSweepEnd(void)
-{
-    if (eventlog_enabled)
-        postEventNoCap(EVENT_CONC_SWEEP_END);
-}
-
-void traceConcUpdRemSetFlush(Capability *cap)
-{
-    if (eventlog_enabled)
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* nothing - no string representation for nonmoving GC events  */
+    } else
+#endif
+    {
         postConcUpdRemSetFlush(cap);
+    }
 }
 
-void traceNonmovingHeapCensus(uint16_t blk_size,
-                              const struct NonmovingAllocCensus *census)
+void traceNonmovingHeapCensus_(uint16_t blk_size, const struct NonmovingAllocCensus *census)
 {
-    if (eventlog_enabled && TRACE_nonmoving_gc)
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* nothing - no string representation for nonmoving GC events  */
+    } else
+#endif
+    {
         postNonmovingHeapCensus(blk_size, census);
+    }
 }
 
-void traceNonmovingPrunedSegments(uint32_t pruned_segments, uint32_t free_segments)
+void traceNonmovingPrunedSegments_(uint32_t pruned_segments, uint32_t free_segments)
 {
-    if (eventlog_enabled && TRACE_nonmoving_gc)
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* nothing - no string representation for nonmoving GC events  */
+    } else
+#endif
+    {
         postNonmovingPrunedSegments(pruned_segments, free_segments);
+    }
 }
 
 void traceThreadStatus_ (StgTSO *tso USED_IF_DEBUG)

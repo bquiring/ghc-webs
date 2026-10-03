@@ -1,4 +1,4 @@
------------------------------------------------------------------------------
+----------------------------------------------------------------------------
 -- (c) The University of Glasgow, 2006
 --
 -- GHC's lexer for Haskell 2010 [1].
@@ -43,13 +43,11 @@
 {
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UnboxedSums #-}
 {-# LANGUAGE UnliftedNewtypes #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE DataKinds #-}
 
 
 {-# OPTIONS_GHC -funbox-strict-fields #-}
@@ -122,8 +120,14 @@ import GHC.Utils.Misc ( readSignificandExponentPair, readHexSignificandExponentP
 
 import GHC.Types.SrcLoc
 import GHC.Types.SourceText
-import GHC.Types.Basic ( InlineSpec(..), RuleMatchInfo(..))
-import GHC.Hs.Doc
+import GHC.Types.InlinePragma ( InlineSpec(..), RuleMatchInfo(..))
+
+import GHC.Hs.DocString (mkHsDocStringChunk)
+import GHC.Hs.Extension (GhcPs)
+import GHC.Hs.Lit
+
+import Language.Haskell.Syntax.Doc
+import Language.Haskell.Syntax.Extension (noExtField)
 
 import GHC.Parser.CharClass
 
@@ -135,6 +139,9 @@ import GHC.Parser.Errors.Ppr ()
 import GHC.Parser.Lexer.Interface
 import qualified GHC.Parser.Lexer.String as Lexer.String
 import GHC.Parser.String
+
+import Language.Haskell.Syntax.Module.Name (ModuleName(..))
+import Language.Haskell.Syntax.Text
 }
 
 -- -----------------------------------------------------------------------------
@@ -145,7 +152,7 @@ import GHC.Parser.String
 $unispace    = \x05 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
 $nl          = [\n\r\f]
 $space       = [\ $unispace]
-$whitechar   = [$nl \v $space]
+$whitechar   = [$nl \t \v $space]
 $white_no_nl = $whitechar # \n -- TODO #8424
 $tab         = \t
 
@@ -248,7 +255,7 @@ haskell :-
 -- Alex "Rules"
 
 -- everywhere: skip whitespace
-$white_no_nl+ ;
+($white_no_nl # \t)+ ;
 $tab          { warnTab }
 
 -- Everywhere: deal with nested comments.  We explicitly rule out
@@ -475,11 +482,11 @@ $unigraphic / { isSmartQuote } { smart_quote_error }
 }
 
 <0> {
-  \? @varid / { ifExtension IpBit } { skip_one_varid ITdupipvarid }
+  \? @varid / { ifExtension IpBit } { skip_one_varid_text ITdupipvarid }
 }
 
 <0> {
-  "#" $idchar+ / { ifExtension OverloadedLabelsBit } { skip_one_varid_src ITlabelvarid }
+  "#" $idchar+ / { ifExtension OverloadedLabelsBit } { skip_one_varid_src_text ITlabelvarid }
   "#" \" @stringchar* \" / { ifExtension OverloadedLabelsBit } { tok_quoted_label }
 }
 
@@ -613,6 +620,10 @@ $unigraphic / { isSmartQuote } { smart_quote_error }
   \" @stringchar* \" \# / { ifExtension MagicHashBit } { tok_string }
   \' @char        \'                                   { tok_char }
   \' @char        \' \# / { ifExtension MagicHashBit } { tok_char }
+
+  -- QualifiedStrings
+  @qual \"\"\"             / { ifExtension QualifiedStringsBit } { tok_qstrings tok_string_multi }
+  @qual \" @stringchar* \" / { ifExtension QualifiedStringsBit } { tok_qstrings tok_string }
 
   -- Check for smart quotes and throw better errors than a plain lexical error (#21843)
   \'              \\ $unigraphic / { isSmartQuote } { smart_quote_error }
@@ -909,17 +920,16 @@ data Token
   | ITqvarsym (FastString,FastString)
   | ITqconsym (FastString,FastString)
 
-  | ITdupipvarid   FastString   -- GHC extension: implicit param: ?x
-  | ITlabelvarid SourceText FastString   -- Overloaded label: #x
+  | ITdupipvarid            HText        -- GHC extension: implicit param: ?x
+  | ITlabelvarid SourceText HText        -- Overloaded label: #x
                                          -- The SourceText is required because we can
                                          -- have a string literal as a label
                                          -- Note [Literal source text] in "GHC.Types.SourceText"
 
   | ITchar     SourceText Char       -- Note [Literal source text] in "GHC.Types.SourceText"
-  | ITstring   SourceText FastString -- Note [Literal source text] in "GHC.Types.SourceText"
-  | ITstringMulti SourceText FastString -- Note [Literal source text] in "GHC.Types.SourceText"
-  | ITinteger  IntegralLit           -- Note [Literal source text] in "GHC.Types.SourceText"
-  | ITrational FractionalLit
+  | ITstring   SourceText StringMeta HText      -- Note [Literal source text] in "GHC.Types.SourceText"
+  | ITinteger  (IntegralLit   GhcPs)
+  | ITrational (FractionalLit GhcPs)
 
   | ITprimchar   SourceText Char     -- Note [Literal source text] in "GHC.Types.SourceText"
   | ITprimstring SourceText ByteString -- Note [Literal source text] in "GHC.Types.SourceText"
@@ -933,8 +943,8 @@ data Token
   | ITprimword16 SourceText Integer  -- Note [Literal source text] in "GHC.Types.SourceText"
   | ITprimword32 SourceText Integer  -- Note [Literal source text] in "GHC.Types.SourceText"
   | ITprimword64 SourceText Integer  -- Note [Literal source text] in "GHC.Types.SourceText"
-  | ITprimfloat  FractionalLit
-  | ITprimdouble FractionalLit
+  | ITprimfloat  (FractionalLit GhcPs)
+  | ITprimdouble (FractionalLit GhcPs)
 
   -- Template Haskell extension tokens
   | ITopenExpQuote HasE IsUnicodeSyntax --  [| or [e|
@@ -947,11 +957,11 @@ data Token
   | ITdollar                            --  prefix $
   | ITdollardollar                      --  prefix $$
   | ITtyQuote                           --  ''
-  | ITquasiQuote (FastString, PsSpan, FastString, PsSpan)
+  | ITquasiQuote (FastString, PsSpan, HText, PsSpan)
     -- ITquasiQuote(quoter, quoter_loc, quote, quote_loc)
     -- represents a quasi-quote of the form
     -- [quoter| quote |]
-  | ITqQuasiQuote (FastString,FastString,PsSpan, FastString, PsSpan)
+  | ITqQuasiQuote (FastString,FastString,PsSpan, HText, PsSpan)
     -- ITqQuasiQuote(Qual, quoter, quoter_loc, quote, quote_loc)
     -- represents a qualified quasi-quote of the form
     -- [Qual.quoter| quote |]
@@ -973,11 +983,11 @@ data Token
   | ITeof                        -- ^ end of file token
 
   -- Documentation annotations. See Note [PsSpan in Comments]
-  | ITdocComment   HsDocString PsSpan -- ^ The HsDocString contains more details about what
-                                      -- this is and how to pretty print it
-  | ITdocOptions   String      PsSpan -- ^ doc options (prune, ignore-exports, etc)
-  | ITlineComment  String      PsSpan -- ^ comment starting by "--"
-  | ITblockComment String      PsSpan -- ^ comment in {- -}
+  | ITdocComment   (HsDocString GhcPs) PsSpan -- ^ The HsDocString contains more details about what
+                                              -- this is and how to pretty print it
+  | ITdocOptions   String              PsSpan -- ^ doc options (prune, ignore-exports, etc)
+  | ITlineComment  String              PsSpan -- ^ comment starting by "--"
+  | ITblockComment String              PsSpan -- ^ comment in {- -}
 
   deriving Show
 
@@ -1188,10 +1198,19 @@ skip_one_varid :: (FastString -> Token) -> Action
 skip_one_varid f span buf len _buf2
   = return (L span $! f (lexemeToFastString (stepOn buf) (len-1)))
 
+skip_one_varid_text :: (HText -> Token) -> Action
+skip_one_varid_text f span buf len _buf2
+  = return (L span $! f (lexemeToText (stepOn buf) (len-1)))
+
 skip_one_varid_src :: (SourceText -> FastString -> Token) -> Action
 skip_one_varid_src f span buf len _buf2
   = return (L span $! f (SourceText $ lexemeToFastString (stepOn buf) (len-1))
                         (lexemeToFastString (stepOn buf) (len-1)))
+
+skip_one_varid_src_text :: (SourceText -> HText -> Token) -> Action
+skip_one_varid_src_text f span buf len _buf2
+  = return (L span $! f (SourceText $ lexemeToFastString (stepOn buf) (len-1))
+                        (lexemeToText (stepOn buf) (len-1)))
 
 skip_two_varid :: (FastString -> Token) -> Action
 skip_two_varid f span buf len _buf2
@@ -1406,7 +1425,7 @@ multiline_doc_comment span buf _len _buf2 = {-# SCC "multiline_doc_comment" #-} 
             lineSpan = mkSrcSpanPs $ mkPsSpan start_loc end_loc
             locatedLine = L lineSpan (mkHsDocStringChunk $ reverse curLine)
             commentLines = NE.reverse $ locatedLine :| prevLines
-            endComment = docCommentEnd input (docType (\dec -> MultiLineDocString dec commentLines)) buf span
+            endComment = docCommentEnd input (docType (\dec -> MultiLineDocString noExtField dec commentLines)) buf span
 
     -- Check if the next line of input belongs to this doc comment as well.
     -- A doc comment continues onto the next line when the following
@@ -1463,7 +1482,7 @@ nested_doc_comment span buf _len _buf2 = {-# SCC "nested_doc_comment" #-} withLe
     worker input@(AI start_loc _) docType _checkNextLine = nested_comment_logic endComment "" input (mkPsSpan start_loc (psSpanEnd span))
       where
         endComment input lcomment
-          = docCommentEnd input (docType (\d -> NestedDocString d (mkHsDocStringChunk . dropTrailingDec <$> lcomment))) buf span
+          = docCommentEnd input (docType (\d -> NestedDocString noExtField d (mkHsDocStringChunk . dropTrailingDec <$> lcomment))) buf span
 
         dropTrailingDec [] = []
         dropTrailingDec "-}" = ""
@@ -1550,7 +1569,7 @@ See #314 for more background on the bug this fixes.
 -}
 
 {-# INLINE withLexedDocType #-}
-withLexedDocType :: (AlexInput -> ((HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)) -> Bool -> P (PsLocated Token))
+withLexedDocType :: (AlexInput -> ((HsDocStringDecorator -> HsDocString GhcPs) -> (HdkComment, Token)) -> Bool -> P (PsLocated Token))
                  -> P (PsLocated Token)
 withLexedDocType lexDocComment = do
   input@(AI _ buf) <- getInput
@@ -1580,17 +1599,17 @@ withLexedDocType lexDocComment = do
             | otherwise -> go (c:acc) input'
           Nothing -> Nothing
 
-mkHdkCommentNext, mkHdkCommentPrev  :: PsSpan -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentNext, mkHdkCommentPrev  :: PsSpan -> (HsDocStringDecorator -> HsDocString GhcPs) -> (HdkComment, Token)
 mkHdkCommentNext loc mkDS =  (HdkCommentNext ds,ITdocComment ds loc)
   where ds = mkDS HsDocStringNext
 mkHdkCommentPrev loc mkDS =  (HdkCommentPrev ds,ITdocComment ds loc)
   where ds = mkDS HsDocStringPrevious
 
-mkHdkCommentNamed :: PsSpan -> String -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentNamed :: PsSpan -> String -> (HsDocStringDecorator -> HsDocString GhcPs) -> (HdkComment, Token)
 mkHdkCommentNamed loc name mkDS = (HdkCommentNamed name ds, ITdocComment ds loc)
   where ds = mkDS (HsDocStringNamed name)
 
-mkHdkCommentSection :: PsSpan -> Int -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentSection :: PsSpan -> Int -> (HsDocStringDecorator -> HsDocString GhcPs) -> (HdkComment, Token)
 mkHdkCommentSection loc n mkDS = (HdkCommentSection n ds, ITdocComment ds loc)
   where ds = mkDS (HsDocStringGroup n)
 
@@ -1679,7 +1698,7 @@ qvarid, qconid :: StringBuffer -> Int -> Token
 qvarid buf len = ITqvarid $! splitQualName buf len False
 qconid buf len = ITqconid $! splitQualName buf len False
 
-splitQualName :: StringBuffer -> Int -> Bool -> (FastString,FastString)
+splitQualName :: StringBuffer -> Int -> Bool -> (FastString, FastString)
 -- takes a StringBuffer and a length, and returns the module name
 -- and identifier parts of a qualified name.  Splits at the *last* dot,
 -- because of hierarchical module names.
@@ -1784,7 +1803,7 @@ varsym opws@OpWsPrefix = sym $ \span exts s ->
   if | s == fsLit "@" ->
          return ITtypeApp  -- regardless of TypeApplications for better error messages
      | s == fsLit "%" ->
-         if xtest LinearTypesBit exts
+         if xtest ModifiersBit exts || xtest LinearTypesBit exts
          then return ITpercent
          else warnExtConflict OperatorWhitespaceSymbol_PrefixPercent
      | s == fsLit "$" ->
@@ -1975,15 +1994,15 @@ tok_primdouble   str = ITprimdouble $! readFractionalLit str
 tok_prim_hex_float  str = ITprimfloat $! readHexFractionalLit str
 tok_prim_hex_double str = ITprimdouble $! readHexFractionalLit str
 
-readFractionalLit, readHexFractionalLit :: String -> FractionalLit
+readFractionalLit, readHexFractionalLit :: String -> FractionalLit GhcPs
 readHexFractionalLit = readFractionalLitX readHexSignificandExponentPair Base2
 readFractionalLit = readFractionalLitX readSignificandExponentPair Base10
 
 readFractionalLitX :: (String -> (Integer, Integer))
                    -> FractionalExponentBase
-                   -> String -> FractionalLit
+                   -> String -> FractionalLit GhcPs
 readFractionalLitX readStr b str =
-  mkSourceFractionalLit str is_neg i e b
+  mkFractionalLitFromText str is_neg i e b
   where
     is_neg = case str of
                     '-' : _ -> True
@@ -2166,7 +2185,7 @@ tok_string span buf len _buf2 = do
         addError err
       pure $ L span (ITprimstring src (unsafeMkByteString s))
     else
-      pure $ L span (ITstring src (mkFastString s))
+      pure $ L span (ITstring src defaultStrMeta (packHText s))
   where
     src = SourceText $ lexemeToFastString buf len
     endsInHash = currentChar (offsetBytes (len - 1) buf) == '#'
@@ -2210,7 +2229,8 @@ tok_string_multi startSpan startBuf _len _buf2 = do
       lexMultilineString contentLen contentStartBuf
 
   setInput i'
-  pure $ L span $ ITstringMulti src (mkFastString s)
+  let meta = defaultStrMeta{strMetaMultiline = True}
+  pure $ L span $ ITstring src meta (packHText s)
   where
     goContent i0 =
       case Lexer.String.alexScan i0 Lexer.String.string_multi_content of
@@ -2261,11 +2281,42 @@ throwStringLexError i (StringLexError e pos) = setInput (advanceInputTo pos i) >
 tok_quoted_label :: Action
 tok_quoted_label span buf len _buf2 = do
   s <- lex_chars ("#\"", "\"") span buf len
-  pure $ L span (ITlabelvarid src (mkFastString s))
+  pure $ L span (ITlabelvarid src (packHText s))
   where
     -- skip leading '#'
     src = SourceText . mkFastString . drop 1 $ lexemeToString buf len
 
+-- See Note [Implementation of QualifiedStrings]
+tok_qstrings :: Action -> Action
+tok_qstrings lex_str span0 buf0 len0 endBuf0 = do
+  let modName = ModuleName $ lexemeToFastString buf0 modNameLen
+  (span1, src, meta, s) <- unITstring <$> lex_str strSpan strBuf strLen endBuf0
+  let span2 = mkPsSpan (psSpanStart span0) (psSpanEnd span1)
+  pure $ L span2 $ ITstring src meta{strMetaQualified = Just modName} s
+  where
+    -- The buffer/span starting at the string literal
+    (strBuf, strSpanStart) =
+      let go buf loc =
+            case nextChar buf of
+              _ | atEnd buf -> panic "tok_qstrings unexpectedly hit EOF"
+              ('"', _) -> (buf, loc)
+              (c, buf') -> go buf' (advancePsLoc loc c)
+       in go buf0 (psSpanStart span0)
+
+    -- The length of the module name + string literal, separately
+    -- Make sure to handle the trailing dot at the end of the module name
+    modNameLen = byteDiff buf0 strBuf - 1
+    strLen = len0 - modNameLen - 1
+
+    -- The span starting at the string literal
+    --
+    -- Naive RealSrcSpan manipulation is okay here because the module qualifier
+    -- is guaranteed to be on a single line
+    strSpan = mkPsSpan strSpanStart (psSpanEnd span0)
+
+    unITstring = \case
+      L span1 (ITstring src meta s) -> (span1, src, meta, s)
+      tok -> panic $ "tok_qstrings got unexpected token: " ++ show tok
 
 tok_char :: Action
 tok_char span buf len _buf2 = do
@@ -2298,7 +2349,7 @@ lex_qquasiquote_tok span buf len _buf2 = do
            (ITqQuasiQuote (qual,
                            quoter,
                            quoter_span,
-                           mkFastString (reverse quote),
+                           packHText (reverse quote),
                            mkPsSpan quoteStart end)))
 
 lex_quasiquote_tok :: Action
@@ -2315,7 +2366,7 @@ lex_quasiquote_tok span buf len _buf2 = do
   return (L (mkPsSpan (psSpanStart span) end)
            (ITquasiQuote (mkFastString quoter,
                           quoter_span,
-                          mkFastString (reverse quote),
+                          packHText (reverse quote),
                           mkPsSpan quoteStart end)))
 
 lex_quasiquote :: RealSrcLoc -> String -> P String
@@ -2443,10 +2494,10 @@ pWarningFlags opts = diag_warning_flags (pDiagOpts opts)
 -- 'HsDocString's spans over the contents of the docstring - i.e. it does not
 -- include the decorator ("-- |", "{-|" etc.)
 data HdkComment
-  = HdkCommentNext HsDocString
-  | HdkCommentPrev HsDocString
-  | HdkCommentNamed String HsDocString
-  | HdkCommentSection Int HsDocString
+  = HdkCommentNext (HsDocString GhcPs)
+  | HdkCommentPrev (HsDocString GhcPs)
+  | HdkCommentNamed String (HsDocString GhcPs)
+  | HdkCommentSection Int (HsDocString GhcPs)
   deriving Show
 
 data PState = PState {
@@ -2779,6 +2830,7 @@ data ExtBits
   | MultiWayIfBit
   | GadtSyntaxBit
   | ImportQualifiedPostBit
+  | ModifiersBit
   | LinearTypesBit
   | NoLexicalNegationBit   -- See Note [Why not LexicalNegationBit]
   | OverloadedRecordDotBit
@@ -2790,6 +2842,7 @@ data ExtBits
   | RequiredTypeArgumentsBit
   | MultilineStringsBit
   | LevelImportsBit
+  | QualifiedStringsBit
 
   -- Flags that are updated once parsing starts
   | InRulePragBit
@@ -2863,6 +2916,7 @@ mkParserOpts extensionFlags diag_opts
       .|. MultiWayIfBit               `xoptBit` LangExt.MultiWayIf
       .|. GadtSyntaxBit               `xoptBit` LangExt.GADTSyntax
       .|. ImportQualifiedPostBit      `xoptBit` LangExt.ImportQualifiedPost
+      .|. ModifiersBit                `xoptBit` LangExt.Modifiers
       .|. LinearTypesBit              `xoptBit` LangExt.LinearTypes
       .|. NoLexicalNegationBit        `xoptNotBit` LangExt.LexicalNegation -- See Note [Why not LexicalNegationBit]
       .|. OverloadedRecordDotBit      `xoptBit` LangExt.OverloadedRecordDot
@@ -2874,6 +2928,7 @@ mkParserOpts extensionFlags diag_opts
       .|. RequiredTypeArgumentsBit    `xoptBit` LangExt.RequiredTypeArguments
       .|. MultilineStringsBit         `xoptBit` LangExt.MultilineStrings
       .|. LevelImportsBit             `xoptBit` LangExt.ExplicitLevelImports
+      .|. QualifiedStringsBit         `xoptBit` LangExt.QualifiedStrings
     optBits =
           HaddockBit        `setBitIf` isHaddock
       .|. RawTokenStreamBit `setBitIf` rawTokStream
@@ -3466,14 +3521,14 @@ ignoredPrags = Map.fromList (map ignored pragmas)
 oneWordPrags = Map.fromList [
      ("rules", rulePrag),
      ("inline",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (Inline (SourceText s)) FunLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) Inline FunLike))),
      ("inlinable",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (Inlinable (SourceText s)) FunLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) Inlinable FunLike))),
      ("inlineable",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (Inlinable (SourceText s)) FunLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) Inlinable FunLike))),
                                     -- Spelling variant
      ("notinline",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (NoInline (SourceText s)) FunLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) NoInline FunLike))),
      ("opaque", fstrtoken (\s -> ITopaque_prag (SourceText s))),
      ("specialize", fstrtoken (\s -> ITspec_prag (SourceText s))),
      ("source", fstrtoken (\s -> ITsource_prag (SourceText s))),
@@ -3495,9 +3550,9 @@ oneWordPrags = Map.fromList [
 
 twoWordPrags = Map.fromList [
      ("inline conlike",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (Inline (SourceText s)) ConLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) Inline ConLike))),
      ("notinline conlike",
-         fstrtoken (\s -> (ITinline_prag (SourceText s) (NoInline (SourceText s)) ConLike))),
+         fstrtoken (\s -> (ITinline_prag (SourceText s) NoInline ConLike))),
      ("specialize inline",
          fstrtoken (\s -> (ITspec_inline_prag (SourceText s) True))),
      ("specialize notinline",

@@ -19,7 +19,9 @@ import GHC.Cmm.Dataflow.Label
 
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
+import GHC.Cmm.InitFini
 
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique ( pprUniqueAlways, getUnique )
 import GHC.Platform
 import GHC.Utils.Outputable
@@ -28,9 +30,7 @@ import GHC.Utils.Panic
 
 pprNatCmmDecl :: IsDoc doc => NCGConfig -> NatCmmDecl RawCmmStatics Instr -> doc
 pprNatCmmDecl config (CmmData section dats) =
-  let platform = ncgPlatform config
-  in
-  pprSectionAlign config section $$ pprDatas platform dats
+  pprSectionAlign config section $$ pprDatas config dats
 
 pprNatCmmDecl config proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
   let platform = ncgPlatform config
@@ -91,11 +91,20 @@ pprAlignForSection _platform _seg
 --     .balign 8
 --
 pprSectionAlign :: IsDoc doc => NCGConfig -> Section -> doc
-pprSectionAlign _config (Section (OtherSection _) _) =
-     panic "AArch64.Ppr.pprSectionAlign: unknown section"
-pprSectionAlign config sec@(Section seg _) =
+pprSectionAlign config sec@(Section seg suffix) =
     line (pprSectionHeader config sec)
+    $$ coffSplitSectionComdatKey
     $$ pprAlignForSection (ncgPlatform config) seg
+  where
+    platform = ncgPlatform config
+    -- See Note [Split sections on COFF objects]
+    coffSplitSectionComdatKey
+      | OSMinGW32 <- platformOS platform
+      , ncgSplitSections config
+      , Nothing <- isInitOrFiniSection seg
+      = line (pprCOFFComdatKey platform suffix <> colon)
+      | otherwise
+      = empty
 
 -- | Output the ELF .size directive.
 pprSizeDecl :: IsDoc doc => Platform -> CLabel -> doc
@@ -138,20 +147,26 @@ pprBasicBlock platform with_dwarf info_env (BasicBlock blockid instrs)
       (l@LOCATION{} : _) -> pprInstr platform l
       _other             -> empty
 
-pprDatas :: IsDoc doc => Platform -> RawCmmStatics -> doc
+pprDatas :: IsDoc doc => NCGConfig -> RawCmmStatics -> doc
 -- See Note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
-pprDatas platform (CmmStaticsRaw alias [CmmStaticLit (CmmLabel lbl), CmmStaticLit ind, _, _])
+pprDatas config (CmmStaticsRaw alias [CmmStaticLit (CmmLabel lbl), CmmStaticLit ind, _, _])
   | lbl == mkIndStaticInfoLabel
   , let labelInd (CmmLabelOff l _) = Just l
         labelInd (CmmLabel l) = Just l
         labelInd _ = Nothing
   , Just ind' <- labelInd ind
   , alias `mayRedirectTo` ind'
+  -- See Note [Split sections on COFF objects]
+  , not $ platformOS platform == OSMinGW32 && ncgSplitSections config
   = pprGloblDecl platform alias
     $$ line (text ".equiv" <+> pprAsmLabel platform alias <> comma <> pprAsmLabel platform ind')
+    where
+      platform = ncgPlatform config
 
-pprDatas platform (CmmStaticsRaw lbl dats)
+pprDatas config (CmmStaticsRaw lbl dats)
   = vcat (pprLabel platform lbl : map (pprData platform) dats)
+    where
+      platform = ncgPlatform config
 
 pprData :: IsDoc doc => Platform -> CmmStatic -> doc
 pprData _platform (CmmString str) = line (pprString str)
@@ -198,22 +213,34 @@ pprTypeDecl platform lbl
 
 pprDataItem :: IsDoc doc => Platform -> CmmLit -> doc
 pprDataItem platform lit
-  = lines_ (ppr_item (cmmTypeFormat $ cmmLitType platform lit) lit)
+  = lines_ (ppr_align fmt ++ ppr_item fmt lit)
     where
-        imm = litToImm lit
+        fmt = cmmTypeFormat $ cmmLitType platform lit
 
-        ppr_item II8  _ = [text "\t.byte\t"  <> pprImm platform imm]
-        ppr_item II16 _ = [text "\t.short\t" <> pprImm platform imm]
-        ppr_item II32 _ = [text "\t.long\t"  <> pprImm platform imm]
-        ppr_item II64 _ = [text "\t.quad\t"  <> pprImm platform imm]
+        -- It's unlikely that we need to attach .p2align to every .short/.long/.quad
+        ppr_align II8 = []
+        ppr_align II16 = []
+        ppr_align II32 = []
+        ppr_align II64 = []
+        ppr_align FF32 = [text "\t.p2align 2"]
+        ppr_align FF64 = [text "\t.p2align 3"]
+        ppr_align (VecFormat {}) = [text "\t.p2align 4"]
+
+        ppr_item II8  lit' = [text "\t.byte\t"  <> pprImm platform (litToImm lit')]
+        ppr_item II16 lit' = [text "\t.short\t" <> pprImm platform (litToImm lit')]
+        ppr_item II32 lit' = [text "\t.long\t"  <> pprImm platform (litToImm lit')]
+        ppr_item II64 lit' = [text "\t.quad\t"  <> pprImm platform (litToImm lit')]
 
         ppr_item FF32  (CmmFloat r _)
-           = let bs = floatToBytes (fromRational r)
+           = let bs = floatToBytes (litFloatingToHostFloat r)
              in  map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
 
         ppr_item FF64 (CmmFloat r _)
-           = let bs = doubleToBytes (fromRational r)
+           = let bs = doubleToBytes (litFloatingToHostDouble r)
              in  map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
+
+        ppr_item (VecFormat _ scalar) (CmmVec lits)
+           = concatMap (ppr_item $ scalarFormatFormat scalar) lits
 
         ppr_item _ _ = pprPanic "pprDataItem:ppr_item" (text $ show lit)
 
@@ -226,11 +253,11 @@ pprImm _ (ImmLit s)     = ftext s
 
 -- TODO: See pprIm below for why this is a bad idea!
 pprImm _ (ImmFloat f)
-  | f == 0 = text "wzr"
-  | otherwise = float (fromRational f)
+  | isPositiveZero f = text "wzr"
+  | otherwise = float f
 pprImm _ (ImmDouble d)
-  | d == 0 = text "xzr"
-  | otherwise = double (fromRational d)
+  | isPositiveZero d = text "xzr"
+  | otherwise = double d
 
 pprImm p (ImmConstantSum a b) = pprImm p a <> char '+' <> pprImm p b
 pprImm p (ImmConstantDiff a b) = pprImm p a <> char '-'
@@ -264,10 +291,10 @@ pprIm platform im = case im of
   --
   -- We could also just turn them into statics :-/ Which is what the
   -- PowerPC backend does.
-  ImmFloat f | f == 0 -> text "wzr"
-  ImmFloat f -> char '#' <> float (fromRational f)
-  ImmDouble d | d == 0 -> text "xzr"
-  ImmDouble d -> char '#' <> double (fromRational d)
+  ImmFloat f | isPositiveZero f -> text "wzr"
+  ImmFloat f -> char '#' <> float f
+  ImmDouble d | isPositiveZero d -> text "xzr"
+  ImmDouble d -> char '#' <> double d
   -- =<lbl> pseudo instruction!
   ImmCLbl l    -> char '=' <> pprAsmLabel platform l
   ImmIndex l o -> text "[=" <> pprAsmLabel platform l <> comma <+> char '#' <> int o <> char ']'
@@ -288,6 +315,7 @@ pprShift SLSL = text "lsl"
 pprShift SLSR = text "lsr"
 pprShift SASR = text "asr"
 pprShift SROR = text "ror"
+pprShift SMSL = text "msl"
 
 pprOp :: IsLine doc => Platform -> Operand -> doc
 pprOp plat op = case op of
@@ -301,6 +329,26 @@ pprOp plat op = case op of
   OpAddr (AddrRegReg r1 r2) -> char '[' <+> pprReg W64 r1 <> comma <+> pprReg W64 r2 <+> char ']'
   OpAddr (AddrRegImm r1 im) -> char '[' <+> pprReg W64 r1 <> comma <+> pprImm plat im <+> char ']'
   OpAddr (AddrReg r1)       -> char '[' <+> pprReg W64 r1 <+> char ']'
+  OpVecLane w r index -> regName <> elementWidth <> int index <> char ']'
+    where
+      regName = case r of
+        RegReal (RealRegSingle i)
+          -- See Note [AArch64 Register assignments]
+          -- General Purpose Registers
+          | i <= 31 -> text "very naughty AArch64 register" <+> parens (text (show w) <+> int i) -- pprPanic "Invalid Reg" (ppr w <+> int i)
+          -- Floating Point Registers
+          | i <= 63 -> text "v" <> int (i-32)
+          | otherwise -> text "very naughty AArch64 register" <+> parens (text (show w) <+> int i)
+        RegVirtual (VirtualRegD u) -> text "%vD_" <> pprUniqueAlways u
+        RegVirtual (VirtualRegV128 u) -> text "%vV128_" <> pprUniqueAlways u
+        _ -> pprPanic "invalid register" (ppr r)
+      elementWidth = case w of
+        W8 -> text ".b["
+        W16 -> text ".h["
+        W32 -> text ".s["
+        W64 -> text ".d["
+        _ -> pprPanic "invalid element width" (ppr w)
+  OpScalarAsVec w r -> pprOp plat (OpVecLane w r 0)
 
 pprReg :: forall doc. IsLine doc => Width -> Reg -> doc
 pprReg w r = case r of
@@ -308,6 +356,7 @@ pprReg w r = case r of
   -- virtual regs should not show up, but this is helpful for debugging.
   RegVirtual (VirtualRegI u)   -> text "%vI_" <> pprUniqueAlways u
   RegVirtual (VirtualRegD u)   -> text "%vD_" <> pprUniqueAlways u
+  RegVirtual (VirtualRegV128 u) -> text "%vV128_" <> pprUniqueAlways u
   _                            -> pprPanic "AArch64.pprReg" (text $ show r)
 
   where
@@ -335,11 +384,68 @@ pprReg w r = case r of
          | i <= 63, w == W128= text "q" <> int (i-32)
          | otherwise = text "very naughty AArch64 register" <+> parens (text (show w) <+> int i)
 
+pprFormatOp :: IsLine doc => Platform -> Format -> Operand -> doc
+pprFormatOp plat fmt op = case op of
+  OpReg w r -> pprFormatReg fmt w r
+  _         -> pprOp plat op
+
+pprFormatReg :: forall doc. IsLine doc => Format -> Width -> Reg -> doc
+pprFormatReg fmt w r = case r of
+  RegReal    (RealRegSingle i) -> ppr_reg_no w i
+  -- virtual regs should not show up, but this is helpful for debugging.
+  RegVirtual (VirtualRegI u)   -> text "%vI_" <> pprUniqueAlways u
+  RegVirtual (VirtualRegD u)   -> text "%vD_" <> pprUniqueAlways u
+  RegVirtual (VirtualRegV128 u) -> case fmt of
+    VecFormat 16 FmtInt8 -> text "%vV128_" <> pprUniqueAlways u <> text ".16b"
+    VecFormat 8 FmtInt16 -> text "%vV128_" <> pprUniqueAlways u <> text ".8h"
+    VecFormat 4 FmtInt32 -> text "%vV128_" <> pprUniqueAlways u <> text ".4s"
+    VecFormat 2 FmtInt64 -> text "%vV128_" <> pprUniqueAlways u <> text ".2d"
+    VecFormat 4 FmtFloat -> text "%vV128_" <> pprUniqueAlways u <> text ".4s"
+    VecFormat 2 FmtDouble -> text "%vV128_" <> pprUniqueAlways u <> text ".2d"
+    _ -> text "%vV128_" <> pprUniqueAlways u
+  _                            -> pprPanic "AArch64.pprReg" (text $ show r)
+
+  where
+    ppr_reg_no :: Width -> Int -> doc
+    ppr_reg_no w 31
+         | w == W64 = text "sp"
+         | w == W32 = text "wsp"
+
+    -- See Note [AArch64 Register assignments]
+    ppr_reg_no w i
+         | i < 0, w == W32 = text "wzr"
+         | i < 0, w == W64 = text "xzr"
+         | i < 0 = pprPanic "Invalid Zero Reg" (ppr w <+> int i)
+         -- General Purpose Registers
+         | i <= 31, w == W8  = text "w" <> int i      -- there are no byte or half
+         | i <= 31, w == W16 = text "w" <> int i      -- words... word will do.
+         | i <= 31, w == W32 = text "w" <> int i
+         | i <= 31, w == W64 = text "x" <> int i
+         | i <= 31 = pprPanic "Invalid Reg" (ppr w <+> int i)
+         -- Floating Point Registers
+         | i <= 63, w == W8  = text "b" <> int (i-32)
+         | i <= 63, w == W16 = text "h" <> int (i-32)
+         | i <= 63, w == W32 = text "s" <> int (i-32)
+         | i <= 63, w == W64 = text "d" <> int (i-32)
+         | i <= 63, w == W128 = case fmt of
+            VecFormat 16 FmtInt8 -> text "v" <> int (i-32) <> text ".16b"
+            VecFormat 8 FmtInt16 -> text "v" <> int (i-32) <> text ".8h"
+            VecFormat 4 FmtInt32 -> text "v" <> int (i-32) <> text ".4s"
+            VecFormat 2 FmtInt64 -> text "v" <> int (i-32) <> text ".2d"
+            VecFormat 4 FmtFloat -> text "v" <> int (i-32) <> text ".4s"
+            VecFormat 2 FmtDouble -> text "v" <> int (i-32) <> text ".2d"
+            _ -> text "q" <> int (i-32)
+         | otherwise = text "very naughty AArch64 register" <+> parens (text (show w) <+> int i)
+
 isFloatOp :: Operand -> Bool
-isFloatOp (OpReg _ (RegReal (RealRegSingle i))) | i > 31 = True
+isFloatOp (OpReg w (RegReal (RealRegSingle i))) | i > 31, w /= W128 = True
 isFloatOp (OpReg _ (RegVirtual (VirtualRegD _))) = True
--- SIMD NCG TODO: what about VirtualVecV128? Could be floating-point or not?
 isFloatOp _ = False
+
+isVectorOp :: Operand -> Bool
+isVectorOp (OpReg W128 (RegReal (RealRegSingle i))) | i > 31 = True
+isVectorOp (OpReg _ (RegVirtual (VirtualRegV128 _))) = True
+isVectorOp _ = False
 
 pprInstr :: IsDoc doc => Platform -> Instr -> doc
 pprInstr platform instr = case instr of
@@ -351,6 +457,7 @@ pprInstr platform instr = case instr of
 
   LOCATION file line' col _name
     -> line (text "\t.loc" <+> int file <+> int line' <+> int col)
+  LDATA {} -> panic "pprInstr: LDATA"
   DELTA d   -> dualDoc (asmComment $ text "\tdelta = " <> int d) empty
                -- see Note [dualLine and dualDoc] in GHC.Utils.Outputable
   NEWBLOCK blockid -> -- This is invalid assembly. But NEWBLOCK should never be contained
@@ -367,31 +474,31 @@ pprInstr platform instr = case instr of
   -- ===========================================================================
   -- AArch64 Instruction Set
   -- 1. Arithmetic Instructions ------------------------------------------------
-  ADD  o1 o2 o3
-    | isFloatOp o1 && isFloatOp o2 && isFloatOp o3 -> op3 (text "\tfadd") o1 o2 o3
-    | otherwise -> op3 (text "\tadd") o1 o2 o3
+  ADD  fmt o1 o2 o3
+    | isFloatOrFloatVecFormat fmt -> op3fmt (text "\tfadd") fmt o1 o2 o3
+    | otherwise -> op3fmt (text "\tadd") fmt o1 o2 o3
   CMP  o1 o2
     | isFloatOp o1 && isFloatOp o2 -> op2 (text "\tfcmp") o1 o2
     | otherwise -> op2 (text "\tcmp") o1 o2
   CMN  o1 o2       -> op2 (text "\tcmn") o1 o2
   MSUB o1 o2 o3 o4 -> op4 (text "\tmsub") o1 o2 o3 o4
-  MUL  o1 o2 o3
-    | isFloatOp o1 && isFloatOp o2 && isFloatOp o3 -> op3 (text "\tfmul") o1 o2 o3
-    | otherwise -> op3 (text "\tmul") o1 o2 o3
+  MUL  fmt o1 o2 o3
+    | isFloatOrFloatVecFormat fmt -> op3fmt (text "\tfmul") fmt o1 o2 o3
+    | otherwise -> op3fmt (text "\tmul") fmt o1 o2 o3
   SMULH o1 o2 o3 -> op3 (text "\tsmulh") o1 o2 o3
   SMULL o1 o2 o3 -> op3 (text "\tsmull") o1 o2 o3
   UMULH o1 o2 o3 -> op3 (text "\tumulh") o1 o2 o3
   UMULL o1 o2 o3 -> op3 (text "\tumull") o1 o2 o3
-  NEG  o1 o2
-    | isFloatOp o1 && isFloatOp o2 -> op2 (text "\tfneg") o1 o2
-    | otherwise -> op2 (text "\tneg") o1 o2
-  SDIV o1 o2 o3 | isFloatOp o1 && isFloatOp o2 && isFloatOp o3
-    -> op3 (text "\tfdiv") o1 o2 o3
-  SDIV o1 o2 o3 -> op3 (text "\tsdiv") o1 o2 o3
+  NEG  fmt o1 o2
+    | isFloatOrFloatVecFormat fmt -> op2fmt (text "\tfneg") fmt o1 o2
+    | otherwise -> op2fmt (text "\tneg") fmt o1 o2
+  SDIV fmt o1 o2 o3
+    | isFloatOrFloatVecFormat fmt -> op3fmt (text "\tfdiv") fmt o1 o2 o3
+    | otherwise -> op3fmt (text "\tsdiv") fmt o1 o2 o3
 
-  SUB  o1 o2 o3
-    | isFloatOp o1 && isFloatOp o2 && isFloatOp o3 -> op3 (text "\tfsub") o1 o2 o3
-    | otherwise -> op3 (text "\tsub")  o1 o2 o3
+  SUB  fmt o1 o2 o3
+    | isFloatOrFloatVecFormat fmt -> op3fmt (text "\tfsub") fmt o1 o2 o3
+    | otherwise -> op3fmt (text "\tsub") fmt o1 o2 o3
   UDIV o1 o2 o3 -> op3 (text "\tudiv") o1 o2 o3
 
   -- 2. Bit Manipulation Instructions ------------------------------------------
@@ -400,29 +507,36 @@ pprInstr platform instr = case instr of
   CLZ  o1 o2       -> op2 (text "\tclz")  o1 o2
   RBIT  o1 o2      -> op2 (text "\trbit")  o1 o2
   REV o1 o2        -> op2 (text "\trev")  o1 o2
-  REV16 o1 o2      -> op2 (text "\trev16")  o1 o2
-  -- REV32 o1 o2      -> op2 (text "\trev32")  o1 o2
+  REV16 fmt o1 o2  -> op2fmt (text "\trev16") fmt o1 o2
+  REV32 fmt o1 o2  -> op2fmt (text "\trev32") fmt o1 o2
+  REV64 fmt o1 o2  -> op2fmt (text "\trev64") fmt o1 o2
   -- signed and unsigned bitfield extract
   SBFX o1 o2 o3 o4 -> op4 (text "\tsbfx") o1 o2 o3 o4
   UBFX o1 o2 o3 o4 -> op4 (text "\tubfx") o1 o2 o3 o4
   SXTB o1 o2       -> op2 (text "\tsxtb") o1 o2
   UXTB o1 o2       -> op2 (text "\tuxtb") o1 o2
   SXTH o1 o2       -> op2 (text "\tsxth") o1 o2
+  SXTW o1 o2       -> op2 (text "\tsxtw") o1 o2
   UXTH o1 o2       -> op2 (text "\tuxth") o1 o2
 
   -- 3. Logical and Move Instructions ------------------------------------------
-  AND o1 o2 o3  -> op3 (text "\tand") o1 o2 o3
+  AND fmt o1 o2 o3  -> op3fmt (text "\tand") fmt o1 o2 o3
   ASR o1 o2 o3  -> op3 (text "\tasr") o1 o2 o3
-  EOR o1 o2 o3  -> op3 (text "\teor") o1 o2 o3
+  EOR fmt o1 o2 o3  -> op3fmt (text "\teor") fmt o1 o2 o3
   LSL o1 o2 o3  -> op3 (text "\tlsl") o1 o2 o3
   LSR o1 o2 o3  -> op3 (text "\tlsr") o1 o2 o3
   MOV o1 o2
+    -- scalar fp <-> scalar fp: FMOV
+    -- scalar fp <-> gp: FMOV
+    -- vector <-> vector: MOV (.16B)
+    -- vector lane <-> gp: MOV
+    | isVectorOp o1 && isVectorOp o2 -> op2fmt (text "\tmov") (VecFormat 16 FmtInt8) o1 o2
     | isFloatOp o1 || isFloatOp o2 -> op2 (text "\tfmov") o1 o2
     | otherwise                    -> op2 (text "\tmov") o1 o2
   MOVK o1 o2    -> op2 (text "\tmovk") o1 o2
   MOVZ o1 o2    -> op2 (text "\tmovz") o1 o2
   MVN o1 o2     -> op2 (text "\tmvn") o1 o2
-  ORR o1 o2 o3  -> op3 (text "\torr") o1 o2 o3
+  ORR fmt o1 o2 o3  -> op3fmt (text "\torr") fmt o1 o2 o3
 
   -- 4. Branch Instructions ----------------------------------------------------
   J t            -> pprInstr platform (B t)
@@ -455,12 +569,8 @@ pprInstr platform instr = case instr of
   -- NOTE: GHC may do whacky things where it only load the lower part of an
   --       address. Not observing the correct size when loading will lead
   --       inevitably to crashes.
-  STR _f o1@(OpReg W8 (RegReal (RealRegSingle i))) o2 | i < 32 ->
-    op2 (text "\tstrb") o1 o2
-  STR _f o1@(OpReg W16 (RegReal (RealRegSingle i))) o2 | i < 32 ->
-    op2 (text "\tstrh") o1 o2
-  STR _f o1 o2 -> op2 (text "\tstr") o1 o2
-  STLR _f o1 o2 -> op2 (text "\tstlr") o1 o2
+  STR f o1 o2 ->  op2 (subword_suffix f $ text "\tstr") o1 o2
+  STLR f o1 o2 -> op2 (subword_suffix f $ text "\tstlr") o1 o2
 
   LDR _f o1 (OpImm (ImmIndex lbl' off)) | Just (_info, lbl) <- dynamicLinkerLabelInfo lbl' ->
     let (adrp', ldr') = op_adrp_reloc_dynamic $ pprAsmLabel platform lbl in
@@ -508,26 +618,22 @@ pprInstr platform instr = case instr of
     op_adrp o1 adrp' $$
     op_add o1 ldr'
 
-  LDR _f o1@(OpReg W8 (RegReal (RealRegSingle i))) o2 | i < 32 ->
-    op2 (text "\tldrb") o1 o2
-  LDR _f o1@(OpReg W16 (RegReal (RealRegSingle i))) o2 | i < 32 ->
-    op2 (text "\tldrh") o1 o2
-  LDR _f o1 o2 -> op2 (text "\tldr") o1 o2
-  LDAR _f o1 o2 -> op2 (text "\tldar") o1 o2
+  LDR f o1 o2 -> op2 (subword_suffix f $ text "\tldr") o1 o2
+  LDAR f o1 o2 -> op2 (subword_suffix f $ text "\tldar") o1 o2
 
   -- 8. Synchronization Instructions -------------------------------------------
   DMBISH DmbLoadStore -> line $ text "\tdmb ish"
   DMBISH DmbLoad -> line $ text "\tdmb ishld"
 
   -- 9. Floating Point Instructions --------------------------------------------
-  FMOV o1 o2 -> op2 (text "\tfmov") o1 o2
+  FMOV fmt o1 o2 -> op2fmt (text "\tfmov") fmt o1 o2
   FCVT o1 o2 -> op2 (text "\tfcvt") o1 o2
   SCVTF o1 o2 -> op2 (text "\tscvtf") o1 o2
   FCVTZS o1 o2 -> op2 (text "\tfcvtzs") o1 o2
-  FABS o1 o2 -> op2 (text "\tfabs") o1 o2
-  FSQRT o1 o2 -> op2 (text "\tfsqrt") o1 o2
-  FMIN o1 o2 o3 -> op3 (text "\tfmin") o1 o2 o3
-  FMAX o1 o2 o3 -> op3 (text "\tfmax") o1 o2 o3
+  FABS fmt o1 o2 -> op2fmt (text "\tfabs") fmt o1 o2
+  FSQRT fmt o1 o2 -> op2fmt (text "\tfsqrt") fmt o1 o2
+  FMIN fmt o1 o2 o3 -> op3fmt (text "\tfmin") fmt o1 o2 o3
+  FMAX fmt o1 o2 o3 -> op3fmt (text "\tfmax") fmt o1 o2 o3
   FMA variant d r1 r2 r3 ->
     let fma = case variant of
                 FMAdd  -> text "\tfmadd"
@@ -535,12 +641,39 @@ pprInstr platform instr = case instr of
                 FNMAdd -> text "\tfnmadd"
                 FNMSub -> text "\tfnmsub"
     in op4 fma d r1 r2 r3
+
+  -- 10. Vector Instructions ---------------------------------------------------
+  UMOV o1 o2 -> op2 (text "\tumov") o1 o2
+  DUP fmt o1 o2 -> op2fmt (text "\tdup") fmt o1 o2
+  INS fmt o1 o2 -> op2fmt (text "\tins") fmt o1 o2
+  ABS fmt o1 o2 -> op2fmt (text "\tabs") fmt o1 o2
+  SMIN fmt o1 o2 o3 -> op3fmt (text "\tsmin") fmt o1 o2 o3
+  SMAX fmt o1 o2 o3 -> op3fmt (text "\tsmax") fmt o1 o2 o3
+  UMIN fmt o1 o2 o3 -> op3fmt (text "\tumin") fmt o1 o2 o3
+  UMAX fmt o1 o2 o3 -> op3fmt (text "\tumax") fmt o1 o2 o3
+  CMGT fmt o1 o2 o3 -> op3fmt (text "\tcmgt") fmt o1 o2 o3
+  CMHI fmt o1 o2 o3 -> op3fmt (text "\tcmhi") fmt o1 o2 o3
+  BSL o1 o2 o3 -> op3fmt (text "\tbsl") (VecFormat 16 FmtInt8) o1 o2 o3
+  FMLA fmt o1 o2 o3 -> op3fmt (text "\tfmla") fmt o1 o2 o3
+  FMLS fmt o1 o2 o3 -> op3fmt (text "\tfmls") fmt o1 o2 o3
+  EXT o1 o2 o3 i -> op_ext (text "\text") (VecFormat 16 FmtInt8) o1 o2 o3 i
+  ZIP1 fmt o1 o2 o3 -> op3fmt (text "\tzip1") fmt o1 o2 o3
+  ZIP2 fmt o1 o2 o3 -> op3fmt (text "\tzip2") fmt o1 o2 o3
+  UZP1 fmt o1 o2 o3 -> op3fmt (text "\tuzp1") fmt o1 o2 o3
+  UZP2 fmt o1 o2 o3 -> op3fmt (text "\tuzp2") fmt o1 o2 o3
+  TRN1 fmt o1 o2 o3 -> op3fmt (text "\ttrn1") fmt o1 o2 o3
+  TRN2 fmt o1 o2 o3 -> op3fmt (text "\ttrn2") fmt o1 o2 o3
+  MOVI fmt o1 o2 -> op2fmt (text "\tmovi") fmt o1 o2
+  MVNI fmt o1 o2 -> op2fmt (text "\tmvni") fmt o1 o2
  where op2 op o1 o2        = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2
        op3 op o1 o2 o3     = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2 <> comma <+> pprOp platform o3
        op4 op o1 o2 o3 o4  = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2 <> comma <+> pprOp platform o3 <> comma <+> pprOp platform o4
+       op2fmt op fmt o1 o2    = line $ op <+> pprFormatOp platform fmt o1 <> comma <+> pprFormatOp platform fmt o2
+       op3fmt op fmt o1 o2 o3 = line $ op <+> pprFormatOp platform fmt o1 <> comma <+> pprFormatOp platform fmt o2 <> comma <+> pprFormatOp platform fmt o3
        op_ldr o1 rest      = line $ text "\tldr" <+> pprOp platform o1 <> comma <+> text "[" <> pprOp platform o1 <> comma <+> rest <> text "]"
        op_adrp o1 rest     = line $ text "\tadrp" <+> pprOp platform o1 <> comma <+> rest
        op_add o1 rest      = line $ text "\tadd" <+> pprOp platform o1 <> comma <+> pprOp platform o1 <> comma <+> rest
+       op_ext op fmt o1 o2 o3 i = line $ op <+> pprFormatOp platform fmt o1 <> comma <+> pprFormatOp platform fmt o2 <> comma <+> pprFormatOp platform fmt o3 <> comma <+> char '#' <> int i
 
        op_adrp_reloc_dynamic asm_lbl = case platformOS platform of
           OSDarwin -> (asm_lbl <> text "@gotpage", asm_lbl <> text "@gotpageoff")
@@ -556,6 +689,12 @@ pprInstr platform instr = case instr of
 
        check_off off = if off >= 0 && off <= 4095 then char '#' <> int off else
          pgmError $ "GHC.CmmToAsm.AArch64.Ppr.check_off : " ++ show off ++ " is out of 12 bit"
+
+       -- Some instructions encode subword ops via b/h suffix on the instruction.
+       -- We handle this here relying on the format rather than the operands.
+       subword_suffix II8  t = t <> char 'b'
+       subword_suffix II16 t = t <> char 'h'
+       subword_suffix _    t = t
 
 pprBcond :: IsLine doc => Cond -> doc
 pprBcond c = text "b." <> pprCond c

@@ -93,6 +93,14 @@ test('T21360', normal, compile, [overlapping_incomplete+'-Wincomplete-record-upd
 test('T21360b', normal, compile, [overlapping_incomplete+'-Wincomplete-record-updates'])
 test('T23520', normal, compile, [overlapping_incomplete+'-Wincomplete-record-updates'])
 test('T25164', [extra_files(['T25164_aux.hs']), req_th], multimod_compile, ['T25164', '-v0'])
+test(
+    'T27314',
+    [ omit_ways(llvm_ways), # -finfo-table-map does not work with -fllvm (#26435)
+      when(js_arch(), skip) # javascript doesn't support -finfo-table-map yet and yields a warning we don't want to handle here
+    ],
+    compile,
+    ['-Wincomplete-uni-patterns -finfo-table-map']
+)
 
 # Other tests
 test('pmc001', [], compile, [overlapping_incomplete])
@@ -123,6 +131,8 @@ test('T21761', [],  compile, [overlapping_incomplete])
 test('T22964', [], compile, [overlapping_incomplete])
 test('T23445', [], compile, [overlapping_incomplete])
 test('T24234', [], compile, [overlapping_incomplete+'-Wincomplete-uni-patterns'])
+test('T26400', [], compile, [overlapping_incomplete])
+test('T26400b', [], compile, [overlapping_incomplete])
 
 # Series (inspired) by Luke Maranget
 
@@ -177,3 +187,7 @@ test('T24824', normal, compile, ['-package ghc -Wincomplete-record-selectors'])
 test('T24891', normal, compile, ['-Wincomplete-record-selectors'])
 test('T25257', normal, compile, [overlapping_incomplete])
 test('T24845', [], compile, [overlapping_incomplete])
+test('T22652', [], compile, [overlapping_incomplete])
+test('T22652a', [], compile, [overlapping_incomplete])
+test('T24867', [], compile_fail, [overlapping_incomplete])
+test('T27360', normal, compile, [overlapping_incomplete + '-g3'])

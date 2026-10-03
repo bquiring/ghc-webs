@@ -35,17 +35,18 @@ import GHC.HsToCore.Monad
 import GHC.HsToCore.Utils
 
 import GHC.Types.SourceText
-import GHC.Types.Id.Make
 import GHC.Types.ForeignCall
+import GHC.Types.Id.Make( mkFCallId )
 import GHC.Types.Basic
 import GHC.Types.Literal
 import GHC.Types.RepType (typePrimRep1)
 
 import GHC.Tc.Utils.TcType
 
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Ids( realWorldPrimId )
 
 import GHC.Driver.DynFlags
 
@@ -102,8 +103,11 @@ dsCCall lbl args may_gc result_ty
   = do (unboxed_args, arg_wrappers) <- mapAndUnzipM unboxArg args
        (ccall_result_ty, res_wrapper) <- boxResult result_ty
        uniq <- newUnique
-       let
-           target = StaticTarget NoSourceText lbl Nothing True
+       let stExt = StaticTargetGhc
+             { staticTargetLabel = NoSourceText
+             , staticTargetUnit  = TargetIsInThisUnit
+             }
+           target = StaticTarget stExt lbl ForeignFunction
            the_fcall    = CCall (CCallSpec target CCallConv may_gc)
            the_prim_app = mkFCall uniq the_fcall unboxed_args ccall_result_ty
        return (foldr ($) (res_wrapper the_prim_app) arg_wrappers)
@@ -148,7 +152,7 @@ unboxArg arg
     (isUnboxedTupleType arg_ty && typePrimRep1 arg_ty == VoidRep)
   = return (arg, \body -> body)
 
-  -- Recursive newtypes
+  -- Possibly-recursive newtypes
   | Just(co, _rep_ty) <- topNormaliseNewType_maybe arg_ty
   = unboxArg (mkCastDs arg co)
 
@@ -341,8 +345,10 @@ resultWrapper result_ty
   -- Data types with a single constructor, which has a single arg
   -- This includes types like Ptr and ForeignPtr
   | Just (tycon, tycon_arg_tys) <- maybe_tc_app
-  , Just data_con <- tyConSingleAlgDataCon_maybe tycon  -- One constructor
-  , null (dataConExTyCoVars data_con)                   -- no existentials
+  , not (isNewTyCon tycon)  -- Newtypes should have been dealt with above, but
+                            -- a recursive one might fall through here, I think
+  , Just data_con <- tyConSingleDataCon_maybe tycon  -- One constructor
+  , null (dataConExTyCoVars data_con)                -- no existentials
   , [Scaled _ unwrapped_res_ty] <- dataConInstOrigArgTys data_con tycon_arg_tys  -- One argument
   = do { (maybe_ty, wrapper) <- resultWrapper unwrapped_res_ty
        ; let marshal_con e  = Var (dataConWrapId data_con)

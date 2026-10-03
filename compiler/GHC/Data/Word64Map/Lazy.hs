@@ -91,8 +91,10 @@ module GHC.Data.Word64Map.Lazy (
     , adjustWithKey
     , update
     , updateWithKey
+    , upsert
     , updateLookupWithKey
     , alter
+    , alterLookup
     , alterF
 
     -- * Query
@@ -111,6 +113,8 @@ module GHC.Data.Word64Map.Lazy (
     -- ** Size
     , WM.null
     , size
+    , sizeAtMost
+    , compareSize
 
     -- * Combine
 
@@ -146,6 +150,7 @@ module GHC.Data.Word64Map.Lazy (
     , WM.map
     , mapWithKey
     , traverseWithKey
+    , traverseWithKey_
     , traverseMaybeWithKey
     , mapAccum
     , mapAccumWithKey

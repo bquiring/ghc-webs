@@ -8,7 +8,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans -Wno-x-partial #-}
 
 -- Fine if this comes from make/Hadrian or the pre-built base.
 #include <ghcplatform.h>
@@ -23,7 +23,6 @@
 
 module Main (main) where
 
-import Debug.Trace
 import qualified GHC.Unit.Database as GhcPkg
 import GHC.Unit.Database hiding (mkMungePathUrl)
 import GHC.HandleEncoding
@@ -48,12 +47,19 @@ import Distribution.Types.UnqualComponentName
 import Distribution.Types.LibraryName
 import Distribution.Types.MungedPackageName
 import Distribution.Types.MungedPackageId
-import Distribution.Simple.Utils (toUTF8BS, writeUTF8File, readUTF8File)
+import Distribution.Simple.Utils (ignoreBOM, toUTF8BS, toUTF8LBS, fromUTF8LBS)
 import qualified Data.Version as Version
-import System.FilePath as FilePath
+import System.OsPath as OsPath
+import qualified System.FilePath as FilePath
 import qualified System.FilePath.Posix as FilePath.Posix
-import System.Directory ( getXdgDirectory, createDirectoryIfMissing, getAppUserDataDirectory,
-                          getModificationTime, XdgDirectory ( XdgData ) )
+import System.Directory.OsPath
+  ( getXdgDirectory, createDirectoryIfMissing, getAppUserDataDirectory,
+    getModificationTime, XdgDirectory ( XdgData ),
+    doesDirectoryExist, getDirectoryContents,
+    doesFileExist, removeFile,
+    getCurrentDirectory )
+import System.Directory.Internal (os)
+import qualified System.File.OsPath as FileIO
 import Text.Printf
 
 import Prelude hiding (Foldable(..))
@@ -66,15 +72,13 @@ import Data.Bifunctor
 
 import Data.Char ( toLower )
 import Control.Monad
-import System.Directory ( doesDirectoryExist, getDirectoryContents,
-                          doesFileExist, removeFile,
-                          getCurrentDirectory )
 import System.Exit ( exitWith, ExitCode(..) )
 import System.Environment ( getArgs, getProgName, getEnv )
 import System.IO
 import System.IO.Error
-import GHC.IO           ( catchException )
+import GHC.IO           ( catchException, unsafePerformIO )
 import GHC.IO.Exception (IOErrorType(InappropriateType))
+import GHC.Stack.Types (HasCallStack)
 import Data.List ( group, sort, sortBy, nub, partition, find
                  , intercalate, intersperse, unfoldr
                  , isInfixOf, isSuffixOf, isPrefixOf, stripPrefix )
@@ -95,6 +99,8 @@ import System.Posix hiding (fdToHandle)
 #if defined(GLOB)
 import qualified System.Info(os)
 #endif
+
+import GHC.Toolchain.Target
 
 -- | Short-circuit 'any' with a \"monadic predicate\".
 anyM :: (Monad m) => (a -> m Bool) -> [a] -> m Bool
@@ -428,8 +434,9 @@ runit verbosity cli nonopts = do
         print filename
         glob filename >>= print
 #endif
-    ["init", filename] ->
-        initPackageDB filename verbosity cli
+    ["init", filename] -> do
+        filenameOs <- encodeFS filename
+        initPackageDB filenameOs verbosity cli
     ["register", filename] ->
         registerPackage filename verbosity cli
                         multi_instance
@@ -537,7 +544,7 @@ readPackageArg AsDefault str = Id <$> readGlobPkgId str
 
 data PackageDB (mode :: GhcPkg.DbMode)
   = PackageDB {
-      location, locationAbsolute :: !FilePath,
+      location, locationAbsolute :: !OsPath,
       -- We need both possibly-relative and definitely-absolute package
       -- db locations. This is because the relative location is used as
       -- an identifier for the db, so it is important we do not modify it.
@@ -569,23 +576,34 @@ allPackagesInStack = concatMap packages
 -- specified package DB can depend on, since dependencies can only extend
 -- down the stack, not up (e.g. global packages cannot depend on user
 -- packages).
-stackUpTo :: FilePath -> PackageDBStack -> PackageDBStack
+stackUpTo :: OsPath -> PackageDBStack -> PackageDBStack
 stackUpTo to_modify = dropWhile ((/= to_modify) . location)
 
-readFromSettingsFile :: FilePath
-                      -> (FilePath -> RawSettings -> Either String b)
+readFromSettingsFile :: OsPath
+                      -> (OsPath -> RawSettings -> Either String b)
                       -> IO (Either String b)
 readFromSettingsFile settingsFile f = do
-  settingsStr <- readFile settingsFile
+  settingsStr <- readUtf8File settingsFile
   pure $ do
     mySettings <- case maybeReadFuzzy settingsStr of
       Just s -> pure $ Map.fromList s
       -- It's excusable to not have a settings file (for now at
       -- least) but completely inexcusable to have a malformed one.
       Nothing -> Left $ "Can't parse settings file " ++ show settingsFile
-    case f settingsFile mySettings of
-      Right archOS -> Right archOS
-      Left e -> Left e
+    f settingsFile mySettings
+
+readFromTargetFile :: OsPath
+                   -> (Target -> b)
+                   -> IO (Either String b)
+readFromTargetFile targetFile f = do
+  targetStr <- readUtf8File targetFile
+  pure $ do
+    target <- case maybeReadFuzzy targetStr of
+      Just t -> Right t
+      -- It's excusable to not have a settings file (for now at
+      -- least) but completely inexcusable to have a malformed one.
+      Nothing -> Left $ "Can't parse .target file " ++ show targetFile
+    Right (f target)
 
 getPkgDatabases :: Verbosity
                 -> GhcPkg.DbOpenMode mode DbModifySelector
@@ -614,32 +632,35 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
      case [ f | FlagGlobalConfig f <- my_flags ] of
         -- See Note [Base Dir] for more information on the base dir / top dir.
         [] -> do mb_dir <- getBaseDir
-                 case mb_dir of
+                 mb_dir_os <- traverse encodeFS mb_dir
+                 case mb_dir_os of
                    Nothing  -> die err_msg
                    Just dir -> do
                      -- Look for where it is given in the settings file, if marked there.
-                     let settingsFile = dir </> "settings"
+                     -- See Note [Settings file] about this file, and why we need GHC to share it with us.
+                     let settingsFile = dir </> os "settings"
                      exists_settings_file <- doesFileExist settingsFile
                      erel_db <-
                       if exists_settings_file
-                          then readFromSettingsFile settingsFile getGlobalPackageDb
-                          else pure (Left ("Settings file doesn't exist: " ++ settingsFile))
+                          then do
+                            readFromSettingsFile settingsFile (\ settings  -> getGlobalPackageDb (unsafeDecodeUtf settings))
+                          else pure (Left ("Settings file doesn't exist: " ++ showOsPath settingsFile))
 
                      case erel_db of
-                      Right rel_db -> return (dir, dir </> rel_db)
+                      Right rel_db -> return (dir, dir </> unsafeEncodeUtf rel_db)
                       -- If the version of GHC doesn't have this field or the settings file
                       -- doesn't exist for some reason, look in the libdir.
                       Left err -> do
                         r <- lookForPackageDBIn dir
                         case r of
-                          Nothing -> die (unlines [err, ("Fallback: Can't find package database in " ++ dir)])
+                          Nothing -> die (unlines [err, ("Fallback: Can't find package database in " ++ showOsPath dir)])
                           Just path -> return (dir, path)
         fs -> do
           -- The value of the $topdir variable used in some package descriptions
           -- Note that the way we calculate this is slightly different to how it
           -- is done in ghc itself. We rely on the convention that the global
           -- package db lives in ghc's libdir.
-          let pkg_db = last fs
+          let pkg_db = unsafeEncodeUtf $ last fs
           top_dir <- absolutePath (takeDirectory pkg_db)
           return (top_dir, pkg_db)
 
@@ -649,19 +670,18 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
   -- getXdgDirectory can fail (e.g. if $HOME isn't set)
 
   mb_user_conf <-
-    case [ f | FlagUserConfig f <- my_flags ] of
+    case [ unsafeEncodeUtf f | FlagUserConfig f <- my_flags ] of
       _ | no_user_db -> return Nothing
       [] -> do
-        -- See Note [Settings file] about this file, and why we need GHC to share it with us.
-        let settingsFile = top_dir </> "settings"
-        exists_settings_file <- doesFileExist settingsFile
+        let targetFile = top_dir </> os "targets" </> os "default.target"
+        exists_settings_file <- doesFileExist targetFile
         targetArchOS <- case exists_settings_file of
           False -> do
-            warn $ "WARNING: settings file doesn't exist " ++ show settingsFile
+            warn $ "WARNING: target file doesn't exist " ++ show targetFile
             warn "cannot know target platform so guessing target == host (native compiler)."
             pure hostPlatformArchOS
           True ->
-            readFromSettingsFile settingsFile getTargetArchOS >>= \case
+            readFromTargetFile targetFile getTargetArchOS >>= \case
               Right v -> pure v
               Left e -> die e
 
@@ -682,15 +702,15 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
         -- otherwise we use $XDG_DATA_HOME/$UNIQUE_SUBDIR
         --
         -- UNIQUE_SUBDIR is typically a combination of the target platform and GHC version
-        m_appdir <- getFirstSuccess $ map (fmap (</> subdir))
-          [ getAppUserDataDirectory "ghc"  -- this is ~/.ghc/
-          , getXdgDirectory XdgData "ghc"  -- this is $XDG_DATA_HOME/
+        m_appdir <- getFirstSuccess $ map (fmap (</> unsafeEncodeUtf subdir))
+          [ getAppUserDataDirectory $ os "ghc"  -- this is ~/.ghc/
+          , getXdgDirectory XdgData $ os "ghc"  -- this is $XDG_DATA_HOME/
           ]
         case m_appdir of
           Nothing -> return Nothing
           Just dir -> do
             lookForPackageDBIn dir >>= \case
-              Nothing -> return (Just (dir </> "package.conf.d", False))
+              Nothing -> return (Just (dir </> os "package.conf.d", False))
               Just f  -> return (Just (f, True))
       fs -> return (Just (last fs, True))
 
@@ -704,11 +724,11 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
 
   e_pkg_path <- tryIO (System.Environment.getEnv "GHC_PACKAGE_PATH")
   let env_stack =
-        case e_pkg_path of
+        case fmap unsafeEncodeUtf e_pkg_path of
                 Left  _ -> sys_databases
                 Right path
-                  | not (null path) && isSearchPathSeparator (last path)
-                  -> splitSearchPath (init path) ++ sys_databases
+                  | hasTrailingPathSeparator path
+                  -> splitSearchPath (dropTrailingPathSeparator path) <> sys_databases
                   | otherwise
                   -> splitSearchPath path
 
@@ -721,7 +741,7 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
                       | Just (user_conf, _user_exists) <- mb_user_conf
                       = Just user_conf
                is_db_flag FlagGlobal     = Just virt_global_conf
-               is_db_flag (FlagConfig f) = Just f
+               is_db_flag (FlagConfig f) = Just $ unsafeEncodeUtf f
                is_db_flag _              = Nothing
 
   let flag_db_names | null db_flags = env_stack
@@ -736,7 +756,7 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
   -- stack, unless any of them are present in the stack
   -- already.
   let final_stack = filter (`notElem` env_stack)
-                     [ f | FlagConfig f <- reverse my_flags ]
+                     [ unsafeEncodeUtf f | FlagConfig f <- reverse my_flags ]
                      ++ env_stack
 
       top_db = if null db_flags
@@ -752,7 +772,7 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
   when (verbosity > Normal) $ do
     infoLn ("db stack: " ++ show (map location db_stack))
     F.forM_ db_to_operate_on $ \db ->
-      infoLn ("modifying: " ++ (location db))
+      infoLn ("modifying: " ++ showOsPath (location db))
     infoLn ("flag db stack: " ++ show (map location flag_db_stack))
 
   return (db_stack, db_to_operate_on, flag_db_stack)
@@ -831,17 +851,19 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
 
         return (db_stack, GhcPkg.DbOpenReadWrite to_modify)
       where
-        couldntOpenDbForModification :: FilePath -> IOError -> IO a
+        couldntOpenDbForModification :: OsPath -> IOError -> IO a
         couldntOpenDbForModification db_path e = die $ "Couldn't open database "
-          ++ db_path ++ " for modification: " ++ show e
+          ++ showOsPath db_path ++ " for modification: " ++ show e
 
         -- Parse package db in read-only mode.
-        readDatabase :: FilePath -> IO (PackageDB 'GhcPkg.DbReadOnly)
+        readDatabase :: OsPath -> IO (PackageDB 'GhcPkg.DbReadOnly)
         readDatabase db_path = do
           db <- readParseDatabase verbosity mb_user_conf
                                   GhcPkg.DbOpenReadOnly use_cache db_path
           if expand_vars
-            then return $ mungePackageDBPaths top_dir db
+            then do
+              top_dir_filepath <- decodeFS top_dir
+              return $ mungePackageDBPaths top_dir_filepath db
             else return db
 
     stateSequence :: Monad m => s -> [s -> m (a, s)] -> m ([a], s)
@@ -851,20 +873,20 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
       (as, s'') <- stateSequence s' ms
       return (a : as, s'')
 
-lookForPackageDBIn :: FilePath -> IO (Maybe FilePath)
+lookForPackageDBIn :: OsPath -> IO (Maybe OsPath)
 lookForPackageDBIn dir = do
-  let path_dir = dir </> "package.conf.d"
+  let path_dir = dir </> os "package.conf.d"
   exists_dir <- doesDirectoryExist path_dir
   if exists_dir then return (Just path_dir) else do
-    let path_file = dir </> "package.conf"
+    let path_file = dir </> os "package.conf"
     exists_file <- doesFileExist path_file
     if exists_file then return (Just path_file) else return Nothing
 
 readParseDatabase :: forall mode t. Verbosity
-                  -> Maybe (FilePath,Bool)
+                  -> Maybe (OsPath,Bool)
                   -> GhcPkg.DbOpenMode mode t
                   -> Bool -- use cache
-                  -> FilePath
+                  -> OsPath
                   -> IO (PackageDB mode)
 readParseDatabase verbosity mb_user_conf mode use_cache path
   -- the user database (only) is allowed to be non-existent
@@ -886,7 +908,7 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
                 Just db -> return db
                 Nothing ->
                   die $ "ghc no longer supports single-file style package "
-                     ++ "databases (" ++ path ++ ") use 'ghc-pkg init'"
+                     ++ "databases (" ++ showOsPath path ++ ") use 'ghc-pkg init'"
                      ++ "to create the database with the correct format."
 
            | otherwise -> ioError err
@@ -902,7 +924,7 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
                         -- It's fine if the cache is not there as long as the
                         -- database is empty.
                         when (not $ null confs) $ do
-                            warn ("WARNING: cache does not exist: " ++ cache)
+                            warn ("WARNING: cache does not exist: " ++ showOsPath cache)
                             warn ("ghc will fail to read this package db. " ++
                                   recacheAdvice)
                       else do
@@ -911,7 +933,7 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
                   ignore_cache (const $ return ())
                 Right tcache -> do
                   when (verbosity >= Verbose) $ do
-                      warn ("Timestamp " ++ show tcache ++ " for " ++ cache)
+                      warn ("Timestamp " ++ show tcache ++ " for " ++ showOsPath cache)
                   -- If any of the .conf files is newer than package.cache, we
                   -- assume that cache is out of date.
                   cache_outdated <- (`anyM` confs) $ \conf ->
@@ -919,12 +941,12 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
                   if not cache_outdated
                       then do
                           when (verbosity > Normal) $
-                             infoLn ("using cache: " ++ cache)
+                             infoLn ("using cache: " ++ showOsPath cache)
                           GhcPkg.readPackageDbForGhcPkg cache mode
                             >>= uncurry mkPackageDB
                       else do
                           whenReportCacheErrors $ do
-                              warn ("WARNING: cache is out of date: " ++ cache)
+                              warn ("WARNING: cache is out of date: " ++ showOsPath cache)
                               warn ("ghc will see an old view of this " ++
                                     "package db. " ++ recacheAdvice)
                           ignore_cache $ \file -> do
@@ -935,11 +957,11 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
                                     GT -> " (older than cache)"
                                     EQ -> " (same as cache)"
                               warn ("Timestamp " ++ show tFile
-                                ++ " for " ++ file ++ rel)
+                                ++ " for " ++ showOsPath file ++ rel)
             where
-                 confs = map (path </>) $ filter (".conf" `isSuffixOf`) fs
+                 confs = map (path </>) $ filter (os ".conf" `OsPath.isExtensionOf`) fs
 
-                 ignore_cache :: (FilePath -> IO ()) -> IO (PackageDB mode)
+                 ignore_cache :: (OsPath -> IO ()) -> IO (PackageDB mode)
                  ignore_cache checkTime = do
                      -- If we're opening for modification, we need to acquire a
                      -- lock even if we don't open the cache now, because we are
@@ -975,17 +997,18 @@ readParseDatabase verbosity mb_user_conf mode use_cache path
           packages = pkgs
         }
 
-parseSingletonPackageConf :: Verbosity -> FilePath -> IO InstalledPackageInfo
+parseSingletonPackageConf :: Verbosity -> OsPath -> IO InstalledPackageInfo
 parseSingletonPackageConf verbosity file = do
-  when (verbosity > Normal) $ infoLn ("reading package config: " ++ file)
-  BS.readFile file >>= fmap fst . parsePackageInfo
+  when (verbosity > Normal) $ infoLn ("reading package config: " ++ showOsPath file)
+  FileIO.readFile file >>= fmap fst . parsePackageInfo . BS.toStrict
 
-cachefilename :: FilePath
-cachefilename = "package.cache"
+
+cachefilename :: OsPath
+cachefilename = os "package.cache"
 
 mungePackageDBPaths :: FilePath -> PackageDB mode -> PackageDB mode
 mungePackageDBPaths top_dir db@PackageDB { packages = pkgs } =
-    db { packages = map (mungePackagePaths top_dir pkgroot) pkgs }
+    db { packages = map (mungePackagePaths top_dir (unsafeDecodeUtf pkgroot)) pkgs }
   where
     pkgroot = takeDirectory $ dropTrailingPathSeparator (locationAbsolute db)
     -- It so happens that for both styles of package db ("package.conf"
@@ -1032,12 +1055,13 @@ mkMungePathUrl top_dir pkgroot = (munge_path, munge_url)
       | Just p' <- stripVarPrefix "$httptopdir"   p = toUrlPath top_dir p'
       | otherwise                                   = p
 
+    toUrlPath :: FilePath -> FilePath -> FilePath
     toUrlPath r p = "file:///"
                  -- URLs always use posix style '/' separators:
                  ++ FilePath.Posix.joinPath
                         (r : -- We need to drop a leading "/" or "\\"
                              -- if there is one:
-                             dropWhile (all isPathSeparator)
+                             dropWhile (all FilePath.isPathSeparator)
                                        (FilePath.splitDirectories p))
 
     -- We could drop the separator here, and then use </> above. However,
@@ -1045,7 +1069,7 @@ mkMungePathUrl top_dir pkgroot = (munge_path, munge_url)
     -- rather than letting FilePath change it to use \ as the separator
     stripVarPrefix var path = case stripPrefix var path of
                               Just [] -> Just []
-                              Just cs@(c : _) | isPathSeparator c -> Just cs
+                              Just cs@(c : _) | FilePath.isPathSeparator c -> Just cs
                               _ -> Nothing
 
 -- -----------------------------------------------------------------------------
@@ -1062,18 +1086,18 @@ mkMungePathUrl top_dir pkgroot = (munge_path, munge_url)
 
 -- ghc itself also cooperates in this workaround
 
-tryReadParseOldFileStyleDatabase :: Verbosity -> Maybe (FilePath, Bool)
-                                 -> GhcPkg.DbOpenMode mode t -> Bool -> FilePath
+tryReadParseOldFileStyleDatabase :: Verbosity -> Maybe (OsPath, Bool)
+                                 -> GhcPkg.DbOpenMode mode t -> Bool -> OsPath
                                  -> IO (Maybe (PackageDB mode))
 tryReadParseOldFileStyleDatabase verbosity mb_user_conf
                                  mode use_cache path = do
   -- assumes we've already established that path exists and is not a dir
-  content <- readFile path `catchIO` \_ -> return ""
+  content <- readUtf8File path `catchIO` \_ -> return ""
   if take 2 content == "[]"
     then do
       path_abs <- absolutePath path
       let path_dir = adjustOldDatabasePath path
-      warn $ "Warning: ignoring old file-style db and trying " ++ path_dir
+      warn $ "Warning: ignoring old file-style db and trying " ++ showOsPath path_dir
       direxists <- doesDirectoryExist path_dir
       if direxists
         then do
@@ -1100,7 +1124,7 @@ tryReadParseOldFileStyleDatabase verbosity mb_user_conf
 adjustOldFileStylePackageDB :: PackageDB mode -> IO (PackageDB mode)
 adjustOldFileStylePackageDB db = do
   -- assumes we have not yet established if it's an old style or not
-  mcontent <- liftM Just (readFile (location db)) `catchIO` \_ -> return Nothing
+  mcontent <- liftM Just (readUtf8File (location db)) `catchIO` \_ -> return Nothing
   case fmap (take 2) mcontent of
     -- it is an old style and empty db, so look for a dir kind in location.d/
     Just "[]" -> return db {
@@ -1109,20 +1133,20 @@ adjustOldFileStylePackageDB db = do
       }
     -- it is old style but not empty, we have to bail
     Just  _   -> die $ "ghc no longer supports single-file style package "
-                    ++ "databases (" ++ location db ++ ") use 'ghc-pkg init'"
+                    ++ "databases (" ++ showOsPath (location db) ++ ") use 'ghc-pkg init'"
                     ++ "to create the database with the correct format."
     -- probably not old style, carry on as normal
     Nothing   -> return db
 
-adjustOldDatabasePath :: FilePath -> FilePath
-adjustOldDatabasePath = (<.> "d")
+adjustOldDatabasePath :: OsPath -> OsPath
+adjustOldDatabasePath = (<.> os "d")
 
 -- -----------------------------------------------------------------------------
 -- Creating a new package DB
 
-initPackageDB :: FilePath -> Verbosity -> [Flag] -> IO ()
+initPackageDB :: OsPath -> Verbosity -> [Flag] -> IO ()
 initPackageDB filename verbosity _flags = do
-  let eexist = die ("cannot create: " ++ filename ++ " already exists")
+  let eexist = die ("cannot create: " ++ showOsPath filename ++ " already exists")
   b1 <- doesFileExist filename
   when b1 eexist
   b2 <- doesDirectoryExist filename
@@ -1171,7 +1195,8 @@ registerPackage input verbosity my_flags multi_instance
       f   -> do
         when (verbosity >= Normal) $
             info ("Reading package info from " ++ show f ++ " ... ")
-        readUTF8File f
+        fs <- encodeFS f
+        readUtf8File fs
 
   expanded <- if expand_env_vars then expandEnvVars s force
                                  else return s
@@ -1187,7 +1212,11 @@ registerPackage input verbosity my_flags multi_instance
   -- validate the expanded pkg, but register the unexpanded
   pkgroot <- absolutePath (takeDirectory to_modify)
   let top_dir = takeDirectory (location (last db_stack))
-      pkg_expanded = mungePackagePaths top_dir pkgroot pkg
+
+  top_dir_filepath <- decodeFS top_dir
+  pkgroot_filepath <- decodeFS pkgroot
+  let
+      pkg_expanded = mungePackagePaths top_dir_filepath pkgroot_filepath pkg
 
   let truncated_stack = stackUpTo to_modify db_stack
   -- truncate the stack for validation, because we don't allow
@@ -1262,13 +1291,13 @@ changeDBDir verbosity cmds db db_stack = do
   updateDBCache verbosity db db_stack
  where
   do_cmd (RemovePackage p) = do
-    let file = location db </> display (installedUnitId p) <.> "conf"
-    when (verbosity > Normal) $ infoLn ("removing " ++ file)
+    let file = location db </> unsafeEncodeUtf (display (installedUnitId p)) <.> os "conf"
+    when (verbosity > Normal) $ infoLn ("removing " ++ showOsPath file)
     removeFileSafe file
   do_cmd (AddPackage p) = do
-    let file = location db </> display (installedUnitId p) <.> "conf"
-    when (verbosity > Normal) $ infoLn ("writing " ++ file)
-    writeUTF8File file (showInstalledPackageInfo p)
+    let file = location db </> unsafeEncodeUtf (display (installedUnitId p)) <.> os "conf"
+    when (verbosity > Normal) $ infoLn ("writing " ++ showOsPath file)
+    writeUtf8File file (showInstalledPackageInfo p)
   do_cmd (ModifyPackage p) =
     do_cmd (AddPackage p)
 
@@ -1326,13 +1355,13 @@ updateDBCache verbosity db db_stack = do
             warn $ "    " ++ pkg
 
   when (verbosity > Normal) $
-      infoLn ("writing cache " ++ filename)
+      infoLn ("writing cache " ++ showOsPath filename)
 
   let d = fmap (fromPackageCacheFormat . fst) pkgsGhcCacheFormat
   GhcPkg.writePackageDb filename d pkgsCabalFormat
     `catchIO` \e ->
       if isPermissionError e
-      then die $ filename ++ ": you don't have permission to modify this file"
+      then die $ showOsPath filename ++ ": you don't have permission to modify this file"
       else ioError e
 
   case packageDbLock db of
@@ -1431,9 +1460,14 @@ convertPackageInfoToCacheFormat pkg =
        GhcPkg.unitImportDirs     = map ST.pack $ importDirs pkg,
        GhcPkg.unitLibraries      = map ST.pack $ hsLibraries pkg,
        GhcPkg.unitExtDepLibsSys  = map ST.pack $ extraLibraries pkg,
+       GhcPkg.unitExtDepLibsStaticSys = map ST.pack $ extraLibrariesStatic pkg,
        GhcPkg.unitExtDepLibsGhc  = map ST.pack $ extraGHCiLibraries pkg,
        GhcPkg.unitLibraryDirs    = map ST.pack $ libraryDirs pkg,
+       GhcPkg.unitLibraryDirsStatic = map ST.pack $ libraryDirsStatic pkg,
        GhcPkg.unitLibraryDynDirs = map ST.pack $ libraryDynDirs pkg,
+       GhcPkg.unitLibraryBytecodeDirs = [],
+       -- TODO: When the Cabal submodule is updated to support "library-bytecode-dirs", use
+       -- that value here. The rest of the compiler is already adjusted to support it.
        GhcPkg.unitExtDepFrameworks = map ST.pack $ frameworks pkg,
        GhcPkg.unitExtDepFrameworkDirs = map ST.pack $ frameworkDirs pkg,
        GhcPkg.unitLinkerOptions  = map ST.pack $ ldOptions pkg,
@@ -1566,7 +1600,7 @@ listPackages verbosity my_flags mPackageName mModuleName = do
       broken = map installedUnitId (brokenPackages pkg_map)
 
       show_normal PackageDB{ location = db_name, packages = pkg_confs } =
-          do hPutStrLn stdout db_name
+          do hPutStrLn stdout (showOsPath db_name)
              if null pkg_confs
                  then hPutStrLn stdout "    (no packages)"
                  else hPutStrLn stdout $ unlines (map ("    " ++) (map pp_pkg pkg_confs))
@@ -1593,7 +1627,7 @@ listPackages verbosity my_flags mPackageName mModuleName = do
 #else
     let
       show_colour PackageDB{ location = db_name, packages = pkg_confs } =
-          do hPutStrLn stdout db_name
+          do hPutStrLn stdout (showOsPath db_name)
              if null pkg_confs
                  then hPutStrLn stdout "    (no packages)"
                  else hPutStrLn stdout $ unlines (map ("    " ++) (map pp_pkg pkg_confs))
@@ -1616,7 +1650,7 @@ listPackages verbosity my_flags mPackageName mModuleName = do
 simplePackageList :: [Flag] -> [InstalledPackageInfo] -> IO ()
 simplePackageList my_flags pkgs = do
    let showPkg :: InstalledPackageInfo -> String
-       showPkg | FlagShowUnitIds `elem` my_flags = traceId . display . installedUnitId
+       showPkg | FlagShowUnitIds `elem` my_flags = display . installedUnitId
                | FlagNamesOnly `elem` my_flags   = display . mungedName . mungedId
                | otherwise                       = display . mungedId
        strs = map showPkg pkgs
@@ -1681,7 +1715,7 @@ dumpUnits verbosity my_flags expand_pkgroot = do
   doDump expand_pkgroot [ (pkg, locationAbsolute db)
                         | db <- flag_db_stack, pkg <- packages db ]
 
-doDump :: Bool -> [(InstalledPackageInfo, FilePath)] -> IO ()
+doDump :: Bool -> [(InstalledPackageInfo, OsPath)] -> IO ()
 doDump expand_pkgroot pkgs = do
   -- fix the encoding to UTF-8, since this is an interchange format
   hSetEncoding stdout utf8
@@ -1714,7 +1748,7 @@ findPackagesByDB db_stack pkgarg
 
 cannotFindPackage :: PackageArg -> Maybe (PackageDB mode) -> IO a
 cannotFindPackage pkgarg mdb = die $ "cannot find package " ++ pkg_msg pkgarg
-  ++ maybe "" (\db -> " in " ++ location db) mdb
+  ++ maybe "" (\db -> " in " ++ showOsPath (location db)) mdb
   where
     pkg_msg (Id pkgid)           = displayGlobPkgId pkgid
     pkg_msg (IUId ipid)          = display ipid
@@ -1792,7 +1826,7 @@ checkConsistency verbosity my_flags = do
               all_ps = map mungedId pkgs1
 
   let not_broken_pkgs = filterOut broken_pkgs pkgs
-      (_, trans_broken_pkgs) = closure [] not_broken_pkgs
+      trans_broken_pkgs = brokenPackages not_broken_pkgs
 
       all_broken_pkgs :: [InstalledPackageInfo]
       all_broken_pkgs = broken_pkgs ++ trans_broken_pkgs
@@ -1811,26 +1845,26 @@ checkConsistency verbosity my_flags = do
   when (not (null all_broken_pkgs)) $ exitWith (ExitFailure 1)
 
 
-closure :: [InstalledPackageInfo] -> [InstalledPackageInfo]
-        -> ([InstalledPackageInfo], [InstalledPackageInfo])
-closure pkgs db_stack = go pkgs db_stack
- where
-   go avail not_avail =
-     case partition (depsAvailable avail) not_avail of
-        ([],        not_avail') -> (avail, not_avail')
-        (new_avail, not_avail') -> go (new_avail ++ avail) not_avail'
-
-   depsAvailable :: [InstalledPackageInfo] -> InstalledPackageInfo
-                 -> Bool
-   depsAvailable pkgs_ok pkg = null dangling
-        where dangling = filter (`notElem` pids) (depends pkg)
-              pids = map installedUnitId pkgs_ok
-
-        -- we want mutually recursive groups of package to show up
-        -- as broken. (#1750)
-
+-- | Compute the set of transitive broken packages.
+--
+-- A package is assumed to be broken if any of its dependencies is not
+-- found in the 'db_stack' after a transitive reduction.
 brokenPackages :: [InstalledPackageInfo] -> [InstalledPackageInfo]
-brokenPackages pkgs = snd (closure [] pkgs)
+brokenPackages db_stack = go Set.empty db_stack
+  where
+    go avail_ids not_avail =
+      case partition (depsAvailable avail_ids) not_avail of
+        ([],        not_avail') -> not_avail'
+        (new_avail, not_avail') -> go (add new_avail avail_ids) not_avail'
+
+    add new_avail avail_ids =
+      foldl' (flip Set.insert) avail_ids (map installedUnitId new_avail)
+
+    depsAvailable :: Set.Set UnitId -> InstalledPackageInfo -> Bool
+    depsAvailable pids pkg = all (`Set.member` pids) (depends pkg)
+
+      -- we want mutually recursive groups of package to show up
+      -- as broken. (#1750)
 
 -----------------------------------------------------------------------------
 -- Sanity-check a new package config, and automatically build GHCi libs
@@ -1927,7 +1961,7 @@ checkPackageConfig pkg verbosity db_stack
   checkExposedModules db_stack pkg
   checkOtherModules pkg
   let has_code = Set.null (openModuleSubstFreeHoles (Map.fromList (instantiatedWith pkg)))
-  when has_code $ mapM_ (checkHSLib verbosity (libraryDirs pkg ++ libraryDynDirs pkg)) (hsLibraries pkg)
+  when has_code $ mapM_ (checkHSLib verbosity (fmap unsafeEncodeUtf $ libraryDirs pkg ++ libraryDynDirs pkg)) (hsLibraries pkg)
   -- ToDo: check these somehow?
   --    extra_libraries :: [String],
   --    c_includes      :: [String],
@@ -1994,20 +2028,20 @@ checkPath url_ok is_dir warn_only thisfield d
            || "https://" `isPrefixOf` d) = return ()
 
  | url_ok
- , Just d' <- stripPrefix "file://" d
- = checkPath False is_dir warn_only thisfield d'
+ , Just f <- stripPrefix "file://" d
+ = checkPath False is_dir warn_only thisfield f
 
    -- Note: we don't check for $topdir/${pkgroot} here. We rely on these
    -- variables having been expanded already, see mungePackagePaths.
 
- | isRelative d = verror ForceFiles $
+ | isRelative d' = verror ForceFiles $
                      thisfield ++ ": " ++ d ++ " is a relative path which "
                   ++ "makes no sense (as there is nothing for it to be "
                   ++ "relative to). You can make paths relative to the "
                   ++ "package database itself by using ${pkgroot}."
         -- relative paths don't make any sense; #4134
  | otherwise = do
-   there <- liftIO $ if is_dir then doesDirectoryExist d else doesFileExist d
+   there <- liftIO $ if is_dir then doesDirectoryExist d' else doesFileExist d'
    when (not there) $
        let msg = thisfield ++ ": " ++ d ++ " doesn't exist or isn't a "
                                         ++ if is_dir then "directory" else "file"
@@ -2015,6 +2049,8 @@ checkPath url_ok is_dir warn_only thisfield d
        if warn_only
           then vwarn msg
           else verror ForceFiles msg
+  where
+   d' = unsafeEncodeUtf d
 
 checkDep :: PackageDBStack -> UnitId -> Validate ()
 checkDep db_stack pkgid
@@ -2033,23 +2069,25 @@ checkDuplicateDepends deps
   where
        dups = [ p | (p:_:_) <- group (sort deps) ]
 
-checkHSLib :: Verbosity -> [String] -> String -> Validate ()
+checkHSLib :: Verbosity -> [OsPath] -> String -> Validate ()
 checkHSLib _verbosity dirs lib = do
-  let filenames = ["lib" ++ lib ++ ".a",
-                   "lib" ++ lib ++ "_p.a",
-                   "lib" ++ lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".so",
-                   "lib" ++ lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".so",
-                   "lib" ++ lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dylib",
-                   "lib" ++ lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dylib",
-                   lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dll",
-                   lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dll"
-                  ]
+  let filenames = fmap OsPath.unsafeEncodeUtf
+        [ "lib" ++ lib ++ ".a"
+        , "lib" ++ lib ++ "_p.a"
+        , "lib" ++ lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".so"
+        , "lib" ++ lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".so"
+        , "lib" ++ lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dylib"
+        , "lib" ++ lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dylib"
+        , lib ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dll"
+        , lib ++ "_p" ++ "-ghc" ++ GHC.Version.cProjectVersion ++ ".dll"
+        , lib ++ ".bytecodelib"
+        ]
   b <- liftIO $ doesFileExistOnPath filenames dirs
   when (not b) $
     verror ForceFiles ("cannot find any of " ++ show filenames ++
                        " on library path")
 
-doesFileExistOnPath :: [FilePath] -> [FilePath] -> IO Bool
+doesFileExistOnPath :: [OsPath] -> [OsPath] -> IO Bool
 doesFileExistOnPath filenames paths = anyM doesFileExist fullFilenames
   where fullFilenames = [ path </> filename
                         | filename <- filenames
@@ -2078,9 +2116,9 @@ checkModuleFile :: InstalledPackageInfo -> ModuleName -> Validate ()
 checkModuleFile pkg modl =
       -- there's no interface file for GHC.Prim
       unless (modl == ModuleName.fromString "GHC.Prim") $ do
-      let files = [ ModuleName.toFilePath modl <.> extension
-                  | extension <- ["hi", "p_hi", "dyn_hi", "p_dyn_hi"] ]
-      b <- liftIO $ doesFileExistOnPath files (importDirs pkg)
+      let files = [ unsafeEncodeUtf (ModuleName.toFilePath modl) <.> extension
+                  | extension <- fmap os ["hi", "p_hi", "dyn_hi", "p_dyn_hi"] ]
+      b <- liftIO $ doesFileExistOnPath files (fmap unsafeEncodeUtf $ importDirs pkg)
       when (not b) $
          verror ForceFiles ("cannot find any of " ++ show files)
 
@@ -2255,19 +2293,45 @@ installSignalHandlers = do
   return ()
 #endif
 
+-- ------------------------------------------------
+-- OsPath Utils
+
+-- | Show an 'OsPath', throwing an exception if we fail to decode it.
+showOsPath :: HasCallStack => OsPath -> FilePath
+showOsPath = unsafePerformIO . decodeFS
+
+-- | Turn a path relative to the current directory into a (normalised)
+-- absolute path.
+absolutePath :: OsPath -> IO OsPath
+absolutePath path = return . normalise . (</> path) =<< getCurrentDirectory
+
+-- ------------------------------------------------
+
 catchIO :: IO a -> (Exception.IOException -> IO a) -> IO a
 catchIO = catchException
 
 tryIO :: IO a -> IO (Either Exception.IOException a)
 tryIO = Exception.try
 
--- removeFileSave doesn't throw an exceptions, if the file is already deleted
-removeFileSafe :: FilePath -> IO ()
+-----------------------------------------
+-- Adapted from ghc/compiler/utils/Panic
+
+-- | 'removeFileSave' doesn't throw an exceptions, if the file is already deleted
+removeFileSafe :: OsPath -> IO ()
 removeFileSafe fn =
   removeFile fn `catchIO` \ e ->
     when (not $ isDoesNotExistError e) $ ioError e
 
--- | Turn a path relative to the current directory into a (normalised)
--- absolute path.
-absolutePath :: FilePath -> IO FilePath
-absolutePath path = return . normalise . (</> path) =<< getCurrentDirectory
+-- | Read a file using UTF-8 encoding
+--
+-- Taken from https://github.com/haskell/cabal/blob/cea1d8ff1a80df3c3b3148d1556bd3edf656da93/Cabal-syntax/src/Distribution/Utils/Generic.hs#L326
+-- and adapted to 'OsPath'.
+writeUtf8File :: OsPath -> String -> IO ()
+writeUtf8File file contents = writeFileAtomic file (toUTF8LBS contents)
+
+-- | Read a file and interpret its content to be UTF-8 encoded.
+--
+-- Taken from https://github.com/haskell/cabal/blob/cea1d8ff1a80df3c3b3148d1556bd3edf656da93/Cabal-syntax/src/Distribution/Utils/Generic.hs#L309
+-- and adapted to 'OsPath'.
+readUtf8File :: OsPath -> IO String
+readUtf8File file = (ignoreBOM . fromUTF8LBS) <$> FileIO.readFile file

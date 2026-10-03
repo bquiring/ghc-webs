@@ -67,14 +67,17 @@ module GHC.Internal.Foreign.Marshal.Array (
   advancePtr,
 ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Foreign.Ptr      (Ptr, plusPtr)
 import GHC.Internal.Foreign.Storable (Storable(alignment,sizeOf,peekElemOff,pokeElemOff))
 import GHC.Internal.Foreign.Marshal.Alloc (mallocBytes, callocBytes, allocaBytesAligned, reallocBytes)
 import GHC.Internal.Foreign.Marshal.Utils (copyBytes, moveBytes)
 
+import GHC.Internal.Err (undefined)
 import GHC.Internal.Num
 import GHC.Internal.List
-import GHC.Internal.Base
+import GHC.Internal.Prim ((+#))
 
 {- Note [Specialising array operations]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

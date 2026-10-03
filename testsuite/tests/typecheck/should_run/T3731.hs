@@ -2,7 +2,7 @@
               FlexibleContexts, FlexibleInstances,
               MultiParamTypeClasses,
               OverlappingInstances, UndecidableInstances,
-              Rank2Types, KindSignatures, EmptyDataDecls #-}
+              RankNTypes, KindSignatures, EmptyDataDecls, GHC2021 #-}
 
 {-# OPTIONS_GHC -Wall #-}
 

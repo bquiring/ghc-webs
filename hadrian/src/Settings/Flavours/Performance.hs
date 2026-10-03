@@ -12,11 +12,11 @@ performanceFlavour = splitSections $ enableLateCCS $ defaultFlavour
 
 performanceArgs :: Args
 performanceArgs = sourceArgs SourceArgs
-    { hsDefault  = pure ["-O", "-H64m"]
-    , hsLibrary  = orM [notStage0, cross] ? arg "-O2"
+    { hsDefault  = pure ["-O", "+RTS", "-O64M", "-RTS"]
+    , hsLibrary  = notStage0 ? arg "-O2"
     , hsCompiler = pure ["-O2"]
     , hsGhc      = mconcat
-                    [ andM [stage0, notCross] ? arg "-O"
-                    , orM  [notStage0, cross] ? arg "-O2"
+                    [ stage0 ? arg "-O"
+                    , notStage0 ? arg "-O2"
                     ]
     }

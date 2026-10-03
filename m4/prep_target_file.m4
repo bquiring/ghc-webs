@@ -95,6 +95,24 @@ AC_DEFUN([PREP_MAYBE_STRING],[
     AC_SUBST([$1MaybeStr])
 ])
 
+# PREP_MAYBE_LIBRARY
+# =========================
+#
+# Introduce a substitution [$1MaybeProg] with
+# * Nothing, if $$1 is empty or "NO"
+# * Just the library otherwise
+AC_DEFUN([PREP_MAYBE_LIBRARY],[
+    if test -z "$$1" || test "$$1" = "NO"; then
+        $1MaybeLibrary=Nothing
+    else
+        PREP_LIST([$2])
+        PREP_MAYBE_STRING([$3])
+        PREP_MAYBE_STRING([$4])
+        $1MaybeLibrary="Just Library { libName = \"$2\", includePath = $$3MaybeStr, libraryPath = $$4MaybeStr }"
+    fi
+    AC_SUBST([$1MaybeLibrary])
+])
+
 # PREP_BOOLEAN
 # ============
 #
@@ -152,11 +170,13 @@ AC_DEFUN([PREP_TARGET_FILE],[
     PREP_BOOLEAN([LdHasFilelist])
     PREP_BOOLEAN([LdHasSingleModule])
     PREP_BOOLEAN([LdIsGNULd])
+    PREP_BOOLEAN([LdSupportsVerbatimNamespace])
     PREP_BOOLEAN([LdHasNoCompactUnwind])
     PREP_BOOLEAN([TargetHasSubsectionsViaSymbols])
     PREP_BOOLEAN([Unregisterised])
     PREP_BOOLEAN([TablesNextToCode])
     PREP_BOOLEAN([UseLibffiForAdjustors])
+    PREP_BOOLEAN([TargetHasLibm])
     PREP_BOOLEAN([ArIsGNUAr])
     PREP_BOOLEAN([ArNeedsRanLib])
     PREP_NOT_BOOLEAN([CrossCompiling])
@@ -171,6 +191,7 @@ AC_DEFUN([PREP_TARGET_FILE],[
     PREP_MAYBE_SIMPLE_PROGRAM([OptCmd])
     PREP_MAYBE_PROGRAM([LlvmAsCmd], [LlvmAsFlags])
     PREP_MAYBE_SIMPLE_PROGRAM([WindresCmd])
+    PREP_MAYBE_SIMPLE_PROGRAM([DlltoolCmd])
     PREP_MAYBE_SIMPLE_PROGRAM([OtoolCmd])
     PREP_MAYBE_SIMPLE_PROGRAM([InstallNameToolCmd])
     PREP_MAYBE_STRING([TargetVendor_CPP])
@@ -178,6 +199,7 @@ AC_DEFUN([PREP_TARGET_FILE],[
     PREP_LIST([CONF_CPP_OPTS_STAGE2])
     PREP_LIST([CONF_CXX_OPTS_STAGE2])
     PREP_LIST([CONF_CC_OPTS_STAGE2])
+    PREP_MAYBE_LIBRARY([UseLibdw], [dw], [LibdwIncludeDir], [LibdwLibDir])
 
     dnl Host target
     PREP_BOOLEAN([ArSupportsAtFile_STAGE0])
@@ -188,6 +210,10 @@ AC_DEFUN([PREP_TARGET_FILE],[
     PREP_LIST([CONF_CXX_OPTS_STAGE0])
     PREP_LIST([CONF_GCC_LINKER_OPTS_STAGE0])
 
+    PREP_BOOLEAN([LdHasNoCompactUnwind_STAGE0])
+    PREP_BOOLEAN([LdIsGNULd_STAGE0])
+    PREP_BOOLEAN([LdHasFilelist_STAGE0])
+    PREP_BOOLEAN([CONF_GCC_SUPPORTS_NO_PIE_STAGE0])
 
     if test -z "$MergeObjsCmd"; then
       MergeObjsCmdMaybe=Nothing
@@ -210,5 +236,3 @@ AC_DEFUN([PREP_TARGET_FILE],[
     esac
     AC_SUBST([TargetEndianness])
 ])
-
-AC_DEFUN()

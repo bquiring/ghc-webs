@@ -29,10 +29,11 @@ data NCGConfig = NCGConfig
    , ncgRegsGraph             :: !Bool
    , ncgAsmLinting            :: !Bool            -- ^ Perform ASM linting pass
    , ncgDoConstantFolding     :: !Bool            -- ^ Perform CMM constant folding
-   , ncgSseVersion            :: Maybe SseVersion -- ^ (x86) SSE instructions
-   , ncgAvxEnabled            :: !Bool
-   , ncgAvx2Enabled           :: !Bool
+   , ncgSseAvxVersion         :: Maybe SseAvxVersion -- ^ (x86) SSE and AVX instructions
    , ncgAvx512fEnabled        :: !Bool
+   , ncgAvx512vlEnabled       :: !Bool
+   , ncgAvx512bwEnabled       :: !Bool
+   , ncgAvx512dqEnabled       :: !Bool
    , ncgBmiVersion            :: Maybe BmiVersion -- ^ (x86) BMI instructions
    , ncgDumpRegAllocStages    :: !Bool
    , ncgDumpAsmStats          :: !Bool
@@ -50,6 +51,7 @@ data NCGConfig = NCGConfig
    , ncgEnableInterModuleFarJumps:: !Bool            -- ^ Use far-jumps for cross-module jumps.
    , ncgComputeUnwinding      :: !Bool            -- ^ Compute block unwinding tables
    , ncgEnableDeadCodeElimination :: !Bool        -- ^ Whether to enable the dead-code elimination
+   , ncgLa664Enabled          :: !Bool            -- ^ la664 is equal to isav1.1
    }
 
 -- | Return Word size

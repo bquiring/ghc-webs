@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -49,8 +50,11 @@ module Control.Applicative (
     liftA, liftA3,
     optional,
     asum,
+    thenA,
     ) where
 
+
+import GHC.Internal.Base
 import GHC.Internal.Control.Category hiding ((.), id)
 import GHC.Internal.Control.Arrow
 import GHC.Internal.Data.Maybe
@@ -60,10 +64,15 @@ import GHC.Internal.Data.Functor ((<$>))
 import GHC.Internal.Data.Functor.Const (Const(..))
 import GHC.Internal.Data.Typeable (Typeable)
 import GHC.Internal.Data.Data (Data)
-
-import GHC.Internal.Base
+import GHC.Generics( Generic, Generic1 )
 import GHC.Internal.Functor.ZipList (ZipList(..))
-import GHC.Generics
+
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Internal.Data.Data as Rebindable
+import qualified GHC.Internal.Data.Typeable.Internal as Rebindable
+import qualified GHC.Num as Rebindable
+import qualified GHC.Generics as Rebindable hiding( Fixity(..) )
+#endif
 
 -- $setup
 -- >>> import Prelude
@@ -143,3 +152,19 @@ deriving instance (Typeable (a :: Type -> Type -> Type), Typeable b, Typeable c,
 
 optional :: Alternative f => f a -> f (Maybe a)
 optional v = Just <$> v <|> pure Nothing
+
+#if __GLASGOW_HASKELL__ < 1000
+
+-- | Sequence two `Applicative` actions, discarding the result of the first one.
+--
+-- Defined as `thenA fa fb = (id <$ fa) <*> fb`.
+--
+-- This can be used to explicitly define `(*>) = thenA`, which is the default
+-- definition.
+--
+-- @since 4.23.0.0
+thenA :: Applicative f => f a -> f b -> f b
+thenA fa fb = (id <$ fa) <*> fb
+{-# INLINEABLE thenA #-}
+
+#endif

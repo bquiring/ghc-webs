@@ -5,7 +5,6 @@
 
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE LambdaCase #-}
 
 module GHC.Linker.Deps
   ( LinkDepsOpts (..)
@@ -33,7 +32,6 @@ import GHC.Utils.Error
 import GHC.Unit.Env
 import GHC.Unit.Finder
 import GHC.Unit.Module
-import GHC.Unit.Module.WholeCoreBindings
 import GHC.Unit.Home.ModInfo
 
 import GHC.Iface.Errors.Types
@@ -59,13 +57,13 @@ data LinkDepsOpts = LinkDepsOpts
   , ldWays        :: !Ways                          -- ^ Enabled ways
   , ldFinderCache :: !FinderCache
   , ldFinderOpts  :: !FinderOpts
-  , ldLoadByteCode :: !(Module -> IO (Maybe Linkable))
+  , ldLoadByteCode :: !(Module -> ModLocation -> IO (Maybe Linkable))
   , ldGetDependencies :: !([Module] -> IO ([Module], UniqDSet UnitId))
   }
 
 data LinkDeps = LinkDeps
   { ldNeededLinkables :: [Linkable]
-  , ldAllLinkables    :: [Linkable]
+  , ldAllLinkables    :: [LinkableUsage]
   , ldUnits           :: [UnitId]
   , ldNeededUnits     :: UniqDSet UnitId
   }
@@ -125,13 +123,19 @@ get_link_deps opts pls maybe_normal_osuf span mods = do
         --     This will either be in the HPT or (in the case of one-shot
         --     compilation) we may need to use maybe_getFileLinkable
       lnks_needed <- mapM (get_linkable (ldObjSuffix opts)) mods_needed
+      let
+        lnks_needed_usages = mkLinkablesUsage lnks_needed
+        new_link_deps lnks = LinkDeps
+          { ldNeededLinkables = lnks_needed
+          , ldAllLinkables    = lnks
+          , ldUnits           = pkgs_needed
+          , ldNeededUnits     = pkgs_s
+          }
+        -- Make sure we do not retain 'Linkable' by evaluating '[LinkableUsage]'
+        link_deps =
+          seqList lnks_needed_usages (new_link_deps (links_got ++ lnks_needed_usages))
 
-      return $ LinkDeps
-        { ldNeededLinkables = lnks_needed
-        , ldAllLinkables    = links_got ++ lnks_needed
-        , ldUnits           = pkgs_needed
-        , ldNeededUnits     = pkgs_s
-        }
+      return link_deps
   where
     unit_env = ldUnitEnv opts
     relevant_mods = filterOut isInteractiveModule mods
@@ -161,8 +165,15 @@ get_link_deps opts pls maybe_normal_osuf span mods = do
            case ue_homeUnit unit_env of
             Nothing -> no_obj mod
             Just home_unit -> do
-              from_bc <- ldLoadByteCode opts mod
-              maybe (fallback_no_bytecode home_unit mod) pure from_bc
+
+              let fc = ldFinderCache opts
+              let fopts = ldFinderOpts opts
+              mb_stuff <- findHomeModule fc fopts home_unit (moduleName mod)
+              case mb_stuff of
+                Found loc _ -> do
+                  from_bc <- ldLoadByteCode opts mod loc
+                  maybe (fallback_no_bytecode home_unit mod) pure from_bc
+                _ -> fallback_no_bytecode home_unit mod
         where
 
             fallback_no_bytecode home_unit mod = do
@@ -199,11 +210,7 @@ get_link_deps opts pls maybe_normal_osuf span mods = do
               DotO file ForeignObject -> pure (DotO file ForeignObject)
               DotA fp    -> panic ("adjust_ul DotA " ++ show fp)
               DotDLL fp  -> panic ("adjust_ul DotDLL " ++ show fp)
-              BCOs {}    -> pure part
-              LazyBCOs{} -> pure part
-              CoreBindings WholeCoreBindings {wcb_module} ->
-                pprPanic "Unhydrated core bindings" (ppr wcb_module)
-
+              DotGBC {}  -> pure part
 
 
 {-

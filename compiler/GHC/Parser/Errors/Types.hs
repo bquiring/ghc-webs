@@ -1,12 +1,9 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DataKinds #-}
 
 module GHC.Parser.Errors.Types where
 
 import GHC.Prelude
 
-import GHC.Core.TyCon (Role)
 import GHC.Data.FastString
 import GHC.Hs
 import GHC.Parser.Types
@@ -132,11 +129,11 @@ data PsMessage
    -- | Found binding occurrence of "*" while StarIsType is enabled
    | PsWarnStarBinder
 
-   -- | Using "*" for "Type" without StarIsType enabled
+   -- | Using "*" for "Type", relying on the legacy extension StarIsType
    | PsWarnStarIsType
 
    -- | Pre qualified import with 'WarnPrepositiveQualifiedModule' enabled
-   | PsWarnImportPreQualified
+   | PsWarnImportPreQualified !Bool -- is 'ImportQualifiedPost' enabled?
 
    | PsWarnOperatorWhitespaceExtConflict !OperatorWhitespaceSymbol
 
@@ -214,7 +211,16 @@ data PsMessage
    | PsErrImportPostQualified
 
    -- | Explicit namespace keyword without 'ExplicitNamespaces'
-   | PsErrIllegalExplicitNamespace
+   | PsErrIllegalExplicitNamespace !ExplicitNamespaceKeyword
+
+   -- | Explicit namespace keyword in unsupported position
+   | PsErrUnsupportedExplicitNamespace !ExplicitNamespaceKeyword !UnsupportedNamespacePosition
+
+   -- | Plain top-level wildcard in an import list, e.g. @import Data.Proxy (..)@
+   | PsErrPlainWildcardImport
+
+   -- | Plain top-level wildcard in an export list, e.g. @module M (..) where@
+   | PsErrPlainWildcardExport
 
    -- | Expecting a type constructor but found a variable
    | PsErrVarForTyCon !RdrName
@@ -419,9 +425,6 @@ data PsMessage
                                [LHsTypeArg GhcPs]
                                !SDoc
 
-   -- | Expected a hyphen
-   | PsErrExpectedHyphen
-
    -- | Found a space in a SCC
    | PsErrSpaceInSCC
 
@@ -435,8 +438,12 @@ data PsMessage
    -- | Invalid rule activation marker
    | PsErrInvalidRuleActivationMarker
 
-   -- | Linear function found but LinearTypes not enabled
+   -- | Linear function found but neither Modifiers nor LinearTypes enabled
    | PsErrLinearFunction
+
+   -- | Other modifier syntax found, but it's illegal here or Modifiers not
+   -- enabled
+   | PsErrModifierSyntax SuggestModifiers
 
    -- | Multi-way if-expression found but MultiWayIf not enabled
    | PsErrMultiWayIf
@@ -447,6 +454,9 @@ data PsMessage
 
    -- | Found qualified-do without QualifiedDo enabled
    | PsErrIllegalQualifiedDo !SDoc
+
+   -- | Found multiline string without MultilineStrings enabled
+   | PsErrIllegalMultilineStrings
 
    -- | Cmm parser error
    | PsErrCmmParser !CmmParserError
@@ -468,8 +478,10 @@ data PsMessage
    -- TODO: embed the proper operator, if possible
    | PsErrParseRightOpSectionInPat !RdrName !(PatBuilder GhcPs)
 
-   -- | Illegal linear arrow or multiplicity annotation in GADT record syntax
-   | PsErrIllegalGadtRecordMultiplicity !(HsMultAnn GhcPs)
+   -- | Illegal modifier or linear arrow in GADT record syntax, e.g.
+   --
+   -- > data T where MkT :: { a :: Int } %1 -> T
+   | PsErrIllegalGadtRecordModifier !(HsModifiedFunArr GhcPs)
 
    | PsErrInvalidCApiImport
 
@@ -516,6 +528,11 @@ data PsMessage
       !Bool -- ^ Is ExplicitNamespaces on?
 
    deriving Generic
+
+-- | A position in an import/export list in which we do not support an explicit namespace keyword.
+data UnsupportedNamespacePosition
+  -- | We do not support @import T(x, type ..)@
+  = UnsupportedNameSpaceInIEThingWith
 
 -- | Extra details about a parse error, which helps
 -- us in determining which should be the hints to
@@ -576,11 +593,10 @@ data PsErrPunDetails
 data PsErrTypeSyntaxDetails
   = PETS_FunctionArrow
       !(LocatedA (PatBuilder GhcPs))
-      !(HsMultAnnOf (LocatedA (PatBuilder GhcPs)) GhcPs)
+      !(HsModifiedFunArrOf (LocatedA (PatBuilder GhcPs)) GhcPs)
       !(LocatedA (PatBuilder GhcPs))
   | PETS_Multiplicity
-      !(EpToken "%")
-      !(LocatedA (PatBuilder GhcPs))
+      ![LHsModifierOf (LocatedA (PatBuilder GhcPs)) GhcPs]
   | PETS_ForallTelescope
       !(HsForAllTelescope GhcPs)
       !(LocatedA (PatBuilder GhcPs))
@@ -636,3 +652,15 @@ data FileHeaderPragmaType
   | IncludePrag
   | LanguagePrag
   | DocOptionsPrag
+
+-- | Whether or not to add a hint about enabling -XModifiers, when we throw an
+-- error about modifier syntax.
+--
+-- We suggest enabling it when modifier syntax is used in a place it's
+-- recognized, but the extension is disabled. We don't suggest enabling it when
+-- modifier syntax is used in a place it's not recognized.
+--
+-- See Note [Overview of Modifiers] in Language.Haskell.Syntax.Type.
+data SuggestModifiers
+  = SuggestModifiers
+  | DontSuggestModifiers

@@ -53,7 +53,7 @@ import GHC.Core
 import GHC.Core.FVs
 import GHC.Core.Utils
 import GHC.Core.DataCon
-import GHC.Core.TyCon     ( tyConArity )
+import GHC.Core.TyCon     ( TyCon, tyConArity, isInjectiveTyCon )
 import GHC.Core.TyCon.RecWalk     ( initRecTc, checkRecTc )
 import GHC.Core.Predicate ( isDictTy, isEvId, isCallStackPredTy, isCallStackTy )
 import GHC.Core.Multiplicity
@@ -64,7 +64,7 @@ import GHC.Core.Multiplicity
 import GHC.Core.Subst    as Core
 import GHC.Core.Type     as Type
 import GHC.Core.Coercion as Type
-import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCo.Compare( eqType, eqTypeIgnoringMultiplicity )
 
 import GHC.Types.Demand
 import GHC.Types.Cpr( CprSig, mkCprSig, botCpr )
@@ -75,7 +75,7 @@ import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Tickish
 
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Prim
 import GHC.Builtin.Uniques
 
 import GHC.Data.FastString
@@ -90,7 +90,6 @@ import GHC.Utils.Misc
 
 import Data.List.NonEmpty ( nonEmpty )
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe( isJust )
 
 {-
 ************************************************************************
@@ -2080,7 +2079,11 @@ eta_expand in_scope one_shots orig_expr
           (expr', args) = collectArgs expr
           (ticks, expr'') = stripTicksTop tickishFloatable expr'
           sexpr = mkApps expr'' args
-          retick expr = foldr mkTick expr ticks
+          retick expr = foldr mkTickCpe expr ticks
+            -- Defensive programming: use 'mkTickCpe' instead of 'mkTick',
+            -- as this code can be called by Core Prep.
+            --
+            -- See Note [mkTick breaks ANF] in GHC.CoreToStg.Prep
 
 {- *********************************************************************
 *                                                                      *
@@ -2367,12 +2370,15 @@ mkEtaForAllMCo (Bndr tcv vis) ty mco
             | otherwise                    -> mk_fco (mkRepReflCo ty)
       MCo co                               -> mk_fco co
   where
-    mk_fco co = MCo (mkForAllCo tcv vis coreTyLamForAllTyFlag
-                                (mkNomReflCo (varType tcv)) co)
+    mk_fco co = MCo (mkForAllCo tcv coreTyLamForAllTyFlag vis MRefl co)
     -- coreTyLamForAllTyFlag: See Note [The EtaInfo mechanism], particularly
     -- the (EtaInfo Invariant).  (sym co) wraps a lambda that always has
     -- a ForAllTyFlag of coreTyLamForAllTyFlag; see Note [Required foralls in Core]
     -- in GHC.Core.TyCo.Rep
+    --
+    -- Orientation: remember, the output of mkEtaForAllCo goes into an `EI bs mco`,
+    -- and is SymCo'd in `etaInfoAbs`.  Hence the orientation of the visibility
+    -- flags.  A bit of a brain-strain (#27557).
 
 {-
 ************************************************************************
@@ -2516,7 +2522,7 @@ eta-reduce that are specific to Core and GHC:
     See Note [Eta expanding primops].
 
 (W) We may not undersaturate StrictWorkerIds.
-    See Note [CBV Function Ids] in GHC.Types.Id.Info.
+    See Note [CBV Function Ids: overview] in GHC.Types.Id.Info.
 
 Here is a list of historic accidents surrounding unsound eta-reduction:
 
@@ -2552,9 +2558,6 @@ I considered eta-reducing if the result is a PAP:
 This reduces clutter, sometimes a lot. See Note [Do not eta-expand PAPs]
 in GHC.Core.Opt.Simplify.Utils, where we are careful not to eta-expand
 a PAP.  If eta-expanding is bad, then eta-reducing is good!
-
-Also the code generator likes eta-reduced PAPs; see GHC.CoreToStg.Prep
-Note [No eta reduction needed in rhsToBody].
 
 But note that we don't want to eta-reduce
      \x y.  f <expensive> x y
@@ -2696,10 +2699,11 @@ same fix.
 
 -- | `tryEtaReduce [x,y,z] e sd` returns `Just e'` if `\x y z -> e` is evaluated
 -- according to `sd` and can soundly and gainfully be eta-reduced to `e'`.
--- See Note [Eta reduction soundness]
--- and Note [Eta reduction makes sense] when that is the case.
 tryEtaReduce :: UnVarSet -> [Var] -> CoreExpr -> SubDemand -> Maybe CoreExpr
 -- Return an expression equal to (\bndrs. body)
+-- See Note [Eta reduction soundness]
+-- and Note [Eta reduction makes sense] when that is the case.
+-- and Note [Eta reduction based on evaluation context] for the `eval_sd` arg
 tryEtaReduce rec_ids bndrs body eval_sd
   = go (reverse bndrs) body (mkRepReflCo (exprType body))
   where
@@ -2808,11 +2812,10 @@ tryEtaReduce rec_ids bndrs body eval_sd
        | Just tv <- getTyVar_maybe arg_ty
        , bndr == tv  = case splitForAllForAllTyBinder_maybe fun_ty of
            Just (Bndr _ vis, _) -> Just (fco, [])
-             where !fco = mkForAllCo tv vis coreTyLamForAllTyFlag kco co
+             where !fco = mkForAllCo tv vis coreTyLamForAllTyFlag MRefl co
                    -- The lambda we are eta-reducing always has visibility
                    -- 'coreTyLamForAllTyFlag' which may or may not match
                    -- the visibility on the inner function (#24014)
-                   kco = mkNomReflCo (tyVarKind tv)
            Nothing -> pprPanic "tryEtaReduce: type arg to non-forall type"
                                (text "fun:" <+> ppr bndr
                                 $$ text "arg:" <+> ppr arg_ty
@@ -2836,21 +2839,6 @@ tryEtaReduce rec_ids bndrs body eval_sd
        = Just (co', t:ticks)
 
     ok_arg _ _ _ _ = Nothing
-
--- | Can we eta-reduce the given function
--- See Note [Eta reduction soundness], criteria (B), (J), and (W).
-cantEtaReduceFun :: Id -> Bool
-cantEtaReduceFun fun
-  =    hasNoBinding fun -- (B)
-       -- Don't undersaturate functions with no binding.
-
-    ||  isJoinId fun    -- (J)
-       -- Don't undersaturate join points.
-       -- See Note [Invariants on join points] in GHC.Core, and #20599
-
-    || (isJust (idCbvMarks_maybe fun)) -- (W)
-       -- Don't undersaturate StrictWorkerIds.
-       -- See Note [CBV Function Ids] in GHC.Types.Id.Info.
 
 
 {- *********************************************************************
@@ -2895,43 +2883,44 @@ pushCoArg :: CoercionR -> CoreArg -> Maybe (CoreArg, MCoercion)
 -- 'co' is always Representational
 pushCoArg co arg
   | Type ty <- arg
-  = do { (ty', m_co') <- pushCoTyArg co ty
+  = do { (_, ty', m_co') <- pushCoTyArg co ty
        ; return (Type ty', m_co') }
   | otherwise
-  = do { (arg_mco, m_co') <- pushCoValArg co
+  = do { (_, arg_mco, m_co') <- pushCoValArg co
        ; let arg_mco' = checkReflexiveMCo arg_mco
              -- checkReflexiveMCo: see Note [Check for reflexive casts in eta expansion]
              -- The coercion is very often (arg_co -> res_co), but without
              -- the argument coercion actually being ReflCo
        ; return (arg `mkCastMCo` arg_mco', m_co') }
 
-pushCoTyArg :: CoercionR -> Type -> Maybe (Type, MCoercionR)
+pushCoTyArg :: CoercionR -> Type -> Maybe (Type, Type, MCoercionR)
 -- We have (fun |> co) @ty
 -- Push the coercion through to return
 --         (fun @ty') |> co'
 -- 'co' is always Representational
 -- If the returned coercion is Nothing, then it would have been reflexive;
 -- it's faster not to compute it, though.
-pushCoTyArg co ty
+pushCoTyArg co arg_ty
   -- The following is inefficient - don't do `eqType` here, the coercion
   -- optimizer will take care of it. See #14737.
   -- -- | tyL `eqType` tyR
   -- -- = Just (ty, Nothing)
 
-  | isReflCo co
-  = Just (ty, MRefl)
+  | Just (ty, _) <- isReflCo_maybe co
+  = Just (ty, arg_ty, MRefl)
 
   | isForAllTy_ty tyL
-  = assertPpr (isForAllTy_ty tyR) (ppr co $$ ppr ty) $
-    Just (ty `mkCastTy` co1, MCo co2)
+  = assertPpr (isForAllTy_ty tyR) (ppr co $$ ppr arg_ty) $
+    Just (tyL, arg_ty `mkCastTy` co1, MCo co2)
 
   | otherwise
   = Nothing
   where
-    Pair tyL tyR = coercionKind co
-       -- co :: tyL ~R tyR
-       -- tyL = forall (a1 :: k1). ty1
-       -- tyR = forall (a2 :: k2). ty2
+    -- co :: tyL ~R tyR
+    -- tyL = forall (a1 :: k1). ty1
+    -- tyR = forall (a2 :: k2). ty2
+    tyL = coercionLKind co
+    tyR = coercionRKind co -- Used only in asssertions and debug messages
 
     co1 = mkSymCo (mkSelCo SelForAll co)
        -- co1 :: k2 ~N k1
@@ -2939,30 +2928,32 @@ pushCoTyArg co ty
        -- kinds of the types related by a coercion between forall-types.
        -- See the SelCo case in GHC.Core.Lint.
 
-    co2 = mkInstCo co (mkGReflLeftCo Nominal ty co1)
-        -- co2 :: ty1[ (ty|>co1)/a1 ] ~R ty2[ ty/a2 ]
+    co2 = mkInstCo co (mkGReflLeftCo Nominal arg_ty co1)
+        -- co2 :: ty1[ (arg_ty|>co1)/a1 ] ~R ty2[ arg_ty/a2 ]
         -- Arg of mkInstCo is always nominal, hence Nominal
 
--- | If @pushCoValArg co = Just (co_arg, co_res)@, then
+-- | If @pushCoValArg co = Just (tyL, co_arg, co_res)@, then
 --
--- > (\x.body) |> co  =  (\y. let { x = y |> co_arg } in body) |> co_res)
+--   co :: tyL ~R# tyR
+-- and
+--   (\x.body) |> co  =  (\y. let { x = y |> co_arg } in body) |> co_res)
 --
 -- or, equivalently
 --
--- > (fun |> co) arg  =  (fun (arg |> co_arg)) |> co_res
+--    (fun |> co) arg  =  (fun (arg |> co_arg)) |> co_res
 --
 -- If the LHS is well-typed, then so is the RHS. In particular, the argument
 -- @arg |> co_arg@ is guaranteed to have a fixed 'RuntimeRep', in the sense of
 -- Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
-pushCoValArg :: CoercionR -> Maybe (MCoercionR, MCoercionR)
+pushCoValArg :: CoercionR -> Maybe (Type, MCoercionR, MCoercionR)
 pushCoValArg co
   -- The following is inefficient - don't do `eqType` here, the coercion
   -- optimizer will take care of it. See #14737.
   -- -- | tyL `eqType` tyR
   -- -- = Just (mkRepReflCo arg, Nothing)
 
-  | isReflCo co
-  = Just (MRefl, MRefl)
+  | Just (ty, _) <- isReflCo_maybe co
+  = Just (ty, MRefl, MRefl)
 
   | isFunTy tyL
   , (_, co1, co2) <- decomposeFunCo co
@@ -2973,12 +2964,15 @@ pushCoValArg co
   , typeHasFixedRuntimeRep new_arg_ty
     -- We can't push the coercion inside if it would give rise to
     -- a representation-polymorphic argument.
+    --
+    -- See Note [Representation polymorphism invariants] in GHC.Core
+    -- test: typecheck/should_run/EtaExpandLevPoly
 
   = assertPpr (isFunTy tyL && isFunTy tyR)
      (vcat [ text "co:" <+> ppr co
            , text "old_arg_ty:" <+> ppr old_arg_ty
            , text "new_arg_ty:" <+> ppr new_arg_ty ]) $
-    Just (coToMCo (mkSymCo co1), coToMCo co2)
+    Just (tyL, coToMCo (mkSymCo co1), coToMCo co2)
     -- Critically, coToMCo to checks for ReflCo; the whole coercion may not
     -- be reflexive, but either of its components might be
     -- We could use isReflexiveCo, but it's not clear if the benefit
@@ -2987,9 +2981,12 @@ pushCoValArg co
   | otherwise
   = Nothing
   where
-    old_arg_ty = funArgTy tyR
+    tyL        = coercionLKind co
     new_arg_ty = funArgTy tyL
-    Pair tyL tyR = coercionKind co
+
+    -- These two are used only in assertions and debug messages
+    tyR        = coercionRKind co
+    old_arg_ty = funArgTy tyR
 
 pushCoercionIntoLambda
     :: HasDebugCallStack => InScopeSet -> Var -> CoreExpr -> CoercionR -> Maybe (Var, CoreExpr)
@@ -3011,25 +3008,26 @@ pushCoercionIntoLambda in_scope x e co
           -- Otherwise they might not match too well
           x' = x `setIdType` t1 `setIdMult` w1
           in_scope' = in_scope `extendInScopeSet` x'
-          subst = extendIdSubst (mkEmptySubst in_scope')
-                                x
-                                (mkCast (Var x') (mkSymCo co1))
+          subst' =
+            extendIdSubst (setInScope emptySubst in_scope')
+              x
+              (mkCast (Var x') (mkSymCo co1))
             -- We substitute x' for x, except we need to preserve types.
             -- The types are as follows:
             --   x :: s1,  x' :: t1,  co1 :: s1 ~# t1,
             -- so we extend the substitution with x |-> (x' |> sym co1).
-      in Just (x', substExpr subst e `mkCast` co2)
+      in Just (x', substExpr subst' e `mkCast` co2)
     | otherwise
     = Nothing
 
-pushCoDataCon :: DataCon -> [CoreExpr] -> MCoercion
+pushCoDataCon :: DataCon -> [CoreExpr] -> MCoercionR
               -> Maybe (DataCon
                        , [Type]      -- Universal type args
                        , [CoreExpr]) -- All other args incl existentials
 -- Implement the KPush reduction rule as described in "Down with kinds"
 -- The transformation applies iff we have
 --      (C e1 ... en) `cast` co
--- where co :: (T t1 .. tn) ~ to_ty
+-- where co :: (T t1 .. tn) ~ (T s1 .. sn)
 -- The left-hand one must be a T, because exprIsConApp returned True
 -- but the right-hand one might not be.  (Though it usually will.)
 pushCoDataCon dc dc_args MRefl    = Just $! (push_dc_refl dc dc_args)
@@ -3041,7 +3039,7 @@ push_dc_refl dc dc_args
   where
     !(univ_ty_args, rest_args) = splitAtList (dataConUnivTyVars dc) dc_args
 
-push_dc_gen :: DataCon -> [CoreExpr] -> Coercion -> Pair Type
+push_dc_gen :: DataCon -> [CoreExpr] -> CoercionR -> Pair Type
             -> Maybe (DataCon, [Type], [CoreExpr])
 push_dc_gen dc dc_args co (Pair from_ty to_ty)
   | from_ty `eqType` to_ty  -- try cheap test first
@@ -3054,43 +3052,53 @@ push_dc_gen dc dc_args co (Pair from_ty to_ty)
         -- where S is a type function.  In fact, exprIsConApp
         -- will probably not be called in such circumstances,
         -- but there's nothing wrong with it
-
-  = let
-        tc_arity       = tyConArity to_tc
-        dc_univ_tyvars = dataConUnivTyVars dc
-        dc_ex_tcvars   = dataConExTyCoVars dc
-        arg_tys        = dataConRepArgTys dc
-
-        non_univ_args  = dropList dc_univ_tyvars dc_args
-        (ex_args, val_args) = splitAtList dc_ex_tcvars non_univ_args
-
-        -- Make the "Psi" from the paper
-        omegas = decomposeCo tc_arity co (tyConRolesRepresentational to_tc)
-        (psi_subst, to_ex_arg_tys)
-          = liftCoSubstWithEx Representational
-                              dc_univ_tyvars
-                              omegas
-                              dc_ex_tcvars
-                              (map exprToType ex_args)
-
-          -- Cast the value arguments (which include dictionaries)
-        new_val_args = zipWith cast_arg (map scaledThing arg_tys) val_args
-        cast_arg arg_ty arg = mkCast arg (psi_subst arg_ty)
-
-        to_ex_args = map Type to_ex_arg_tys
-
-        dump_doc = vcat [ppr dc,      ppr dc_univ_tyvars, ppr dc_ex_tcvars,
-                         ppr arg_tys, ppr dc_args,
-                         ppr ex_args, ppr val_args, ppr co, ppr from_ty, ppr to_ty, ppr to_tc
-                         , ppr $ mkTyConApp to_tc (map exprToType $ takeList dc_univ_tyvars dc_args) ]
-    in
-    assertPpr (eqType from_ty (mkTyConApp to_tc (map exprToType $ takeList dc_univ_tyvars dc_args))) dump_doc $
-    assertPpr (equalLength val_args arg_tys) dump_doc $
-    Just (dc, to_tc_arg_tys, to_ex_args ++ new_val_args)
+  = Just (push_data_con to_tc to_tc_arg_tys dc dc_args co Representational)
 
   | otherwise
   = Nothing
 
+
+push_data_con :: TyCon -> [Type] -> DataCon -> [CoreExpr]
+              -> CoercionR -> Role                  -- Coercion and its role
+              -> (DataCon, [Type], [CoreExpr])
+push_data_con to_tc to_tc_arg_tys dc dc_args co role
+  = assertPpr (eqTypeIgnoringMultiplicity from_ty dc_app_ty) dump_doc $
+    assertPpr (equalLength val_args arg_tys) dump_doc $
+    assertPpr (role == coercionRole co)      dump_doc $
+    assertPpr (isInjectiveTyCon to_tc role)  dump_doc $
+    -- isInjectiveTyCon: see (UCM9) in Note [Unary class magic]
+    --                   in GHC.Core.TyCon
+    (dc, to_tc_arg_tys, to_ex_args ++ new_val_args)
+  where
+    Pair from_ty to_ty = coercionKind co
+    tc_arity       = tyConArity to_tc
+    dc_univ_tyvars = dataConUnivTyVars dc
+    dc_ex_tcvars   = dataConExTyCoVars dc
+    arg_tys        = dataConRepArgTys dc
+
+    dc_app_ty = mkTyConApp to_tc (map exprToType $ takeList dc_univ_tyvars dc_args)
+
+    non_univ_args  = dropList dc_univ_tyvars dc_args
+    (ex_args, val_args) = splitAtList dc_ex_tcvars non_univ_args
+
+    -- Make the "Psi" from the paper
+    omegas = decomposeCo tc_arity co (tyConRolesX role to_tc)
+    (psi_subst, to_ex_arg_tys)
+      = liftCoSubstWithEx dc_univ_tyvars
+                          omegas
+                          dc_ex_tcvars
+                          (map exprToType ex_args)
+
+      -- Cast the value arguments (which include dictionaries)
+    new_val_args = zipWith cast_arg (map scaledThing arg_tys) val_args
+    cast_arg arg_ty arg = mkCast arg (psi_subst arg_ty)
+
+    to_ex_args = map Type to_ex_arg_tys
+
+    dump_doc = vcat [ppr dc, ppr dc_univ_tyvars, ppr dc_ex_tcvars
+                    , ppr arg_tys, ppr dc_args
+                    , ppr ex_args, ppr val_args, ppr co, ppr from_ty, ppr to_ty, ppr to_tc
+                    , ppr $ mkTyConApp to_tc (map exprToType $ takeList dc_univ_tyvars dc_args) ]
 
 collectBindersPushingCo :: CoreExpr -> ([Var], CoreExpr)
 -- Collect lambda binders, pushing coercions inside if possible
@@ -3147,15 +3155,12 @@ collectBindersPushingCo e
 
       | otherwise = (reverse bs, mkCast (Lam b e) co)
 
-{-
-
-Note [collectBindersPushingCo]
+{- Note [collectBindersPushingCo]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We just look for coercions of form
    <type> % w -> blah
 (and similarly for foralls) to keep this function simple.  We could do
 more elaborate stuff, but it'd involve substitution etc.
-
 -}
 
 {- *********************************************************************

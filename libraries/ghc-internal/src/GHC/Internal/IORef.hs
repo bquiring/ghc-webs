@@ -26,6 +26,9 @@ module GHC.Internal.IORef (
     ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Prim (
+    RealWorld, atomicModifyMutVar2#, atomicModifyMutVar_#, atomicSwapMutVar#,
+  )
 import GHC.Internal.STRef
 import GHC.Internal.IO
 

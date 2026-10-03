@@ -1,6 +1,3 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -----------------------------------------------------------------------------
@@ -174,7 +171,7 @@ instance DSM.MonadGetUnique FCode where
   getUniqueM = GHC.Types.Unique.Supply.getUniqueM
 
 initC :: IO CgState
-initC  = do { uniqs <- mkSplitUniqSupply 'c'
+initC  = do { uniqs <- mkSplitUniqSupply CmmTag
             ; return (initCgState uniqs) }
 
 runC :: StgToCmmConfig -> FCodeState -> CgState -> FCode a -> (a, CgState)

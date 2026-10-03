@@ -37,14 +37,14 @@ import GHC.Cmm.Graph
 import GHC.Types.Name
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare( eqType )
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Prim
 import GHC.Types.Unique.FM
 import GHC.Types.Var.Env
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
-import GHC.Builtin.Names (getUnique)
+import GHC.Builtin.KnownKeys (getUnique)
 
 
 -------------------------------------
@@ -90,7 +90,7 @@ idInfoToAmode cg_info
 
 -- | A tag adds a byte offset to the pointer
 addDynTag :: Platform -> CmmExpr -> DynTag -> CmmExpr
-addDynTag = cmmOffsetB
+addDynTag platform e tag = cmmOffsetB platform e (fromDynTag tag)
 
 maybeLetNoEscape :: CgIdInfo -> Maybe (BlockId, [LocalReg])
 maybeLetNoEscape CgIdInfo { cg_loc = LneLoc blk_id args} = Just (blk_id, args)

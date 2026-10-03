@@ -87,6 +87,13 @@ test('T783',
       ],
       compile,[''])
 
+test ('T26426'
+     , [ only_ways(['normal'])
+       , collect_compiler_stats('bytes allocated',4) ]
+     , compile
+     , ['']
+     )
+
 test('T5321Fun',
      [ only_ways(['normal']),  # no optimisation for this one
        collect_compiler_runtime(2),
@@ -181,6 +188,30 @@ test ('T13386',
         collect_compiler_stats('bytes allocated',3) ],
       compile,
       ['-v0 -O0'])
+
+# Performance test for lookups in the family application cache
+test('FamAppCachePerf',
+     [ only_ways(['normal'])
+     , collect_compiler_stats('bytes allocated',2)
+     ],
+     compile,
+     ['-v0 -O0'])
+
+test('T27336',
+     [ only_ways(['normal'])
+     , collect_compiler_stats('bytes allocated',2)
+     ],
+     compile,
+     ['-v0 -O0'])
+
+# Performance test involving pushing casts around in the simplifier
+test('SimplCastPerf',
+     [ only_ways(['normal'])
+     , collect_compiler_residency(20)
+     , collect_compiler_stats('bytes allocated',2)
+     ],
+     compile,
+     ['-v0 -O'])
 
 #########
 # The following tests are very sensitive
@@ -332,15 +363,20 @@ test('T13379',
 # (though the size of the fluctuations does perhaps suggest that it
 # would be valuable to solve the pathology in a more general way).
 
+# Note [MultiLayerModules* test timeout]
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# These tests are relatively sensitive to system load and cane
+# take a while to run. This caused a fair number of CI failures
+# in the past. So we give them some headroom.
+# We need to ensure to use the right timeout for those test. In the past
+# we used the compile timeout for the GHCi versions by accident.
+
 test('MultiLayerModules',
      [ collect_compiler_stats('bytes allocated',2),
        pre_cmd('./genMultiLayerModules'),
        extra_files(['genMultiLayerModules']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
      ],
      multimod_compile,
      # see Note [Increased initial stack size for MultiLayerModules]
@@ -351,11 +387,8 @@ test('MultiLayerModulesRecomp',
      [ collect_compiler_stats('bytes allocated',2),
        pre_cmd('$MAKE -s --no-print-directory MultiModulesRecomp'),
        extra_files(['genMultiLayerModules']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
      ],
      multimod_compile,
      # see Note [Increased initial stack size for MultiLayerModules]
@@ -367,6 +400,7 @@ test('MultiLayerModulesTH_Make',
      [ collect_compiler_stats('bytes allocated',2),
        pre_cmd('$MAKE -s --no-print-directory MultiLayerModulesTH_Make_Prep'),
        extra_files(['genMultiLayerModulesTH']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5),
        when(arch('wasm32'), fragile(25336)),
        # We skip the test on darwin due to recent regression due to toolchain
@@ -382,6 +416,7 @@ test('MultiLayerModulesTH_OneShot',
      [ collect_compiler_stats('bytes allocated',2),
        pre_cmd('$MAKE -s --no-print-directory MultiLayerModulesTH_OneShot_Prep'),
        extra_files(['genMultiLayerModulesTH']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5),
        when(arch('wasm32'), fragile(25336)),
        # We skip the test on darwin due to recent regression due to toolchain
@@ -395,12 +430,9 @@ test('MultiLayerModulesTH_OneShot',
 test('MultiLayerModulesDefsGhci',
      [ collect_compiler_residency(15),
        pre_cmd('./genMultiLayerModulesDefs'),
-       extra_files(['../../ghci/shell.hs', 'genMultiLayerModulesDefs']),
-       compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
+       extra_files(['genMultiLayerModulesDefs']),
+       # See Note [MultiLayerModules* test timeout]
+       run_timeout_multiplier(5)
      ],
      ghci_script,
      ['MultiLayerModulesDefsGhci.script'])
@@ -409,25 +441,32 @@ test('MultiLayerModulesDefsGhciWithCore',
      [ collect_compiler_residency(15),
        pre_cmd('$MAKE -s --no-print-directory MultiModulesRecompDefsWithCore'),
        extra_files(['genMultiLayerModulesCore', 'MultiLayerModulesDefsGhciWithCore.script']),
-       compile_timeout_multiplier(5),
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
+       # See Note [MultiLayerModules* test timeout]
+       pre_cmd_timeout_multiplier(5),
+       run_timeout_multiplier(5),
        extra_run_opts('-fwrite-if-simplified-core MultiLayerModules')
      ],
      ghci_script,
      ['MultiLayerModulesDefsGhciWithCore.script'])
 
+test('MultiLayerModulesDefsGhciWithBytecodeFiles',
+     [ collect_compiler_residency(15),
+       pre_cmd('$MAKE -s --no-print-directory MultiModulesRecompDefsWithBytecodeFiles'),
+       extra_files(['genMultiLayerModulesCore', 'MultiLayerModulesDefsGhciWithBytecodeFiles.script']),
+       # See Note [MultiLayerModules* test timeout]
+       pre_cmd_timeout_multiplier(5),
+       run_timeout_multiplier(5),
+       extra_run_opts('-fwrite-byte-code MultiLayerModules')
+     ],
+     ghci_script,
+     ['MultiLayerModulesDefsGhciWithBytecodeFiles.script'])
+
 test('MultiLayerModulesDefsGhcWithCore',
      [ collect_compiler_residency(15),
        pre_cmd('$MAKE -s --no-print-directory MultiModulesDefsWithCore'),
        extra_files(['genMultiLayerModulesCore']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
      ],
      multimod_compile,
      ['MultiLayerModules', '-v0 -fwrite-if-simplified-core'])
@@ -436,17 +475,14 @@ test('MultiLayerModulesDefsGhciReload',
      [ collect_compiler_residency(15),
        pre_cmd('./genMultiLayerModulesDefs'),
        extra_files(['genMultiLayerModulesDefs']),
-       compile_timeout_multiplier(10)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
+       # See Note [MultiLayerModules* test timeout]
+       run_timeout_multiplier(5)
      ],
      ghci_script,
      ['MultiLayerModulesDefsGhciReload.script'])
 
 test('InstanceMatching',
-     [ collect_compiler_stats('bytes allocated',3),
+     [ collect_compiler_stats('bytes allocated',5),
        pre_cmd('$MAKE -s --no-print-directory InstanceMatching'),
        extra_files(['genMatchingTest']),
        compile_timeout_multiplier(5),
@@ -459,11 +495,8 @@ test('InstanceMatching1',
      [ collect_compiler_stats('bytes allocated',3),
        pre_cmd('./genMatchingTest 1'),
        extra_files(['genMatchingTest']),
+       # See Note [MultiLayerModules* test timeout]
        compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
      ],
      multimod_compile,
      ['Defs', '-fno-code -fwrite-interface -v0'])
@@ -473,11 +506,8 @@ test('MultiLayerModulesNoCode',
      [ collect_compiler_residency(15),
        pre_cmd('./genMultiLayerModulesNoCode'),
        extra_files(['genMultiLayerModulesNoCode']),
-       compile_timeout_multiplier(5)
-       # this is _a lot_
-       # but this test has been failing every now and then,
-       # especially on i386. Let's just give it some room
-       # to complete successfully reliably everywhere.
+       # See Note [MultiLayerModules* test timeout]
+       run_timeout_multiplier(5)
      ],
      ghci_script,
      ['MultiLayerModulesNoCode.script'])
@@ -493,12 +523,30 @@ test('MultiComponentModulesRecomp',
 
 test('MultiComponentModules',
      [ collect_compiler_runtime(2),
-       pre_cmd('$PYTHON ./genMultiComp.py'),
+       pre_cmd('$PYTHON ./genMultiComp.py 20 20'),
        extra_files(['genMultiComp.py']),
        compile_timeout_multiplier(5)
      ],
      multiunit_compile,
      [['unitp%d' % n for n in range(20)], '-fno-code -fwrite-interface -v0'])
+
+test('MultiComponentModulesRecomp100',
+     [ collect_compiler_runtime(2),
+       pre_cmd('$MAKE -s --no-print-directory MultiComponentModulesRecomp100'),
+       extra_files(['genMultiComp.py']),
+       compile_timeout_multiplier(5)
+     ],
+     multiunit_compile,
+     [['unitp%d' % n for n in range(100)], '-fno-code -fwrite-interface -v0'])
+
+test('MultiComponentModules100',
+     [ collect_compiler_runtime(2),
+       pre_cmd('$PYTHON ./genMultiComp.py 100 20'),
+       extra_files(['genMultiComp.py']),
+       compile_timeout_multiplier(5)
+     ],
+     multiunit_compile,
+     [['unitp%d' % n for n in range(100)], '-fno-code -fwrite-interface -v0'])
 
 test('ManyConstructors',
      [ collect_compiler_stats('bytes allocated',2),
@@ -575,13 +623,15 @@ test ('T15164',
       ],
       compile,
       ['-v0 -O'])
+# T15630/T15630a guard against exponential simplifier blowup when inlining
+# join points (#15630).
 test('T15630',
-      [collect_compiler_stats()
+      [collect_compiler_stats('bytes allocated', 2)
       ],
       compile,
       ['-O2'])
 test('T15630a',
-      [collect_compiler_stats()
+      [collect_compiler_stats('bytes allocated', 2)
       ],
       compile,
       ['-O2'])
@@ -646,7 +696,7 @@ test ('T18140',
       ['-v0 -O'])
 test('T10421',
     [ only_ways(['normal']),
-      collect_compiler_runtime(1)
+      collect_compiler_runtime(2) # 1% tolerance was too small (#27289)
     ],
     multimod_compile,
     ['T10421', '-v0 -O'])
@@ -666,6 +716,18 @@ test ('T13253-spj',
       ],
       compile,
       ['-v0 -O'])
+test ('T13820',
+      [ collect_compiler_stats('peak_megabytes_allocated', 5),
+        collect_compiler_stats('bytes allocated', 2),
+      ],
+      compile,
+      ['-v0'])
+test ('T13960',
+      [ collect_compiler_stats('peak_megabytes_allocated', 20),
+        collect_compiler_stats('bytes allocated', 2),
+      ],
+      compile,
+      ['-O'])
 test ('T14766',
       [ collect_compiler_stats('bytes allocated',2),
         pre_cmd('python3 genT14766.py > T14766.hs'),
@@ -693,12 +755,17 @@ test ('T9198',
       compile,
       [''])
 
+# Guards against quadratic demand-analysis cost on wide recursive data
+# types, which manifested as a compile-time memory blowup (#11545).
 test('T11545',
-     [ collect_compiler_stats('all', 15) ],
+     [ collect_compiler_stats('bytes allocated', 2)
+     , collect_compiler_residency(15) ],
      compile, ['-O'])
 
+# Guards against the compile-time memory blowup of #15304
 test('T15304',
-     [ collect_compiler_stats('all', 10) ],
+     [ collect_compiler_stats('bytes allocated', 2)
+     , collect_compiler_residency(10) ],
      compile, ['-O'])
 test ('T20049',
       [ collect_compiler_stats('bytes allocated',2) ],
@@ -720,8 +787,10 @@ test('T16875',  # Testing one hole-fit with a lot in scope for #16875
      collect_compiler_runtime(4),
      compile, ['-fdefer-type-errors -fno-max-valid-hole-fits -package ghc'])
 
+# Guards against renamer/typechecker allocation regressions on very large
+# generated modules (#20261, a Happy-generated parser).
 test ('T20261',
-      [collect_compiler_stats('all')],
+      [collect_compiler_stats('bytes allocated', 2)],
       compile,
       [''])
 
@@ -730,8 +799,7 @@ test ('T20261',
 # does not sensibly handle one test acting as both
 # a compile-time and a run-time performance test
 test('T21839c',
-    [   collect_compiler_stats('all', 10),
-        collect_compiler_runtime(1),
+    [   collect_compiler_runtime(1),
         only_ways(['normal'])],
     compile,
     ['-O'])
@@ -752,11 +820,12 @@ test('RecordUpdPerf',
 
 test('T22744',
      [ collect_compiler_stats('peak_megabytes_allocated',20),
-       req_interp,
+       req_th,
        pre_cmd('$MAKE -s --no-print-directory T22744'),
        extra_files(['genT22744']),
        pre_cmd_timeout_multiplier(5),
-       compile_timeout_multiplier(5)
+       compile_timeout_multiplier(5),
+       only_ways(['normal']),
      ],
      multimod_compile,
      ['T22744', '-v0'])
@@ -767,7 +836,10 @@ test ('LookupFusion',
       ['-O2 -package base'])
 
 test('T24471',
-     [req_th, collect_compiler_stats('all', 5)],
+     [ req_th,
+       collect_compiler_residency(15),
+       collect_compiler_stats('bytes allocated', 5),
+     ],
      multimod_compile, ['T24471', '-v0 -O'])
 
 test ('T24582',
@@ -787,8 +859,34 @@ test ('T24984',
       compile,
       ['-O'])
 
+# Performance regression test for the parser of command line arguments
+test(
+    'T25763',
+    [
+        collect_compiler_runtime(5),
+        pre_cmd(f'seq 400000 | sed "s/.*/-XCPP/" > t25763.txt && echo "main = pure ()" > t25763.hs'),
+    ],
+    multimod_compile,
+    ['t25763', '@t25763.txt -c -fno-code'])
+
 test('interpreter_steplocal',
      [ collect_compiler_stats('bytes allocated', 5)
      ],
      ghci_script,
      ['interpreter_steplocal.script'])
+
+# Guards against the compile-time memory blowup of #26425
+test ('T26425',
+      [ collect_compiler_stats('bytes allocated', 2)
+      , collect_compiler_residency(20) ],
+      compile,
+      ['-O'])
+
+test ('T26989',
+      [ only_ways(['normal']),
+        collect_compiler_stats('bytes allocated',1)
+      , extra_files(['T26989a.hs'])
+      ],
+      multimod_compile,
+      ['T26989', '-v0 -O'])
+

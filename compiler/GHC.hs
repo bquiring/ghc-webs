@@ -1,10 +1,8 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE NondecreasingIndentation, ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections, NamedFieldPuns #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE LambdaCase #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -30,7 +28,7 @@ module GHC (
 
         -- * Flags and settings
         DynFlags(..), GeneralFlag(..), Severity(..), Backend, gopt,
-        ncgBackend, llvmBackend, viaCBackend, interpreterBackend, noBackend,
+        ncgBackend, llvmBackend, viaCBackend, bytecodeBackend, interpreterBackend, noBackend,
         GhcMode(..), GhcLink(..),
         parseDynamicFlags, parseTargetFiles,
         getSessionDynFlags,
@@ -65,6 +63,7 @@ module GHC (
         SuccessFlag(..), succeeded, failed,
         defaultWarnErrLogger, WarnErrLogger,
         workingDirectoryChanged,
+        TcMPluginHandling(..),
         parseModule, typecheckModule, desugarModule,
         ParsedModule(..), TypecheckedModule(..), DesugaredModule(..),
         TypecheckedSource, ParsedSource, RenamedSource,   -- ditto
@@ -81,7 +80,13 @@ module GHC (
         ModuleGraph, emptyMG, mapMG, mkModuleGraph, mgModSummaries,
         mgLookupModule,
         ModSummary(..), ms_mod_name, ModLocation(..),
-        pattern ModLocation,
+        ml_hs_file,
+        ml_hi_file,
+        ml_dyn_hi_file,
+        ml_obj_file,
+        ml_dyn_obj_file,
+        ml_hie_file,
+        ml_bytecode_file,
         getModSummary,
         getModuleGraph,
         isLoaded,
@@ -290,7 +295,7 @@ module GHC (
         SrcLoc(..), RealSrcLoc,
         mkSrcLoc, noSrcLoc,
         srcLocFile, srcLocLine, srcLocCol,
-        SrcSpan(..), RealSrcSpan,
+        SrcSpan(..), RealSrcSpan, GeneratedSrcSpanDetails (..),
         mkSrcSpan, srcLocSpan, isGoodSrcSpan, noSrcSpan,
         srcSpanStart, srcSpanEnd,
         srcSpanFile,
@@ -337,7 +342,6 @@ module GHC (
 import GHC.Prelude hiding (init)
 
 import GHC.Platform
-import GHC.Platform.Ways
 
 import GHC.Driver.Phases   ( Phase(..), isHaskellSrcFilename
                            , isSourceFilename, startPhase )
@@ -351,7 +355,6 @@ import GHC.Driver.Backend
 import GHC.Driver.Config.Finder (initFinderOpts)
 import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Driver.Config.Logger (initLogFlags)
-import GHC.Driver.Config.StgToJS (initStgToJSConfig)
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Main
 import GHC.Driver.Make
@@ -360,10 +363,11 @@ import GHC.Driver.Monad
 import GHC.Driver.Ppr
 
 import GHC.ByteCode.Types
-import qualified GHC.Linker.Loader as Loader
 import GHC.Runtime.Loader
 import GHC.Runtime.Eval
 import GHC.Runtime.Interpreter
+import GHC.Runtime.Interpreter.Init
+import GHC.Driver.Config.Interpreter
 import GHC.Runtime.Context
 import GHCi.RemoteTypes
 
@@ -375,16 +379,19 @@ import GHC.Parser.Utils
 import GHC.Iface.Env ( trace_if )
 import GHC.Iface.Load        ( loadSysInterface )
 import GHC.Hs
-import GHC.Builtin.Types.Prim ( alphaTyVars )
+import GHC.Builtin.WiredIn.Prim ( alphaTyVars )
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Rename.Names (renamePkgQual, renameRawPkgQual)
 
-import GHC.Tc.Utils.Monad    ( finalSafeMode, fixSafeInstances, initIfaceTcRn )
+import GHC.Tc.Utils.Monad
+  ( TcMPluginHandling(..)
+  , finalSafeMode, fixSafeInstances, initIfaceTcRn, shutdownTcMPluginsIO
+  )
 import GHC.Tc.Types
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Module
+import GHC.Tc.Module hiding (getGHCiMonad)
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Instance.Family
 
@@ -439,10 +446,8 @@ import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Graph
 import GHC.Unit.Home.ModInfo
 import qualified GHC.Unit.Home.Graph as HUG
-import GHC.Settings
 
 import Control.Applicative ((<|>))
-import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch as MC
 import Data.Foldable
@@ -463,6 +468,9 @@ import System.Exit      ( exitWith, ExitCode(..) )
 import System.FilePath
 import System.IO.Error  ( isDoesNotExistError )
 
+#if defined(HAVE_INTERNAL_INTERPRETER)
+import Foreign.C
+#endif
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -597,12 +605,12 @@ withCleanupSession ghc = ghc `MC.finally` cleanup
 
 initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
 initGhcMonad mb_top_dir = setSession =<< liftIO ( do
-#if !defined(javascript_HOST_ARCH)
+#if defined(HAVE_INTERNAL_INTERPRETER)
     -- The call to c_keepCAFsForGHCi must not be optimized away. Even in non-debug builds.
     -- So we can't use assertM here.
     -- See Note [keepCAFsForGHCi] in keepCAFsForGHCi.c for details about why.
     !keep_cafs <- c_keepCAFsForGHCi
-    massert keep_cafs
+    massert $ keep_cafs /= 0
 #endif
     initHscEnv mb_top_dir
   )
@@ -663,15 +671,12 @@ setUnitDynFlagsNoCheck uid dflags1 = do
   logger <- getLogger
   hsc_env <- getSession
 
-  let old_hue = ue_findHomeUnitEnv uid (hsc_unit_env hsc_env)
-  let cached_unit_dbs = homeUnitEnv_unit_dbs old_hue
-  (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags1 cached_unit_dbs (hsc_all_home_unit_ids hsc_env)
+  (unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags1 (hscUIC hsc_env) (hsc_all_home_unit_ids hsc_env)
   updated_dflags <- liftIO $ updatePlatformConstants dflags1 mconstants
 
   let upd hue =
        hue
           { homeUnitEnv_units = unit_state
-          , homeUnitEnv_unit_dbs = Just dbs
           , homeUnitEnv_dflags = updated_dflags
           , homeUnitEnv_home_unit = Just home_unit
           }
@@ -712,100 +717,16 @@ setTopSessionDynFlags :: GhcMonad m => DynFlags -> m ()
 setTopSessionDynFlags dflags = do
   hsc_env <- getSession
   logger  <- getLogger
-  lookup_cache  <- liftIO $ mkInterpSymbolCache
+  let platform = targetPlatform dflags
+  let unit_env = hsc_unit_env hsc_env
+  let tmpfs = hsc_tmpfs hsc_env
+  let finder_cache = hsc_FC hsc_env
+  interp_opts' <- liftIO $ initInterpOpts dflags
+  let interp_opts = interp_opts'
+                      { interpCreateProcess = createIservProcessHook (hsc_hooks hsc_env)
+                      }
 
-  -- see Note [Target code interpreter]
-  interp <- if
-    -- Wasm dynamic linker
-    | ArchWasm32 <- platformArch $ targetPlatform dflags
-    -> do
-        s <- liftIO $ newMVar InterpPending
-        loader <- liftIO Loader.uninitializedLoader
-        dyld <- liftIO $ makeAbsolute $ topDir dflags </> "dyld.mjs"
-#if defined(wasm32_HOST_ARCH)
-        let libdir = sorry "cannot spawn child process on wasm"
-#else
-        libdir <- liftIO $ last <$> Loader.getGccSearchDirectory logger dflags "libraries"
-#endif
-        let profiled = ways dflags `hasWay` WayProf
-            way_tag = if profiled then "_p" else ""
-        let cfg =
-              WasmInterpConfig
-                { wasmInterpDyLD = dyld,
-                  wasmInterpLibDir = libdir,
-                  wasmInterpOpts = getOpts dflags opt_i,
-                  wasmInterpBrowser = gopt Opt_GhciBrowser dflags,
-                  wasmInterpBrowserHost = ghciBrowserHost dflags,
-                  wasmInterpBrowserPort = ghciBrowserPort dflags,
-                  wasmInterpBrowserRedirectWasiConsole = gopt Opt_GhciBrowserRedirectWasiConsole dflags,
-                  wasmInterpBrowserPuppeteerLaunchOpts = ghciBrowserPuppeteerLaunchOpts dflags,
-                  wasmInterpBrowserPlaywrightBrowserType = ghciBrowserPlaywrightBrowserType dflags,
-                  wasmInterpBrowserPlaywrightLaunchOpts = ghciBrowserPlaywrightLaunchOpts dflags,
-                  wasmInterpTargetPlatform = targetPlatform dflags,
-                  wasmInterpProfiled = profiled,
-                  wasmInterpHsSoSuffix = way_tag ++ dynLibSuffix (ghcNameVersion dflags),
-                  wasmInterpUnitState = ue_homeUnitState $ hsc_unit_env hsc_env
-                }
-        pure $ Just $ Interp (ExternalInterp $ ExtWasm $ ExtInterpState cfg s) loader lookup_cache
-
-    -- JavaScript interpreter
-    | ArchJavaScript <- platformArch (targetPlatform dflags)
-    -> do
-         s <- liftIO $ newMVar InterpPending
-         loader <- liftIO Loader.uninitializedLoader
-         let cfg = JSInterpConfig
-              { jsInterpNodeConfig  = defaultNodeJsSettings
-              , jsInterpScript      = topDir dflags </> "ghc-interp.js"
-              , jsInterpTmpFs       = hsc_tmpfs hsc_env
-              , jsInterpTmpDir      = tmpDir dflags
-              , jsInterpLogger      = hsc_logger hsc_env
-              , jsInterpCodegenCfg  = initStgToJSConfig dflags
-              , jsInterpUnitEnv     = hsc_unit_env hsc_env
-              , jsInterpFinderOpts  = initFinderOpts dflags
-              , jsInterpFinderCache = hsc_FC hsc_env
-              }
-         return (Just (Interp (ExternalInterp (ExtJS (ExtInterpState cfg s))) loader lookup_cache))
-
-    -- external interpreter
-    | gopt Opt_ExternalInterpreter dflags
-    -> do
-         let
-           prog = pgm_i dflags ++ flavour
-           profiled = ways dflags `hasWay` WayProf
-           dynamic  = ways dflags `hasWay` WayDyn
-           flavour
-             | profiled && dynamic = "-prof-dyn"
-             | profiled  = "-prof"
-             | dynamic   = "-dyn"
-             | otherwise = ""
-           msg = text "Starting " <> text prog
-         tr <- if verbosity dflags >= 3
-                then return (logInfo logger $ withPprStyle defaultDumpStyle msg)
-                else return (pure ())
-         let
-          conf = IServConfig
-            { iservConfProgram  = prog
-            , iservConfOpts     = getOpts dflags opt_i
-            , iservConfProfiled = profiled
-            , iservConfDynamic  = dynamic
-            , iservConfHook     = createIservProcessHook (hsc_hooks hsc_env)
-            , iservConfTrace    = tr
-            }
-         s <- liftIO $ newMVar InterpPending
-         loader <- liftIO Loader.uninitializedLoader
-         return (Just (Interp (ExternalInterp (ExtIServ (ExtInterpState conf s))) loader lookup_cache))
-
-    -- Internal interpreter
-    | otherwise
-    ->
-#if defined(HAVE_INTERNAL_INTERPRETER)
-     do
-      loader <- liftIO Loader.uninitializedLoader
-      return (Just (Interp InternalInterp loader lookup_cache))
-#else
-      return Nothing
-#endif
-
+  interp <- liftIO $ initInterpreter dflags tmpfs logger platform finder_cache unit_env interp_opts
 
   modifySession $ \h -> hscSetFlags dflags
                         h{ hsc_IC = (hsc_IC h){ ic_dflags = dflags }
@@ -835,17 +756,15 @@ setProgramDynFlags_ invalidate_needed dflags = do
         old_unit_env <- ue_setFlags dflags0 . hsc_unit_env <$> getSession
 
         home_unit_graph <- forM (ue_home_unit_graph old_unit_env) $ \homeUnitEnv -> do
-          let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
-              dflags = homeUnitEnv_dflags homeUnitEnv
+          let dflags = homeUnitEnv_dflags homeUnitEnv
               old_hpt = homeUnitEnv_hpt homeUnitEnv
               home_units = HUG.allUnits (ue_home_unit_graph old_unit_env)
 
-          (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags cached_unit_dbs home_units
+          (unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags (ue_uic old_unit_env) home_units
 
           updated_dflags <- liftIO $ updatePlatformConstants dflags0 mconstants
           pure HomeUnitEnv
             { homeUnitEnv_units = unit_state
-            , homeUnitEnv_unit_dbs = Just dbs
             , homeUnitEnv_dflags = updated_dflags
             , homeUnitEnv_hpt = old_hpt
             , homeUnitEnv_home_unit = Just home_unit
@@ -859,6 +778,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
               , ue_current_unit    = ue_currentUnit old_unit_env
               , ue_module_graph    = ue_module_graph old_unit_env
               , ue_eps             = ue_eps old_unit_env
+              , ue_uic      = ue_uic old_unit_env
               }
         modifySession $ \h -> hscSetFlags dflags1 h{ hsc_unit_env = unit_env }
     else modifySession (hscSetFlags dflags0)
@@ -916,6 +836,7 @@ setProgramHUG_ invalidate_needed new_hug0 = do
             , ue_current_unit    = ue_currentUnit unit_env0
             , ue_eps             = ue_eps unit_env0
             , ue_module_graph    = ue_module_graph unit_env0
+            , ue_uic      = ue_uic unit_env0
             }
       modifySession $ \h ->
         -- hscSetFlags takes care of updating the logger as well.
@@ -957,19 +878,17 @@ setProgramHUG_ invalidate_needed new_hug0 = do
 
     updateHomeUnit :: GhcMonad m => Logger -> UnitEnv -> HomeUnitGraph -> (UnitId -> HomeUnitEnv -> m HomeUnitEnv)
     updateHomeUnit logger unit_env updates = \uid homeUnitEnv -> do
-      let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
-          dflags = case HUG.unitEnv_lookup_maybe uid updates of
+      let dflags = case HUG.unitEnv_lookup_maybe uid updates of
             Nothing -> homeUnitEnv_dflags homeUnitEnv
             Just env -> homeUnitEnv_dflags env
           old_hpt = homeUnitEnv_hpt homeUnitEnv
           home_units = HUG.allUnits (ue_home_unit_graph unit_env)
 
-      (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags cached_unit_dbs home_units
+      (unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags (ue_uic unit_env) home_units
 
       updated_dflags <- liftIO $ updatePlatformConstants dflags mconstants
       pure HomeUnitEnv
         { homeUnitEnv_units = unit_state
-        , homeUnitEnv_unit_dbs = Just dbs
         , homeUnitEnv_dflags = updated_dflags
         , homeUnitEnv_hpt = old_hpt
         , homeUnitEnv_home_unit = Just home_unit
@@ -1427,8 +1346,8 @@ parseModule ms = do
 -- | Typecheck and rename a parsed module.
 --
 -- Throws a 'SourceError' if either fails.
-typecheckModule :: GhcMonad m => ParsedModule -> m TypecheckedModule
-typecheckModule pmod = do
+typecheckModule :: GhcMonad m => TcMPluginHandling -> ParsedModule -> m TypecheckedModule
+typecheckModule tcm_plugin_handling pmod = do
  hsc_env <- getSession
 
  liftIO $ do
@@ -1438,9 +1357,10 @@ typecheckModule pmod = do
           hscSetFlags lcl_dflags $
           hscSetActiveUnitId (toUnitId $ moduleUnit $ ms_mod ms) hsc_env
    let lcl_logger  = hsc_logger lcl_hsc_env
-   (tc_gbl_env, rn_info) <- hscTypecheckRename lcl_hsc_env ms $
-                        HsParsedModule { hpm_module = parsedSource pmod,
-                                         hpm_src_files = pm_extra_src_files pmod }
+   (tc_gbl_env, rn_info) <-
+     hscTypecheckRename lcl_hsc_env ms tcm_plugin_handling $
+        HsParsedModule { hpm_module = parsedSource pmod
+                       , hpm_src_files = pm_extra_src_files pmod }
    details <- makeSimpleDetails lcl_logger tc_gbl_env
    safe    <- finalSafeMode lcl_dflags tc_gbl_env
 
@@ -1462,20 +1382,22 @@ typecheckModule pmod = do
 
 -- | Desugar a typechecked module.
 desugarModule :: GhcMonad m => TypecheckedModule -> m DesugaredModule
-desugarModule tcm = do
- hsc_env <- getSession
- liftIO $ do
-   let ms = modSummary tcm
-   let (tcg, _) = tm_internals tcm
-   let lcl_hsc_env = hscSetFlags (ms_hspp_opts ms) hsc_env
-   guts <- hscDesugar lcl_hsc_env ms tcg
-   return $
-     DesugaredModule {
-       dm_typechecked_module = tcm,
-       dm_core_module        = guts
-     }
-
-
+desugarModule tcm = do_desugar `MC.onException` (liftIO $ shutdownTcMPluginsIO tcm_plugins_ref)
+  where
+    (tc_gbl, _) = tm_internals_ tcm
+    tcm_plugins_ref = tcg_plugins tc_gbl
+    do_desugar = do
+      hsc_env <- getSession
+      liftIO $ do
+        let ms = modSummary tcm
+        let (tcg, _) = tm_internals tcm
+        let lcl_hsc_env = hscSetFlags (ms_hspp_opts ms) hsc_env
+        guts <- hscDesugar lcl_hsc_env ms tcg
+        return $
+          DesugaredModule {
+            dm_typechecked_module = tcm,
+            dm_core_module        = guts
+          }
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -1529,9 +1451,11 @@ compileCore simplify fn = do
        -- Now we have the module name;
        -- parse, typecheck and desugar the module
        (tcg, mod_guts) <- -- TODO: space leaky: call hsc* directly?
-         do tm <- typecheckModule =<< parseModule modSummary
-            let tcg = fst (tm_internals tm)
-            (,) tcg . coreModule <$> desugarModule tm
+         MC.mask $ \ restore ->
+           do pm <- restore $ parseModule modSummary
+              tm <- restore $ typecheckModule StartAndKeepRunningTcMPlugins pm
+              let tcg = fst (tm_internals tm)
+              (,) tcg . coreModule <$> restore (desugarModule tm)
        liftM (gutsToCoreModule (mg_safe_haskell mod_guts)) $
          if simplify
           then do
@@ -1599,7 +1523,7 @@ getNameToInstancesIndex :: GhcMonad m
   -> m (Messages TcRnMessage, Maybe (NameEnv ([ClsInst], [FamInst])))
 getNameToInstancesIndex visible_mods mods_to_load = do
   hsc_env <- getSession
-  liftIO $ runTcInteractive hsc_env $
+  liftIO $ runTcInteractive NoTcMPlugins hsc_env $
     do { case mods_to_load of
            Nothing -> loadUnqualIfaces hsc_env (hsc_IC hsc_env)
            Just mods ->
@@ -1661,7 +1585,7 @@ pprParenSymName a = parenSymOcc (getOccName a) (ppr (getName a))
 -- a module by using 'getModSummary'
 --
 -- XXX: Explain pre-conditions
-getModuleSourceAndFlags :: ModSummary -> IO (String, StringBuffer, DynFlags)
+getModuleSourceAndFlags :: ModSummary -> IO (FilePath, StringBuffer, DynFlags)
 getModuleSourceAndFlags m = do
   case ml_hs_file $ ms_location m of
     Nothing -> throwIO $ mkApiErr (ms_hspp_opts m) (text "No source available for module " <+> ppr (ms_mod m))
@@ -1681,7 +1605,7 @@ getTokenStream mod = do
   let startLoc = mkRealSrcLoc (mkFastString sourceFile) 1 1
   case lexTokenStream (initParserOpts dflags) source startLoc of
     POk _ ts    -> return ts
-    PFailed pst -> throwErrors (GhcPsMessage <$> getPsErrorMessages pst)
+    PFailed pst -> throwErrors (initSourceErrorContext dflags) (GhcPsMessage <$> getPsErrorMessages pst)
 
 -- | Give even more information on the source than 'getTokenStream'
 -- This function allows reconstructing the source completely with
@@ -1692,7 +1616,7 @@ getRichTokenStream mod = do
   let startLoc = mkRealSrcLoc (mkFastString sourceFile) 1 1
   case lexTokenStream (initParserOpts dflags) source startLoc of
     POk _ ts    -> return $ addSourceToTokens startLoc source ts
-    PFailed pst -> throwErrors (GhcPsMessage <$> getPsErrorMessages pst)
+    PFailed pst -> throwErrors (initSourceErrorContext dflags) (GhcPsMessage <$> getPsErrorMessages pst)
 
 -- | Given a source location and a StringBuffer corresponding to this
 -- location, return a rich token stream with the source associated to the
@@ -1703,6 +1627,7 @@ addSourceToTokens _ _ [] = []
 addSourceToTokens loc buf (t@(L span _) : ts)
     = case span of
       UnhelpfulSpan _ -> (t,"") : addSourceToTokens loc buf ts
+      GeneratedSrcSpan _ -> (t,"") : addSourceToTokens loc buf ts
       RealSrcSpan s _ -> (t,str) : addSourceToTokens newLoc newBuf ts
         where
           (newLoc, newBuf, str) = go "" loc buf
@@ -1723,12 +1648,14 @@ showRichTokenStream ts = go startLoc ts ""
     where sourceFile = getFile $ map (getLoc . fst) ts
           getFile [] = panic "showRichTokenStream: No source file found"
           getFile (UnhelpfulSpan _ : xs) = getFile xs
+          getFile (GeneratedSrcSpan _ : xs) = getFile xs
           getFile (RealSrcSpan s _ : _) = srcSpanFile s
           startLoc = mkRealSrcLoc sourceFile 1 1
           go _ [] = id
           go loc ((L span _, str):ts)
               = case span of
                 UnhelpfulSpan _ -> go loc ts
+                GeneratedSrcSpan _ -> go loc ts
                 RealSrcSpan s _
                  | locLine == tokLine -> ((replicate (tokCol - locCol) ' ') ++)
                                        . (str ++)
@@ -1755,26 +1682,28 @@ findModule mod_name maybe_pkg = do
 
 findQualifiedModule :: GhcMonad m => PkgQual -> ModuleName -> m Module
 findQualifiedModule pkgqual mod_name = withSession $ \hsc_env -> do
-  liftIO $ trace_if (hsc_logger hsc_env) (text "findQualifiedModule" <+> ppr mod_name <+> ppr pkgqual)
+  let logger = hsc_logger hsc_env
+  liftIO $ trace_if logger (text "findQualifiedModule" <+> ppr mod_name <+> ppr pkgqual)
   let mhome_unit = hsc_home_unit_maybe hsc_env
-  let dflags    = hsc_dflags hsc_env
+  let dflags = hsc_dflags hsc_env
+  let sec = initSourceErrorContext dflags
   case pkgqual of
     ThisPkg uid -> do
       home <- lookupLoadedHomeModule uid mod_name
       case home of
         Just m  -> return m
         Nothing -> liftIO $ do
-           res <- findImportedModule hsc_env mod_name pkgqual
+           res <- findImportedModule hsc_env LookupUser mod_name pkgqual
            case res of
              Found loc m | notHomeModuleMaybe mhome_unit m -> return m
                          | otherwise -> modNotLoadedError dflags m loc
-             err -> throwOneError $ noModError hsc_env noSrcSpan mod_name err
+             err -> throwOneError sec $ noModError hsc_env noSrcSpan mod_name err
 
     _ -> liftIO $ do
-      res <- findImportedModule hsc_env mod_name pkgqual
+      res <- findImportedModule hsc_env LookupUser mod_name pkgqual
       case res of
         Found _ m -> return m
-        err       -> throwOneError $ noModError hsc_env noSrcSpan mod_name err
+        err       -> throwOneError sec $ noModError hsc_env noSrcSpan mod_name err
 
 
 modNotLoadedError :: DynFlags -> Module -> ModLocation -> IO a
@@ -1810,11 +1739,12 @@ lookupQualifiedModule NoPkgQual mod_name = withSession $ \hsc_env -> do
       let fc     = hsc_FC hsc_env
       let units  = hsc_units hsc_env
       let dflags = hsc_dflags hsc_env
+      let sec    = initSourceErrorContext dflags
       let fopts  = initFinderOpts dflags
-      res <- findExposedPackageModule fc fopts units mod_name NoPkgQual
+      res <- findExposedPackageModule fc fopts units LookupUser mod_name NoPkgQual
       case res of
         Found _ m -> return m
-        err       -> throwOneError $ noModError hsc_env noSrcSpan mod_name err
+        err       -> throwOneError sec $ noModError hsc_env noSrcSpan mod_name err
 lookupQualifiedModule pkgqual mod_name = findQualifiedModule pkgqual mod_name
 
 lookupLoadedHomeModule :: GhcMonad m => UnitId -> ModuleName -> m (Maybe Module)
@@ -1859,11 +1789,12 @@ lookupAllQualifiedModuleNames NoPkgQual mod_name = withSession $ \hsc_env -> do
       let fc     = hsc_FC hsc_env
       let units  = hsc_units hsc_env
       let dflags = hsc_dflags hsc_env
+      let sec    = initSourceErrorContext dflags
       let fopts  = initFinderOpts dflags
-      res <- findExposedPackageModule fc fopts units mod_name NoPkgQual
+      res <- findExposedPackageModule fc fopts units LookupUser mod_name NoPkgQual
       case res of
         Found _ m -> return [m]
-        err       -> throwOneError $ noModError hsc_env noSrcSpan mod_name err
+        err       -> throwOneError sec $ noModError hsc_env noSrcSpan mod_name err
 lookupAllQualifiedModuleNames pkgqual mod_name = do
   m <- findQualifiedModule pkgqual mod_name
   pure [m]
@@ -1890,11 +1821,11 @@ setGHCiMonad :: GhcMonad m => String -> m ()
 setGHCiMonad name = withSession $ \hsc_env -> do
     ty <- liftIO $ hscIsGHCiMonad hsc_env name
     modifySession $ \s ->
-        let ic = (hsc_IC s) { ic_monad = ty }
+        let ic = (hsc_IC s) { ic_monad = ExactName ty }
         in s { hsc_IC = ic }
 
 -- | Get the monad GHCi lifts user statements into.
-getGHCiMonad :: GhcMonad m => m Name
+getGHCiMonad :: GhcMonad m => m ExactRdrName
 getGHCiMonad = fmap (ic_monad . hsc_IC) getSession
 
 getHistorySpan :: GhcMonad m => History -> m SrcSpan
@@ -2094,7 +2025,7 @@ mkApiErr :: DynFlags -> SDoc -> GhcApiError
 mkApiErr dflags msg = GhcApiError (showSDoc dflags msg)
 
 
-#if !defined(javascript_HOST_ARCH)
+#if defined(HAVE_INTERNAL_INTERPRETER)
 foreign import ccall unsafe "keepCAFsForGHCi"
-    c_keepCAFsForGHCi   :: IO Bool
+    c_keepCAFsForGHCi   :: IO CBool
 #endif

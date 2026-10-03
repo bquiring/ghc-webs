@@ -34,6 +34,7 @@ import GHC.Types.Var
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Shape
+import GHC.Types.Unique.Supply
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
@@ -194,7 +195,7 @@ initRnIface hsc_env iface insts nsubst do_this = do
             sh_if_errs = errs_var
         }
     -- Modeled off of 'initTc'
-    res <- initTcRnIf 'c' hsc_env env () $ tryM do_this
+    res <- initTcRnIf RnIfaceTag hsc_env env () $ tryM do_this
     msgs <- readIORef errs_var
     case res of
         Left _                               -> return (Left msgs)
@@ -394,144 +395,322 @@ rnIfaceNeverExported name = do
 
 -- PILES AND PILES OF BOILERPLATE
 
+{- Note [Prefer explicit record construction]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It's better to use explicit record construction in the 'rnIface..' functions,
+because this ensures the functions are updated when new fields are added.
+
+Consider for example 'rnIfaceConDecl :: Rename IfaceConDecl'.
+If we write it as follows:
+
+  rnIfaceConDecl con_decl = do
+    con_name <- rnIfaceGlobal (ifConName con_decl)
+    ...
+    return $ con_decl { ifConName = con_name, ... }
+
+then the code will contine to typecheck without warnings after adding new fields
+to 'IfaceConDecl'. This is undesirable, as newly introduced fields should be
+renamed as well (unless they are completely static, e.g. a boolean field).
+
+Hence, we avoid record update and use record construction syntax instead:
+
+  rnIfaceConDecl (IfConDecl { ifConName = con_name0, ... }) = do
+    con_name <- rnIfaceGlobal con_name
+    ...
+    return $ IfConDecl { ifConName = con_name, ... }
+
+With this style, after adding the field 'newField' to 'IfConDecl', we will get
+a warning of the form
+
+  Fields of ‘IfaceFamInst’ not initialised: 'newField'
+
+which makes it easier to keep the code up to date.
+-}
+
 -- | Rename an 'IfaceClsInst', with special handling for an associated
 -- dictionary function.
 rnIfaceClsInst :: Rename IfaceClsInst
-rnIfaceClsInst cls_inst = do
-    n <- rnIfaceGlobal (ifInstCls cls_inst)
-    tys <- mapM rnRoughMatchTyCon (ifInstTys cls_inst)
-
-    dfun <- rnIfaceNeverExported (ifDFun cls_inst)
-    return cls_inst { ifInstCls = n
-                    , ifInstTys = tys
-                    , ifDFun = dfun
-                    }
+rnIfaceClsInst
+  ( IfaceClsInst
+    { ifInstCls  = n0
+    , ifInstTys  = tys0
+    , ifDFun     = dfun0
+    , ifOFlag    = oflag
+    , ifInstOrph = orph
+    , ifInstWarn = warn
+    } ) = do
+      n    <- rnIfaceGlobal n0
+      tys  <- mapM rnRoughMatchTyCon tys0
+      dfun <- rnIfaceNeverExported dfun0
+      return $
+        IfaceClsInst -- See Note [Prefer explicit record construction]
+          { ifInstCls  = n
+          , ifInstTys  = tys
+          , ifDFun     = dfun
+          , ifOFlag    = oflag
+          , ifInstOrph = orph
+          , ifInstWarn = warn
+          }
 
 rnIfaceDefault :: Rename IfaceDefault
-rnIfaceDefault cls_inst = do
-    n <- rnIfaceGlobal (ifDefaultCls cls_inst)
-    tys <- mapM rnIfaceType (ifDefaultTys cls_inst)
-    return cls_inst { ifDefaultCls = n
-                    , ifDefaultTys = tys
-                    }
+rnIfaceDefault
+  ( IfaceDefault
+    { ifDefaultCls  = n0
+    , ifDefaultTys  = tys0
+    , ifDefaultWarn = warn
+    } ) = do
+      n   <- rnIfaceGlobal n0
+      tys <- mapM rnIfaceType tys0
+      return $
+        IfaceDefault  -- See Note [Prefer explicit record construction]
+          { ifDefaultCls = n
+          , ifDefaultTys = tys
+          , ifDefaultWarn = warn
+          }
 
 rnRoughMatchTyCon :: Rename (Maybe IfaceTyCon)
 rnRoughMatchTyCon Nothing = return Nothing
 rnRoughMatchTyCon (Just tc) = Just <$> rnIfaceTyCon tc
 
 rnIfaceFamInst :: Rename IfaceFamInst
-rnIfaceFamInst d = do
-    fam <- rnIfaceGlobal (ifFamInstFam d)
-    tys <- mapM rnRoughMatchTyCon (ifFamInstTys d)
-    axiom <- rnIfaceGlobal (ifFamInstAxiom d)
-    return d { ifFamInstFam = fam, ifFamInstTys = tys, ifFamInstAxiom = axiom }
+rnIfaceFamInst
+  ( IfaceFamInst
+     { ifFamInstFam   = fam0
+     , ifFamInstTys   = tys0
+     , ifFamInstAxiom = axiom0
+     , ifFamInstOrph  = orph
+     } ) = do
+    fam   <- rnIfaceGlobal fam0
+    tys   <- mapM rnRoughMatchTyCon tys0
+    axiom <- rnIfaceGlobal axiom0
+    return $
+      IfaceFamInst  -- See Note [Prefer explicit record construction]
+        { ifFamInstFam   = fam
+        , ifFamInstTys   = tys
+        , ifFamInstAxiom = axiom
+        , ifFamInstOrph  = orph
+        }
 
 rnIfaceDecl' :: Rename (Fingerprint, IfaceDecl)
 rnIfaceDecl' (fp, decl) = (,) fp <$> rnIfaceDecl decl
 
 rnIfaceDecl :: Rename IfaceDecl
-rnIfaceDecl d@IfaceId{} = do
-            name <- case ifIdDetails d of
-                      IfDFunId -> rnIfaceNeverExported (ifName d)
-                      _ | isDefaultMethodOcc (occName (ifName d))
-                        -> rnIfaceNeverExported (ifName d)
-                      -- Typeable bindings. See Note [Grand plan for Typeable].
-                      _ | isTypeableBindOcc (occName (ifName d))
-                        -> rnIfaceNeverExported (ifName d)
-                        | otherwise -> rnIfaceGlobal (ifName d)
-            ty <- rnIfaceType (ifType d)
-            details <- rnIfaceIdDetails (ifIdDetails d)
-            info <- rnIfaceIdInfo (ifIdInfo d)
-            return d { ifName = name
-                     , ifType = ty
-                     , ifIdDetails = details
-                     , ifIdInfo = info
-                     }
-rnIfaceDecl d@IfaceData{} = do
-            name <- rnIfaceGlobal (ifName d)
-            binders <- mapM rnIfaceTyConBinder (ifBinders d)
-            ctxt <- mapM rnIfaceType (ifCtxt d)
-            cons <- rnIfaceConDecls (ifCons d)
-            res_kind <- rnIfaceType (ifResKind d)
-            parent <- rnIfaceTyConParent (ifParent d)
-            return d { ifName = name
-                     , ifBinders = binders
-                     , ifCtxt = ctxt
-                     , ifCons = cons
-                     , ifResKind = res_kind
-                     , ifParent = parent
-                     }
-rnIfaceDecl d@IfaceSynonym{} = do
-            name <- rnIfaceGlobal (ifName d)
-            binders <- mapM rnIfaceTyConBinder (ifBinders d)
-            syn_kind <- rnIfaceType (ifResKind d)
-            syn_rhs <- rnIfaceType (ifSynRhs d)
-            return d { ifName = name
-                     , ifBinders = binders
-                     , ifResKind = syn_kind
-                     , ifSynRhs = syn_rhs
-                     }
-rnIfaceDecl d@IfaceFamily{} = do
-            name <- rnIfaceGlobal (ifName d)
-            binders <- mapM rnIfaceTyConBinder (ifBinders d)
-            fam_kind <- rnIfaceType (ifResKind d)
-            fam_flav <- rnIfaceFamTyConFlav (ifFamFlav d)
-            return d { ifName = name
-                     , ifBinders = binders
-                     , ifResKind = fam_kind
-                     , ifFamFlav = fam_flav
-                     }
-rnIfaceDecl d@IfaceClass{} = do
-            name <- rnIfaceGlobal (ifName d)
-            binders <- mapM rnIfaceTyConBinder (ifBinders d)
-            body <- rnIfaceClassBody (ifBody d)
-            return d { ifName    = name
-                     , ifBinders = binders
-                     , ifBody    = body
-                     }
-rnIfaceDecl d@IfaceAxiom{} = do
-            name <- rnIfaceNeverExported (ifName d)
-            tycon <- rnIfaceTyCon (ifTyCon d)
-            ax_branches <- mapM rnIfaceAxBranch (ifAxBranches d)
-            return d { ifName = name
-                     , ifTyCon = tycon
-                     , ifAxBranches = ax_branches
-                     }
-rnIfaceDecl d@IfacePatSyn{} =  do
-            name <- rnIfaceGlobal (ifName d)
-            let rnPat (n, b) = (,) <$> rnIfaceGlobal n <*> pure b
-            pat_matcher <- rnPat (ifPatMatcher d)
-            pat_builder <- T.traverse rnPat (ifPatBuilder d)
-            pat_univ_bndrs <- mapM rnIfaceForAllBndr (ifPatUnivBndrs d)
-            pat_ex_bndrs <- mapM rnIfaceForAllBndr (ifPatExBndrs d)
-            pat_prov_ctxt <- mapM rnIfaceType (ifPatProvCtxt d)
-            pat_req_ctxt <- mapM rnIfaceType (ifPatReqCtxt d)
-            pat_args <- mapM rnIfaceType (ifPatArgs d)
-            pat_ty <- rnIfaceType (ifPatTy d)
-            return d { ifName = name
-                     , ifPatMatcher = pat_matcher
-                     , ifPatBuilder = pat_builder
-                     , ifPatUnivBndrs = pat_univ_bndrs
-                     , ifPatExBndrs = pat_ex_bndrs
-                     , ifPatProvCtxt = pat_prov_ctxt
-                     , ifPatReqCtxt = pat_req_ctxt
-                     , ifPatArgs = pat_args
-                     , ifPatTy = pat_ty
-                     }
+rnIfaceDecl = \case
+  IfaceId
+    { ifName      = name0
+    , ifType      = ty0
+    , ifIdDetails = details0
+    , ifIdInfo    = info0
+    } -> do
+    name <-
+      case details0 of
+        IfDFunId -> rnIfaceNeverExported name0
+        _ | isDefaultMethodOcc (occName name0)
+          -> rnIfaceNeverExported name0
+        -- Typeable bindings. See Note [Grand plan for Typeable].
+        _ | isTypeableBindOcc (occName name0)
+          -> rnIfaceNeverExported name0
+          | otherwise -> rnIfaceGlobal name0
+    ty      <- rnIfaceType ty0
+    details <- rnIfaceIdDetails details0
+    info    <- rnIfaceIdInfo info0
+    return $
+      IfaceId  -- See Note [Prefer explicit record construction]
+        { ifName      = name
+        , ifType      = ty
+        , ifIdDetails = details
+        , ifIdInfo    = info
+        }
+  IfaceData
+    { ifName       = name0
+    , ifKind       = kind0
+    , ifBinders    = binders0
+    , ifNbEtaBinders = nb_eta
+    , ifResKind    = res_kind0
+    , ifCType      = ctype
+    , ifRoles      = roles
+    , ifCtxt       = ctxt0
+    , ifCons       = cons0
+    , ifGadtSyntax = gadt
+    , ifParent     = parent0
+    } -> do
+    name     <- rnIfaceGlobal name0
+    binders  <- mapM rnIfaceTyConBinder binders0
+    ctxt     <- mapM rnIfaceType ctxt0
+    cons     <- rnIfaceConDecls cons0
+    kind     <- rnIfaceType kind0
+    res_kind <- rnIfaceType res_kind0
+    parent   <- rnIfaceTyConParent parent0
+    return $
+      IfaceData  -- See Note [Prefer explicit record construction]
+        { ifName       = name
+        , ifKind       = kind
+        , ifBinders    = binders
+       , ifNbEtaBinders = nb_eta
+        , ifResKind    = res_kind
+        , ifCType      = ctype
+        , ifRoles      = roles
+        , ifCtxt       = ctxt
+        , ifCons       = cons
+        , ifGadtSyntax = gadt
+        , ifParent     = parent
+        }
+  IfaceSynonym
+    { ifName    = name0
+    , ifBinders = binders0
+    , ifKind    = syn_kind0
+    , ifResKind = syn_reskind0
+    , ifSynRhs  = syn_rhs0
+    , ifRoles   = roles
+    } -> do
+      name        <- rnIfaceGlobal name0
+      binders     <- mapM rnIfaceTyConBinder binders0
+      syn_kind    <- rnIfaceType syn_kind0
+      syn_reskind <- rnIfaceType syn_reskind0
+      syn_rhs     <- rnIfaceType syn_rhs0
+      return $
+        IfaceSynonym  -- See Note [Prefer explicit record construction]
+          { ifName    = name
+          , ifBinders = binders
+          , ifKind    = syn_kind
+          , ifResKind = syn_reskind
+          , ifSynRhs  = syn_rhs
+          , ifRoles   = roles
+          }
+  IfaceFamily
+    { ifName    = name0
+    , ifBinders = binders0
+    , ifNbEtaBinders = nb_eta
+    , ifKind    = fam_kind0
+    , ifResKind = fam_reskind0
+    , ifFamFlav = fam_flav0
+    , ifResVar  = res_var
+    , ifFamInj  = inj
+    } -> do
+      name        <- rnIfaceGlobal name0
+      binders     <- mapM rnIfaceTyConBinder binders0
+      fam_kind    <- rnIfaceType fam_kind0
+      fam_reskind <- rnIfaceType fam_reskind0
+      fam_flav    <- rnIfaceFamTyConFlav fam_flav0
+      return $
+        IfaceFamily  -- See Note [Prefer explicit record construction]
+          { ifName    = name
+          , ifBinders = binders
+          , ifNbEtaBinders = nb_eta
+          , ifKind    = fam_kind
+          , ifResKind = fam_reskind
+          , ifFamFlav = fam_flav
+          , ifResVar  = res_var
+          , ifFamInj  = inj
+          }
+  IfaceClass
+    { ifName    = name0
+    , ifBinders = binders0
+    , ifBody    = body0
+    , ifKind    = kind0
+    , ifRoles   = roles
+    , ifFDs     = fds
+    } -> do
+      name    <- rnIfaceGlobal name0
+      binders <- mapM rnIfaceTyConBinder binders0
+      body    <- rnIfaceClassBody body0
+      kind    <- rnIfaceType kind0
+      return $
+        IfaceClass  -- See Note [Prefer explicit record construction]
+          { ifName    = name
+          , ifBinders = binders
+          , ifBody    = body
+          , ifKind    = kind
+          , ifRoles   = roles
+          , ifFDs     = fds
+          }
+  IfaceAxiom
+    { ifName       = name0
+    , ifTyCon      = tycon0
+    , ifAxBranches = ax_branches0
+    , ifRole       = role
+    } -> do
+    name        <- rnIfaceNeverExported name0
+    tycon       <- rnIfaceTyCon tycon0
+    ax_branches <- mapM rnIfaceAxBranch ax_branches0
+    return $
+      IfaceAxiom  -- See Note [Prefer explicit record construction]
+        { ifName       = name
+        , ifTyCon      = tycon
+        , ifAxBranches = ax_branches
+        , ifRole       = role
+        }
+  IfacePatSyn
+    { ifName         = name0
+    , ifPatMatcher   = pat_matcher0
+    , ifPatBuilder   = pat_builder0
+    , ifPatUnivBndrs = pat_univ_bndrs0
+    , ifPatExBndrs   = pat_ex_bndrs0
+    , ifPatProvCtxt  = pat_prov_ctxt0
+    , ifPatReqCtxt   = pat_req_ctxt0
+    , ifPatArgs      = pat_args0
+    , ifPatTy        = pat_ty0
+    , ifPatIsInfix   = is_infix
+    , ifFieldLabels  = field_labels
+    } -> do
+    let rnPat (n, b) = (,) <$> rnIfaceGlobal n <*> pure b
+    name           <- rnIfaceGlobal name0
+    pat_matcher    <- rnPat pat_matcher0
+    pat_builder    <- T.traverse rnPat pat_builder0
+    pat_univ_bndrs <- mapM rnIfaceForAllBndr pat_univ_bndrs0
+    pat_ex_bndrs   <- mapM rnIfaceForAllBndr pat_ex_bndrs0
+    pat_prov_ctxt  <- mapM rnIfaceType pat_prov_ctxt0
+    pat_req_ctxt   <- mapM rnIfaceType pat_req_ctxt0
+    pat_args       <- mapM rnIfaceType pat_args0
+    pat_ty         <- rnIfaceType pat_ty0
+    return $
+      IfacePatSyn  -- See Note [Prefer explicit record construction]
+        { ifName         = name
+        , ifPatMatcher   = pat_matcher
+        , ifPatBuilder   = pat_builder
+        , ifPatUnivBndrs = pat_univ_bndrs
+        , ifPatExBndrs   = pat_ex_bndrs
+        , ifPatProvCtxt  = pat_prov_ctxt
+        , ifPatReqCtxt   = pat_req_ctxt
+        , ifPatArgs      = pat_args
+        , ifPatTy        = pat_ty
+        , ifPatIsInfix   = is_infix
+        , ifFieldLabels  = field_labels
+        }
 
 rnIfaceClassBody :: Rename IfaceClassBody
 rnIfaceClassBody IfAbstractClass = return IfAbstractClass
-rnIfaceClassBody d@IfConcreteClass{} = do
-    ctxt <- mapM rnIfaceType (ifClassCtxt d)
-    ats <- mapM rnIfaceAT (ifATs d)
-    sigs <- mapM rnIfaceClassOp (ifSigs d)
-    return d { ifClassCtxt = ctxt, ifATs = ats, ifSigs = sigs }
+rnIfaceClassBody
+  ( IfConcreteClass
+    { ifClassCtxt = ctxt0
+    , ifATs       = ats0
+    , ifSigs      = sigs0
+    , ifMinDef    = min_def
+    , ifUnary     = unary } ) = do
+    ctxt <- mapM rnIfaceType ctxt0
+    ats  <- mapM rnIfaceAT ats0
+    sigs <- mapM rnIfaceClassOp sigs0
+    return $
+      IfConcreteClass  -- See Note [Prefer explicit record construction]
+        { ifClassCtxt = ctxt
+        , ifATs       = ats
+        , ifSigs      = sigs
+        , ifMinDef    = min_def
+        , ifUnary     = unary
+        }
 
 rnIfaceFamTyConFlav :: Rename IfaceFamTyConFlav
-rnIfaceFamTyConFlav (IfaceClosedSynFamilyTyCon (Just (n, axs)))
-    = IfaceClosedSynFamilyTyCon . Just <$> ((,) <$> rnIfaceNeverExported n
-                                                <*> mapM rnIfaceAxBranch axs)
-rnIfaceFamTyConFlav flav = pure flav
+rnIfaceFamTyConFlav (IfaceClosedTypeFamilyTyCon ctf)
+  = IfaceClosedTypeFamilyTyCon <$>
+      case ctf of
+        IfaceAbstractClosedTyFamTyCon -> pure IfaceAbstractClosedTyFamTyCon
+        IfaceBuiltInClosedTyFamTyCon -> pure IfaceBuiltInClosedTyFamTyCon
+        IfaceClosedTyFamTyCon mb_ax -> IfaceClosedTyFamTyCon <$> traverse rn_coax mb_ax
+  where
+    rn_coax (n, axs) = ((,) <$> rnIfaceNeverExported n
+                            <*> mapM rnIfaceAxBranch axs)
+rnIfaceFamTyConFlav IfaceOpenTypeFamilyTyCon = pure IfaceOpenTypeFamilyTyCon
+rnIfaceFamTyConFlav IfaceDataFamilyTyCon = pure IfaceDataFamilyTyCon
 
 rnIfaceAT :: Rename IfaceAT
 rnIfaceAT (IfaceAT decl mb_ty)
@@ -551,27 +730,48 @@ rnIfaceConDecls (IfNewTyCon d) = IfNewTyCon <$> rnIfaceConDecl d
 rnIfaceConDecls IfAbstractTyCon = pure IfAbstractTyCon
 
 rnIfaceConDecl :: Rename IfaceConDecl
-rnIfaceConDecl d = do
-    con_name <- rnIfaceGlobal (ifConName d)
-    con_ex_tvs <- mapM rnIfaceBndr (ifConExTCvs d)
-    con_user_tvbs <- mapM rnIfaceForAllBndr (ifConUserTvBinders d)
+rnIfaceConDecl
+  ( IfCon { ifConName          = con_name0
+          , ifConUnivTvs       = con_univ_tvs0
+          , ifConExTCvs        = con_ex_tvs0
+          , ifConUserTvBinders = con_user_tvbs0
+          , ifConEqSpec        = con_eq_spec0
+          , ifConCtxt          = con_ctxt0
+          , ifConArgTys        = con_arg_tys0
+          , ifConFields        = con_fields0
+          , ifConStricts       = con_stricts0
+          , ifConWrapper       = con_wrapper
+          , ifConInfix         = con_infix
+          , ifConSrcStricts    = con_src_stricts
+          } ) = do
     let rnIfConEqSpec (n,t) = (,) n <$> rnIfaceType t
-    con_eq_spec <- mapM rnIfConEqSpec (ifConEqSpec d)
-    con_ctxt <- mapM rnIfaceType (ifConCtxt d)
-    con_arg_tys <- mapM rnIfaceScaledType (ifConArgTys d)
-    con_fields <- mapM rnFieldLabel (ifConFields d)
-    let rnIfaceBang (IfUnpackCo co) = IfUnpackCo <$> rnIfaceCo co
+        rnIfaceBang (IfUnpackCo co) = IfUnpackCo <$> rnIfaceCo co
         rnIfaceBang bang = pure bang
-    con_stricts <- mapM rnIfaceBang (ifConStricts d)
-    return d { ifConName = con_name
-             , ifConExTCvs = con_ex_tvs
-             , ifConUserTvBinders = con_user_tvbs
-             , ifConEqSpec = con_eq_spec
-             , ifConCtxt = con_ctxt
-             , ifConArgTys = con_arg_tys
-             , ifConFields = con_fields
-             , ifConStricts = con_stricts
-             }
+
+    con_name      <- rnIfaceGlobal con_name0
+    con_univ_tvs  <- mapM rnIfaceBndr con_univ_tvs0
+    con_ex_tvs    <- mapM rnIfaceBndr con_ex_tvs0
+    con_user_tvbs <- mapM rnIfaceForAllBndr con_user_tvbs0
+    con_eq_spec   <- mapM rnIfConEqSpec con_eq_spec0
+    con_ctxt      <- mapM rnIfaceType con_ctxt0
+    con_arg_tys   <- mapM rnIfaceScaledType con_arg_tys0
+    con_fields    <- mapM rnFieldLabel con_fields0
+    con_stricts   <- mapM rnIfaceBang con_stricts0
+    return $
+      IfCon  -- See Note [Prefer explicit record construction]
+        { ifConName          = con_name
+        , ifConUnivTvs       = con_univ_tvs
+        , ifConExTCvs        = con_ex_tvs
+        , ifConUserTvBinders = con_user_tvbs
+        , ifConEqSpec        = con_eq_spec
+        , ifConCtxt          = con_ctxt
+        , ifConArgTys        = con_arg_tys
+        , ifConFields        = con_fields
+        , ifConStricts       = con_stricts
+        , ifConWrapper       = con_wrapper
+        , ifConInfix         = con_infix
+        , ifConSrcStricts    = con_src_stricts
+        }
 
 rnIfaceClassOp :: Rename IfaceClassOp
 rnIfaceClassOp (IfaceClassOp n ty dm) =
@@ -584,13 +784,31 @@ rnMaybeDefMethSpec (Just (GenericDM ty)) = Just . GenericDM <$> rnIfaceType ty
 rnMaybeDefMethSpec mb = return mb
 
 rnIfaceAxBranch :: Rename IfaceAxBranch
-rnIfaceAxBranch d = do
-    ty_vars <- mapM rnIfaceTvBndr (ifaxbTyVars d)
-    lhs <- rnIfaceAppArgs (ifaxbLHS d)
-    rhs <- rnIfaceType (ifaxbRHS d)
-    return d { ifaxbTyVars = ty_vars
-             , ifaxbLHS = lhs
-             , ifaxbRHS = rhs }
+rnIfaceAxBranch
+  ( IfaceAxBranch
+    { ifaxbEtaTyVars = eta_tvs0
+    , ifaxbTyVars    = tvs0
+    , ifaxbCoVars    = cvs0
+    , ifaxbLHS       = lhs0
+    , ifaxbRHS       = rhs0
+    , ifaxbRoles     = roles
+    , ifaxbIncomps   = incomps
+    } ) = do
+    eta_tvs <- mapM rnIfaceTvBndr eta_tvs0
+    tvs     <- mapM rnIfaceTvBndr tvs0
+    cvs     <- mapM rnIfaceIdBndr cvs0
+    lhs     <- rnIfaceAppArgs lhs0
+    rhs     <- rnIfaceType rhs0
+    return $
+      IfaceAxBranch  -- See Note [Prefer explicit record construction]
+        { ifaxbEtaTyVars = eta_tvs
+        , ifaxbTyVars    = tvs
+        , ifaxbCoVars    = cvs
+        , ifaxbLHS       = lhs
+        , ifaxbRHS       = rhs
+        , ifaxbRoles     = roles
+        , ifaxbIncomps   = incomps
+        }
 
 rnIfaceIdInfo :: Rename IfaceIdInfo
 rnIfaceIdInfo = mapM rnIfaceInfoItem
@@ -642,8 +860,12 @@ rnIfaceBndrs :: Rename [IfaceBndr]
 rnIfaceBndrs = mapM rnIfaceBndr
 
 rnIfaceBndr :: Rename IfaceBndr
-rnIfaceBndr (IfaceIdBndr (w, fs, ty)) = IfaceIdBndr <$> ((,,) w fs <$> rnIfaceType ty)
+rnIfaceBndr (IfaceIdBndr id_bndr) = IfaceIdBndr <$> rnIfaceIdBndr id_bndr
 rnIfaceBndr (IfaceTvBndr tv_bndr) = IfaceTvBndr <$> rnIfaceTvBndr tv_bndr
+
+rnIfaceIdBndr :: Rename IfaceIdBndr
+rnIfaceIdBndr (w, fs, ty) =
+  (,,) <$> rnIfaceType w <*> pure fs <*> rnIfaceType ty
 
 rnIfaceTvBndr :: Rename IfaceTvBndr
 rnIfaceTvBndr (fs, kind) = (,) fs <$> rnIfaceType kind
@@ -689,7 +911,7 @@ rnIfaceCo (IfaceAxiomCo ax cos)         = IfaceAxiomCo ax <$> mapM rnIfaceCo cos
 rnIfaceCo (IfaceKindCo c)               = IfaceKindCo <$> rnIfaceCo c
 rnIfaceCo (IfaceForAllCo bndr visL visR co1 co2)
     = (\bndr' co1' co2' -> IfaceForAllCo bndr' visL visR co1' co2')
-      <$> rnIfaceBndr bndr <*> rnIfaceCo co1 <*> rnIfaceCo co2
+      <$> rnIfaceBndr bndr <*> rnIfaceMCo co1 <*> rnIfaceCo co2
 rnIfaceCo (IfaceUnivCo s r t1 t2 deps)
     = IfaceUnivCo s r <$> rnIfaceType t1 <*> rnIfaceType t2 <*> mapM rnIfaceCo deps
 

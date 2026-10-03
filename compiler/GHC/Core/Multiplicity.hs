@@ -30,19 +30,21 @@ module GHC.Core.Multiplicity
   , IsSubmult(..)
   , submult
   , mapScaledType
-  , pprArrowWithMultiplicity
+  , pprArrowWithModifiers
   , MultiplicityFlag(..)
   ) where
 
 import GHC.Prelude
 
 import GHC.Utils.Outputable
+import GHC.Base (Multiplicity(..))
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep
 import GHC.Types.Var( isFUNArg )
-import {-# SOURCE #-} GHC.Builtin.Types ( multMulTyCon )
-import GHC.Builtin.Names (multMulTyConKey)
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types ( multMulTyCon )
+import GHC.Builtin.KnownKeys (multMulTyConKey)
 import GHC.Types.Unique (hasKey)
+import GHC.Utils.Panic (assertPpr)
 
 {-
 Note [Linear types]
@@ -276,32 +278,25 @@ backwards compatibility. Consider
 
 We have
 
-    map :: (a -> b) -> f a -> f b
-    Just :: a %1 -> Just a
+    map :: (a -> b) -> [a] -> [b]
+    Just :: a %1 -> Maybe a
 
 Types don't match, we should get a type error. But this is legal Haskell 98
 code! Bad! Bad! Bad!
 
-It could be solved with subtyping, but subtyping doesn't combine well with
-polymorphism. Instead, we generalise the type of Just, when used as term:
+This problem could be solved with subtyping, but subtyping doesn't combine well
+with polymorphism. The "polymorphism" approach is to behave as if 'Just', when
+used as a term, had the type:
+    Just :: forall {m :: Multiplicity}. a %m -> Maybe a
+We can then achieve subtyping via subsumption, like we do for deep subsumption.
 
-   Just :: forall {p}. a %p-> Just a
-
-This is solely a concern for higher-order code like this: when called fully
-applied linear constructors are more general than constructors with unrestricted
-fields. In particular, linear constructors can always be eta-expanded to their
-Haskell 98 type. This is explained in the paper (but there, we had a different
-strategy to resolve this type mismatch in higher-order code. It turned out to be
-insufficient, which is explained in the wiki page as well as the proposal).
-
-We only generalise linear fields this way: fields with multiplicity Many, or
-other multiplicity expressions are exclusive to -XLinearTypes, hence don't have
-backward compatibility implications.
-
-The implementation is described in Note [Typechecking data constructors]
+The precise details of how we use subsumption to typecheck partial applications
+of data constructors are explained in Note [Typechecking data constructors]
 in GHC.Tc.Gen.Head.
 
-More details in the proposal.
+Only linear fields are concerned by this extra complication. Fields with
+multiplicity Many – or other multiplicity expressions – are exclusive to
+-XLinearTypes, hence don't have backward compatibility implications.
 -}
 
 {-
@@ -381,21 +376,36 @@ submult OneTy OneTy  = Submult
 submult OneTy _    = Submult
 submult _     _    = Unknown
 
-pprArrowWithMultiplicity :: FunTyFlag -> Either Bool SDoc -> SDoc
--- Pretty-print a multiplicity arrow.  The multiplicity itself
--- is described by the (Either Bool SDoc)
---    Left False   -- Many
---    Left True    -- One
---    Right doc    -- Something else
--- In the Right case, the doc is in parens if not atomic
-pprArrowWithMultiplicity af pp_mult
+-- | Pretty print a function arrow, with modifiers preceding it.
+--
+-- Each modifier is prefixed with @%@, but it's the caller's responsibility to
+-- ensure they're parenthesized correctly if not atomic.
+pprArrowWithModifiers
+  :: [SDoc] -- ^ Modifiers.
+  -> FunTyFlag -- ^ Is this @->@/@⊸@ or @=>@? See Note [FunTyFlag].
+  -> Multiplicity -- ^ Is this @->@ or @⊸@?
+  -> SDoc
+pprArrowWithModifiers mods af mult
   | isFUNArg af
-  = case pp_mult of
-      Left False -> arrow
-      Left True  -> lollipop
-      Right doc  -> text "%" <> doc <+> arrow
+  = getPprStyle $ \sty ->
+    getPprDebug $ \debug ->
+    sdocOption sdocLinearTypes $ \ show_linear_types ->
+      hsep (map (text "%" <>) mods)
+        <+> case mult of
+          Many -> arrow
+          One ->
+            if show_linear_types || dumpStyle sty || debug
+            then lollipop
+            else arrow
   | otherwise
-  = ppr (funTyFlagTyCon af)
+  = assertPpr multIsMany (text "invalid linear constraint arrow") $
+    assertPpr (null mods) (text "modifiers on constraint arrow") $
+    ppr (funTyFlagTyCon af)
+ where
+  multIsMany = case mult of
+    Many -> True
+    One -> False
+{-# INLINEABLE pprArrowWithModifiers #-}
 
 -- | In Core, without `-dlinear-core-lint`, some function must ignore
 -- multiplicities. See Note [Linting linearity] in GHC.Core.Lint.

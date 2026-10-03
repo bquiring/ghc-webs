@@ -10,6 +10,7 @@ import GHC.Platform.Reg.Class
 import GHC.Platform.Reg.Class.Separate
 import GHC.Platform.Regs
 import GHC.Prelude
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -52,9 +53,14 @@ d7RegNo, ft7RegNo :: RegNo
 d7RegNo = 39
 ft7RegNo = d7RegNo
 
+d28RegNo, ft8RegNo :: RegNo
+d28RegNo = 60
+ft8RegNo = d28RegNo
+
 -- | Last floating point register.
-d31RegNo :: RegNo
+d31RegNo, ft11RegNo :: RegNo
 d31RegNo = 63
+ft11RegNo = d31RegNo
 
 a0RegNo, x10RegNo :: RegNo
 x10RegNo = 10
@@ -143,8 +149,8 @@ data Imm
   | ImmCLbl CLabel -- AbstractC Label (with baggage)
   | ImmLit FastString
   | ImmIndex CLabel Int
-  | ImmFloat Rational
-  | ImmDouble Rational
+  | ImmFloat !Float
+  | ImmDouble !Double
   | ImmConstantSum Imm Imm
   | ImmConstantDiff Imm Imm
   deriving (Eq, Show)
@@ -158,8 +164,8 @@ litToImm (CmmInt i w) = ImmInteger (narrowS w i)
 -- narrow to the width: a CmmInt might be out of
 -- range, but we assume that ImmInteger only contains
 -- in-range values.  A signed value should be fine here.
-litToImm (CmmFloat f W32) = ImmFloat f
-litToImm (CmmFloat f W64) = ImmDouble f
+litToImm (CmmFloat f LitFloat)  = ImmFloat $ litFloatingToHostFloat f
+litToImm (CmmFloat f LitDouble) = ImmDouble $ litFloatingToHostDouble f
 litToImm (CmmLabel l) = ImmCLbl l
 litToImm (CmmLabelOff l off) = ImmIndex l off
 litToImm (CmmLabelDiffOff l1 l2 off _) =

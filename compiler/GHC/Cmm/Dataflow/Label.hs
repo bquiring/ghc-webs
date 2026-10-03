@@ -1,15 +1,10 @@
-{-# LANGUAGE DeriveTraversable  #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE FlexibleInstances  #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 module GHC.Cmm.Dataflow.Label
-    ( Label
-    , LabelMap
-    , LabelSet
+    ( Label(..)
+    , LabelMap(..)
+    , LabelSet(..)
     , FactBase
     , lookupFact
     , mkHooplLabel
@@ -43,6 +38,7 @@ module GHC.Cmm.Dataflow.Label
     , mapInsertWith
     , mapDelete
     , mapAlter
+    , mapUpsert
     , mapAdjust
     , mapUnion
     , mapUnions
@@ -83,6 +79,7 @@ import GHC.Data.Word64Map.Strict (Word64Map)
 import qualified GHC.Data.Word64Map.Strict as M
 import GHC.Data.TrieMap
 
+import Data.Coerce
 import Data.Word (Word64)
 
 
@@ -164,7 +161,7 @@ setFoldr k z (LS s) = S.foldr (\v a -> k (mkHooplLabel v) a) z s
 
 {-# INLINE setElems #-}
 setElems :: LabelSet -> [Label]
-setElems (LS s) = map mkHooplLabel (S.elems s)
+setElems (LS s) = coerce $ S.elems s
 
 {-# INLINE setFromList #-}
 setFromList :: [Label] -> LabelSet
@@ -210,6 +207,9 @@ mapDelete (Label k) (LM m) = LM (M.delete k m)
 
 mapAlter :: (Maybe v -> Maybe v) -> Label -> LabelMap v -> LabelMap v
 mapAlter f (Label k) (LM m) = LM (M.alter f k m)
+
+mapUpsert :: (Maybe v -> v) -> Label -> LabelMap v -> LabelMap v
+mapUpsert f (Label k) (LM m) = LM (M.upsert f k m)
 
 mapAdjust :: (v -> v) -> Label -> LabelMap v -> LabelMap v
 mapAdjust f (Label k) (LM m) = LM (M.adjust f k m)
@@ -272,7 +272,7 @@ mapKeys (LM m) = map (mkHooplLabel . fst) (M.toList m)
 
 {-# INLINE mapToList #-}
 mapToList :: LabelMap b -> [(Label, b)]
-mapToList (LM m) = [(mkHooplLabel k, v) | (k, v) <- M.toList m]
+mapToList (LM m) = coerce $ M.toList m
 
 {-# INLINE mapFromList #-}
 mapFromList :: [(Label, v)] -> LabelMap v

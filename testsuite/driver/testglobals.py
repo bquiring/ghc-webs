@@ -4,7 +4,7 @@
 
 from my_typing import *
 from pathlib import Path
-from perf_notes import MetricChange, PerfStat, Baseline, GitRef
+from perf_notes import MetricChange, PerfStat, CommitMetric, GitRef
 from datetime import datetime
 
 # -----------------------------------------------------------------------------
@@ -31,6 +31,9 @@ class TestConfig:
         self.run_only_some_tests = False
         self.only = set()
 
+        # Skip these tests
+        self.skip = set()
+
         # Don't fail on out-of-tolerance stat failures
         self.ignore_perf_increases = False
         self.ignore_perf_decreases = False
@@ -55,6 +58,8 @@ class TestConfig:
         # Run tests requiring Haddock
         self.haddock = False
 
+        self.is_musl = None # type: Optional[bool]
+
         # Compiler has native code generator?
         self.have_ncg = False
 
@@ -70,6 +75,10 @@ class TestConfig:
         # Was the compiler compiled with -debug?
         self.debug_rts = False
 
+        # Were the compiler + libraries built with IPE-related options
+        # (e.g. -finfo-table-map, -fdistinct-constructor-tables)?
+        self.ghc_with_ipe = False
+
         # Was the compiler compiled with LLVM?
         self.ghc_built_by_llvm = False
 
@@ -78,7 +87,6 @@ class TestConfig:
         self.os = ''
         self.arch = ''
         self.msys = False
-        self.cygwin = False
 
         # What is the wordsize (in bits) of this platform?
         self.wordsize = ''
@@ -136,9 +144,12 @@ class TestConfig:
         # Do we have interpreter support?
         self.have_interp = False
 
+        # Do we have external interpreter support?
+        self.have_ext_interp = False
+
         # Are we cross-compiling?
         self.cross = False
-        
+
         # Does the RTS linker only support loading shared libraries?
         self.interp_force_dyn = False
 
@@ -182,6 +193,9 @@ class TestConfig:
 
         # Are we running in a ThreadSanitizer-instrumented build?
         self.have_thread_sanitizer = False
+
+        # Are we running with UndefinedBehaviorSanitizer enabled?
+        self.have_ubsan = False
 
         # Do symbols use leading underscores?
         self.leading_underscore = False
@@ -274,29 +288,33 @@ ghc_env = os.environ.copy()
 class TestResult:
     """
     A result from the execution of a test. These live in the expected_passes,
-    framework_failures, framework_warnings, unexpected_passes,
+    expected_failures, framework_failures, framework_warnings, unexpected_passes,
     unexpected_failures, unexpected_stat_failures lists of TestRun.
     """
-    __slots__ = 'directory', 'testname', 'reason', 'way', 'stdout', 'stderr'
+    __slots__ = 'directory', 'testname', 'reason', 'way', 'stdout', 'stderr', 'diff', 'runtime'
     def __init__(self,
                  directory: str,
                  testname: TestName,
                  reason: str,
                  way: WayName,
                  stdout: Optional[str]=None,
-                 stderr: Optional[str]=None) -> None:
+                 stderr: Optional[str]=None,
+                 diff: Optional[str]=None,
+                 runtime: Optional[float]=None) -> None:
         self.directory = directory
         self.testname = testname
         self.reason = reason
         self.way = way
         self.stdout = stdout
         self.stderr = stderr
+        self.diff = diff
+        self.runtime = runtime # Walltime
 
 # A performance metric measured in this test run.
 PerfMetric = NamedTuple('PerfMetric',
                         [('change', MetricChange),
                          ('stat', PerfStat),
-                         ('baseline', Optional[Baseline]) ])
+                         ('baseline', Optional[CommitMetric]) ])
 
 class TestRun:
    def __init__(self) -> None:
@@ -306,13 +324,12 @@ class TestRun:
 
        self.n_tests_skipped = 0
        self.n_missing_libs = 0
-       self.n_expected_passes = 0
-       self.n_expected_failures = 0
 
        self.framework_failures = [] # type: List[TestResult]
        self.framework_warnings = [] # type: List[TestResult]
 
        self.expected_passes = [] # type: List[TestResult]
+       self.expected_failures = [] # type: List[TestResult]
        self.unexpected_passes = [] # type: List[TestResult]
        self.unexpected_failures = [] # type: List[TestResult]
        self.unexpected_stat_failures = [] # type: List[TestResult]

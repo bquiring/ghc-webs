@@ -8,18 +8,6 @@ AC_DEFUN([ADD_GHC_TOOLCHAIN_ARG],
     done
 ])
 
-dnl $1 argument name
-dnl $2 first variable to try
-dnl $3 variable to add if the first variable is empty
-AC_DEFUN([ADD_GHC_TOOLCHAIN_ARG_CHOOSE],
-[
-    if test -z "$2"; then
-        ADD_GHC_TOOLCHAIN_ARG([$1],[$3])
-    else
-        ADD_GHC_TOOLCHAIN_ARG([$1],[$2])
-    fi
-])
-
 AC_DEFUN([ENABLE_GHC_TOOLCHAIN_ARG],
 [
     if test "$2" = "YES"; then
@@ -107,6 +95,7 @@ AC_DEFUN([FIND_GHC_TOOLCHAIN],
     echo "--merge-objs=$MergeObjsCmd" >> acargs
     echo "--readelf=$READELF" >> acargs
     echo "--windres=$WindresCmd" >> acargs
+    echo "--dlltool=$DlltoolCmd" >> acargs
     echo "--llc=$LlcCmd" >> acargs
     echo "--opt=$OptCmd" >> acargs
     echo "--llvm-as=$LlvmAsCmd" >> acargs
@@ -120,16 +109,18 @@ AC_DEFUN([FIND_GHC_TOOLCHAIN],
     ENABLE_GHC_TOOLCHAIN_ARG([tables-next-to-code], [$TablesNextToCode])
     ENABLE_GHC_TOOLCHAIN_ARG([ld-override], [$enable_ld_override])
     ENABLE_GHC_TOOLCHAIN_ARG([libffi-adjustors], [$UseLibffiForAdjustors])
+    ENABLE_GHC_TOOLCHAIN_ARG([dwarf-unwind], [$enable_dwarf_unwind])
 
     dnl We store USER_* variants of all user-specified flags to pass them over to ghc-toolchain.
-    ADD_GHC_TOOLCHAIN_ARG_CHOOSE([cc-opt], [$USER_CONF_CC_OPTS_STAGE2], [$USER_CFLAGS])
-    ADD_GHC_TOOLCHAIN_ARG_CHOOSE([cc-link-opt], [$USER_CONF_GCC_LINKER_OPTS_STAGE2], [$USER_LDFLAGS])
-    ADD_GHC_TOOLCHAIN_ARG([cc-link-opt], [$USER_LIBS])
-    ADD_GHC_TOOLCHAIN_ARG_CHOOSE([cxx-opt], [$USER_CONF_CXX_OPTS_STAGE2], [$USER_CXXFLAGS])
+    ADD_GHC_TOOLCHAIN_ARG([cc-opt], [$USER_CONF_CC_OPTS_STAGE2])
+    ADD_GHC_TOOLCHAIN_ARG([cc-link-opt], [$USER_CONF_GCC_LINKER_OPTS_STAGE2])
+    ADD_GHC_TOOLCHAIN_ARG([cxx-opt], [$USER_CONF_CXX_OPTS_STAGE2])
     ADD_GHC_TOOLCHAIN_ARG([cpp-opt], [$USER_CPP_ARGS])
     ADD_GHC_TOOLCHAIN_ARG([hs-cpp-opt], [$USER_HS_CPP_ARGS])
     ADD_GHC_TOOLCHAIN_ARG([js-cpp-opt], [$USER_JS_CPP_ARGS])
     ADD_GHC_TOOLCHAIN_ARG([cmm-cpp-opt], [$USER_CMM_CPP_ARGS])
+    ADD_GHC_TOOLCHAIN_ARG([libdw-includes], [$LibdwIncludeDir])
+    ADD_GHC_TOOLCHAIN_ARG([libdw-libraries], [$LibdwLibDir])
 
     INVOKE_GHC_TOOLCHAIN()
 
@@ -146,11 +137,23 @@ dnl         and that we must compile ghc-toolchain before invoking it
 AC_DEFUN([FIND_GHC_TOOLCHAIN_BIN],[
     case "$1" in
         YES)
-            # We're configuring the bindist, and the binary is already available
-            GHC_TOOLCHAIN_BIN="bin/ghc-toolchain-bin"
+            # We're configuring the bindist, and the binary is already available.
+            # For cross-compilation bindists, Hadrian names the binary with the
+            # cross-compile prefix (e.g. riscv64-linux-gnu-ghc-toolchain-bin).
+            GHC_TOOLCHAIN_BIN="bin/${CrossCompilePrefix}ghc-toolchain-bin"
             ;;
         NO)
-            # We're in the source tree, so compile ghc-toolchain
+            # We're in the source tree
+
+            # Check for consistency of LLVM versions
+            hs_min_llvm=$(sed -n 's/^minLlvmVersion = //p' utils/ghc-toolchain/src/GHC/Toolchain/Program.hs)
+            hs_max_llvm=$(sed -n 's/^maxLlvmVersionExcl = //p' utils/ghc-toolchain/src/GHC/Toolchain/Program.hs)
+            test "$hs_min_llvm" = "$LlvmMinVersion" || \
+                AC_MSG_ERROR([minLlvmVersion ($hs_min_llvm) in utils/ghc-toolchain/src/GHC/Toolchain/Program.hs must equal LlvmMinVersion ($LlvmMinVersion) in configure.ac])
+            test "$hs_max_llvm" = "$LlvmMaxVersion" || \
+                AC_MSG_ERROR([maxLlvmVersionExcl ($hs_max_llvm) in utils/ghc-toolchain/src/GHC/Toolchain/Program.hs must equal LlvmMaxVersion ($LlvmMaxVersion) in configure.ac])
+
+            # Compile ghc-toolchain
             "$GHC" -v0 \
                 -ilibraries/ghc-platform/src -iutils/ghc-toolchain/src \
                 -XNoImplicitPrelude \

@@ -6,16 +6,24 @@
 
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE LambdaCase #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Loading interface files
 module GHC.Iface.Load (
         -- Importing one thing
-        tcLookupImported_maybe, importDecl,
+        importDecl,
         checkWiredInTyCon, ifCheckWiredInThing,
+        loadGlobalName,
+
+        -- Known-occ things
+        KnownEntitySource(..),
+        lookupKnownKeyThing, lookupKnownKeyName,
+        lookupKnownOccThing, lookupKnownOccName,
+        loadKnownKeyOccMaps, lookupKnownGRE,
+        checkKnownKeyNamesIface,
 
         -- RnM/TcM functions
         loadModuleInterface, loadModuleInterfaces,
@@ -31,6 +39,7 @@ module GHC.Iface.Load (
         needWiredInHomeIface, loadWiredInHomeIface,
 
         WhereFrom(..),
+        ModuleLookupScope(..),
 
         pprModIfaceSimple,
         ifaceStats, pprModIface, showIface,
@@ -43,15 +52,21 @@ module GHC.Iface.Load (
 import GHC.Prelude
 
 import GHC.Platform.Profile
+import GHC.Data.FastString (fastStringToShortText)
 
 import {-# SOURCE #-} GHC.IfaceToCore
    ( tcIfaceDecls, tcIfaceRules, tcIfaceInst, tcIfaceFamInst
    , tcIfaceAnnotations, tcIfaceCompleteMatches, tcIfaceDefaults)
 
-import GHC.Driver.Env
-import GHC.Driver.Errors.Types
+import GHC.Hs.Extension (GhcPass)
+import GHC.Hs.Doc
+
 import GHC.Driver.DynFlags
+import GHC.Driver.Env
+import GHC.Driver.Env.KnotVars
+import GHC.Driver.Errors.Types
 import GHC.Driver.Hooks
+import {-# source #-} GHC.Driver.Main.Compile (loadIfaceByteCode)
 import GHC.Driver.Plugins
 
 import GHC.Iface.Warnings
@@ -61,6 +76,8 @@ import GHC.Iface.Binary
 import GHC.Iface.Rename
 import GHC.Iface.Env
 import GHC.Iface.Errors as Iface_Errors
+import GHC.Iface.Errors.Types
+import GHC.HsToCore.Breakpoints.Types (modBreaks_locs)
 
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
@@ -71,21 +88,31 @@ import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
+import GHC.Utils.Misc( HasDebugCallStack )
 
 import GHC.Settings.Constants
 
-import GHC.Builtin.Names
-import GHC.Builtin.Utils
+import GHC.Builtin
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.Modules( rEBINDABLE_MOD_NAME, eSSENTIALS_NAME, gHC_PRIM, isWiredInOnlyModule )
+import GHC.Builtin.PrimOps
+import GHC.Builtin.PrimOps.Ids
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Ids( seqId )
 
 import GHC.Core.Rules
 import GHC.Core.TyCon
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
 
+import GHC.Parser.Annotation( noLocA, noAnn )
+
 import GHC.Types.Annotations
+import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Cache
 import GHC.Types.Name.Env
+import GHC.Types.Name.Reader
 import GHC.Types.Avail
 import GHC.Types.Fixity
 import GHC.Types.Fixity.Env
@@ -94,38 +121,358 @@ import GHC.Types.SourceFile
 import GHC.Types.SafeHaskell
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.DSet
+import GHC.Types.Unique.Map( listToUniqMap )
+import GHC.Types.Unique.FM( UniqFM, listToUFM, lookupUFM, elemUFM )
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing
 import GHC.Types.PkgQual
+import GHC.Types.SourceText
 
 import GHC.Unit.External
 import GHC.Unit.Module
+import GHC.Unit.Module.Graph
 import GHC.Unit.Module.Warnings
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.Deps
 import GHC.Unit.State
 import GHC.Unit.Home
+import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
 import GHC.Unit.Finder
 import GHC.Unit.Env
 
+import GHC.Stack( callStack )
 import GHC.Data.Maybe
 
+import Language.Haskell.Syntax.Lit (StringLiteral(..))
+
 import Control.Monad
+import qualified Data.Foldable as Foldable
+import Data.Function ((&))
 import Data.Map ( toList )
 import System.FilePath
 import System.Directory
-import GHC.Driver.Env.KnotVars
-import {-# source #-} GHC.Driver.Main (loadIfaceByteCode)
-import GHC.Iface.Errors.Types
-import Data.Function ((&))
-import GHC.Unit.Module.Graph
-import qualified GHC.Unit.Home.Graph as HUG
+
+
+{- *********************************************************************
+*                                                                      *
+*                      Known-occ things                                *
+*                                                                      *
+********************************************************************* -}
+
+data KnownEntitySource  -- See Note [Overview of known entities]
+  -- | Look up the known-occ name in this GlobalRdrEnv/Type, which
+  --   reflect the top-level scope of the current module.
+  -- This happens when -frebindable-known-name is set, usually when
+  --   we are compiling `ghc-internal` or `base`
+  -- Why both global and local type env?  See (KN4) in Note [Overview of known entities]
+  = KES_InScope { ke_mod          :: Module
+                , ke_rdr_env      :: GlobalRdrEnv
+                , ke_gbl_type_env :: TypeEnv
+                , ke_lcl_type_env :: TcTypeEnv
+                    -- ^ Empty outside of typechecking (e.g. at CoreTidy time)
+                }
+
+  -- | Look up the known-occ name in the export list of GHC.Essentials,
+  -- directly via the stored 'KnownKeyNameMaps'.
+  --
+  -- This is the "normal path", and happens when -frebindable-known-names
+  -- is /not/ set.
+  | KES_FromModule KnownKeyNameMaps
+
+instance Outputable KnownEntitySource where
+  ppr (KES_FromModule {})                    = text "FromModule"
+  ppr (KES_InScope { ke_rdr_env = rdr_env }) = text "InScope" <> braces (ppr rdr_env)
+
+lookupKnownKeyThing :: HasDebugCallStack
+                    => KnownKey -> KnownEntitySource
+                    -> IfM lcl (MaybeErr IfaceMessage TyThing)
+lookupKnownKeyThing key kk_ns
+  = do { mb_name <- lookupKnownKeyName key kk_ns
+       ; case mb_name of
+             Failed err     -> return (Failed err)
+             Succeeded name -> lookupKnownName kk_ns name }
+
+lookupKnownKeyName :: HasDebugCallStack
+                   => KnownKey -> KnownEntitySource
+                   -> IfM lcl (MaybeErr IfaceMessage Name)
+lookupKnownKeyName key (KES_FromModule (kk_map, _))
+  = return (lookupKnownKeysMap kk_map key)
+
+lookupKnownKeyName key (KES_InScope { ke_rdr_env = gbl_rdr_env })
+  -- Just gbl_rdr_env: we have -frebindable-known-names on, and
+  --                   here is the top-level GlobalRdrEnv
+  -- Look up the /un-qualified/ known-key OccName in the GlobalRdrEnv
+  -- If we get a unique hit, use it; if not, panic.
+  | Just (occ :: OccName) <- lookupUFM knownKeyUniqMap key
+  = case lookupKnownGRE gbl_rdr_env occ of
+       Succeeded gre -> do { let name = greName gre
+                           ; traceIf $ hang (text "lookupKnownKeyName1 NoImplicitKnownKeyNames")
+                                          2 (ppr name <+> ppr key)
+                           ; return (Succeeded name) }
+       Failed err    -> return (Failed err)
+
+  | otherwise
+  = pprTrace "lookup failed" (pprKnownKey key $$ callStackDoc) $
+    return (Failed (MissingKnownKey2 key))
+
+lookupKnownGRE :: HasDebugCallStack
+               => GlobalRdrEnv -> OccName -> MaybeErr IfaceMessage GlobalRdrElt
+lookupKnownGRE rdr_env occ
+  | [gre] <- pickQualGREs rEBINDABLE_MOD_NAME gres
+  = Succeeded gre  -- Found qualified 'Known.occ' in scope
+
+  | [gre] <- pickUnqualGREs gres
+  = Succeeded gre  -- Found unqualified 'occ' in scope
+
+  | [_] <- gres
+  = Failed (KnownKeyScopeError occ [] callStack)
+           -- It's in scope, but only qualified
+
+  | otherwise
+  = Failed (KnownKeyScopeError occ gres callStack)
+  where
+    gres :: [GlobalRdrElt]
+    gres = lookupGRE rdr_env (LookupOccName occ SameNameSpace)
+
+lookupKnownOccThing :: HasDebugCallStack
+                    => KnownOcc -> KnownEntitySource
+                    -> IfM lcl (MaybeErr IfaceMessage TyThing)
+lookupKnownOccThing occ kk_ns
+  = do { mb_name <- lookupKnownOccName occ kk_ns
+       ; case mb_name of
+             Failed err     -> return (Failed err)
+             Succeeded name -> lookupKnownName kk_ns name }
+
+lookupKnownOccName :: HasDebugCallStack
+                   => KnownOcc -> KnownEntitySource
+                   -> IfM lcl (MaybeErr IfaceMessage Name)
+lookupKnownOccName occ (KES_FromModule (_, occ_map))
+  = return $ case lookupOccEnv occ_map occ of
+      Just name -> Succeeded name
+      Nothing   -> Failed (MissingKnownKey3 occ)
+
+lookupKnownOccName occ (KES_InScope { ke_rdr_env = gbl_rdr_env })
+  -- Just gbl_rdr_env: we have -frebindable-known-names on, and
+  --                   here is the top-level GlobalRdrEnv
+  -- Look up the /un-qualified/ known-occ OccName in the GlobalRdrEnv
+  -- If we get a unique hit, use it; if not, panic.
+  = case lookupKnownGRE gbl_rdr_env occ of
+       Succeeded gre -> do { let name = greName gre
+                           ; traceIf $ hang (text "lookupKnownKeyName2 NoImplicitKnownKeyNames")
+                                          2 (ppr name <+> ppr occ)
+                           ; return (Succeeded name) }
+       Failed err -> return (Failed err)
+
+lookupKnownName :: HasDebugCallStack
+                => KnownEntitySource -> Name
+                -> IfM lcl (MaybeErr IfaceMessage TyThing)
+-- Go from a known Name to its TyThing
+-- If we are in KES_InScope, look up in the current module's type environment
+-- in case it is defined right here in this module rather than imported
+lookupKnownName kk_ns name
+  = case kk_ns of
+      KES_InScope { ke_mod = this_mod, ke_gbl_type_env = type_env, ke_lcl_type_env = lcl_type_env }
+         | name_mod == this_mod
+         -> case lookupNameEnv lcl_type_env name of
+              Just (ATcId { tct_id = id }) -> return (Succeeded (AnId id))
+              _ -> case lookupTypeEnv type_env name of
+                     Just thing -> return (Succeeded thing)
+                     Nothing    -> pprPanic "lookupKnownName" (ppr name $$ ppr type_env)
+                        -- We found the name in the GlobalRdrEnv, but it's
+                        -- not in the type env.  That's a compiler error
+
+      _ -> loadGlobalName name name_mod
+  where
+    name_mod = nameModule name
+
+-- | Load the 'KnownKeyNameMaps' by resolving a 'GHC.Essentials' import.
+-- compiled resolves its known entities through.
+--
+-- See Note [Finding GHC.Essentials] in GHC.Builtin.
+loadKnownKeyOccMaps :: IfM lcl (MaybeErr IfaceMessage KnownKeyNameMaps)
+loadKnownKeyOccMaps
+  = do { hsc_env <- getTopEnv
+       ; fr <- liftIO $
+           findImportedModule hsc_env LookupSystem eSSENTIALS_NAME NoPkgQual
+       ; case fr of
+           Found _ mod -> Succeeded <$> known_key_maps mod
+           _ -> return $ Failed $
+                  CantFindEssentials
+                    (cannotFindModule hsc_env eSSENTIALS_NAME fr)
+                    UnknownLoadEssentialsReason
+       }
+  where
+    doc = text "Need interface for KnownKeyNames"
+
+    known_key_maps :: Module -> IfM lcl KnownKeyNameMaps
+    known_key_maps mod
+      = do { iface <- loadInterfaceWithException doc mod ImportBySystem
+           ; let !abi_hash = mi_mod_hash iface
+           ; eps <- getEps
+           ; case lookupModuleEnv (eps_known_keys eps) mod of
+               Just (cached_hash, kk_maps)
+                 | cached_hash == abi_hash
+                 -> return kk_maps
+               _ -> do { let kk_maps = build_maps iface
+                       ; updateEps_ $ \ eps ->
+                           eps { eps_known_keys =
+                                   extendModuleEnv (eps_known_keys eps) mod
+                                     (abi_hash, kk_maps) }
+                       ; return kk_maps } }
+
+    build_maps :: ModIface -> KnownKeyNameMaps
+    build_maps iface = (kk_map, occ_map)
+      where
+        kk_map :: UniqFM KnownKey Name
+        -- Domain is just the KnownKeys in the knownKeyTable
+        kk_map  = listToUFM [ (getUnique nm, nm)
+                            | avail <- mi_exports iface
+                            , nm <- availNames avail
+                            , let uniq = getUnique nm
+                            , uniq `elemUFM` knownKeyUniqMap ]
+        occ_map :: OccEnv Name
+        occ_map = mkOccEnv [ (nameOccName nm, nm)
+                           | avail <- mi_exports iface
+                           , nm <- availNames avail ]
+
+lookupKnownKeysMap :: UniqFM KnownKey Name -> KnownKey -> MaybeErr IfaceMessage Name
+lookupKnownKeysMap kk_map key = case lookupUFM kk_map key of
+  Just name -> Succeeded name
+  Nothing -- cold path, this should never happen if GHC is working properly
+    | wired_in_nm : _ <- filter (`hasKey` key) wiredInNames
+    -> -- We should never call lookupKnownKeyName on the key of a wired-in
+       -- entity; see (KN3) in Note [Overview of known entities]
+       -- We hackily panic here rather than use a civilised error
+       -- message so that we get a helpful stack backtrace
+       pprPanic "lookupKownKeyName" $
+       hang (text "You tried to look up wired-in"
+             <+> quotes (ppr wired_in_nm) <+> text "in the known-key table")
+          2 (text "Better to use the wired-in name directly")
+    | otherwise
+    -> Failed (MissingKnownKey1 key)
+
+
+
+-- | Check that the known-key map covers the whole of 'knownKeyTable', with
+-- agreeing uniques and occ-names.
+--
+-- This is only used for sanity checking (see the @EssentialsCoverage@ GHC API
+-- test). Failures to look up known entities report a civilised error (see
+-- 'MissingKnownKey1').
+checkKnownKeyNamesIface :: UniqFM KnownKey Name -> Maybe SDoc
+checkKnownKeyNamesIface known_key_names_occ_map
+  | null bad_ones = Nothing
+  | otherwise     = Just $ braces $ fsep $
+                    [ parens (ppr occ <> comma <+> pprKnownKey key)
+                    | (occ,key) <- bad_ones ]
+  where
+    bad_ones = filter is_bad knownKeyTable
+    is_bad (occ, key)
+      = case lookupUFM known_key_names_occ_map key of
+            Nothing   -> True  -- Missing from the known-key exports
+            Just name -> getOccName name /= occ
+
+{- *********************************************************************
+*                                                                      *
+*                      Global things
+*                                                                      *
+********************************************************************* -}
+
+loadGlobalName :: forall lcl.
+                  HasDebugCallStack
+               => Name
+               -> Module  -- Use this for non-External Names (maybe Backpack-related?)
+               -> IfM lcl (MaybeErr IfaceMessage TyThing)
+-- Only works for External Names that have a Module
+loadGlobalName name mod
+  = do  { env <- getGblEnv
+        ; case lookupKnotVars (if_rec_types env) mod of
+               -- Note [Tying the knot]
+            Just get_type_env
+                -> do           -- It's defined in a module in the hs-boot loop
+                { type_env <- setLclEnv () get_type_env         -- yuk
+                ; traceIf (text "loadGlobalName1" <+> ppr name)
+                ; case lookupNameEnv type_env name of
+                    Just thing -> do { traceIf (text "loadGlobalName2" <+> ppr thing)
+                                     ; return (Succeeded thing) }
+                    -- See Note [Knot-tying fallback on boot]
+                    Nothing   -> do { traceIf (text "loadGlobalName3" <+> ppr name)
+                                    ; via_external }
+                }
+
+            _ -> do { traceIf (text "loadGlobalName4" <+> ppr name $$ ppr (if_rec_types env) $$ text "stack" <+> callStackDoc)
+                    ; via_external } }
+  where
+    via_external = do { hsc_env <- getTopEnv
+                      ; mb_thing <- liftIO (lookupType hsc_env name)
+                      ; case mb_thing of
+                          Just thing -> return (Succeeded thing)
+                          Nothing    -> importDecl name }
+
+-- Note [Tying the knot]
+-- ~~~~~~~~~~~~~~~~~~~~~
+-- The if_rec_types field is used when we are compiling M.hs, which indirectly
+-- imports Foo.hi, which mentions M.T Then we look up M.T in M's type
+-- environment, which is splatted into if_rec_types after we've built M's type
+-- envt.
+--
+-- This is a dark and complicated part of GHC type checking, with a lot
+-- of moving parts.  Interested readers should also look at:
+--
+--      * Note [Knot-tying typecheckIface]
+--      * Note [DFun knot-tying]
+--      * Note [hsc_type_env_var hack]
+--      * Note [Knot-tying fallback on boot]
+--      * Note [Hydrating Modules]
+--
+-- There is also a wiki page on the subject, see:
+--
+--      https://gitlab.haskell.org/ghc/ghc/wikis/commentary/compiler/tying-the-knot
+
+-- Note [Knot-tying fallback on boot]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Suppose that you are typechecking A.hs, which transitively imports,
+-- via B.hs, A.hs-boot. When we poke on B.hs and discover that it
+-- has a reference to a type T from A, what TyThing should we wire
+-- it up with? Clearly, if we have already typechecked T and
+-- added it into the type environment, we should go ahead and use that
+-- type. But what if we haven't typechecked it yet?
+--
+-- For the longest time, GHC adopted the policy that this was
+-- *an error condition*; that you MUST NEVER poke on B.hs's reference
+-- to a T defined in A.hs until A.hs has gotten around to kind-checking
+-- T and adding it to the env. However, actually ensuring this is the
+-- case has proven to be a bug farm, because it's really difficult to
+-- actually ensure this never happens. The problem was especially poignant
+-- with type family consistency checks, which eagerly happen before any
+-- typechecking takes place.
+--
+-- Today, we take a different strategy: if we ever try to access
+-- an entity from A which doesn't exist, we just fall back on the
+-- definition of A from the hs-boot file. This is complicated in
+-- its own way: it means that you may end up with a mix of A.hs and
+-- A.hs-boot TyThings during the course of typechecking.  We don't
+-- think (and have not observed) any cases where this would cause
+-- problems, but the hypothetical situation one might worry about
+-- is something along these lines in Core:
+--
+--    case x of
+--        A -> e1
+--        B -> e2
+--
+-- If, when typechecking this, we find x :: T, and the T we are hooked
+-- up with is the abstract one from the hs-boot file, rather than the
+-- one defined in this module with constructors A and B.  But it's hard
+-- to see how this could happen, especially because the reference to
+-- the constructor (A and B) means that GHC will always typecheck
+-- this expression *after* typechecking T.
+
 
 {-
 ************************************************************************
 *                                                                      *
-*      tcImportDecl is the key function for "faulting in"              *
+*      importDecl is the key function for "faulting in"                *
 *      imported things
 *                                                                      *
 ************************************************************************
@@ -148,27 +495,8 @@ where the code that e1 expands to might import some defns that
 also turn out to be needed by the code that e2 expands to.
 -}
 
-tcLookupImported_maybe :: Name -> TcM (MaybeErr IfaceMessage TyThing)
--- Returns (Failed err) if we can't find the interface file for the thing
-tcLookupImported_maybe name
-  = do  { hsc_env <- getTopEnv
-        ; mb_thing <- liftIO (lookupType hsc_env name)
-        ; case mb_thing of
-            Just thing -> return (Succeeded thing)
-            Nothing    -> tcImportDecl_maybe name }
 
-tcImportDecl_maybe :: Name -> TcM (MaybeErr IfaceMessage TyThing)
--- Entry point for *source-code* uses of importDecl
-tcImportDecl_maybe name
-  | Just thing <- wiredInNameTyThing_maybe name
-  = do  { when (needWiredInHomeIface thing)
-               (initIfaceTcRn (loadWiredInHomeIface name))
-                -- See Note [Loading instances for wired-in things]
-        ; return (Succeeded thing) }
-  | otherwise
-  = initIfaceTcRn (importDecl name)
-
-importDecl :: Name -> IfM lcl (MaybeErr IfaceMessage TyThing)
+importDecl :: HasDebugCallStack => Name -> IfM lcl (MaybeErr IfaceMessage TyThing)
 -- Get the TyThing for this Name from an interface file
 -- It's not a wired-in thing -- the caller caught that
 importDecl name
@@ -226,6 +554,13 @@ for any module with an instance decl or RULE that we might want.
   example, Control.Exception.Base.recSelError is wired in, but that module
   is compiled late in the base library, and we don't want to force it to
   load before it's been compiled!
+
+* As this only affects instances/RULES, we can skip modules that do not contain
+  any. This is very convenient for GHC.Internal.Box which happens to depend on
+  the 'Natural' type; an implicit dependency on 'GHC.Internal.Box' can be added
+  by the big tuple machinery or by SetLevels, and we want to avoid this implicit
+  dependency forcing an interface load (which might fail as we might not yet
+  have compiled it, because 'Natural' is compiled quite late within ghc-internal).
 
 All of this is done by the type checker. The renamer plays no role.
 (It used to, but no longer.)
@@ -289,13 +624,14 @@ needWiredInHomeIface _           = False
 -- | Load the interface corresponding to an @import@ directive in
 -- source code.  On a failure, fail in the monad with an error message.
 loadSrcInterface :: SDoc
+                 -> ModuleLookupScope
                  -> ModuleName
                  -> IsBootInterface     -- {-# SOURCE #-} ?
                  -> PkgQual             -- "package", if any
                  -> RnM ModIface
 
-loadSrcInterface doc mod want_boot maybe_pkg
-  = do { res <- loadSrcInterface_maybe doc mod want_boot maybe_pkg
+loadSrcInterface doc scope mod want_boot maybe_pkg
+  = do { res <- loadSrcInterface_maybe doc scope mod want_boot maybe_pkg
        ; case res of
            Failed    err ->
              failWithTc $
@@ -308,19 +644,20 @@ loadSrcInterface doc mod want_boot maybe_pkg
 
 -- | Like 'loadSrcInterface', but returns a 'MaybeErr'.
 loadSrcInterface_maybe :: SDoc
+                       -> ModuleLookupScope
                        -> ModuleName
                        -> IsBootInterface     -- {-# SOURCE #-} ?
                        -> PkgQual             -- "package", if any
                        -> RnM (MaybeErr MissingInterfaceError ModIface)
 
-loadSrcInterface_maybe doc mod want_boot maybe_pkg
+loadSrcInterface_maybe doc scope mod want_boot maybe_pkg
   -- We must first find which Module this import refers to.  This involves
   -- calling the Finder, which as a side effect will search the filesystem
   -- and create a ModLocation.  If successful, loadIface will read the
   -- interface; it will call the Finder again, but the ModLocation will be
   -- cached from the first search.
   = do hsc_env <- getTopEnv
-       res <- liftIO $ findImportedModule hsc_env mod maybe_pkg
+       res <- liftIO $ findImportedModule hsc_env scope mod maybe_pkg
        case res of
            Found _ mod -> initIfaceTcRn $ loadInterface doc mod (ImportByUser want_boot)
            -- TODO: Make sure this error message is good
@@ -380,6 +717,7 @@ loadInterfaceForModule doc m
 loadWiredInHomeIface :: Name -> IfM lcl ()
 loadWiredInHomeIface name
   = assert (isWiredInName name) $
+    unless (isWiredInOnlyModule (nameModule name)) $
     do _ <- loadSysInterface doc (nameModule name); return ()
   where
     doc = text "Need home interface for wired-in thing" <+> ppr name
@@ -752,7 +1090,7 @@ computeInterface hsc_env doc_str hi_boot_file mod0 = do
             Succeeded (iface0, path) ->
               rnModIface hsc_env (instUnitInsts (moduleUnit indef)) Nothing iface0 >>= \case
                 Right x   -> return (Succeeded (x, path))
-                Left errs -> throwErrors (GhcTcRnMessage <$> errs)
+                Left errs -> throwErrors (initSourceErrorContext (hsc_dflags hsc_env)) (GhcTcRnMessage <$> errs)
             Failed err -> return (Failed err)
       (mod, _) -> find_iface mod
 
@@ -895,6 +1233,7 @@ findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
       mhome_unit  = hsc_home_unit_maybe hsc_env
       dflags     = hsc_dflags hsc_env
       logger     = hsc_logger hsc_env
+      hooks      = hsc_hooks hsc_env
 
 
   trace_if logger (sep [hsep [text "Reading",
@@ -905,59 +1244,51 @@ findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
                            ppr mod <> semi],
                      nest 4 (text "reason:" <+> doc_str)])
 
-  -- Check for GHC.Prim, and return its static interface
-  -- See Note [GHC.Prim] in primops.txt.pp.
-  -- TODO: make this check a function
-  if mod `installedModuleEq` gHC_PRIM
-      then do
-          let iface = getGhcPrimIface hsc_env
-          return (Succeeded (iface, panic "GHC.Prim ModLocation (findAndReadIface)"))
-      else do
-          -- Look for the file
-          mb_found <- liftIO (findExactModule hsc_env mod hi_boot_file)
-          case mb_found of
-              InstalledFound loc -> do
-                  -- See Note [Home module load error]
-                  if HUG.memberHugUnitId (moduleUnit mod) (hsc_HUG hsc_env)
-                      && not (isOneShot (ghcMode dflags))
-                    then return (Failed (HomeModError mod loc))
-                    else do
-                        r <- read_file logger name_cache unit_state dflags wanted_mod (ml_hi_file loc)
-                        case r of
-                          Failed err
-                            -> return (Failed $ BadIfaceFile err)
-                          Succeeded (iface,_fp)
-                            -> do
-                                r2 <- load_dynamic_too_maybe logger name_cache unit_state
-                                                         (setDynamicNow dflags) wanted_mod
-                                                         iface loc
-                                case r2 of
-                                  Failed sdoc -> return (Failed sdoc)
-                                  Succeeded {} -> return $ Succeeded (iface, loc)
-              err -> do
-                  trace_if logger (text "...not found")
-                  return $ Failed $ cannotFindInterface
-                                      unit_state
-                                      mhome_unit
-                                      profile
-                                      (moduleName mod)
-                                      err
+  -- Look for the file
+  mb_found <- liftIO (findExactModule hsc_env mod hi_boot_file)
+  case mb_found of
+      InstalledFound loc -> do
+          -- See Note [Home module load error]
+          if HUG.memberHugUnitId (moduleUnit mod) (hsc_HUG hsc_env)
+              && not (isOneShot (ghcMode dflags))
+            then return (Failed (HomeModError mod loc))
+            else do
+                r <- read_file hooks logger name_cache dflags wanted_mod (ml_hi_file loc)
+                case r of
+                  Failed err
+                    -> return (Failed $ BadIfaceFile err)
+                  Succeeded (iface,_fp)
+                    -> do
+                        r2 <- load_dynamic_too_maybe hooks logger name_cache
+                                                 (setDynamicNow dflags) wanted_mod
+                                                 iface loc
+                        case r2 of
+                          Failed sdoc -> return (Failed sdoc)
+                          Succeeded {} -> return $ Succeeded (iface, loc)
+      err -> do
+          trace_if logger (text "...not found")
+          return $ Failed $ cannotFindInterface
+                              unit_state
+                              mhome_unit
+                              profile
+                              (moduleName mod)
+                              err
 
 -- | Check if we need to try the dynamic interface for -dynamic-too
-load_dynamic_too_maybe :: Logger -> NameCache -> UnitState -> DynFlags
+load_dynamic_too_maybe :: Hooks -> Logger -> NameCache -> DynFlags
                        -> Module -> ModIface -> ModLocation
                        -> IO (MaybeErr MissingInterfaceError ())
-load_dynamic_too_maybe logger name_cache unit_state dflags wanted_mod iface loc
+load_dynamic_too_maybe hooks logger name_cache dflags wanted_mod iface loc
   -- Indefinite interfaces are ALWAYS non-dynamic.
   | not (moduleIsDefinite (mi_module iface)) = return (Succeeded ())
-  | gopt Opt_BuildDynamicToo dflags = load_dynamic_too logger name_cache unit_state dflags wanted_mod iface loc
+  | gopt Opt_BuildDynamicToo dflags = load_dynamic_too hooks logger name_cache dflags wanted_mod iface loc
   | otherwise = return (Succeeded ())
 
-load_dynamic_too :: Logger -> NameCache -> UnitState -> DynFlags
+load_dynamic_too :: Hooks -> Logger -> NameCache -> DynFlags
                  -> Module -> ModIface -> ModLocation
                  -> IO (MaybeErr MissingInterfaceError ())
-load_dynamic_too logger name_cache unit_state dflags wanted_mod iface loc = do
-  read_file logger name_cache unit_state dflags wanted_mod (ml_dyn_hi_file loc) >>= \case
+load_dynamic_too hooks logger name_cache dflags wanted_mod iface loc = do
+  read_file hooks logger name_cache dflags wanted_mod (ml_dyn_hi_file loc) >>= \case
     Succeeded (dynIface, _)
      | mi_mod_hash iface == mi_mod_hash dynIface
      -> return (Succeeded ())
@@ -971,10 +1302,10 @@ load_dynamic_too logger name_cache unit_state dflags wanted_mod iface loc = do
 
 
 
-read_file :: Logger -> NameCache -> UnitState -> DynFlags
+read_file :: Hooks -> Logger -> NameCache -> DynFlags
           -> Module -> FilePath
           -> IO (MaybeErr ReadInterfaceError (ModIface, FilePath))
-read_file logger name_cache unit_state dflags wanted_mod file_path = do
+read_file hooks logger name_cache dflags wanted_mod file_path = do
 
   -- Figure out what is recorded in mi_module.  If this is
   -- a fully definite interface, it'll match exactly, but
@@ -983,9 +1314,9 @@ read_file logger name_cache unit_state dflags wanted_mod file_path = do
         case getModuleInstantiation wanted_mod of
             (_, Nothing) -> wanted_mod
             (_, Just indef_mod) ->
-              instModuleToModule unit_state
+              instModuleToModule
                 (uninstantiateInstantiatedModule indef_mod)
-  read_result <- readIface logger dflags name_cache wanted_mod' file_path
+  read_result <- readIface hooks logger dflags name_cache wanted_mod' file_path
   case read_result of
     Failed err      -> return (Failed err)
     Succeeded iface -> return (Succeeded (iface, file_path))
@@ -1012,13 +1343,14 @@ flagsToIfCompression dflags
 -- Failed err    <=> file not found, or unreadable, or illegible
 -- Succeeded iface <=> successfully found and parsed
 readIface
-  :: Logger
+  :: Hooks
+  -> Logger
   -> DynFlags
   -> NameCache
   -> Module
   -> FilePath
   -> IO (MaybeErr ReadInterfaceError ModIface)
-readIface logger dflags name_cache wanted_mod file_path = do
+readIface hooks logger dflags name_cache wanted_mod file_path = do
   trace_if logger (text "readIFace" <+> text file_path)
   let profile = targetProfile dflags
   res <- tryMost $ readBinIface profile name_cache CheckHiWay QuietBinIFace file_path
@@ -1028,9 +1360,14 @@ readIface logger dflags name_cache wanted_mod file_path = do
         -- critical for correctness of recompilation checking
         -- (it lets us tell when -this-unit-id has changed.)
         | wanted_mod == actual_mod
-                        -> return (Succeeded iface)
+                        -> return (Succeeded final_iface)
         | otherwise     -> return (Failed err)
         where
+          final_iface
+            -- Check for GHC.Prim, and return its static interface
+            -- See Note [GHC.Prim] in primops.txt.pp.
+            | wanted_mod == gHC_PRIM = getGhcPrimIface hooks
+            | otherwise              = iface
           actual_mod = mi_module iface
           err = HiModuleNameMismatchWarn file_path wanted_mod actual_mod
 
@@ -1055,11 +1392,122 @@ ghcPrimIface
       & set_mi_decl_warn_fn (mkIfaceDeclWarnCache ghcPrimWarns)
       & set_mi_export_warn_fn (mkIfaceExportWarnCache ghcPrimWarns)
       & set_mi_fix_fn (mkIfaceFixCache ghcPrimFixities)
-      & set_mi_docs (Just ghcPrimDeclDocs) -- See Note [GHC.Prim Docs] in GHC.Builtin.Utils
-      & set_mi_warns (toIfaceWarnings ghcPrimWarns) -- See Note [GHC.Prim Deprecations] in GHC.Builtin.Utils
+      & set_mi_docs (Just ghcPrimDeclDocs) -- See Note [GHC.Prim Docs] in GHC.Builtin
+      & set_mi_warns (toIfaceWarnings ghcPrimWarns) -- See Note [GHC.Prim Deprecations] in GHC.Builtin
 
   where
     empty_iface = emptyFullModIface gHC_PRIM
+
+-- | Get gHC_PRIM interface file
+--
+-- This is a helper function that takes into account the hook allowing ghc-prim
+-- interface to be extended via the ghc-api. Afaik it was introduced for GHCJS
+-- so that it can add its own primitive types.
+getGhcPrimIface :: Hooks -> ModIface
+getGhcPrimIface hooks =
+  case ghcPrimIfaceHook hooks of
+    Nothing -> ghcPrimIface
+    Just h  -> h
+
+ghcPrimExports :: [IfaceExport]
+ghcPrimExports
+ = map (Avail . idName) ghcPrimIds ++
+   map (Avail . idName) allThePrimOpIds ++
+   [ AvailTC n [n]
+   | tc <- exposedPrimTyCons, let n = tyConName tc ]
+
+ghcPrimDeclDocs :: Docs
+ghcPrimDeclDocs = emptyDocs
+  { docs_decls = listToUniqMap $ mapMaybe declDoc primOpDocs
+  , docs_structure = buildStructure primOpDocs
+  }
+  where
+    declDoc (PrimOpDecl fs doc)
+      | not (null doc)
+      , Just name <- lookupFsEnv ghcPrimNames fs
+      = Just (name, [mkHsDoc doc])
+    declDoc _ = Nothing
+
+    buildStructure [] = []
+    buildStructure (PrimOpSection title desc : rest) =
+        DsiSectionHeading 1 (mkHsDoc title)
+      : [DsiDocChunk (mkHsDoc desc) | not (null desc)]
+     ++ buildStructure rest
+    buildStructure items =
+      let (decls, rest) = span isDecl items
+          avails = mapMaybe declAvail decls
+      in  [DsiExports (DefinitelyDeterministicAvails avails) | not (null avails)]
+       ++ buildStructure rest
+
+    isDecl (PrimOpDecl {}) = True
+    isDecl _               = False
+
+    declAvail (PrimOpDecl fs _)
+      | Just name <- lookupFsEnv ghcPrimNames fs
+      = Just $ if isTyConName name
+               then AvailTC name [name]
+               else Avail name
+    declAvail _ = Nothing
+
+    mkHsDoc s = WithHsDocIdentifiers (mkGeneratedHsDocStringGhc s) []
+
+ghcPrimNames :: FastStringEnv Name
+ghcPrimNames
+  = mkFsEnv
+    [ (occNameFS $ nameOccName name, name)
+    | name <-
+        map idName ghcPrimIds ++
+        map idName allThePrimOpIds ++
+        map tyConName exposedPrimTyCons
+    ]
+
+-- See Note [GHC.Prim Deprecations]
+ghcPrimWarns :: Warnings (GhcPass p)
+ghcPrimWarns = WarnSome
+  -- declaration warnings
+  (map mk_decl_dep primOpDeprecations)
+  -- export warnings
+  []
+  where
+    mk_txt msg =
+      DeprecatedTxt (NoSourceText, noAnn)
+        [ noLocA $
+          WithHsDocIdentifiers
+            (StringLiteral NoSourceText (fastStringToShortText msg))
+            []
+        ]
+    mk_decl_dep (occ, msg) = (occ, mk_txt msg)
+
+ghcPrimFixities :: [(OccName,Fixity)]
+ghcPrimFixities = fixities
+  where
+    -- The fixity listed here for @`seq`@ should match
+    -- those in primops.txt.pp (from which Haddock docs are generated).
+    fixities = (getOccName seqId, Fixity 0 InfixR)
+             : mapMaybe mkFixity allThePrimOps
+    mkFixity op = (,) (primOpOcc op) <$> primOpFixity op
+
+{-
+Note [GHC.Prim Docs]
+~~~~~~~~~~~~~~~~~~~~
+GHCi's :doc command and Haddock read from ModIface's. GHC.Prim has a wired-in
+iface whose docs are populated from primops.txt.
+
+genprimopcode --wired-in-docs generates the primOpDocs list (included as
+primop-docs.hs-incl), which contains section headers (PrimOpSection) and
+per-declaration documentation (PrimOpDecl). We use stringy names because
+mapping names to "Name"s is difficult for things like primtypes and pseudoops.
+
+Note [GHC.Prim Deprecations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Like Haddock documentation, we must record deprecation pragmas in two places:
+in the GHC.Prim source module consumed by Haddock, and in the
+declarations wired-in to GHC. To do the following we generate
+GHC.Builtin.PrimOps.primOpDeprecations, a list of (OccName, DeprecationMessage)
+pairs. We insert these deprecations into the mi_warns field of GHC.Prim's ModIface,
+as though they were written in a source module.
+-}
+
 
 {-
 *********************************************************
@@ -1105,7 +1553,7 @@ For some background on this choice see #15269.
 showIface :: Logger -> DynFlags -> UnitState -> NameCache -> FilePath -> IO ()
 showIface logger dflags unit_state name_cache filename = do
    let profile = targetProfile dflags
-       printer = logMsg logger MCOutput noSrcSpan . withPprStyle defaultDumpStyle
+       printer = logOutput logger . withPprStyle defaultDumpStyle
 
    -- skip the hi way check; we don't want to worry about profiled vs.
    -- non-profiled interfaces, for example.
@@ -1160,9 +1608,11 @@ pprModIface unit_state iface
         , vcat [ppr ver $$ nest 2 (ppr decl) | (ver,decl) <- mi_decls iface]
         , case mi_simplified_core iface of
             Nothing -> empty
-            Just (IfaceSimplifiedCore eds fs) ->
+            Just (IfaceSimplifiedCore eds mbs fs) ->
               vcat [ text "extra decls:"
                            $$ nest 2 (vcat ([ppr bs | bs <- eds]))
+                   , text "mod breaks:"
+                           $$ nest 2 (ppr $ Foldable.toList . modBreaks_locs <$> mbs)
                    , text "foreign stubs:"
                            $$ nest 2 (ppr fs)
                    ]
@@ -1240,13 +1690,3 @@ instance Outputable WhereFrom where
   ppr ImportByPlugin                       = text "{- PLUGIN -}"
 
 
--- | Get gHC_PRIM interface file
---
--- This is a helper function that takes into account the hook allowing ghc-prim
--- interface to be extended via the ghc-api. Afaik it was introduced for GHCJS
--- so that it can add its own primitive types.
-getGhcPrimIface :: HscEnv -> ModIface
-getGhcPrimIface hsc_env =
-  case ghcPrimIfaceHook (hsc_hooks hsc_env) of
-    Nothing -> ghcPrimIface
-    Just h  -> h

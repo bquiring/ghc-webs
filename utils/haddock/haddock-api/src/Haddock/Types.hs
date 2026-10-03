@@ -51,18 +51,21 @@ import Data.Data (Data)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
 import GHC
 import GHC.Data.BooleanFormula (BooleanFormula)
 import GHC.Driver.Session (Language)
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core.InstEnv (is_dfun_name)
-import GHC.Types.Fixity (Fixity (..))
+import GHC.Hs.Decls.Overlap (OverlapMode)
+import GHC.Types.ForeignCall (CType)
 import GHC.Types.Name (stableNameCmp)
 import GHC.Types.Name.Occurrence
-import GHC.Types.Name.Reader (RdrName (..))
 import GHC.Types.SrcLoc (srcSpanToRealSrcSpan)
 import GHC.Types.Var (Specificity)
-import GHC.Utils.Outputable
+import GHC.Utils.Outputable hiding ((<>))
 
 import Documentation.Haddock.Types
 
@@ -219,9 +222,9 @@ deriving newtype instance Monad m => MonadState (IfEnv m) (IfM m)
 data IfEnv m = IfEnv
   { ifeLookupName :: Name -> m (Maybe TyThing)
   -- ^ Lookup names in the environment.
-  , ifeOutOfScopeNames :: !(Set.Set String)
+  , ifeOutOfScopeNames :: !(Set.Set Text)
   -- ^ Names which we have warned about for being out of scope
-  , ifeAmbiguousNames :: !(Set.Set String)
+  , ifeAmbiguousNames :: !(Set.Set Text)
   -- ^ Names which we have warned about for being ambiguous
   }
 
@@ -252,8 +255,8 @@ lookupName name = IfM $ do
   lift (lookup_name name)
 
 -- | Very basic logging function that simply prints to stdout
-warn :: MonadIO m => String -> IfM m ()
-warn msg = liftIO $ putStrLn msg
+warn :: MonadIO m => Text -> IfM m ()
+warn msg = liftIO $ T.putStrLn msg
 
 -----------------------------------------------------------------------------
 
@@ -275,7 +278,7 @@ data ExportItem name
     ExportGroup
       { expItemSectionLevel :: !Int
       -- ^ Section level (1, 2, 3, ...).
-      , expItemSectionId :: !String
+      , expItemSectionId :: !Text
       -- ^ Section id (for hyperlinks).
       , expItemSectionText :: !(Doc (IdP name))
       -- ^ Section heading text.
@@ -327,7 +330,7 @@ data ExportD name = ExportD
 data RnExportD = RnExportD
   { rnExpDExpD :: !(ExportD DocNameI)
   -- ^ The renamed export declaration
-  , rnExpDHoogle :: [String]
+  , rnExpDHoogle :: [Text]
   -- ^ If Hoogle textbase (textual database) output is enabled, the text
   -- output lines for this declaration. If Hoogle output is not enabled, the
   -- list will be empty.
@@ -467,10 +470,10 @@ instance Outputable n => Outputable (Wrap n) where
   ppr (Parenthesized n) = hcat [char '(', ppr n, char ')']
   ppr (Backticked n) = hcat [char '`', ppr n, char '`']
 
-showWrapped :: (a -> String) -> Wrap a -> String
+showWrapped :: (a -> Text) -> Wrap a -> Text
 showWrapped f (Unadorned n) = f n
-showWrapped f (Parenthesized n) = "(" ++ f n ++ ")"
-showWrapped f (Backticked n) = "`" ++ f n ++ "`"
+showWrapped f (Parenthesized n) = "(" <> f n <> ")"
+showWrapped f (Backticked n) = "`" <> f n <> "`"
 
 instance HasOccName DocName where
   occName = occName . getName
@@ -499,7 +502,7 @@ instance Ord SName where
 data SimpleType
   = SimpleType SName [SimpleType]
   | SimpleIntTyLit Integer
-  | SimpleStringTyLit String
+  | SimpleStringTyLit Text
   | SimpleCharTyLit Char
   deriving (Eq, Ord)
 
@@ -637,9 +640,9 @@ instance NFData id => NFData (TableRow id) where
 instance NFData id => NFData (TableCell id) where
   rnf (TableCell i j c) = i `deepseq` j `deepseq` c `deepseq` ()
 
-exampleToString :: Example -> String
+exampleToString :: Example -> Text
 exampleToString (Example expression result) =
-  ">>> " ++ expression ++ "\n" ++ unlines result
+  ">>> " <> expression <> "\n" <> T.unlines result
 
 instance NFData name => NFData (HaddockModInfo name) where
   rnf (HaddockModInfo{..}) =
@@ -658,12 +661,12 @@ instance NFData LangExt.Extension
 
 data HaddockModInfo name = HaddockModInfo
   { hmi_description :: Maybe (Doc name)
-  , hmi_copyright :: Maybe String
-  , hmi_license :: Maybe String
-  , hmi_maintainer :: Maybe String
-  , hmi_stability :: Maybe String
-  , hmi_portability :: Maybe String
-  , hmi_safety :: Maybe String
+  , hmi_copyright :: Maybe Text
+  , hmi_license :: Maybe Text
+  , hmi_maintainer :: Maybe Text
+  , hmi_stability :: Maybe Text
+  , hmi_portability :: Maybe Text
+  , hmi_safety :: Maybe Text
   , hmi_language :: Maybe Language
   , hmi_extensions :: [LangExt.Extension]
   }
@@ -763,7 +766,7 @@ data SinceQual
 -- | Renames an identifier.
 -- The first input is the identifier as it occurred in the comment
 -- The second input is the possible namespaces of the identifier
-type Renamer = String -> (NameSpace -> Bool) -> [Name]
+type Renamer = Text -> (NameSpace -> Bool) -> [Name]
 
 -----------------------------------------------------------------------------
 
@@ -773,18 +776,18 @@ type Renamer = String -> (NameSpace -> Bool) -> [Name]
 
 -- | Haddock's own exception type.
 data HaddockException
-  = HaddockException String
-  | WithContext [String] SomeException
+  = HaddockException Text
+  | WithContext [Text] SomeException
 
 instance Show HaddockException where
-  show (HaddockException str) = str
-  show (WithContext ctxts se) = unlines $ ["While " ++ ctxt ++ ":\n" | ctxt <- reverse ctxts] ++ [show se]
+  show (HaddockException str) = T.unpack str
+  show (WithContext ctxts se) = T.unpack $ T.unlines $ ["While " <> ctxt <> ":\n" | ctxt <- reverse ctxts] ++ [T.pack $ show se]
 
-throwE :: String -> a
+throwE :: Text -> a
 instance Exception HaddockException
 throwE str = throw (HaddockException str)
 
-withExceptionContext :: MonadCatch m => String -> m a -> m a
+withExceptionContext :: MonadCatch m => Text -> m a -> m a
 withExceptionContext ctxt =
   handle
     ( \ex ->
@@ -810,18 +813,20 @@ instance WrapXRec DocNameI (HsType DocNameI) where
 
 type instance Anno DocName = SrcSpanAnnN
 type instance Anno (HsTyVarBndr flag DocNameI) = SrcSpanAnnA
-type instance Anno [LocatedA (HsType DocNameI)] = SrcSpanAnnC
+type instance Anno [LocatedA (HsType DocNameI)] = SrcSpanAnnA
 type instance Anno (HsType DocNameI) = SrcSpanAnnA
 type instance Anno (DataFamInstDecl DocNameI) = SrcSpanAnnA
 type instance Anno (DerivStrategy DocNameI) = EpAnn NoEpAnns
 type instance Anno (FieldOcc DocNameI) = SrcSpanAnnA
 type instance Anno (HsConDeclRecField DocNameI) = SrcSpan
+type instance Anno (HsDocString DocNameI) = SrcSpan
+type instance Anno (WithHsDocIdentifiers (HsDocString DocNameI) DocNameI) = SrcSpan
 type instance Anno (Located (HsConDeclRecField DocNameI)) = SrcSpan
 type instance Anno [Located (HsConDeclRecField DocNameI)] = SrcSpan
 type instance Anno (ConDecl DocNameI) = SrcSpan
 type instance Anno (FunDep DocNameI) = SrcSpan
 type instance Anno (TyFamInstDecl DocNameI) = SrcSpanAnnA
-type instance Anno [LocatedA (TyFamInstDecl DocNameI)] = SrcSpanAnnL
+type instance Anno [LocatedA (TyFamInstDecl DocNameI)] = SrcSpanAnnA
 type instance Anno (FamilyDecl DocNameI) = SrcSpan
 type instance Anno (Sig DocNameI) = SrcSpan
 type instance Anno (InjectivityAnn DocNameI) = EpAnn NoEpAnns
@@ -829,7 +834,13 @@ type instance Anno (HsDecl DocNameI) = SrcSpanAnnA
 type instance Anno (FamilyResultSig DocNameI) = EpAnn NoEpAnns
 type instance Anno (HsOuterTyVarBndrs Specificity DocNameI) = SrcSpanAnnA
 type instance Anno (HsSigType DocNameI) = SrcSpanAnnA
-type instance Anno (BooleanFormula DocNameI) = SrcSpanAnnL
+type instance Anno (BooleanFormula DocNameI) = SrcSpanAnnA
+type instance Anno (OverlapMode DocNameI) = SrcSpanAnnA
+type instance Anno (CType DocNameI) = SrcSpanAnnA
+type instance Anno (Header DocNameI) = SrcSpanAnnA
+type instance Anno (HsModifierOf (LocatedA (HsType DocNameI)) DocNameI) = SrcSpanAnnA
+type instance Anno (HsContextDetails DocNameI a) = SrcSpanAnnA
+type instance Anno (HsGadtTelescope DocNameI) = SrcSpanAnnA
 
 type XRecCond a =
   ( XParTy a ~ (EpToken "(", EpToken ")")
@@ -848,10 +859,10 @@ type instance XBndrRequired DocNameI = NoExtField
 type instance XBndrInvisible DocNameI = NoExtField
 type instance XXBndrVis DocNameI = DataConCantHappen
 
-type instance XUnannotated _ DocNameI = NoExtField
-type instance XLinearAnn _ DocNameI = NoExtField
-type instance XExplicitMult _ DocNameI = NoExtField
-type instance XXMultAnnOf _ DocNameI = DataConCantHappen
+type instance XModifier DocNameI = ModifierPrintsAs
+
+type instance XHsStandardArr DocNameI = NoExtField
+type instance XHsLinearArr DocNameI = NoExtField
 
 type instance XForAllTy DocNameI = EpAnn NoEpAnns
 type instance XQualTy DocNameI = EpAnn NoEpAnns
@@ -885,14 +896,18 @@ data HsTypeDocNameIExt
 
   | HsRedacted  (HsType DocNameI) -- ^ contains the kind of the redacted type
 
-type instance XNumTy DocNameI = NoExtField
-type instance XStrTy DocNameI = NoExtField
-type instance XCharTy DocNameI = NoExtField
-type instance XXTyLit DocNameI = DataConCantHappen
+type instance XHsNatural DocNameI = NoExtField
+type instance XHsString DocNameI = NoExtField
+type instance XHsChar DocNameI = NoExtField
+type instance XXLit DocNameI = DataConCantHappen
 
 type instance XHsForAllVis DocNameI = NoExtField
 type instance XHsForAllInvis DocNameI = NoExtField
 type instance XXHsForAllTelescope DocNameI = DataConCantHappen
+
+type instance XGadtForAll DocNameI = NoExtField
+type instance XGadtPar DocNameI = NoExtField
+type instance XXGadtArg DocNameI = DataConCantHappen
 
 type instance XTyVarBndr DocNameI = NoExtField
 type instance XXTyVarBndr DocNameI = DataConCantHappen
@@ -907,6 +922,11 @@ type instance XXBndrKind DocNameI = DataConCantHappen
 
 type instance XCFieldOcc DocNameI = RdrName
 type instance XXFieldOcc DocNameI = DataConCantHappen
+
+type instance XNoNamespaceSpecifier DocNameI = NoExtField
+type instance XTypeNamespaceSpecifier DocNameI = NoExtField
+type instance XDataNamespaceSpecifier DocNameI = NoExtField
+type instance XXNamespaceSpecifier DocNameI = DataConCantHappen
 
 type instance XFixitySig DocNameI = NoExtField
 type instance XFixSig DocNameI = NoExtField
@@ -924,9 +944,25 @@ type instance XCExport DocNameI = NoExtField
 type instance XXForeignImport DocNameI = DataConCantHappen
 type instance XXForeignExport DocNameI = DataConCantHappen
 
+type instance XStaticTarget  DocNameI = NoExtField
+type instance XDynamicTarget DocNameI = NoExtField
+type instance XXCCallTarget  DocNameI = DataConCantHappen
+
+type instance XCType  DocNameI = NoExtField
+type instance XXCType DocNameI = DataConCantHappen
+
+type instance XHeader  DocNameI = NoExtField
+type instance XXHeader DocNameI = DataConCantHappen
+
+
 type instance XConDeclGADT DocNameI = NoExtField
 type instance XConDeclH98 DocNameI = NoExtField
 type instance XXConDecl DocNameI = DataConCantHappen
+
+type instance XPrefixCon DocNameI = NoExtField
+type instance XRecCon DocNameI = NoExtField
+type instance XInfixCon DocNameI = NoExtField
+type instance XXHsConDetails DocNameI = DataConCantHappen
 
 type instance XPrefixConGADT DocNameI = NoExtField
 type instance XRecConGADT DocNameI = NoExtField
@@ -946,7 +982,7 @@ type instance XXFamilyResultSig DocNameI = DataConCantHappen
 type instance XCFamEqn DocNameI _ = NoExtField
 type instance XXFamEqn DocNameI _ = DataConCantHappen
 
-type instance XCClsInstDecl DocNameI = NoExtField
+type instance XCClsInstDecl DocNameI = HsNestedGroup DocNameI
 type instance XCDerivDecl DocNameI = NoExtField
 type instance XStockStrategy DocNameI = NoExtField
 type instance XAnyClassStrategy DocNameI = NoExtField
@@ -957,12 +993,16 @@ type instance XTyFamInstD DocNameI = NoExtField
 type instance XClsInstD DocNameI = NoExtField
 type instance XCHsDataDefn DocNameI = NoExtField
 type instance XCFamilyDecl DocNameI = NoExtField
-type instance XClassDecl DocNameI = NoExtField
+type instance XClassDecl DocNameI =  (HsNestedGroup DocNameI, NoExtField)
 type instance XDataDecl DocNameI = NoExtField
 type instance XSynDecl DocNameI = NoExtField
 type instance XFamDecl DocNameI = NoExtField
+type instance XOverlapMode DocNameI = NoExtField
+type instance XIntegralLit DocNameI = NoExtField
 type instance XXHsDataDefn DocNameI = DataConCantHappen
 type instance XXFamilyDecl DocNameI = DataConCantHappen
+type instance XXOverlapMode DocNameI = DataConCantHappen
+type instance XXIntegralLit DocNameI = DataConCantHappen
 type instance XXTyClDecl DocNameI = DataConCantHappen
 
 type instance XHsWC DocNameI _ = NoExtField
@@ -984,6 +1024,11 @@ type instance XXConDeclRecField DocNameI = DataConCantHappen
 type instance XConDeclField DocNameI = NoExtField
 type instance XXConDeclField DocNameI = DataConCantHappen
 
+type instance XMultiLineDocString DocNameI = NoExtField
+type instance XNestedDocString    DocNameI = NoExtField
+type instance XGeneratedDocString DocNameI = NoExtField
+type instance XXHsDocString       DocNameI = DataConCantHappen
+
 type instance XXPat DocNameI = DataConCantHappen
 type instance XXHsBindsLR DocNameI a = DataConCantHappen
 
@@ -995,17 +1040,20 @@ type instance XCFunDep DocNameI = NoExtField
 
 type instance XCTyFamInstDecl DocNameI = NoExtField
 
+type instance XHsContext DocNameI = NoExtField
+type instance XXHsContextDetails DocNameI = DataConCantHappen
+
+type instance XBFVar           DocNameI = NoExtField
+type instance XBFAnd           DocNameI = NoExtField
+type instance XBFOr            DocNameI = NoExtField
+type instance XBFParens        DocNameI = (EpToken "(", EpToken ")")
+type instance XXBooleanFormula DocNameI = DataConCantHappen
+
 -----------------------------------------------------------------------------
 
 -- * NFData instances for GHC types
 
 -----------------------------------------------------------------------------
-
-instance NFData RdrName where
-  rnf (Unqual on) = rnf on
-  rnf (Qual mn on) = mn `deepseq` on `deepseq` ()
-  rnf (Orig m on) = m `deepseq` on `deepseq` ()
-  rnf (Exact n) = rnf n
 
 instance NFData (EpAnn NameAnn) where
   rnf (EpAnn en ann cs) = en `deepseq` ann `deepseq` cs `deepseq` ()
@@ -1083,11 +1131,9 @@ instance NFData DeltaPos where
 
 instance NFData (EpToken tok) where
   rnf (EpTok l) = rnf l
-  rnf NoEpTok = ()
 
 instance NFData (EpUniToken tok toku) where
   rnf (EpUniTok l s) = l `deepseq` s `deepseq` ()
-  rnf NoEpUniTok = ()
 
 instance NFData IsUnicodeSyntax where
   rnf NormalSyntax = ()

@@ -58,6 +58,7 @@ module GHC.Internal.Event.Manager
 ------------------------------------------------------------------------
 -- Imports
 
+import GHC.Internal.Base
 import GHC.Internal.Control.Concurrent.MVar (MVar, newMVar, putMVar,
                                 tryPutMVar, takeMVar, withMVar)
 import GHC.Internal.Control.Exception (onException)
@@ -69,12 +70,14 @@ import GHC.Internal.Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef
 import GHC.Internal.Data.Maybe (maybe)
 import GHC.Internal.Data.OldList (partition)
 import GHC.Internal.Arr (Array, (!), listArray)
-import GHC.Internal.Base
 import GHC.Internal.Conc.Sync (yield)
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.List (filter, replicate)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num (Num(..))
+import GHC.Internal.Prim (seq)
 import GHC.Internal.Real (fromIntegral)
-import GHC.Internal.Show (Show(..))
+import GHC.Internal.Show
 import GHC.Internal.Event.Control
 import GHC.Internal.Event.IntTable (IntTable)
 import GHC.Internal.Event.Internal (Backend, Event, evtClose, evtRead, evtWrite,
@@ -186,7 +189,7 @@ newWith :: Backend -> IO EventManager
 newWith be = do
   iofds <- fmap (listArray (0, callbackArraySize-1)) $
            replicateM callbackArraySize (newMVar =<< IT.new 8)
-  ctrl <- newControl False
+  ctrl <- newControl
   state <- newIORef Created
   us <- newSource
   _ <- mkWeakIORef state $ do

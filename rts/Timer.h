@@ -8,5 +8,12 @@
 
 #pragma once
 
-RTS_PRIVATE void initTimer (void);
-RTS_PRIVATE void exitTimer (bool wait);
+#include "BeginPrivate.h"
+
+void initTimer(void);
+void exitTimer(void);
+
+void pauseTimer(void);
+void unpauseTimer(void);
+
+#include "EndPrivate.h"

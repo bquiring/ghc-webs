@@ -16,16 +16,19 @@ import GHC.Internal.Types ()
 
 #include <sys/file.h>
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Data.Bits
 import GHC.Internal.Data.Function
 import GHC.Internal.Foreign.C.Error
 import GHC.Internal.Foreign.C.Types
-import GHC.Internal.Base
 import GHC.Internal.IO.Exception
 import GHC.Internal.IO.FD
 import GHC.Internal.IO.Handle.FD
 import GHC.Internal.IO.Handle.Lock.Common
 import GHC.Internal.IO.Handle.Types (Handle)
+import GHC.Internal.Maybe (Maybe(..))
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 lockImpl :: Handle -> String -> LockMode -> Bool -> IO Bool
 lockImpl h ctx mode block = do

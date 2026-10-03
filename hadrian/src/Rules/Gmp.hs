@@ -11,14 +11,13 @@ import Target
 import Utilities
 import Hadrian.BuildPath
 import Hadrian.Expression
-import Settings.Builders.Common (cArgs, getStagedCCFlags)
-import GHC.Platform.ArchOS
+import Settings.Builders.Common (getStagedCCFlags)
 
 -- | Build in-tree GMP library objects (if GmpInTree flag is set) and return
 -- their paths.
 gmpObjects :: Stage -> Action [FilePath]
 gmpObjects s = do
-  isInTree <- flag GmpInTree
+  isInTree <- buildFlag GmpInTree s
   if not isInTree
     then return []
     else do
@@ -66,8 +65,9 @@ gmpRules = do
             packageP   = takeDirectory buildP
             librariesP = takeDirectory packageP
             stageP     = takeDirectory librariesP
+        stage <- parsePath parseStage "<stage>" (takeFileName stageP)
 
-        isInTree <- flag GmpInTree
+        isInTree <- buildFlag GmpInTree stage
 
         if isInTree
         then do
@@ -126,15 +126,23 @@ gmpRules = do
             cFlags <-
                 interpretInContext ctx $
                 mconcat
-                    [ cArgs
-                    , getStagedCCFlags
-                    , anyTargetArch [ArchWasm32] ? arg "-fvisibility=default"
+                    [ getStagedCCFlags
+                    -- gmp fails to configure with newer compilers
+                    -- that default to c23:
+                    -- https://gmplib.org/list-archives/gmp-devel/2025-January/006279.html.
+                    -- for now just manually specify -std=gnu11 until
+                    -- next upstream release.
+                    , arg "-std=gnu11"
+                    -- gmp symbols are only used by bignum logic in
+                    -- ghc-internal and shouldn't be exported by the
+                    -- ghc-internal shared library.
+                    , arg "-fvisibility=hidden"
                     ]
             env <- sequence
                      [ builderEnvironment "CC" $ Cc CompileC (stage ctx)
                      , return . AddEnv "CFLAGS" $ unwords cFlags
                      , builderEnvironment "AR" (Ar Unpack (stage ctx))
-                     , builderEnvironment "NM" Nm
+                     , builderEnvironment "NM" (Nm (stage ctx))
                      ]
             need [mk <.> "in"]
             buildWithCmdOptions env $

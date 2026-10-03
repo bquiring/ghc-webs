@@ -39,7 +39,7 @@ import GHC.Tc.Gen.HsType
 import GHC.Tc.Solver( reportUnsolvedEqualities, pushLevelAndSolveEqualitiesX
                     , emitResidualConstraints )
 import GHC.Tc.Solver.Solve( solveWanteds )
-import GHC.Tc.Solver.Monad( runTcS, runTcSWithEvBinds )
+import GHC.Tc.Solver.Monad( runTcS, setTcSMode, TcSMode(..), vanillaTcSMode, runTcSWithEvBinds )
 import GHC.Tc.Validity ( checkValidType )
 
 import GHC.Tc.Utils.Monad
@@ -50,6 +50,7 @@ import GHC.Tc.Utils.Instantiate( topInstantiate, tcInstTypeBndrs )
 import GHC.Tc.Utils.Env
 
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 
@@ -67,12 +68,13 @@ import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Id  ( idName, idType, setInlinePragma
                      , mkLocalId, realIdUnfolding )
+import GHC.Types.InlinePragma
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.SrcLoc
 
-import GHC.Builtin.Names( mkUnboundName )
+import GHC.Builtin( mkUnboundName )
 import GHC.Unit.Module( Module, getModule )
 
 import GHC.Utils.Misc as Utils ( singleton )
@@ -162,6 +164,9 @@ errors were dealt with by the renamer.
 ********************************************************************* -}
 
 tcTySigs :: [LSig GhcRn] -> TcM ([TcId], TcSigFun)
+-- The returned [TcId] are the ones for which we have
+--   a /complete/ type signature.
+-- See Note [Complete and partial type signatures]
 tcTySigs hs_sigs
   = checkNoErrs $
     do { -- Fail if any of the signatures is duff
@@ -171,9 +176,6 @@ tcTySigs hs_sigs
 
        ; let ty_sigs = concat ty_sigs_s
              poly_ids = mapMaybe completeSigPolyId_maybe ty_sigs
-                        -- The returned [TcId] are the ones for which we have
-                        -- a complete type signature.
-                        -- See Note [Complete and partial type signatures]
              env = mkNameEnv [(tcSigInfoName sig, sig) | sig <- ty_sigs]
 
        ; return (poly_ids, lookupNameEnv env) }
@@ -186,10 +188,13 @@ tcTySig (L _ (XSig (IdSig id)))
              sig = completeSigFromId ctxt id
        ; return [TcIdSig (TcCompleteSig sig)] }
 
-tcTySig (L loc (TypeSig _ names sig_ty))
+tcTySig (L loc (TypeSig _ mods names sig_ty))
   = setSrcSpanA loc $
     do { sigs <- sequence [ tcUserTypeSig (locA loc) sig_ty (Just name)
                           | L _ name <- names ]
+         -- We don't do anything with modifiers, but we do need to make sure
+         -- they type check.
+       ; _ <- tcModifiersAndWarn mods
        ; return (map TcIdSig sigs) }
 
 tcTySig (L loc (PatSynSig _ names sig_ty))
@@ -287,11 +292,14 @@ no_anon_wc_ty lty = go lty
       HsWildCardTy _                 -> False
       HsAppTy _ ty1 ty2              -> go ty1 && go ty2
       HsAppKindTy _ ty ki            -> go ty && go ki
-      HsFunTy _ w ty1 ty2            -> go ty1 && go ty2 && all go (multAnnToHsType w)
+      HsFunTy _ w ty1 ty2            -> go ty1 && go ty2 && go_mult w
+        where
+          go_mult (HsModifiedFunArr _ mods _) = all go_mod mods
+          go_mod (L _ (HsModifier _ ty)) = go ty
       HsListTy _ ty                  -> go ty
       HsTupleTy _ _ tys              -> gos tys
       HsSumTy _ tys                  -> gos tys
-      HsOpTy _ _ ty1 _ ty2           -> go ty1 && go ty2
+      HsOpTy _ ty1 tyop ty2          -> go tyop && go ty1 && go ty2
       HsParTy _ ty                   -> go ty
       HsIParamTy _ _ ty              -> go ty
       HsKindSig _ ty kind            -> go ty && go kind
@@ -302,7 +310,7 @@ no_anon_wc_ty lty = go lty
                  , hst_body = ty } -> no_anon_wc_tele tele
                                         && go ty
       HsQualTy { hst_ctxt = ctxt
-               , hst_body = ty }  -> gos (unLoc ctxt) && go ty
+               , hst_body = ty }  -> gos (hsc_ctxt $ unLoc ctxt) && go ty
       HsSpliceTy (HsUntypedSpliceTop _ ty) _ -> go ty
       HsSpliceTy (HsUntypedSpliceNested _) _ -> True
       HsTyLit{} -> True
@@ -449,6 +457,10 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
        -- This is because, when creating a matcher:
        --   - the argument types become the binder types (see test RepPolyPatySynArg),
        --   - the return type becomes the scrutinee type (see test RepPolyPatSynRes).
+       --
+       -- Note that, in practice, reducible type family applications will have
+       -- been reduced already, due to the logic described in
+       -- Note [Prevent unification with type families] in GHC.Tc.Utils.Unify.
        ; let (arg_tys, res_ty) = tcSplitFunTys body_ty
        ; mapM_
            (\(Scaled _ arg_ty) -> checkTypeHasFixedRuntimeRep FixedRuntimeRepPatSynSigArg arg_ty)
@@ -591,26 +603,26 @@ mkPragEnv sigs binds
           Nothing -> sig -- See Note [Pattern synonym inline arity]
 
     -- ar_env maps a local to the arity of its definition
-    ar_env :: NameEnv Arity
-    ar_env = foldr lhsBindArity emptyNameEnv binds
+    ar_env :: NameEnv VisArity
+    ar_env = foldr lhsBindVisArity emptyNameEnv binds
 
-addInlinePragArity :: Arity -> LSig GhcRn -> LSig GhcRn
+addInlinePragArity :: VisArity -> LSig GhcRn -> LSig GhcRn
 addInlinePragArity ar (L l (InlineSig x nm inl))  = L l (InlineSig x nm (add_inl_arity ar inl))
 addInlinePragArity ar (L l (SpecSig x nm ty inl)) = L l (SpecSig x nm ty (add_inl_arity ar inl))
 addInlinePragArity ar (L l (SpecSigE n x e inl))  = L l (SpecSigE n x e (add_inl_arity ar inl))
 addInlinePragArity _ sig = sig
 
-add_inl_arity :: Arity -> InlinePragma -> InlinePragma
+add_inl_arity :: VisArity -> InlinePragma GhcRn -> InlinePragma GhcRn
 add_inl_arity ar prag@(InlinePragma { inl_inline = inl_spec })
   | Inline {} <- inl_spec  -- Add arity only for real INLINE pragmas, not INLINABLE
-  = prag { inl_sat = Just ar }
+  = prag `setInlinePragmaSaturation` AppliedToAtLeast ar
   | otherwise
   = prag
 
-lhsBindArity :: LHsBind GhcRn -> NameEnv Arity -> NameEnv Arity
-lhsBindArity (L _ (FunBind { fun_id = id, fun_matches = ms })) env
-  = extendNameEnv env (unLoc id) (matchGroupArity ms)
-lhsBindArity _ env = env        -- PatBind/VarBind
+lhsBindVisArity :: LHsBind GhcRn -> NameEnv Arity -> NameEnv Arity
+lhsBindVisArity (L _ (FunBind { fun_id = id, fun_matches = ms })) env
+  = extendNameEnv env (unLoc id) (matchGroupVisArity ms)
+lhsBindVisArity _ env = env        -- PatBind/VarBind
 
 
 -----------------
@@ -623,7 +635,7 @@ addInlinePrags poly_id prags_for_me
   | otherwise
   = return poly_id
   where
-    inl_prags = [L loc prag | L loc (InlineSig _ _ prag) <- prags_for_me]
+    inl_prags = [L loc (tcInlinePragma prag) | L loc (InlineSig _ _ prag) <- prags_for_me]
 
     warn_multiple_inlines _ [] = return ()
 
@@ -741,7 +753,7 @@ Note that
   the same (Eq p) dictionary. Reason: we don't want to force them to be visibly
   equal at the call site.
 
-* The `spec_bnrs`, which are lambda-bound in the specialised function `$sf`,
+* The `spec_bndrs`, which are lambda-bound in the specialised function `$sf`,
   are a subset of `rule_bndrs`.
 
     spec_bndrs = @p (d2::Eq p) (x::Int) (y::p)
@@ -759,7 +771,8 @@ This is done in three parts.
 
     (1) Typecheck the expression, capturing its constraints
 
-    (2) Solve these constraints
+    (2) Solve these constraints.  When doing so, switch on `tcsmFullySolveQCIs`;
+        see wrinkle (NFS1) below.
 
     (3) Compute the constraints to quantify over, using `getRuleQuantCts` on
         the unsolved constraints returned by (2).
@@ -794,6 +807,28 @@ This is done in three parts.
     (3) Then we build the specialised function $sf, and concoct a RULE
         of the form:
            forall @a @b d1 d2 d3. f d1 d2 d3 = $sf d1 d2 d3
+
+(NFS1) Consider
+    f :: forall f a. (Ix a, forall x. Eq x => Eq (f x)) => a -> f a
+    {-# SPECIALISE f :: forall f. (forall x. Eq x => Eq (f x)) => Int -> f Int #-}
+  This SPECIALISE is treated like an expression with a type signature, so
+  we instantiate the constraints, simplify them and re-generalise.  From the
+  instantiation we get  [W] d :: (forall x. Eq a => Eq (f x))
+  and we want to generalise over that.  We do not want to attempt to solve it
+  and then get stuck, and emit an error message.  If we can't solve it, it is
+  much, much better to leave it alone.
+
+  We still need to simplify quantified constraints that can be /fully solved/
+  from instances, otherwise we would never be able to specialise them
+  away. Example: {-# SPECIALISE f @[] @a #-}.  So:
+
+  * The constraint solver has a mode flag `tcsmFullySolveQCIs` that says
+    "fully solve quantified constraint, or leave them alone
+  * When simplifying constraints in a SPECIALISE pragma, we switch on this
+    flag the `SpecPragE` case of `tcSpecPrag`.
+
+  You might worry about the wasted work from failed attempts to fully-solve, but
+  it is seldom repeated (because the constraint solver seldom iterates much).
 
 Note [Handling old-form SPECIALISE pragmas]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -963,7 +998,7 @@ tcSpecPrag poly_id prag@(SpecSig _ fun_name hs_tys inl)
     tc_one hs_ty
       = do { spec_ty <- tcHsSigType   (FunSigCtxt name NoRRC) hs_ty
            ; wrap    <- tcSpecWrapper (FunSigCtxt name (lhsSigTypeContextSpan hs_ty)) poly_ty spec_ty
-           ; return (SpecPrag poly_id wrap inl) }
+           ; return (SpecPrag poly_id wrap (tcInlinePragma inl)) }
 
 tcSpecPrag poly_id (SpecSigE nm rule_bndrs spec_e inl)
   -- For running commentary, see Note [Handling new-form SPECIALISE pragmas]
@@ -977,8 +1012,10 @@ tcSpecPrag poly_id (SpecSigE nm rule_bndrs spec_e inl)
 
          -- (2) Solve the resulting wanteds
        ; ev_binds_var <- newTcEvBinds
-       ; spec_e_wanted <- setTcLevel rhs_tclvl $
+       ; spec_e_wanted <- setTcLevel rhs_tclvl            $
                           runTcSWithEvBinds ev_binds_var  $
+                          setTcSMode (vanillaTcSMode { tcsmFullySolveQCIs = True }) $
+                               -- tcsmFullySolveQCIs: see (NFS1)
                           solveWanteds spec_e_wanted
        ; spec_e_wanted <- liftZonkM $ zonkWC spec_e_wanted
 
@@ -1024,7 +1061,7 @@ tcSpecPrag poly_id (SpecSigE nm rule_bndrs spec_e inl)
                            , spe_bndrs = qevs ++ rule_bndrs' -- Dependency order
                                                              -- does not matter
                            , spe_call  = lhs_call
-                           , spe_inl   = inl }] }
+                           , spe_inl   = tcInlinePragma inl }] }
 
 tcSpecPrag _ prag = pprPanic "tcSpecPrag" (ppr prag)
 
@@ -1186,9 +1223,10 @@ tcRule (HsRule { rd_ext  = ext
                , rd_bndrs = bndrs
                , rd_lhs  = lhs
                , rd_rhs  = rhs })
-  = addErrCtxt (RuleCtxt name)  $
+  = let name_fs = mkFastStringShortText name in
+    addErrCtxt (RuleCtxt name_fs)  $
     do { traceTc "---- Rule ------" (pprFullRuleName (snd ext) rname)
-       ; skol_info <- mkSkolemInfo (RuleSkol name)
+       ; skol_info <- mkSkolemInfo (RuleSkol name_fs)
         -- Note [Typechecking rules]
        ; (tc_lvl, lhs_wanted, stuff)
               <- tcRuleBndrs skol_info bndrs $
@@ -1204,7 +1242,7 @@ tcRule (HsRule { rd_ext  = ext
                                   , ppr rhs_wanted ])
 
        ; (lhs_evs, residual_lhs_wanted, dont_default)
-            <- simplifyRule name tc_lvl lhs_wanted rhs_wanted
+            <- simplifyRule name_fs tc_lvl lhs_wanted rhs_wanted
 
        -- SimplifyRule Plan, step 4
        -- Now figure out what to quantify over
@@ -1245,7 +1283,7 @@ tcRule (HsRule { rd_ext  = ext
        -- See Note [Quantifying over equalities in RULES].
        ; case allPreviouslyQuantifiableEqualities residual_lhs_wanted of {
            Just cts | not (insolubleWC rhs_wanted)
-                    -> do { addDiagnostic $ TcRnRuleLhsEqualities name lhs cts
+                    -> do { addDiagnostic $ TcRnRuleLhsEqualities name_fs lhs cts
                           ; return Nothing } ;
            _  ->
 
@@ -1456,7 +1494,7 @@ in `getRuleQuantCts`.  Why not?
          do { ev_id <- newEvVar pred
             ; fillCoercionHole hole (mkCoVarCo ev_id)
             ; return ev_id }
-    But that led to new complications becuase of the side effect on the coercion
+    But that led to new complications because of the side effect on the coercion
     hole. Much easier just to side-step the issue entirely by not quantifying over
     equalities.
 

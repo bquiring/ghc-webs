@@ -1,4 +1,6 @@
+{-# LANGUAGE ImpredicativeTypes #-}
 {-# LANGUAGE TypeFamilies #-}
+
 module Hadrian.Utilities (
     -- * List manipulation
     fromSingleton, replaceEq, minusOrd, intersectOrd, lookupAll, chunksOfSize,
@@ -8,18 +10,22 @@ module Hadrian.Utilities (
 
     -- * FilePath manipulation
     unifyPath, (-/-), makeRelativeNoSysLink, makeAbsolute,
+    isMsysPath, windowsToMsysPathList,
+    ExeSpawnPath, exeSpawnPath, cmdExe,
 
     -- * Accessing Shake's type-indexed map
     insertExtra, lookupExtra, userSetting,
 
     -- * Paths
     BuildRoot (..), buildRoot, buildRootRules, isGeneratedSource,
+    withResponseFileIfLongCmd, responseFilePath,
 
     -- * File system operations
     copyFile, copyFileUntracked, createFileLink, fixFile,
     makeExecutable, moveFile, removeFile, createDirectory, copyDirectory,
-    moveDirectory, removeDirectory, removeFile_, writeFileChangedBS,
-    findExecutable,
+    moveDirectory, removeDirectory, removeFile_,
+    writeFileAtomic, writeFileLinesAtomic,
+    writeFileChangedBS,
 
     -- * Diagnostic info
     Colour (..), ANSIColour (..), putColoured, shouldUseColor,
@@ -46,9 +52,15 @@ import Data.List.Extra
 import Data.Maybe
 import Data.Typeable (TypeRep, typeOf)
 import Development.Shake hiding (Normal)
+import qualified Development.Shake as Shake
 import Development.Shake.Classes
+import Control.Exception.Extra (Partial)
+import Development.Shake.Command
+  (CmdArgument (..), CmdArguments (cmdArguments), IsCmdArgument (toCmdArgument))
 import Development.Shake.FilePath
+import GHC.ResponseFile (escapeArgs)
 import System.Environment (lookupEnv)
+import System.IO.Error (isPermissionError)
 
 import qualified Data.ByteString        as BS
 import qualified Control.Exception.Base as IO
@@ -56,8 +68,7 @@ import qualified Data.HashMap.Strict    as Map
 import qualified System.Directory.Extra as IO
 import qualified System.Info.Extra      as IO
 import qualified System.IO              as IO
-import System.IO.Error (isPermissionError)
-import qualified System.FilePath.Posix as Posix
+import qualified System.FilePath.Posix  as Posix
 
 -- | Extract a value from a singleton list, or terminate with an error message
 -- if the list does not contain exactly one value.
@@ -137,17 +148,51 @@ zeroOne True  = "1"
 unifyPath :: FilePath -> FilePath
 unifyPath = toStandard . normaliseEx
 
-{- Note [Absolute paths and MSYS]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When dealing with absolute paths in Hadrian, we opt to always use Unix-style
-forward slashes for separating paths.
-This is because, on Windows, the MSYS toolchain can reliably handle paths such
-as /c/foo, while it occasionally falls over on paths of the form C:\foo.
+{- Note [MSYS paths]
+~~~~~~~~~~~~~~~~~~~~
+On Windows, GHC is built using an MSYS toolchain, which understands two
+different types of paths:
+  - Windows   C:\foo\bar  (forward slashes also accepted)
+  - POSIX     /c/foo/bar  /usr/baz/quux
+
+On the other hand, like any other Haskell program that depends on 'filepath',
+when compiled on Windows, Hadrian by default only understands Windows file paths.
+
+Separately, backslashes are a source of tricky bugs, as they require escaping
+in most circumstances.
+
+So, on Windows, we settle on using Windows-style paths with forward slashes.
+Hadrian manipulates existing paths using '(-/-)' and 'makeAbsolute', which
+maintain this convention. What's left to handle are the paths Hadrian receives,
+such as the paths of toolchain programs. Those are converted to the standing
+path convention using FP_CANONICALISE_WIN_PATH, which uses 'cygpath'.
+
+The end result is that Hadrian itself never needs to turn a POSIX path into a
+Windows path, and hence never needs to call 'cygpath'.
 -}
+
+-- | Is this an MSYS path, e.g. @\/usr\/bin\/tar@ or @\/c\/foo@, rather than a
+-- Windows one?
+--
+-- See Note [MSYS paths].
+isMsysPath :: FilePath -> Bool
+isMsysPath ('/' : _) = True
+isMsysPath _         = False
+
+-- | Rewrite a Windows path list, e.g. @C:\\foo;C:\\msys64\\usr\\share@, into
+-- the MSYS syntax @\/c\/foo:\/c\/msys64\/usr\/share@ that MSYS tools expect.
+--
+-- See Note [MSYS paths].
+windowsToMsysPathList :: String -> String
+windowsToMsysPathList = intercalate ":" . map toMsysPath . splitOn ";"
+  where
+    toMsysPath path = case replaceEq '\\' '/' path of
+        drive : ':' : rest | isAlpha drive -> '/' : toLower drive : rest
+        msysPath                           -> msysPath
 
 -- | Combine paths with a forward slash regardless of platform.
 --
--- See Note [Absolute paths and MSYS].
+-- See Note [MSYS paths].
 (-/-) :: FilePath -> FilePath -> FilePath
 _  -/- b
     | isAbsolute b
@@ -163,12 +208,82 @@ infixr 6 -/-
 -- | Like 'System.Directory.makeAbsolute' from @directory@, but always
 -- using forward slashes.
 --
--- See Note [Absolute paths and MSYS].
+-- See Note [MSYS paths].
 makeAbsolute :: FilePath -> IO FilePath
 makeAbsolute fp = do
   cwd <- IO.getCurrentDirectory
   let fp' = cwd -/- fp
   return $ Posix.normalise fp'
+
+{- Note [NeedCurrentDirectoryForExePath]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Windows API specifies some rather convoluted rules for whether the current
+directory is included in the search when looking for an executable (e.g. for
+CreateProcess). The documentation states:
+
+  https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-needcurrentdirectoryforexepatha
+
+  NeedCurrentDirectoryForExePathA function
+  Determines whether the current directory should be included in the search path
+  for the specified executable.
+
+  If CreateProcess is called with a relative executable name, it will
+  automatically search for the executable, calling this function to determine
+  the search path.
+
+  The value of the NoDefaultCurrentDirectoryInExePath environment variable
+  determines the value this function returns.
+  If the value of the ExeName parameter contains a backslash (\), this function
+  will always return TRUE. If it does not contain a backslash, the existence of
+  the NoDefaultCurrentDirectoryInExePath environment variable is checked, and
+  not its value.
+
+In practice, this means that when we create a process with the executable being
+specified using a relative path, whether the lookup succeeds depends on
+minutiae of the path. Assuming that NoDefaultCurrentDirectoryInExePath is set,
+the behaviour is as follows:
+
+  bin\target.exe   -- SUCCEEDS: contains backslash
+  bin/target.exe   -- FAILS
+  ./bin/target.exe -- SUCCEEDS: ./ specifically means "in CWD"
+
+To avoid process spawning behaviour depending on the value of the
+NoDefaultCurrentDirectoryInExePath environment variable, we have a few choices
+for how to specify executable paths when creating a process:
+
+  1. Always use absolute paths.
+  2. Always use backslashes.
+  3. Add "./" to the front of relative paths.
+
+We choose to implement (1), see 'exeSpawnPath'. It's the most robust option, as
+it pins down the exact executable path (no search needed); (2) would go against
+Note [MSYS paths].
+-}
+
+-- | An executable path suitable for 'createProcess'.
+--
+-- See Note [NeedCurrentDirectoryForExePath].
+newtype ExeSpawnPath = ExeSpawnPath FilePath
+
+instance IsCmdArgument ExeSpawnPath where
+  toCmdArgument (ExeSpawnPath path) = toCmdArgument [path]
+
+-- | Resolve the path of a program into an 'ExeSpawnPath' suitable for a
+-- 'createProcess' invocation.
+--
+-- See Note [NeedCurrentDirectoryForExePath].
+exeSpawnPath :: FilePath -> Action ExeSpawnPath
+exeSpawnPath path
+  -- Don't touch a bare program name (e.g. "clang"), as that resolves from PATH.
+  | path == takeFileName path = return $ ExeSpawnPath path
+  | otherwise                 = ExeSpawnPath <$> liftIO (makeAbsolute path)
+
+-- | Like Shake's 'cmd', except that the program to run must be given as an
+-- 'ExeSpawnPath'. Prefer this over 'cmd', which would accept any 'String'.
+--
+-- See Note [NeedCurrentDirectoryForExePath].
+cmdExe :: (Partial, CmdArguments args) => ExeSpawnPath -> args
+cmdExe = cmdArguments . toCmdArgument
 
 -- | This is like Posix makeRelative, but assumes no sys links in the input
 -- paths. This allows the result to start with possibly many "../"s. Input
@@ -252,13 +367,13 @@ infix 1 %%>
 -- library, they can reach 2MB! Some operating systems do not support command
 -- lines of such length, and this function can be used to obtain a reasonable
 -- approximation of the limit. On Windows, it is theoretically 32768 characters
--- (since Windows 7). In practice we use 31000 to leave some breathing space for
+-- (since Windows 7). In practice we use 30000 to leave some breathing space for
 -- the builder path & name, auxiliary flags, and other overheads. On Mac OS X,
 -- ARG_MAX is 262144, yet when using @xargs@ on OSX this is reduced by over
 -- 20000. Hence, 200000 seems like a sensible limit. On other operating systems
 -- we currently use the 4194304 setting.
 cmdLineLengthLimit :: Int
-cmdLineLengthLimit | IO.isWindows = 31000
+cmdLineLengthLimit | IO.isWindows = 30000
                    | IO.isMac     = 200000
                    | otherwise    = 4194304
 
@@ -298,7 +413,7 @@ userSettingRules defaultValue = do
     extra <- shakeExtra <$> getShakeOptionsRules
     return $ lookupExtra defaultValue extra
 
-newtype BuildRoot = BuildRoot FilePath deriving (Typeable, Eq, Show)
+newtype BuildRoot = BuildRoot FilePath deriving (Eq, Show)
 
 -- | All build results are put into the 'buildRoot' directory.
 buildRoot :: Action FilePath
@@ -317,6 +432,38 @@ buildRootRules = do
 -- test is usually very fast.
 isGeneratedSource :: FilePath -> Action Bool
 isGeneratedSource file = buildRoot <&> (`isPrefixOf` file)
+
+-- | Run an command with the given arguments. If the command is too long then the
+-- response file arguments are placed into a response file and escaped with @GHC.ResponseFile.escapeArgs@.
+withResponseFileIfLongCmd ::
+    CmdResult c
+    => FilePath      -- ^ Response base name. The reponse file is placed in @_build/rsp/\<Response base name\>@.
+    -> ExeSpawnPath  -- ^ The program to run.
+    -> CmdArgument   -- ^ Command arguments before the response file arguments.
+    -> [String]      -- ^ Response file aruguments.
+    -> CmdArgument   -- ^ Command arguments after the response file arguments.
+    -> Action c
+withResponseFileIfLongCmd outputFilePath prog argsPre argsResp argsPost = do
+    let cmdLineLengh = sum
+            [ 1 + length arg -- add one to account for space inbetween arguments
+            | let CmdArgument args =
+                    toCmdArgument prog <> argsPre <> toCmdArgument argsResp <> argsPost
+            , Right arg <- args
+            ]
+    if cmdLineLengh < cmdLineLengthLimit
+        then cmdExe prog argsPre argsResp argsPost
+        else do
+            rspFile <- responseFilePath outputFilePath
+            writeFileAtomic rspFile (escapeArgs argsResp)
+            cmdExe prog argsPre ['@' : rspFile] argsPost
+
+-- | Convert a command's output file path to a response file path to be used for that command.
+-- Response files are placed in a dedicated @rps@ directory under the build directory. This avoids
+-- clutering the work tree or interfearing with other build directories.
+responseFilePath :: FilePath -> Action FilePath
+responseFilePath outputFilePath = do
+    buildDir <- buildRoot
+    return $ buildDir </> "rsp" </> outputFilePath
 
 -- | Link a file tracking the link target. Create the target directory if
 -- missing.
@@ -366,6 +513,19 @@ copyFileUntracked source target = do
     putProgressInfo =<< renderAction "Copy file (untracked)" source target
     liftIO $ IO.copyFile source target
 
+-- | An atomic version of Shake's 'Shake.writeFile''.
+writeFileAtomic :: FilePath -> String -> Action ()
+writeFileAtomic file contents = do
+    let dir = takeDirectory file
+    liftIO $ IO.createDirectoryIfMissing True dir
+    withTempFileWithin dir $ \temp -> do
+        Shake.writeFile' temp contents
+        liftIO $ IO.renameFile temp file
+
+-- | An atomic version of Shake's 'Shake.writeFileLines'.
+writeFileLinesAtomic :: FilePath -> [String] -> Action ()
+writeFileLinesAtomic file = writeFileAtomic file . unlines
+
 -- | Transform a given file by applying a function to its contents.
 fixFile :: FilePath -> (String -> String) -> Action ()
 fixFile file f = do
@@ -375,20 +535,22 @@ fixFile file f = do
         let new = f old
         IO.evaluate $ rnf new
         return new
-    liftIO $ writeFile file contents
+    writeFileAtomic file contents
 
 -- | Make a given file executable by running the @chmod +x@ command.
 makeExecutable :: FilePath -> Action ()
 makeExecutable file = do
     putProgressInfo $ "| Make " ++ quote file ++ " executable."
-    quietly $ cmd "chmod +x " [file]
+    chmodProg <- exeSpawnPath "chmod"
+    quietly $ cmdExe chmodProg ["+x", file]
 
 
 -- | Move a file. Note that we cannot track the source, because it is moved.
 moveFile :: FilePath -> FilePath -> Action ()
 moveFile source target = do
     putProgressInfo =<< renderAction "Move file" source target
-    quietly $ cmd ["mv", source, target]
+    mvProg <- exeSpawnPath "mv"
+    quietly $ cmdExe mvProg [source, target]
 
 -- | Remove a file that doesn't necessarily exist.
 removeFile :: FilePath -> Action ()
@@ -406,13 +568,15 @@ createDirectory dir = do
 copyDirectory :: FilePath -> FilePath -> Action ()
 copyDirectory source target = do
     putProgressInfo =<< renderAction "Copy directory" source target
-    quietly $ cmd ["cp", "-r", source, target]
+    cpProg <- exeSpawnPath "cp"
+    quietly $ cmdExe cpProg ["-r", source, target]
 
 -- | Move a directory. The contents of the source directory is untracked.
 moveDirectory :: FilePath -> FilePath -> Action ()
 moveDirectory source target = do
     putProgressInfo =<< renderAction "Move directory" source target
-    quietly $ cmd ["mv", source, target]
+    mvProg <- exeSpawnPath "mv"
+    quietly $ cmdExe mvProg [source, target]
 
 -- | Remove a directory that doesn't necessarily exist.
 removeDirectory :: FilePath -> Action ()
@@ -484,7 +648,6 @@ putColoured code msg = do
         else putInfo msg
 
 newtype BuildProgressColour = BuildProgressColour String
-    deriving Typeable
 
 -- | By default, Hadrian tries to figure out if the current terminal
 --   supports colors using this function. The default can be overridden
@@ -511,7 +674,6 @@ putBuild msg = do
     putColoured code msg
 
 newtype SuccessColour = SuccessColour String
-    deriving Typeable
 
 -- | Generate an encoded colour for successful output from names
 mkSuccessColour :: Colour -> SuccessColour
@@ -528,7 +690,6 @@ putSuccess msg = do
     putColoured code msg
 
 newtype FailureColour = FailureColour String
-    deriving Typeable
 
 -- | Generate an encoded colour for failure output messages
 mkFailureColour :: Colour -> FailureColour
@@ -544,7 +705,7 @@ putFailure msg = do
   FailureColour code <- userSetting red
   putColoured code msg
 
-data ProgressInfo = None | Brief | Normal | Unicorn deriving (Eq, Show, Typeable)
+data ProgressInfo = None | Brief | Normal | Unicorn deriving (Eq, Show)
 
 -- | Version of 'putBuild' controlled by @--progress-info@ command line argument.
 putProgressInfo :: String -> Action ()
@@ -694,7 +855,3 @@ renderUnicorn ls =
     ponyPadding = "                                            "
     boxLines :: [String]
     boxLines = ["", "", ""] ++ (lines . renderBox $ ls)
-
--- Workaround for https://github.com/haskell/directory/issues/180
-findExecutable :: String -> IO (Maybe FilePath)
-findExecutable exe = IO.catch (IO.findExecutable exe) $ \(_ :: IO.IOException) -> pure Nothing

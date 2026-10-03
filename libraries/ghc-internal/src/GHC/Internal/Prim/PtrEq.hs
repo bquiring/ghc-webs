@@ -34,15 +34,12 @@ module GHC.Internal.Prim.PtrEq
     sameMutVar#,
     sameTVar#,
     sameMVar#,
-    sameIOPort#,
     samePromptTag#,
     eqStableName#
   ) where
 
+import GHC.Internal.Base -- Also make implicit dependency known to build system
 import GHC.Internal.Prim
-import GHC.Internal.Types -- Also make implicit dependency known to build system
-  ( RuntimeRep(BoxedRep), UnliftedType )
-default () -- Double and Integer aren't available yet
 
 {- **********************************************************************
 *                                                                       *
@@ -128,10 +125,6 @@ sameTVar# = unsafePtrEquality#
 -- | Compare the underlying pointers of two 'MVar#'s.
 sameMVar# :: forall {l} s (a :: TYPE (BoxedRep l)). MVar# s a -> MVar# s a -> Int#
 sameMVar# = unsafePtrEquality#
-
--- | Compare the underlying pointers of two 'IOPort#'s.
-sameIOPort# :: forall {l} s (a :: TYPE (BoxedRep l)). IOPort# s a -> IOPort# s a -> Int#
-sameIOPort# = unsafePtrEquality#
 
 -- | Compare the underlying pointers of two 'PromptTag#'s.
 samePromptTag# :: forall a. PromptTag# a -> PromptTag# a -> Int#

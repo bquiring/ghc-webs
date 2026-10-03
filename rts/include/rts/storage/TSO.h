@@ -30,6 +30,15 @@ typedef StgWord64 StgThreadID;
 
 #define tsoLocked(tso) ((tso)->flags & TSO_LOCKED)
 
+/* Type for the tso->why_blocked field. See values in Constants.h.
+ *
+ * The StgThreadWhyBlocked type could be 8-bits, but for reasons
+ * unclear it is currently 32-bits. Previous comments here claimed
+ * that the smallest atomic type on AArch64 is 32-bits, but this is
+ * false.
+ */
+typedef StgWord32 StgThreadWhyBlocked;
+
 /*
  * Type returned after running a thread.  Values of this type
  * include HeapOverflow, StackOverflow etc.  See Constants.h for the
@@ -37,32 +46,52 @@ typedef StgWord64 StgThreadID;
  */
 typedef unsigned int StgThreadReturnCode;
 
+/* Additional information about how the thread is blocked.
+ * The tso->why_blocked is the tag for this union. */
+typedef union {
+  /* Used for generic read, for cases where block_info is a closure.
+   * Never used for writes. Use .unused below instead. */
+  StgClosure *closure;
+
+  /* For why_blocked cases where block_info is unused, this will be set to
+   * END_TSO_QUEUE, to maintain invariant that block_info.closure is valid */
+  StgTSO *unused;
+
+  /* case NotBlocked: A back-link when the TSO is on the run queue */
+  StgTSO *prev;
+
+  /* case BlockedOnMVar, BlockedOnMVarRead: the mvar the TSO is blocked on */
+  StgMVar *mvar;
+
+  /* case BlockedOnBlackHole */
+  struct MessageBlackHole_ *bh;
+
+  /* case BlockedOnMsgThrowTo */
+  struct MessageThrowTo_ *throwto;
+
+  /* case BlockedOnRead, BlockedOnWrite: legacy select I/O manager */
+  StgInt fd;    /* StgInt instead of int, so that it's the same size as the ptrs */
+
+  /* case BlockedOnRead, BlockedOnWrite: new I/O managers */
+  StgAsyncIOOp *aiop;
+
+  /* case BlockedOnDelay: new I/O managers */
+  StgTimeoutQueue *timeout;
+
 #if defined(mingw32_HOST_OS)
-/* results from an async I/O request + its request ID. */
-typedef struct {
-  unsigned int reqID;
-  int          len;
-  int          errCode;
-} StgAsyncIOResult;
+  /* case BlockedOnRead, BlockedOnWrite, BlockedOnDoProc:
+   * only used by the win32-legacy I/O manager.
+   * This is the async request id for the operation. */
+  StgWord async_reqID;
 #endif
 
-/* Reason for thread being blocked. See comment above struct StgTso_. */
-typedef union {
-  StgClosure *closure;
-  StgTSO *prev; // a back-link when the TSO is on the run queue (NotBlocked)
-  struct MessageBlackHole_ *bh;
-  struct MessageThrowTo_ *throwto;
-  struct MessageWakeup_  *wakeup;
-  StgInt fd;    /* StgInt instead of int, so that it's the same size as the ptrs */
-#if defined(mingw32_HOST_OS)
-  StgAsyncIOResult *async_result;
-#endif
 #if !defined(THREADED_RTS)
+  /* case BlockedOnDelay: used by the select I/O manager */
   StgWord target;
-    // Only for the non-threaded RTS: the target time for a thread
-    // blocked in threadDelay, in units of 1ms.  This is a
-    // compromise: we don't want to take up much space in the TSO.  If
-    // you want better resolution for threadDelay, use -threaded.
+    // Only for the legacy select I/O manager: the target time for a thread
+    // blocked in threadDelay, in units of 1ms.  This is a compromise: we don't
+    // want to take up much space in the TSO.  If you want better resolution
+    // for threadDelay, use *literally any* other I/O manager.
 #endif
 } StgTSOBlockInfo;
 
@@ -78,7 +107,21 @@ typedef union {
  * have the reason in the why_blocked field of the TSO, and some
  * further info (such as the closure the thread is blocked on, or the
  * file descriptor if the thread is waiting on I/O) in the block_info
- * field.
+ * field. See Constants.h for the why_blocked values.
+ *
+ * The why_blocked field must be updated atomically. The protocol for
+ * updating block_info and why_blocked fields together is as follows:
+ *
+ *   Writes:
+ *     - first write block_info (normal non-atomic write)
+ *     - then write why_blocked with an atomic *store release*
+ *
+ *   Reads:
+ *     - first read why_blocked with an atomic *load acquire*
+ *     - then read block_info (normal non-atomic read)
+ *
+ *   Read of only why_blocked without block_info:
+ *     - read why_blocked with an atomic *relaxed load*
  */
 
 typedef struct StgTSO_ {
@@ -128,11 +171,7 @@ typedef struct StgTSO_ {
     StgWord16               what_next;      // Values defined in Constants.h
     StgWord32               flags;          // Values defined in Constants.h
 
-    /*
-     * N.B. why_blocked only has a handful of values but must be atomically
-     * updated; the smallest width which AArch64 supports for is 32-bits.
-     */
-    StgWord32               why_blocked;    // Values defined in Constants.h
+    StgThreadWhyBlocked     why_blocked;    // Values defined in Constants.h
     StgTSOBlockInfo         block_info;     // Barrier provided by why_blocked
     StgThreadID             id;
     StgWord32               saved_errno;
@@ -183,6 +222,15 @@ typedef struct StgTSO_ {
      * hard +RTS -K<size> limit.
      */
     StgWord32  tot_stack_size;
+
+    /*
+     * The number of stack words spilled by the current stg_ctoi_t
+     * frame. This is used by stg_ctoi_t to handle tuple returns from compiled
+     * to interpreted code.
+     *
+     * See Note [GHCi unboxed tuples stack spills] in StgMiscClosures.cmm
+     */
+    StgWord    ctoi_tuple_spill_words;
 
 #if defined(TICKY_TICKY)
     /* TICKY-specific stuff would go here. */
@@ -318,7 +366,6 @@ void dirty_STACK (Capability *cap, StgStack *stack);
         BlockedOnMVar          the MVAR             the MVAR's queue
 
         BlockedOnSTM           END_TSO_QUEUE        STM wait queue(s)
-        BlockedOnSTM           STM_AWOKEN           run queue
 
         BlockedOnMsgThrowTo    MessageThrowTo *     TSO->blocked_exception
 

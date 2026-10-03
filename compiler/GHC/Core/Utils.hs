@@ -11,6 +11,7 @@ module GHC.Core.Utils (
         -- * Constructing expressions
         mkCast, mkCastMCo, mkPiMCo,
         mkTick, mkTicks, mkTickNoHNF, tickHNFArgs,
+        mkTickCpe,
         bindNonRec, needsCaseBinding, needsCaseBindingL,
         mkAltExpr, mkDefaultCase, mkSingleAltCase,
 
@@ -19,6 +20,7 @@ module GHC.Core.Utils (
         mergeAlts, mergeCaseAlts, trimConArgs,
         filterAlts, combineIdenticalAlts, refineDefaultAlt,
         scaleAltsBy,
+        BinderSwapDecision(..), scrutOkForBinderSwap,
 
         -- * Properties of expressions
         exprType, coreAltType, coreAltsType,
@@ -32,7 +34,9 @@ module GHC.Core.Utils (
         isCheapApp, isExpandableApp, isSaturatedConApp,
         exprIsTickedString, exprIsTickedString_maybe,
         exprIsTopLevelBindable,
-        altsAreExhaustive, etaExpansionTick,
+        exprIsUnaryClassFun, isUnaryClassId,
+        altsAreExhaustive,
+        canCollectArgsThroughTick, cantEtaReduceFun,
 
         -- * Equality
         cheapEqExpr, cheapEqExpr', diffBinds,
@@ -57,7 +61,7 @@ module GHC.Core.Utils (
         isJoinBind,
 
         -- * Tag inference
-        mkStrictFieldSeqs, shouldStrictifyIdForCbv, shouldUseCbvForId,
+        mkStrictFieldSeqs, wantCbvForId,
 
         -- * unsafeEqualityProof
         isUnsafeEqualityCase,
@@ -71,18 +75,19 @@ import GHC.Platform
 
 import GHC.Core
 import GHC.Core.Ppr
-import GHC.Core.FVs( bindFreeVars )
+import GHC.Core.FVs( exprFreeVars, bindFreeVars )
 import GHC.Core.DataCon
 import GHC.Core.Type as Type
 import GHC.Core.Predicate( isEqPred )
+import GHC.Core.Predicate( isUnaryClass )
 import GHC.Core.FamInstEnv
-import GHC.Core.TyCo.Compare( eqType, eqTypeX )
+import GHC.Core.TyCo.Compare( eqType, eqTypeX, eqTypeIgnoringMultiplicity )
 import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.TyCon
 import GHC.Core.Multiplicity
 
-import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofIdKey, unsafeReflDataConKey )
+import GHC.Builtin.KnownKeys ( makeStaticKey, unsafeEqualityProofIdKey, unsafeReflDataConKey )
 import GHC.Builtin.PrimOps
 
 import GHC.Types.Var
@@ -98,24 +103,25 @@ import GHC.Types.Basic( Arity )
 import GHC.Types.Unique
 import GHC.Types.Unique.Set
 import GHC.Types.Demand
-import GHC.Types.RepType (isZeroBitTy)
+import GHC.Types.RepType (isZeroBitTy, mightBeFunTy)
 
 import GHC.Data.FastString
 import GHC.Data.Maybe
 import GHC.Data.List.SetOps( minusList )
 import GHC.Data.OrdList
 
+import GHC.Data.Bag        (emptyBag, snocBag, bagToList)
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 
+import Control.Monad       ( guard )
 import Data.ByteString     ( ByteString )
 import Data.Function       ( on )
 import Data.List           ( sort, sortBy, partition, zipWith4, mapAccumL )
-import qualified Data.List as Partial ( init, last )
+import qualified Data.List.NonEmpty as NE
 import Data.Ord            ( comparing )
-import Control.Monad       ( guard )
 import qualified Data.Set as Set
 
 {-
@@ -250,7 +256,7 @@ applyTypeToArgs op_ty args
 
 mkCastMCo :: CoreExpr -> MCoercionR -> CoreExpr
 mkCastMCo e MRefl    = e
-mkCastMCo e (MCo co) = Cast e co
+mkCastMCo e (MCo co) = mkCast e co
   -- We are careful to use (MCo co) only when co is not reflexive
   -- Hence (Cast e co) rather than (mkCast e co)
 
@@ -273,11 +279,13 @@ mkCast expr co
   = assertPpr (coercionRole co == Representational)
               (text "coercion" <+> ppr co <+> text "passed to mkCast"
                <+> ppr expr <+> text "has wrong role" <+> ppr (coercionRole co)) $
-    warnPprTrace (not (coercionLKind co `eqType` exprType expr))
-          "Trying to coerce" (text "(" <> ppr expr
-          $$ text "::" <+> ppr (exprType expr) <> text ")"
-          $$ ppr co $$ ppr (coercionType co)
-          $$ callStackDoc) $
+    warnPprTrace (not (coercionLKind co `eqTypeIgnoringMultiplicity` exprType expr)) "Bad cast"
+      (vcat [ text "Coercion LHS kind does not match enclosed expression type"
+            , text "co:" <+> ppr co
+            , text "coercionLKind:" <+> ppr (coercionLKind co)
+            , text "exprType:" <+> ppr (exprType expr)
+            , text "expr:" <+> ppr expr
+            , callStackDoc ]) $
     case expr of
       Cast expr co2 -> mkCast expr (mkTransCo co2 co)
       Tick t expr   -> Tick t (mkCast expr co)
@@ -298,103 +306,349 @@ mkCast expr co
 *                                                                      *
 ********************************************************************* -}
 
--- | Wraps the given expression in the source annotation, dropping the
--- annotation if possible.
+-- | Wraps the given expression in a Tick, floating the tick as far into
+-- the AST as possible in order to try to satisfy the tick's desired placement
+-- properties (as per Note [Tickish placement] in GHC.Types.Tickish).
+--
+-- Prefer using 'mkTick' over explicit use of the 'Tick' constructor.
+--
+-- Also performs small on-the-fly optimisations:
+--
+--   * Eliminate unnecessary ticks by either absorbing them into existing ones
+--     or dropping them if that is valid (e.g. dropping profiling ticks around
+--     types, coercions and literals).
+--   * Split profiling ticks into counting/scoping parts so that the two parts
+--     can be placed independently into the AST.
 mkTick :: CoreTickish -> CoreExpr -> CoreExpr
-mkTick t orig_expr = mkTick' id id orig_expr
+mkTick = mk_tick False
+
+-- | A version of 'mkTick' that preserves ANF, for use in Core Prep.
+--
+-- See Note [mkTick breaks ANF] in GHC.CoreToStg.Prep.
+mkTickCpe :: CoreTickish -> CoreExpr -> CoreExpr
+mkTickCpe = mk_tick True
+
+-- | Internal function used to define both 'mkTick' and 'mkTickCpe'
+-- without duplication.
+mk_tick :: Bool -> CoreTickish -> CoreExpr -> CoreExpr
+mk_tick preserve_anf t orig_expr = mk_tick_t orig_expr
  where
   -- Some ticks (cost-centres) can be split in two, with the
   -- non-counting part having laxer placement properties.
-  canSplit = tickishCanSplit t && tickishPlace (mkNoCount t) /= tickishPlace t
-  -- mkTick' handles floating of ticks *into* the expression.
-  -- In this function, `top` is applied after adding the tick, and `rest` before.
-  -- This will result in applications that look like (top $ Tick t $ rest expr).
-  -- If we want to push the tick deeper, we pre-compose `top` with a function
-  -- adding the tick.
-  mkTick' :: (CoreExpr -> CoreExpr) -- apply after adding tick (float through)
-          -> (CoreExpr -> CoreExpr) -- apply before adding tick (float with)
-          -> CoreExpr               -- current expression
-          -> CoreExpr
-  mkTick' top rest expr = case expr of
-    -- Float ticks into unsafe coerce the same way we would do with a cast.
-    Case scrut bndr ty alts@[Alt ac abs _rhs]
-      | Just rhs <- isUnsafeEqualityCase scrut bndr alts
-      -> top $ mkTick' (\e -> Case scrut bndr ty [Alt ac abs e]) rest rhs
+  -- See Note [Scoping ticks and counting ticks] in GHC.Types.Tickish.
+  can_split = tickishCanSplit t
 
-    -- Cost centre ticks should never be reordered relative to each
-    -- other. Therefore we can stop whenever two collide.
-    Tick t2 e
-      | ProfNote{} <- t2, ProfNote{} <- t -> top $ Tick t $ rest expr
-
-    -- Otherwise we assume that ticks of different placements float
-    -- through each other.
-      | tickishPlace t2 /= tickishPlace t -> mkTick' (top . Tick t2) rest e
-
-    -- For annotations this is where we make sure to not introduce
-    -- redundant ticks.
-      | tickishContains t t2              -> mkTick' top rest e
-      | tickishContains t2 t              -> orig_expr
-      | otherwise                         -> mkTick' top (rest . Tick t2) e
-
-    -- Ticks don't care about types, so we just float all ticks
-    -- through them. Note that it's not enough to check for these
-    -- cases top-level. While mkTick will never produce Core with type
-    -- expressions below ticks, such constructs can be the result of
-    -- unfoldings. We therefore make an effort to put everything into
-    -- the right place no matter what we start with.
-    Cast e co   -> mkTick' (top . flip Cast co) rest e
-    Coercion co -> Coercion co
+  -- mk_tick_t handles floating of tick `t` *into* the expression.
+  mk_tick_t :: CoreExpr -> CoreExpr
+  mk_tick_t expr
+    -- Deal with ticking a expression headed by one or more ticks.
+    | Just (ts, e) <- tickedExpr_maybe expr
+    = tickTickedExpr preserve_anf t ts e
+  mk_tick_t expr = case expr of
 
     Lam x e
       -- Always float through type lambdas. Even for non-type lambdas,
       -- floating is allowed for all but the most strict placement rule.
       | not (isRuntimeVar x) || tickishPlace t /= PlaceRuntime
-      -> mkTick' (top . Lam x) rest e
+      -> Lam x $ mk_tick_t e
 
-      -- If it is both counting and scoped, we split the tick into its
-      -- two components, often allowing us to keep the counting tick on
-      -- the outside of the lambda and push the scoped tick inside.
-      -- The point of this is that the counting tick can probably be
-      -- floated, and the lambda may then be in a position to be
-      -- beta-reduced.
-      | canSplit
-      -> top $ Tick (mkNoScope t) $ rest $ Lam x $ mkTick (mkNoCount t) e
+      -- Push SCCs into lambdas.
+      -- See (PSCC2) in Note [Pushing SCCs inwards].
+      | can_split
+      -> Tick (mkNoScope t) $ Lam x $ mk_tick preserve_anf (mkNoCount t) e
 
     App f arg
-      -- Always float through type applications.
+      -- All ticks float inwards through non-runtime arguments, as per
+      -- Note [Tickish placement] in GHC.Types.Tickish.
       | not (isRuntimeArg arg)
-      -> mkTick' (top . flip App arg) rest f
+      -> App (mk_tick_t f) arg
 
-      -- We can also float through constructor applications, placement
-      -- permitting. Again we can split.
-      | isSaturatedConApp expr && (tickishPlace t==PlaceCostCentre || canSplit)
+      -- Push SCCs into saturated constructor applications.
+      -- See (PSCC3) in Note [Pushing SCCs inwards].
+      | not preserve_anf -- this optimisation breaks ANF;
+                         -- see Note [mkTick breaks ANF] in GHC.CoreToStg.Prep
+      , isSaturatedConApp expr
+      , tickishPlace t == PlaceCostCentre || can_split
       -> if tickishPlace t == PlaceCostCentre
-         then top $ rest $ tickHNFArgs t expr
-         else top $ Tick (mkNoScope t) $ rest $ tickHNFArgs (mkNoCount t) expr
+         then tickHNFArgs t expr
+         else Tick (mkNoScope t) $ tickHNFArgs (mkNoCount t) expr
+
+    -- See Note [No ticks around types or coercions]
+    e@(Coercion {}) -> e
+    e@(Type {})     -> e
+    -- Don't wrap static data in a tick which compiles to code,
+    -- as the code will never be run.
+    e@(Lit {}) | tickishIsCode t -> e
+
+    -- All ticks can be floated through casts, as per Note [Tickish placement].
+    Cast e co   -> mkCast (mk_tick_t e) co
+
+    -- Treat 'unsafeCoerce' as if it was a cast: float all ticks inwards.
+    -- See Note [Push ticks into unsafeCoerce]
+    Case scrut bndr ty alts@[Alt ac abs _rhs]
+      | Just rhs <- isUnsafeEqualityCase scrut bndr alts
+      -> Case scrut bndr ty [Alt ac abs (mk_tick_t rhs)]
 
     Var x
-      | notFunction && tickishPlace t == PlaceCostCentre
-      -> orig_expr
-      | notFunction && canSplit
-      -> top $ Tick (mkNoScope t) $ rest expr
-      where
-        -- SCCs can be eliminated on variables provided the variable
-        -- is not a function.  In these cases the SCC makes no difference:
-        -- the cost of evaluating the variable will be attributed to its
-        -- definition site.  When the variable refers to a function, however,
-        -- an SCC annotation on the variable affects the cost-centre stack
-        -- when the function is called, so we must retain those.
-        notFunction = not (isFunTy (idType x))
-
-    Lit{}
+       -- Don't drop any ticks around anything that might be a function,
+       -- including:
+       --
+       --  1. Definite function types such as 'Int -> Bool'.
+       --  2. Newtypes around function types, e.g. 'IO ()'. (#27225)
+       --  3. Type family applications that reduce to (1) or (2).
+      | mightBeFunTy (idType x)
+      -> Tick t expr
+      -- Drop SCCs around non-function variables.
+      -- See (PSCC1) in Note [Pushing SCCs inwards].
       | tickishPlace t == PlaceCostCentre
-      -> orig_expr
+      -> -- Drop pure SCC ticks:  scc<foo> (x :: Int) ==> x
+         expr
+      | can_split
+      -> -- Drop the scoping part of the tick, but keep the counting part.
+         Tick (mkNoScope t) expr
 
-    -- Catch-all: Annotate where we stand
-    _any -> top $ Tick t $ rest expr
+    -- Catch-all: annotate where we stand.
+    -- In particular (but not only): Let, most Cases.
+    _other -> Tick t expr
+
+-- | Apply a tick to an expression headed by ticks.
+tickTickedExpr
+  :: Bool                    -- ^ preserve ANF?
+  -> CoreTickish             -- ^ tick to add
+  -> NE.NonEmpty CoreTickish -- ^ existing stack of ticks
+  -> CoreExpr                -- ^ inner core expression
+  -> CoreExpr
+tickTickedExpr preserve_anf t1 t2s e
+
+  -- Case 1: common up 't1' with a tick in the stack.
+  --
+  -- It's important to look at the whole stack to expose more opportunities for
+  -- combination.
+  -- See Note [Avoiding duplicate ticks] in GHC.Core.Opt.FloatOut
+  -- and Note [Ordering of source notes] in GHC.Types.Tickish.
+  | Just combined <- combine_into_stack t1 (NE.toList t2s)
+  = case combined of
+      DropIncomingTick          -> apply_ticks t2s e
+      TickOutsideStack t1' t2s' -> Tick t1' (apply_ticks t2s' e)
+
+  -- Case 2: 't1' can be commuted past all the ticks in the stack, e.g. because
+  -- it has tighter placement properties than all the ticks in the stack.
+  -- Push it inwards to expose cancellation opportunities.
+  | all (tickishCommutable t1) t2s
+  = apply_ticks t2s $ mk_tick preserve_anf t1 e
+
+  -- Fallback: keep the new tick on the outside.
+  | otherwise
+  = Tick t1 (apply_ticks t2s e)
+
+  where
+    apply_ticks :: Foldable f => f CoreTickish -> CoreExpr -> CoreExpr
+    apply_ticks ts e' = foldr Tick e' ts
+    {-# INLINE apply_ticks #-}
+
+-- | The result of combining a tick into a stack of ticks.
+data CombineIntoStack
+  -- | Drop the incoming tick: it's subsumed by a tick in the stack.
+  = DropIncomingTick
+  -- | Keep the incoming tick on the outside (possibly merged with an inner tick),
+  -- and wrap it around the given stack (from which we removed subsumed ticks).
+  | TickOutsideStack !CoreTickish [CoreTickish]
+
+-- | Try to combine a tick into a stack of ticks, never re-ordering any ticks.
+--
+--  - If the tick is subsumed by a tick in the stack, drop it.
+--  - Otherwise merge it with the ticks it subsumes and keep the result outside
+--    the whole stack (#27749), discarding the ticks it makes redundant.
+combine_into_stack :: CoreTickish -> [CoreTickish] -> Maybe CombineIntoStack
+combine_into_stack _ [] = Nothing
+combine_into_stack s (t : ts) =
+  case combineTickish_maybe s t of
+    Just s1
+      -- 's1 is redundant: drop it, keeping the stack as it is.
+      | s1 == t  -> Just DropIncomingTick
+      -- 't' is redundant: put 's1' outside the stack.
+      -- Carry on, as 's1' may subsume further ticks in the stack.
+      | otherwise -> Just $ combine_into_stack s1 ts `orElse` TickOutsideStack s1 ts
+    -- Didn't combine: recur, and discard 't' if we end up putting a tick on the
+    -- outside that subsumes it.
+    Nothing -> retain t <$> combine_into_stack s ts
+  where
+    retain _  DropIncomingTick = DropIncomingTick -- retains it
+    retain t1 res@(TickOutsideStack s1 ss)
+      | Just t1' <- combineTickish_maybe s1 t1
+      , s1 == t1'
+      -- s1 subsumes t1: drop t1
+      = res
+      | otherwise
+      = TickOutsideStack s1 (t1 : ss)
+
+{- Note [Pushing SCCs inwards]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Amongst all ticks, SCCs have the laxest placement properties (PlaceCostCentre,
+as described in Note [Tickish placement] GHC.Types.Tickish):
+
+  (PSCC1) SCCs around non-function variables can be eliminated.
+    The cost of evaluating the variable will be attributed to its definition
+    site, so the SCC makes no difference. Example:
+
+      scc<foo> (x :: Int)  ==>  x
+
+    NB: this is only valid when the variable is not a function. For example, in:
+
+      scc<foo> (f :: Int -> Int)
+
+    we must retain the cost centre annotation, as it affects the cost-centre
+    pointer when the function is called. Discarding the SCC in this case would
+    defeat the profiling mechanism entirely!
+
+  (PSCC2) SCCs can be pushed into lambdas.
+
+       scc<foo> (\x -> e)  ==>  \x -> scc<foo> e
+
+  (PSCC3) We can push SCCs into (saturated) constructor applications.
+    For example, for an arity 2 data constructor 'D':
+
+       scc<foo> (D e1 e2)  ==>  D (scc<foo> e1) (scc<foo> e2)
+
+Now, two kinds of ticks contain SCCs:
+
+  - bare SCCs (i.e. ProfNote with profNoteCounts = False, profNoteScopes = True)
+  - profiling ticks that both count and scope
+
+The above explanation deals with bare SCCs. When handling profiling ticks that
+both count and scope, we can split tick into two, so that the scoping part can
+be pushed inwards (or even discarded). Specifically, we perform the following
+transformations:
+
+  (PSCC1) Drop the SCC around non-function variables, keeping only the counting
+    part:
+
+       scctick<foo> (x :: Int)  ==>  tick<foo> x
+
+  (PSCC2) Push the SCC inside lambdas:
+
+       scctick<foo> (\x. e)  ==>  tick<foo> (\x. scc<foo> e)
+
+    NB: we must keep the counting part outside the lambda, in order to preserve
+    tick counter tallies – it would not be sound to push the counting part inside.
+
+  (PSCC3) Push the SCC inside saturated contructor applications.
+
+       scctick<foo> (D e1 e2)  ==>  tick<foo> (D (scc<foo> e1) (scc<foo> e2))
+
+The benefit of these transformation is that the counting part, tick<foo>, can
+likely be floated out of the way, which may expose additional optimisation
+opportunities. For example, for (PSCC2):
+
+  (scctick<foo> (\x. e)) arg
+
+    ==>{PSCC2}
+
+  (tick<foo> (\x. scc<foo> e)) arg
+
+    ==>{GHC.Core.Opt.FloatOut.floatExpr, because 'tick<foo>' has no scope}
+
+  tick<foo> ((\x. scc<foo> e) arg)
+
+    ==>{beta reduction}
+
+  tick<foo> (let x = arg in scc<foo> e)
+
+For (PSCC3):
+
+  case (scctick<foo> (Just x)) of { Nothing -> 0; Just y -> y + 1 }
+
+    ==>{PSCC3}
+
+  case (tick<foo> (Just (scc<foo> x))) of { Nothing -> 0; Just y -> y + 1 }
+
+    ==>{GHC.Core.Opt.FloatOut.floatExpr, because 'tick<foo>' has no scope}
+
+  tick<foo> (case Just (scc<foo> x) of { Nothing -> 0; Just y -> y + 1 })
+
+    ==>{case of known constructor}
+
+  tick<foo> (let y = scc<foo> x in y + 1)
+
+Note [Push ticks into unsafeCoerce]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In #25212, we had a program of the form:
+
+  data Box = Box Any
+  asBox :: a -> Box
+  asBox x = {-# SCC asBox #-} Box (unsafeCoerce x)
+
+As per Note [Implementing unsafeCoerce] in GHC.Internal.Unsafe.Coerce, the call
+to `unsafeCoerce` turns into
+
+  case unsafeEqualityProof @Type @a @Any of
+    UnsafeRefl (co :: a ~# Any) -> x |> Sub co
+
+The worker for 'asBox' is then of the form:
+
+  $wasBox = \@a (x :: a) ->
+    (# case unsafeEqualityProof @Type @a @Any of
+        UnsafeRefl (co :: a ~# Any) -> x |> Sub co
+    #)
+
+When inserting the SCC, we push it into the constructor as per (PSCC3) in
+Note [Pushing SCCs inwards], so we get:
+
+  $wasBox = \@a (x :: a) ->
+    tick<asBox>
+    (# scc<asBox>
+       case unsafeEqualityProof @Type @a @Any of
+         UnsafeRefl (co :: a ~# Any) -> x |> Sub co
+    #)
+
+Now, if we don't push the SCC tick into the case statement, Core Prep will
+see an expression like 'MkSolo# (scc<asBox> ...)', which it will ANFise to
+'let x = scc<asBox> ... in MkSolo# x', creating an unwanted thunk in the process.
+
+So the strategy is to treat this 'unsafeEqualityProof' case statement as if it
+was a cast. We thus push the SCC into the RHS of the pattern match:
+
+  $wasBox = \@a (x :: a) ->
+    tick<asBox>
+    (# case unsafeEqualityProof @Type @a @Any of
+         UnsafeRefl (co :: a ~# Any) -> scc<asBox> x |> Sub co
+    #)
+
+Then the SCC completely evaporates, as per (PSCC1) in Note [Pushing SCCs inwards].
+
+Note [No ticks around types or coercions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It doesn't make much sense to put a tick around a type or a coercion, as both
+types and coercions are erased in the end.
+
+In fact, it is quite dangerous to add a tick around types or coercions, because
+the optimiser does not robustly look through ticks:
+
+  - 'GHC.Core.SimpleOpt.simple_bind_pair' does not look through ticks when
+    looking at the RHS to decide whether it is a Type or Coercion,
+  - 'GHC.Core.Opt.Simplify.Iteration.completeBind' does not look through ticks
+    when looking at the RHS of an CoVar binding.
+
+This means it is vital to drop ticks around types/coercions:
+
+  - (#26941) Core Lint rejects bindings of the form "let co = tick ..."
+    in which the LHS is a CoVar and the RHS is a ticked Coercion.
+  - (#27121) The simplifier mis-handles ticked coercion bindings, which can
+    result in 'lookupIdSubst' panics (due to failing to extend the substitution
+    with a coercion).
+-}
 
 mkTicks :: [CoreTickish] -> CoreExpr -> CoreExpr
 mkTicks ticks expr = foldr mkTick expr ticks
+
+-- | Is this expression headed by a stack of ticks?
+tickedExpr_maybe :: CoreExpr -> Maybe (NE.NonEmpty CoreTickish, CoreExpr)
+tickedExpr_maybe = go emptyBag
+  where
+    go ts (Tick t e) = go (ts `snocBag` t) e
+    go ts e = case bagToList ts of
+      [] -> Nothing
+      t2:rest -> Just (t2 NE.:| rest, e)
 
 isSaturatedConApp :: CoreExpr -> Bool
 isSaturatedConApp e = go e []
@@ -587,6 +841,28 @@ The default alternative must be first, if it exists at all.
 This makes it easy to find, though it makes matching marginally harder.
 -}
 
+data BinderSwapDecision
+  = NoBinderSwap
+  | DoBinderSwap OutVar MCoercion
+
+scrutOkForBinderSwap :: OutExpr -> BinderSwapDecision
+-- If (scrutOkForBinderSwap e = DoBinderSwap v mco, then
+--    e = v |> mco
+-- See Note [Case of cast]
+-- See Historical Note [Care with binder-swap on dictionaries]
+--
+-- We use this same function in SpecConstr, and Simplify.Iteration,
+-- when something binder-swap-like is happening
+--
+-- See Note [Binder swap] in GHC.Core.Opt.OccurAnal
+scrutOkForBinderSwap e
+  = case e of
+      Tick _ e        -> scrutOkForBinderSwap e  -- Drop ticks
+      Var v           -> DoBinderSwap v MRefl
+      Cast (Var v) co -> DoBinderSwap v (MCo co)
+                         -- Cast: see Note [Case of cast]
+      _               -> NoBinderSwap
+
 -- | Extract the default case alternative
 findDefault :: [Alt b] -> ([Alt b], Maybe (Expr b))
 findDefault (Alt DEFAULT args rhs : alts) = assert (null args) (alts, Just rhs)
@@ -648,11 +924,12 @@ filters down the matching alternatives in GHC.Core.Opt.Simplify.rebuildCase.
 -}
 
 ---------------------------------
-mergeCaseAlts :: Id -> [CoreAlt] -> Maybe ([CoreBind], [CoreAlt])
+mergeCaseAlts :: CoreExpr -> Id -> [CoreAlt] -> Maybe ([CoreBind], [CoreAlt])
 -- See Note [Merge Nested Cases]
-mergeCaseAlts outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
+mergeCaseAlts scrut outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
   | Just (joins, inner_alts) <- go deflt_rhs
-  = Just (joins, mergeAlts outer_alts inner_alts)
+  , Just aux_binds <- mk_aux_binds joins
+  = Just (aux_binds ++ joins, mergeAlts outer_alts inner_alts )
                 -- NB: mergeAlts gives priority to the left
                 --      case x of
                 --        A -> e1
@@ -662,6 +939,20 @@ mergeCaseAlts outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
                 -- When we merge, we must ensure that e1 takes
                 -- precedence over e2 as the value for A!
   where
+    scrut_fvs = exprFreeVars scrut
+
+    -- See Note [Floating join points out of DEFAULT alternatives]
+    mk_aux_binds join_binds
+      | not (any mentions_outer_bndr join_binds)
+      = Just []                         -- Good!  No auxiliary bindings needed
+      | exprIsTrivial scrut
+      , not (outer_bndr `elemVarSet` scrut_fvs)
+      = Just [NonRec outer_bndr scrut]  -- Need a fixup binding
+      | otherwise
+      = Nothing                         -- Can't do it
+
+    mentions_outer_bndr bind = outer_bndr `elemVarSet` bindFreeVars bind
+
     go :: CoreExpr -> Maybe ([CoreBind], [CoreAlt])
 
     -- Whizzo: we can merge!
@@ -685,7 +976,7 @@ mergeCaseAlts outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
       , Just tc  <- tyConAppTyCon_maybe type_arg
       , Just (dc1:dcs) <- tyConDataCons_maybe tc   -- At least one data constructor
       , dcs `lengthAtMost` 3  -- Arbitrary
-      = return ( [], mk_alts dc1 dcs)
+      = return ([], mk_alts dc1 dcs)
       where
         mk_lit dc = mkLitIntUnchecked $ toInteger $ dataConTagZ dc
         mk_rhs dc = Var (dataConWorkId dc)
@@ -699,23 +990,38 @@ mergeCaseAlts outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
       = do { (joins, alts) <- go body
 
              -- Check for capture; but only if we could otherwise do a merge
-           ; let capture = outer_bndr `elem` bindersOf bind
-                           || outer_bndr `elemVarSet` bindFreeVars bind
-           ; guard (not capture)
+             --    (i.e. the recursive `go` succeeds)
+           ; guard (okToFloatJoin scrut_fvs outer_bndr bind)
 
-           ; return (bind:joins, alts ) }
+           ; return (bind : joins, alts ) }
       | otherwise
       = Nothing
 
-    -- We don't want ticks to get in the way; just push them inwards.
-    -- (This happens when you add SourceTicks e.g. GHC.Num.Integer.integerLt#)
+    -- Push ticks **inwards** (when possible).
+    -- See (MC5) in Note [Merge Nested Cases].
     go (Tick t body)
-      = do { (joins, alts) <- go body
-           ; return (joins, [Alt con bs (Tick t rhs) | Alt con bs rhs <- alts]) }
+      = do { (joins, alts) <- go body -- (MC4): any join points inside are floated out of the tick.
+
+             -- Abort if this would put a non-soft-scope tick in between
+             -- a join point binding and its jumps. See (MC6).
+           ; guard $ null joins || tickishHasSoftScope t
+           ; return (joins, [Alt con bs (mkTick t rhs) | Alt con bs rhs <- alts])
+           }
 
     go _ = Nothing
 
-mergeCaseAlts _ _ = Nothing
+mergeCaseAlts _ _ _ = Nothing
+
+okToFloatJoin :: VarSet -> Id -> CoreBind -> Bool
+-- Check a join-point binding to see if it can be floated out of
+-- the DEFAULT branch of a `case`.
+-- See Note [Floating join points out of DEFAULT alternatives]
+okToFloatJoin scrut_fvs outer_bndr bind
+  = not (any bad_bndr (bindersOf bind))
+  where
+    bad_bndr bndr = bndr == outer_bndr              -- (a)
+                    || bndr `elemVarSet` scrut_fvs  -- (b)
+
 
 ---------------------------------
 mergeAlts :: [Alt a] -> [Alt a] -> [Alt a]
@@ -800,8 +1106,9 @@ refineDefaultAlt :: [Unique]          -- ^ Uniques for constructing new binders
 refineDefaultAlt us mult tycon tys imposs_deflt_cons all_alts
   | Alt DEFAULT _ rhs : rest_alts <- all_alts
   , isAlgTyCon tycon            -- It's a data type, tuple, or unboxed tuples.
-  , not (isNewTyCon tycon)      -- Exception 1 in Note [Refine DEFAULT case alternatives]
-  , not (isTypeDataTyCon tycon) -- Exception 2 in Note [Refine DEFAULT case alternatives]
+  , not (isNewTyCon tycon)        -- (DALT1) in Note [DataAlt restrictions] in GHC.Core
+  , not (isTypeDataTyCon tycon)   -- (DALT2) in Note [DataAlt restrictions] in GHC.Core
+  , not (isUnaryClassTyCon tycon) -- (DALT3) in Note [DataAlt restrictions] in GHC.Core
   , Just all_cons <- tyConDataCons_maybe tycon
   , let imposs_data_cons = mkUniqSet [con | DataAlt con <- imposs_deflt_cons]
                              -- We now know it's a data type, so we can use
@@ -922,11 +1229,109 @@ Wrinkles
 
       So `mergeCaseAlts` floats out any join points. It doesn't float out
       non-join-points unless the /outer/ case has just one alternative; doing
-      so would risk more allocation
+      so would risk more allocation.
 
-(MC5) See Note [Cascading case merge]
+      Note also that `mergeCaseAlts` floats join points out of ticks, for which
+      we need to be extra careful; see (MC6).
+
+      Floating out join points isn't entirely straightforward.
+      See Note [Floating join points out of DEFAULT alternatives]
+
+(MC5) We want to move ticks out of the way if possible, to prevent them from
+      inhibiting optimisation. For example, say we have:
+
+        case expensive of r {
+          C1 -> rhs1; -- happy path
+          _  -> scctick<doEdgeCase> (case r of { C2 -> rhs2; C3 -> rhs3 })
+        }
+
+      In this situation, we push the "doEdgeCase" tick **inwards** and proceed
+      to merge cases, like so:
+
+        case expensive of
+          C1 -> rhs1
+          C2 -> scctick<doEdgeCase> rhs2
+          C3 -> scctick<doEdgeCase> rhs3
+
+      This preserves the tick semantics (see Note [Scoping ticks and counting ticks]
+      in GHC.Types.Tickish), because this transformation:
+
+        1. preserves counts,
+        2. does not move cost in or out of the tick scope.
+
+      (1) is clear: we will tick 'doEdgeCase' exactly in the C2/C3 alternatives,
+      and we won't otherwise.
+      For (2), recall that case is strict in Core. We already evaluated 'expensive',
+      so re-scrutinising 'r' is free.
+
+      This means that, perhaps surprisingly, this transformation is valid for
+      **all** ticks, including non-floatable ones.
+
+      In contrast, we would not want to move the tick outwards, because this:
+
+        - will lead to additional counting of 'doEdgeCase' in the 'C1' (happy path) case,
+        - risks attributing the cost of evaluating 'expensive' to 'doEdgeCase'.
+
+(MC6) There is a dangerous interaction between (MC4) and (MC5), which can lead
+      to invalid Core (as reported in #26642, #26929). Suppose we have:
+
+        case f x of r ->
+          scctick<foo>
+            join j y = rhs in
+            case r of { C1 -> j 1; C2 -> bar }
+
+      If we naively carried out (MC4) and (MC5) together, this would result in:
+
+        join j y = rhs in
+          case f x of
+            C1 -> scctick<foo> (j 1)
+            C2 -> scctick<foo> bar
+
+      This has moved the tick in between the join point binding 'j' and the
+      join point jump, which is invalid as per Note [Join points, casts, and ticks]
+      in GHC.Core. The simplifier cannot deal with such Core, resulting in #26642.
+
+      The solution: abort whenever we would position a non-soft-scope tick
+      inside a join point in this manner.
+      An alternative would be to float the tick outwards, but as we saw in (MC5)
+      this risks a grave misattribution of profiling costs, so we don't do that.
+
+(MC7) See Note [Cascading case merge]
 
 See also Note [Example of case-merging and caseRules] in GHC.Core.Opt.Simplify.Utils
+
+Note [Floating join points out of DEFAULT alternatives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this, from (MC4) of Note [Merge Nested Cases]
+   case x of r
+     DEFAULT -> join j = rhs in case r of ...
+     alts
+
+We want to float that join point out to give this
+   join j = rhs
+   case x of r
+     DEFAULT -> case r of ...
+     alts
+
+But doing so is flat-out wrong if the scoping gets messed up:
+    (a) case x of r { DEFAULT -> join r = ... in ...r... }
+    (b) case j of r { DEFAULT -> join j = ... in ... }
+    (c) case x of r { DEFAULT -> join j = ...r.. in ... }
+In all these cases we can't float the join point out because r changes its
+meaning.  For (a) and (b) the Simplifier removes shadowing, so they'll
+be solved in the next iteration.  But case (c) will persist.
+
+Happily, we can fix up case (c) by adding an auxiliary binding, like this
+    let r = e in
+    join j = rhs[r]
+    case e of r
+       DEFAULT -> ...r...
+       ...other alts...
+
+We can only do this if
+  * We don't introduce shadowing: that is `j` and `r` do not appear free in `e`.
+    (Again the Simplifier will eliminate such shadowing.)
+  * The scrutinee `e` is trivial so that the transformation doesn't duplicate work.
 
 
 Note [Cascading case merge]
@@ -1044,38 +1449,9 @@ with a specific constructor is desirable.
    `imposs_deflt_cons` argument is populated with constructors which
    are matched elsewhere.
 
-There are two exceptions where we avoid refining a DEFAULT case:
-
-* Exception 1: Newtypes
-
-  We can have a newtype, if we are just doing an eval:
-
-    case x of { DEFAULT -> e }
-
-  And we don't want to fill in a default for them!
-
-* Exception 2: `type data` declarations
-
-  The data constructors for a `type data` declaration (see
-  Note [Type data declarations] in GHC.Rename.Module) do not exist at the
-  value level. Nevertheless, it is possible to strictly evaluate a value
-  whose type is a `type data` declaration. Test case
-  type-data/should_compile/T2294b.hs contains an example:
-
-    type data T a where
-      A :: T Int
-
-    f :: T a -> ()
-    f !x = ()
-
-  We want to generate the following Core for f:
-
-    f = \(@a) (x :: T a) ->
-         case x of
-           __DEFAULT -> ()
-
-  Namely, we do _not_ want to match on `A`, as it doesn't exist at the value
-  level! See wrinkle (W2b) in Note [Type data declarations] in GHC.Rename.Module
+We must not refine the DEFAULT into a DataAlt for newtypes, `type data`
+declarations, or unary classes, since none of these have a data constructor
+that can appear in a DataAlt. See Note [DataAlt restrictions] in GHC.Core.
 
 
 Note [Combine identical alternatives]
@@ -1294,14 +1670,17 @@ trivial_expr_fold :: (Id -> r) -> (Literal -> r) -> r -> r -> CoreExpr -> r
 -- * `case e of {}` an empty case
 trivial_expr_fold k_id k_lit k_triv k_not_triv = go
   where
-    -- If you change this function, be sure to change SetLevels.notWorthFloating
-    -- as well!
+    -- If you change this function, be sure to change
+    -- SetLevels.notWorthFloating as well!
     -- (Or yet better: Come up with a way to share code with this function.)
     go (Var v)                            = k_id v  -- See Note [Variables are trivial]
     go (Lit l)    | litIsTrivial l        = k_lit l
     go (Type _)                           = k_triv
     go (Coercion _)                       = k_triv
-    go (App f t)  | not (isRuntimeArg t)  = go f
+    go (App f arg)
+      | not (isRuntimeArg arg)            = go f
+      | exprIsUnaryClassFun f             = go arg
+      | otherwise                         = k_not_triv
     go (Lam b e)  | not (isRuntimeVar b)  = go e
     go (Tick t e) | not (tickishIsCode t) = go e              -- See Note [Tick trivial]
     go (Cast e _)                         = go e
@@ -1418,6 +1797,23 @@ heap-allocates noFactor's argument.  At the moment (May 12) we are just
 going to put up with this, because the previous more aggressive inlining
 (which treated 'noFactor' as work-free) was duplicating primops, which
 in turn was making inner loops of array calculations runs slow (#5623)
+
+Wrinkles
+
+(WF1) Strict constructor fields.  We regard (K x) as work-free even if
+  K is a strict data constructor (see Note [Strict fields in Core])
+      data T a = K !a
+  If we have
+    let t = K x in ...(case t of K y -> blah)...
+  we want to treat t's binding as expandable so that `exprIsConApp_maybe`
+  will look through its unfolding. (NB: exprIsWorkFree implies
+  exprIsExpandable.)
+
+  Note, however, that because K is strict, after inlining we'll get a leftover
+  eval on x, which may or may not disappear
+    let t = K x in ...(case x of y -> blah)...
+  We put up with this extra eval: in effect we count duplicating the eval as
+  work-free.
 
 Note [Case expressions are work-free]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1560,7 +1956,8 @@ isWorkFreeApp fn n_val_args
   = True
   | otherwise
   = case idDetails fn of
-      DataConWorkId {} -> True
+      DataConWorkId {} -> True  -- Even if the data constructor is strict
+                                -- See (WF1) in Note [exprIsWorkFree]
       PrimOpId op _    -> primOpIsWorkFree op
       _                -> False
 
@@ -1661,6 +2058,8 @@ expansion.  Specifically:
   duplicate the (a +# b) primop, which we should not do lightly.
   (It's quite hard to trigger this bug, but T13155 does so for GHC 8.0.)
 
+NB: exprIsWorkFree implies exprIsExpandable.
+
 Note [isExpandableApp: bottoming functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 It's important that isExpandableApp does not respond True to bottoming
@@ -1704,14 +2103,31 @@ get this:
 So we treat the application of a function (negate in this case) to a
 *dictionary* as expandable.  In effect, every function is CONLIKE when
 it's applied only to dictionaries.
+-}
+
+isUnaryClassId :: Id -> Bool
+-- True of (a) the method selector (classop)
+--         (b) the dictionary data constructor
+-- of a unary class
+isUnaryClassId v
+  | Just cls <- isClassOpId_maybe v     = isUnaryClass cls
+  | Just dc  <- isDataConWorkId_maybe v = isUnaryClassDataCon dc
+  | otherwise                           = False
+
+exprIsUnaryClassFun :: CoreExpr -> Bool
+-- True of an a type application (f @t1 .. @tn),
+-- where `f` is a unary-class-id
+-- See (UCM4) in Note [Unary class magic] in GHC.Core.TyCon
+exprIsUnaryClassFun (App f (Type {}))       = exprIsUnaryClassFun f
+exprIsUnaryClassFun (Var v)                 = isUnaryClassId v
+exprIsUnaryClassFun _                       = False
 
 
-************************************************************************
+{- *********************************************************************
 *                                                                      *
              exprOkForSpeculation
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 -----------------------------
 -- | To a first approximation, 'exprOkForSpeculation' returns True of
@@ -1852,9 +2268,10 @@ app_ok fun_ok primop_ok fun args
 
   | otherwise
   = case idDetails fun of
-      DFunId new_type -> not new_type
+      DFunId terminating -> terminating
          -- DFuns terminate, unless the dict is implemented
-         -- with a newtype in which case they may not
+         -- by a no-op in which case they may not
+         -- See (UCM3) in Note [Unary class magic] in GHC.Core.TyCon
 
       DataConWorkId dc
         | isLazyDataConRep dc
@@ -1871,10 +2288,10 @@ app_ok fun_ok primop_ok fun args
 
       PrimOpId op _
         | primOpIsDiv op
-        , Lit divisor <- Partial.last args
+        , Lit divisor <- last args
             -- there can be 2 args (most div primops) or 3 args
             -- (WordQuotRem2Op), hence the use of last/init
-        -> not (isZeroLit divisor) && all (expr_ok fun_ok primop_ok) (Partial.init args)
+        -> not (isZeroLit divisor) && all (expr_ok fun_ok primop_ok) (init args)
               -- Special case for dividing operations that fail
               -- In general they are NOT ok-for-speculation
               -- (which primop_ok will catch), but they ARE OK
@@ -1947,14 +2364,31 @@ altsAreExhaustive (Alt con1 _ _ : alts)
       -- we behave conservatively here -- I don't think it's important
       -- enough to deserve special treatment
 
--- | Should we look past this tick when eta-expanding the given function?
+-- | Should we look past this tick when collecting arguments
+-- for the given function?
 --
 -- See Note [Ticks and mandatory eta expansion]
--- Takes the function we are applying as argument.
-etaExpansionTick :: Id -> GenTickish pass -> Bool
-etaExpansionTick id t
-  = hasNoBinding id &&
-    ( tickishFloatable t || isProfTick t )
+canCollectArgsThroughTick
+  :: Id -- ^ function at the head of the application
+  -> GenTickish pass -- ^ tick we want to collect arguments past
+  -> Bool
+canCollectArgsThroughTick id t
+  = tickishFloatable t || cantEtaReduceFun id
+
+-- | Can we eta-reduce the given function?
+-- See Note [Eta reduction soundness], criteria (B), (J), and (W).
+cantEtaReduceFun :: Id -> Bool
+cantEtaReduceFun fun
+  =    hasNoBinding fun -- (B)
+       -- Don't undersaturate functions with no binding.
+
+    || isJoinId fun    -- (J)
+       -- Don't undersaturate join points.
+       -- See Note [Invariants on join points] in GHC.Core, and #20599
+
+    || isJust (idCbvMarks_maybe fun) -- (W)
+       -- Don't undersaturate StrictWorkerIds.
+       -- See Note [CBV Function Ids: overview] in GHC.Types.Id.Info.
 
 {- Note [exprOkForSpeculation and type classes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2127,6 +2561,7 @@ it doesn't have the trickiness of the let-can-float invariant to worry about.
 -- and in so doing makes the binding lazy.
 --
 -- So, it does /not/ treat variables as evaluated, unless they say they are.
+--
 -- However, it /does/ treat partial applications and constructor applications
 -- as values, even if their arguments are non-trivial, provided the argument
 -- type is lifted. For example, both of these are values:
@@ -2143,20 +2578,24 @@ it doesn't have the trickiness of the let-can-float invariant to worry about.
 -- Suppose @f x@ diverges; then @C (f x)@ is not a value.
 -- We check for this using needsCaseBinding below
 exprIsHNF :: CoreExpr -> Bool           -- True => Value-lambda, constructor, PAP
-exprIsHNF = exprIsHNFlike isDataConWorkId isEvaldUnfolding
+exprIsHNF = exprIsHNFlike isDataConWorkId isEvaldUnfolding True
 
 -- | Similar to 'exprIsHNF' but includes CONLIKE functions as well as
 -- data constructors. Conlike arguments are considered interesting by the
 -- inliner.
 exprIsConLike :: CoreExpr -> Bool       -- True => lambda, conlike, PAP
-exprIsConLike = exprIsHNFlike isConLikeId isConLikeUnfolding
+exprIsConLike = exprIsHNFlike isConLikeId isConLikeUnfolding False
 
 -- | Returns true for values or value-like expressions. These are lambdas,
 -- constructors / CONLIKE functions (as determined by the function argument)
 -- or PAPs.
 --
-exprIsHNFlike :: HasDebugCallStack => (Var -> Bool) -> (Unfolding -> Bool) -> CoreExpr -> Bool
-exprIsHNFlike is_con is_con_unf e
+exprIsHNFlike :: HasDebugCallStack => (Var -> Bool)
+                                   -> (Unfolding -> Bool)
+                                   -> Bool
+                                   -> CoreExpr -> Bool
+{-# INLINE exprIsHNFlike #-}   -- Specialise at its two call sites
+exprIsHNFlike is_con is_con_unf rubbish_lit_result e
   = -- pprTraceWith "hnf" (\r -> ppr r <+> ppr e) $
     is_hnf_like e
   where
@@ -2175,9 +2614,12 @@ exprIsHNFlike is_con is_con_unf e
       || definitelyUnliftedType (idType v)
         -- Unlifted binders are always evaluated (#20140)
 
-    is_hnf_like (Lit l)          = not (isLitRubbish l)
+    is_hnf_like (Lit lit)
+      | isLitRubbish lit = rubbish_lit_result
+      | otherwise        = True
         -- Regarding a LitRubbish as ConLike leads to unproductive inlining in
         -- WWRec, see #20035
+
     is_hnf_like (Type _)         = True       -- Types are honorary Values;
                                               -- we don't mind copying them
     is_hnf_like (Coercion _)     = True       -- Same for coercions
@@ -2204,22 +2646,26 @@ exprIsHNFlike is_con is_con_unf e
                                | otherwise  = app_is_value f as
     app_is_value _          _  = False
 
-    id_app_is_value id val_args =
+    id_app_is_value id val_args
+      | Just dc <- isDataConWorkId_maybe id
+      , isUnaryClassDataCon  dc
+      = all is_hnf_like val_args  -- Look through unary class data cons
+      | otherwise
       -- See Note [exprIsHNF for function applications]
       --   for the specification and examples
-      case compare (idArity id) (length val_args) of
-        EQ | is_con id ->      -- Saturated app of a DataCon/CONLIKE Id
-          case mb_str_marks id of
-            Just str_marks ->  -- with strict fields; see (SFC1) of Note [Strict fields in Core]
-              assert (val_args `equalLength` str_marks) $
-              fields_hnf str_marks
-            Nothing ->         -- without strict fields: like PAP
-              args_hnf         -- NB: CONLIKEs are lazy!
+      = case compare (idArity id) (length val_args) of
+          EQ | is_con id ->      -- Saturated app of a DataCon/CONLIKE Id
+            case mb_str_marks id of
+              Just str_marks ->  -- with strict fields; see (SFC1) of Note [Strict fields in Core]
+                assert (val_args `equalLength` str_marks) $
+                fields_hnf str_marks
+              Nothing ->         -- without strict fields: like PAP
+                args_hnf         -- NB: CONLIKEs are lazy!
 
-        GT ->                  -- PAP: Check unlifted val_args
-          args_hnf
+          GT ->                  -- PAP: Check unlifted val_args
+            args_hnf
 
-        _  -> False
+          _  -> False
 
       where
         -- Saturated, Strict DataCon: Check unlifted val_args and strict fields
@@ -2254,7 +2700,6 @@ exprIsHNFlike is_con is_con_unf e
           | otherwise
           = Nothing
 
-{-# INLINE exprIsHNFlike #-}
 
 {-
 Note [exprIsHNF Tick]
@@ -2348,8 +2793,8 @@ exprIsTickedString = isJust . exprIsTickedString_maybe
 exprIsTickedString_maybe :: CoreExpr -> Maybe ByteString
 exprIsTickedString_maybe (Lit (LitString bs)) = Just bs
 exprIsTickedString_maybe (Tick t e)
-  -- we don't tick literals with CostCentre ticks, compare to mkTick
-  | tickishPlace t == PlaceCostCentre = Nothing
+  -- Shortcut: ticks with code never wrap literals (compare with 'mkTick')
+  | tickishIsCode t = Nothing
   | otherwise = exprIsTickedString_maybe e
 exprIsTickedString_maybe _ = Nothing
 
@@ -2695,11 +3140,16 @@ isEmptyTy ty
 -- | If @normSplitTyConApp_maybe _ ty = Just (tc, tys, co)@
 -- then @ty |> co = tc tys@. It's 'splitTyConApp_maybe', but looks through
 -- coercions via 'topNormaliseType_maybe'. Hence the \"norm\" prefix.
+--
+-- Postcondition: tc is not a newtype (guaranteed by topNormaliseType_maybe)
 normSplitTyConApp_maybe :: FamInstEnvs -> Type -> Maybe (TyCon, [Type], Coercion)
 normSplitTyConApp_maybe fam_envs ty
   | let Reduction co ty1 = topNormaliseType_maybe fam_envs ty
                            `orElse` (mkReflRedn Representational ty)
   , Just (tc, tc_args) <- splitTyConApp_maybe ty1
+  , not (isNewTyCon tc)  -- How can tc be a newtype, after `topNormaliseType`?
+                         -- Answer: if it is a recursive newtype, `topNormaliseType`
+                         --         may be a no-op.   Example: tc226
   = Just (tc, tc_args, co)
 normSplitTyConApp_maybe _ _ = Nothing
 
@@ -2739,8 +3189,8 @@ collectMakeStaticArgs
   :: CoreExpr -> Maybe (CoreExpr, Type, CoreExpr, CoreExpr)
 collectMakeStaticArgs e
     | (fun@(Var b), [Type t, loc, arg], _) <- collectArgsTicks (const True) e
-    , idName b == makeStaticName = Just (fun, t, loc, arg)
-collectMakeStaticArgs _          = Nothing
+    , b `hasKnownKey` makeStaticKey = Just (fun, t, loc, arg)
+collectMakeStaticArgs _             = Nothing
 
 {-
 ************************************************************************
@@ -2777,29 +3227,38 @@ dumpIdInfoOfProgram dump_locals ppr_id_info binds = vcat (map printId ids)
 
 {- Note [Call-by-value for worker args]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If we unbox a constructor with strict fields we want to
-preserve the information that some of the arguments came
-out of strict fields and therefore should be already properly
-tagged, however we can't express this directly in core.
-
-Instead what we do is generate a worker like this:
+If we unbox a constructor with strict fields we want to preserve the information
+that some of the arguments came out of strict fields and therefore should be
+already evaluated and properly tagged (EPT) throughout the body of the
+function.  We express this fact in Core like this:
 
   data T = MkT A !B
 
   foo = case T of MkT a b -> $wfoo a b
 
   $wfoo a b = case b of b' -> rhs[b/b']
+              ^^^^ The "extra eval"
 
-This makes the worker strict in b causing us to use a more efficient
-calling convention for `b` where the caller needs to ensure `b` is
-properly tagged and evaluated before it's passed to $wfoo. See Note [CBV Function Ids].
+Now
+ * Throughout `rhs` the Simplifier can see that `b` is EPT, and can (say)
+   drop evals on `b`.
 
-Usually the argument will be known to be properly tagged at the call site so there is
+ * The EPT enforcement pass will make $wfoo into a CBV function, where
+   the caller guarantees to pass an EPT argument (see Note [EPT enforcement] in
+   GHC.Core.Stg.EnforceEpt)
+
+ * The code generator will discard that "extra eval" case, because $wfoo is
+   CBV.
+
+See also Note [CBV Function Ids: overview].
+
+In tihs case the argument is known to be properly tagged at the call site so there is
 no additional work for the caller and the worker can be more efficient since it can
 assume the presence of a tag.
 
 This is especially true for recursive functions like this:
     -- myPred expect it's argument properly tagged
+    -- The EnforceEPT pass has made it a CBV function
     myPred !x = ...
 
     loop :: MyPair -> Int
@@ -2809,11 +3268,10 @@ This is especially true for recursive functions like this:
             B -> 2
             _ -> loop (MyPair (myPred x) (myPred y))
 
-Here we would ordinarily not be strict in y after unboxing.
-However if we pass it as a regular argument then this means on
-every iteration of loop we will incur an extra seq on y before
-we can pass it to `myPred` which isn't great! That is in STG after
-tag inference we get:
+Here we would ordinarily not be strict in y after unboxing.  However if we pass
+it as a regular argument then this means on every iteration of loop we will
+incur an extra seq on y before we can pass it to `myPred` which isn't great!
+That is in STG after tag inference we get:
 
     Rec {
     Find.$wloop [InlPrag=[2], Occ=LoopBreaker]
@@ -2823,7 +3281,7 @@ tag inference we get:
     Str=<1L><ML>,
     Unf=OtherCon []] =
         {} \r [x y]
-            case x<TagProper> of x' [Occ=Once1] {
+            case x<TagVal[TagEPT]> of x' [Occ=Once1] {
               __DEFAULT ->
                   case y of y' [Occ=Once1] {
                   __DEFAULT ->
@@ -2838,7 +3296,7 @@ tag inference we get:
             };
     end Rec }
 
-Here comes the tricky part: If we make $wloop strict in both x/y and we get:
+But if we add an extra eval on `y` during worker/wrapper we this this:
 
     Rec {
     Find.$wloop [InlPrag=[2], Occ=LoopBreaker]
@@ -2848,8 +3306,8 @@ Here comes the tricky part: If we make $wloop strict in both x/y and we get:
     Str=<1L><!L>,
     Unf=OtherCon []] =
         {} \r [x y]
-            case y<TagProper> of y' [Occ=Once1] { __DEFAULT ->
-            case x<TagProper> of x' [Occ=Once1] {
+            case y<TagVal[TagEPT]> of y' [Occ=Once1] { __DEFAULT ->
+            case x<TagVal[TagEPT]> of x' [Occ=Once1] {
               __DEFAULT ->
                   case Find.$wmyPred y' of pred_y [Occ=Once1] {
                   __DEFAULT ->
@@ -2862,18 +3320,24 @@ Here comes the tricky part: If we make $wloop strict in both x/y and we get:
             };
     end Rec }
 
-Here both x and y are known to be tagged in the function body since we pass strict worker args using unlifted cbv.
-This means the seqs on x and y both become no-ops and compared to the first version the seq on `y` disappears at runtime.
+Here both x and y are known to be tagged in the function body since we pass
+strict worker args using unlifted cbv.  This means the seqs on x and y both
+become no-ops (via (EPT-codegen) in Not [EPT enforcement]) and, compared to the
+first version, the seq on `y` disappears at runtime.
 
-The downside is that the caller of $wfoo potentially has to evaluate `y` once if we can't prove it isn't already evaluated.
-But y coming out of a strict field is in WHNF so safe to evaluated. And most of the time it will be properly tagged+evaluated
-already at the call site because of the EPT Invariant! See Note [EPT enforcement] for more in this.
-This makes GHC itself around 1% faster despite doing slightly more work! So this is generally quite good.
+The downside is that the caller of $wfoo potentially has to evaluate `y` once if
+we can't prove it isn't already evaluated.  The wrapper, which calls `$wfoo` has
+just pulled `y` out of a strict field of a data constructor, so it will always
+be EPT.  See Note [EPT enforcement] for more in this.  This makes GHC itself
+around 1% faster despite doing slightly more work! So this is generally quite
+good.
 
-We only apply this when we think there is a benefit in doing so however. There are a number of cases in which
-it would be useless to insert an extra seq. ShouldStrictifyIdForCbv tries to identify these to avoid churn in the
+We only apply this when we think there is a benefit in doing so however. There
+are a number of cases in which it would be useless to insert an extra
+seq. `wantCbvForId` tries to identify these to avoid churn in the
 simplifier. See Note [Which Ids should be strictified] for details on this.
 -}
+
 mkStrictFieldSeqs :: [(Id,StrictnessMark)] -> CoreExpr -> (CoreExpr)
 mkStrictFieldSeqs args rhs =
   foldr addEval rhs args
@@ -2883,7 +3347,7 @@ mkStrictFieldSeqs args rhs =
       addEval (arg_id,arg_cbv) (rhs)
         -- Argument representing strict field.
         | isMarkedStrict arg_cbv
-        , shouldStrictifyIdForCbv arg_id
+        , wantCbvForId arg_id
         -- Make sure to remove unfoldings here to avoid the simplifier dropping those for OtherCon[] unfoldings.
         = Case (Var $! zapIdUnfolding arg_id) arg_id case_ty ([Alt DEFAULT [] rhs])
         -- Normal argument
@@ -2903,87 +3367,99 @@ There are multiple reasons why we might not want to insert a seq in the rhs to
 strictify a functions argument:
 
 1) The argument doesn't exist at runtime.
-
-For zero width types (like Types) there is no benefit as we don't operate on them
-at runtime at all. This includes things like void#, coercions and state tokens.
+   For zero width types (like Types) there is no benefit as we don't operate on them
+   at runtime at all. This includes things like void#, coercions and state tokens.
 
 2) The argument is a unlifted type.
-
-If the argument is a unlifted type the calling convention already is explicitly
-cbv. This means inserting a seq on this argument wouldn't do anything as the seq
-would be a no-op *and* it wouldn't affect the calling convention.
+   If the argument is a unlifted type the calling convention already is explicitly
+   cbv. This means inserting a seq on this argument wouldn't do anything as the seq
+   would be a no-op *and* it wouldn't affect the calling convention.
 
 3) The argument is absent.
+   If the argument is absent in the body there is no advantage to it being passed as
+   cbv to the function. The function won't ever look at it so we don't save any work.
 
-If the argument is absent in the body there is no advantage to it being passed as
-cbv to the function. The function won't ever look at it so we don't safe any work.
+   This mostly happens for join points. For example we might have:
 
-This mostly happens for join point. For example we might have:
+       data T = MkT ![Int] [Char]
+       f t = case t of MkT xs{strict} ys-> snd (xs,ys)
 
-    data T = MkT ![Int] [Char]
-    f t = case t of MkT xs{strict} ys-> snd (xs,ys)
+   and abstract the case alternative to:
 
-and abstract the case alternative to:
+       f t = join j1 = \xs ys -> snd (xs,ys)
+             in case t of MkT xs{strict} ys-> j1 xs xy
 
-    f t = join j1 = \xs ys -> snd (xs,ys)
-          in case t of MkT xs{strict} ys-> j1 xs xy
+   While we "use" xs inside `j1` it's not used inside the function `snd` we pass it to.
+   In short a absent demand means neither our RHS, nor any function we pass the argument
+   to will inspect it. So there is no work to be saved by forcing `xs` early.
 
-While we "use" xs inside `j1` it's not used inside the function `snd` we pass it to.
-In short a absent demand means neither our RHS, nor any function we pass the argument
-to will inspect it. So there is no work to be saved by forcing `xs` early.
-
-NB: There is an edge case where if we rebox we *can* end up seqing an absent value.
-Note [Absent fillers] has an example of this. However this is so rare it's not worth
-caring about here.
-
-4) The argument is already strict.
-
-Consider this code:
-
-    data T = MkT ![Int]
-    f t = case t of MkT xs{strict} -> reverse xs
-
-The `xs{strict}` indicates that `xs` is used strictly by the `reverse xs`.
-If we do a w/w split, and add the extra eval on `xs`, we'll get
-
-    $wf xs =
-        case xs of xs1 ->
-            let t = MkT xs1 in
-            case t of MkT xs2 -> reverse xs2
-
-That's not wrong; but the w/w body will simplify to
-
-    $wf xs = case xs of xs1 -> reverse xs1
-
-and now we'll drop the `case xs` because `xs1` is used strictly in its scope.
-Adding that eval was a waste of time.  So don't add it for strictly-demanded Ids.
+   NB: There is an edge case where if we rebox we *can* end up seqing an absent value.
+   Note [Absent fillers] has an example of this. However this is so rare it's not worth
+   caring about here.
 
 5) Functions
+   Functions are tricky (see Note [TagInfo of functions] in EnforceEpt).
+   But the gist of it even if we make a higher order function argument strict
+   we can't avoid the tag check when it's used later in the body.
+   So there is no benefit.
 
-Functions are tricky (see Note [TagInfo of functions] in EnforceEpt).
-But the gist of it even if we make a higher order function argument strict
-we can't avoid the tag check when it's used later in the body.
-So there is no benefit.
+Wrinkles:
+
+(WIS1) You might have thought that we can omit the eval if the argument is used
+   strictly demanded in the body.  But you'd be wrong. Consider this code:
+          data T = MkT ![Int]
+          f t = case t of MkT xs{Dmd=STR} -> reverse xs
+
+   The `xs{Dmd=STR}` indicates that `xs` is used strictly by the `reverse xs`.
+   If we do a w/w split, and add the extra eval on `xs`, we'll get
+       $wf xs = case xs of xs1 ->
+                  let t = MkT xs1 in
+                  case t of MkT xs2 -> reverse xs2
+
+   That's not wrong; but you might wonder if the eval on `xs` is needed
+   when it is certainly evaluated by the `reverse`.  But yes, it is (#26722):
+       g s True  t = f s t t
+       g s False t = g s True t
+
+       f True  (MkT xs) t = f False (MkT xs) t
+       f False (MkT xs) _ = xs
+
+   After worker/wrapper we get:
+       g s b t = case t of MkT ww -> $wg s b ww
+       $wg s ds ww = case ds of {
+                      False -> case ww of wg { __DEFAULT -> Bar.$wg s True wg }
+                      True  -> let { t1 = MkT ww } in f s t1 t1 }
+
+   We must make `f` inline inside `$wg`, because `f` too is ww'd, and we
+   don't want to rebox `t1` before passing it to `f`.  BUT while `t1`
+   looks like a HNF, `exprIsHNF` will say False because `MkT` is strict
+   and `ww` isn't evaluated.  So `f` doesn't inline and we get lots of
+   reboxing.
+
+   The Right Thing to to is to add the eval for the data con argument:
+       $wg s ds ww = case ww of ww' { DEFAULT ->
+                     case ds of {
+                      False -> case ww of wg { __DEFAULT -> Bar.$wg s True wg }
+                      True  -> let { t1 = MkT ww' } in f s t1 t1 } }
+
+   Now `t1` will be a HNF, and `f` will inline, and we get
+       $wg s ds ww = case ww of ww' { DEFAULT ->
+                     case ds of {
+                      False -> Bar.$wg s True ww'
+                      True  -> $wf s ww'
+
+  (Ultimately `$wg` will be a CBV function, so that `case ww` will be a
+  no-op: see (EPT-codegen) in Note [EPT enforcement] in GHC.Stg.EnforceEpt.)
 
 -}
--- | Do we expect there to be any benefit if we make this var strict
--- in order for it to get treated as as cbv argument?
--- See Note [Which Ids should be strictified]
--- See Note [CBV Function Ids] for more background.
-shouldStrictifyIdForCbv :: Var -> Bool
-shouldStrictifyIdForCbv = wantCbvForId False
-
--- Like shouldStrictifyIdForCbv but also wants to use cbv for strict args.
-shouldUseCbvForId :: Var -> Bool
-shouldUseCbvForId = wantCbvForId True
 
 -- When we strictify we want to skip strict args otherwise the logic is the same
--- as for shouldUseCbvForId so we common up the logic here.
+-- as for wantCbvForId so we common up the logic here.
 -- Basically returns true if it would be beneficial for runtime to pass this argument
 -- as CBV independent of weither or not it's correct. E.g. it might return true for lazy args
 -- we are not allowed to force.
-wantCbvForId :: Bool -> Var -> Bool
-wantCbvForId cbv_for_strict v
+wantCbvForId :: Var -> Bool
+wantCbvForId v
   -- Must be a runtime var.
   -- See Note [Which Ids should be strictified] point 1)
   | isId v
@@ -2997,9 +3473,6 @@ wantCbvForId cbv_for_strict v
   , not $ isFunTy ty
   -- If the var is strict already a seq is redundant.
   -- See Note [Which Ids should be strictified] point 4)
-  , not (isStrictDmd dmd) || cbv_for_strict
-  -- If the var is absent a seq is almost always useless.
-  -- See Note [Which Ids should be strictified] point 3)
   , not (isAbsDmd dmd)
   = True
   | otherwise

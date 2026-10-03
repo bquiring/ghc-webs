@@ -5,9 +5,6 @@
 \section[DataCon]{@DataCon@: Data Constructors}
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable, Binary
-
 module GHC.Core.DataCon (
         -- * Main data types
         DataCon, DataConRep(..),
@@ -32,8 +29,6 @@ module GHC.Core.DataCon (
         dataConName, dataConIdentity, dataConTag, dataConTagZ,
         dataConTyCon, dataConOrigTyCon,
         dataConWrapperType,
-        dataConNonlinearType,
-        dataConDisplayType,
         dataConUnivTyVars, dataConExTyCoVars, dataConUnivAndExTyCoVars,
         dataConConcreteTyVars,
         dataConUserTyVars, dataConUserTyVarBinders,
@@ -58,8 +53,9 @@ module GHC.Core.DataCon (
         isNullarySrcDataCon, isNullaryRepDataCon,
         isLazyDataConRep,
         isTupleDataCon, isBoxedTupleDataCon, isUnboxedTupleDataCon,
-        isUnboxedSumDataCon, isCovertGadtDataCon,
-        isVanillaDataCon, isNewDataCon, isTypeDataCon,
+        isUnboxedSumDataCon, isCovertGadtDataCon, isUnaryClassDataCon,
+        isVanillaDataCon, isNewDataCon, isTypeDataCon, isBoxingDataCon,
+        dataConHasNoBinding,
         classDataCon, dataConCannotMatch,
         dataConUserTyVarBindersNeedWrapper, checkDataConTyVars,
         isBanged, isUnpacked, isMarkedStrict, cbvFromStrictMark, eqHsBang, isSrcStrict, isSrcUnpacked,
@@ -87,7 +83,7 @@ import GHC.Types.FieldLabel
 import GHC.Types.SourceText
 import GHC.Core.Class
 import GHC.Types.Name
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 import GHC.Core.Predicate
 import GHC.Types.Var
 import GHC.Types.Var.Env
@@ -95,6 +91,7 @@ import GHC.Types.Basic
 import GHC.Data.FastString
 import GHC.Unit.Types
 import GHC.Utils.Binary
+import GHC.Types.Unique ( UniqueTag (BoxingTyConTag), unpkUnique )
 import GHC.Types.Unique.FM ( UniqFM )
 import GHC.Types.Unique.Set
 import GHC.Builtin.Uniques( mkAlphaTyVarUnique )
@@ -112,7 +109,6 @@ import qualified Data.ByteString.Lazy    as LBS
 import qualified Data.Data as Data
 import Data.Char
 import Data.List( find )
-import Control.DeepSeq
 
 {-
 Note [Data constructor representation]
@@ -1033,16 +1029,6 @@ instance Outputable HsImplBang where
     ppr (HsUnpack (Just co))    = text "Unpacked" <> parens (ppr co)
     ppr (HsStrict b)            = text "StrictNotUnpacked" <> parens (ppr b)
 
-instance Outputable SrcStrictness where
-    ppr SrcLazy     = char '~'
-    ppr SrcStrict   = char '!'
-    ppr NoSrcStrict = empty
-
-instance Outputable SrcUnpackedness where
-    ppr SrcUnpack   = text "{-# UNPACK #-}"
-    ppr SrcNoUnpack = text "{-# NOUNPACK #-}"
-    ppr NoSrcUnpack = empty
-
 instance Outputable StrictnessMark where
     ppr MarkedStrict    = text "!"
     ppr NotMarkedStrict = empty
@@ -1056,40 +1042,6 @@ instance Binary StrictnessMark where
            0 -> return NotMarkedStrict
            1 -> return MarkedStrict
            _ -> panic "Invalid binary format"
-
-instance Binary SrcStrictness where
-    put_ bh SrcLazy     = putByte bh 0
-    put_ bh SrcStrict   = putByte bh 1
-    put_ bh NoSrcStrict = putByte bh 2
-
-    get bh =
-      do h <- getByte bh
-         case h of
-           0 -> return SrcLazy
-           1 -> return SrcStrict
-           _ -> return NoSrcStrict
-
-instance Binary SrcUnpackedness where
-    put_ bh SrcNoUnpack = putByte bh 0
-    put_ bh SrcUnpack   = putByte bh 1
-    put_ bh NoSrcUnpack = putByte bh 2
-
-    get bh =
-      do h <- getByte bh
-         case h of
-           0 -> return SrcNoUnpack
-           1 -> return SrcUnpack
-           _ -> return NoSrcUnpack
-
-instance NFData SrcStrictness where
-  rnf SrcLazy = ()
-  rnf SrcStrict = ()
-  rnf NoSrcStrict = ()
-
-instance NFData SrcUnpackedness where
-  rnf SrcNoUnpack = ()
-  rnf SrcUnpack = ()
-  rnf NoSrcUnpack = ()
 
 -- | Compare strictness annotations
 eqHsBang :: HsImplBang -> HsImplBang -> Bool
@@ -1283,7 +1235,7 @@ dataConTyCon = dcRepTyCon
 -- type constructor.
 dataConOrigTyCon :: DataCon -> TyCon
 dataConOrigTyCon dc
-  | Just (tc, _) <- tyConFamInst_maybe (dcRepTyCon dc) = tc
+  | Just (tc, _) <- tyConDataFamInst_maybe (dcRepTyCon dc) = tc
   | otherwise                                          = dcRepTyCon dc
 
 -- | The representation type of the data constructor, i.e. the sort
@@ -1538,30 +1490,13 @@ MkT :: a %1 -> T a (with -XLinearTypes)
 or
 MkT :: a  -> T a (with -XNoLinearTypes)
 
-There are three different methods to retrieve a type of a datacon.
-They differ in how linear fields are handled.
-
-1. dataConWrapperType:
-The type of the wrapper in Core.
+The type of the wrapper in Core is given by dataConWrapperType.
 For example, dataConWrapperType for Maybe is a %1 -> Just a.
 
-2. dataConNonlinearType:
-The type of the constructor, with linear arrows replaced by unrestricted ones.
-Used when we don't want to introduce linear types to user (in holes
-and in types in hie used by haddock).
-
-3. dataConDisplayType (takes a boolean indicating if -XLinearTypes is enabled):
-The type we'd like to show in error messages, :info and -ddump-types.
-Ideally, it should reflect the type written by the user;
-the function returns a type with arrows that would be required
-to write this constructor under the current setting of -XLinearTypes.
-In principle, this type can be different from the user's source code
-when the value of -XLinearTypes has changed, but we don't
-expect this to cause much trouble.
-
-Due to internal plumbing in checkValidDataCon, we can't just return a Doc.
-The multiplicity of arrows returned by dataConDisplayType and
-dataConDisplayType is used only for pretty-printing.
+However, we might not want to show these linear types in error messages, e.g.
+if the user has not enabled LinearTypes, or in haddock.
+This is handled by the sdocLinearTypes option: linear arrows are displayed
+as regular arrows if sdocLinearTypes is False.
 -}
 
 dataConWrapperType :: DataCon -> Type
@@ -1587,26 +1522,6 @@ dataConWrapperType (MkData { dcUserTyVarBinders = user_tvbs,
     mkInvisFunTys (stupid_theta ++ theta) $
     mkScaledFunTys arg_tys $
     res_ty
-
-dataConNonlinearType :: DataCon -> Type
--- Just like dataConWrapperType, but with the
--- linearity on the arguments all zapped to Many
-dataConNonlinearType (MkData { dcUserTyVarBinders = user_tvbs,
-                               dcOtherTheta = theta, dcOrigArgTys = arg_tys,
-                               dcOrigResTy = res_ty,
-                               dcStupidTheta = stupid_theta })
-  = mkForAllTys user_tvbs $
-    mkInvisFunTys (stupid_theta ++ theta) $
-    mkScaledFunTys arg_tys' $
-    res_ty
-  where
-    arg_tys' = map (\(Scaled w t) -> Scaled (case w of OneTy -> ManyTy; _ -> w) t) arg_tys
-
-dataConDisplayType :: Bool -> DataCon -> Type
-dataConDisplayType show_linear_types dc
-  = if show_linear_types
-    then dataConWrapperType dc
-    else dataConNonlinearType dc
 
 -- | Finds the instantiated types of the arguments required to construct a
 -- 'DataCon' representation
@@ -1773,6 +1688,15 @@ isNewDataCon dc = isNewTyCon (dataConTyCon dc)
 isTypeDataCon :: DataCon -> Bool
 isTypeDataCon dc = isTypeDataTyCon (dataConTyCon dc)
 
+-- | Is this one of the boxing data constructors of Note [Boxing constructors]
+-- in GHC.Builtin.WiredIn.Types.Box?
+isBoxingDataCon :: DataCon -> Bool
+isBoxingDataCon dc
+  | (BoxingTyConTag, _) <- unpkUnique $ getUnique dc
+  = True
+  | otherwise
+  = False
+
 isCovertGadtDataCon :: DataCon -> Bool
 -- See Note [isCovertGadtDataCon]
 isCovertGadtDataCon (MkData { dcUnivTyVars  = univ_tvs
@@ -1792,10 +1716,30 @@ isCovertGadtDataCon (MkData { dcUnivTyVars  = univ_tvs
          && not (isTyVarTy ty)  -- See Note [isCovertGadtDataCon] for
                                 -- an example where 'ty' is a tyvar
 
+isUnaryClassDataCon :: DataCon -> Bool
+isUnaryClassDataCon dc = isUnaryClassTyCon (dataConTyCon dc)
+
+-- | Does this data constructor lack an associated top-level binding?
+dataConHasNoBinding :: DataCon -> Bool
+dataConHasNoBinding dc
+  =  isNewDataCon dc
+     -- Newtype constructors turn into a cast.
+     -- See Note [Newtype workers] in GHC.Types.Id.Make.
+  || isUnboxedTupleDataCon dc
+  || isUnboxedSumDataCon dc
+  || isUnaryClassDataCon dc
+     -- Unary class dictionary constructors are eliminated in Core Prep.
+     -- See Note [Unary class magic] in GHC.Core.TyCon
+  || (isBoxingDataCon dc && not (isNullaryRepDataCon dc))
+     -- Non-nullary Box constructors have no binding.
+     -- See Note [No implicit binds for Box constructors] in GHC.CoreToStg.AddImplicitBinds.
+
 {- Note [isCovertGadtDataCon]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 (isCovertGadtDataCon K) returns True if K is a GADT data constructor, but
-does not /look/ like it. Consider (#21447)
+does not /look/ like it. It is used only to help in error message printing.
+
+Consider (#21447)
     type T :: TYPE r -> Type
     data T a where { MkT :: b -> T b }
 Here MkT doesn't look GADT-like, but it is. If we make the kind applications
@@ -1845,7 +1789,7 @@ dataConCannotMatch :: [Type] -> DataCon -> Bool
 dataConCannotMatch tys con
   -- See (U6) in Note [Implementing unsafeCoerce]
   -- in base:Unsafe.Coerce
-  | dataConName con == unsafeReflDataConName
+  | con `hasKnownKey` unsafeReflDataConKey
                       = False
   | null inst_theta   = False   -- Common
   | all isTyVarTy tys = False   -- Also common
@@ -1882,7 +1826,7 @@ dataConResRepTyArgs :: DataCon -> [Type]
 -- This is almost the same as (subst eq_spec univ_tvs); but not quite,
 --   because eq_spec omits constraint-kinded equalities
 dataConResRepTyArgs dc@(MkData { dcRepTyCon = rep_tc, dcOrigResTy = orig_res_ty })
-  | Just (fam_tc, fam_args) <- tyConFamInst_maybe rep_tc
+  | Just (fam_tc, fam_args) <- tyConDataFamInst_maybe rep_tc
   = -- fvs(fam_args) = tyConTyVars rep_tc
     -- These tyvars are the domain of subst
     -- Fvs(range(subst)) = tvars of the datacon

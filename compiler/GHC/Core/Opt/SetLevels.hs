@@ -91,24 +91,28 @@ import GHC.Core.Utils
 import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe, isOneShotBndr )
 import GHC.Core.FVs     -- all of it
 import GHC.Core.Subst
+import GHC.Core.TyCo.Subst( lookupTyVar )
+import GHC.Core.TyCo.FVs
 import GHC.Core.Make    ( sortQuantVars )
-import GHC.Core.Type    ( Type, tyCoVarsOfType
-                        , mightBeUnliftedType, closeOverKindsDSet
-                        , typeHasFixedRuntimeRep
-                        )
+import GHC.Core.Make.Box ( mkCanonicalCo )
+import GHC.Core.Coercion ( MCoercion(..), MCoercionR, mkSymMCo )
+import GHC.Core.DataCon ( DataCon, dataConTyCon )
+import GHC.Core.Type    ( Type, mightBeUnliftedType, typeHasFixedRuntimeRep
+                        , mkTyConTy, getRuntimeRep )
 import GHC.Core.Multiplicity     ( pattern ManyTy )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Var
 import GHC.Types.Var.Set
+import GHC.Types.Var.FV
 import GHC.Types.Unique.Set   ( nonDetStrictFoldUniqSet )
 import GHC.Types.Unique.DSet  ( getUniqDSet )
 import GHC.Types.Var.Env
 import GHC.Types.Literal      ( litIsTrivial )
 import GHC.Types.Demand       ( DmdSig, prependArgsDmdSig )
 import GHC.Types.Cpr          ( CprSig, prependArgsCprSig )
-import GHC.Types.Name         ( getOccName, mkSystemVarName )
+import GHC.Types.Name         ( getOccName )
 import GHC.Types.Name.Occurrence ( occNameFS )
 import GHC.Types.Unique       ( hasKey )
 import GHC.Types.Tickish      ( tickishIsCode )
@@ -116,12 +120,11 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Unique.DFM
 import GHC.Types.Basic  ( Arity, RecFlag(..), isRec )
 
-import GHC.Builtin.Types
-import GHC.Builtin.Names      ( runRWKey )
+import GHC.Builtin.KnownKeys      ( runRWKey )
+import GHC.Builtin.WiredIn.Types.Box ( RuntimeRepBoxingInfo(..), repBoxingInfo )
 
 import GHC.Data.FastString
 
-import GHC.Utils.FV
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -466,8 +469,8 @@ lvlCase env scrut_fvs scrut' case_bndr ty alts
     ty' = substTyUnchecked (le_subst env) ty
 
     incd_lvl = incMinorLvl (le_ctxt_lvl env)
-    dest_lvl = maxFvLevel (const True) env scrut_fvs
-            -- Don't abstract over type variables, hence const True
+    dest_lvl = maxFvLevel includeTyVars env scrut_fvs
+            -- Don't abstract over type variables, hence includeTyVars
 
     lvl_alt alts_env (AnnAlt con bs rhs)
       = do { rhs' <- lvlMFE new_env True rhs
@@ -614,7 +617,8 @@ lvlMFE env strict_ctxt e@(_, AnnCase {})
   = lvlExpr env e     -- See Note [Case MFEs]
 
 lvlMFE env strict_ctxt ann_expr
-  | not float_me
+  |  notWorthFloating expr abs_vars
+  || not float_me
   || floatTopLvlOnly env && not (isTopLvl dest_lvl)
          -- Only floating to the top level is allowed.
   || hasFreeJoin env fvs   -- If there is a free join, don't float
@@ -623,9 +627,6 @@ lvlMFE env strict_ctxt ann_expr
          -- We can't let-bind an expression if we don't know
          -- how it will be represented at runtime.
          -- See Note [Representation polymorphism invariants] in GHC.Core
-  || notWorthFloating expr abs_vars
-         -- Test notWorhtFloating last;
-         -- See Note [Large free-variable sets]
   = -- Don't float it out
     lvlExpr env ann_expr
 
@@ -635,36 +636,31 @@ lvlMFE env strict_ctxt ann_expr
   = do { expr1 <- lvlFloatRhs abs_vars dest_lvl rhs_env NonRecursive
                               is_bot_lam NotJoinPoint ann_expr
                   -- Treat the expr just like a right-hand side
-       ; var <- newLvlVar expr1 NotJoinPoint is_mk_static
+       ; var <- newLvlVar expr1 NotJoinPoint
        ; let var2 = annotateBotStr var float_n_lams mb_bot_str
        ; return (Let (NonRec (TB var2 (FloatMe dest_lvl)) expr1)
                      (mkVarApps (Var var2) abs_vars)) }
 
   -- OK, so the float has an unlifted type (not top-level bindable)
   --     and no new value lambdas (float_is_new_lam is False)
-  -- Try for the boxing strategy
+  -- Try for the boxing strategy: box the value, float the box, and unbox at
+  -- each use site.
   -- See Note [Floating MFEs of unlifted type]
   | escapes_value_lam
   , not expr_ok_for_spec -- Boxing/unboxing isn't worth it for cheap expressions
                          -- See Note [Test cheapness with exprOkForSpeculation]
-  , BI_Box { bi_data_con = box_dc, bi_inst_con = boxing_expr
-           , bi_boxed_type = box_ty } <- boxingDataCon expr_ty
-  , let [bx_bndr, ubx_bndr] = mkTemplateLocals [box_ty, expr_ty]
-  = do { expr1 <- lvlExpr rhs_env ann_expr
-       ; let l1r       = incMinorLvlFrom rhs_env
-             float_rhs = mkLams abs_vars_w_lvls $
-                         Case expr1 (stayPut l1r ubx_bndr) box_ty
-                             [Alt DEFAULT [] (App boxing_expr (Var ubx_bndr))]
+  = case repBoxingInfo (getRuntimeRep expr_ty) of
+      -- Lifted expressions were floated without boxing by the
+      -- 'exprIsTopLevelBindable' case above.
+      BoxLifted -> pprPanic "lvlMFE: boxing a lifted expression" (ppr expr)
 
-       ; var <- newLvlVar float_rhs NotJoinPoint is_mk_static
-       ; let l1u      = incMinorLvlFrom env
-             use_expr = Case (mkVarApps (Var var) abs_vars)
-                             (stayPut l1u bx_bndr) expr_ty
-                             [Alt (DataAlt box_dc) [stayPut l1u ubx_bndr] (Var ubx_bndr)]
-       ; return (Let (NonRec (TB var (FloatMe dest_lvl)) float_rhs)
-                     use_expr) }
+      -- We don't box unboxed tuples or sums; it's better to float their
+      -- components individually. See Note [Floating MFEs of unlifted type]
+      BoxComponents {} -> lvlExpr env ann_expr
 
-  | otherwise          -- e.g. do not float unboxed tuples
+      BoxWithDataCon box_dc fld_ty -> box_and_float box_dc fld_ty
+
+  | otherwise
   = lvlExpr env ann_expr
 
   where
@@ -693,16 +689,16 @@ lvlMFE env strict_ctxt ann_expr
 
     (rhs_env, abs_vars_w_lvls) = lvlLamBndrs env dest_lvl abs_vars
 
-    is_mk_static = isJust (collectMakeStaticArgs expr)
-        -- Yuk: See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
-
         -- A decision to float entails let-binding this thing, and we only do
         -- that if we'll escape a value lambda, or will go to the top level.
-    float_me = saves_work || saves_alloc || is_mk_static
+        -- Never float trivial expressions;
+        --   notably, save_work might be true of a lone evaluated variable.
+    float_me = saves_work || saves_alloc
 
     -- See Note [Saving work]
+    is_hnf = exprIsHNF expr
     saves_work = escapes_value_lam        -- (a)
-                 && not (exprIsHNF expr)  -- (b)
+                 && not is_hnf            -- (b)
                  && not float_is_new_lam  -- (c)
     escapes_value_lam = dest_lvl `ltMajLvl` (le_ctxt_lvl env)
 
@@ -710,16 +706,49 @@ lvlMFE env strict_ctxt ann_expr
     saves_alloc =  isTopLvl dest_lvl
                 && floatConsts env
                 && (   not strict_ctxt                     -- (a)
-                    || exprIsHNF expr                      -- (b)
+                    || is_hnf                              -- (b)
                     || (is_bot_lam && escapes_value_lam))  -- (c)
+
+
+    -- Box the expression with the boxing data constructor 'box_dc', float
+    -- the box, and unbox it at the use site.
+    box_and_float :: DataCon -> Type -> LvlM LevelledExpr
+    box_and_float box_dc fld_ty
+      = do { expr1 <- lvlExpr rhs_env ann_expr
+           ; let box_ty   = mkTyConTy (dataConTyCon box_dc)
+                 -- The boxing data constructor stores acanonical type, so we
+                 -- cast using 'mkCanonicalCo'.
+                 -- See Note [The canonical type of a RuntimeRep] in GHC.Core.Make.Box.
+                 canon_co = mkCanonicalCo expr_ty  -- expr_ty ~R# fld_ty
+                 [bx_bndr, ubx_bndr, fld_bndr] = mkTemplateLocals [box_ty, expr_ty, fld_ty]
+                 l1r       = incMinorLvlFrom rhs_env
+                 float_rhs = mkLams abs_vars_w_lvls $
+                             Case expr1 (stayPut l1r ubx_bndr) box_ty
+                                 [Alt DEFAULT [] (mkConApp box_dc [Var ubx_bndr `mk_cast` canon_co])]
+
+           ; var <- newLvlVar float_rhs NotJoinPoint
+           ; let l1u      = incMinorLvlFrom env
+                 use_expr = Case (mkVarApps (Var var) abs_vars)
+                                 (stayPut l1u bx_bndr) expr_ty
+                                 [Alt (DataAlt box_dc) [stayPut l1u fld_bndr]
+                                      (Var fld_bndr `mk_cast` mkSymMCo canon_co)]
+           ; return (Let (NonRec (TB var (FloatMe dest_lvl)) float_rhs)
+                         use_expr) }
+      where
+        mk_cast :: LevelledExpr -> MCoercionR -> LevelledExpr
+        mk_cast e MRefl    = e
+        mk_cast e (MCo co) = Cast e co
 
 hasFreeJoin :: LevelEnv -> DVarSet -> Bool
 -- Has a free join point which is not being floated to top level.
 -- (In the latter case it won't be a join point any more.)
 -- Not treating top-level ones specially had a massive effect
 -- on nofib/minimax/Prog.prog
-hasFreeJoin env fvs
-  = not (maxFvLevel isJoinId env fvs == tOP_LEVEL)
+hasFreeJoin env fvs = anyDVarSet bad_join fvs
+  where
+    bad_join v = isJoinId v &&
+                 maxIn True env v tOP_LEVEL /= tOP_LEVEL
+
 
 {- Note [Saving work]
 ~~~~~~~~~~~~~~~~~~~~~
@@ -807,7 +836,7 @@ general, float HNFs, the balance change if it goes to the top:
 * We don't pay an allocation cost for the floated expression; it
   just becomes static data.
 
-* Floating string literal is valuable -- no point in duplicating the
+* Floating string literals is valuable -- no point in duplicating the
   at each call site!
 
 * Floating bottoming expressions is valuable: they are always cold
@@ -867,28 +896,6 @@ It's controlled by a flag (floatConsts), because doing this too
 early loses opportunities for RULES which (needless to say) are
 important in some nofib programs (gcd is an example).  [SPJ note:
 I think this is obsolete; the flag seems always on.]
-
-Note [Large free-variable sets]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In #24471 we had something like
-     x1 = I# 1
-     ...
-     x1000 = I# 1000
-     foo = f x1 (f x2 (f x3 ....))
-So every sub-expression in `foo` has lots and lots of free variables.  But
-none of these sub-expressions float anywhere; the entire float-out pass is a
-no-op.
-
-In lvlMFE, we want to find out quickly if the MFE is not-floatable; that is
-the common case.  In #24471 it turned out that we were testing `abs_vars` (a
-relatively complicated calculation that takes at least O(n-free-vars) time to
-compute) for every sub-expression.
-
-Better instead to test `float_me` early. That still involves looking at
-dest_lvl, which means looking at every free variable, but the constant factor
-is a lot better.
-
-ToDo: find a way to fix the bad asymptotic complexity.
 
 Note [Floating join point bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -988,7 +995,7 @@ Even if we floated 'j' to top level, (b) would still hold.
 Bottom line: never float a MFE that has a free JoinId.
 
 Note [Floating MFEs of unlifted type]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have
    case f x of (r::Int#) -> blah
 we'd like to float (f x). But it's not trivial because it has type
@@ -999,22 +1006,11 @@ and replace the original (f x) with
    case (case y of I# r -> r) of r -> blah
 
 Being able to float unboxed expressions is sometimes important; see #12603.
-I'm not sure how /often/ it is important, but it's not hard to achieve.
+I'm not sure how /often/ it is important, but it's not hard to achieve:
+See Note [Boxing constructors] in GHC.Builtin.WiredIn.Types.Box.
 
-We only do it for a fixed collection of types for which we have a
-convenient boxing constructor (see boxingDataCon_maybe).  In
-particular we /don't/ do it for unboxed tuples; it's better to float
-the components of the tuple individually.
-
-I did experiment with a form of boxing that works for any type, namely
-wrapping in a function.  In our example
-
-   let y = case f x of r -> \v. f x
-   in case y void of r -> blah
-
-It works fine, but it's 50% slower (based on some crude benchmarking).
-I suppose we could do it for types not covered by boxingDataCon_maybe,
-but it's more code and I'll wait to see if anyone wants it.
+Note that we /don't/ box unboxed tuples or sums; it's better to float their
+components individually.
 
 Note [Test cheapness with exprOkForSpeculation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1135,7 +1131,6 @@ float the case (as advocated here) we won't float the (build ...y..)
 either, so fusion will happen.  It can be a big effect, esp in some
 artificial benchmarks (e.g. integer, queens), but there is no perfect
 answer.
-
 -}
 
 annotateBotStr :: Id -> Arity -> Maybe (Arity, DmdSig, CprSig) -> Id
@@ -1152,68 +1147,132 @@ annotateBotStr id n_extra mb_bot_str
   = id
 
 notWorthFloating :: CoreExpr -> [Var] -> Bool
--- Returns True if the expression would be replaced by
--- something bigger than it is now.  For example:
---   abs_vars = tvars only:  return True if e is trivial,
---                           but False for anything bigger
---   abs_vars = [x] (an Id): return True for trivial, or an application (f x)
---                           but False for (f x x)
---
--- One big goal is that floating should be idempotent.  Eg if
--- we replace e with (lvl79 x y) and then run FloatOut again, don't want
--- to replace (lvl79 x y) with (lvl83 x y)!
-
+--  See Note [notWorthFloating]
 notWorthFloating e abs_vars
-  = go e (count isId abs_vars)
+  = go e 0
   where
-    go (Var {}) n               = n >= 0
-    go (Lit lit) n              = assert (n==0) $
-                                  litIsTrivial lit   -- Note [Floating literals]
-    go (Type {}) _              = True
-    go (Coercion {}) _          = True
+    n_abs_vars = count isId abs_vars  -- See (NWF5)
+
+    go :: CoreExpr -> Int -> Bool
+    -- (go e n) return True if (e x1 .. xn) is not worth floating
+    -- where `e` has n trivial value arguments x1..xn
+    -- See (NWF4)
+    go (Lit lit) n         = (n==0)                 -- See (NWF1b)
+                              && litIsTrivial lit   -- See (NWF1a)
+    go (Type {}) _         = True
+    go (Tick t e) n        = not (tickishIsCode t) && go e n
+    go (Cast e _) n        = n==0 || go e n     -- See (NWF3)
+    go (Coercion {}) _     = True
     go (App e arg) n
-       -- See Note [Floating applications to coercions]
-       | not (isRuntimeArg arg) = go e n
-       | n==0                   = False
-       | exprIsTrivial arg      = go e (n-1) -- NB: exprIsTrivial arg = go arg 0
-       | otherwise              = False
-    go (Tick t e) n             = not (tickishIsCode t) && go e n
-    go (Cast e _)  n            = go e n
-    go (Case e b _ as) n
+       | Type {} <- arg    = go e n    -- Just types, not coercions (NWF2)
+       | exprIsTrivial arg = go e (n+1)
+       | otherwise         = n==0 && exprIsUnaryClassFun e
+                             -- (f non-triv) is worth floating,
+                             -- unless if is a unary class fun
+    go (Case e b _ as) _
+      -- Do not float the `case` part of trivial cases (NWF3)
+      -- We'll have a look at the RHS when we get there
       | null as
-      = go e n     -- See Note [Empty case is trivial]
-      | Just rhs <- isUnsafeEqualityCase e b as
-      = go rhs n   -- See (U2) of Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
-    go _ _                      = False
+      = True   -- See Note [Empty case is trivial]
+      | Just {} <- isUnsafeEqualityCase e b as
+      = True   -- See (U2) of Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
+      | otherwise
+      = False
 
-{-
-Note [Floating literals]
-~~~~~~~~~~~~~~~~~~~~~~~~
-It's important to float Integer literals, so that they get shared,
-rather than being allocated every time round the loop.
-Hence the litIsTrivial.
+    go (Var v) n
+      | isUnaryClassId v = n==1   -- (op x) is not worth floating, but (op x y) is!!
+                                  --    See (NWF3)
+      | n==0             = True   -- Naked variable
+      | n <= n_abs_vars  = True   -- (f a b c) is not worth floating if
+      | otherwise        = False  -- a,b,c are all abstracted; see (NWF5)
 
-Ditto literal strings (LitString), which we'd like to float to top
-level, which is now possible.
+    go _ _ = False  -- Let etc is worth floating
 
-Note [Floating applications to coercions]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We don’t float out variables applied only to type arguments, since the
-extra binding would be pointless: type arguments are completely erased.
-But *coercion* arguments aren’t (see Note [Coercion tokens] in
-"GHC.CoreToStg" and Note [inlineBoringOk] in"GHC.Core.Unfold"),
-so we still want to float out variables applied only to
-coercion arguments.
+{- Note [notWorthFloating]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+`notWorthFloating` returns True if the expression would be replaced by something
+bigger than it is now.  One big goal is that floating should be idempotent.  Eg
+if we replace e with (lvl79 x y) and then run FloatOut again, don't want to
+replace (lvl79 x y) with (lvl83 x y)!
 
+For example:
+  abs_vars = tvars only:  return True if e is trivial,
+                          but False for anything bigger
+  abs_vars = [x] (an Id): return True for trivial, or an application (f x)
+                          but False for (f x x)
 
-************************************************************************
-*                                                                      *
-\subsection{Bindings}
-*                                                                      *
-************************************************************************
+(NWF1a) It's important to float Integer literals, so that they get shared, rather
+  than being allocated every time round the loop.  Hence the litIsTrivial.
 
-The binding stuff works for top level too.
+  Ditto literal strings (LitString), which we'd like to float to top
+  level, which is now possible.
+
+(NWF1b) You might think that a literal should never be applied to a value
+  (hence n=0) but actually we can get (see test T23024):
+      RUBBISH @(a->b) (x::a)
+  See Note [Rubbish literals] in GHC.Types.Literal.  (Mind you, we should be
+  in dead code at this point!)
+
+(NWF2) We don’t float out variables applied only to type arguments, since the
+  extra binding would be pointless: type arguments are completely erased.
+  But *coercion* arguments aren’t (see Note [Coercion tokens] in
+  "GHC.CoreToStg" and Note [inlineBoringOk] in"GHC.Core.Unfold"),
+  so we still want to float out variables applied only to
+  coercion arguments.
+
+(NWF3) Some expressions have trivial wrappers:
+     - Casts (e |> co)
+     - Unary-class applications:
+          - Dictionary applications (MkC meth)
+          - Class-op applictions    (op dict)
+     - Case of empty alts
+     - Unsafe-equality case
+  In all these cases we say "not worth floating", and we do so /regardless/
+  of the wrapped expression.  The SetLevels stuff may subsequently float the
+  components of the expression.
+
+  Example:  is it worth floating (f x |> co)?  No!  If we did we'd get
+     lvl = f x |> co
+     ...lvl....
+  Then we'd do cast worker/wrapper and end up with.
+     lvl' = f x
+     ...(lvl' |> co)...
+  Silly!  Better not to float it in the first place.  If we say "no" here,
+  we'll subsequently say "yes" for (f x) and get
+     lvl = f x
+     ....(lvl |> co)...
+  which is what we want.  In short: don't float trivial wrappers.
+
+(NWF4) The only non-trivial expression that we say "not worth floating" for
+  is an application
+             f x y z
+  where the number of value arguments is <= the number of abstracted Ids.
+  This is what makes floating idempotent.  Hence counting the number of
+  value arguments in `go`
+
+(NWF5) In #24471 we had something like
+     x1 = I# 1
+     ...
+     x1000 = I# 1000
+     foo = f x1 (f x2 (f x3 ....))
+  So every sub-expression in `foo` has lots and lots of free variables.  But
+  none of these sub-expressions float anywhere; the entire float-out pass is a
+  no-op.
+
+  So `notWorthFloating` tries to avoid evaluating `n_abs_vars`, in cases where
+  it obviously /is/ worth floating.  (In #24471 it turned out that we were
+  testing `abs_vars` (a relatively complicated calculation that takes at least
+  O(n-free-vars) time to compute) for every sub-expression.)
+
+  Hence testing `n_abs_vars only` at the very end.
 -}
+
+{- *********************************************************************
+*                                                                      *
+                       Bindings
+        This binding stuff works for top level too.
+*                                                                      *
+********************************************************************* -}
 
 lvlBind :: LevelEnv
         -> CoreBindWithFVs
@@ -1251,7 +1310,7 @@ lvlBind env (AnnNonRec bndr rhs)
     bndr_ty    = idType bndr
     ty_fvs     = tyCoVarsOfType bndr_ty
     rhs_fvs    = freeVarsOf rhs
-    bind_fvs   = rhs_fvs `unionDVarSet` dIdFreeVars bndr
+    bind_fvs   = rhs_fvs `unionDVarSet` dBndrFreeVars bndr
     abs_vars   = abstractVars dest_lvl env bind_fvs
     dest_lvl   = destLevel env bind_fvs ty_fvs (isFunction rhs) is_bot_lam
 
@@ -1339,8 +1398,8 @@ lvlBind env (AnnRec pairs)
         -- Finding the free vars of the binding group is annoying
     bind_fvs = ((unionDVarSets [ freeVarsOf rhs | (_, rhs) <- pairs])
                 `unionDVarSet`
-                (fvDVarSet $ unionsFV [ idFVs bndr
-                                      | (bndr, (_,_)) <- pairs]))
+                (runFVSelective isLocalVar $
+                 mapUnionFV (\(bndr,_) -> bndrFVs bndr) pairs))
                `delDVarSetList`
                 bndrs
 
@@ -1565,10 +1624,10 @@ destLevel env fvs fvs_ty is_function is_bot
 
   | otherwise = max_fv_id_level
   where
-    max_fv_id_level = maxFvLevel isId env fvs -- Max over Ids only; the
-                                              -- tyvars will be abstracted
+    max_fv_id_level = maxFvLevel idsOnly env fvs -- Max over Ids only; the
+                                                 -- tyvars will be abstracted
 
-    as_far_as_poss = maxFvLevel' isId env fvs_ty
+    as_far_as_poss = maxFvLevel' idsOnly env fvs_ty
                      -- See Note [Floating and kind casts]
 
 {- Note [Floating and kind casts]
@@ -1726,28 +1785,47 @@ extendCaseBndrEnv le@(LE { le_subst = subst, le_env = id_env })
        , le_env     = add_id id_env (case_bndr, scrut_var) }
 extendCaseBndrEnv env _ _ = env
 
-maxFvLevel :: (Var -> Bool) -> LevelEnv -> DVarSet -> Level
-maxFvLevel max_me env var_set
-  = nonDetStrictFoldDVarSet (maxIn max_me env) tOP_LEVEL var_set
+includeTyVars, idsOnly :: Bool
+idsOnly       = False
+includeTyVars = True
+
+maxFvLevel :: Bool -> LevelEnv -> DVarSet -> Level
+maxFvLevel include_tyvars env var_set
+  = nonDetStrictFoldDVarSet (maxIn include_tyvars env) tOP_LEVEL var_set
     -- It's OK to use a non-deterministic fold here because maxIn commutes.
 
-maxFvLevel' :: (Var -> Bool) -> LevelEnv -> TyCoVarSet -> Level
+maxFvLevel' :: Bool -> LevelEnv -> TyCoVarSet -> Level
 -- Same but for TyCoVarSet
-maxFvLevel' max_me env var_set
-  = nonDetStrictFoldUniqSet (maxIn max_me env) tOP_LEVEL var_set
+maxFvLevel' include_tyvars env var_set
+  = nonDetStrictFoldUniqSet (maxIn include_tyvars env) tOP_LEVEL var_set
     -- It's OK to use a non-deterministic fold here because maxIn commutes.
 
-maxIn :: (Var -> Bool) -> LevelEnv -> InVar -> Level -> Level
-maxIn max_me (LE { le_lvl_env = lvl_env, le_env = id_env }) in_var lvl
+maxIn :: Bool -> LevelEnv -> InVar -> Level -> Level
+-- True <=> include tyvars
+maxIn include_tyvars env@(LE { le_subst = subst, le_env = id_env }) in_var lvl
+  | isId in_var
   = case lookupVarEnv id_env in_var of
+      Nothing            -> maxOut env in_var lvl
       Just (abs_vars, _) -> foldr max_out lvl abs_vars
-      Nothing            -> max_out in_var lvl
-  where
-    max_out out_var lvl
-        | max_me out_var = case lookupVarEnv lvl_env out_var of
-                                Just lvl' -> maxLvl lvl' lvl
-                                Nothing   -> lvl
-        | otherwise = lvl       -- Ignore some vars depending on max_me
+          where
+            max_out out_var lvl
+              | isTyVar out_var && not include_tyvars
+                          = lvl
+              | otherwise = maxOut env out_var lvl
+
+  | include_tyvars -- TyVars
+  = case lookupTyVar subst in_var of
+      Just ty -> nonDetStrictFoldVarSet (maxOut env) lvl (tyCoVarsOfType ty)
+      Nothing -> maxOut env in_var lvl
+
+  | otherwise      -- Ignore free tyvars
+  = lvl
+
+maxOut :: LevelEnv -> OutVar -> Level -> Level
+maxOut (LE { le_lvl_env = lvl_env }) out_var lvl
+  = case lookupVarEnv lvl_env out_var of
+       Just lvl' -> maxLvl lvl' lvl
+       Nothing   -> lvl
 
 lookupVar :: LevelEnv -> Id -> LevelledExpr
 lookupVar le v = case lookupVarEnv (le_env le) v of
@@ -1770,7 +1848,6 @@ abstractVars dest_lvl (LE { le_subst = subst, le_lvl_env = lvl_env }) in_fvs
     map zap $ sortQuantVars $
     filter abstract_me      $
     dVarSetElems            $
-    closeOverKindsDSet      $
     substDVarSet subst in_fvs
         -- NB: it's important to call abstract_me only on the OutIds the
         -- come from substDVarSet (not on fv, which is an InId)
@@ -1831,9 +1908,8 @@ newPolyBndrs dest_lvl
 
 newLvlVar :: LevelledExpr        -- The RHS of the new binding
           -> JoinPointHood       -- Its join arity, if it is a join point
-          -> Bool                -- True <=> the RHS looks like (makeStatic ...)
           -> LvlM Id
-newLvlVar lvld_rhs join_arity_maybe is_mk_static
+newLvlVar lvld_rhs join_arity_maybe
   = do { uniq <- getUniqueM
        ; return (add_join_info (mk_id uniq rhs_ty))
        }
@@ -1842,13 +1918,7 @@ newLvlVar lvld_rhs join_arity_maybe is_mk_static
     de_tagged_rhs = deTagExpr lvld_rhs
     rhs_ty        = exprType de_tagged_rhs
 
-    mk_id uniq rhs_ty
-      -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
-      | is_mk_static
-      = mkExportedVanillaId (mkSystemVarName uniq (mkFastString "static_ptr"))
-                            rhs_ty
-      | otherwise
-      = mkSysLocal (mkFastString "lvl") uniq ManyTy rhs_ty
+    mk_id uniq rhs_ty = mkSysLocal (mkFastString "lvl") uniq ManyTy rhs_ty
 
 -- | Clone the binders bound by a single-alternative case.
 cloneCaseBndrs :: LevelEnv -> Level -> [Var] -> LvlM (LevelEnv, [Var])

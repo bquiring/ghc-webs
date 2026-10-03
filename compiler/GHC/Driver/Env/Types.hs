@@ -3,6 +3,8 @@
 module GHC.Driver.Env.Types
   ( Hsc(..)
   , HscEnv(..)
+  , HasHscEnv(..)
+
   ) where
 
 import GHC.Driver.Errors.Types ( GhcMessage )
@@ -28,11 +30,18 @@ import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.IORef
 import GHC.Driver.Env.KnotVars
+import Control.Monad.Catch
 
 -- | The Hsc monad: Passing an environment and diagnostic state
 newtype Hsc a = Hsc (HscEnv -> Messages GhcMessage -> IO (a, Messages GhcMessage))
-    deriving (Functor, Applicative, Monad, MonadIO)
+    deriving (Functor, Applicative, Monad, MonadIO, MonadCatch, MonadThrow, MonadMask)
       via ReaderT HscEnv (StateT (Messages GhcMessage) IO)
+
+instance HasHscEnv ((->) HscEnv) where
+    getHscEnv = id
+
+instance HasHscEnv Hsc where
+    getHscEnv = Hsc $ \e w -> return (e, w)
 
 instance HasDynFlags Hsc where
     getDynFlags = Hsc $ \e w -> return (hsc_dflags e, w)
@@ -76,8 +85,8 @@ data HscEnv
 
         hsc_type_env_vars :: KnotVars (IORef TypeEnv)
                 -- ^ Used for one-shot compilation only, to initialise
-                -- the 'IfGblEnv'. See 'GHC.Tc.Utils.tcg_type_env_var' for
-                -- 'GHC.Tc.Utils.TcGblEnv'.  See also Note [hsc_type_env_var hack]
+                -- the 'IfGblEnv'. See 'tcg_knot_vars' in 'GHC.Tc.Utils.TcGblEnv'.
+                -- See also Note [hsc_type_env_var hack]
 
         , hsc_interp :: Maybe Interp
                 -- ^ target code interpreter (if any) to use for TH and GHCi.
@@ -109,3 +118,5 @@ data HscEnv
                 -- ^ LLVM configuration cache.
  }
 
+class HasHscEnv m where
+    getHscEnv :: m HscEnv

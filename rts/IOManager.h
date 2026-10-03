@@ -19,7 +19,17 @@
 
 #pragma once
 
+#include "Capability.h"
 #include "sm/GC.h" // for evac_fn
+
+#if defined(mingw32_HOST_OS)
+/* Global var (only on Windows) that is exported (hence before BeginPrivate.h)
+ * to be shared with the I/O code in the base library to tell us which style
+ * of I/O manager we are using: one that uses the Windows native API HANDLEs,
+ * or one that uses Posix style fds.
+ */
+extern bool rts_IOManagerIsWin32Native;
+#endif
 
 #include "BeginPrivate.h"
 
@@ -42,6 +52,12 @@
 
 #if defined(IOMGR_BUILD_SELECT) && !defined(THREADED_RTS)
     #define IOMGR_ENABLED_SELECT
+#endif
+#if defined(IOMGR_BUILD_SELECTBIS) && !defined(THREADED_RTS)
+    #define IOMGR_ENABLED_SELECTBIS
+#endif
+#if defined(IOMGR_BUILD_POLL) && !defined(THREADED_RTS)
+    #define IOMGR_ENABLED_POLL
 #endif
 #if defined(IOMGR_BUILD_MIO) && defined(THREADED_RTS)
 /* For MIO, it is really two separate I/O manager implementations: one for
@@ -82,6 +98,10 @@
 #else // !defined(THREADED_RTS)
 #if   defined(IOMGR_DEFAULT_NON_THREADED_SELECT)
     #define IOMGR_DEFAULT_STR "select"
+#elif defined(IOMGR_DEFAULT_NON_THREADED_SELECTBIS)
+    #define IOMGR_DEFAULT_STR "selectbis"
+#elif defined(IOMGR_DEFAULT_NON_THREADED_POLL)
+    #define IOMGR_DEFAULT_STR "poll"
 #elif defined(IOMGR_DEFAULT_NON_THREADED_WINIO)
     #define IOMGR_DEFAULT_STR "winio"
 #elif defined(IOMGR_DEFAULT_NON_THREADED_WIN32_LEGACY)
@@ -100,6 +120,16 @@
 #else
     #define IOMGR_ENABLED_STR_SELECT ""
 #endif
+#if defined(IOMGR_ENABLED_SELECTBIS)
+    #define IOMGR_ENABLED_STR_SELECTBIS " selectbis"
+#else
+    #define IOMGR_ENABLED_STR_SELECTBIS ""
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+    #define IOMGR_ENABLED_STR_POLL " poll"
+#else
+    #define IOMGR_ENABLED_STR_POLL ""
+#endif
 #if defined(IOMGR_ENABLED_MIO_POSIX) || defined(IOMGR_ENABLED_MIO_WIN32)
     #define IOMGR_ENABLED_STR_MIO " mio"
 #else
@@ -117,6 +147,8 @@
 #endif
 #define IOMGRS_ENABLED_STR \
           IOMGR_ENABLED_STR_SELECT \
+          IOMGR_ENABLED_STR_SELECTBIS \
+          IOMGR_ENABLED_STR_POLL \
           IOMGR_ENABLED_STR_MIO \
           IOMGR_ENABLED_STR_WINIO \
           IOMGR_ENABLED_STR_WIN32_LEGACY
@@ -128,6 +160,12 @@
 typedef enum {
 #if defined(IOMGR_ENABLED_SELECT)
     IO_MANAGER_SELECT,
+#endif
+#if defined(IOMGR_ENABLED_SELECTBIS)
+    IO_MANAGER_SELECTBIS,
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+    IO_MANAGER_POLL,
 #endif
 #if defined(IOMGR_ENABLED_MIO_POSIX)
     IO_MANAGER_MIO_POSIX,
@@ -145,14 +183,6 @@ typedef enum {
 
 /* Global var to tell us which I/O manager impl we are using */
 extern IOManagerType iomgr_type;
-
-#if defined(mingw32_HOST_OS)
-/* Global var (only on Windows) that is exported to be shared with the I/O code
- * in the base library to tell us which style of I/O manager we are using: one
- * that uses the Windows native API HANDLEs, or one that uses Posix style fds.
- */
-extern bool rts_IOManagerIsWin32Native;
-#endif
 
 
 /* The CapIOManager is the per-capability data structure belonging to the I/O
@@ -196,6 +226,26 @@ char * showIOManager(void);
  */
 bool is_io_mng_native_p (void);
 
+/* Values for StgAsyncIOOp.operation.
+ *
+ * Note: this is encoded in 6 bits in StgAsyncIOOp.
+ */
+enum IOOpCode {
+    IOOpCodeWaitRead  = 0,
+    IOOpCodeWaitWrite = 1
+    /* This will be extended, e.g. for Read/Write */
+};
+
+/* Values for StgAsyncIOOp.outcome.
+ *
+ * Note: this is encoded in 2 bits in StgAsyncIOOp.
+ */
+enum IOOpOutcome {
+    IOOpOutcomeInFlight  = 0,
+    IOOpOutcomeSuccess   = 1,
+    IOOpOutcomeFailed    = 2,
+    IOOpOutcomeCancelled = 3
+};
 
 /* Init hook: called from hs_init_ghc, early in the startup after the RTS flags
  * have been processed.
@@ -205,26 +255,57 @@ bool is_io_mng_native_p (void);
 void selectIOManager(void);
 
 
-/* Allocate and initialise the per-capability CapIOManager that lives in each
- * Capability. Called from initCapability(), which is done in the RTS startup
- * in initCapabilities(), and later at runtime via setNumCapabilities().
+/* Allocate a CapIOManager for a given Capability. Having this helps us keep
+ * struct CapIOManager opaque from most of the rest of the RTS.
  */
-void initCapabilityIOManager(Capability *cap);
+CapIOManager *allocCapabilityIOManager(Capability *cap);
 
+/* Initialise the per-capability CapIOManager that lives in each Capability.
+ * Called from initCapability(), which is done in the RTS startup in
+ * initCapabilities(), and later at runtime via setNumCapabilities().
+ *
+ * This is separate from allocCapabilityIOManager so that we can re-initialise
+ * I/O managers after forkProcess.
+ */
+void initCapabilityIOManager(CapIOManager *iomgr);
+
+/* When shutting down a capability, or after forkProcess, free the resources
+ * held by a CapIOManager to put it back into a state in which either it can be
+ * re-initialised using initCapabilityIOManager, or the whole structure freed.
+ *
+ * Note that this does not free the CapIOManager structure itself, just the
+ * contents.
+ *
+ * This is used during capability shutdown, during RTS shutdown. It is not used
+ * when reducing the number of capabilities. Capabilities are disabled rather
+ * than freed entirely: the I/O manager keeps running but threads that become
+ * runnable are migrated away.
+ *
+ * It is also used after forkProcess.
+ */
+void freeCapabilityIOManager(CapIOManager *iomgr);
+
+/* CapIOManager life cycle:
+ *
+ * alloc -> init -> free -> free struct
+ *           ^        |
+ *           +--------+
+ */
 
 /* Init hook: called from hs_init_ghc, very late in the startup after almost
  * everything else is done.
  */
-void initIOManager(void);
+void startIOManager(void);
 
 
 /* Init hook: called from forkProcess in the child process on the surviving
  * capability.
  *
- * Note that this is synchronous and can run Haskell code, so can change the
- * given cap.
+ * This is synchronous and can run Haskell code, so can change the given cap.
+ * TODO: it would make for a cleaner API here if this were made asynchronous.
  */
-void initIOManagerAfterFork(/* inout */ Capability **pcap);
+void restartIOManager(CapIOManager *iomgr,
+          /* inout */ Capability  **pcap);
 
 /* TODO: rationalise initIOManager and initIOManagerAfterFork into a single
          per-capability init function.
@@ -232,8 +313,12 @@ void initIOManagerAfterFork(/* inout */ Capability **pcap);
 
 
 /* Called from setNumCapabilities.
+ *
+ * This is synchronous and can run Haskell code, so can change the given cap.
+ * TODO: it would make for a cleaner API here if this were made asynchronous.
  */
-void notifyIOManagerCapabilitiesChanged(Capability **pcap);
+void notifyIOManagerCapabilitiesChanged(CapIOManager *iomgr,
+                            /* inout */ Capability  **pcap);
 
 
 /* Shutdown hooks: called from hs_exit_ before and after the scheduler exits.
@@ -247,50 +332,72 @@ void stopIOManager(void);
 void exitIOManager(bool wait_threads);
 
 
-/* Wakeup hook: called from the scheduler's wakeUpRts (currently only in
- * threaded mode).
- *
- * The I/O manager can be blocked waiting on I/O or timers. Sometimes there are
- * other external events where we need to wake up the I/O manager and return
- * to the schedulr.
- *
- * At the moment, all the non-threaded I/O managers will do this automagically
- * since a signal will interrupt any waiting system calls, so at the moment
- * the implementation for the non-threaded I/O managers does nothing.
- *
- * For the I/O managers in threaded mode, this arranges to unblock the I/O
- * manager if it waa blocked waiting.
- */
-void wakeupIOManager(void);
-
-
 /* GC hook: mark any per-capability GC roots the I/O manager uses.
  */
-void markCapabilityIOManager(evac_fn evac, void *user, Capability *cap);
-
-
-/* GC hook: scavenge I/O related tso->block_info. Used by scavengeTSO.
- */
-void scavengeTSOIOManager(StgTSO *tso);
+void markCapabilityIOManager(evac_fn evac, void *user, CapIOManager *iomgr);
 
 
 /* Several code paths are almost identical between read and write paths. In
  * such cases we use a shared code path with an enum to say which we're doing.
  */
-typedef enum { IORead, IOWrite } IOReadOrWrite;
+enum IOReadOrWrite { IORead = 0, IOWrite = 1 };
+
+INLINE_HEADER enum IOOpCode convIOReadOrWriteToIOOpCode (enum IOReadOrWrite rw)
+{
+    // The codes are compatible:
+    ASSERT((int) IOOpCodeWaitRead  == (int) IORead &&
+           (int) IOOpCodeWaitWrite == (int) IOWrite);
+
+    return (enum IOOpCode) rw;
+}
+
 
 /* Synchronous operations: I/O and delays. As synchronous operations they
  * necessarily operate on threads. The thread is suspended until the operation
  * completes.
+ *
+ * Some of these are called from CMM primops. The primops returing bool can
+ * perform heap allocation, which might fail. They return true on success, or
+ * false on heap allocation failure.
  */
 
-void syncIOWaitReady(Capability *cap, StgTSO *tso, IOReadOrWrite rw, HsInt fd);
+/* Note [Encoding of result of I/O manager operations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We have quite a bit of information that to return from the I/O manager calls
+back to the I/O primops. It (somewhat uncomfortably) fits into a C int.
 
-void syncIOCancel(Capability *cap, StgTSO *tso);
+We use the following encoding of the result:
 
-void syncDelay(Capability *cap, StgTSO *tso, HsInt us_delay);
+ * negative: synchronous failure, with -errno as the result.
+ * 0: ok, result successful, proceed to async: suspend the TSO.
+ * 1: synchronous success, return without suspending the TSO. This can occur
+      for example when waiting on readiness of a regular file (which is always
+      ready).
+ * 2: heap overflow
+ * >2: unallocated status codes
+*/
+typedef int IOSubmitResult;
 
-void syncDelayCancel(Capability *cap, StgTSO *tso);
+/* Provide constants for IOSubmitResult */
+enum IOSubmitResultCodes {
+  /* negative numbers are -errno error codes */
+  IOSubmitResultAsyncContinue = 0,
+  IOSubmitResultSyncSuccess   = 1,
+  IOSubmitResultHeapOverflow  = 2
+};
+
+/* Called from CMM primop */
+IOSubmitResult syncIOWaitReady(CapIOManager *iomgr, StgTSO *tso,
+                               enum IOReadOrWrite rw, HsInt fd);
+
+/* Cancel the I/O the TSO is blocked on and add the TSO to the run queue */
+void syncIOCancel(CapIOManager *iomgr, StgTSO *tso);
+
+/* Called from CMM primop */
+bool syncDelay(CapIOManager *iomgr, StgTSO *tso, HsInt us_delay);
+
+/* Cancel the timeout the TSO is blocked on and add the TSO to the run queue */
+void syncDelayCancel(CapIOManager *iomgr, StgTSO *tso);
 
 #if defined(IOMGR_ENABLED_SELECT) || defined(IOMGR_ENABLED_WIN32_LEGACY)
 /* Add a thread to the end of the queue of threads blocked on I/O.
@@ -298,7 +405,7 @@ void syncDelayCancel(Capability *cap, StgTSO *tso);
  * This is used by the select() and the Windows MIO non-threaded I/O manager
  * implementation. Called from CMM code.
  */
-void appendToIOBlockedQueue(Capability *cap, StgTSO *tso);
+void appendToIOBlockedQueue(CapIOManager *iomgr, StgTSO *tso);
 #endif
 
 /* Check to see if there are any pending timeouts or I/O operations
@@ -307,7 +414,7 @@ void appendToIOBlockedQueue(Capability *cap, StgTSO *tso);
  * This is used by the scheduler as part of deadlock-detection, and the
  * "context switch as often as possible" test.
  */
-bool anyPendingTimeoutsOrIO(Capability *cap);
+bool anyPendingTimeoutsOrIO(CapIOManager *iomgr);
 
 /* If there are any completed I/O operations or expired timers, process the
  * completions as appropriate (which will typically unblock some waiting
@@ -315,22 +422,39 @@ bool anyPendingTimeoutsOrIO(Capability *cap);
  *
  * Called from schedule() both *before* and *after* scheduleDetectDeadlock().
  */
-void pollCompletedTimeoutsOrIO(Capability *cap);
+void pollCompletedTimeoutsOrIO(CapIOManager *iomgr);
 
- /* If there are any completed I/O operations or expired timers, process the
+/* If there are any completed I/O operations or expired timers, process the
  * completions as appropriate. If there are none, wait until I/O or a timer
  * does complete (or we get a signal with a handler) and process the
  * completions as appropriate.
  *
- * Upon return this guarantees that the scheduler run queue is non-empty or
- * that the scheduler is no longer in the running state. Succinctly, the
- * post-condition is (!emptyRunQueue(cap) || getSchedState() != SCHED_RUNNING).
+ * This should _only_ be called when there are no runnable threads and it is
+ * thus accepable to block and wait for I/O or timeouts. Notably this means it
+ * must _not_ be used in the threaded RTS (where it is unacceptable to block
+ * a capability).
+ *
+ * Upon returning true this guarantees that the scheduler run queue is
+ * non-empty or that the scheduler is no longer in the running state.
+ * Succinctly, the post-condition in the return true case is
+ * (!emptyRunQueue(cap) || getSchedState() != SCHED_RUNNING).
+ * A false result means the wait was interrupted by interruptIOManager, and
+ * there is no post-condition in this case.
  *
  * This is only expected to be called if anyPendingTimeoutsOrIO() returns true,
  * i.e. there actually is something to wait for.
  *
  * Called from schedule() both *before* and *after* scheduleDetectDeadlock().
  */
-void awaitCompletedTimeoutsOrIO(Capability *cap);
+bool awaitCompletedTimeoutsOrIO(CapIOManager *iomgr);
+
+/* Interrupt the I/O manager if it is blocked in awaitCompletedTimeoutsOrIO,
+ * causing it to return early.
+ *
+ * Its use is inherently concurrent and racy: the interrupt races against any
+ * I/O or timer completion. This does not matter for the intended use case of
+ * returning control to the scheduler.
+ */
+void interruptIOManager(CapIOManager *iomgr);
 
 #include "EndPrivate.h"

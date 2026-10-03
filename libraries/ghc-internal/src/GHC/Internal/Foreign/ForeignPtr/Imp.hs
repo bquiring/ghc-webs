@@ -48,10 +48,12 @@ module GHC.Internal.Foreign.ForeignPtr.Imp
         )
         where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Foreign.Ptr
 import GHC.Internal.Foreign.Storable ( Storable(sizeOf) )
 
-import GHC.Internal.Base
+import GHC.Internal.Err ( undefined )
 import GHC.Internal.Num
 import GHC.Internal.ForeignPtr
 

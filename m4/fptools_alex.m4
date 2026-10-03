@@ -10,7 +10,9 @@ dnl https://gitlab.haskell.org/ghc/ghc/wikis/building/preparation/tools
 dnl
 AC_DEFUN([FPTOOLS_ALEX],
 [AC_PATH_PROG(ALEX,[alex],)
-AC_SUBST(AlexCmd,$ALEX)
+AlexCmd="$ALEX"
+FP_CANONICALISE_WIN_PATH([AlexCmd])
+AC_SUBST(AlexCmd)
 AC_CACHE_CHECK([for version of alex], fptools_cv_alex_version,
 changequote(, )dnl
 [if test x"$AlexCmd" != x; then
@@ -23,10 +25,16 @@ changequote([, ])dnl
 ])
 if test ! -f compiler/GHC/Parser/Lexer.hs || test ! -f compiler/GHC/Cmm/Lexer.hs
 then
+    if test x"$fptools_cv_alex_version" != x; then
+        fptools_cv_alex_version_display="version $fptools_cv_alex_version";
+    else
+        fptools_cv_alex_version_display="none";
+    fi;
+    failure_msg="Alex version >= 3.2.6 && < 4 is required to compile GHC. (Found: $fptools_cv_alex_version_display)"
     FP_COMPARE_VERSIONS([$fptools_cv_alex_version],[-lt],[3.2.6],
-      [AC_MSG_ERROR([Alex >= 3.2.6 && < 4 is required to compile GHC.])])[]
+      [AC_MSG_ERROR([$failure_msg])])[]
     FP_COMPARE_VERSIONS([$fptools_cv_alex_version],[-ge],[4.0.0],
-      [AC_MSG_ERROR([Alex >= 3.2.6 && < 4 is required to compile GHC.])])[]
+      [AC_MSG_ERROR([$failure_msg])])[]
 fi
 AlexVersion=$fptools_cv_alex_version;
 AC_SUBST(AlexVersion)

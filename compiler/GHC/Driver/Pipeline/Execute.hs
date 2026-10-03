@@ -1,9 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE DerivingVia #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE GADTs #-}
 #include <ghcplatform.h>
 
 {- Functions for providing the default interpretation of the 'TPhase' actions
@@ -15,6 +12,7 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Catch
 import GHC.Driver.Hooks
+import GHC.Driver.DynFlags
 import Control.Monad.Trans.Reader
 import GHC.Driver.Pipeline.Monad
 import GHC.Driver.Pipeline.Phases
@@ -30,11 +28,11 @@ import GHC.Unit.Module.ModIface
 import GHC.Driver.Backend
 import GHC.Driver.Session
 import GHC.Unit.Module.ModSummary
-import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.SrcLoc
 import GHC.Driver.Main
 import GHC.Driver.Downsweep
 import GHC.Tc.Types
+import GHC.Tc.Utils.Monad (TcMPluginHandling(..))
 import GHC.Types.Error
 import GHC.Driver.Errors.Types
 import GHC.Fingerprint
@@ -42,7 +40,9 @@ import GHC.Utils.Logger
 import GHC.Utils.TmpFs
 import GHC.Platform
 import Data.List (intercalate, isInfixOf)
+import qualified Data.List.NonEmpty as NE
 import GHC.Unit.Env
+import GHC.Unit.Home.ModInfo
 import GHC.Utils.Error
 import Data.Maybe
 import GHC.CmmToLlvm.Mangler
@@ -66,12 +66,13 @@ import GHC.Unit.Finder
 import Data.IORef
 import GHC.Types.Name.Env
 import GHC.Platform.Ways
+import GHC.Runtime.Loader (initializePlugins)
 import GHC.Driver.LlvmConfigCache (readLlvmConfigCache)
 import GHC.CmmToLlvm.Config (LlvmTarget (..), LlvmConfig (..))
+import GHC.CmmToLlvm.Version.Type (LlvmVersion (..))
 import {-# SOURCE #-} GHC.Driver.Pipeline (compileForeign, compileEmptyStub)
 import GHC.Settings
 import System.IO
-import GHC.Linker.ExtraObj
 import GHC.Linker.Dynamic
 import GHC.Utils.Panic
 import GHC.Utils.Touch
@@ -80,13 +81,13 @@ import GHC.Driver.Env.KnotVars
 import GHC.Driver.Config.Finder
 import GHC.Rename.Names
 import GHC.StgToJS.Linker.Linker (embedJsFile)
+import GHC.Types.UnresolvedImport (rnUnresolvedImportPkgQual)
 
 import Language.Haskell.Syntax.Module.Name
-import GHC.Unit.Home.ModInfo
-import GHC.Runtime.Loader (initializePlugins)
 
 newtype HookedUse a = HookedUse { runHookedUse :: (Hooks, PhaseHook) -> IO a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadThrow, MonadCatch) via (ReaderT (Hooks, PhaseHook) IO)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadThrow, MonadCatch, MonadMask)
+    via (ReaderT (Hooks, PhaseHook) IO)
 
 instance MonadUse TPhase HookedUse where
   use fa = HookedUse $ \(hooks, (PhaseHook k)) ->
@@ -181,55 +182,17 @@ runMergeForeign _pipe_env hsc_env input_fn foreign_os = do
 
 runLlvmLlcPhase :: PipeEnv -> HscEnv -> FilePath -> IO FilePath
 runLlvmLlcPhase pipe_env hsc_env input_fn = do
-    -- Note [Clamping of llc optimizations]
-    -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    -- See #13724
-    --
-    -- we clamp the llc optimization between [1,2]. This is because passing -O0
-    -- to llc 3.9 or llc 4.0, the naive register allocator can fail with
-    --
-    --   Error while trying to spill R1 from class GPR: Cannot scavenge register
-    --   without an emergency spill slot!
-    --
-    -- Observed at least with target 'arm-unknown-linux-gnueabihf'.
-    --
-    --
-    -- With LLVM4, llc -O3 crashes when ghc-stage1 tries to compile
-    --   rts/HeapStackCheck.cmm
-    --
-    -- llc -O3 '-mtriple=arm-unknown-linux-gnueabihf' -enable-tbaa /var/folders/fv/xqjrpfj516n5xq_m_ljpsjx00000gn/T/ghc33674_0/ghc_6.bc -o /var/folders/fv/xqjrpfj516n5xq_m_ljpsjx00000gn/T/ghc33674_0/ghc_7.lm_s
-    -- 0  llc                      0x0000000102ae63e8 llvm::sys::PrintStackTrace(llvm::raw_ostream&) + 40
-    -- 1  llc                      0x0000000102ae69a6 SignalHandler(int) + 358
-    -- 2  libsystem_platform.dylib 0x00007fffc23f4b3a _sigtramp + 26
-    -- 3  libsystem_c.dylib        0x00007fffc226498b __vfprintf + 17876
-    -- 4  llc                      0x00000001029d5123 llvm::SelectionDAGISel::LowerArguments(llvm::Function const&) + 5699
-    -- 5  llc                      0x0000000102a21a35 llvm::SelectionDAGISel::SelectAllBasicBlocks(llvm::Function const&) + 3381
-    -- 6  llc                      0x0000000102a202b1 llvm::SelectionDAGISel::runOnMachineFunction(llvm::MachineFunction&) + 1457
-    -- 7  llc                      0x0000000101bdc474 (anonymous namespace)::ARMDAGToDAGISel::runOnMachineFunction(llvm::MachineFunction&) + 20
-    -- 8  llc                      0x00000001025573a6 llvm::MachineFunctionPass::runOnFunction(llvm::Function&) + 134
-    -- 9  llc                      0x000000010274fb12 llvm::FPPassManager::runOnFunction(llvm::Function&) + 498
-    -- 10 llc                      0x000000010274fd23 llvm::FPPassManager::runOnModule(llvm::Module&) + 67
-    -- 11 llc                      0x00000001027501b8 llvm::legacy::PassManagerImpl::run(llvm::Module&) + 920
-    -- 12 llc                      0x000000010195f075 compileModule(char**, llvm::LLVMContext&) + 12133
-    -- 13 llc                      0x000000010195bf0b main + 491
-    -- 14 libdyld.dylib            0x00007fffc21e5235 start + 1
-    -- Stack dump:
-    -- 0.  Program arguments: llc -O3 -mtriple=arm-unknown-linux-gnueabihf -enable-tbaa /var/folders/fv/xqjrpfj516n5xq_m_ljpsjx00000gn/T/ghc33674_0/ghc_6.bc -o /var/folders/fv/xqjrpfj516n5xq_m_ljpsjx00000gn/T/ghc33674_0/ghc_7.lm_s
-    -- 1.  Running pass 'Function Pass Manager' on module '/var/folders/fv/xqjrpfj516n5xq_m_ljpsjx00000gn/T/ghc33674_0/ghc_6.bc'.
-    -- 2.  Running pass 'ARM Instruction Selection' on function '@"stg_gc_f1$def"'
-    --
-    -- Observed at least with -mtriple=arm-unknown-linux-gnueabihf -enable-tbaa
-    --
     llvm_config <- readLlvmConfigCache (hsc_llvm_config hsc_env)
     let dflags = hsc_dflags hsc_env
         logger = hsc_logger hsc_env
         llvmOpts = case llvmOptLevel dflags of
           0 -> "-O1" -- required to get the non-naive reg allocator. Passing -regalloc=greedy is not sufficient.
           1 -> "-O1"
-          _ -> "-O2"
+          _ -> "-O3"
 
-        defaultOptions = map GHC.SysTools.Option . concatMap words . snd
-                         $ unzip (llvmOptions llvm_config dflags)
+    llvm_version <- figureLlvmVersion logger dflags
+    let defaultOptions = map GHC.SysTools.Option . concatMap words . snd
+                         $ unzip (llvmOptions llvm_config llvm_version dflags)
         optFlag = if null (getOpts dflags opt_lc)
                   then map GHC.SysTools.Option $ words llvmOpts
                   else []
@@ -258,14 +221,15 @@ runLlvmOptPhase pipe_env hsc_env input_fn = do
     llvm_config <- readLlvmConfigCache (hsc_llvm_config hsc_env)
     let -- we always (unless -optlo specified) run Opt since we rely on it to
         -- fix up some pretty big deficiencies in the code we generate
-        optIdx = max 0 $ min 2 $ llvmOptLevel dflags  -- ensure we're in [0,2]
+        optIdx = max 0 $ min 3 $ llvmOptLevel dflags  -- ensure we're in [0,3]
         llvmOpts = case lookup optIdx $ llvmPasses llvm_config of
                     Just passes -> passes
                     Nothing -> panic ("runPhase LlvmOpt: llvm-passes file "
                                       ++ "is missing passes for level "
                                       ++ show optIdx)
-        defaultOptions = map GHC.SysTools.Option . concat . fmap words . fst
-                         $ unzip (llvmOptions llvm_config dflags)
+    llvm_version <- figureLlvmVersion logger dflags
+    let defaultOptions = map GHC.SysTools.Option . concat . fmap words . fst
+                         $ unzip (llvmOptions llvm_config llvm_version dflags)
 
         -- don't specify anything if user has specified commands. We do this
         -- for opt but not llc since opt is very specifically for optimisation
@@ -411,6 +375,7 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   let unit_env  = hsc_unit_env hsc_env
   let home_unit = hsc_home_unit_maybe hsc_env
   let tmpfs     = hsc_tmpfs hsc_env
+  let tmpdir    = tmpDir dflags
   let platform  = ue_platform unit_env
   let hcc       = cc_phase `eqPhase` HCc
 
@@ -432,7 +397,7 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   let include_paths = include_paths_quote ++ include_paths_global
 
   let gcc_extra_viac_flags = extraGccViaCFlags dflags
-  let pic_c_flags = picCCOpts dflags
+  let cc_config = configureCc dflags
 
   let verbFlags = getVerbFlags dflags
 
@@ -481,14 +446,14 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   ghcVersionH <- getGhcVersionIncludeFlags dflags unit_env
 
   withAtomicRename output_fn $ \temp_outputFilename ->
-    GHC.SysTools.runCc (phaseForeignLanguage cc_phase) logger tmpfs dflags (
+    GHC.SysTools.runCc (phaseForeignLanguage cc_phase) logger tmpfs tmpdir cc_config (
                   [ GHC.SysTools.Option "-c"
                   , GHC.SysTools.FileOption "" input_fn
                   , GHC.SysTools.Option "-o"
                   , GHC.SysTools.FileOption "" temp_outputFilename
                   ]
                  ++ map GHC.SysTools.Option (
-                    pic_c_flags
+                    (ccPicOpts cc_config)
 
                  -- See Note [Produce big objects on Windows]
                  ++ [ "-Wa,-mbig-obj"
@@ -603,7 +568,7 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
               mlinkable <-
                 if gopt Opt_ByteCodeAndObjectCode dflags
                   then do
-                    bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                    bc <- generateAndWriteByteCodeLinkable hsc_env (mkCgInteractiveGuts cgguts) mod_location
                     return $ emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }
 
                   else return emptyHomeModInfoLinkable
@@ -620,7 +585,7 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
             do
               final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
               hscMaybeWriteIface logger dflags True final_iface mb_old_iface_hash location
-              bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+              bc <- generateAndWriteByteCodeLinkable hsc_env (mkCgInteractiveGuts cgguts) mod_location
               return ([], final_iface, emptyHomeModInfoLinkable { homeMod_bytecode = Just bc } , panic "interpreter")
 
 
@@ -660,10 +625,11 @@ getFileArgs hsc_env input_fn = do
   let dflags0 = hsc_dflags hsc_env
       logger  = hsc_logger hsc_env
       parser_opts = initParserOpts dflags0
-  (warns0, src_opts) <- getOptionsFromFile parser_opts (supportedLanguagePragmas dflags0) input_fn
+      sec = initSourceErrorContext dflags0
+  (warns0, src_opts) <- getOptionsFromFile parser_opts sec (supportedLanguagePragmas dflags0) input_fn
   (dflags1, unhandled_flags, warns)
     <- parseDynamicFilePragma logger dflags0 src_opts
-  checkProcessArgsResult unhandled_flags
+  checkProcessArgsResult dflags0 unhandled_flags
   return (dflags1, warns0, warns)
 
 runCppPhase :: HscEnv -> FilePath -> FilePath -> IO FilePath
@@ -704,17 +670,15 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   hsc_env <- initializePlugins hsc_env1
 
   -- gather the imports and module name
-  (hspp_buf,mod_name,imps,src_imps) <- do
+  (hspp_buf,mod_name,imps) <- do
     buf <- hGetStringBuffer input_fn
-    let imp_prelude = xopt LangExt.ImplicitPrelude dflags
-        popts = initParserOpts dflags
-        rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env)
-        rn_imps = fmap (\(s, rpk, lmn@(L _ mn)) -> (s, rn_pkg_qual mn rpk, lmn))
-    eimps <- getImports popts imp_prelude buf input_fn (basename <.> suff)
+    let rn_imps = map (rnUnresolvedImportPkgQual (renameRawPkgQual (hsc_unit_env hsc_env)))
+        sec = initSourceErrorContext dflags
+    eimps <- parseHeaderImports dflags buf input_fn (basename <.> suff)
     case eimps of
-        Left errs -> throwErrors (GhcPsMessage <$> errs)
-        Right (src_imps,imps, L _ mod_name) -> return
-              (Just buf, mod_name, rn_imps imps, src_imps)
+        Left errs -> throwErrors sec (GhcPsMessage <$> errs)
+        Right (imps, L _ mod_name) -> return
+              (Just buf, mod_name, rn_imps imps)
 
   -- Take -o into account if present
   -- Very like -ohi, but we must *only* do this if we aren't linking
@@ -722,16 +686,17 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   -- the object file for one module.)
   -- Note the nasty duplication with the same computation in compileFile above
   location <- mkOneShotModLocation pipe_env dflags src_flavour mod_name
-  let o_file = ml_obj_file location -- The real object file
-      hi_file = ml_hi_file location
-      hie_file = ml_hie_file location
-      dyn_o_file = ml_dyn_obj_file location
+  let o_file = ml_obj_file_ospath location -- The real object file
+      hi_file = ml_hi_file_ospath location
+      hie_file = ml_hie_file_ospath location
+      dyn_o_file = ml_dyn_obj_file_ospath location
 
   src_hash <- getFileHash (basename <.> suff)
   hi_date <- modificationTimeIfExists hi_file
   hie_date <- modificationTimeIfExists hie_file
   o_mod <- modificationTimeIfExists o_file
   dyn_o_mod <- modificationTimeIfExists dyn_o_file
+  bytecode_date <- modificationTimeIfExists (ml_bytecode_file_ospath location)
 
   -- Tell the finder cache about this module
   mod <- do
@@ -753,8 +718,8 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
                                 ms_parsed_mod   = Nothing,
                                 ms_iface_date   = hi_date,
                                 ms_hie_date     = hie_date,
-                                ms_textual_imps = imps,
-                                ms_srcimps      = src_imps }
+                                ms_bytecode_date = bytecode_date,
+                                ms_textual_imps = imps }
 
 
   -- run the compiler!
@@ -765,7 +730,7 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   mg <- downsweepThunk hsc_env mod_summary
 
   -- Need to set the knot-tying mutable variable for interface
-  -- files. See GHC.Tc.Utils.TcGblEnv.tcg_type_env_var.
+  -- files. See GHC.Tc.Utils.TcGblEnv.tcg_knot_vars
   -- See also Note [hsc_type_env_var hack]
   type_env_var <- newIORef emptyNameEnv
   let hsc_env' =
@@ -820,7 +785,12 @@ mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
       fopts = initFinderOpts dflags
 
 runHscTcPhase :: HscEnv -> ModSummary -> IO (FrontendResult, Messages GhcMessage)
-runHscTcPhase = hscTypecheckAndGetWarnings
+runHscTcPhase hsc_env ms =
+  hscTypecheckAndGetWarnings hsc_env ms StartAndKeepRunningTcMPlugins
+    -- NB: we properly stop TcM plugins in 'hscPipeline':
+    --
+    --  - if we proceed to desugaring, the desugarer will shut them down
+    --  - otherwise, we shut them down after typechecking.
 
 runHscPostTcPhase ::
     HscEnv
@@ -829,9 +799,9 @@ runHscPostTcPhase ::
   -> Messages GhcMessage
   -> Maybe Fingerprint
   -> IO HscBackendAction
-runHscPostTcPhase hsc_env mod_summary tc_result tc_warnings mb_old_hash = do
-        runHsc hsc_env $ do
-            hscDesugarAndSimplify mod_summary tc_result tc_warnings mb_old_hash
+runHscPostTcPhase hsc_env mod_summary tc_result tc_warnings mb_old_hash
+  = runHsc hsc_env $
+    hscDesugarAndSimplify mod_summary tc_result tc_warnings mb_old_hash
 
 
 runHsPpPhase :: HscEnv -> FilePath -> FilePath -> FilePath -> IO FilePath
@@ -959,11 +929,20 @@ getOutputFilename logger tmpfs stop_phase output basename dflags next_phase mayb
 -- | LLVM Options. These are flags to be passed to opt and llc, to ensure
 -- consistency we list them in pairs, so that they form groups.
 llvmOptions :: LlvmConfig
+            -> Maybe LlvmVersion
             -> DynFlags
             -> [(String, String)]  -- ^ pairs of (opt, llc) arguments
-llvmOptions llvm_config dflags =
+llvmOptions llvm_config llvm_version dflags =
        [("-relocation-model=" ++ rmodel
         ,"-relocation-model=" ++ rmodel) | not (null rmodel)]
+
+    -- Both llc/opt need these flags for split sections
+    ++ [ ("--data-sections", "--data-sections")
+       | gopt Opt_SplitSections dflags
+       ]
+    ++ [ ("--function-sections", "--function-sections")
+       | gopt Opt_SplitSections dflags
+       ]
 
     -- Additional llc flags
     ++ [("", "-mcpu=" ++ mcpu)   | not (null mcpu)
@@ -1001,15 +980,23 @@ llvmOptions llvm_config dflags =
               ++ ["+sse2"    | isSse2Enabled platform   ]
               ++ ["+sse"     | isSseEnabled platform    ]
               ++ ["+avx512f" | isAvx512fEnabled dflags  ]
+              ++ ["+evex512" | isAvx512fEnabled dflags
+                             , maybe False (>= LlvmVersion (18 NE.:| [])) llvm_version ]
+                   -- +evex512 is recognized by LLVM 18 or newer and needed on macOS (#26410).
+                   -- It may become deprecated in a future LLVM version, though.
               ++ ["+avx2"    | isAvx2Enabled dflags     ]
               ++ ["+avx"     | isAvxEnabled dflags      ]
+              ++ ["+avx512bw"| isAvx512bwEnabled dflags ]
               ++ ["+avx512cd"| isAvx512cdEnabled dflags ]
+              ++ ["+avx512dq"| isAvx512dqEnabled dflags ]
               ++ ["+avx512er"| isAvx512erEnabled dflags ]
               ++ ["+avx512pf"| isAvx512pfEnabled dflags ]
-              -- For Arch64 +fma is not a option (it's unconditionally available).
+              ++ ["+avx512vl"| isAvx512vlEnabled dflags ]
+              -- For AArch64 +fma is not a option (it's unconditionally available).
               ++ ["+fma"     | isFmaEnabled dflags && (arch /= ArchAArch64) ]
               ++ ["+bmi"     | isBmiEnabled dflags      ]
               ++ ["+bmi2"    | isBmi2Enabled dflags     ]
+              ++ ["+gfni"    | isGfniEnabled dflags     ]
 
         abi :: String
         abi = case platformArch (targetPlatform dflags) of
@@ -1135,7 +1122,8 @@ joinObjectFiles hsc_env o_files output_fn
 
   | otherwise = do
   withAtomicRename output_fn $ \tmp_ar ->
-      liftIO $ runAr logger dflags Nothing $ map Option $ ["qc" ++ dashL, tmp_ar] ++ o_files
+      let ar_opts = configureAr dflags
+      in liftIO $ runAr logger ar_opts Nothing $ map Option $ ["qc" ++ dashL, tmp_ar] ++ o_files
   where
     dashLSupported = sArSupportsDashL (settings dflags)
     dashL = if dashLSupported then "L" else ""
@@ -1162,7 +1150,7 @@ getHCFilePackages filename =
 linkDynLibCheck :: Logger -> TmpFs -> DynFlags -> UnitEnv -> [String] -> [UnitId] -> IO ()
 linkDynLibCheck logger tmpfs dflags unit_env o_files dep_units = do
   when (haveRtsOptsFlags dflags) $
-    logMsg logger MCInfo noSrcSpan
+    logInfo logger
       $ withPprStyle defaultUserStyle
       (text "Warning: -rtsopts and -with-rtsopts have no effect with -shared." $$
       text "    Call hs_init_ghc() from your main() function to set these options.")

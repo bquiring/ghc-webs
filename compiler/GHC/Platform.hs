@@ -1,6 +1,3 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE LambdaCase #-}
-
 -- | Platform description
 module GHC.Platform
    ( Platform (..)
@@ -32,7 +29,7 @@ module GHC.Platform
    , platformCConvNeedsExtension
    , platformHasRTSLinker
    , PlatformMisc(..)
-   , SseVersion (..)
+   , SseAvxVersion (..)
    , BmiVersion (..)
    , wordAlignment
    -- * SSE and AVX
@@ -47,6 +44,9 @@ module GHC.Platform
    , platformHsSOName
    , platformSOExt
    , genericPlatform
+   -- * Target integer type
+   , TargetInt
+   , toTargetInt
    )
 where
 
@@ -63,6 +63,25 @@ import Data.Word
 import Data.Int
 import System.FilePath
 import System.Directory
+
+-- Note [TargetInt]
+-- ~~~~~~~~~~~~~~~~
+-- GHC uses 'TargetInt' to represent a value of type 'Int' on the target
+-- machine. This is distinct from the host's 'Int' type: when cross-compiling
+-- from a 32-bit host to a 64-bit target, the host 'Int' is 32 bits but the
+-- target's 'Int' type is 64 bits. Using host 'Int' to store target 'Int'
+-- values would cause silent truncation in that scenario.
+--
+-- We use 'Int64' because it covers the full range of any supported target
+-- (32-bit or 64-bit), while still being a fixed-size type that participates in
+-- correct signed arithmetic (e.g. bitwise complement, see 'cmmPointerMask').
+type TargetInt = Int64
+
+-- | Convert a host-side 'Int' value to a 'TargetInt'.
+-- Use this when converting host-computed counts or offsets into target-sized
+-- integers, e.g. when passing to 'mkIntExpr' or 'mkIntCLit'.
+toTargetInt :: Int -> TargetInt
+toTargetInt = fromIntegral
 
 -- | Platform description
 --
@@ -264,14 +283,16 @@ platformHasRTSLinker p = case archOS_arch (platformArchOS p) of
 -- Instruction sets
 --------------------------------------------------
 
--- | x86 SSE instructions
-data SseVersion
+-- | x86 SSE and AVX instructions
+data SseAvxVersion
    = SSE1
    | SSE2
    | SSE3
    | SSSE3
    | SSE4
    | SSE42
+   | AVX1
+   | AVX2
    deriving (Eq, Ord)
 
 -- | x86 BMI (bit manipulation) instructions

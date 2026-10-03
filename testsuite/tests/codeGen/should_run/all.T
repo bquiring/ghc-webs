@@ -187,6 +187,8 @@ test('T14619', normal, compile_and_run, [''])
 test('T14754', normal, compile_and_run, [''])
 test('T14346', only_ways(['threaded1','threaded2']), compile_and_run, ['-O -threaded'])
 test('T14251', normal, compile_and_run, [''])
+test('T9811', [extra_ways(['optasm']), js_skip], compile_and_run, [''])
+test('T21227', [extra_ways(['optasm']), js_skip], compile_and_run, [''])
 
 # These actually used to fail with all optimisation settings, but adding -O just
 # to make sure
@@ -256,3 +258,49 @@ test('T24893', normal, compile_and_run, ['-O'])
 test('CCallConv', [req_c], compile_and_run, ['CCallConv_c.c'])
 test('T25364', normal, compile_and_run, [''])
 test('T26061', normal, compile_and_run, [''])
+test('T26537', compile_timeout_multiplier(1.5), compile_and_run, ['-O2 -fregs-graph'])
+test('T24016', normal, compile_and_run, ['-O1 -fPIC'])
+test('T27046',
+     [ req_cmm
+     , when(arch('i386'), skip) # i386 does not support MO_S_Mul2 W64
+     , when(arch('wasm32'), skip)
+     , js_skip
+     , when(unregisterised(), skip) # pprCallishMachOp_for_C: MO_S_Mul2 W64 not supported
+     ], compile_and_run, ['T27046_cmm.cmm'])
+
+# Check that GHC-generated finalizers run on Darwin. The Apple linker doesn't
+# support --wrap, so we can't intercept hs_spt_remove directly.  Instead we
+# compile a small checker dylib (T27072d_check.c) whose constructor registers
+# a __cxa_atexit handler *before* the executable's __mod_init_func entries run.
+# LIFO ordering ensures the checker fires after the GHC-generated finalizer,
+# so it can observe that SPT entries were removed.
+# Requires dynamic way so the RTS is a dylib (avoids archive conflicts).
+test('T27072d', [req_c, only_ways(['dyn']), when(not opsys('darwin'), skip),
+     pre_cmd('{compiler} -shared -no-hs-main'
+             ' -optl -undefined -optl dynamic_lookup'
+             ' -o T27072d_check.dylib T27072d_check.c')],
+     compile_and_run,
+     ['T27072d_c.c -no-hs-main'
+      ' -optl -Wl,-needed_library,T27072d_check.dylib -optl -rpath -optl .'])
+# check that finalizers are being run, using --wrap to intercept hs_spt_remove.
+# Skipped on Darwin (Apple linker doesn't support --wrap).
+test('T27072w', [req_c, js_skip, when(opsys('darwin'), skip)],
+     compile_and_run, ['T27072w_c.c -no-hs-main -optl-Wl,--wrap=hs_spt_remove'])
+# AArch64-specific runtime tests
+test('aarch64-ushr-subword-run', [unless(arch('aarch64'), skip)], compile_and_run, ['-O'])
+test('aarch64-subword-ops', [unless(arch('aarch64'), skip)], compile_and_run, ['-O'])
+test('aarch64-sxtw-run',
+     [ extra_files(['aarch64-sxtw-cmm.cmm']),
+       unless(arch('aarch64'), skip),
+       when(unregisterised(), skip)],
+     multi_compile_and_run,
+     ['aarch64-sxtw-run', [('aarch64-sxtw-cmm.cmm', '')], '-O'])
+
+test('T27430', [req_c, extra_ways(['optasm'])], compile_and_run, ['T27430_c.c'])
+
+test('T27533', [req_cmm, extra_ways(['optasm'])], multi_compile_and_run,
+               ['T27533', [('T27533_cmm.cmm', '')], '-O'])
+
+test('T27537', normal, compile_and_run, ['-O'])
+
+test('T27538', normal, compile_and_run, ['-O'])

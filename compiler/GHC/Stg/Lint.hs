@@ -91,8 +91,8 @@ be ill-typed in Core.  But it must still be well-kinded!
 
 -}
 
-{-# LANGUAGE ScopedTypeVariables, FlexibleContexts, TypeFamilies,
-  DeriveFunctor #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module GHC.Stg.Lint ( lintStgTopBindings ) where
 
@@ -104,10 +104,10 @@ import GHC.Stg.Utils
 import GHC.Core.DataCon
 import GHC.Core             ( AltCon(..) )
 import GHC.Core.Type
+import GHC.Core.Lint        ( lintMessage )
 
-import GHC.Types.Basic      ( TopLevelFlag(..), isTopLevel, isMarkedCbv )
+import GHC.Types.Basic      ( TopLevelFlag(..), isTopLevel )
 import GHC.Types.CostCentre ( isCurrentCCS )
-import GHC.Types.Error      ( DiagnosticReason(WarningWithoutFlag) )
 import GHC.Types.Id
 import GHC.Types.Var.Set
 import GHC.Types.Name       ( getSrcLoc, nameIsLocalOrFrom )
@@ -116,7 +116,7 @@ import GHC.Types.SrcLoc
 
 import GHC.Utils.Logger
 import GHC.Utils.Outputable
-import GHC.Utils.Error      ( mkLocMessage, DiagOpts )
+import GHC.Utils.Error      ( DiagOpts )
 import qualified GHC.Utils.Error as Err
 
 import GHC.Unit.Module            ( Module )
@@ -124,12 +124,10 @@ import GHC.Unit.Module            ( Module )
 import GHC.Data.Bag         ( Bag, emptyBag, isEmptyBag, snocBag, bagToList )
 
 import Control.Monad
-import Data.Maybe
-import GHC.Utils.Misc
+import GHC.Exts            ( oneShot )
 import GHC.Core.Multiplicity (scaledThing)
 import GHC.Settings (Platform)
 import GHC.Core.TyCon (primRepCompatible, primRepsCompatible)
-import GHC.Utils.Panic.Plain (panic)
 
 lintStgTopBindings :: forall a . (OutputablePass a, BinderP a ~ Id)
                    => Platform
@@ -149,8 +147,7 @@ lintStgTopBindings platform logger diag_opts opts extra_vars this_mod unarised w
       Nothing  ->
         return ()
       Just msg -> do
-        logMsg logger Err.MCInfo noSrcSpan   -- See Note [MCInfo for Lint] in "GHC.Core.Lint"
-          $ withPprStyle defaultDumpStyle
+        lintMessage logger
           (vcat [ text "*** Stg Lint ErrMsgs: in" <+>
                         text whodunit <+> text "***",
                   msg,
@@ -176,36 +173,47 @@ lintStgTopBindings platform logger diag_opts opts extra_vars this_mod unarised w
     lint_bind (StgTopStringLit v _) = return [v]
 
 lintStgConArg :: StgArg -> LintM ()
-lintStgConArg arg = do
-  unarised <- lf_unarised <$> getLintFlags
-  when unarised $ case stgArgRep_maybe arg of
-    -- Note [Post-unarisation invariants], invariant 4
-    Just [_] -> pure ()
-    badRep   -> addErrL $
-      text "Non-unary constructor arg: " <> ppr arg $$
-      text "Its PrimReps are: " <> ppr badRep
+lintStgConArg arg
+  = do { lintStgArg arg
 
-  case arg of
-    StgLitArg _ -> pure ()
-    StgVarArg v -> lintStgVar v
+       ; unarised <- lf_unarised <$> getLintFlags
+       ; when unarised $ case stgArgRep_maybe arg of
+           -- Note [Post-unarisation invariants], invariant 4
+           Just [_] -> pure ()
+           badRep   -> addErrL $
+             text "Non-unary constructor arg: " <> ppr arg $$
+             text "Its PrimReps are: " <> ppr badRep }
 
 lintStgFunArg :: StgArg -> LintM ()
-lintStgFunArg arg = do
-  unarised <- lf_unarised <$> getLintFlags
-  when unarised $ case stgArgRep_maybe arg of
-    -- Note [Post-unarisation invariants], invariant 3
-    Just []  -> pure ()
-    Just [_] -> pure ()
-    badRep   -> addErrL $
-      text "Function arg is not unary or void: " <> ppr arg $$
-      text "Its PrimReps are: " <> ppr badRep
+lintStgFunArg arg
+  = do { lintStgArg arg
 
-  case arg of
-    StgLitArg _ -> pure ()
-    StgVarArg v -> lintStgVar v
+       ; unarised <- lf_unarised <$> getLintFlags
+       ; when unarised $ case stgArgRep_maybe arg of
+           -- Note [Post-unarisation invariants], invariant 3
+           Just []  -> pure ()
+           Just [_] -> pure ()
+           badRep   -> addErrL $
+             text "Function arg is not unary or void: " <> ppr arg $$
+             text "Its PrimReps are: " <> ppr badRep }
 
-lintStgVar :: Id -> LintM ()
-lintStgVar id = checkInScope id
+lintStgArg :: StgArg -> LintM ()
+lintStgArg (StgLitArg _) = pure ()
+lintStgArg (StgVarArg v) = do { lintStgVarOcc v
+                              ; lintAppCbvMarks v [] }
+
+lintStgVarOcc :: Id -> LintM ()
+lintStgVarOcc id = do
+    checkInScope id
+    -- Enforce that 'Box' constructors appear exactly saturated.
+    -- See Note [No implicit binds for Box constructors] in GHC.CoreToStg.AddImplicitBinds.
+    case isDataConId_maybe id of
+      Just con
+        | isBoxingDataCon con && not (isNullaryRepDataCon con)
+        -> addErrL $
+             hang (text "Unexpected value occurrence of a boxing data constructor") 2 $
+               ppr id <+> dcolon <+> ppr (idType id)
+      _ -> return ()
 
 lintStgBinds
     :: (OutputablePass a, BinderP a ~ Id)
@@ -277,13 +285,11 @@ lintStgExpr :: (OutputablePass a, BinderP a ~ Id) => GenStgExpr a -> LintM ()
 
 lintStgExpr (StgLit _) = return ()
 
-lintStgExpr e@(StgApp fun args) = do
-  lintStgVar fun
-  mapM_ lintStgFunArg args
-  lintAppCbvMarks e
-  lintStgAppReps fun args
-
-
+lintStgExpr (StgApp fun args)
+  = do { lintStgVarOcc fun
+       ; mapM_ lintStgFunArg args
+       ; lintAppCbvMarks fun args
+       ; lintStgAppReps fun args }
 
 lintStgExpr app@(StgConApp con _n args _arg_tys) = do
     -- unboxed sums should vanish during unarise
@@ -415,22 +421,20 @@ lintStgAppReps fun args = do
 
   match_args actual_arg_reps fun_arg_tys_reps
 
-lintAppCbvMarks :: OutputablePass pass
-                => GenStgExpr pass -> LintM ()
-lintAppCbvMarks e@(StgApp fun args) = do
-  lf <- getLintFlags
-  when (lf_unarised lf) $ do
+lintAppCbvMarks :: Id -> [StgArg] -> LintM ()
+lintAppCbvMarks fun args
+  | idCbvMarkArity fun > length args
     -- A function which expects a unlifted argument as n'th argument
     -- always needs to be applied to n arguments.
-    -- See Note [CBV Function Ids].
-    let marks = fromMaybe [] $ idCbvMarks_maybe fun
-    when (length (dropWhileEndLE (not . isMarkedCbv) marks) > length args) $ do
-      addErrL $ hang (text "Undersatured cbv marked ID in App" <+> ppr e ) 2 $
-        (text "marks" <> ppr marks $$
-        text "args" <> ppr args $$
-        text "arity" <> ppr (idArity fun) $$
-        text "join_arity" <> ppr (idJoinPointHood fun))
-lintAppCbvMarks _ = panic "impossible - lintAppCbvMarks"
+    -- See Note [CBV Function Ids: overview].
+  = addErrL $ hang (text "Undersatured cbv marked ID in App" <+> ppr fun)
+                 2 (vcat [ text "marks" <> ppr (idCbvMarks_maybe fun)
+                         , text "args" <> ppr args
+                         , text "arity" <> ppr (idArity fun)
+                         , text "join_arity" <> ppr (idJoinPointHood fun) ])
+
+  | otherwise
+  = return ()
 
 {-
 ************************************************************************
@@ -440,17 +444,40 @@ The Lint monad
 ************************************************************************
 -}
 
-newtype LintM a = LintM
-    { unLintM :: Module
-              -> LintFlags
-              -> DiagOpts          -- Diagnostic options
-              -> StgPprOpts        -- Pretty-printing options
+data LintReaderEnv = LintReaderEnv
+  { le_mod ::  !Module
+  , le_flags :: !LintFlags
+  , le_diag_opts :: !DiagOpts  -- Diagnostic options
+  , le_ppr_opts :: !StgPprOpts  -- Pretty-printing options
+  }
+
+newtype LintM a = LintM'
+    { unLintM :: LintReaderEnv
               -> [LintLocInfo]     -- Locations
               -> IdSet             -- Local vars in scope
               -> Bag SDoc        -- Error messages so far
               -> (a, Bag SDoc)   -- Result and error messages (if any)
     }
-    deriving (Functor)
+instance Functor LintM where
+  fmap f (LintM m) =
+    LintM $ \env loc scope errs ->
+      case m env loc scope errs of
+        (a, errs') -> (f a, errs')
+
+-- See Note [The one-shot state monad trick] in GHC.Utils.Monad
+{-# COMPLETE LintM #-}
+pattern LintM :: (LintReaderEnv
+              -> [LintLocInfo]
+              -> IdSet
+              -> Bag SDoc
+              -> (a, Bag SDoc))
+              -> LintM a
+pattern LintM m <- LintM' m
+  where
+    LintM m = LintM' $ oneShot (\env -> oneShot
+                                      (\loc -> oneShot
+                                        (\scope -> oneShot
+                                          (\errs -> m env loc scope errs))))
 
 data LintFlags = LintFlags { lf_unarised :: !Bool
                            , lf_platform :: !Platform
@@ -481,14 +508,16 @@ pp_binders bs
 
 initL :: Platform -> DiagOpts -> Module -> Bool -> StgPprOpts -> IdSet -> LintM a -> Maybe SDoc
 initL platform diag_opts this_mod unarised opts locals (LintM m) = do
-  let (_, errs) = m this_mod (LintFlags unarised platform) diag_opts opts [] locals emptyBag
+  let !flags = LintFlags unarised platform
+      !env = LintReaderEnv this_mod flags diag_opts opts
+      (_, errs) = m env [] locals emptyBag
   if isEmptyBag errs then
       Nothing
   else
       Just (vcat (punctuate blankLine (bagToList errs)))
 
 instance Applicative LintM where
-      pure a = LintM $ \_mod _lf _df _opts _loc _scope errs -> (a, errs)
+      pure a = LintM $ \_env _loc _scope errs -> (a, errs)
       (<*>) = ap
       (*>)  = thenL_
 
@@ -497,14 +526,14 @@ instance Monad LintM where
     (>>)  = (*>)
 
 thenL :: LintM a -> (a -> LintM b) -> LintM b
-thenL m k = LintM $ \mod lf diag_opts opts loc scope errs
-  -> case unLintM m mod lf diag_opts opts loc scope errs of
-      (r, errs') -> unLintM (k r) mod lf diag_opts opts loc scope errs'
+thenL m k = LintM $ \env loc scope errs
+  -> case unLintM m env loc scope errs of
+      (r, errs') -> unLintM (k r) env loc scope errs'
 
 thenL_ :: LintM a -> LintM b -> LintM b
-thenL_ m k = LintM $ \mod lf diag_opts opts loc scope errs
-  -> case unLintM m mod lf diag_opts opts loc scope errs of
-      (_, errs') -> unLintM k mod lf diag_opts opts loc scope errs'
+thenL_ m k = LintM $ \env loc scope errs
+  -> case unLintM m env loc scope errs of
+      (_, errs') -> unLintM k env loc scope errs'
 
 checkL :: Bool -> SDoc -> LintM ()
 checkL True  _   = return ()
@@ -533,35 +562,36 @@ checkPostUnariseId id
     id_ty = idType id
 
 addErrL :: SDoc -> LintM ()
-addErrL msg = LintM $ \_mod _lf df _opts loc _scope errs -> ((), addErr df errs msg loc)
+addErrL msg = LintM $ \LintReaderEnv{le_diag_opts = df} loc _scope errs
+  -> ((), addErr df errs msg loc)
 
 addErr :: DiagOpts -> Bag SDoc -> SDoc -> [LintLocInfo] -> Bag SDoc
 addErr diag_opts errs_so_far msg locs
   = errs_so_far `snocBag` mk_msg locs
   where
     mk_msg (loc:_) = let (l,hdr) = dumpLoc loc
-                     in  mkLocMessage (Err.mkMCDiagnostic diag_opts WarningWithoutFlag Nothing)
+                     in  Err.mkLintWarning diag_opts
                                       l (hdr $$ msg)
     mk_msg []      = msg
 
 addLoc :: LintLocInfo -> LintM a -> LintM a
-addLoc extra_loc m = LintM $ \mod lf diag_opts opts loc scope errs
-   -> unLintM m mod lf diag_opts opts (extra_loc:loc) scope errs
+addLoc extra_loc m = LintM $ \env loc scope errs
+   -> unLintM m env (extra_loc:loc) scope errs
 
 addInScopeVars :: [Id] -> LintM a -> LintM a
-addInScopeVars ids m = LintM $ \mod lf diag_opts opts loc scope errs
+addInScopeVars ids m = LintM $ \env loc scope errs
  -> let
         new_set = mkVarSet ids
-    in unLintM m mod lf diag_opts opts loc (scope `unionVarSet` new_set) errs
+    in unLintM m env loc (scope `unionVarSet` new_set) errs
 
 getLintFlags :: LintM LintFlags
-getLintFlags = LintM $ \_mod lf _df _opts _loc _scope errs -> (lf, errs)
+getLintFlags = LintM $ \LintReaderEnv{le_flags = lf} _loc _scope errs -> (lf, errs)
 
 getStgPprOpts :: LintM StgPprOpts
-getStgPprOpts = LintM $ \_mod _lf _df opts _loc _scope errs -> (opts, errs)
+getStgPprOpts = LintM $ \LintReaderEnv{le_ppr_opts = opts} _loc _scope errs -> (opts, errs)
 
 checkInScope :: Id -> LintM ()
-checkInScope id = LintM $ \mod _lf diag_opts _opts loc scope errs
+checkInScope id = LintM $ \LintReaderEnv{le_mod = mod, le_diag_opts = diag_opts} loc scope errs
  -> if nameIsLocalOrFrom mod (idName id) && not (id `elemVarSet` scope) then
         ((), addErr diag_opts errs (hsep [ppr id, dcolon, ppr (idType id),
                                     text "is out of scope"]) loc)

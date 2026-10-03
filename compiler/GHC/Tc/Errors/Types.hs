@@ -1,12 +1,4 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE LambdaCase #-}
 
 module GHC.Tc.Errors.Types (
   -- * Main types
@@ -31,7 +23,6 @@ module GHC.Tc.Errors.Types (
   , SuggestUnliftedTypes(..)
   , DataSort(..), ppDataSort
   , AllowedDataResKind(..)
-  , NotClosedReason(..)
   , SuggestPartialTypeSignatures(..)
   , suggestPartialTypeSignatures
   , DeriveInstanceErrReason(..)
@@ -62,7 +53,7 @@ module GHC.Tc.Errors.Types (
   , SolverReport(..), SupplementaryInfo(..)
   , SolverReportWithCtxt(..)
   , SolverReportErrCtxt(..)
-  , getUserGivens, discardProvCtxtGivens
+  , getUsefulGivens
   , TcSolverReportMsg(..)
   , CannotUnifyVariableReason(..)
   , MismatchMsg(..)
@@ -72,7 +63,7 @@ module GHC.Tc.Errors.Types (
   , ExpectedActualInfo(..)
   , TyVarInfo(..), SameOccInfo(..)
   , AmbiguityInfo(..)
-  , CND_Extra(..)
+  , CND_ExpectedActual(..)
   , FitsMbSuppressed(..)
   , ValidHoleFits(..), noValidHoleFits
   , HoleFitDispConfig(..)
@@ -83,9 +74,12 @@ module GHC.Tc.Errors.Types (
   , Subordinate(..), pprSubordinate
   , ImportError(..)
   , WhatLooking(..)
-  , lookingForSubordinate
   , HoleError(..)
   , CoercibleMsg(..)
+  , NoBuiltinInstanceMsg(..)
+  , HasFieldMsg(..)
+  , TypeableMsg(..)
+  , TooFancyField(..)
   , PotentialInstances(..)
   , UnsupportedCallConvention(..)
   , ExpectedBackends
@@ -114,7 +108,9 @@ module GHC.Tc.Errors.Types (
   , HsTyVarBndrExistentialFlag(..)
   , TySynCycleTyCons
   , BadImportKind(..)
+  , BadExportSubordinate(..)
   , DodgyImportsReason (..)
+  , DodgyExportsReason (..)
   , ImportLookupExtensions (..)
   , ImportLookupReason (..)
   , UnusedImportReason (..)
@@ -126,6 +122,8 @@ module GHC.Tc.Errors.Types (
   , NonCanonical_Monad(..)
   , TypeSyntax(..)
   , typeSyntaxExtension
+  , SuggestLinear(..)
+  , ImplicitStrictnessField(..)
 
     -- * Errors for hs-boot and signature files
   , BadBootDecls(..)
@@ -175,7 +173,7 @@ module GHC.Tc.Errors.Types (
   , TypeCannotBeMarshaledReason(..)
 
   -- * Error contexts
-  , ErrCtxtMsg(..)
+  , HsCtxt(..)
   ) where
 
 import GHC.Prelude
@@ -189,7 +187,7 @@ import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence (EvBindsVar)
 import GHC.Tc.Types.ErrCtxt
 import GHC.Tc.Types.Origin ( CtOrigin (ProvCtxtOrigin), SkolemInfoAnon (SigSkol)
-                           , UserTypeCtxt (PatSynCtxt), TyVarBndrs, TypedThing
+                           , TyVarBndrs, TypedThing
                            , FixedRuntimeRepOrigin(..), InstanceWhat )
 import GHC.Tc.Types.CtLoc( CtLoc, ctLocOrigin, SubGoalDepth )
 import GHC.Tc.Types.Rank (Rank)
@@ -200,9 +198,9 @@ import GHC.Tc.Utils.TcType (TcType, TcSigmaType, TcPredType,
 import GHC.Types.Basic
 import GHC.Types.Error
 import GHC.Types.Avail
-import GHC.Types.Hint (UntickedPromotedThing(..), AssumedDerivingStrategy(..), SigLike)
-import GHC.Types.ForeignCall (CLabelString)
+import GHC.Types.Hint
 import GHC.Types.Id.Info ( RecSelParent(..) )
+import GHC.Types.InlinePragma (InlinePragma(..))
 import GHC.Types.Name (NamedThing(..), Name, OccName, getSrcLoc, getSrcSpan)
 import GHC.Types.Name.Env (NameEnv)
 import qualified GHC.Types.Name.Occurrence as OccName
@@ -217,7 +215,6 @@ import GHC.Types.DefaultEnv (ClassDefaults)
 
 import GHC.Unit.Types (Module)
 import GHC.Unit.State (UnitState)
-import GHC.Unit.Module.Warnings (WarningCategory, WarningTxt)
 import GHC.Unit.Module.ModIface (ModIface)
 
 import GHC.Utils.Outputable
@@ -231,7 +228,7 @@ import GHC.Core.FamInstEnv (FamInst)
 import GHC.Core.InstEnv (LookupInstanceErrReason, ClsInst, DFunId)
 import GHC.Core.PatSyn (PatSyn)
 import GHC.Core.Predicate (EqRel, predTypeEqRel)
-import GHC.Core.TyCon (TyCon, Role, FamTyConFlav, AlgTyConRhs)
+import GHC.Core.TyCon (TyCon, FamTyConFlav, AlgTyConRhs)
 import GHC.Core.Type (Kind, Type, ThetaType, PredType, ErrorMsgType, ForAllTyFlag, ForAllTyBinder)
 
 import GHC.Driver.Backend (Backend)
@@ -244,8 +241,6 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.FastString (FastString)
 import GHC.Data.Pair
 import GHC.Exception.Type (SomeException)
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import           Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
@@ -297,7 +292,7 @@ existence of these two types, which for now remain a "necessary evil".
 -- | The majority of TcRn messages come with extra context about the error,
 -- and this newtype captures it. See Note [Migrating TcM Messages].
 data ErrInfo = ErrInfo {
-    errInfoContext :: ![ErrCtxtMsg]
+    errInfoContext :: ![HsCtxt]
     -- ^ Extra context associated to the error.
   , errInfoSupplementary :: !(Maybe (HoleFitDispConfig, [SupplementaryInfo]))
     -- ^ Extra supplementary info associated to the error.
@@ -453,7 +448,7 @@ data TcRnMessage where
   -}
   TcRnTypeDoesNotHaveFixedRuntimeRep :: !Type
                                      -> !FixedRuntimeRepProvenance
-                                     -> ![ErrCtxtMsg] -- Extra info accumulated in the TcM monad
+                                     -> ![HsCtxt] -- Extra info accumulated in the TcM monad
                                      -> TcRnMessage
 
   {-| TcRnImplicitLift is a warning (controlled with -Wimplicit-lift) that occurs when
@@ -465,7 +460,7 @@ data TcRnMessage where
 
      Test cases: th/T17804
   -}
-  TcRnImplicitLift :: Name -> ![ErrCtxtMsg] -> TcRnMessage
+  TcRnImplicitLift :: Name -> ![HsCtxt] -> TcRnMessage
 
   {-| TcRnUnusedPatternBinds is a warning (controlled with -Wunused-pattern-binds)
       that occurs if a pattern binding binds no variables at all, unless it is a
@@ -500,24 +495,11 @@ data TcRnMessage where
       See 'DodgyImportsReason' for the different warnings.
   -}
   TcRnDodgyImports :: !DodgyImportsReason -> TcRnMessage
-  {-| TcRnDodgyExports is a warning (controlled by -Wdodgy-exports) that occurs when
-      an export of the form 'T(..)' for a type constructor 'T' does not actually export anything
-      beside 'T' itself.
+  {-| TcRnDodgyExports is a group of warnings (controlled with -Wdodgy-exports).
 
-     Example:
-       module Foo (
-           T(..)  -- Warning: T is a type synonym
-         , A(..)  -- Warning: A is a type family
-         , C(..)  -- Warning: C is a data family
-         ) where
-
-       type T = Int
-       type family A :: * -> *
-       data family C :: * -> *
-
-     Test cases: warnings/should_compile/DodgyExports01
+      See 'DodgyExportsReason' for the different warnings.
   -}
-  TcRnDodgyExports :: GlobalRdrElt -> TcRnMessage
+  TcRnDodgyExports :: !DodgyExportsReason -> TcRnMessage
   {-| TcRnMissingImportList is a warning (controlled by -Wmissing-import-lists) that occurs when
       an import declaration does not explicitly list all the names brought into scope.
 
@@ -618,8 +600,7 @@ data TcRnMessage where
      Test cases:
         None.
   -}
-  TcRnSimplifierTooManyIterations :: Cts
-                                  -> !IntWithInf
+  TcRnSimplifierTooManyIterations :: !IntWithInf
                                   -- ^ The limit.
                                   -> WantedConstraints
                                   -> TcRnMessage
@@ -835,20 +816,38 @@ data TcRnMessage where
      Test cases: th/T8412
                  typecheck/should_fail/T8306
   -}
-  TcRnNegativeNumTypeLiteral :: HsTyLit GhcPs -> TcRnMessage
+  TcRnNegativeNumTypeLiteral :: IntegralLit GhcRn -> TcRnMessage
 
   {-| TcRnIllegalWildcardsInConstructor is an error that occurs whenever
-      the record wildcards '..' are used inside a constructor without labeled fields.
+      the record wildcards '..' are used with a constructor whose fields are
+      positional (unlabelled). The 'RecordFieldPart' field records whether
+      the wildcards occurred in a record construction (an expression) or in
+      a record pattern, so that the message and its suggested fixes can be
+      worded accordingly. Constructors with no fields at all do not trigger
+      this error: since GHC proposal 496 ("Nullary record wildcards"),
+      @C {..}@ is legal for nullary constructors.
+      Example(s):
 
-      Examples(s): None
+        data D = D Int Bool
+
+        f :: D -> ()
+        f D{..} = ()      -- record pattern
+
+        g :: D
+        g = D{..}         -- record construction
 
      Test cases:
        rename/should_fail/T9815.hs
        rename/should_fail/T9815b.hs
        rename/should_fail/T9815ghci.hs
        rename/should_fail/T9815bghci.hs
+       rename/should_fail/T21101.hs
   -}
-  TcRnIllegalWildcardsInConstructor :: !Name -> TcRnMessage
+  TcRnIllegalWildcardsInConstructor
+    :: !RecordFieldPart -- ^ context in which the constructor application occurs
+    -> !Name     -- ^ name of the constructor
+    -> !VisArity -- ^ arity of the constructor
+    -> TcRnMessage
 
   {-| TcRnIgnoringAnnotations is a warning that occurs when the source code
       contains annotation pragmas but the platform in use does not support an
@@ -1566,12 +1565,24 @@ data TcRnMessage where
       occurs when a module appears more than once in an export list.
 
       Example(s):
-      module Foo (module Bar, module Bar)
-      import Bar
+        module Foo (module Bar, module Bar) where
+        import Bar
+
+      Text cases:
+        DuplicateModExport
+  -}
+  TcRnDupeModuleExport :: ModuleName -> TcRnMessage
+
+  {-| TcRnDupeWildcardExport is a warning controlled by @-Wduplicate-exports@ that
+      occurs when a namespace-specified wildcard @type ..@ or @data ..@ appears
+      more than once in an export list.
+
+      Example(s):
+      module Foo (type .., type ..)
 
      Text cases: None
   -}
-  TcRnDupeModuleExport :: ModuleName -> TcRnMessage
+  TcRnDupeWildcardExport :: ModuleName -> NamespaceSpecifier GhcPs -> TcRnMessage
 
   {-| TcRnExportedModNotImported is an error that occurs when an export list
       contains a module that is not imported.
@@ -1585,17 +1596,6 @@ data TcRnMessage where
   -}
   TcRnExportedModNotImported :: ModuleName -> TcRnMessage
 
-  {-| TcRnNullExportedModule is a warning controlled by -Wdodgy-exports that occurs
-      when an export list contains a module that has no exports.
-
-      Example(s):
-      module Foo (module Bar) where
-      import Bar ()
-
-     Test cases: None
-  -}
-  TcRnNullExportedModule :: ModuleName -> TcRnMessage
-
   {-| TcRnMissingExportList is a warning controlled by -Wmissing-export-lists that
       occurs when a module does not have an explicit export list.
 
@@ -1604,15 +1604,6 @@ data TcRnMessage where
      Test cases: typecheck/should_fail/MissingExportList03
   -}
   TcRnMissingExportList :: ModuleName -> TcRnMessage
-
-  {-| TcRnExportHiddenComponents is an error that occurs when an export contains
-      constructor or class methods that are not visible.
-
-      Example(s): None
-
-     Test cases: None
-  -}
-  TcRnExportHiddenComponents :: IE GhcPs -> TcRnMessage
 
   {-| TcRnExportHiddenDefault is an error that occurs when an export contains
       a class default (with language extension NamedDefaults) that is not visible.
@@ -1662,6 +1653,26 @@ data TcRnMessage where
                                   -> TyThing
                                   -> Name -- ^ child
                                   -> [Name] -> TcRnMessage
+
+  {-| TcRnExportedSubordinateNotFound is an error that occurs when the name of a
+      subordinate export item is not in scope.
+
+      Example:
+        module M (T(X)) where  -- X is not in scope
+        data T = Y
+
+      Test cases: module/mod4
+                  rename/should_fail/T12488a
+                  rename/should_fail/T12488a_foo
+                  rename/should_fail/T12488e
+                  rename/should_fail/T12488g
+                  rename/should_fail/T25899e2
+  -}
+  TcRnExportedSubordinateNotFound
+    :: GlobalRdrElt                  -- ^ parent
+    -> BadExportSubordinate
+    -> [GhcHint]                     -- ^ similar name suggestions
+    -> TcRnMessage
 
   {-| TcRnConflictingExports is an error that occurs when different identifiers that
       have the same name are being exported by a module.
@@ -1837,7 +1848,7 @@ data TcRnMessage where
     Test cases: rename/should_fail/RnStaticPointersFail01
                 rename/should_fail/RnStaticPointersFail03
   -}
-  TcRnStaticFormNotClosed :: Name -> NotClosedReason -> TcRnMessage
+  TcRnStaticFormNotClosed :: Name -> TcRnMessage
 
   {-| TcRnUselessTypeable is a warning (controlled by -Wderiving-typeable) that
       occurs when trying to derive an instance of the 'Typeable' class. Deriving
@@ -2147,7 +2158,7 @@ data TcRnMessage where
      Example(s):
      foreign import prim unsafe "my_primop_cmm" :: ...
 
-    Test cases: None
+    Test cases: ffi/should_fail/ccfail009
   -}
   TcRnForeignImportPrimSafeAnn :: ForeignImport GhcRn -> TcRnMessage
 
@@ -2205,6 +2216,9 @@ data TcRnMessage where
 
     Test cases: ffi/should_fail/T3066
                 ffi/should_fail/ccfail004
+                ffi/should_fail/ccfail006
+                ffi/should_fail/ccfail007
+                ffi/should_fail/ccfail008
                 ffi/should_fail/T10461
                 ffi/should_fail/T7506
                 ffi/should_fail/T5664
@@ -2467,6 +2481,21 @@ data TcRnMessage where
   -}
   TcRnUnpromotableThing :: !Name -> !PromotionErr -> TcRnMessage
 
+  {-| TcRnUnpromotableLit is an error that occurs when the user attempts to
+      use a literal at the type level that cannot be promoted. This includes
+      primitive literals (such as unboxed integers, characters, strings, and
+      floating-point numbers) as well as boxed floating-point numbers.
+
+      Example(s):
+         type TCharPrim   = 'x'#
+         type TIntPrim    = 1#
+         type TDoublePrim = 1.0##
+         type TDouble     = 1.0
+
+      Test cases: typecheck/should_fail/T26862
+  -}
+  TcRnUnpromotableLit :: !(HsLit GhcRn) -> TcRnMessage
+
   {- | TcRnIllegalTermLevelUse is an error that occurs when the user attempts to
        use a type-level entity at the term-level.
 
@@ -2518,16 +2547,6 @@ data TcRnMessage where
       Test case: rename/should_fail/T11663
   -}
   TcRnUnexpectedPatSigType :: HsPatSigType GhcPs -> TcRnMessage
-
-  {-| TcRnIllegalKindSignature is an error occurring when there is
-      a kind signature without -XKindSignatures extension
-
-      Examples:
-        data Foo (a :: Nat) = ....
-
-      Test case: parser/should_fail/readFail036
-  -}
-  TcRnIllegalKindSignature :: HsType GhcPs -> TcRnMessage
 
   {-| TcRnDataKindsError is an error occurring when there is
       an illegal type or kind, probably required -XDataKinds
@@ -2599,8 +2618,8 @@ data TcRnMessage where
   -}
   TcRnMultipleInlinePragmas
     :: !Id -- ^ Target of the pragmas
-    -> !(LocatedA InlinePragma) -- ^ The first pragma
-    -> !(NE.NonEmpty (LocatedA InlinePragma)) -- ^ Other pragmas
+    -> !(LocatedA (InlinePragma GhcTc)) -- ^ The first pragma
+    -> !(NE.NonEmpty (LocatedA (InlinePragma GhcTc))) -- ^ Other pragmas
     -> TcRnMessage
 
   {-| TcRnUnexpectedPragmas is a warning that occurs when unexpected pragmas appear
@@ -2822,7 +2841,6 @@ data TcRnMessage where
   -}
   TcRnIllegalNewtype
             :: DataCon
-            -> Bool -- ^ True if linear types enabled
             -> IllegalNewtypeReason
             -> TcRnMessage
 
@@ -2848,6 +2866,12 @@ data TcRnMessage where
        type-data/should_fail/TDRecordsH98
        type-data/should_fail/TDStrictnessGADT
        type-data/should_fail/TDStrictnessH98
+       type-data/should_fail/T27732a
+       type-data/should_fail/T27732b
+       type-data/should_fail/T27732c
+       type-data/should_fail/T27732d
+       type-data/should_fail/T27732e
+       type-data/should_fail/T27732f
   -}
   TcRnTypeDataForbids :: !TypeDataForbids -> TcRnMessage
 
@@ -4218,6 +4242,23 @@ data TcRnMessage where
 
   -}
   TcRnMissingRoleAnnotation :: Name -> [Role] -> TcRnMessage
+
+  {-| TcRnImplicitFieldStrictness is a warning that occurs when a data
+     constructor field lacks an explicit strictness annotation (@!@ or @~@)
+
+     Controlled by flags:
+       - Wimplicit-field-strictness
+
+     Test cases:
+       T16836a, T16836b, T16836c, T16836d
+
+  -}
+  TcRnImplicitFieldStrictness
+    :: Bool -- ^ whether @LazyFieldAnnotations@ is enabled
+    -> NonEmpty (Name, NonEmpty ImplicitStrictnessField)
+       -- ^ per data constructor, the fields lacking annotations
+    -> TcRnMessage
+
   {-| TcRnPatersonCondFailure is an error that occurs when an instance
       declaration fails to conform to the Paterson conditions. Which particular condition
       fails depends on the constructor of PatersonCondFailure
@@ -4412,6 +4453,17 @@ data TcRnMessage where
   -}
   TcRnDefaultedExceptionContext :: CtLoc -> TcRnMessage
 
+  {-| TcRnDefaultedCallStack is a warning that is triggered when an implicit
+      @CallStack@ constraint is defaulted to the empty call stack because there
+      is no enclosing @HasCallStack@ constraint to solve it from. The 'CtLoc' is
+      the location and origin of the defaulted constraint.
+
+      See Note [Warn about defaulted CallStacks] in GHC.Tc.Solver.Dict.
+
+      Test cases: WarnDefaultedCallStack
+  -}
+  TcRnDefaultedCallStack :: CtLoc -> TcRnMessage
+
   {-| TcRnOutOfArityTyVar is an error raised when the arity of a type synonym
       (as determined by the SAKS and the LHS) is insufficiently high to
       accommodate an implicit binding for a free variable that occurs in the
@@ -4441,6 +4493,36 @@ data TcRnMessage where
     Test cases: T24159_type_syntax_rn_fail
   -}
   TcRnUnexpectedTypeSyntaxInTerms :: TypeSyntax -> TcRnMessage
+
+  {- | TcRnUnrecognisedModifier is a warning controlled by
+       -Wunrecognised-modifiers, and raised when a modifier is used that we
+       don't know what to do with.
+
+       Examples:
+
+         %() instance C a
+         foo :: a %True -> b
+  -}
+  TcRnUnrecognisedModifier :: HsModifier GhcRn -> SuggestLinear -> TcRnMessage
+
+  {- | TcRnUnknownModifierKind is an error raised when a modifier is used with
+       unknown kind.
+
+       Examples:
+
+         foo :: a %m -> b
+  -}
+  TcRnUnknownModifierKind :: HsModifier GhcRn -> Maybe Name -> TcRnMessage
+
+  {- | TcRnTooManyMultiplicities is an error raised when more than one
+       Multiplicity modifier is used in a place where zero or one are expected.
+
+       Examples:
+
+         foo :: a %1 %1 -> b
+         bar :: a %1 ⊸ b
+  -}
+  TcRnTooManyMultiplicities :: TcRnMessage
   deriving Generic
 
 ----
@@ -4465,15 +4547,15 @@ data ZonkerMessage where
 data TypeDataForbids
   = TypeDataForbidsDatatypeContexts
   | TypeDataForbidsLabelledFields
-  | TypeDataForbidsStrictnessAnnotations
+  | TypeDataForbidsFieldAnnotations
   | TypeDataForbidsDerivingClauses
   deriving Generic
 
 instance Outputable TypeDataForbids where
-  ppr TypeDataForbidsDatatypeContexts      = text "Data type contexts"
-  ppr TypeDataForbidsLabelledFields        = text "Labelled fields"
-  ppr TypeDataForbidsStrictnessAnnotations = text "Strictness flags"
-  ppr TypeDataForbidsDerivingClauses       = text "Deriving clauses"
+  ppr TypeDataForbidsDatatypeContexts = text "Data type contexts"
+  ppr TypeDataForbidsLabelledFields   = text "Labelled fields"
+  ppr TypeDataForbidsFieldAnnotations = text "Strictness, unpackedness or multiplicity annotations"
+  ppr TypeDataForbidsDerivingClauses  = text "Deriving clauses"
 
 -- | Specifies which back ends can handle a requested foreign import or export
 type ExpectedBackends = [Backend]
@@ -4635,12 +4717,6 @@ data AllowedDataResKind
   = AnyTYPEKind
   | AnyBoxedKind
   | LiftedKind
-
--- | A data type to describe why a variable is not closed.
--- See Note [Not-closed error messages] in GHC.Tc.Gen.Expr
-data NotClosedReason = NotLetBoundReason
-                     | NotTypeClosed VarSet
-                     | NotClosed Name NotClosedReason
 
 data SuggestPartialTypeSignatures
   = YesSuggestPartialTypeSignatures
@@ -5410,10 +5486,6 @@ data SolverReportErrCtxt
                                     -- See Note [Suppressing error messages]
       }
 
-getUserGivens :: SolverReportErrCtxt -> [UserGiven]
--- One item for each enclosing implication
-getUserGivens (CEC {cec_encl = implics}) = getUserGivensFromImplics implics
-
 ----------------------------------------------------------------------------
 --
 --   ErrorItem
@@ -5424,7 +5496,7 @@ getUserGivens (CEC {cec_encl = implics}) = getUserGivensFromImplics implics
 -- that will give rise to a diagnostic.
 data ErrorItem
 -- We could perhaps use Ct here (and indeed used to do exactly that), but
--- having a separate type gives to denote errors-in-formation gives us
+-- having a separate type to denote error-information gives us
 -- a nice place to do pre-processing, such as calculating ei_suppress.
 -- Perhaps some day, an ErrorItem could eventually evolve to contain
 -- the error text (or some representation of it), so we can then have all
@@ -5437,9 +5509,13 @@ data ErrorItem
          --   for Givens, Nothing
        , ei_flavour  :: CtFlavour
        , ei_loc      :: CtLoc
-       , ei_m_reason :: Maybe CtIrredReason  -- if this ErrorItem was made from a
+       , ei_m_reason :: Maybe CtIrredReason  -- If this ErrorItem was made from a
                                              -- CtIrred, this stores the reason
-       , ei_suppress :: Bool    -- Suppress because of Note [Wanteds rewrite Wanteds]
+       , ei_insoluble :: Bool   -- True if the constraint is definitely insoluble
+                                -- Cache of `insolubleCt`
+
+       , ei_suppress  :: Bool   -- Suppress because of
+                                -- Note [Wanteds rewrite Wanteds: rewriter-sets]
                                 -- in GHC.Tc.Constraint
        }
 
@@ -5510,6 +5586,31 @@ message (showing both problems):
 -}
 
 
+getUsefulGivens :: SolverReportErrCtxt -> ErrorItem -> [UserGiven]
+-- One item for each enclosing implication
+getUsefulGivens (CEC {cec_encl = implics}) item
+  | dont_show_local_givens
+  = []
+  | otherwise
+  = discardProvCtxtGivens orig $
+    getGivensFromImplics implics
+  where
+    orig = errorItemOrigin item
+
+    -- If the constraint is utterly insoluble, we won't try to solve it
+    -- from the inert Givens, so can be positively confusing to list them;
+    -- we may get stuff like "Can't deduce X from X".
+    -- EXCEPTION: when the insolubility comes from a fundep interaction
+    --            between the constraint and a local Given, it's confusing
+    --            NOT to show the Given.  Example:
+    --               [G] ?x::Int   [W] ?x::String
+    -- See Note [Insoluble fundeps] in GHC.Tc.Solver.FunDeps
+    dont_show_local_givens
+      | Just (InsolubleFunDepReason is_top) <- ei_m_reason item
+      = is_top
+      | otherwise
+      = ei_insoluble item
+
 discardProvCtxtGivens :: CtOrigin -> [UserGiven] -> [UserGiven]
 discardProvCtxtGivens orig givens  -- See Note [discardProvCtxtGivens]
   | ProvCtxtOrigin (PSB {psb_id = L _ name}) <- orig
@@ -5564,7 +5665,7 @@ data TcSolverReportMsg
      { mismatchMsg           :: MismatchMsg
      , mismatchTyVarInfo     :: Maybe TyVarInfo
      , mismatchAmbiguityInfo :: [AmbiguityInfo]
-     , mismatchCoercibleInfo :: Maybe CoercibleMsg }
+     , mismatchCoercibleInfo :: [CoercibleMsg] }
 
    -- | A violation of the representation-polymorphism invariants.
    --
@@ -5616,6 +5717,7 @@ data TcSolverReportMsg
     , cannotResolve_unifiers     :: [ClsInst]
     , cannotResolve_candidates   :: [ClsInst]
     , cannotResolve_relBinds     :: RelevantBindings
+    , cannotResolve_noBuiltinMsg :: Maybe NoBuiltinInstanceMsg
     }
 
   -- | Could not solve a constraint using available instances
@@ -5676,15 +5778,20 @@ data MismatchMsg
   -- Used for messages such as @"No instance for ..."@ and
   -- @"Could not deduce ... from"@.
   | CouldNotDeduce
-     { cnd_user_givens :: [Implication]
+     { cnd_user_givens   :: [Implication]
         -- | The Wanted constraints we couldn't solve.
         --
         -- N.B.: the 'ErrorItem' at the head of the list has been tidied,
         -- perhaps not the others.
-     , cnd_wanted      :: NE.NonEmpty ErrorItem
+     , cnd_wanted        :: NE.NonEmpty ErrorItem
 
-       -- | Some additional info consumed by 'mk_supplementary_ea_msg'.
-     , cnd_extra       :: Maybe CND_Extra
+       -- | Additional "expected/actual" information
+       -- consumed by 'mk_supplementary_ea_msg'.
+     , cnd_ea            :: Maybe CND_ExpectedActual
+
+       -- | Additional message relating to unsolved constraints for
+       -- typeclasses which have built-in instances.
+     , cnd_noBuiltin_msg :: Maybe NoBuiltinInstanceMsg
      }
   deriving Generic
 
@@ -5738,8 +5845,7 @@ data CannotUnifyVariableReason
   --
   -- For example, trying to unify a 'SkolemTv' with the
   -- type Int, or with a 'TyVarTv'.
-  | DifferentTyVars TyVarInfo
-  | RepresentationalEq TyVarInfo (Maybe CoercibleMsg)
+  | DifferentTyVars TyVarInfo [CoercibleMsg]
   deriving Generic
 
 -- | Report a mismatch error without any extra
@@ -5750,11 +5856,11 @@ mkPlainMismatchMsg msg
      { mismatchMsg           = msg
      , mismatchTyVarInfo     = Nothing
      , mismatchAmbiguityInfo = []
-     , mismatchCoercibleInfo = Nothing }
+     , mismatchCoercibleInfo = [] }
 
 -- | Additional information to be given in a 'CouldNotDeduce' message,
 -- which is then passed on to 'mk_supplementary_ea_msg'.
-data CND_Extra = CND_Extra TypeOrKind Type Type
+data CND_ExpectedActual = CND_ExpectedActual TypeOrKind Type Type
 
 -- | A cue to print out information about type variables,
 -- e.g. where they were bound, when there is a mismatch @tv1 ~ ty2@.
@@ -5822,6 +5928,11 @@ data BadImportKind
   -- | Incorrect @type@ keyword when importing something which isn't a type.
   | BadImportAvailVar
   deriving Generic
+
+data BadExportSubordinate
+  = BadExportSubordinateNotFound !(LIEWrappedName GhcPs)
+  | BadExportSubordinateNonType  !GlobalRdrElt
+  | BadExportSubordinateNonData  !GlobalRdrElt
 
 {- Note [Reasons for BadImportAvailTyCon]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -5957,6 +6068,10 @@ data CoercibleMsg
   -- Test cases: none.
   | TyConIsAbstract TyCon
 
+  -- | The type constructor has the given role in the specified
+  -- argument positions.
+  | TyConHasRoleInArgs Role TyCon (NE.NonEmpty Int)
+
   -- | We can't unwrap a newtype whose constructor is not in scope.
   --
   -- Example:
@@ -5966,7 +6081,67 @@ data CoercibleMsg
   --   foo = coerce
   --
   -- Test cases: TcCoercibleFail.
-  | OutOfScopeNewtypeConstructor TyCon DataCon
+  | OutOfScopeNewtypeConstructor DataCon [ImportSuggestion]
+
+  -- | A type is a data family application which does not reduce to a
+  -- known instance.
+  | StuckDataFamApps TyCon (NE.NonEmpty [Type])
+
+-- | Explains why GHC wasn't able to provide a built-in instance for
+-- a particular class.
+data NoBuiltinInstanceMsg
+  = NoBuiltinHasFieldMsg HasFieldMsg
+  | NoBuiltinTypeableMsg TypeableMsg
+
+  -- Other useful constructors might be:
+  -- NoBuiltinDataToTagMsg -- see conditions in Note [DataToTag overview]
+  -- NoBuiltinWithDictMsg  -- see Note [withDict]
+
+-- | Explains why GHC wasn't able to provide a built-in 'HasField' instance
+-- for the given types.
+data HasFieldMsg
+  -- | The field is not a literal field name, e.g. @HasField x u v@ where @x@
+  -- is a type variable.
+  = NotALiteralFieldName Type
+  -- | The type we are selecting from is not a record type,
+  -- e.g. @HasField "fld" Int fld@.
+  | NotARecordType Type
+  -- | The field is out of scope.
+  | OutOfScopeField TyCon FieldLabel [ImportSuggestion]
+  -- | The field has a type which means that GHC cannot solve
+  -- a 'HasField' constraint for it.
+  | FieldTooFancy TyCon FieldLabelString TooFancyField
+  -- | No such field, but the field is perhaps mis-spelled;
+  -- here are some suggestions.
+  | SuggestSimilarFields
+      (Maybe (TyCon, TyCon)) -- ^ (optional) desired parent (tc and rep_tc)
+      FieldLabelString       -- ^ field name
+      [(TyCon, SimilarName)]         -- ^ suggestions (for this 'TyCon' or other 'TyCon's)
+      [(PatSyn, SimilarName)]       -- ^ pattern synonyms with similarly named fields
+      [ImportSuggestion]     -- ^ import suggestions
+
+  -- | Using -XRebindableSyntax and a different 'HasField'.
+  | CustomHasField TyCon -- ^ the custom HasField TyCon
+
+-- | Explains why GHC wasn't able to provide a built-in 'Typeable' instance
+-- for the given types.
+data TypeableMsg
+  -- | Polymorphic types are not typeable.
+  = NoTypeableForPolytype Type
+  -- | Qualified types are not typeable.
+  | NoTypeableForQualifiedType Type
+  -- | Unboxed sum types are not typeable.
+  | NoTypeableForUnboxedSumType Type
+  -- | Unreduced Type Family Applications are not typeable.
+  | NoTypeableForUnreducedTypeFamilyApplication Type
+  -- | TyCons whose kind is not typeable are not typeable.
+  | NoTypeableForTyConWithNonTypeableKind Type Kind
+
+-- | Why is a record field "too fancy" for GHC to be able to properly
+-- solve a 'HasField' constraint?
+data TooFancyField
+  = FieldHasExistential
+  | FieldHasForAlls
 
 -- | Explain a problem with an import.
 data ImportError
@@ -6016,15 +6191,6 @@ data WhatLooking = WL_Anything
                      -- This is is used for rebindable syntax, where there
                      -- is no point in suggesting alternative spellings
                  deriving (Eq, Show)
-
--- | In what namespaces should we look for a subordinate
--- of the given 'GlobalRdrElt'.
-lookingForSubordinate :: GlobalRdrElt -> WhatLooking
-lookingForSubordinate parent_gre =
-  case greInfo parent_gre of
-    IAmTyCon ClassFlavour
-      -> WL_TyCon_or_TermVar
-    _ -> WL_Term
 
 -- | This datatype collates instances that match or unifier,
 -- in order to report an error message for an unsolved typeclass constraint.
@@ -6105,7 +6271,7 @@ data FixedRuntimeRepErrorInfo
 
 -- | An error message context, for errors in the renamer.
 --
--- TODO: this should probably get merged in some way with 'ErrCtxtMsg',
+-- TODO: this should probably get merged in some way with 'HsCtxt',
 -- but that's a battle for another day.
 data HsDocContext
   = TypeSigCtx [LocatedN RdrName]
@@ -6242,7 +6408,7 @@ data WrongThingSort
 
 data LevelCheckReason
   = LevelCheckInstance !InstanceWhat !PredType
-  | LevelCheckSplice !Name !(Maybe GlobalRdrElt)
+  | LevelCheckSplice !(WithUserRdr GlobalRdrElt)
 
 data UninferrableTyVarCtx
   = UninfTyCtx_ClassContext [TcType]
@@ -6257,9 +6423,17 @@ data PatSynInvalidRhsReason
   | PatSynUnboundVar !Name
   deriving (Generic)
 
+-- | A constructor field lacking an explicit strictness annotation, as
+-- reported by 'TcRnImplicitFieldStrictness'.
+data ImplicitStrictnessField
+    -- | A record field
+  = ImplicitStrictnessRecField FieldLabelString
+    -- | A positional argument (1-based index)
+  | ImplicitStrictnessPosField Int
+
 data BadFieldAnnotationReason where
   {-| A lazy data type field annotation (~) was used without enabling the
-    extension StrictData.
+    extension LazyFieldAnnotations.
 
     Test cases:
     LazyFieldsDisabled
@@ -6381,7 +6555,7 @@ data DodgyImportsReason =
     Test cases:
       DodgyImports
   -}
-  DodgyImportsEmptyParent !GlobalRdrElt
+  DodgyImportsEmptyParent !(IE GhcPs) !(NamespaceSpecifier GhcPs) !GlobalRdrElt
   |
   {-| A 'hiding' clause contains something that would be reported as an error in a
     regular import, but is relaxed to a warning.
@@ -6390,6 +6564,57 @@ data DodgyImportsReason =
       DodgyImports_hiding
   -}
   DodgyImportsHiding !ImportLookupReason
+  |
+  {-| A namespace-specified wildcard @type ..@ or @data ..@ does not match
+      any names in the imported module.
+
+      Test cases:
+        T25901_imp_dodgy_1
+        T25901_imp_dodgy_2
+  -}
+  DodgyImportsWildcard !ModuleName !(NamespaceSpecifier GhcPs)
+  deriving (Generic)
+
+-- | Different types of warnings for dodgy exports.
+data DodgyExportsReason =
+  {-| An export of the form 'T(..)' for a type constructor 'T' does not actually export anything
+      beside 'T' itself.
+
+      Example:
+        module Foo (
+            T(..)  -- Warning: T is a type synonym
+          , A(..)  -- Warning: A is a type family
+          , C(..)  -- Warning: C is a data family
+          ) where
+
+        type T = Int
+        type family A :: * -> *
+        data family C :: * -> *
+
+      Test cases: warnings/should_compile/DodgyExports01
+  -}
+  DodgyExportsEmptyParent !(IE GhcPs) !(NamespaceSpecifier GhcPs) !GlobalRdrElt
+  |
+  {-| An export list contains a module that has no exports.
+
+      Example(s):
+        module Foo (module Bar) where
+        import Bar ()
+
+      Test cases:
+        EmptyModExport
+  -}
+  DodgyExportsNullModule !ModuleName
+  |
+  {-| A namespace-specified wildcard in an export list does not match any names.
+
+      Example(s):
+        module Foo (type ..) where
+        x = 42   -- no types defined in this module
+
+      Test cases: None
+  -}
+  DodgyExportsWildcard !ModuleName !(NamespaceSpecifier GhcPs)
   deriving (Generic)
 
 -- | What extensions were enabled at import site.
@@ -6429,20 +6654,13 @@ data ImportLookupReason where
       ImportLookupIllegal
   -}
   ImportLookupIllegal :: ImportLookupReason
-  {-| An item in an import list matches multiple names exported from that module.
-
-    Test cases:
-      None
-  -}
-  ImportLookupAmbiguous :: !RdrName -- ^ The name extracted from the import item
-                        -> ![GlobalRdrElt] -- ^ The potential matches
-                        -> ImportLookupReason
   deriving (Generic)
 
 -- | Distinguish record fields from other names for pretty-printing.
 data UnusedImportName where
   UnusedImportNameRecField :: !Parent -> !OccName -> UnusedImportName
   UnusedImportNameRegular :: !Name -> UnusedImportName
+  UnusedImportWildcard :: !(NamespaceSpecifier GhcRn) -> UnusedImportName
 
 -- | Different types of errors for unused imports.
 data UnusedImportReason where
@@ -6818,8 +7036,9 @@ data AddTopDeclsError
       'addTopDecls' is not a function, value, annotation, or foreign import declaration.
 
        Example(s):
+       [d| data Foo |] >>= addTopDecls
 
-       Test cases:
+       Test cases: th/TH_InvalidTopDecl
     -}
     InvalidTopDecl !(HsDecl GhcPs)
     {-| UnexpectedDeclarationSplice is an error that occurs when a Template Haskell
@@ -7055,6 +7274,7 @@ data TypeSyntax
   | ContextArrowSyntax     -- ^ @ctx => t@
   | FunctionArrowSyntax    -- ^ @t1 -> t2@
   | ForallTelescopeSyntax  -- ^ @forall tvs. t@
+  | StarKindSyntax         -- ^ @*@
   deriving Generic
 
 typeSyntaxExtension :: TypeSyntax -> LangExt.Extension
@@ -7062,3 +7282,16 @@ typeSyntaxExtension TypeKeywordSyntax     = LangExt.ExplicitNamespaces
 typeSyntaxExtension ContextArrowSyntax    = LangExt.RequiredTypeArguments
 typeSyntaxExtension FunctionArrowSyntax   = LangExt.RequiredTypeArguments
 typeSyntaxExtension ForallTelescopeSyntax = LangExt.RequiredTypeArguments
+typeSyntaxExtension StarKindSyntax        = LangExt.RequiredTypeArguments
+
+-- | Whether or not to add a hint about enabling -XLinearTypes, when
+-- encountering an unrecognised modifier. We suggest enabling it when
+--
+-- * A Multiplicity modifier is used in a place where -XLinearTypes would
+--   recognize it;
+-- * Or a %1 modifier is used anywhere.
+--
+-- See Note [Overview of Modifiers] in Language.Haskell.Syntax.Type.
+data SuggestLinear
+  = SuggestLinear
+  | DontSuggestLinear

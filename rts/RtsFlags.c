@@ -101,7 +101,8 @@ static int  openStatsFile (
     char *filename, const char *FILENAME_FMT, FILE **file_ret);
 
 static StgWord64 decodeSize (
-    const char *flag, uint32_t offset, StgWord64 min, StgWord64 max);
+    const char *flag, uint32_t offset, StgWord64 min, StgWord64 max,
+    bool allow_zero);
 
 static double parseDouble (
     const char *arg, bool *error);
@@ -112,9 +113,7 @@ static void bad_option (const char *s);
 static void read_debug_flags(const char *arg);
 #endif
 
-#if defined(PROFILING)
 static bool read_heap_profiling_flag(const char *arg);
-#endif
 
 #if defined(TRACING)
 static void read_trace_flags(const char *arg);
@@ -143,8 +142,8 @@ void initRtsFlagsDefaults(void)
     if (maxStkSize == 0)
         maxStkSize = 8 * 1024 * 1024;
     // GcFlags.maxStkSiz is 32-bit, so we need to cap to prevent overflow (#17019)
-    else if (maxStkSize > UINT32_MAX * sizeof(W_))
-        maxStkSize = UINT32_MAX * sizeof(W_);
+    else if (maxStkSize > (StgWord64) UINT32_MAX * sizeof(W_))
+        maxStkSize = (StgWord64) UINT32_MAX * sizeof(W_);
 
     RtsFlags.GcFlags.statsFile          = NULL;
     RtsFlags.GcFlags.giveStats          = NO_GC_STATS;
@@ -157,7 +156,7 @@ void initRtsFlagsDefaults(void)
     /* -A default. See #16499 for a discussion about the tradeoffs */
     RtsFlags.GcFlags.minAllocAreaSize   = (4 * 1024 * 1024)       / BLOCK_SIZE;
     RtsFlags.GcFlags.largeAllocLim      = 0; /* defaults to minAllocAreasize */
-    RtsFlags.GcFlags.nurseryChunkSize   = 0;
+    RtsFlags.GcFlags.nurseryChunkSize   = -1; /* -1: Nothing set by user, normalized to off by default, 0: off explicitly, <n>: explicit size*/
     RtsFlags.GcFlags.minOldGenSize      = (1024 * 1024)       / BLOCK_SIZE; /* -O default */
     RtsFlags.GcFlags.maxHeapSize        = 0;    /* off by default */
     RtsFlags.GcFlags.heapLimitGrace     = (1024 * 1024);
@@ -211,6 +210,8 @@ void initRtsFlagsDefaults(void)
     RtsFlags.DebugFlags.numa            = false;
     RtsFlags.DebugFlags.compact         = false;
     RtsFlags.DebugFlags.continuation    = false;
+    RtsFlags.DebugFlags.iomanager       = false;
+    RtsFlags.DebugFlags.ipe             = false;
 
 #if defined(PROFILING)
     RtsFlags.CcFlags.doCostCentres      = COST_CENTRES_NONE;
@@ -237,6 +238,9 @@ void initRtsFlagsDefaults(void)
     RtsFlags.ProfFlags.eraSelector        = 0;
 #endif
 
+    RtsFlags.ProfFlags.closureTypeSelector = NULL;
+    RtsFlags.ProfFlags.infoTableSelector   = NULL;
+
 #if defined(TRACING)
     RtsFlags.TraceFlags.tracing       = TRACE_NONE;
     RtsFlags.TraceFlags.timestamp     = false;
@@ -246,6 +250,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.TraceFlags.sparks_sampled= false;
     RtsFlags.TraceFlags.sparks_full   = false;
     RtsFlags.TraceFlags.user          = false;
+    RtsFlags.TraceFlags.ipe           = false;
     RtsFlags.TraceFlags.ticky         = false;
     RtsFlags.TraceFlags.trace_output  = NULL;
 #  if defined(THREADED_RTS)
@@ -327,7 +332,7 @@ usage_text[] = {
 "  --copying-gc",
 "            Selects the copying garbage collector to manage all generations.",
 "",
-"  -K<size>  Sets the maximum stack size (default: 80% of the heap)",
+"  -K<size>  Sets the maximum stack size (0 = unlimited, default: 80% of the heap)",
 "            e.g.: -K32k -K512k -K8M",
 "  -ki<size> Sets the initial thread stack size (default 1k)  e.g.: -ki4k -ki2m",
 "  -kc<size> Sets the stack chunk size (default 32k)",
@@ -345,9 +350,9 @@ usage_text[] = {
 "            memory controlled by this factor (higher is slower). Setting the factor",
 "            to 0 means memory is not returned.",
 "            (default 4.0)",
-"  -n<size>  Allocation area chunk size (0 = disabled, default: 0)",
+"  -n<size>  Allocation area chunk size (0 = disabled, default: 0, 4m for -A >= 16m)",
 "  -O<size>  Sets the minimum size of the old generation (default 1M)",
-"  -M<size>  Sets the maximum heap size (default unlimited)  e.g.: -M256k -M1G",
+"  -M<size>  Sets the maximum heap size (0 = unlimited, default unlimited)  e.g.: -M256k -M1G",
 "  -H<size>  Sets the minimum heap size (default 0M)   e.g.: -H24m  -H1G",
 "  -xb<addr> Sets the address from which a suitable start for the heap memory",
 "            will be searched from. This is useful if the default address",
@@ -403,6 +408,8 @@ usage_text[] = {
 "    -hr<cc>...   closures with specified retainers",
 "    -hb<bio>...  closures with specified biographies (lag,drag,void,use)",
 "    -he<era>...  closures with specified era",
+"    -hT<typ>,... specified closure types",
+"    -hi<adr>,... closures with specified info table addresses",
 "",
 "  -R<size>       Set the maximum retainer set size (default: 8)",
 "",
@@ -418,6 +425,9 @@ usage_text[] = {
 "  -h       Heap residency profile (output file <program>.hp)",
 "  -hT      Produce a heap profile grouped by closure type",
 "  -hi      Produce a heap profile grouped by info table address",
+"  A subset of closures may be selected thusly:",
+"    -hT<typ>,... specified closure types",
+"    -hi<adr>,... closures with specified info table addresses",
 "  -po<file>  Override profiling output file name prefix (program name by default)",
 #endif /* PROFILING */
 
@@ -441,6 +451,7 @@ usage_text[] = {
 "                p    par spark events (sampled)",
 "                f    par spark events (full detail)",
 "                u    user events (emitted from Haskell code)",
+"                I    IPE events",
 #if defined(TICKY_TICKY)
 "                T    ticky-ticky counter samples",
 #endif
@@ -449,7 +460,7 @@ usage_text[] = {
 "                t    add time stamps (only useful with -v)",
 #  endif
 "               -x    disable an event class, for any flag above",
-"             the initial enabled event classes are 'sgpu'",
+"             the initial enabled event classes are 'sgIpu'",
 #  if defined(THREADED_RTS)
 " --eventlog-flush-interval=<secs>",
 "             Periodically flush the eventlog at the specified interval.",
@@ -476,6 +487,7 @@ usage_text[] = {
 #if defined(DEBUG)
 "  -Ds  DEBUG: scheduler",
 "  -Di  DEBUG: interpreter",
+"  -DI  DEBUG: IPE",
 "  -Dw  DEBUG: weak",
 "  -DG  DEBUG: gccafs",
 "  -Dg  DEBUG: gc",
@@ -924,11 +936,10 @@ error = true;
 #endif
 
 #if defined(PROFILING)
-# define PROFILING_BUILD_ONLY(x)   x
+# define PROFILING_BUILD_ONLY(_arg, x)   x
 #else
-# define PROFILING_BUILD_ONLY(x) \
-errorBelch("the flag %s requires the program to be built with -prof", \
-           rts_argv[arg]);                                            \
+# define PROFILING_BUILD_ONLY(arg, x) \
+errorBelch("the flag %s requires the program to be built with -prof", arg); \
 error = true;
 #endif
 
@@ -1229,19 +1240,19 @@ error = true;
                   if (rts_argv[arg][2] == 'L') {
                       RtsFlags.GcFlags.largeAllocLim
                           = decodeSize(rts_argv[arg], 3, 2*BLOCK_SIZE,
-                                       HS_INT_MAX) / BLOCK_SIZE;
+                                       (StgWord64) HS_WORD32_MAX * BLOCK_SIZE, true) / BLOCK_SIZE;
                   } else {
                       // minimum two blocks in the nursery, so that we have one
                       // to grab for allocate().
                       RtsFlags.GcFlags.minAllocAreaSize
                           = decodeSize(rts_argv[arg], 2, 2*BLOCK_SIZE,
-                                       HS_INT_MAX) / BLOCK_SIZE;
+                                       (StgWord64) HS_WORD32_MAX * BLOCK_SIZE, false) / BLOCK_SIZE;
                   }
                   break;
               case 'n':
                   OPTION_UNSAFE;
                   RtsFlags.GcFlags.nurseryChunkSize
-                      = decodeSize(rts_argv[arg], 2, 2*BLOCK_SIZE, HS_INT_MAX)
+                      = decodeSize(rts_argv[arg], 2, 2*BLOCK_SIZE, ((StgWord64) HS_INT32_MAX) * BLOCK_SIZE, true)
                            / BLOCK_SIZE;
                   break;
 
@@ -1291,9 +1302,14 @@ error = true;
 
               case 'K':
                   OPTION_UNSAFE;
-                  RtsFlags.GcFlags.maxStkSize =
-                      decodeSize(rts_argv[arg], 2, 0, UINT32_MAX)
-                      / sizeof(W_);
+                  // -K and -K0 mean unlimited.
+                  if (rts_argv[arg][2] == '\0') {
+                      RtsFlags.GcFlags.maxStkSize = 0;
+                  } else {
+                      RtsFlags.GcFlags.maxStkSize =
+                          decodeSize(rts_argv[arg], 2, sizeof(W_), (StgWord64) UINT32_MAX * sizeof(W_), true)
+                          / sizeof(W_);
+                  }
                   break;
 
               case 'k':
@@ -1301,22 +1317,22 @@ error = true;
                 switch(rts_argv[arg][2]) {
                 case 'c':
                   RtsFlags.GcFlags.stkChunkSize =
-                      decodeSize(rts_argv[arg], 3, sizeof(W_), HS_WORD_MAX)
+                      decodeSize(rts_argv[arg], 3, sizeof(W_), (StgWord64)HS_WORD32_MAX * sizeof(W_), false)
                       / sizeof(W_);
                   break;
                 case 'b':
                   RtsFlags.GcFlags.stkChunkBufferSize =
-                      decodeSize(rts_argv[arg], 3, sizeof(W_), HS_WORD_MAX)
+                      decodeSize(rts_argv[arg], 3, sizeof(W_), (StgWord64)HS_WORD32_MAX * sizeof(W_), false)
                       / sizeof(W_);
                   break;
                 case 'i':
                   RtsFlags.GcFlags.initialStkSize =
-                      decodeSize(rts_argv[arg], 3, sizeof(W_), HS_WORD_MAX)
+                      decodeSize(rts_argv[arg], 3, sizeof(W_), (StgWord64)HS_WORD32_MAX * sizeof(W_), false)
                       / sizeof(W_);
                   break;
                 default:
                   RtsFlags.GcFlags.initialStkSize =
-                      decodeSize(rts_argv[arg], 2, sizeof(W_), HS_WORD_MAX)
+                      decodeSize(rts_argv[arg], 2, sizeof(W_), (StgWord64)HS_WORD32_MAX * sizeof(W_), false)
                       / sizeof(W_);
                   break;
                 }
@@ -1326,10 +1342,10 @@ error = true;
                   OPTION_UNSAFE;
                   if (0 == strncmp("grace=", rts_argv[arg] + 2, 6)) {
                       RtsFlags.GcFlags.heapLimitGrace =
-                          decodeSize(rts_argv[arg], 8, BLOCK_SIZE, HS_WORD_MAX);
+                          decodeSize(rts_argv[arg], 8, BLOCK_SIZE, HS_WORD_MAX, false);
                   } else {
                       RtsFlags.GcFlags.maxHeapSize =
-                          decodeSize(rts_argv[arg], 2, BLOCK_SIZE, HS_WORD_MAX)
+                          decodeSize(rts_argv[arg], 2, BLOCK_SIZE, (StgWord64) HS_WORD32_MAX * BLOCK_SIZE, true)
                           / BLOCK_SIZE;
                       // user give size in *bytes* but "maxHeapSize" is in
                       // *blocks*
@@ -1378,8 +1394,9 @@ error = true;
 #endif
               case 'G':
                   OPTION_UNSAFE;
-                  RtsFlags.GcFlags.generations =
-                      decodeSize(rts_argv[arg], 2, 1, HS_INT_MAX);
+                  // Capped at 64 by hardcoded array size in non-threaded RTS.
+                  RtsFlags.GcFlags.generations = (uint32_t)
+                      decodeSize(rts_argv[arg], 2, 1, GC_MAX_GENERATIONS, false);
                   break;
 
               case 'H':
@@ -1388,8 +1405,12 @@ error = true;
                       RtsFlags.GcFlags.heapSizeSuggestionAuto = true;
                   } else {
                       RtsFlags.GcFlags.heapSizeSuggestion = (uint32_t)
-                          (decodeSize(rts_argv[arg], 2, BLOCK_SIZE, HS_WORD_MAX)
+                          (decodeSize(rts_argv[arg], 2, BLOCK_SIZE, (StgWord64) HS_WORD32_MAX * BLOCK_SIZE, true)
                           / BLOCK_SIZE);
+                      // -H0 resets to the default of no suggestion.
+                      if (RtsFlags.GcFlags.heapSizeSuggestion == 0) {
+                          RtsFlags.GcFlags.heapSizeSuggestionAuto = false;
+                      }
                   }
                   break;
 
@@ -1397,7 +1418,7 @@ error = true;
                   OPTION_UNSAFE;
                   RtsFlags.GcFlags.minOldGenSize =
                       (uint32_t)(decodeSize(rts_argv[arg], 2, BLOCK_SIZE,
-                                       HS_WORD_MAX)
+                                       (StgWord64) HS_WORD32_MAX * BLOCK_SIZE, false)
                             / BLOCK_SIZE);
                   break;
 
@@ -1485,11 +1506,11 @@ error = true;
                       RtsFlags.CcFlags.outputFileNameStem = rts_argv[arg]+3;
                       break;
                   default:
-                      PROFILING_BUILD_ONLY();
+                      PROFILING_BUILD_ONLY(rts_argv[arg],);
 
                 } break;
 #else
-                PROFILING_BUILD_ONLY(
+                PROFILING_BUILD_ONLY(rts_argv[arg],
                 switch (rts_argv[arg][2]) {
                   case 'a':
                     RtsFlags.CcFlags.doCostCentres = COST_CENTRES_ALL;
@@ -1527,43 +1548,25 @@ error = true;
 
               case 'R':
                   OPTION_SAFE;
-                  PROFILING_BUILD_ONLY(
+                  PROFILING_BUILD_ONLY(rts_argv[arg],
                       RtsFlags.ProfFlags.maxRetainerSetSize =
                         atof(rts_argv[arg]+2);
                   ) break;
               case 'L':
                   OPTION_SAFE;
-                  PROFILING_BUILD_ONLY(
+                  PROFILING_BUILD_ONLY(rts_argv[arg],
                       RtsFlags.ProfFlags.ccsLength = atof(rts_argv[arg]+2);
                       if(RtsFlags.ProfFlags.ccsLength <= 0) {
                         bad_option(rts_argv[arg]);
                       }
                   ) break;
               case 'h': /* serial heap profile */
-#if !defined(PROFILING)
-                switch (rts_argv[arg][2]) {
-                  case '\0':
-                    errorBelch("-h is deprecated, use -hT instead.");
-
-                    FALLTHROUGH;
-                  case 'T':
-                    OPTION_UNSAFE;
-                    RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CLOSURE_TYPE;
-                    break;
-                  case 'i':
-                    OPTION_UNSAFE;
-                    RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_INFO_TABLE;
-                    break;
-                  default:
-                    OPTION_SAFE;
-                    PROFILING_BUILD_ONLY();
-                }
-#else
+#if defined(PROFILING)
                 OPTION_SAFE;
-                PROFILING_BUILD_ONLY(
-                    error = read_heap_profiling_flag(rts_argv[arg]);
-                );
-#endif /* PROFILING */
+#else
+                OPTION_UNSAFE;
+#endif
+                error = read_heap_profiling_flag(rts_argv[arg]);
                 break;
 
               case 'i': /* heap sample interval */
@@ -1840,7 +1843,7 @@ error = true;
                 case 'c': /* Debugging tool: show current cost centre on
                            an exception */
                     OPTION_SAFE;
-                    PROFILING_BUILD_ONLY(
+                    PROFILING_BUILD_ONLY(rts_argv[arg],
                         RtsFlags.ProfFlags.showCCSOnException = true;
                         );
                     unchecked_arg_start++;
@@ -1860,14 +1863,14 @@ error = true;
                 case 'q':
                   OPTION_UNSAFE;
                   RtsFlags.GcFlags.allocLimitGrace
-                      = decodeSize(rts_argv[arg], 3, BLOCK_SIZE, HS_INT_MAX)
+                      = decodeSize(rts_argv[arg], 3, BLOCK_SIZE, HS_INT_MAX, false)
                           / BLOCK_SIZE;
                   break;
 
                 case 'r':
                     OPTION_UNSAFE;
                     RtsFlags.GcFlags.addressSpaceSize
-                      = decodeSize(rts_argv[arg], 3, MBLOCK_SIZE, HS_WORD64_MAX);
+                      = decodeSize(rts_argv[arg], 3, MBLOCK_SIZE, HS_WORD64_MAX, false);
                     break;
 
                   default:
@@ -2002,9 +2005,25 @@ static void normaliseRtsOpts (void)
         RtsFlags.GcFlags.minAllocAreaSize = RtsFlags.GcFlags.maxHeapSize;
     }
 
-    // If we have -A16m or larger, use -n4m.
-    if (RtsFlags.GcFlags.minAllocAreaSize >= (16*1024*1024) / BLOCK_SIZE) {
-        RtsFlags.GcFlags.nurseryChunkSize = (4*1024*1024) / BLOCK_SIZE;
+    // If no explicit size was given, and we have -A16m or larger, use -n4m.
+    if (RtsFlags.GcFlags.nurseryChunkSize == -1) {
+        if (RtsFlags.GcFlags.minAllocAreaSize >= (16*1024*1024) / BLOCK_SIZE) {
+            RtsFlags.GcFlags.nurseryChunkSize = (4*1024*1024) / BLOCK_SIZE;
+        } else {
+            RtsFlags.GcFlags.nurseryChunkSize = 0;
+        }
+    }
+    else if ( RtsFlags.GcFlags.nurseryChunkSize > 0 && RtsFlags.GcFlags.nurseryChunkSize < 2) {
+        errorBelch("nursery chunk size (-n) must be at least %" FMT_Word " large.", (W_)(2 * BLOCK_SIZE));
+        errorBelch("Disabling nursery chunking");
+        RtsFlags.GcFlags.nurseryChunkSize = 0;
+    }
+    // If the user gave a chunk size respect it, unless it's larger than
+    // minimum allocation area.
+    else if ( (StgWord64) RtsFlags.GcFlags.nurseryChunkSize > (StgWord64) RtsFlags.GcFlags.minAllocAreaSize) {
+        errorBelch("warning: nursery chunk size (-n) is bigger than minimum alloc area size (-A), "
+                   "disabling nursery chunking");
+        RtsFlags.GcFlags.nurseryChunkSize = 0;
     }
 
     if (RtsFlags.ParFlags.parGcLoadBalancingGen == ~0u) {
@@ -2034,7 +2053,7 @@ static void normaliseRtsOpts (void)
 
 #if !defined(PROFILING) && !defined(DEBUG)
     // The mark-region collector is incompatible with heap census unless
-    // we zero slop of blackhole'd thunks, which doesn't happen in the
+    // we mark slop of blackhole'd thunks, which doesn't happen in the
     // vanilla way. See #9666.
     if (RtsFlags.ProfFlags.doHeapProfile && RtsFlags.GcFlags.sweep) {
         barf("The mark-region collector can only be used with profiling\n"
@@ -2152,10 +2171,14 @@ static void initStatsFile (FILE *f)
 
 /* -----------------------------------------------------------------------------
  * decodeSize: parse a string containing a size, like 300K or 1.2M
+ *
+ * The result must lie within [min, max]. If allow_zero is set an explicitly
+ * given zero (e.g. "-M0") is accepted as well.
 -------------------------------------------------------------------------- */
 
 static StgWord64
-decodeSize(const char *flag, uint32_t offset, StgWord64 min, StgWord64 max)
+decodeSize(const char *flag, uint32_t offset, StgWord64 min, StgWord64 max,
+           bool allow_zero)
 {
     const char *s;
     StgDouble m;
@@ -2214,10 +2237,14 @@ decodeSize(const char *flag, uint32_t offset, StgWord64 min, StgWord64 max)
 
     val = (StgWord64)m;
 
-    if (m < 0 || val < min || val > max) {
-        // printf doesn't like 64-bit format specs on Windows
-        // apparently, so fall back to unsigned long.
-        errorBelch("error in RTS option %s: size outside allowed range (%" FMT_Word " - %" FMT_Word ")", flag, (W_)min, (W_)max);
+    // Only a explicit zero-digit is accepted for allow_zero.
+    bool explicit_zero = allow_zero && *s != '\0' && m == 0;
+    if (m < 0 || (val < min && !explicit_zero) || val > max) {
+        if (allow_zero && min > 0) {
+            errorBelch("error in RTS option %s: size outside allowed range (0 or %" FMT_Word64 " - %" FMT_Word64 ")", flag, (StgWord64)min, (StgWord64)max);
+        } else {
+            errorBelch("error in RTS option %s: size outside allowed range (%" FMT_Word64 " - %" FMT_Word64 ")", flag, (StgWord64)min, (StgWord64)max);
+        }
         stg_exit(EXIT_FAILURE);
     }
 
@@ -2324,6 +2351,9 @@ static void read_debug_flags(const char* arg)
         case 'o':
             RtsFlags.DebugFlags.iomanager = true;
             break;
+        case 'I':
+            RtsFlags.DebugFlags.ipe = true;
+            break;
         default:
             bad_option( arg );
         }
@@ -2341,139 +2371,171 @@ static void read_debug_flags(const char* arg)
 }
 #endif
 
-#if defined(PROFILING)
 // Parse a "-h" flag, returning whether the parse resulted in an error.
 static bool read_heap_profiling_flag(const char *arg)
 {
-    // Already parsed "-h"
-
+    // Already parsed arg[0:2] = "-h"
     bool error = false;
-    switch (arg[2]) {
-    case '\0':
-      errorBelch("-h is deprecated, use -hc instead.");
-      FALLTHROUGH;
-    case 'C':
-    case 'c':
-    case 'M':
-    case 'm':
-    case 'D':
-    case 'd':
-    case 'Y':
-    case 'y':
-    case 'i':
-    case 'R':
-    case 'r':
-    case 'B':
-    case 'b':
-    case 'e':
-    case 'T':
-        if (arg[2] != '\0' && arg[3] != '\0') {
-            {
-                const char *left  = strchr(arg, '{');
-                const char *right = strrchr(arg, '}');
+    char property;
+    const char *filter;
+    if (arg[2] != '\0') {
+        property = arg[2];
+        filter = arg + 3;
+    } else {
+#if defined(PROFILING)
+        errorBelch("-h is deprecated, use -hc instead.");
+        property = 'c';
+        filter = arg + 2;
+#else
+        errorBelch("-h is deprecated, use -hT instead.");
+        property = 'T';
+        filter = arg + 2;
+#endif
+    }
+    // here property is initialized, and filter is a pointer inside arg
 
-                // curly braces are optional, for
-                // backwards compat.
-                if (left)
-                    left = left+1;
-                else
-                    left = arg + 3;
+    if (filter[0] != '\0') {
+        // For backwards compat, extract the portion between curly braces, else
+        // use the entire string
+        const char *left = strchr(filter, '{');
+        const char *right = strrchr(filter, '}');
 
-                if (!right)
-                    right = arg + strlen(arg);
+        if (left)
+            left = left + 1;
+        else
+            left = filter;
 
-                char *selector = stgStrndup(left, right - left + 1);
+        if (!right)
+            right = filter + strlen(filter);
 
-                switch (arg[2]) {
-                case 'c': // cost centre label select
-                    RtsFlags.ProfFlags.ccSelector = selector;
-                    break;
-                case 'C':
-                    RtsFlags.ProfFlags.ccsSelector = selector;
-                    break;
-                case 'M':
-                case 'm': // cost centre module select
-                    RtsFlags.ProfFlags.modSelector = selector;
-                    break;
-                case 'D':
-                case 'd': // closure descr select
-                    RtsFlags.ProfFlags.descrSelector = selector;
-                    break;
-                case 'Y':
-                case 'y': // closure type select
-                    RtsFlags.ProfFlags.typeSelector = selector;
-                    break;
-                case 'R':
-                case 'r': // retainer select
-                    RtsFlags.ProfFlags.retainerSelector = selector;
-                    break;
-                case 'B':
-                case 'b': // biography select
-                    RtsFlags.ProfFlags.bioSelector = selector;
-                    break;
-                case 'E':
-                case 'e': // era select
-                    RtsFlags.ProfFlags.eraSelector = strtoul(selector, (char **) NULL, 10);
-                    break;
-                default:
-                    stgFree(selector);
-                }
-            }
+        char *selector = stgStrndup(left, right - left);
+        switch (property) {
+#if defined(PROFILING)
+        case 'c': // cost centre label select
+            RtsFlags.ProfFlags.ccSelector = selector;
             break;
-        }
+        case 'C':
+            RtsFlags.ProfFlags.ccsSelector = selector;
+            break;
+        case 'M':
+        case 'm': // cost centre module select
+            RtsFlags.ProfFlags.modSelector = selector;
+            break;
+        case 'D':
+        case 'd': // closure descr select
+            RtsFlags.ProfFlags.descrSelector = selector;
+            break;
+        case 'Y':
+        case 'y': // closure type select
+            RtsFlags.ProfFlags.typeSelector = selector;
+            break;
+        case 'R':
+        case 'r': // retainer select
+            RtsFlags.ProfFlags.retainerSelector = selector;
+            break;
+        case 'B':
+        case 'b': // biography select
+            RtsFlags.ProfFlags.bioSelector = selector;
+            break;
+        case 'E':
+        case 'e': // era select
+            RtsFlags.ProfFlags.eraSelector = strtoul(selector, (char **) NULL, 10);
+            break;
+#else
+        case 'c':
+        case 'C':
+        case 'M':
+        case 'm':
+        case 'D':
+        case 'd':
+        case 'Y':
+        case 'y':
+        case 'R':
+        case 'r':
+        case 'B':
+        case 'b':
+        case 'E':
+        case 'e':
+            PROFILING_BUILD_ONLY(arg,);
+            break;
+        case 'T': /* closure type select */
+            RtsFlags.ProfFlags.closureTypeSelector = selector;
+            break;
+        case 'i': /* info table select */
+            RtsFlags.ProfFlags.infoTableSelector = selector;
+            break;
 
+#endif /* PROFILING */
+        default:
+            stgFree(selector);
+        }
+    } else {
         if (RtsFlags.ProfFlags.doHeapProfile != 0) {
             errorBelch("multiple heap profile options");
             error = true;
-            break;
+        } else {
+            switch (property) {
+#if defined(PROFILING)
+            case 'C':
+            case 'c':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CCS;
+                break;
+            case 'M':
+            case 'm':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_MOD;
+                break;
+            case 'D':
+            case 'd':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_DESCR;
+                break;
+            case 'Y':
+            case 'y':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_TYPE;
+                break;
+            case 'R':
+            case 'r':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_RETAINER;
+                break;
+            case 'B':
+            case 'b':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_LDV;
+                break;
+            case 'e':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_ERA;
+                break;
+#else
+            case 'C':
+            case 'c':
+            case 'M':
+            case 'm':
+            case 'D':
+            case 'd':
+            case 'Y':
+            case 'y':
+            case 'R':
+            case 'r':
+            case 'B':
+            case 'b':
+            case 'e':
+                PROFILING_BUILD_ONLY(arg,);
+                break;
+#endif /* PROFILING*/
+            case 'T':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CLOSURE_TYPE;
+                break;
+            case 'i':
+                RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_INFO_TABLE;
+                break;
+            default:
+                errorBelch("invalid heap profile option: %s", arg);
+                error = true;
+                break;
+            }
         }
-
-        switch (arg[2]) {
-        case '\0':
-        case 'C':
-        case 'c':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CCS;
-            break;
-        case 'M':
-        case 'm':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_MOD;
-            break;
-        case 'D':
-        case 'd':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_DESCR;
-            break;
-        case 'Y':
-        case 'y':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_TYPE;
-            break;
-        case 'i':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_INFO_TABLE;
-            break;
-        case 'R':
-        case 'r':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_RETAINER;
-            break;
-        case 'B':
-        case 'b':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_LDV;
-            break;
-        case 'T':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CLOSURE_TYPE;
-            break;
-        case 'e':
-            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_ERA;
-            break;
-        }
-        break;
-
-    default:
-        errorBelch("invalid heap profile option: %s", arg);
-        error = true;
     }
 
     return error;
 }
-#endif
 
 #if defined(TRACING)
 static void read_trace_flags(const char *arg)
@@ -2503,6 +2565,7 @@ static void read_trace_flags(const char *arg)
     RtsFlags.TraceFlags.gc             = true;
     RtsFlags.TraceFlags.sparks_sampled = true;
     RtsFlags.TraceFlags.user           = true;
+    RtsFlags.TraceFlags.ipe            = true;
 
     for (c  = arg; *c != '\0'; c++) {
         switch(*c) {
@@ -2516,8 +2579,9 @@ static void read_trace_flags(const char *arg)
             RtsFlags.TraceFlags.gc             = enabled;
             RtsFlags.TraceFlags.sparks_sampled = enabled;
             RtsFlags.TraceFlags.sparks_full    = enabled;
-            RtsFlags.TraceFlags.user           = enabled;
             RtsFlags.TraceFlags.nonmoving_gc   = enabled;
+            RtsFlags.TraceFlags.user           = enabled;
+            RtsFlags.TraceFlags.ipe            = enabled;
 #if defined(TICKY_TICKY)
             RtsFlags.TraceFlags.ticky          = enabled;
 #endif
@@ -2550,6 +2614,10 @@ static void read_trace_flags(const char *arg)
             break;
         case 'u':
             RtsFlags.TraceFlags.user      = enabled;
+            enabled = true;
+            break;
+        case 'I':
+            RtsFlags.TraceFlags.ipe       = enabled;
             enabled = true;
             break;
         case 'T':

@@ -35,6 +35,7 @@ import GHC.Data.BooleanFormula
 import GHC.Exts hiding (toList)
 import GHC.Types.Name
 import GHC.Types.Name.Reader (rdrNameOcc)
+import Language.Haskell.Syntax.Text (unpackHText)
 import Text.XHtml hiding (name, p, quote, title)
 
 import Haddock.Backends.Xhtml.DocMarkup
@@ -45,6 +46,7 @@ import Haddock.Backends.Xhtml.Utils
 import Haddock.Doc (combineDocumentation)
 import Haddock.GhcUtils
 import Haddock.Types
+import qualified Data.Text.Lazy as LText
 
 -- | Pretty print a declaration
 ppDecl
@@ -75,7 +77,7 @@ ppDecl summ links (L loc decl) pats (mbDoc, fnArgsDoc) instances fixities subdoc
   TyClD _ d@(DataDecl{}) -> ppDataDecl summ links instances fixities subdocs (locA loc) mbDoc d pats splice unicode pkg qual
   TyClD _ d@(SynDecl{}) -> ppTySyn summ links fixities (locA loc) (mbDoc, fnArgsDoc) d splice unicode pkg qual
   TyClD _ d@(ClassDecl{}) -> ppClassDecl summ links instances fixities (locA loc) mbDoc subdocs d splice unicode pkg qual
-  SigD _ (TypeSig _ lnames lty) ->
+  SigD _ (TypeSig _ _ lnames lty) ->
     ppLFunSig
       summ
       links
@@ -330,7 +332,7 @@ ppSubSigLike unicode qual typ argDocs subdocs sep emptyCtxts = do_sig_args 0 sep
       where
         leader' = leader <+> ppForAllPart unicode qual tele
     do_args n leader (HsQualTy _ lctxt ltype)
-      | null (unLoc lctxt) =
+      | null (hsc_ctxt $ unLoc lctxt) =
           do_largs n leader ltype
       | otherwise =
           (leader <+> ppLContextNoArrow lctxt unicode qual emptyCtxts, Nothing, [])
@@ -352,9 +354,9 @@ ppSubSigLike unicode qual typ argDocs subdocs sep emptyCtxts = do_sig_args 0 sep
     -- We need 'gadtComma' and 'gadtEnd' to line up with the `{` from
     -- 'gadtOpen', so we add 3 spaces to cover for `-> `/`:: ` (3 in unicode
     -- mode since `->` and `::` are rendered as single characters.
-    gadtComma = concatHtml (replicate (if unicode then 2 else 3) spaceHtml) <> toHtml ","
-    gadtEnd = concatHtml (replicate (if unicode then 2 else 3) spaceHtml) <> toHtml "}"
-    gadtOpen = toHtml "{"
+    gadtComma = concatHtml (replicate (if unicode then 2 else 3) spaceHtml) <> toHtml ("," :: LText)
+    gadtEnd = concatHtml (replicate (if unicode then 2 else 3) spaceHtml) <> toHtml ("}" :: LText)
+    gadtOpen = toHtml ("{" :: LText)
 
 ppFixities :: [(DocName, Fixity)] -> Qualification -> Html
 ppFixities [] _ = noHtml
@@ -365,7 +367,7 @@ ppFixities fs qual = foldr1 (+++) (map ppFix uniq_fs) +++ rightEdge
         ! [theclass "fixity"]
         << (toHtml d <+> toHtml (show p) <+> ppNames ns)
 
-    ppDir InfixR = "infixr"
+    ppDir InfixR = ("infixr" :: LText)
     ppDir InfixL = "infixl"
     ppDir InfixN = "infix"
 
@@ -411,7 +413,7 @@ ppFor
   links
   loc
   doc
-  (ForeignImport _ (L _ name) typ _)
+  (ForeignImport _ _ (L _ name) typ _)
   fixities
   splice
   unicode
@@ -467,7 +469,7 @@ ppTySyn
       hdr =
         hsep
           ( [keyword "type", ppBinder summary occ]
-              ++ ppTyVars unicode qual (hsQTvExplicit ltyvars)
+              ++ ppTyVars unicode qual (hsQTvExplicitBinders ltyvars)
           )
       full = hdr <+> def
       def = case unLoc ltype of
@@ -594,7 +596,7 @@ ppFamHeader
   qual =
     hsep
       [ ppFamilyLeader associated info
-      , ppAppDocNameTyVarBndrs summary unicode qual name (hsq_explicit tvs)
+      , ppAppDocNameTyVarBndrs summary unicode qual name (hsQTvExplicitBinders tvs)
       , ppResultSig result unicode qual
       , injAnn
       , whereBit
@@ -705,7 +707,7 @@ ppLContext
   -> Qualification
   -> HideEmptyContexts
   -> Html
-ppLContext Nothing u q h = ppContext [] u q h
+ppLContext Nothing u q h = ppContext (HsContext noExtField []) u q h
 ppLContext (Just c) u q h = ppContext (unLoc c) u q h
 
 ppLContextNoArrow
@@ -719,7 +721,7 @@ ppLContextNoArrow c u q h = ppContextNoArrow (unLoc c) u q h
 ppContextNoArrow :: HsContext DocNameI -> Unicode -> Qualification -> HideEmptyContexts -> Html
 ppContextNoArrow cxt unicode qual emptyCtxts =
   Maybe.fromMaybe noHtml $
-    ppContextNoLocsMaybe (map unLoc cxt) unicode qual emptyCtxts
+    ppContextNoLocsMaybe (map unLoc (hsc_ctxt cxt)) unicode qual emptyCtxts
 
 ppContextNoLocs :: [HsType DocNameI] -> Unicode -> Qualification -> HideEmptyContexts -> Html
 ppContextNoLocs cxt unicode qual emptyCtxts =
@@ -730,11 +732,11 @@ ppContextNoLocsMaybe :: [HsType DocNameI] -> Unicode -> Qualification -> HideEmp
 ppContextNoLocsMaybe [] _ _ emptyCtxts =
   case emptyCtxts of
     HideEmptyContexts -> Nothing
-    ShowEmptyToplevelContexts -> Just (toHtml "()")
+    ShowEmptyToplevelContexts -> Just (toHtml ("()" :: LText))
 ppContextNoLocsMaybe cxt unicode qual _ = Just $ ppHsContext cxt unicode qual
 
 ppContext :: HsContext DocNameI -> Unicode -> Qualification -> HideEmptyContexts -> Html
-ppContext cxt unicode qual emptyCtxts = ppContextNoLocs (map unLoc cxt) unicode qual emptyCtxts
+ppContext cxt unicode qual emptyCtxts = ppContextNoLocs (map unLoc (hsc_ctxt cxt)) unicode qual emptyCtxts
 
 ppHsContext :: [HsType DocNameI] -> Unicode -> Qualification -> Html
 ppHsContext [] _ _ = noHtml
@@ -749,7 +751,7 @@ ppHsContext cxt unicode qual = parenBreakableList (map (ppType unicode qual Hide
 
 ppClassHdr
   :: Bool
-  -> Maybe (LocatedC [LHsType DocNameI])
+  -> Maybe (LHsContext DocNameI)
   -> DocName
   -> LHsQTyVars DocNameI
   -> [LHsFunDep DocNameI]
@@ -758,8 +760,8 @@ ppClassHdr
   -> Html
 ppClassHdr summ lctxt n tvs fds unicode qual =
   keyword "class"
-    <+> (if not (null $ fromMaybeContext lctxt) then ppLContext lctxt unicode qual HideEmptyContexts else noHtml)
-    <+> ppAppDocNameTyVarBndrs summ unicode qual n (hsQTvExplicit tvs)
+    <+> (if not (null $ hsc_ctxt $ fromMaybeContext lctxt) then ppLContext lctxt unicode qual HideEmptyContexts else noHtml)
+    <+> ppAppDocNameTyVarBndrs summ unicode qual n (hsQTvExplicitBinders tvs)
     <+> ppFds fds unicode qual
 
 ppFds :: [LHsFunDep DocNameI] -> Unicode -> Qualification -> Html
@@ -791,8 +793,8 @@ ppShortClassDecl
       , tcdLName = lname
       , tcdTyVars = tvs
       , tcdFDs = fds
-      , tcdSigs = sigs
-      , tcdATs = ats
+      , tcdCExt = (HsNestedGroup { ng_sigs = sigs
+                                 , ng_ats = ats }, _)
       }
     )
   loc
@@ -869,9 +871,9 @@ ppClassDecl
           , tcdLName = lname
           , tcdTyVars = ltyvars
           , tcdFDs = lfds
-          , tcdSigs = lsigs
-          , tcdATs = ats
-          , tcdATDefs = atsDefs
+          , tcdCExt = (HsNestedGroup { ng_sigs = lsigs
+                                     , ng_ats = ats
+                                     , ng_tyfam_insts = atsDefs }, _)
           }
         )
   splice
@@ -996,26 +998,26 @@ ppClassDecl
       -- Minimal complete definition
       minimalBit = case [s | MinimalSig _ (L _ s) <- sigs] of
         -- Miminal complete definition = every shown method
-        And xs : _
-          | sort [getName n | L _ (Var (L _ n)) <- xs]
+        And _ xs : _
+          | sort [getName n | L _ (Var _ (L _ n)) <- xs]
               == sort [getName n | ClassOpSig _ _ ns _ <- sigs, L _ n <- ns] ->
               noHtml
         -- Minimal complete definition = the only shown method
-        Var (L _ n) : _
+        Var _ (L _ n) : _
           | [getName n]
               == [getName n' | ClassOpSig _ _ ns _ <- sigs, L _ n' <- ns] ->
               noHtml
         -- Minimal complete definition = nothing
-        And [] : _ -> subMinimal $ toHtml "Nothing"
+        And _ [] : _ -> subMinimal $ toHtml ("Nothing" :: LText)
         m : _ -> subMinimal $ ppMinimal False m
         _ -> noHtml
 
-      ppMinimal _ (Var (L _ n)) = ppDocName qual Prefix True n
-      ppMinimal _ (And fs) = foldr1 (\a b -> a +++ ", " +++ b) $ map (ppMinimal True . unLoc) fs
-      ppMinimal p (Or fs) = wrap $ foldr1 (\a b -> a +++ " | " +++ b) $ map (ppMinimal False . unLoc) fs
+      ppMinimal _ (Var _ (L _ n)) = ppDocName qual Prefix True n
+      ppMinimal _ (And _ fs) = foldr1 (\a b -> a +++ (", " :: LText) +++ b) $ map (ppMinimal True . unLoc) fs
+      ppMinimal p (Or _ fs) = wrap $ foldr1 (\a b -> a +++ (" | " :: LText) +++ b) $ map (ppMinimal False . unLoc) fs
         where
           wrap | p = parens | otherwise = id
-      ppMinimal p (Parens x) = ppMinimal p (unLoc x)
+      ppMinimal p (Parens _ x) = ppMinimal p (unLoc x)
 
       -- Instances
       instancesBit =
@@ -1115,7 +1117,7 @@ ppInstHead links splice unicode qual mdoc origin orphan no ihd@(InstHead{..}) md
         pdecl = pdata <+> ppShortDataDecl False True dd [] unicode qual
     DataInst {} -> error "ppInstHead"
   where
-    mname = maybe noHtml (\m -> toHtml "Defined in" <+> ppModule m) mdl
+    mname = maybe noHtml (\m -> toHtml ("Defined in" :: LText) <+> ppModule m) mdl
     iid = instanceId origin no orphan ihd
     typ = ppAppNameTypes ihdClsName ihdTypes unicode qual
 
@@ -1149,7 +1151,7 @@ ppInstanceSigs
   -> [Sig DocNameI]
   -> [Html]
 ppInstanceSigs links splice unicode qual sigs = do
-  TypeSig _ lnames typ <- sigs
+  TypeSig _ _ lnames typ <- sigs
   let names = map unLoc lnames
       L _ rtyp = dropWildCardsI typ
   -- Instance methods signatures are synified and thus don't have a useful
@@ -1163,9 +1165,9 @@ ppInstanceSigs links splice unicode qual sigs = do
 lookupAnySubdoc :: Eq id1 => id1 -> [(id1, DocForDecl id2)] -> DocForDecl id2
 lookupAnySubdoc n = Maybe.fromMaybe noDocForDecl . lookup n
 
-instanceId :: InstOrigin DocName -> Int -> Bool -> InstHead DocNameI -> String
+instanceId :: InstOrigin DocName -> Int -> Bool -> InstHead DocNameI -> LText
 instanceId origin no orphan ihd =
-  concat $
+  LText.pack $ concat $
     ["o:" | orphan]
       ++ [ qual origin
          , ":" ++ getOccString origin
@@ -1353,13 +1355,13 @@ ppShortConstrParts summary dataInst con unicode qual =
             header_ = ppConstrHdr forall_ tyVars context unicode qual
          in case det of
               -- Prefix constructor, e.g. 'Just a'
-              PrefixCon args ->
+              PrefixCon _ args ->
                 ( header_ <+> hsep (ppOcc : map (ppLParendType unicode qual HideEmptyContexts . hsConDeclFieldToHsTypeNoMult) args)
                 , noHtml
                 , noHtml
                 )
               -- Record constructor, e.g. 'Identity { runIdentity :: a }'
-              RecCon (L _ fields) ->
+              RecCon _ (L _ fields) ->
                 ( header_ +++ ppOcc <+> char '{'
                 , shortSubDecls
                     dataInst
@@ -1369,7 +1371,7 @@ ppShortConstrParts summary dataInst con unicode qual =
                 , char '}'
                 )
               -- Infix constructor, e.g. 'a :| [a]'
-              InfixCon arg1 arg2 ->
+              InfixCon _ arg1 arg2 ->
                 ( header_
                     <+> hsep
                       [ ppLParendType unicode qual HideEmptyContexts (hsConDeclFieldToHsTypeNoMult arg1)
@@ -1430,7 +1432,7 @@ ppSideBySideConstr subdocs fixities unicode pkg qual (L _ con) =
               header_ = ppConstrHdr forall_ tyVars context unicode qual
            in case det of
                 -- Prefix constructor, e.g. 'Just a'
-                PrefixCon args
+                PrefixCon _ args
                   | hasArgDocs -> header_ <+> ppOcc <+> fixity
                   | otherwise ->
                       hsep
@@ -1439,9 +1441,9 @@ ppSideBySideConstr subdocs fixities unicode pkg qual (L _ con) =
                         , fixity
                         ]
                 -- Record constructor, e.g. 'Identity { runIdentity :: a }'
-                RecCon _ -> header_ <+> ppOcc <+> fixity
+                RecCon _ _ -> header_ <+> ppOcc <+> fixity
                 -- Infix constructor, e.g. 'a :| [a]'
-                InfixCon arg1 arg2
+                InfixCon _ arg1 arg2
                   | hasArgDocs -> header_ <+> ppOcc <+> fixity
                   | otherwise ->
                       hsep
@@ -1471,11 +1473,11 @@ ppSideBySideConstr subdocs fixities unicode pkg qual (L _ con) =
         _ -> []
       ConDeclH98{con_args = con_args'} -> case con_args' of
         -- H98 record declarations
-        RecCon (L _ fields) -> [doRecordFields fields]
+        RecCon _ (L _ fields) -> [doRecordFields fields]
         -- H98 prefix data constructors
-        PrefixCon args | hasArgDocs -> [doConstrArgsWithDocs args]
-        -- H98 infix data constructor
-        InfixCon arg1 arg2 | hasArgDocs -> [doConstrArgsWithDocs [arg1, arg2]]
+        PrefixCon _ args | hasArgDocs -> [doConstrArgsWithDocs args]
+        -- H98 inf ix data constructor
+        InfixCon _ arg1 arg2 | hasArgDocs -> [doConstrArgsWithDocs [arg1, arg2]]
         _ -> []
 
     doRecordFields fields =
@@ -1525,11 +1527,11 @@ ppConstrHdr forall_ tvs ctxt unicode qual = ppForall +++ ppCtxt
       | otherwise = ppForAllPart unicode qual (HsForAllInvis noExtField tvs)
 
     ppCtxt
-      | null ctxt = noHtml
+      | null (hsc_ctxt ctxt) = noHtml
       | otherwise =
           ppContextNoArrow ctxt unicode qual HideEmptyContexts
             <+> darrow unicode
-            +++ toHtml " "
+            +++ toHtml (" " :: LText)
 
 -- | Pretty-print a record field
 ppSideBySideField
@@ -1562,10 +1564,10 @@ ppSideBySideField subdocs unicode qual (HsConDeclRecField _ names ltype) =
 -- don't use cdf_doc for same reason we don't use con_doc above
 -- Where there is more than one name, they all have the same documentation
 ppRecFieldMultAnn :: Unicode -> Qualification -> HsConDeclField DocNameI -> Html
-ppRecFieldMultAnn unicode qual (CDF { cdf_multiplicity = ann }) = case ann of
-  HsUnannotated _ -> noHtml
-  HsLinearAnn _ -> toHtml "%1"
-  HsExplicitMult _ mult -> multAnnotation <> ppr_mono_lty mult unicode qual HideEmptyContexts
+ppRecFieldMultAnn unicode qual (CDF { cdf_multiplicity = ann }) = case arr of
+  HsStandardArr _ -> ppr_modifiers mods unicode qual HideEmptyContexts
+  HsLinearArr _ -> toHtml ("%1" :: LText) <+> ppr_modifiers mods unicode qual HideEmptyContexts
+  where HsModifiedFunArr _ mods arr = ann
 
 ppShortField :: Bool -> Unicode -> Qualification -> HsConDeclRecField DocNameI -> Html
 ppShortField summary unicode qual (HsConDeclRecField _ names ltype) =
@@ -1655,7 +1657,7 @@ ppDataHeader
       ppLContext ctxt unicode qual HideEmptyContexts
       <+>
       -- T a b c ..., or a :+: b
-      ppAppDocNameTyVarBndrs summary unicode qual name (hsQTvExplicit tvs)
+      ppAppDocNameTyVarBndrs summary unicode qual name (hsQTvExplicitBinders tvs)
       <+> case ks of
         Nothing -> mempty
         Just (L _ x) -> dcolon unicode <+> ppKind unicode qual x
@@ -1668,8 +1670,8 @@ ppDataHeader _ _ _ _ = error "ppDataHeader: illegal argument"
 --------------------------------------------------------------------------------
 
 ppBang :: HsSrcBang -> Html
-ppBang (HsSrcBang _ _ SrcStrict) = toHtml "!"
-ppBang (HsSrcBang _ _ SrcLazy) = toHtml "~"
+ppBang (HsSrcBang _ _ SrcStrict) = toHtml ("!" :: LText)
+ppBang (HsSrcBang _ _ SrcLazy) = toHtml ("~" :: LText)
 ppBang _ = noHtml
 
 tupleParens :: HsTupleSort -> [Html] -> Html
@@ -1707,7 +1709,7 @@ ppSigType unicode qual emptyCtxts sig_ty = ppr_sig_ty (reparenSigType sig_ty) un
 ppLHsTypeArg :: Unicode -> Qualification -> HideEmptyContexts -> LHsTypeArg DocNameI -> Html
 ppLHsTypeArg unicode qual emptyCtxts (HsValArg _ ty) = ppLParendType unicode qual emptyCtxts ty
 ppLHsTypeArg unicode qual emptyCtxts (HsTypeArg _ ki) = atSign <> ppLParendType unicode qual emptyCtxts ki
-ppLHsTypeArg _ _ _ (HsArgPar _) = toHtml ""
+ppLHsTypeArg _ _ _ (HsArgPar _) = toHtml ("" :: LText)
 
 class RenderableBndrFlag flag where
   ppHsTyVarBndr :: Unicode -> Qualification -> HsTyVarBndr flag DocNameI -> Html
@@ -1761,16 +1763,18 @@ patSigContext sig_typ
   where
     typ = sig_body (unLoc sig_typ)
 
+    hasNonEmptyContext :: LHsType DocNameI -> Bool
     hasNonEmptyContext t =
       case unLoc t of
         HsForAllTy _ _ s -> hasNonEmptyContext s
-        HsQualTy _ cxt s -> if null (unLoc cxt) then hasNonEmptyContext s else True
+        HsQualTy _ cxt s -> if null (hsc_ctxt $ unLoc cxt) then hasNonEmptyContext s else True
         HsFunTy _ _ _ s -> hasNonEmptyContext s
         _ -> False
+    isFirstContextEmpty :: LHsType DocNameI -> Bool
     isFirstContextEmpty t =
       case unLoc t of
         HsForAllTy _ _ s -> isFirstContextEmpty s
-        HsQualTy _ cxt _ -> null (unLoc cxt)
+        HsQualTy _ cxt _ -> null (hsc_ctxt $ unLoc cxt)
         HsFunTy _ _ _ s -> isFirstContextEmpty s
         _ -> False
 
@@ -1814,22 +1818,21 @@ ppr_mono_ty (HsQualTy _ ctxt ty) unicode qual emptyCtxts =
   ppLContext (Just ctxt) unicode qual emptyCtxts <+> ppr_mono_lty ty unicode qual emptyCtxts
 -- UnicodeSyntax alternatives
 ppr_mono_ty (HsTyVar _ _ (L _ name)) True _ _
-  | getOccString (getName name) == "(->)" = toHtml "(→)"
+  | getOccString (getName name) == "(->)" = toHtml ("(→)" :: LText)
 ppr_mono_ty (HsTyVar _ prom (L _ name)) _ q _
   | isPromoted prom = promoQuote (ppDocName q Prefix True name)
   | otherwise = ppDocName q Prefix True name
-ppr_mono_ty (HsStarTy _ isUni) u _ _ =
-  toHtml (if u || isUni then "★" else "*")
-ppr_mono_ty (HsFunTy _ mult ty1 ty2) u q e =
+ppr_mono_ty (HsStarTy _) u _ _ =
+  toHtml (if u then "★" else "*" :: LText)
+ppr_mono_ty (HsFunTy _ (HsModifiedFunArr _ mods arr) ty1 ty2) u q e =
   hsep
     [ ppr_mono_lty ty1 u q HideEmptyContexts
-    , arr <+> ppr_mono_lty ty2 u q e
+    , ppr_modifiers mods u q e <+> arr' <+> ppr_mono_lty ty2 u q e
     ]
   where
-    arr = case mult of
-      HsLinearAnn _ -> lollipop u
-      HsUnannotated _ -> arrow u
-      HsExplicitMult _ m -> multAnnotation <> ppr_mono_lty m u q e <+> arrow u
+    arr' = case arr of
+      HsStandardArr _ -> arrow u
+      HsLinearArr _ -> lollipop u
 ppr_mono_ty (HsTupleTy _ con tys) u q _ =
   tupleParens con (map (ppLType u q HideEmptyContexts) tys)
 ppr_mono_ty (HsSumTy _ tys) u q _ =
@@ -1842,7 +1845,7 @@ ppr_mono_ty (HsIParamTy _ (L _ n) ty) u q _ =
 ppr_mono_ty (HsSpliceTy v _) _ _ _ = dataConCantHappen v
 ppr_mono_ty (XHsType (HsBangTy b ty)) u q _ =
   ppBang b +++ ppLParendType u q HideEmptyContexts ty
-ppr_mono_ty (XHsType (HsRecTy{})) _ _ _ = toHtml "{..}"
+ppr_mono_ty (XHsType (HsRecTy{})) _ _ _ = toHtml ("{..}" :: LText)
 -- Can now legally occur in ConDeclGADT, the output here is to provide a
 -- placeholder in the signature, which is followed by the field
 -- declarations.
@@ -1861,15 +1864,15 @@ ppr_mono_ty (HsAppKindTy _ fun_ty arg_ki) unicode qual _ =
     [ ppr_mono_lty fun_ty unicode qual HideEmptyContexts
     , atSign <> ppr_mono_lty arg_ki unicode qual HideEmptyContexts
     ]
-ppr_mono_ty (HsOpTy _ prom ty1 op ty2) unicode qual _ =
-  ppr_mono_lty ty1 unicode qual HideEmptyContexts <+> ppr_op_prom <+> ppr_mono_lty ty2 unicode qual HideEmptyContexts
+ppr_mono_ty (HsOpTy _ ty1 tyop ty2) unicode qual _
+  | Just pp_op <- ppr_infix_ty tyop qual
+  = pp_ty1 <+> pp_op <+> pp_ty2
+  | otherwise  -- This shouldn't happen unless the user constructs weird ASTs via the GHC API
+  = let pp_op = ppr_mono_lty tyop unicode qual HideEmptyContexts
+    in hsep [hsep [pp_op, pp_ty1], pp_ty2]
   where
-    ppr_op_prom
-      | isPromoted prom =
-          promoQuote ppr_op
-      | otherwise =
-          ppr_op
-    ppr_op = ppLDocName qual Infix op
+    pp_ty1  = ppr_mono_lty ty1 unicode qual HideEmptyContexts
+    pp_ty2  = ppr_mono_lty ty2 unicode qual HideEmptyContexts
 ppr_mono_ty (HsParTy _ ty) unicode qual emptyCtxts =
   parens (ppr_mono_lty ty unicode qual emptyCtxts)
 --  = parens (ppr_mono_lty ctxt_prec ty unicode qual emptyCtxts)
@@ -1880,7 +1883,25 @@ ppr_mono_ty (HsWildCardTy _) _ _ _ = char '_'
 ppr_mono_ty (HsTyLit _ n) _ _ _ = ppr_tylit n
 ppr_mono_ty (XHsType HsRedacted{}) _ _ _ = error "ppr_mono_ty: HsRedacted can't be used here"
 
-ppr_tylit :: HsTyLit DocNameI -> Html
-ppr_tylit (HsNumTy _ n) = toHtml (show n)
-ppr_tylit (HsStrTy _ s) = toHtml (show s)
-ppr_tylit (HsCharTy _ c) = toHtml (show c)
+ppr_infix_ty :: LHsType DocNameI -> Qualification -> Maybe Html
+ppr_infix_ty (L _ (HsTyVar _ prom op)) qual = Just pp_op_prom
+  where
+    pp_op_prom
+      | isPromoted prom = promoQuote pp_op
+      | otherwise = pp_op
+    pp_op = ppLDocName qual Infix op
+ppr_infix_ty (L _ (HsWildCardTy _)) _ = Just (toHtml ("`_`" :: LText))
+ppr_infix_ty _ _ = Nothing
+
+ppr_tylit :: HsLit DocNameI -> Html
+ppr_tylit (HsNatural _ n) = toHtml (show (il_value n))
+ppr_tylit (HsString  _ s) = toHtml (show (unpackHText s))
+ppr_tylit (HsChar    _ c) = toHtml (show c)
+ppr_tylit _               = error "ppr_tylit: unsupported lit"
+
+ppr_modifiers :: [LHsModifier DocNameI] -> Unicode -> Qualification -> HideEmptyContexts -> Html
+ppr_modifiers mods unicode qual emptyCtxts = foldr ((<+>) . ppr_modifier) mempty mods
+  where
+    ppr_modifier (L _ (HsModifier ModifierPrintsAs1 _)) = multAnnotation <> char '1'
+    ppr_modifier (L _ (HsModifier ModifierPrintsAsSelf ty)) =
+      multAnnotation <> ppr_mono_lty ty unicode qual emptyCtxts

@@ -1,15 +1,19 @@
-{-# LANGUAGE RecordWildCards, FlexibleInstances, MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | Info about installed units (compiled libraries)
 module GHC.Unit.Info
    ( GenericUnitInfo (..)
    , GenUnitInfo
    , UnitInfo
+   , UnitInfoMap
+   , mkUnitInfoMap
    , UnitKey (..)
    , UnitKeyInfo
    , mkUnitKeyInfo
    , mapUnitInfo
    , mkUnitPprInfo
+   , evaluateUnitInfoLists
+   , seqUnitInfoLists
 
    , mkUnit
 
@@ -25,6 +29,8 @@ module GHC.Unit.Info
    , collectLibraryDirs
    , collectFrameworks
    , collectFrameworksDirs
+   , libraryDirsForWay
+   , libraryDirsForWay'
    , unitHsLibs
    )
 where
@@ -47,9 +53,12 @@ import GHC.Unit.Database
 
 import GHC.Settings
 
+import Data.Containers.ListUtils (nubOrd)
 import Data.Version
 import Data.Bifunctor
 import Data.List (isPrefixOf, stripPrefix)
+import GHC.Types.Unique.Map
+import Control.Exception (evaluate)
 
 
 -- | Information about an installed unit
@@ -69,6 +78,10 @@ type UnitKeyInfo = GenUnitInfo UnitKey
 -- | Information about an installed unit (units are identified by their internal
 -- UnitId)
 type UnitInfo    = GenUnitInfo UnitId
+
+-- | Information about multiple installed units (units are identified by their internal
+-- UnitId)
+type UnitInfoMap = UniqMap UnitId UnitInfo
 
 -- | Convert a DbUnitInfo (read from a package database) into `UnitKeyInfo`
 mkUnitKeyInfo :: DbUnitInfo -> UnitKeyInfo
@@ -139,9 +152,12 @@ pprUnitInfo GenericUnitInfo {..} =
       field "trusted"              (ppr unitIsTrusted),
       field "import-dirs"          (fsep (map (text . ST.unpack) unitImportDirs)),
       field "library-dirs"         (fsep (map (text . ST.unpack) unitLibraryDirs)),
+      field "library-dirs-static"  (fsep (map (text . ST.unpack) unitLibraryDirsStatic)),
       field "dynamic-library-dirs" (fsep (map (text . ST.unpack) unitLibraryDynDirs)),
+      field "bytecode-library-dirs" (fsep (map (text . ST.unpack) unitLibraryBytecodeDirs)),
       field "hs-libraries"         (fsep (map (text . ST.unpack) unitLibraries)),
       field "extra-libraries"      (fsep (map (text . ST.unpack) unitExtDepLibsSys)),
+      field "extra-libraries-static" (fsep (map (text . ST.unpack) unitExtDepLibsStaticSys)),
       field "extra-ghci-libraries" (fsep (map (text . ST.unpack) unitExtDepLibsGhc)),
       field "include-dirs"         (fsep (map (text . ST.unpack) unitIncludeDirs)),
       field "includes"             (fsep (map (text . ST.unpack) unitIncludes)),
@@ -180,7 +196,7 @@ mkUnitPprInfo ufs i = UnitPprInfo
 
 -- | Find all the include directories in the given units
 collectIncludeDirs :: [UnitInfo] -> [FilePath]
-collectIncludeDirs ps = map ST.unpack $ ordNub (filter (not . ST.null) (concatMap unitIncludeDirs ps))
+collectIncludeDirs ps = map ST.unpack $ nubOrd (filter (not . ST.null) (concatMap unitIncludeDirs ps))
 
 -- | Find all the C-compiler options in the given units
 collectExtraCcOpts :: [UnitInfo] -> [String]
@@ -188,7 +204,7 @@ collectExtraCcOpts ps = map ST.unpack (concatMap unitCcOptions ps)
 
 -- | Find all the library directories in the given units for the given ways
 collectLibraryDirs :: Ways -> [UnitInfo] -> [FilePath]
-collectLibraryDirs ws = ordNub . filter notNull . concatMap (libraryDirsForWay ws)
+collectLibraryDirs ws = nubOrd . filter notNull . concatMap (libraryDirsForWay ws)
 
 -- | Find all the frameworks in the given units
 collectFrameworks :: [UnitInfo] -> [String]
@@ -196,13 +212,16 @@ collectFrameworks ps = map ST.unpack (concatMap unitExtDepFrameworks ps)
 
 -- | Find all the package framework paths in these and the preload packages
 collectFrameworksDirs :: [UnitInfo] -> [String]
-collectFrameworksDirs ps = map ST.unpack (ordNub (filter (not . ST.null) (concatMap unitExtDepFrameworkDirs ps)))
+collectFrameworksDirs ps = map ST.unpack (nubOrd (filter (not . ST.null) (concatMap unitExtDepFrameworkDirs ps)))
 
 -- | Either the 'unitLibraryDirs' or 'unitLibraryDynDirs' as appropriate for the way.
 libraryDirsForWay :: Ways -> UnitInfo -> [String]
-libraryDirsForWay ws
-  | hasWay ws WayDyn = map ST.unpack . unitLibraryDynDirs
-  | otherwise        = map ST.unpack . unitLibraryDirs
+libraryDirsForWay ws = libraryDirsForWay' (hasWay ws WayDyn)
+
+libraryDirsForWay' :: Bool -> UnitInfo -> [String]
+libraryDirsForWay' is_dyn
+  | is_dyn    = map ST.unpack . unitLibraryDynDirs
+  | otherwise = map ST.unpack . unitLibraryDirsStatic
 
 unitHsLibs :: GhcNameVersion -> Ways -> UnitInfo -> [String]
 unitHsLibs namever ways0 p = map (mkDynName . addSuffix . ST.unpack) (unitLibraries p)
@@ -241,3 +260,44 @@ unitHsLibs namever ways0 p = map (mkDynName . addSuffix . ST.unpack) (unitLibrar
 
         expandTag t | null t = ""
                     | otherwise = '_':t
+
+-- | Create a Map UnitId UnitInfo
+--
+-- For each instantiated unit, we add two map keys:
+--    * the real unit id
+--    * the virtual unit id made from its instantiation
+--
+-- We do the same thing for fully indefinite units (which are "instantiated"
+-- with module holes).
+--
+mkUnitInfoMap :: [UnitInfo] -> UnitInfoMap
+mkUnitInfoMap infos = foldl' add emptyUniqMap infos
+  where
+   mkVirt      p = virtualUnitId (mkInstantiatedUnit (unitInstanceOf p) (unitInstantiations p))
+   add pkg_map p
+      | not (null (unitInstantiations p))
+      = addToUniqMap (addToUniqMap pkg_map (mkVirt p) p)
+                     (unitId p) p
+      | otherwise
+      = addToUniqMap pkg_map (unitId p) p
+
+-- | Evaluate the lists in 'UnitInfo' to avoid retaining references to old 'UnitInfo's.
+evaluateUnitInfoLists :: UnitInfo -> IO UnitInfo
+evaluateUnitInfoLists ui = evaluate (ui `seqUnitInfoLists` ui)
+
+-- | Evaluate the lists in 'UnitInfo' to avoid retaining references to old 'UnitInfo's.
+-- This effectively ensures that all list elements in 'UnitInfo' are fully to whnf.
+seqUnitInfoLists :: UnitInfo -> b -> b
+seqUnitInfoLists ui b =
+  unitImportDirs ui `seqList`
+  unitIncludeDirs ui `seqList`
+  unitLibraryDirs ui `seqList`
+  unitLibraryBytecodeDirs ui `seqList`
+  unitExtDepFrameworkDirs ui `seq`
+  unitHaddockInterfaces ui `seq`
+  unitHaddockHTMLs ui `seqList`
+  unitLibraryDynDirs ui `seqList`
+  unitLibraryDirsStatic ui `seqList`
+  unitDepends ui `seqList`
+  unitExposedModules ui `seqList`
+  b

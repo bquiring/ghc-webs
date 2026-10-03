@@ -1,15 +1,4 @@
 {-# LANGUAGE CPP                       #-}
-{-# LANGUAGE ConstraintKinds           #-}
-{-# LANGUAGE DataKinds                 #-}
-{-# LANGUAGE DeriveDataTypeable        #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE FlexibleContexts          #-}
-{-# LANGUAGE FlexibleInstances         #-}
-{-# LANGUAGE LambdaCase                #-}
-{-# LANGUAGE MultiParamTypeClasses     #-}
-{-# LANGUAGE ScopedTypeVariables       #-}
-{-# LANGUAGE StandaloneDeriving        #-}
-{-# LANGUAGE TypeApplications          #-}
 {-# LANGUAGE TypeFamilyDependencies    #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -38,6 +27,7 @@ import GHC.Hs.Pat
 import GHC.Hs.Lit
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+import Language.Haskell.Syntax.Text
 import GHC.Hs.Extension
 import GHC.Hs.Type
 import GHC.Hs.Binds
@@ -45,10 +35,11 @@ import GHC.Parser.Annotation
 
 -- others:
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Types.ErrCtxt
 import GHC.Types.Id.Info ( RecSelParent )
 import GHC.Types.Name
 import GHC.Types.Name.Reader
-import GHC.Types.Name.Set
+import GHC.Types.Name.Set( FreeNames )
 import GHC.Types.Basic
 import GHC.Types.Fixity
 import GHC.Types.SourceText
@@ -63,12 +54,12 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Data.FastString
 import GHC.Core.Type
-import GHC.Builtin.Types (mkTupleStr)
-import GHC.Tc.Utils.TcType (TcType, TcTyVar)
+import GHC.Builtin.WiredIn.Types (mkTupleStr)
+import GHC.Tc.Utils.TcType (TcType)
 import {-# SOURCE #-} GHC.Tc.Types.LclEnv (TcLclEnv)
 
 import GHCi.RemoteTypes ( ForeignRef )
-import qualified GHC.Boot.TH.Syntax as TH (Q)
+import qualified GHC.Boot.TH.Monad as TH (Q)
 
 -- libraries:
 import Data.Data hiding (Fixity(..))
@@ -132,7 +123,7 @@ data SyntaxExprTc = SyntaxExprTc { syn_expr      :: HsExpr GhcTc
 -- | This is used for rebindable-syntax pieces that are too polymorphic
 -- for tcSyntaxOp (trS_fmap and the mzip in ParStmt)
 noExpr :: HsExpr (GhcPass p)
-noExpr = HsLit noExtField (HsString (SourceText $ fsLit "noExpr") (fsLit "noExpr"))
+noExpr = HsLit noExtField (HsString (SourceText $ fsLit "noExpr") (packHText "noExpr"))
 
 noSyntaxExpr :: forall p. IsPass p => SyntaxExpr (GhcPass p)
                               -- Before renaming, and sometimes after
@@ -243,6 +234,7 @@ type instance XIPVar         GhcRn = NoExtField
 type instance XIPVar         GhcTc = DataConCantHappen
 type instance XOverLitE      (GhcPass _) = NoExtField
 type instance XLitE          (GhcPass _) = NoExtField
+type instance XQualLitE      (GhcPass _) = NoExtField
 type instance XLam           (GhcPass _) = EpAnnLam
 type instance XApp           (GhcPass _) = NoExtField
 
@@ -274,7 +266,7 @@ type instance XPar           GhcPs = (EpToken "(", EpToken ")")
 type instance XPar           GhcRn = NoExtField
 type instance XPar           GhcTc = NoExtField
 
-type instance XExplicitTuple GhcPs = (EpaLocation, EpaLocation)
+type instance XExplicitTuple GhcPs = AnnParen
 type instance XExplicitTuple GhcRn = NoExtField
 type instance XExplicitTuple GhcTc = NoExtField
 
@@ -298,11 +290,13 @@ type instance XLet           GhcPs = (EpToken "let", EpToken "in")
 type instance XLet           GhcRn = NoExtField
 type instance XLet           GhcTc = NoExtField
 
-type instance XDo            GhcPs = AnnList EpaLocation
+type instance XDo            GhcPs = DoAnn
 type instance XDo            GhcRn = NoExtField
 type instance XDo            GhcTc = Type
 
-type instance XExplicitList  GhcPs = AnnList ()
+type DoAnn = (Either (EpToken "[", EpToken "]") AnnList, EpaLocation)
+
+type instance XExplicitList  GhcPs = (EpToken "[", EpToken "]")
 type instance XExplicitList  GhcRn = NoExtField
 type instance XExplicitList  GhcTc = Type
 -- GhcPs: ExplicitList includes all source-level
@@ -313,11 +307,11 @@ type instance XExplicitList  GhcTc = Type
 -- See Note [Handling overloaded and rebindable constructs]
 -- in  GHC.Rename.Expr
 
-type instance XRecordCon     GhcPs = (Maybe (EpToken "{"), Maybe (EpToken "}"))
+type instance XRecordCon     GhcPs = NoExtField
 type instance XRecordCon     GhcRn = NoExtField
 type instance XRecordCon     GhcTc = PostTcExpr   -- Instantiated constructor function
 
-type instance XRecordUpd     GhcPs = (Maybe (EpToken "{"), Maybe (EpToken "}"))
+type instance XRecordUpd     GhcPs = (EpToken "{", EpToken "}")
 type instance XRecordUpd     GhcRn = NoExtField
 type instance XRecordUpd     GhcTc = DataConCantHappen
   -- We desugar record updates in the typechecker.
@@ -372,9 +366,12 @@ type instance XArithSeq      GhcTc = PostTcExpr
 type instance XProc          (GhcPass _) = (EpToken "proc", TokRarrow)
 
 type instance XStatic        GhcPs = EpToken "static"
-type instance XStatic        GhcRn = NameSet
-type instance XStatic        GhcTc = (NameSet, Type)
-  -- Free variables and type of expression, this is stored for convenience as wiring in
+type instance XStatic        GhcRn = FreeNames
+  -- Free variables of the body; we can't tell if they are
+  -- type or term variables until we are typechecking
+type instance XStatic        GhcTc = (Type, HsExpr GhcTc)
+  -- Type of expression, and the (fromStaticPtr function)
+  -- These are stored for convenience as the wiring in
   -- StaticPtr is a bit tricky (see #20150)
 
 type instance XEmbTy         GhcPs = EpToken "type"
@@ -383,6 +380,9 @@ type instance XEmbTy         GhcTc = DataConCantHappen
   -- A free-standing HsEmbTy is an error.
   -- Valid usages are immediately desugared into Type.
 
+type instance XStar          GhcPs = TokStar
+type instance XStar          GhcRn = TokStar
+type instance XStar          GhcTc = DataConCantHappen
 
 {-
 Note [Holes in expressions]
@@ -541,12 +541,6 @@ type instance XPragE         (GhcPass _) = NoExtField
 
 type instance XFunRhs  = AnnFunRhs
 
-type instance Anno [LocatedA ((StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (body (GhcPass pr)))))] = SrcSpanAnnLW
-type instance Anno (StmtLR GhcRn GhcRn (LocatedA (body GhcRn))) = SrcSpanAnnA
-
-multAnnToHsExpr :: HsMultAnnOf (LocatedA (HsExpr GhcRn)) GhcRn -> Maybe (LocatedA (HsExpr GhcRn))
-multAnnToHsExpr = expandHsMultAnnOf mkHsVar
-
 mkHsVar :: forall p. IsPass p => LIdP (GhcPass p) -> HsExpr (GhcPass p)
 mkHsVar n = HsVar noExtField $
   case ghcPass @p of
@@ -563,14 +557,13 @@ mkHsVarWithUserRdr rdr n = HsVar noExtField $
 
 data AnnExplicitSum
   = AnnExplicitSum {
-      aesOpen       :: EpaLocation,
+      aesParens     :: AnnParen,
       aesBarsBefore :: [EpToken "|"],
-      aesBarsAfter  :: [EpToken "|"],
-      aesClose      :: EpaLocation
+      aesBarsAfter  :: [EpToken "|"]
       } deriving Data
 
 instance NoAnn AnnExplicitSum where
-  noAnn = AnnExplicitSum noAnn noAnn noAnn noAnn
+  noAnn = AnnExplicitSum noAnn noAnn noAnn
 
 data AnnFieldLabel
   = AnnFieldLabel {
@@ -624,7 +617,7 @@ instance NoAnn AnnFunRhs where
 
 -- ---------------------------------------------------------------------
 
-type instance XSCC           (GhcPass _) = (AnnPragma, SourceText)
+type instance XSCC           (GhcPass _) = (AnnPragSCC, SourceText)
 type instance XXPragE        (GhcPass _) = DataConCantHappen
 
 type instance XCDotFieldOcc (GhcPass _) = AnnFieldLabel
@@ -669,103 +662,34 @@ type instance XXExpr GhcTc = XXExprGhcTc
 *                                                                      *
 ********************************************************************* -}
 
--- | The different source constructs that we use to instantiate the "original" field
---   in an `XXExprGhcRn original expansion`
-data HsThingRn = OrigExpr (HsExpr GhcRn)
-               | OrigStmt (ExprLStmt GhcRn)
-               | OrigPat  (LPat GhcRn)
-
-isHsThingRnExpr, isHsThingRnStmt, isHsThingRnPat :: HsThingRn -> Bool
-isHsThingRnExpr (OrigExpr{}) = True
-isHsThingRnExpr _ = False
-
-isHsThingRnStmt (OrigStmt{}) = True
-isHsThingRnStmt _ = False
-
-isHsThingRnPat (OrigPat{}) = True
-isHsThingRnPat _ = False
+-- See Note [Rebindable syntax and XXExprGhcRn]
+-- See Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
+-- See Note [Typechecking by expansion: overview]
+data HsExpansion p
+  = HSE { hse_ctxt :: HsCtxt      -- The original source thing context,
+                                  -- to be used for error messages
+        , hse_exp  :: LHsExpr p   -- The compiler generated expansion
+        }
 
 data XXExprGhcRn
-  = ExpandedThingRn { xrn_orig     :: HsThingRn       -- The original source thing
-                    , xrn_expanded :: HsExpr GhcRn }  -- The compiler generated expanded thing
+  = ExpandedThingRn (HsExpansion GhcRn)  -- ^ Renamed/Pre Typecheck expanded expression
 
-  | PopErrCtxt                                     -- A hint for typechecker to pop
-    {-# UNPACK #-} !(LHsExpr GhcRn)                -- the top of the error context stack
-                                                   -- Does not presist post renaming phase
-                                                   -- See Part 3. of Note [Expanding HsDo with XXExprGhcRn]
-                                                   -- in `GHC.Tc.Gen.Do`
   | HsRecSelRn  (FieldOcc GhcRn)   -- ^ Variable pointing to record selector
                            -- See Note [Non-overloaded record field selectors] and
                            -- Note [Record selectors in the AST]
-
-
-
--- | Wrap a located expression with a `PopErrCtxt`
-mkPopErrCtxtExpr :: LHsExpr GhcRn -> HsExpr GhcRn
-mkPopErrCtxtExpr a = XExpr (PopErrCtxt a)
-
--- | Wrap a located expression with a PopSrcExpr with an appropriate location
-mkPopErrCtxtExprAt :: SrcSpanAnnA ->  LHsExpr GhcRn -> LHsExpr GhcRn
-mkPopErrCtxtExprAt loc a = L loc $ mkPopErrCtxtExpr a
-
--- | Build an expression using the extension constructor `XExpr`,
---   and the two components of the expansion: original expression and
---   expanded expressions.
-mkExpandedExpr
-  :: HsExpr GhcRn         -- ^ source expression
-  -> HsExpr GhcRn         -- ^ expanded expression
-  -> HsExpr GhcRn         -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedExpr oExpr eExpr = XExpr (ExpandedThingRn (OrigExpr oExpr) eExpr)
-
--- | Build an expression using the extension constructor `XExpr`,
---   and the two components of the expansion: original do stmt and
---   expanded expression
-mkExpandedStmt
-  :: ExprLStmt GhcRn      -- ^ source statement
-  -> HsExpr GhcRn         -- ^ expanded expression
-  -> HsExpr GhcRn         -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedStmt oStmt eExpr = XExpr (ExpandedThingRn (OrigStmt oStmt) eExpr)
-
-mkExpandedPatRn
-  :: LPat   GhcRn      -- ^ source pattern
-  -> HsExpr GhcRn      -- ^ expanded expression
-  -> HsExpr GhcRn      -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedPatRn oPat eExpr = XExpr (ExpandedThingRn (OrigPat oPat) eExpr)
-
--- | Build an expression using the extension constructor `XExpr`,
---   and the two components of the expansion: original do stmt and
---   expanded expression an associate with a provided location
-mkExpandedStmtAt
-  :: SrcSpanAnnA          -- ^ Location for the expansion expression
-  -> ExprLStmt GhcRn      -- ^ source statement
-  -> HsExpr GhcRn         -- ^ expanded expression
-  -> LHsExpr GhcRn        -- ^ suitably wrapped located 'XXExprGhcRn'
-mkExpandedStmtAt loc oStmt eExpr = L loc $ mkExpandedStmt oStmt eExpr
-
--- | Wrap the expanded version of the expression with a pop.
-mkExpandedStmtPopAt
-  :: SrcSpanAnnA          -- ^ Location for the expansion statement
-  -> ExprLStmt GhcRn      -- ^ source statement
-  -> HsExpr GhcRn         -- ^ expanded expression
-  -> LHsExpr GhcRn        -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedStmtPopAt loc oStmt eExpr = mkPopErrCtxtExprAt loc $ mkExpandedStmtAt loc oStmt eExpr
-
 
 data XXExprGhcTc
   = WrapExpr        -- Type and evidence application and abstractions
       HsWrapper (HsExpr GhcTc)
 
-  | ExpandedThingTc                         -- See Note [Rebindable syntax and XXExprGhcRn]
-                                            -- See Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
-         { xtc_orig     :: HsThingRn        -- The original user written thing
-         , xtc_expanded :: HsExpr GhcTc }   -- The expanded typechecked expression
+  | ExpandedThingTc (HsExpansion GhcTc) -- ^ Typechecked expanded expression
 
-  | ConLikeTc      -- Result of typechecking a data-con
-                   -- See Note [Typechecking data constructors] in
-                   --     GHC.Tc.Gen.Head
-                   -- The two arguments describe how to eta-expand
-                   -- the data constructor when desugaring
-        ConLike [TcTyVar] [Scaled TcType]
+  | ConLikeTc
+      -- ^ A 'ConLike', either a data constructor or pattern synonym
+      --
+      -- We use this field instead of 'Var' because pattern synonyms come with
+      -- a lot more information than a single 'Id' (see 'PatSyn').
+      ConLike
 
   ---------------------------------------
   -- Haskell program coverage (Hpc) Support
@@ -783,25 +707,6 @@ data XXExprGhcTc
                              -- See Note [Non-overloaded record field selectors] and
                              -- Note [Record selectors in the AST]
 
-
--- | Build a 'XXExprGhcRn' out of an extension constructor,
---   and the two components of the expansion: original and
---   expanded typechecked expressions.
-mkExpandedExprTc
-  :: HsExpr GhcRn           -- ^ source expression
-  -> HsExpr GhcTc           -- ^ expanded typechecked expression
-  -> HsExpr GhcTc           -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedExprTc oExpr eExpr = XExpr (ExpandedThingTc (OrigExpr oExpr) eExpr)
-
--- | Build a 'XXExprGhcRn' out of an extension constructor.
---   The two components of the expansion are: original statement and
---   expanded typechecked expression.
-mkExpandedStmtTc
-  :: ExprLStmt GhcRn        -- ^ source do statement
-  -> HsExpr GhcTc           -- ^ expanded typechecked expression
-  -> HsExpr GhcTc           -- ^ suitably wrapped 'XXExprGhcRn'
-mkExpandedStmtTc oStmt eExpr = XExpr (ExpandedThingTc (OrigStmt oStmt) eExpr)
-
 {- *********************************************************************
 *                                                                      *
             Pretty-printing expressions
@@ -812,29 +717,85 @@ instance (OutputableBndrId p) => Outputable (HsExpr (GhcPass p)) where
     ppr expr = pprExpr expr
 
 -----------------------
--- pprExpr, pprLExpr, pprBinds call pprDeeper;
--- the underscore versions do not
-pprLExpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
-pprLExpr (L _ e) = pprExpr e
-
-pprExpr :: (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
-pprExpr e | isAtomicHsExpr e || isQuietHsExpr e =            ppr_expr e
-          | otherwise                           = pprDeeper (ppr_expr e)
-
-isQuietHsExpr :: HsExpr id -> Bool
--- Parentheses do display something, but it gives little info and
--- if we go deeper when we go inside them then we get ugly things
--- like (...)
-isQuietHsExpr (HsPar {})        = True
--- applications don't display anything themselves
-isQuietHsExpr (HsApp {})        = True
-isQuietHsExpr (HsAppType {})    = True
-isQuietHsExpr (OpApp {})        = True
-isQuietHsExpr _ = False
+-- pprExpr, pprLExpr, pprBinds call pprDeeper
+-- ppr_expr, ppr_lexpr do not
+-- We generally recurse through the former
 
 pprBinds :: (OutputableBndrId idL, OutputableBndrId idR)
          => HsLocalBindsLR (GhcPass idL) (GhcPass idR) -> SDoc
 pprBinds b = pprDeeper (ppr b)
+
+pprLExpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
+pprLExpr (L _ e) = pprExpr e
+
+pprExpr :: (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
+-- pprExpr does a couple of special cases before calling
+-- pprDeeper and calling ppr_expr for the main dispatch
+
+-- HsPar: print parens before trimming with pprDeeper
+-- So for      f (case x of (a,b) -> blah) x
+-- we'll get   f (...) x
+-- and not     f ... x
+pprExpr (HsPar _ e) = parens (pprLExpr e)
+
+-- HsApp/HsAppType: always try to print the head of the application,
+-- so we get      f (g ...) (h ...)
+-- rather than    f (...) (...)
+pprExpr e@(HsApp {})     = pprApp e
+pprExpr e@(HsAppType {}) = pprApp e
+
+-- Now trim with pprDeeper, unless the expression is atomic
+-- in which case replacing "x" with "..." is silly
+pprExpr e
+  | isAtomicHsExpr e = ppr_expr e
+  | otherwise        = pprDeeper (ppr_expr e)
+
+-----------------------
+pprApp :: (OutputableBndrId p) => HsExpr (GhcPass p) -> SDoc
+-- Pretty-print an application (f e1 .. en)
+--
+-- If we have reached the depth limit, we don't want to print
+--       "f (...) (...) (....)"
+-- Instead we print "f ..."
+-- But if there is just one (value) argument we print
+--    f x, or perhaps f (...)   by calling pprLExpr on the argument
+--
+-- Crucially (#26330) we also increase the depth count as we step into
+-- each argument, so that deeply-nested function calls get trimmed
+pprApp app
+  = go app []  -- Collect arguments and print all at once
+  where
+    go fun args
+      = case fun of
+          HsApp _     (L _ fun') arg -> go fun' (Left arg  : args)
+          HsAppType _ (L _ fun') arg -> go fun' (Right arg : args)
+          _                          -> ppr_app fun args
+
+    ppr_app fun args
+      -- Special case: (f x) should print as (f x)
+      --               even if depth has run out
+      | [Left (L _ arg)] <- args
+      , isAtomicHsExpr arg
+      = pprExpr fun <+> ppr_expr arg
+
+      -- Function is not atomic, say ((case blah) x y z)
+      -- If we have reached the depth limit just print "..."
+      -- If not, just recurse
+      | not (isAtomicHsExpr fun)
+      = pprDeeper (hang (pprExpr fun)
+                      2 (fsep $ map pp args))
+
+      | otherwise
+      = hang (ppr_expr fun)    -- Function is atomic
+           2 (pprDeeper $ fsep $ map pp args)
+        -- If we have reached the depth limit, print "f ...",
+        -- rather than "f (...) x (...)", with all the arguments
+        -- NB: if there are 1000 arguments and we have /not/ reached the depth limit
+        --     we will print them all, which is perhaps sub-optimal.  We could deal
+        --     with that if it bites us; but arity-1000 functions are rather rare
+
+    pp (Left arg)  = ppr_lexpr arg  -- We already gone deeper in ppr_app
+    pp (Right arg) = text "@" <> ppr arg
 
 -----------------------
 ppr_lexpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
@@ -842,7 +803,16 @@ ppr_lexpr e = ppr_expr (unLoc e)
 
 ppr_expr :: forall p. (OutputableBndrId p)
          => HsExpr (GhcPass p) -> SDoc
+ppr_expr (HsPar _ e)         = parens (ppr_lexpr e)
+ppr_expr e@(HsApp {})        = pprApp e
+ppr_expr e@(HsAppType {})    = pprApp e
+
 ppr_expr (HsVar _ (L _ v))   = pprPrefixOcc v
+ppr_expr (HsIPVar _ v)       = ppr v
+ppr_expr (HsLit _ lit)       = ppr lit
+ppr_expr (HsOverLit _ lit)   = ppr lit
+ppr_expr (HsQualLit _ lit)   = ppr lit
+
 ppr_expr (HsHole x) = case (ghcPass @p, x) of
   (GhcPs, HoleVar (L _ v)) -> pprPrefixOcc v
   (GhcRn, HoleVar (L _ v)) -> pprPrefixOcc v
@@ -850,23 +820,17 @@ ppr_expr (HsHole x) = case (ghcPass @p, x) of
   (GhcPs, HoleError) -> pprPrefixOcc unnamedHoleRdrName
   (GhcRn, HoleError) -> pprPrefixOcc unnamedHoleRdrName
   (GhcTc, (HoleError, _)) -> pprPrefixOcc unnamedHoleRdrName
-ppr_expr (HsIPVar _ v)       = ppr v
 ppr_expr (HsOverLabel s l) = case ghcPass @p of
                GhcPs -> helper s
                GhcRn -> helper s
                GhcTc -> dataConCantHappen s
-    where helper s =
+
+    where helper :: SourceText -> SDoc
+          helper s =
             char '#' <> case s of
                           NoSourceText -> ppr l
                           SourceText src -> ftext src
-ppr_expr (HsLit _ lit)       = ppr lit
-ppr_expr (HsOverLit _ lit)   = ppr lit
-ppr_expr (HsPar _ e)         = parens (ppr_lexpr e)
-
-ppr_expr (HsPragE _ prag e) = sep [ppr prag, ppr_lexpr e]
-
-ppr_expr e@(HsApp {})        = ppr_apps e []
-ppr_expr e@(HsAppType {})    = ppr_apps e []
+ppr_expr (HsPragE _ prag e)  = sep [ppr prag, ppr_lexpr e]
 
 ppr_expr (OpApp _ e1 op e2)
   | Just pp_op <- ppr_infix_expr (unLoc op)
@@ -1043,10 +1007,13 @@ ppr_expr (HsStatic _ e)
 ppr_expr (HsEmbTy _ ty)
   = hsep [text "type", ppr ty]
 
-ppr_expr (HsQual _ ctxt ty)
-  = sep [ppr_context ctxt, ppr_lexpr ty]
+ppr_expr (HsStar _)
+  = starLit
+
+ppr_expr (HsQual _ (L _ ctxt) ty)
+  = sep [ppr_context (hsc_ctxt ctxt), ppr_lexpr ty]
   where
-    ppr_context (L _ ctxt) =
+    ppr_context ctxt =
       case ctxt of
         []       -> parens empty             <+> darrow
         [L _ ty] -> ppr_expr ty              <+> darrow
@@ -1056,38 +1023,43 @@ ppr_expr (HsForAll _ tele ty)
   = sep [pprHsForAll tele Nothing, ppr_lexpr ty]
 
 ppr_expr (HsFunArr _ arr arg res)
-  = sep [ppr_lexpr arg, pprHsArrow arr <+> ppr_lexpr res]
+  = sep [ppr_lexpr arg, pprHsModifiedFunArr arr <+> ppr_lexpr res]
 
 ppr_expr (XExpr x) = case ghcPass @p of
   GhcRn -> ppr x
   GhcTc -> ppr x
 
-instance Outputable HsThingRn where
-  ppr thing
-    = case thing of
-        OrigExpr x -> ppr_builder "<OrigExpr>:" x
-        OrigStmt x -> ppr_builder "<OrigStmt>:" x
-        OrigPat x  -> ppr_builder "<OrigPat>:" x
 
-    where ppr_builder prefix x = ifPprDebug (braces (text prefix <+> parens (ppr x))) (ppr x)
+ppr_hse :: forall p. (IsPass p) => HsExpansion (GhcPass p) -> SDoc
+ppr_hse hse
+  = case ghcPass @p of
+      GhcPs -> empty
+      GhcRn -> case hse of
+                 HSE o e -> ifPprDebug (braces $ vcat [pprCtxt o, text ";;" , ppr e]) (pprCtxt o)
+      GhcTc -> case hse of
+                 HSE o e -> ifPprDebug (braces $ vcat [pprCtxt o, text ";;" , ppr e]) (pprCtxt o)
+    where
+      ppr_builder prefix x = ifPprDebug (braces (text prefix <+> parens x)) x
+      pprCtxt :: HsCtxt -> SDoc
+      pprCtxt (ExprCtxt e) = ppr_builder "<OrigExpr>:"  (ppr e)
+      pprCtxt (StmtErrCtxt _ stmt) = ppr_builder "<OrigStmt>:" (ppr stmt)
+      pprCtxt (StmtErrCtxtPat pat) = ppr_builder "<OrigPat>:" (ppr pat)
+      pprCtxt (FunAppCtxt (FunAppCtxtExpr _ e) _) = ppr_builder "<FunAppCtxt>:"  (ppr e)
+      pprCtxt _ = ppr_builder "<MiscHsCtxt>:" empty
 
 instance Outputable XXExprGhcRn where
-  ppr (ExpandedThingRn o e) = ifPprDebug (braces $ vcat [ppr o, ppr e]) (ppr o)
-  ppr (PopErrCtxt e)        = ifPprDebug (braces (text "<PopErrCtxt>" <+> ppr e)) (ppr e)
   ppr (HsRecSelRn f)        = pprPrefixOcc f
+  ppr (ExpandedThingRn hse) = ppr_hse hse
+
 
 instance Outputable XXExprGhcTc where
   ppr (WrapExpr co_fn e)
     = pprHsWrapper co_fn (\_parens -> pprExpr e)
 
-  ppr (ExpandedThingTc o e)
-    = ifPprDebug (braces $ vcat [ppr o, ppr e]) (ppr o)
-            -- e is the expanded expression, we print the original
-            -- expression (HsExpr GhcRn), not the
-            -- expanded typechecked one (HsExpr GhcTc),
-            -- unless we are in ppr's debug mode printed both
+  ppr (ExpandedThingTc hse)
+    = ppr_hse hse
 
-  ppr (ConLikeTc con _ _) = pprPrefixOcc con
+  ppr (ConLikeTc con) = pprPrefixOcc con
    -- Used in error messages generated by
    -- the pattern match overlap checker
 
@@ -1118,37 +1090,20 @@ ppr_infix_expr (XExpr x)            = case ghcPass @p of
 ppr_infix_expr _ = Nothing
 
 ppr_infix_expr_rn :: XXExprGhcRn -> Maybe SDoc
-ppr_infix_expr_rn (ExpandedThingRn thing _) = ppr_infix_hs_expansion thing
-ppr_infix_expr_rn (PopErrCtxt (L _ a))      = ppr_infix_expr a
+ppr_infix_expr_rn (ExpandedThingRn (HSE thing _)) = ppr_infix_hs_expansion thing
 ppr_infix_expr_rn (HsRecSelRn f)            = Just (pprInfixOcc f)
 
 ppr_infix_expr_tc :: XXExprGhcTc -> Maybe SDoc
 ppr_infix_expr_tc (WrapExpr _ e)    = ppr_infix_expr e
-ppr_infix_expr_tc (ExpandedThingTc thing _)  = ppr_infix_hs_expansion thing
-ppr_infix_expr_tc (ConLikeTc {})             = Nothing
+ppr_infix_expr_tc (ExpandedThingTc (HSE thing _))  = ppr_infix_hs_expansion thing
+ppr_infix_expr_tc (ConLikeTc con)            = Just (pprInfixOcc (conLikeName con))
 ppr_infix_expr_tc (HsTick {})                = Nothing
 ppr_infix_expr_tc (HsBinTick {})             = Nothing
 ppr_infix_expr_tc (HsRecSelTc f)            = Just (pprInfixOcc f)
 
-ppr_infix_hs_expansion :: HsThingRn -> Maybe SDoc
-ppr_infix_hs_expansion (OrigExpr e) = ppr_infix_expr e
+ppr_infix_hs_expansion :: HsCtxt -> Maybe SDoc
+ppr_infix_hs_expansion (ExprCtxt e) = ppr_infix_expr e
 ppr_infix_hs_expansion _            = Nothing
-
-ppr_apps :: (OutputableBndrId p)
-         => HsExpr (GhcPass p)
-         -> [Either (LHsExpr (GhcPass p)) (LHsWcType (NoGhcTc (GhcPass p)))]
-         -> SDoc
-ppr_apps (HsApp _ (L _ fun) arg)        args
-  = ppr_apps fun (Left arg : args)
-ppr_apps (HsAppType _ (L _ fun) arg)    args
-  = ppr_apps fun (Right arg : args)
-ppr_apps fun args = hang (ppr_expr fun) 2 (fsep (map pp args))
-  where
-    pp (Left arg)                             = ppr arg
-    -- pp (Right (LHsWcTypeX (HsWC { hswc_body = L _ arg })))
-    --   = char '@' <> pprHsType arg
-    pp (Right arg)
-      = text "@" <> ppr arg
 
 pprDebugParendExpr :: (OutputableBndrId p)
                    => PprPrec -> LHsExpr (GhcPass p) -> SDoc
@@ -1180,6 +1135,7 @@ hsExprNeedsParens prec = go
     go (HsOverLabel{})                = False
     go (HsLit _ l)                    = hsLitNeedsParens prec l
     go (HsOverLit _ ol)               = hsOverLitNeedsParens prec ol
+    go (HsQualLit{})                  = False
     go (HsPar{})                      = False
     go (HsApp{})                      = prec >= appPrec
     go (HsAppType {})                 = prec >= appPrec
@@ -1189,7 +1145,7 @@ hsExprNeedsParens prec = go
     go (SectionR{})                   = True
     -- Special-case unary boxed tuple applications so that they are
     -- parenthesized as `Identity (Solo x)`, not `Identity Solo x` (#18612)
-    -- See Note [One-tuples] in GHC.Builtin.Types
+    -- See Note [One-tuples] in GHC.Builtin.WiredIn.Types
     go (ExplicitTuple _ [Present{}] Boxed)
                                       = prec >= appPrec
     go (ExplicitTuple{})              = False
@@ -1217,6 +1173,7 @@ hsExprNeedsParens prec = go
     go (HsProjection{})               = True
     go (HsGetField{})                 = False
     go (HsEmbTy{})                    = prec > topPrec
+    go (HsStar{})                     = prec >= starPrec
     go (HsHole{})                     = False
     go (HsForAll{})                   = prec >= funPrec
     go (HsQual{})                     = prec >= funPrec
@@ -1227,19 +1184,18 @@ hsExprNeedsParens prec = go
 
     go_x_tc :: XXExprGhcTc -> Bool
     go_x_tc (WrapExpr _ e)                   = hsExprNeedsParens prec e
-    go_x_tc (ExpandedThingTc thing _)        = hsExpandedNeedsParens thing
+    go_x_tc (ExpandedThingTc (HSE thing _))  = hsExpandedNeedsParens thing
     go_x_tc (ConLikeTc {})                   = False
     go_x_tc (HsTick _ (L _ e))               = hsExprNeedsParens prec e
     go_x_tc (HsBinTick _ _ (L _ e))          = hsExprNeedsParens prec e
     go_x_tc (HsRecSelTc{})                   = False
 
     go_x_rn :: XXExprGhcRn -> Bool
-    go_x_rn (ExpandedThingRn thing _)    = hsExpandedNeedsParens thing
-    go_x_rn (PopErrCtxt (L _ a))         = hsExprNeedsParens prec a
+    go_x_rn (ExpandedThingRn (HSE thing _))  = hsExpandedNeedsParens thing
     go_x_rn (HsRecSelRn{})               = False
 
-    hsExpandedNeedsParens :: HsThingRn -> Bool
-    hsExpandedNeedsParens (OrigExpr e) = hsExprNeedsParens prec e
+    hsExpandedNeedsParens :: HsCtxt -> Bool
+    hsExpandedNeedsParens (ExprCtxt e) = hsExprNeedsParens prec e
     hsExpandedNeedsParens _            = False
 
 -- | Parenthesize an expression without token information
@@ -1280,29 +1236,28 @@ isAtomicHsExpr (XExpr x)
   where
     go_x_tc :: XXExprGhcTc -> Bool
     go_x_tc (WrapExpr _ e)            = isAtomicHsExpr e
-    go_x_tc (ExpandedThingTc thing _) = isAtomicExpandedThingRn thing
+    go_x_tc (ExpandedThingTc (HSE thing _)) = isAtomicExpandedThingRn thing
     go_x_tc (ConLikeTc {})            = True
     go_x_tc (HsTick {})               = False
     go_x_tc (HsBinTick {})            = False
     go_x_tc (HsRecSelTc{})            = True
 
     go_x_rn :: XXExprGhcRn -> Bool
-    go_x_rn (ExpandedThingRn thing _) = isAtomicExpandedThingRn thing
-    go_x_rn (PopErrCtxt (L _ a))      = isAtomicHsExpr a
-    go_x_rn (HsRecSelRn{})            = True
+    go_x_rn (ExpandedThingRn (HSE thing _))   = isAtomicExpandedThingRn thing
+    go_x_rn (HsRecSelRn{})              = True
 
-    isAtomicExpandedThingRn :: HsThingRn -> Bool
-    isAtomicExpandedThingRn (OrigExpr e) = isAtomicHsExpr e
+    isAtomicExpandedThingRn :: HsCtxt -> Bool
+    isAtomicExpandedThingRn (ExprCtxt e) = isAtomicHsExpr e
     isAtomicExpandedThingRn _            = False
 
 isAtomicHsExpr _ = False
 
 instance Outputable (HsPragE (GhcPass p)) where
-  ppr (HsPragSCC (_, st) (StringLiteral stl lbl _)) =
+  ppr (HsPragSCC (_, st) sl@(StringLiteral _ lbl)) =
     pprWithSourceText st (text "{-# SCC")
      -- no doublequotes if stl empty, for the case where the SCC was written
      -- without quotes.
-    <+> pprWithSourceText stl (ftext lbl) <+> text "#-}"
+    <+> pprWithSourceText (stringLitSourceText sl) (ppr lbl) <+> text "#-}"
 
 
 {- *********************************************************************
@@ -1313,9 +1268,9 @@ instance Outputable (HsPragE (GhcPass p)) where
 
 {- Note [Rebindable syntax and XXExprGhcRn]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We implement rebindable syntax (RS) support by performing a desugaring
+We implement rebindable syntax (RS) support by performing an expansion
 in the renamer. We transform GhcPs expressions and patterns affected by
-RS into the appropriate desugared form, but **annotated with the original
+RS into the appropriate expanded form, but **annotated with the original
 expression/pattern**.
 
 Let us consider a piece of code like:
@@ -1337,7 +1292,7 @@ following function application:
 
 which doesn't typecheck. But GHC would report an error about
 not being able to match the third argument's type (Bool) with the
-expected type: (), in the expression _as desugared_, i.e in
+expected type: (), in the expression _as expanded_, i.e in
 the aforementioned function application. But the user never
 wrote a function application! This would be pretty bad.
 
@@ -1350,12 +1305,12 @@ expression in its first field, and the desugared one in the
 second field. The resulting renamed AST would look like:
 
     L locif (XExpr
-      (ExpandedThingRn
-        (HsIf (L loca 'a')
-              (L loctrue ())
-              (L locfalse True)
-        )
-        (App (L generatedSrcSpan
+      (ExpandedThingRn (HSE
+        { hse_ctxt = (HsIf (L loca 'a')
+                       (L loctrue ())
+                       (L locfalse True))
+        , hse_exp = L generatedSrcSpan
+              (App (L generatedSrcSpan
                 (App (L generatedSrcSpan
                         (App (L generatedSrcSpan (Var ifThenElse))
                              (L loca 'a')
@@ -1364,13 +1319,13 @@ second field. The resulting renamed AST would look like:
                      (L loctrue ())
                 )
              )
-             (L locfalse True)
-        )
+             (L locfalse True))
+        }
       )
     )
 
 When comes the time to typecheck the program, we end up calling
-tcMonoExpr on the AST above. If this expression gives rise to
+tcMonoLExpr on the AST above. If this expression gives rise to
 a type error, then it will appear in a context line and GHC
 will pretty-print it using the 'Outputable (XXExprGhcRn a b)'
 instance defined below, which *only prints the original
@@ -1487,7 +1442,7 @@ type instance XCmdArrApp  GhcPs = (IsUnicodeSyntax, EpaLocation)
 type instance XCmdArrApp  GhcRn = NoExtField
 type instance XCmdArrApp  GhcTc = Type
 
-type instance XCmdArrForm GhcPs = AnnList ()
+type instance XCmdArrForm GhcPs = (EpUniToken "(|" "⦇", EpUniToken "|)"  "⦈")
 -- | fixity (filled in by the renamer), for forms that were converted from
 -- OpApp's by the renamer
 type instance XCmdArrForm GhcRn = Maybe Fixity
@@ -1514,7 +1469,7 @@ type instance XCmdLet     GhcPs = (EpToken "let", EpToken "in")
 type instance XCmdLet     GhcRn = NoExtField
 type instance XCmdLet     GhcTc = NoExtField
 
-type instance XCmdDo      GhcPs = AnnList EpaLocation
+type instance XCmdDo      GhcPs = DoAnn
 type instance XCmdDo      GhcRn = NoExtField
 type instance XCmdDo      GhcTc = Type
 
@@ -1529,8 +1484,14 @@ type instance XXCmd       GhcTc = HsWrap HsCmd
     -- Then (XCmd (HsWrap wrap cmd)) :: arg2 --> res
 
 -- | Command Syntax Table (for Arrow syntax)
-type CmdSyntaxTable p = [(Name, HsExpr p)]
+newtype CmdSyntaxTable p = CST [(KnownOcc, HsExpr p)]
 -- See Note [CmdSyntaxTable]
+
+instance Typeable p => Data (CmdSyntaxTable p) where
+    -- Don't traverse a CmdSyntaxTable
+    toConstr _   = abstractConstr "CmdSyntaxTable"
+    gunfold _ _  = error "gunfold:CmdSyntaxTable"
+    dataTypeOf _ = mkNoRepType "CmdSyntaxTable"
 
 {-
 Note [CmdSyntaxTable]
@@ -1562,16 +1523,23 @@ is Less Cool because
     See the tedious GHC.Rename.Expr.methodNamesCmd.
 
   * The desugarer has to know the polymorphic type of the instantiated
-    method. This is checked by Inst.tcSyntaxName, but is less flexible
+    method. This is checked by Inst.tcCmdSyntaxTable, but is less flexible
     than the rest of rebindable syntax, where the type is less
     pre-ordained.  (And this flexibility is useful; for example we can
     typecheck do-notation with (>>=) :: m1 a -> (a -> m2 b) -> m2 b.)
 -}
 
 data CmdTopTc
-  = CmdTopTc Type    -- Nested tuple of inputs on the command's stack
-             Type    -- return type of the command
-             (CmdSyntaxTable GhcTc) -- See Note [CmdSyntaxTable]
+  = CmdTopTc
+    -- | Nested tuple of inputs on the command's stack
+  { ctt_stack  :: Type
+    -- | Arrow type
+  , ctt_arr_ty :: Type
+    -- | Return type of the command
+  , ctt_res_ty :: Type
+    -- | Command syntax table; see Note [CmdSyntaxTable]
+  , ctt_table  :: CmdSyntaxTable GhcTc
+  }
 
 type instance XCmdTop  GhcPs = NoExtField
 type instance XCmdTop  GhcRn = CmdSyntaxTable GhcRn -- See Note [CmdSyntaxTable]
@@ -1656,7 +1624,7 @@ ppr_cmd (HsCmdArrForm rn_fix (L _ op) ps_fix args)
   | HsVar _ (L _ v) <- op
   = ppr_cmd_infix v
   | GhcTc <- ghcPass @p
-  , XExpr (ConLikeTc c _ _) <- op
+  , XExpr (ConLikeTc c) <- op
   = ppr_cmd_infix (conLikeName c)
   | otherwise
   = fall_through
@@ -1695,9 +1663,12 @@ instance (OutputableBndrId p) => Outputable (HsCmdTop (GhcPass p)) where
 ************************************************************************
 -}
 
-type instance XMG         GhcPs b = Origin
-type instance XMG         GhcRn b = Origin -- See Note [Generated code and pattern-match checking]
+type instance XMG         GhcPs b = (Origin, MatchGroupAnn)
+type instance XMG         GhcRn b = (Origin, -- See Note [Generated code and pattern-match checking]
+                                     MatchGroupAnn)
 type instance XMG         GhcTc b = MatchGroupTc
+
+type MatchGroupAnn = AnnList
 
 data MatchGroupTc
   = MatchGroupTc
@@ -1727,10 +1698,11 @@ isSingletonMatchGroup matches
   | otherwise
   = False
 
-matchGroupArity :: MatchGroup (GhcPass id) body -> Arity
+matchGroupVisArity :: MatchGroup (GhcPass id) body -> VisArity
 -- This is called before type checking, when mg_arg_tys is not set
-matchGroupArity MG { mg_alts = L _ [] } = 1 -- See Note [Empty mg_alts]
-matchGroupArity MG { mg_alts = L _ (alt1 : _) } = count isVisArgLPat (hsLMatchPats alt1)
+-- Returns the "visible arity" of the MatchGroup i.e. including required type arguments.
+matchGroupVisArity MG { mg_alts = L _ [] } = 1 -- See Note [Empty mg_alts]
+matchGroupVisArity MG { mg_alts = L _ (alt1 : _) } = count isVisArgLPat (hsLMatchPats alt1)
 
 hsLMatchPats :: LMatch (GhcPass id) body -> [LPat (GhcPass id)]
 hsLMatchPats (L _ (Match { m_pats = L _ pats })) = pats
@@ -1858,7 +1830,7 @@ matchSeparator PatBindRhs       = text "="
 matchSeparator PatBindGuards    = text "="
 matchSeparator StmtCtxt{}       = text "<-"
 matchSeparator RecUpd           = text "="  -- This can be printed by the pattern
-matchSeparator PatSyn           = text "<-" -- match checker trace
+matchSeparator PatSynCtx        = text "<-" -- match checker trace
 matchSeparator LazyPatCtx       = panic "unused"
 matchSeparator ThPatSplice      = panic "unused"
 matchSeparator ThPatQuote       = panic "unused"
@@ -1931,7 +1903,7 @@ type instance XTransStmt       (GhcPass _) GhcPs b = AnnTransStmt
 type instance XTransStmt       (GhcPass _) GhcRn b = NoExtField
 type instance XTransStmt       (GhcPass _) GhcTc b = Type
 
-type instance XRecStmt         (GhcPass _) GhcPs b = AnnList (EpToken "rec")
+type instance XRecStmt         (GhcPass _) GhcPs b = (AnnList, EpToken "rec")
 type instance XRecStmt         (GhcPass _) GhcRn b = NoExtField
 type instance XRecStmt         (GhcPass _) GhcTc b = RecStmtTc
 
@@ -2297,6 +2269,7 @@ data HsImplicitLiftSplice =
           { implicit_lift_bind_lvl :: S.Set ThLevelIndex
           , implicit_lift_used_lvl :: ThLevelIndex
           , implicit_lift_gre :: Maybe GlobalRdrElt
+            -- ^ Nothing iff 'LevelCheckReason' is 'LevelCheckInstance'
           , implicit_lift_lid :: LIdOccP GhcRn
           }
 
@@ -2335,7 +2308,7 @@ pprUntypedSplice _     _ (XUntypedSplice x) =
     GhcRn -> case x of
               HsImplicitLiftSplice _ _ _ lid -> ppr lid
 
-ppr_quasi :: OutputableBndr p => p -> FastString -> SDoc
+ppr_quasi :: OutputableBndr p => p -> HText -> SDoc
 ppr_quasi quoter quote = char '[' <> ppr quoter <> vbar <>
                            ppr quote <> text "|]"
 
@@ -2454,7 +2427,7 @@ instance Outputable fn => Outputable (HsMatchContext fn) where
   ppr (StmtCtxt _)            = text "StmtCtxt _"
   ppr ThPatSplice             = text "ThPatSplice"
   ppr ThPatQuote              = text "ThPatQuote"
-  ppr PatSyn                  = text "PatSyn"
+  ppr PatSynCtx               = text "PatSynCtx"
   ppr LazyPatCtx              = text "LazyPatCtx"
 
 instance Outputable HsLamVariant where
@@ -2468,9 +2441,9 @@ lamCaseKeyword LamSingle = text "lambda"
 lamCaseKeyword LamCase   = text "\\case"
 lamCaseKeyword LamCases  = text "\\cases"
 
-pprExternalSrcLoc :: (StringLiteral,(Int,Int),(Int,Int)) -> SDoc
-pprExternalSrcLoc (StringLiteral _ src _,(n1,n2),(n3,n4))
-  = ppr (src,(n1,n2),(n3,n4))
+pprExternalSrcLoc :: (StringLiteral (GhcPass p), (Int, Int), (Int, Int)) -> SDoc
+pprExternalSrcLoc (sLit, (n1,n2), (n3,n4))
+  = ppr (stringLitSourceText sLit, (n1,n2), (n3,n4))
 
 instance Outputable HsArrowMatchContext where
   ppr ProcExpr                  = text "ProcExpr"
@@ -2498,7 +2471,7 @@ matchContextErrString RecUpd                        = text "record update"
 matchContextErrString (ArrowMatchCtxt c)            = matchArrowContextErrString c
 matchContextErrString ThPatSplice                   = panic "matchContextErrString"  -- Not used at runtime
 matchContextErrString ThPatQuote                    = panic "matchContextErrString"  -- Not used at runtime
-matchContextErrString PatSyn                        = text "pattern synonym"
+matchContextErrString PatSynCtx                     = text "pattern synonym"
 matchContextErrString (StmtCtxt (ParStmtCtxt c))    = matchContextErrString (StmtCtxt c)
 matchContextErrString (StmtCtxt (TransStmtCtxt c))  = matchContextErrString (StmtCtxt c)
 matchContextErrString (StmtCtxt (PatGuard _))       = text "pattern guard"
@@ -2573,7 +2546,7 @@ pprMatchContextNoun PatBindGuards           = text "pattern binding guards"
 pprMatchContextNoun (ArrowMatchCtxt c)      = pprArrowMatchContextNoun c
 pprMatchContextNoun (StmtCtxt ctxt)         = text "pattern binding in"
                                               $$ pprAStmtContext ctxt
-pprMatchContextNoun PatSyn                  = text "pattern synonym declaration"
+pprMatchContextNoun PatSynCtx               = text "pattern synonym declaration"
 pprMatchContextNoun LazyPatCtx              = text "irrefutable pattern"
 
 pprMatchContextNouns :: Outputable fn => HsMatchContext fn -> SDoc
@@ -2677,7 +2650,7 @@ pprPrefixFastString :: FastString -> SDoc
 pprPrefixFastString fs = pprPrefixOcc (mkVarUnqual fs)
 
 instance UnXRec p => Outputable (DotFieldOcc p) where
-  ppr (DotFieldOcc _ s) = (pprPrefixFastString . field_label . unXRec @p) s
+  ppr (DotFieldOcc _ s) = (pprPrefixFastString . mkFastStringShortText . field_label . unXRec @p) s
   ppr XDotFieldOcc{} = text "XDotFieldOcc"
 
 {-
@@ -2689,30 +2662,31 @@ instance UnXRec p => Outputable (DotFieldOcc p) where
 -}
 
 type instance Anno (HsExpr (GhcPass p)) = SrcSpanAnnA
-type instance Anno [LocatedA (HsExpr (GhcPass p))] = SrcSpanAnnC
-type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (HsExpr (GhcPass pr))))] = SrcSpanAnnLW
-type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (HsCmd (GhcPass pr))))] = SrcSpanAnnLW
+type instance Anno [LocatedA (HsExpr (GhcPass p))] = SrcSpanAnnA
+type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (HsExpr (GhcPass pr))))] = SrcSpanAnnA
+type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (HsCmd (GhcPass pr))))] = SrcSpanAnnA
 
 type instance Anno (HsCmd (GhcPass p)) = SrcSpanAnnA
 
 type instance Anno (HsCmdTop (GhcPass p)) = EpAnnCO
-type instance Anno [LocatedA (Match (GhcPass p) (LocatedA (HsExpr (GhcPass p))))] = SrcSpanAnnLW
-type instance Anno [LocatedA (Match (GhcPass p) (LocatedA (HsCmd  (GhcPass p))))] = SrcSpanAnnLW
+type instance Anno [LocatedA (Match (GhcPass p) (LocatedA (HsExpr (GhcPass p))))] = SrcSpanAnnA
+type instance Anno [LocatedA (Match (GhcPass p) (LocatedA (HsCmd  (GhcPass p))))] = SrcSpanAnnA
 type instance Anno (Match (GhcPass p) (LocatedA (HsExpr (GhcPass p)))) = SrcSpanAnnA
 type instance Anno (Match (GhcPass p) (LocatedA (HsCmd  (GhcPass p)))) = SrcSpanAnnA
-type instance Anno [LocatedA (Pat (GhcPass p))] = EpaLocation
+type instance Anno [LocatedA (Pat (GhcPass p))] = SrcSpanAnnA
 type instance Anno (GRHS (GhcPass p) (LocatedA (HsExpr (GhcPass p)))) = EpAnnCO
 type instance Anno (GRHS (GhcPass p) (LocatedA (HsCmd  (GhcPass p)))) = EpAnnCO
 type instance Anno (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (body (GhcPass pr)))) = SrcSpanAnnA
 
 type instance Anno (HsUntypedSplice (GhcPass p)) = SrcSpanAnnA
 
-type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (body (GhcPass pr))))] = SrcSpanAnnLW
+type instance Anno [LocatedA (StmtLR (GhcPass pl) (GhcPass pr) (LocatedA (body (GhcPass pr))))] = SrcSpanAnnA
 
 type instance Anno (FieldLabelStrings (GhcPass p)) = EpAnnCO
 type instance Anno FieldLabelString                = SrcSpanAnnN
 
 type instance Anno FastString                      = EpAnnCO
+type instance Anno HText                           = EpAnnCO
   -- Used in HsQuasiQuote and perhaps elsewhere
 
 type instance Anno (DotFieldOcc (GhcPass p))       = EpAnnCO

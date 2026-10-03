@@ -32,17 +32,21 @@ module GHC.Internal.Stats
     , getRTSStatsEnabled
 ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Control.Monad
 import GHC.Internal.Int
+import GHC.Internal.Maybe ( Maybe(..) )
 import GHC.Internal.Word
-import GHC.Internal.Base
 import GHC.Internal.Generics (Generic)
-import GHC.Internal.Read ( Read )
-import GHC.Internal.Show ( Show )
+import GHC.Internal.Read
+import GHC.Internal.Show
 import GHC.Internal.IO.Exception
 import GHC.Internal.Foreign.Marshal.Alloc
 import GHC.Internal.Foreign.Storable
 import GHC.Internal.Foreign.Ptr
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
+import qualified GHC.Internal.Generics as Rebindable hiding( prec )
 
 #include "Rts.h"
 
@@ -111,6 +115,8 @@ data RTSStats = RTSStats {
   , gc_cpu_ns :: RtsTime
     -- | Total elapsed time used by the GC
   , gc_elapsed_ns :: RtsTime
+    -- | Total elapsed time used during GC synchronization
+  , gc_sync_elapsed_ns :: RtsTime
     -- | Total CPU time (at the previous GC)
   , cpu_ns :: RtsTime
     -- | Total elapsed time (at the previous GC)
@@ -234,6 +240,7 @@ getRTSStats = do
     mutator_elapsed_ns <- (# peek RTSStats, mutator_elapsed_ns) p
     gc_cpu_ns <- (# peek RTSStats, gc_cpu_ns) p
     gc_elapsed_ns <- (# peek RTSStats, gc_elapsed_ns) p
+    gc_sync_elapsed_ns <- (# peek RTSStats, gc_sync_elapsed_ns) p
     cpu_ns <- (# peek RTSStats, cpu_ns) p
     elapsed_ns <- (# peek RTSStats, elapsed_ns) p
     nonmoving_gc_sync_cpu_ns <- (# peek RTSStats, nonmoving_gc_sync_cpu_ns) p

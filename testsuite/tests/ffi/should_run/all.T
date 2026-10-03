@@ -103,7 +103,7 @@ test('T2276_ghci', [ only_ghci,
                      pre_cmd('$MAKE -s --no-print-directory T2276_ghci_setup ghciWayFlags=' + config.ghci_way_flags) ],
                    compile_and_run, ['-fobject-code T2276_ghci_c.o'])
 
-test('T2469', normal, compile_and_run, ['-optc-std=gnu99'])
+test('T2469', normal, compile_and_run, ['-optc-std=gnu11'])
 
 test('T2594', [req_c], compile_and_run, ['T2594_c.c'])
 
@@ -225,6 +225,8 @@ test('PrimFFIInt32', [req_c], compile_and_run, ['PrimFFIInt32_c.c'])
 
 test('PrimFFIWord32', [req_c], compile_and_run, ['PrimFFIWord32_c.c'])
 
+test('PrimFFIUnboxedSum', req_cmm, compile_and_run, ['PrimFFIUnboxedSum_cmm.cmm'])
+
 test('T493', [ req_c], compile_and_run, ['T493_c.c'])
 
 test('UnliftedNewtypesByteArrayOffset', [req_c], compile_and_run, ['UnliftedNewtypesByteArrayOffset_c.c'])
@@ -247,6 +249,7 @@ test('T21305', [cmm_src], multi_compile_and_run,
 
 test('T22159',
      [unless(opsys('mingw32'), skip),
+      fragile(27248),
       extra_files(['T22159_c.c'])],
      makefile_test, ['T22159'])
 

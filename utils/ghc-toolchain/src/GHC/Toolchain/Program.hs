@@ -16,6 +16,7 @@ module GHC.Toolchain.Program
     , _poPath
     , _poFlags
     , findProgram
+    , findLlvmProgram
      -- * Compiler programs
     , compile
     , supportsTarget
@@ -23,7 +24,8 @@ module GHC.Toolchain.Program
 
 import Control.Monad
 import Control.Monad.IO.Class
-import Data.List (intercalate, isPrefixOf)
+import Data.Char (isDigit)
+import Data.List (find, intercalate, isPrefixOf, tails)
 import Data.Maybe
 import System.FilePath
 import System.Directory
@@ -131,17 +133,13 @@ programFromOpt userSpec path flags = Program { prgPath = fromMaybe path (poPath 
 -- in the given list of candidates.
 --
 -- If the 'ProgOpt' program flags are unspecified the program will have an empty list of flags.
-findProgram :: String
+findProgram :: String      -- ^ The program description
             -> ProgOpt     -- ^ path provided by user
             -> [FilePath]  -- ^ candidate names
             -> M Program
 findProgram description userSpec candidates
-  | Just path <- poPath userSpec = do
-      let err =
-            [ "Failed to find " ++ description ++ "."
-            , "Looked for user-specified program '" ++ path ++ "' in the system search path."
-            ]
-      toProgram <$> find_it path <|> throwEs err
+  | Just findProgramFromProgOpts <- maybeFindProgramFromProgOpts description userSpec
+  = findProgramFromProgOpts
 
   | otherwise = do
       env <- getEnv
@@ -150,21 +148,94 @@ findProgram description userSpec candidates
                 Just prefix -> map (prefix++) candidates
                 Nothing     -> []
           candidates' = prefixedCandidates ++ candidates
-          err =
-            [ "Failed to find " ++ description ++ "."
-            , "Looked for one of " ++ show candidates' ++ " in the system search path."
-            ]
-      toProgram <$> oneOf' err (map find_it candidates') <|> throwEs err
-  where
-      toProgram path = Program { prgPath = path, prgFlags = fromMaybe [] (poFlags userSpec) }
+      pathMay <- findM doesExecutableExist candidates'
+      case pathMay of
+        Nothing -> throwEs
+          [ "Failed to find " ++ description ++ "."
+          , "Looked for one of " ++ show candidates' ++ " in the system search path."
+          ]
+        Just path ->
+          return Program { prgPath = path, prgFlags = fromMaybe [] (poFlags userSpec) }
 
-      find_it name = do
-          r <- liftIO $ findExecutable name
-          case r of
-            Nothing -> throwE $ name ++ " not found in search path"
-            -- Use the given `prgPath` or candidate name rather than the
-            -- absolute path returned by `findExecutable`.
-            Just _x -> return name
+-- Note that @configure.ac@ checks these llvm version constants (using @sed@) to
+-- ensure they are the same as the @$LlvmMinVersion@ and @$LlvmMaxVersion@
+-- defined in @configure.ac@.
+
+-- Min llvm version (inclusive)
+minLlvmVersion :: Int
+minLlvmVersion = 13
+
+-- Max llvm version (exclusive)
+maxLlvmVersionExcl :: Int
+maxLlvmVersionExcl = 24
+
+-- Max llvm version (inclusive)
+maxLlvmVersion :: Int
+maxLlvmVersion = maxLlvmVersionExcl - 1
+
+-- | Tries to find an llvm program with the highest supported llvm versions.
+-- This searches for an explicitly versioned executable (postfixed with the llvm version).
+-- If an explicitly versioned executable is not found, then this searches for a non-explicitly
+-- versioned executable. If supported, the llvm version is checked by passing @--version@ to
+-- the executable.
+--
+-- If the 'ProgOpt' program flags are unspecified the program will have an empty list of flags.
+findLlvmProgram :: String      -- ^ The llvm program description
+                -> ProgOpt     -- ^ path provided by user
+                -> FilePath    -- ^ Candidate name
+                -> Bool        -- ^ True if the program supports the @--version@ flag and the output
+                               --   contains the llvm version number in the form @version <LLVM_VERSION>@
+                -> M Program
+findLlvmProgram description userSpec candidate checkVersion
+  | Just findProgramFromProgOpts <- maybeFindProgramFromProgOpts description userSpec
+  = findProgramFromProgOpts
+
+  | otherwise = do
+      program <- findProgram description userSpec (versionedCandidates ++ [candidate])
+      when checkVersion $ do
+        -- Extract the version from the `--version` output
+        versionOutput <- readProgramStdout program ["--version"]
+        let versionStrPrefix = "version "
+
+            versionMay :: Maybe Int
+            versionMay = fmap (read . takeWhile isDigit . drop (length versionStrPrefix))
+              . find (versionStrPrefix `isPrefixOf`)
+              $ tails versionOutput
+
+            errSupportedVersions = prgPath program <> ": We only support llvm " <> show minLlvmVersion <> " upto " <> show maxLlvmVersion <> " (non-inclusive)"
+        case versionMay of
+          Nothing -> throwE (errSupportedVersions <> " (no version found).")
+          Just version -> when
+            (version < minLlvmVersion || version > maxLlvmVersion)
+            (throwE $ errSupportedVersions <> "  (found " <> show version <> ").")
+      return program
+  where
+    versionedCandidates =
+      [ candidate <> postfix
+      | llvmVersion <- show <$> [maxLlvmVersion, maxLlvmVersion-1 .. minLlvmVersion]
+      , postfix <-
+        [ "-" <> llvmVersion
+        , "-" <> llvmVersion <> ".0"
+        , llvmVersion
+        ]
+      ]
+
+maybeFindProgramFromProgOpts :: String -> ProgOpt -> Maybe (M Program)
+maybeFindProgramFromProgOpts description userSpec = case poPath userSpec of
+  Nothing -> Nothing
+  Just path -> Just $ do
+    exists <- doesExecutableExist path
+    unless exists $ throwEs
+      [ "Failed to find " ++ description ++ "."
+      , "Looked for user-specified program '" ++ path ++ "' in the system search path."
+      ]
+    return Program { prgPath = path, prgFlags = fromMaybe [] (poFlags userSpec) }
+
+doesExecutableExist
+  :: String -- ^ executable name
+  -> M Bool
+doesExecutableExist name = isJust <$> liftIO (findExecutable name)
+
 
 -------------------- Compiling utilities --------------------
 

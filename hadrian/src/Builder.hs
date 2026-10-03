@@ -8,7 +8,7 @@ module Builder (
     -- * Builder properties
     builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilders,
     runBuilder, runBuilderWith, runBuilderWithCmdOptions, getBuilderPath,
-    builderEnvironment
+    builderEnvironment, remBuilderEnvironment
     ) where
 
 import Control.Exception.Extra (Partial)
@@ -17,7 +17,7 @@ import Development.Shake.Classes
 import Development.Shake.Command
 import Development.Shake.FilePath
 import GHC.Generics
-import GHC.Platform.ArchOS (ArchOS(..), Arch(..))
+import GHC.Platform.ArchOS (ArchOS(..), Arch(..), OS(..))
 import qualified Hadrian.Builder as H
 import Hadrian.Builder hiding (Builder)
 import Hadrian.Builder.Ar
@@ -26,20 +26,18 @@ import Hadrian.Builder.Tar
 import Hadrian.Oracles.Path
 import Hadrian.Oracles.TextFile
 import Hadrian.Utilities
-import Oracles.Setting (bashPath, targetStage)
 import System.Exit
 import System.IO (stderr)
 
 import Base
 import Context
 import Oracles.Flag
-import Oracles.Setting (setting, Setting(..))
+import Oracles.Setting
 import Packages
 
 import GHC.IO.Encoding (getFileSystemEncoding)
 import qualified Data.ByteString as BS
 import qualified GHC.Foreign as GHC
-import GHC.ResponseFile
 
 import GHC.Toolchain (Target(..))
 import qualified GHC.Toolchain as Toolchain
@@ -49,7 +47,7 @@ import GHC.Toolchain.Program
 -- * Compile or preprocess a source file.
 -- * Extract source dependencies by passing @-MM@ command line argument.
 data CcMode = CompileC | FindCDependencies DependencyType deriving (Eq, Generic, Show)
-data DependencyType = CDep | CxxDep deriving (Eq, Generic, Show)
+data DependencyType = CDep | CxxDep | AsmDep deriving (Eq, Generic, Show)
 
 instance Binary   CcMode
 instance Hashable CcMode
@@ -170,19 +168,17 @@ data Builder = Alex
              | GhcPkg GhcPkgMode Stage
              | Haddock HaddockMode
              | Happy
-             | Hp2Ps
-             | Hpc
-             | HsCpp
-             | JsCpp
+             | HsCpp Stage
+             | JsCpp Stage
              | Hsc2Hs Stage
              | Ld Stage --- ^ linker
              | Make FilePath
              | Makeinfo
-             | MergeObjects Stage -- ^ linker to be used to merge object files.
-             | Nm
+             | Nm Stage
              | Objdump
              | Python
-             | Ranlib
+             | Ranlib Stage
+             | Dlltool Stage
              | Testsuite TestMode
              | Sphinx SphinxMode
              | Tar TarMode
@@ -212,10 +208,6 @@ builderProvenance = \case
     Haddock _        -> context Stage1 haddock
     Hsc2Hs _         -> context stage0Boot hsc2hs
     Unlit            -> context stage0Boot unlit
-
-    -- Never used
-    Hpc              -> context Stage1 hpcBin
-    Hp2Ps            -> context stage0Boot hp2ps
     _                -> Nothing
   where
     context s p = Just $ vanillaContext s p
@@ -236,25 +228,13 @@ instance H.Builder Builder where
           -- changes (#18001).
           _bootGhcVersion <- setting GhcVersion
           pure []
-        Ghc _ st -> do
+        Ghc _ stage -> do
             root <- buildRoot
             unlitPath  <- builderPath Unlit
-            distro_mingw <- lookupSystemConfig "settings-use-distro-mingw"
-            libffi_adjustors <- useLibffiForAdjustors
-            use_system_ffi <- flag UseSystemFfi
+            distro_mingw <- lookupStageBuildConfig "settings-use-distro-mingw" stage
 
             return $ [ unlitPath ]
                   ++ [ root -/- mingwStamp | windowsHost, distro_mingw == "NO" ]
-                     -- proxy for the entire mingw toolchain that
-                     -- we have in inplace/mingw initially, and then at
-                     -- root -/- mingw.
-                  -- ffi.h needed by the compiler when using libffi_adjustors (#24864)
-                  -- It would be nicer to not duplicate this logic between here
-                  -- and needRtsLibffiTargets and libffiHeaderFiles but this doesn't change
-                  -- very often.
-                  ++ [ root -/- buildDir (rtsContext st) -/- "include" -/- header
-                     | header <- ["ffi.h", "ffitarget.h"]
-                     , libffi_adjustors && not use_system_ffi ]
 
         Hsc2Hs stage -> (\p -> [p]) <$> templateHscPath stage
         Make dir  -> return [dir -/- "Makefile"]
@@ -274,38 +254,43 @@ instance H.Builder Builder where
                 msgIn  = "[askBuilder] Exactly one input file expected."
             needBuilders [builder]
             path <- H.builderPath builder
+            prog <- exeSpawnPath path
             -- we do not depend on bare builders. E.g. we won't depend on `clang`
             -- or `ld` or `ar`.  Unless they are provided with fully qualified paths
             -- this is the job of the person invoking ./configure to pass e.g.
             -- CC=$(which clang) if they want the fully qualified clang path!
             when (path /= takeFileName path) $
                 need [path]
-            Stdout stdout <- cmd' [path] ["--no-user-package-db", "field", input, "depends"]
+            Stdout stdout <- cmd' prog ["--no-user-package-db", "field", input, "depends"]
             return stdout
         Testsuite GetExtraDeps -> do
           path <- builderPath builder
+          prog <- exeSpawnPath path
           withResources buildResources $
               withTempFile $ \temp -> do
-                () <- cmd' [path] (buildArgs ++ ["--only-report-hadrian-deps", temp])
+                () <- cmd' prog (buildArgs ++ ["--only-report-hadrian-deps", temp])
                 readFile' temp
         Git ListFiles -> do
           path <- builderPath builder
+          prog <- exeSpawnPath path
           withResources buildResources $ do
               -- NUL separated list of files
               -- We need to read this in the filesystem encoding
               enc <- liftIO getFileSystemEncoding
-              Stdout stdout <- cmd' BinaryPipes [path] buildArgs
+              Stdout stdout <- cmd' prog BinaryPipes buildArgs
               liftIO $ BS.useAsCStringLen stdout $ \fp -> GHC.peekCStringLen enc fp
         Win32Tarballs ListTarballs -> do
           path <- builderPath builder
+          prog <- exeSpawnPath path
           withResources buildResources $ do
-              Stdout stdout <- cmd' [path] buildArgs
+              Stdout stdout <- cmd' prog buildArgs
               pure stdout
         _ -> error $ "Builder " ++ show builder ++ " can not be asked!"
 
     runBuilderWith :: Builder -> BuildInfo -> Action ()
     runBuilderWith builder BuildInfo {..} = do
         path <- builderPath builder
+        prog <- exeSpawnPath path
         withResources buildResources $ do
             verbosity <- getVerbosity
             let input  = fromSingleton msgIn buildInputs
@@ -314,94 +299,113 @@ instance H.Builder Builder where
                 msgOut = "[runBuilderWith] Exactly one output file expected."
                 -- Capture stdout and write it to the output file.
                 captureStdout = do
-                    Stdout stdout <- cmd' [path] buildArgs buildOptions
+                    Stdout stdout <- cmd' prog buildArgs buildOptions
                     -- see Note [Capture stdout as a ByteString]
                     writeFileChangedBS output stdout
             case builder of
                 Ar Pack stg -> do
                     useTempFile <- arSupportsAtFile stg
-                    if useTempFile then runAr                path buildArgs buildInputs buildOptions
-                                   else runArWithoutTempFile path buildArgs buildInputs buildOptions
+                    if useTempFile then runAr output         prog buildArgs buildInputs buildOptions
+                                   else runArWithoutTempFile prog buildArgs buildInputs buildOptions
 
-                Ar Unpack _ -> cmd' [Cwd output] [path] buildArgs buildOptions
+                Ar Unpack _ -> cmd' prog [Cwd output] buildArgs buildOptions
 
                 Autoreconf dir -> do
-                  bash <- bashPath
-                  cmd' [Cwd dir] [bash, path] buildArgs buildOptions
+                  sh <- shPath
+                  shProg <- exeSpawnPath sh
+                  cmd' shProg [Cwd dir] [path] buildArgs buildOptions
 
                 Configure  dir -> do
-                    -- Inject /bin/bash into `libtool`, instead of /bin/sh,
+                    -- Also inject the shell into `libtool` via CONFIG_SHELL,
                     -- otherwise Windows breaks. TODO: Figure out why.
-                    bash <- bashPath
-                    let env = AddEnv "CONFIG_SHELL" bash
-                    cmd' env [Cwd dir] ["sh", path] buildOptions buildArgs
+                    sh <- shPath
+                    shProg <- exeSpawnPath sh
+                    let env = AddEnv "CONFIG_SHELL" sh
+                    cmd' shProg env [Cwd dir] [path] buildOptions buildArgs
 
                 GenApply {} -> captureStdout
 
                 GenPrimopCode -> do
                     need [input]
-                    Stdout stdout <- cmd' (FileStdin input) [path] buildArgs buildOptions
+                    Stdout stdout <- cmd' prog (FileStdin input) buildArgs buildOptions
                     -- see Note [Capture stdout as a ByteString]
                     writeFileChangedBS output stdout
 
                 GhcPkg Copy _ -> do
-                    Stdout pkgDesc <- cmd' [path]
+                    Stdout pkgDesc <- cmd' prog
                       [ "--expand-pkgroot"
                       , "--no-user-package-db"
                       , "describe"
                       , input -- the package name
                       ]
-                    cmd' (Stdin pkgDesc) [path] (buildArgs ++ ["-"]) buildOptions
+                    cmd' prog (Stdin pkgDesc) (buildArgs ++ ["-"]) buildOptions
 
                 GhcPkg Unregister _ -> do
                     -- unregistering is allowed to fail (e.g. when a package
                     -- isn't already present)
-                    Exit _ <- cmd' [path] (buildArgs ++ [input]) buildOptions
+                    Exit _ <- cmd' prog (buildArgs ++ [input]) buildOptions
                     return ()
 
-                Haddock BuildPackage -> runHaddock path buildArgs buildInputs
+                Haddock BuildPackage -> runHaddock output prog buildArgs buildInputs
 
-                HsCpp    -> captureStdout
+                Ghc _ _ ->
+                  -- Use a response file for ghc invocations to avoid issues with command line
+                  -- size limit on Windows (#26637).
+                  -- NB: we can't put the buildArgs in a response file, because some flags require
+                  -- empty arguments (such as the -dep-suffix flag), but that isn't supported
+                  -- yet due to #26560.
+                  withResponseFileIfLongCmd
+                    output
+                    prog
+                    (toCmdArgument buildArgs)
+                    buildInputs
+                    (toCmdArgument buildOptions)
 
-                Make dir -> cmd' buildOptions path ["-C", dir] buildArgs
+                HsCpp {}    -> captureStdout
+
+                Make dir -> cmd' prog buildOptions ["-C", dir] buildArgs
 
                 Makeinfo -> do
-                  cmd' [path] "--no-split" [ "-o", output] [input] buildOptions
+                  cmd' prog "--no-split" [ "-o", output] [input] buildOptions
 
                 Xelatex   ->
                   -- xelatex produces an incredible amount of output, almost
                   -- all of which is useless. Suppress it unless user
                   -- requests a loud build.
                   if verbosity >= Diagnostic
-                    then cmd' [Cwd output] [path] buildArgs buildOptions
-                    else do (Stdouterr out, Exit code) <- cmd' [Cwd output] [path] buildArgs buildOptions
+                    then cmd' prog [Cwd output] buildArgs buildOptions
+                    else do (Stdouterr out, Exit code) <- cmd' prog [Cwd output] buildArgs buildOptions
                             when (code /= ExitSuccess) $ do
                               liftIO $ BSL.hPutStrLn stderr out
                               putFailure "xelatex failed!"
                               fail "xelatex failed"
 
-                Makeindex -> unit $ cmd' [Cwd output] [path] (buildArgs ++ [input]) buildOptions
+                Makeindex -> unit $ cmd' prog [Cwd output] (buildArgs ++ [input]) buildOptions
 
-                Tar _ -> cmd' buildOptions [path] buildArgs
+                Tar _ -> cmd' prog buildOptions buildArgs
 
                 -- RunTest produces a very large amount of (colorised) output;
                 -- Don't attempt to capture it.
                 Testsuite RunTest -> do
-                  Exit code <- cmd [path] buildArgs buildOptions
+                  Exit code <- cmdExe prog buildArgs buildOptions
                   when (code /= ExitSuccess) $ do
                     fail "tests failed"
 
-                _  -> cmd' [path] buildArgs buildOptions
+                _  -> cmd' prog buildArgs buildOptions
 
--- | Invoke @haddock@ given a path to it and a list of arguments. The arguments
--- are passed in a response file.
-runHaddock :: FilePath    -- ^ path to @haddock@
+-- | Invoke @haddock@ given a path to it and a list of arguments. On Windows,
+-- the input file arguments are passed as a response file.
+runHaddock :: FilePath -- ^ base name to use for response file
+      -> ExeSpawnPath   -- ^ path to @haddock@
       -> [String]
       -> [FilePath]  -- ^ input file paths
       -> Action ()
-runHaddock haddockPath flagArgs fileInputs = withTempFile $ \tmp -> do
-    writeFile' tmp $ escapeArgs fileInputs
-    cmd [haddockPath] flagArgs ('@' : tmp)
+runHaddock outputFilePath haddockPath flagArgs fileInputs = withResponseFileIfLongCmd
+  outputFilePath
+  haddockPath
+  (toCmdArgument flagArgs)
+  fileInputs
+  (CmdArgument [])
 
 -- TODO: Some builders are required only on certain platforms. For example,
 -- 'Objdump' is only required on OpenBSD and AIX. Add support for platform
@@ -417,8 +421,9 @@ isOptional target = \case
     Happy    -> True
     Alex     -> True
     -- Most ar implemententions no longer need ranlib, but some still do
-    Ranlib   -> not $ Toolchain.arNeedsRanlib (tgtAr target)
-    JsCpp    -> not $ (archOS_arch . tgtArchOs) target == ArchJavaScript -- ArchWasm32 too?
+    Ranlib {}  -> not $ Toolchain.arNeedsRanlib (tgtAr target)
+    Dlltool {} -> archOS_OS (tgtArchOs target) /= OSMinGW32
+    JsCpp {}   -> not $ (archOS_arch . tgtArchOs) target == ArchJavaScript -- ArchWasm32 too?
     _        -> False
 
 -- | Determine the location of a system 'Builder'.
@@ -433,24 +438,16 @@ systemBuilderPath builder = case builder of
     Ghc _  (Stage0 {})   -> fromKey "system-ghc"
     GhcPkg _ (Stage0 {}) -> fromKey "system-ghc-pkg"
     Happy           -> fromKey "happy"
-    HsCpp           -> fromTargetTC "hs-cpp" (Toolchain.hsCppProgram . tgtHsCPreprocessor)
-    JsCpp           -> fromTargetTC "js-cpp" (maybeProg Toolchain.jsCppProgram . tgtJsCPreprocessor)
-    Ld _            -> fromTargetTC "ld" (Toolchain.ccLinkProgram . tgtCCompilerLink)
-    -- MergeObjects Stage0 is a special case in case of
-    -- cross-compiling. We're building stage1, e.g. code which will be
-    -- executed on the host and hence we need to use host's merge
-    -- objects tool and not the target merge object tool.
-    -- Note, merge object tool is usually platform linker with some
-    -- parameters. E.g. building a cross-compiler on and for x86_64
-    -- which will target ppc64 means that MergeObjects Stage0 will use
-    -- x86_64 linker and MergeObject _ will use ppc64 linker.
-    MergeObjects st -> fromStageTC st "merge-objects" (maybeProg Toolchain.mergeObjsProgram . tgtMergeObjs)
+    JsCpp stage     -> fromStageTC stage "js-cpp" (maybeProg Toolchain.jsCppProgram . tgtJsCPreprocessor)
+    HsCpp stage     -> fromStageTC stage "hs-cpp" (Toolchain.hsCppProgram . tgtHsCPreprocessor)
+    Ld stage        -> fromStageTC stage "ld" (Toolchain.ccLinkProgram . tgtCCompilerLink)
     Make _          -> fromKey "make"
     Makeinfo        -> fromKey "makeinfo"
-    Nm              -> fromTargetTC "nm" (Toolchain.nmProgram . tgtNm)
+    Nm stage        -> fromStageTC stage "nm" (Toolchain.nmProgram . tgtNm)
     Objdump         -> fromKey "objdump"
     Python          -> fromKey "python"
-    Ranlib          -> fromTargetTC "ranlib" (maybeProg Toolchain.ranlibProgram . tgtRanlib)
+    Ranlib stage    -> fromStageTC stage "ranlib" (maybeProg Toolchain.ranlibProgram . tgtRanlib)
+    Dlltool stage   -> fromStageTC stage "dlltool" (maybeProg id . tgtDlltool)
     Testsuite _     -> fromKey "python"
     Sphinx _        -> fromKey "sphinx-build"
     Tar _           -> fromKey "tar"
@@ -473,11 +470,6 @@ systemBuilderPath builder = case builder of
         path <- prgPath . key <$> targetStage stage
         validate keyname path
 
-    -- Get program from the target's target configuration
-    fromTargetTC keyname key = do
-        path <- queryTargetTarget (prgPath . key)
-        validate keyname path
-
     validate keyname path = do
         target <- getTargetTarget
         if null path
@@ -486,6 +478,12 @@ systemBuilderPath builder = case builder of
                 ++ quote keyname ++ " is not specified" ++ inCfg
             return "" -- TODO: Use a safe interface.
         else do
+            when (windowsHost && isMsysPath path) . error $
+             unlines
+               [ "The path to builder " ++ quote keyname ++ inCfg
+               , "is an MSYS path: " ++ quote path ++ "."
+               , "Please re-run ./configure to fix this issue."
+               ]
             -- angerman: I find this lookupInPath rather questionable.
             -- if we specify CC, LD, ... *without* a path, that is intentional
             -- lookupInPath should be done by the person invoking the configure
@@ -495,8 +493,8 @@ systemBuilderPath builder = case builder of
             fullPath <- lookupInPath path
             case (windowsHost, hasExtension fullPath) of
                 (False, _    ) -> return path
-                (True , True ) -> fixAbsolutePathOnWindows fullPath
-                (True , False) -> fixAbsolutePathOnWindows fullPath <&> (<.> exe)
+                (True , True ) -> return $ unifyPath fullPath
+                (True , False) -> return $ unifyPath fullPath <.> exe
 
     -- Without this function, on Windows we can observe a bad builder path
     -- for 'autoreconf'. If the relevant system.config field is set to
@@ -562,8 +560,8 @@ isSpecified = fmap (not . null) . systemBuilderPath
 -- | Wrapper for Shake's 'cmd'
 --
 -- See Note [cmd wrapper]
-cmd' :: (Partial, CmdWrap args) => args :-> Action r
-cmd' = cmdArgs mempty
+cmd' :: (Partial, CmdWrap args) => ExeSpawnPath -> args :-> Action r
+cmd' = cmdArgs . toCmdArgument
 
 
 -- See Note [cmd wrapper]

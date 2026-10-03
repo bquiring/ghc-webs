@@ -2,6 +2,11 @@ test('testblockalloc',
      [c_src, only_ways(['normal','threaded1']), extra_run_opts('+RTS -I0')],
      compile_and_run, [''])
 
+test('numeric_version_eventlog_flush',
+     [ignore_stdout, req_ghc_with_threaded_rts],
+     run_command,
+     ['{compiler} --numeric-version +RTS -l --eventlog-flush-interval=1 -RTS'])
+
 test('testmblockalloc',
      [c_src, only_ways(['normal','threaded1']), extra_run_opts('+RTS -I0 -xr0.125T'),
       when(arch('wasm32'), skip)], # MBlocks can't be freed on wasm32, see Note [Megablock allocator on wasm] in rts
@@ -14,9 +19,8 @@ test('testmblockalloc',
 # See bug #101, test requires +RTS -c (or equivalently +RTS -M<something>)
 # only GHCi triggers the bug, but we run the test all ways for completeness.
 test('bug1010',
-     # Non-moving GC doesn't support -c
-     omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_ghc']),
-     compile_and_run, ['+RTS -c -RTS'])
+     extra_ways(['compacting_gc']),
+     compile_and_run, [''])
 
 def normalise_address(str):
     return re.sub('Access violation in generated code when reading [0]+',
@@ -117,10 +121,8 @@ test('outofmem2',
 
 test('T2047',
      [ignore_stdout,
-      extra_run_opts('+RTS -c -RTS'),
       when(opsys('freebsd'), fragile(25751)),
-      # Non-moving collector doesn't support -c
-      omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity', 'nonmoving_thr_ghc'])],
+      extra_ways(['compacting_gc'])],
      compile_and_run, ['-package containers'])
 
 # Blackhole-detection test.
@@ -169,7 +171,7 @@ test('T3424',
 # Test for out-of-range heap size
 test('rtsflags001', [ only_ways(['normal']),
                       exit_code(1),
-                      extra_run_opts('+RTS -H0m -RTS'),
+                      extra_run_opts('+RTS -H1k -RTS'),
                       js_skip # JS backend uses its own rts.
                     ],
                      compile_and_run, [''])
@@ -444,14 +446,11 @@ test('T13832', [exit_code(1), req_ghc_with_threaded_rts], compile_and_run, ['-th
 test('T13894', js_skip, compile_and_run, [''])
 # this test fails with the profasm way on some machines but not others,
 # so we just skip it.
-test('T14497', [omit_ways(['profasm']), multi_cpu_race], compile_and_run, ['-O'])
-# The issue in the above test also happened with compaction enabled.
-test('T14497-compact',
-               [ extra_files(['T14497.hs'])
-               , only_ways(['normal'])
+test('T14497', [ omit_ways(['profasm'])
+               , extra_ways(['compacting_gc'])
                , multi_cpu_race
-               , extra_run_opts('+RTS -c -RTS')
-               ] , compile_and_run, ['-O'])
+               ]
+               , compile_and_run, ['-O'])
 test('T14695', [js_broken(22359), ignore_stderr], makefile_test, ['T14695'])
 test('T14702', [ ignore_stdout
                , when(unregisterised(), skip)
@@ -525,11 +524,12 @@ test('test-zeroongc', extra_run_opts('-DZ'), compile_and_run, ['-debug'])
 test('T13676',
      [when(opsys('mingw32'), expect_broken(17447)),
       extra_files(['T13676.hs']),
-      when(opsys('linux') and not ghc_dynamic(), expect_broken(20706))],
+      when(opsys('linux') and not ghc_dynamic(), fragile(20706))],
      ghci_script, ['T13676.script'])
 test('InitEventLogging',
      [ only_ways(['normal'])
      , extra_run_opts('+RTS -RTS')
+     , when(ghc_with_ipe(), skip) # IPE builds can change eventlog writer call counts.
      , req_c
      ],
      compile_and_run, ['InitEventLogging_c.c'])
@@ -540,7 +540,7 @@ test('RestartEventLogging',
      compile_and_run, ['RestartEventLogging_c.c'])
 
 test('T17088',
-     [only_ways(['normal']), extra_run_opts('+RTS -c -A256k -RTS')],
+     [extra_ways(['compacting_gc']), extra_run_opts('+RTS -A256k -RTS')],
      compile_and_run, ['-rtsopts -O2'])
 
 test('T15427', js_broken(22374), compile_and_run, [''])
@@ -574,29 +574,56 @@ test('cloneMyStack', [req_c,only_ways(['normal']), extra_files(['cloneStackLib.c
 
 test('cloneMyStack2',
   [ ignore_stdout
+  , only_ways(['normal'])
   , js_broken(22261) # cloneMyStack# not yet implemented
   ], compile_and_run, [''])
 
-test('cloneMyStack_retBigStackFrame', [req_c, extra_files(['cloneStackLib.c']), ignore_stdout], compile_and_run, ['cloneStackLib.c'])
+test('cloneMyStack_retBigStackFrame',
+  [ req_c
+  , only_ways(['normal'])
+  , extra_files(['cloneStackLib.c'])
+  , ignore_stdout
+  ], compile_and_run, ['cloneStackLib.c'])
 
-test('cloneThreadStack', [req_c, only_ways(['threaded1']), extra_ways(['threaded1']), extra_files(['cloneStackLib.c']), req_ghc_with_threaded_rts], compile_and_run, ['cloneStackLib.c -threaded'])
+test('cloneThreadStack',
+  [ req_c
+  , only_ways(['threaded1'])
+  , extra_ways(['threaded1'])
+  , extra_files(['cloneStackLib.c'])
+  , req_ghc_with_threaded_rts
+  ], compile_and_run, ['cloneStackLib.c -threaded'])
+
+test('cloneThreadStackMigrating',
+  [ ignore_stdout
+  , only_ways(['threaded1'])
+  , extra_ways(['threaded1'])
+  , extra_run_opts('+RTS -N -DS -RTS')
+  , req_ghc_with_threaded_rts
+  , req_target_smp
+  ], compile_and_run, ['-threaded -debug -rtsopts'])
 
 test('decodeMyStack',
-  [ omit_ghci, js_broken(22261) # cloneMyStack# not yet implemented
+  [ only_ways(['normal'])
+  , js_broken(22261) # cloneMyStack# not yet implemented
+  , when(ghc_with_ipe(), skip) # IPE builds can change decoded stack output.
   ], compile_and_run, ['-finfo-table-map'])
 
 # Options:
 #   - `-kc8K`: Set stack chunk size to it's minimum to provoke underflow stack frames.
 test('decodeMyStack_underflowFrames',
   [ extra_run_opts('+RTS -kc8K -RTS')
-  , omit_ghci, js_broken(22261) # cloneMyStack# not yet implemented
+  , only_ways(['threaded1'])
+  , js_broken(22261) # cloneMyStack# not yet implemented
+  , when(ghc_with_ipe(), skip) # IPE builds can change decoded stack layout/length.
   ], compile_and_run, ['-finfo-table-map -rtsopts'])
 
 # -finfo-table-map intentionally missing
 test('decodeMyStack_emptyListForMissingFlag',
   [ ignore_stdout
   , ignore_stderr
+  , only_ways(['threaded1'])
   , js_broken(22261) # cloneMyStack# not yet implemented
+  , when(ghc_with_ipe(), skip) # IPE builds can populate IPE info even without -finfo-table-map on this module.
   ], compile_and_run, [''])
 
 # Tests RTS flag parsing. Skipped on JS as it uses a distinct RTS.
@@ -604,6 +631,13 @@ test('T20201a', [js_skip, exit_code(1)], compile_and_run, ['-with-rtsopts -Aturt
 test('T20201b', [js_skip, exit_code(1)], compile_and_run, ['-with-rtsopts -A64z'])
 
 test('T22012', [js_skip, extra_ways(['ghci'])], compile_and_run, ['T22012_c.c'])
+
+test('T27131',
+     [ only_ways(['threaded1', 'threaded2'])
+     , req_ghc_with_threaded_rts
+     , req_target_smp
+     ],
+     compile_and_run, ['T27131_c.c'])
 
 # Skip for JS platform as the JS RTS is always single threaded
 test('T22795a', [only_ways(['normal']), js_skip, req_ghc_with_threaded_rts], compile_and_run, ['-threaded'])
@@ -641,8 +675,73 @@ test('T25280', [unless(opsys('linux'),skip),req_process,js_skip], compile_and_ru
 test('T25560', [req_c_rts, ignore_stderr], compile_and_run, [''])
 
 test('TestProddableBlockSet', [req_c_rts], multimod_compile_and_run, ['TestProddableBlockSet.c', '-no-hs-main'])
-test('T22859', 
+test('T22859',
      [js_skip,
-      # Allocation behaviour differs with the wasm backend so we get different output
-      when(arch('wasm32'), skip)],
+      # This test is vulnerable to changes in allocation behaviour, so we disable it in some ways
+      when(arch('wasm32'), skip),
+      omit_ways(llvm_ways + ['nonmoving_thr', 'nonmoving_thr_sanity'])],
      compile_and_run, ['-with-rtsopts -A8K'])
+
+# These tests need access to the internal RTS headers.
+# TODO: there is probably some cleaner way to do this, and it should probably
+# be guarded for in-tree tests, since it cannot work against an arbitrary
+# installed ghc.
+
+test('TimeoutQueue',
+     [c_src, only_ways(['normal', 'debug'])], compile_and_run,
+     ['-debug -optc-Wall -optc-DDEBUG -I{top}/../rts'])
+
+test('ClosureTable',
+     [req_c, only_ways(['normal', 'debug']), extra_files(['ClosureTable_c.c'])], compile_and_run,
+     ['-debug -O0 ClosureTable_c.c -I{top}/../rts -I{top}/../rts/include'])
+
+test('resizeMutableByteArrayInPlace', [req_cmm, extra_ways(['optasm', 'sanity']), only_ways(['optasm', 'sanity'])], compile_and_run, [''])
+
+test('T27123', [when(have_profiling(), extra_ways(['prof']))], compile_and_run, ['-O'])
+
+# T27434 and T27649 test the compacting GC on large closures (AP and
+# CONSTR respectively) that only the bytecode interpreter allocates, so
+# they must run in the ghci way. In the ghci way extra_run_opts only
+# sets the interpreted program's argv (via :set args), so enable
+# compaction with GHCRTS to make it reach the RTS of the GHCi process
+# itself (#27615).
+test('T27434',
+     [only_ways(['ghci']),
+      cmd_prefix('GHCRTS=-c ')],
+     compile_and_run, [''])
+
+test('T27649',
+     [only_ways(['ghci']),
+      cmd_prefix('GHCRTS=-c ')],
+     compile_and_run, [''])
+
+test('T19048',
+     [ omit_ghci
+     , no_check_hp
+     , js_skip
+     , extra_run_opts('+RTS -hT -i0 -RTS')
+     ],
+     compile_and_run, ['-O -rtsopts'])
+
+test('T27585',
+     [ omit_ghci
+     , no_check_hp
+     , js_skip
+     , when(have_profiling(), extra_ways(['prof_hb']))
+     , only_ways(['prof_hb'])
+     , extra_run_opts('+RTS -i0 -RTS')
+     ],
+     compile_and_run, ['-O -rtsopts'])
+
+test('T27477',
+     [ extra_run_opts('600 24 +RTS -N4 -A1m -RTS')
+     , req_ghc_smp
+     , req_target_smp
+     , only_ways(['threaded1', 'threaded2'])
+     ],
+     compile_and_run, ['-O2'])
+
+test('T27618',
+     [req_target_smp, omit_ghci],
+     compile_and_run, ['-O2 -threaded -with-rtsopts "-N4 -A32k"'])
+

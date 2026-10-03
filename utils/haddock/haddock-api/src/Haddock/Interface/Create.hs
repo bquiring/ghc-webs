@@ -42,11 +42,11 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust, mapMaybe, maybeToList)
 import Data.Traversable (for)
+import qualified Data.Text as T
 import GHC hiding (lookupName)
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.Modules( gHC_PRIM )
+import GHC.Builtin.WiredIn.Prim
 import GHC.Core.ConLike (ConLike (..))
-import GHC.Data.FastString (FastString, bytesFS, unpackFS)
 import qualified GHC.Driver.Config.Parser as Parser
 import qualified GHC.Driver.DynFlags as DynFlags
 import GHC.Driver.Ppr
@@ -74,6 +74,7 @@ import Haddock.Interface.LexParseRn
 import Haddock.Options (Flag (..), modulePackageInfo)
 import Haddock.Types
 import Haddock.Utils (replace)
+import Language.Haskell.Syntax.Text
 
 createInterface1
   :: MonadIO m
@@ -126,7 +127,7 @@ createInterface1' flags unit_state dflags hie_file mod_iface ifaces inst_ifaces 
     pkg_name :: Maybe Package
     pkg_name =
       let
-        unpack (PackageName name) = unpackFS name
+        unpack (PackageName name) = fastStringToText name
        in
         fmap unpack pkg_name_fs
 
@@ -157,7 +158,7 @@ createInterface1' flags unit_state dflags hie_file mod_iface ifaces inst_ifaces 
   mod_iface_docs <- case mi_docs mod_iface of
     Just docs -> pure docs
     Nothing -> do
-      warn $ showPpr dflags mdl ++ " has no docs in its .hi file"
+      warn $ T.pack (showPpr dflags mdl ++ " has no docs in its .hi file")
       pure emptyDocs
   -- Derive final options to use for haddocking this module
   doc_opts <- mkDocOpts (docs_haddock_opts mod_iface_docs) flags mdl
@@ -200,7 +201,7 @@ createInterface1' flags unit_state dflags hie_file mod_iface ifaces inst_ifaces 
       instanceMap = Map.fromList [(l, n) | n <- local_instances, RealSrcSpan l _ <- [getSrcSpan n]]
 
   -- See Note [Exporting built-in items]
-  let builtinTys = DsiSectionHeading 1 (WithHsDocIdentifiers (mkGeneratedHsDocString "Builtin syntax") [])
+  let builtinTys = DsiSectionHeading 1 (WithHsDocIdentifiers (mkGeneratedHsDocStringGhc "Builtin syntax") [])
       bonus_ds mods
         | mdl == gHC_PRIM =
             [ builtinTys
@@ -354,16 +355,15 @@ parseWarning
   -> IfM m (Doc Name)
 parseWarning parserOpts sDocContext w = case w of
   IfDeprecatedTxt _ msg -> format "Deprecated: " (map dstToDoc msg)
-  IfWarningTxt _ _ msg -> format "Warning: " (map dstToDoc msg)
+  IfWarningTxt  _ _ msg -> format "Warning: " (map dstToDoc msg)
   where
     dstToDoc :: (IfaceStringLiteral, [Name]) -> HsDoc GhcRn
-    dstToDoc ((IfStringLiteral _ fs), ids) = WithHsDocIdentifiers (fsToDoc fs) (map noLoc ids)
+    dstToDoc ((IfStringLiteral _ fs), ids) = WithHsDocIdentifiers (fsToDoc fs) (map noLocA ids)
 
-    fsToDoc :: FastString -> HsDocString
-    fsToDoc fs = GeneratedDocString $ HsDocStringChunk (bytesFS fs)
+    fsToDoc fs = GeneratedDocString noExtField $ mkHsDocStringChunkUtf8ByteString (bytesHText fs)
 
     format x bs =
-      DocWarning . DocParagraph . DocAppend (DocString x)
+      DocWarning . DocParagraph . DocAppend (DocString (fastStringToText x))
         <$> foldrM (\doc rest -> docAppend <$> processDocString parserOpts sDocContext doc <*> pure rest) DocEmpty bs
 
 -------------------------------------------------------------------------------
@@ -398,7 +398,7 @@ parseOption "not-home" = return (Just OptNotHome)
 parseOption "show-extensions" = return (Just OptShowExtensions)
 parseOption "print-explicit-runtime-reps" = return (Just OptPrintRuntimeRep)
 parseOption "redact-type-synonyms" = return (Just OptRedactTypeSyns)
-parseOption other = warn ("Unrecognised option: " ++ other) >> return Nothing
+parseOption other = warn (T.pack ("Unrecognised option: " ++ other)) >> return Nothing
 
 --------------------------------------------------------------------------------
 -- Declarations
@@ -467,7 +467,7 @@ mkExportItems
         DsiNamedChunkRef ref -> do
           case Map.lookup ref namedChunks of
             Nothing -> do
-              warn $ "Cannot find documentation for: $" ++ ref
+              warn $ T.pack ("Cannot find documentation for: $" ++ ref)
               pure []
             Just hsDoc' -> do
               doc <- processDocStringParas parserOpts sDocContext pkgName hsDoc'
@@ -527,7 +527,7 @@ unrestrictedModExports sDocContext thisMod ifaceMap instIfaceMap avails mod_name
         case Map.lookup mod_name instIfaceMap' of
           Just iface -> pure $ Just (instMod iface, mkNameSet (instExports iface))
           Nothing -> do
-            warn $
+            warn $ T.pack $
               "Warning: "
                 ++ pretty sDocContext thisMod
                 ++ ": Could not find "
@@ -612,7 +612,7 @@ availExportItem
                     -- with signature inheritance
                     case Map.lookup (nameModule t) instIfaceMap of
                       Nothing -> do
-                        warn $
+                        warn $ T.pack $
                           "Warning: "
                             ++ pretty sDocContext thisMod
                             ++ ": Couldn't find .haddock for export "
@@ -750,11 +750,11 @@ hiDecl sDocContext prr t = do
   mayTyThing <- lookupName t
   case mayTyThing of
     Nothing -> do
-      warn $ "Warning: Not found in environment: " ++ pretty sDocContext t
+      warn $ T.pack ("Warning: Not found in environment: " ++ pretty sDocContext t)
       return Nothing
     Just x -> case tyThingToLHsDecl prr x of
-      Left m -> (warn $ bugWarn m) >> return Nothing
-      Right (m, t') -> mapM (warn . bugWarn) m >> return (Just $ L (noAnnSrcSpan (nameSrcSpan t)) t')
+      Left m -> (warn $ T.pack (bugWarn m)) >> return Nothing
+      Right (m, t') -> mapM (warn . T.pack . bugWarn) m >> return (Just $ L (noAnnSrcSpan (nameSrcSpan t)) t')
   where
     warnLine x =
       O.text "haddock-bug:"
@@ -837,8 +837,8 @@ extractDecl prr dflags sDocContext name decl
           _
           d@ClassDecl
             { tcdLName = L _ clsNm
-            , tcdSigs = clsSigs
-            , tcdATs = clsATs
+            , tcdCExt = (HsNestedGroup { ng_sigs = clsSigs
+                                       , ng_ats = clsATs }, _)
             } ->
             let
               matchesMethod =
@@ -921,7 +921,7 @@ extractDecl prr dflags sDocContext name decl
               if isDataConName name
                 then fmap (SigD noExtField) <$> extractPatternSyn name n tys (toList $ dd_cons defn)
                 else fmap (SigD noExtField) <$> extractRecSel name n tys (toList $ dd_cons defn)
-        InstD _ (ClsInstD _ ClsInstDecl{cid_datafam_insts = insts})
+        InstD _ (ClsInstD _ ClsInstDecl{ cid_ext = (_, HsNestedGroup { ng_datafam_insts = insts})})
           | isDataConName name ->
               let matches =
                     [ d' | L _ d'@(DataFamInstDecl (FamEqn{feqn_rhs = dd})) <- insts, name `elem` map unLoc (concatMap (toList . getConNames . unLoc) (dd_cons dd))
@@ -965,9 +965,9 @@ extractPatternSyn nm t tvs cons =
       let args =
             case con of
               ConDeclH98{con_args = con_args'} -> case con_args' of
-                PrefixCon args' -> map cdf_type args'
-                RecCon (L _ fields) -> cdf_type . cdrf_spec . unLoc <$> fields
-                InfixCon arg1 arg2 -> map cdf_type [arg1, arg2]
+                PrefixCon _ args' -> map cdf_type args'
+                RecCon _ (L _ fields) -> cdf_type . cdrf_spec . unLoc <$> fields
+                InfixCon _ arg1 arg2 -> map cdf_type [arg1, arg2]
               ConDeclGADT{con_g_args = con_args'} -> case con_args' of
                 PrefixConGADT _ args' -> map cdf_type args'
                 RecConGADT _ (L _ fields) -> cdf_type . cdrf_spec . unLoc <$> fields
@@ -976,11 +976,11 @@ extractPatternSyn nm t tvs cons =
             case con of
               ConDeclH98{con_mb_cxt = Just cxt} -> noLocA (HsQualTy noExtField cxt typ)
               _ -> typ
-          typ'' = noLocA (HsQualTy noExtField (noLocA []) typ')
+          typ'' = noLocA (HsQualTy noExtField (noLocA emptyContext) typ')
        in PatSynSig noAnn [noLocA nm] (mkEmptySigType typ'')
 
     longArrow :: [LHsType GhcRn] -> LHsType GhcRn -> LHsType GhcRn
-    longArrow inputs output = foldr (\x y -> noLocA (HsFunTy noExtField (HsUnannotated noExtField) x y)) output inputs
+    longArrow inputs output = foldr (\x y -> noLocA (HsFunTy noExtField (HsModifiedFunArr noExtField [] $ HsStandardArr noExtField) x y)) output inputs
 
     data_ty con
       | ConDeclGADT{} <- con = con_res_ty con
@@ -1002,7 +1002,18 @@ extractRecSel nm t tvs (L _ con : rest) =
   case getRecConArgs_maybe con of
     Just (L _ fields)
       | ((l, L _ (HsConDeclRecField _ _nn ty)) : _) <- matching_fields fields ->
-          pure (L (noAnnSrcSpan l) (TypeSig noAnn [noLocA nm] (mkEmptyWildCardBndrs $ mkEmptySigType (noLocA (HsFunTy noExtField (HsUnannotated noExtField) data_ty (cdf_type ty))))))
+          pure $
+            L (noAnnSrcSpan l) $
+              TypeSig
+                noAnn
+                []
+                [noLocA nm]
+                (mkEmptyWildCardBndrs $
+                  mkEmptySigType $
+                    noLocA $
+                      HsFunTy noExtField (HsModifiedFunArr noExtField [] $ HsStandardArr noExtField) data_ty $
+                        cdf_type ty
+                )
     _ -> extractRecSel nm t tvs rest
   where
     matching_fields :: [LHsConDeclRecField GhcRn] -> [(SrcSpan, LHsConDeclRecField GhcRn)]

@@ -99,6 +99,8 @@ test('driver200', [extra_files(['A200.hs', 'B200/', 'D200.hs'])], makefile_test,
 
 test('T2566', normalise_fun(normalise_errmsg), makefile_test, [])
 
+test('stringtrie', [mini_quickcheck], compile_and_run, ['-package ghc'])
+
 test('pragma001', normal, compile, [''])
 test('pragma002', normal, compile, [''])
 
@@ -120,13 +122,11 @@ if config.os == 'darwin':
 else:
   only_darwin = skip
 
-test('static001', [extra_files(['Static001.hs']),
-                   only_darwin,
-                   when(arch('x86_64'), expect_broken(8127))],
+test('static001', [extra_files(['Static001.hs']), only_darwin],
      makefile_test, ['static001'])
 
 test('dynHelloWorld',
-     [only_ways(['dyn']), when(opsys('linux') and not ghc_dynamic() and not arch('wasm32'), expect_broken(20706))],
+     [only_ways(['dyn']), when(opsys('linux') and not ghc_dynamic() and not arch('wasm32'), fragile(20706))],
      compile_and_run,
      [''])
 
@@ -179,24 +179,23 @@ test('T7060', [], makefile_test, [])
 test('T7130', normal, compile_fail, ['-fflul-laziness'])
 test('T7563', when(unregisterised(), skip), makefile_test, [])
 test('T6037',
-     # The testsuite doesn't know how to set a non-Unicode locale on Windows or MacOS < Sonoma.
-     # Because in previous version of MacOS the test is still broken, we mark it as fragile.
+     # Requires forcing a 7-bit/ASCII-only locale.
+     # - On Windows (mingw32) the testsuite can't reliably set a non-Unicode C locale -> expect_fail.
+     # - On modern Darwin there are no pure ASCII locales available -> skip.
      [when(opsys('mingw32'), expect_fail),
-      when(opsys('darwin'), fragile(24161))
+      when(opsys('darwin'), skip)
      ],
      makefile_test, [])
 test('T2507',
-     # The testsuite doesn't know how to set a non-Unicode locale on Windows or MacOS < Sonoma
-     # Because in previous version of MacOS the test is still broken, we mark it as fragile.
+     # Same locale assumptions as T6037 (ASCII-only needed, unavailable on Darwin; untestable on Windows).
      [when(opsys('mingw32'), expect_fail),
-      when(opsys('darwin'), fragile(24161))
+      when(opsys('darwin'), skip)
      ],
      makefile_test, [])
 test('T8959a',
-     # The testsuite doesn't know how to set a non-Unicode locale on Windows or MacOS < Sonoma
-     # Because in previous version of MacOS the test is still broken, we mark it as fragile.
+     # Same locale assumptions as T6037 (ASCII-only needed, unavailable on Darwin; untestable on Windows).
      [when(opsys('mingw32'), expect_fail),
-      when(opsys('darwin'), fragile(24161))
+      when(opsys('darwin'), skip)
      ],
      makefile_test, [])
 
@@ -274,12 +273,10 @@ test('T12752pass', normal, compile, ['-DSHOULD_PASS=1 -Wcpp-undef'])
 test('T12955', normal, makefile_test, [])
 
 test('T12971', [when(opsys('mingw32'), fragile(17945)), ignore_stdout], makefile_test, [])
-test('json_dump', normal, compile_fail, ['-ddump-json'])
 test('json', normalise_version('ghc'), compile_fail, ['-fdiagnostics-as-json'])
 test('json_warn', normalise_version('ghc'), compile, ['-fdiagnostics-as-json -Wunused-matches -Wx-partial'])
-test('json2', normalise_version('ghc-internal', 'base','ghc-prim'), compile, ['-ddump-types -ddump-json -Wno-unsupported-llvm-version'])
-test('T16167', [normalise_version('ghc'),req_interp,exit_code(1)], run_command,
-     ['{compiler} -x hs -e ":set prog T16167.hs" -ddump-json T16167.hs'])
+test('json2', normalise_version('ghc-internal', 'base','ghc-prim'), compile, ['-ddump-types -fdiagnostics-as-json -Wno-unsupported-llvm-version'])
+test('T16167', normalise_version('ghc'), compile_fail, ['-fdiagnostics-as-json'])
 test('T13604', [], makefile_test, [])
 test('T13604a',
   [ js_broken(22261) # require HPC support
@@ -300,7 +297,7 @@ test('T18369', normal, compile, ['-O'])
 test('T21682', normal, compile_fail, ['-Werror=unrecognised-warning-flags -Wfoo'])
 test('FullGHCVersion', normal, compile_and_run, ['-package ghc-boot'])
 test('OneShotTH', req_th, makefile_test, [])
-test('T17481', js_broken(23013), makefile_test, [])
+test('T17481', normal, makefile_test, [])
 test('T20084', normal, makefile_test, [])
 test('RunMode', [req_interp,extra_files(['RunMode/Test.hs'])], run_command, ['{compiler} --run -iRunMode/ -ignore-dot-ghci RunMode.hs -- hello'])
 test('T20439', normal, run_command,
@@ -315,6 +312,12 @@ test('MultiRootsErr', normal, multimod_compile_fail, ['MultiRootsErr', 'MultiRoo
 test('patch-level2', normal, compile, ['-Wcpp-undef'])
 test('T16476a', normal, makefile_test, [])
 test('T16476b', normal, makefile_test, [])
+
+# Test that GHC can handle an empty preprocessor response file.
+# This used to cause GHC to hang indefinitely: #18177
+test('T18177', [js_skip, pre_cmd('touch cpp-args')], compile,
+     ['-v0 -fforce-recomp -fhpc -optP@cpp-args -optP-DX'])
+
 test('T20569', extra_files(["T20569/"]), makefile_test, [])
 test('T21866', normal, multimod_compile, ['T21866','-no-link'])
 test('T21349', extra_files(['T21349']), makefile_test, [])
@@ -332,3 +335,6 @@ test('T24839', [unless(arch('x86_64') or arch('aarch64'), skip), extra_files(["t
 test('t25150', [extra_files(["t25150"])], multimod_compile, ['Main.hs', '-v0 -working-dir t25150/dir a.c'])
 test('T25382', normal, makefile_test, [])
 test('T26018', req_c, makefile_test, [])
+test('T24120', normal, compile, ['-Wunused-packages -hide-all-packages -package base -package system-cxx-std-lib'])
+test('T26551', [extra_files(['T26551.hs'])], makefile_test, [])
+test('T26435', [only_ways(['llvm'])], warn_and_run, ['-finfo-table-map'])

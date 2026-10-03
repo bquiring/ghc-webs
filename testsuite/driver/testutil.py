@@ -14,6 +14,7 @@ PassFail = NamedTuple('PassFail',
                        ('tag', Optional[str]),
                        ('stderr', Optional[str]),
                        ('stdout', Optional[str]),
+                       ('diff', Optional[str]),
                        ('hc_opts', Optional[str]),
                        ])
 
@@ -26,19 +27,27 @@ def passed(hc_opts=None) -> PassFail:
                     tag=None,
                     stderr=None,
                     stdout=None,
+                    diff=None,
                     hc_opts=hc_opts)
 
 def failBecause(reason: str,
                 tag: Optional[str]=None,
                 stderr: Optional[str]=None,
-                stdout: Optional[str]=None
+                stdout: Optional[str]=None,
+                diff: Optional[str]=None
                 ) -> PassFail:
     return PassFail(passed=False, reason=reason, tag=tag,
-                    stderr=stderr, stdout=stdout, hc_opts=None)
+                    stderr=stderr, stdout=stdout, diff=diff, hc_opts=None)
 
 def strip_quotes(s: str) -> str:
     # Don't wrap commands to subprocess.call/Popen in quotes.
     return s.strip('\'"')
+
+# Python 3.7 compatibility shim for str.removeprefix (added in Python 3.9).
+def str_removeprefix(s: str, prefix: str) -> str:
+    if s.startswith(prefix):
+        return s.replace(prefix, '', 1)
+    return s
 
 def str_warn(s: str) -> str:
     return colored(Color.YELLOW, s)
@@ -71,7 +80,7 @@ def lndir(srcdir: Path, dstdir: Path, force_copy=False):
             link_or_copy_file(src, dst, force_copy)
         else:
             dst.mkdir()
-            lndir(src, dst)
+            lndir(src, dst, force_copy)
 
 # All possible test metric strings.
 def testing_metrics():

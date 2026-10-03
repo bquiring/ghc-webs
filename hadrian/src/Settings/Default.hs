@@ -40,7 +40,6 @@ import Settings.Builders.HsCpp
 import Settings.Builders.Ar
 import Settings.Builders.Ld
 import Settings.Builders.Make
-import Settings.Builders.MergeObjects
 import Settings.Builders.SplitSections
 import Settings.Builders.RunTest
 import Settings.Builders.Xelatex
@@ -53,8 +52,8 @@ import Settings.Builders.Win32Tarballs
 defaultPackages :: Stage -> Action [Package]
 defaultPackages (Stage0 GlobalLibs) = stageBootPackages
 defaultPackages (Stage0 InTreeLibs) = stage0Packages
-defaultPackages Stage1 = stage1Packages
-defaultPackages Stage2 = stage2Packages
+defaultPackages Stage1 = stagedPackages Stage1
+defaultPackages Stage2 = stagedPackages Stage2
 defaultPackages Stage3 = return []
 
 -- | Default bignum backend.
@@ -68,6 +67,7 @@ defaultBignumBackend = "gmp"
 stageBootPackages :: Action [Package]
 stageBootPackages = return
   [ lintersCommon, lintCommitMsg, lintSubmoduleRefs, lintWhitespace, lintNotes
+  , changelogD
   , hsc2hs
   , compareSizes
   , deriveConstants
@@ -89,7 +89,6 @@ stage0Packages = do
              , ghc
              , ghcBoot
              , ghcBootThNext
-             , ghcHeap
              , ghcPkg
              , ghcPlatform
              , ghcToolchain
@@ -107,7 +106,10 @@ stage0Packages = do
              , runGhc
              , semaphoreCompat -- depends on
              , time -- depends on win32
+             , thLift -- new library not yet present for boot compilers
+             , thQuasiquoter -- new library not yet present for boot compilers
              , unlit
+             , xhtml -- new version is not backwards compat with latest
              , if windowsHost then win32 else unix
              -- We must use the in-tree `Win32` as the version
              -- bundled with GHC 9.6 is too old for `semaphore-compat`.
@@ -116,12 +118,20 @@ stage0Packages = do
              -- that confused Hadrian, so we must make those a stage0 package as well.
              -- Once we drop `Win32`/`unix` it should be possible to drop those too.
              ]
+          -- Currently, we have no way to provide paths to [n]curses libs for
+          -- both - build and target - in cross builds. Thus, we only build it
+          -- for upper stages. As we only use stage0 to build upper stages,
+          -- this should be fine.
           ++ [ terminfo | not windowsHost, not cross ]
-          ++ [ timeout  | windowsHost                ]
+          ++ [ timeout  | windowsHost ]
+          -- Due to some weird logic, we need ghcToolchainBin in Stage0 and
+          -- Stage1 packages if we're cross compiling. "Stage2 cross-compilers"
+          -- will solve this.
+          ++ [ ghcToolchainBin | cross ]
 
 -- | Packages built in 'Stage1' by default. You can change this in "UserSettings".
-stage1Packages :: Action [Package]
-stage1Packages = do
+stagedPackages :: Stage -> Action [Package]
+stagedPackages stage = do
     let good_stage0_package p
           -- we only keep libraries for some reason
           | not (isLibrary p) = False
@@ -135,7 +145,10 @@ stage1Packages = do
 
     libraries0 <- filter good_stage0_package <$> stage0Packages
     cross      <- flag CrossCompiling
-    winTarget  <- isWinTarget
+    winTarget  <- isWinTarget stage
+    jsTarget   <- isJsTarget stage
+    haveCurses <- any (/= "") <$> traverse (flip buildSetting stage) [ CursesIncludeDir, CursesLibDir ]
+    useSystemFfi <- buildFlag UseSystemFfi stage
 
     let when c xs = if c then xs else mempty
 
@@ -151,6 +164,7 @@ stage1Packages = do
         , ghc
         , ghcBignum
         , ghcBootTh
+        , ghcHeap
         , ghcCompact
         , ghcExperimental
         , ghcInternal
@@ -172,23 +186,24 @@ stage1Packages = do
         , transformers
         , unlit
         , xhtml
-        , if winTarget then win32 else unix
-        ]
-      , when (not cross)
-        [ hpcBin
-        , iserv
-        , runGhc
         , ghcToolchainBin
+        , hpcBin
+        , if winTarget then win32 else unix
+        , runGhc
         ]
       , when (winTarget && not cross)
         [ -- See Note [Hadrian's ghci-wrapper package]
           ghciWrapper
         ]
+      , when (cross && haveCurses)
+        [
+          terminfo
+        ]
+      , when (not jsTarget && not useSystemFfi)
+        [
+          libffi
+        ]
       ]
-
--- | Packages built in 'Stage2' by default. You can change this in "UserSettings".
-stage2Packages :: Action [Package]
-stage2Packages = stage1Packages
 
 -- | Packages that are built only for the testsuite.
 testsuitePackages :: Action [Package]
@@ -199,30 +214,34 @@ testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkExact,
 -- * We build 'profiling' way when stage > Stage0.
 -- * We build 'dynamic' way when stage > Stage0 and the platform supports it.
 defaultLibraryWays :: Ways
-defaultLibraryWays = Set.fromList <$>
-    mconcat
-    [ pure [vanilla]
-    , notStage0 ? pure [profiling]
-    , notStage0 ? platformSupportsSharedLibs ? pure [dynamic, profilingDynamic]
-    ]
+defaultLibraryWays = do
+    stage <- getStage
+    Set.fromList <$>
+      mconcat
+      [ pure [vanilla]
+      , notStage0 ? pure [profiling]
+      , notStage0 ? targetSupportsSharedLibs stage ? pure [dynamic, profilingDynamic]
+      ]
 
 -- | Default build ways for the RTS.
 defaultRtsWays :: Ways
-defaultRtsWays = Set.fromList <$>
-  mconcat
-  [ pure [vanilla]
-  , notStage0 ? pure
-      [ profiling, debugProfiling
-      , debug
-      ]
-  , notStage0 ? targetSupportsThreadedRts ? pure [threaded, threadedProfiling, threadedDebugProfiling, threadedDebug]
-  , notStage0 ? platformSupportsSharedLibs ? pure
-      [ dynamic, profilingDynamic, debugDynamic, debugProfilingDynamic
-      ]
-  , notStage0 ? platformSupportsSharedLibs ? targetSupportsThreadedRts ? pure
-      [ threadedDynamic, threadedDebugDynamic, threadedProfilingDynamic, threadedDebugProfilingDynamic
-      ]
-  ]
+defaultRtsWays = do
+  stage <- getStage
+  Set.fromList <$>
+     mconcat
+     [ pure [vanilla]
+     , notStage0 ? pure
+         [ profiling, debugProfiling
+         , debug
+         ]
+     , notStage0 ? targetSupportsThreadedRts stage ? pure [threaded, threadedProfiling, threadedDebugProfiling, threadedDebug]
+     , notStage0 ? targetSupportsSharedLibs stage ? pure
+         [ dynamic, profilingDynamic, debugDynamic, debugProfilingDynamic
+         ]
+     , notStage0 ? targetSupportsSharedLibs stage ? targetSupportsThreadedRts stage ? pure
+        [ threadedDynamic, threadedDebugDynamic, threadedProfilingDynamic, threadedDebugProfilingDynamic
+        ]
+     ]
 
 -- TODO: Move C source arguments here
 -- | Default and package-specific source arguments.
@@ -258,7 +277,7 @@ defaultSourceArgs :: SourceArgs
 defaultSourceArgs = SourceArgs
     { hsDefault  = mconcat [ stage0    ? arg "-O"
                            , notStage0 ? arg "-O2"
-                           , arg "-H32m" ]
+                           , pure ["+RTS", "-O64M", "-RTS"] ]
     , hsLibrary  = notStage0 ? arg "-haddock"
     , hsCompiler = mempty
     , hsGhc      = mempty }
@@ -272,8 +291,7 @@ defaultFlavour = Flavour
     , extraArgs          = defaultExtraArgs
     , packages           = defaultPackages
     , bignumBackend      = defaultBignumBackend
-    , bignumCheck        = False
-    , textWithSIMDUTF    = False
+    , textWithSIMDUTF    = const (return False)
     , libraryWays        = defaultLibraryWays
     , rtsWays            = defaultRtsWays
     , dynamicGhcPrograms = defaultDynamicGhcPrograms
@@ -291,9 +309,9 @@ defaultFlavour = Flavour
 --
 --   It corresponds to the DYNAMIC_GHC_PROGRAMS logic implemented
 --   in @mk/config.mk.in@.
-defaultDynamicGhcPrograms :: Action Bool
-defaultDynamicGhcPrograms = do
-  supportsShared <- platformSupportsSharedLibs
+defaultDynamicGhcPrograms :: Stage -> Action Bool
+defaultDynamicGhcPrograms stage = do
+  supportsShared <- targetSupportsSharedLibs stage
   return (not windowsHost && supportsShared)
 
 -- | All 'Builder'-dependent command line arguments.
@@ -316,7 +334,6 @@ defaultBuilderArgs = mconcat
     , ldBuilderArgs
     , arBuilderArgs
     , makeBuilderArgs
-    , mergeObjectsBuilderArgs
     , runTestBuilderArgs
     , validateBuilderArgs
     , xelatexBuilderArgs

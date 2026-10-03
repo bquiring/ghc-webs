@@ -1,21 +1,21 @@
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Packages (
     -- * GHC packages
-    array, base, binary, bytestring, cabal, cabalSyntax, checkPpr,
+    array, base, binary, bytestring, cabal, cabalSyntax, changelogD, checkPpr,
     checkExact, countDeps,
     compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls,
     exceptions, filepath, fileio, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform,
     ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim,
     ghcToolchain, ghcToolchainBin, haddockApi, haddockLibrary, haddock, haskeline,
-    hsc2hs, hp2ps, hpc, hpcBin, integerGmp, iserv, iservProxy,
+    hsc2hs, hp2ps, hpc, hpcBin, integerGmp, iservProxy,
     libffi, mtl, osString, parsec, pretty, primitive, process, remoteIserv, rts,
-    runGhc, semaphoreCompat, stm, templateHaskell, terminfo, text, time, timeout,
+    runGhc, semaphoreCompat, stm, templateHaskell, thLift, thQuasiquoter, terminfo, text, time, timeout,
     transformers, unlit, unix, win32, xhtml,
     lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace,
     ghcPackages, isGhcPackage,
 
     -- * Package information
-    crossPrefix, programName, nonHsMainPackage, programPath, timeoutPath,
+    crossPrefix, programBasename, programName, nonHsMainPackage, programPath, timeoutPath,
     ) where
 
 import Hadrian.Package
@@ -23,7 +23,6 @@ import Hadrian.Utilities
 
 import Base
 import Context.Type
-import Oracles.Flag
 import Oracles.Setting
 
 -- | These are all GHC packages we know about. Build rules will be generated for
@@ -33,13 +32,13 @@ import Oracles.Setting
 -- packages and modify build default build conditions in "UserSettings".
 ghcPackages :: [Package]
 ghcPackages =
-    [ array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps
+    [ array, base, binary, bytestring, cabalSyntax, cabal, changelogD, checkPpr, checkExact, countDeps
     , compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls
     , exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform
     , ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim
     , ghcToolchain, ghcToolchainBin, haddockApi, haddockLibrary, haddock, haskeline, hsc2hs
-    , hp2ps, hpc, hpcBin, integerGmp, iserv, libffi, mtl, osString
-    , parsec, pretty, process, rts, runGhc, stm, semaphoreCompat, templateHaskell
+    , hp2ps, hpc, hpcBin, integerGmp, libffi, mtl, osString
+    , parsec, pretty, process, rts, runGhc, stm, semaphoreCompat, templateHaskell, thLift, thQuasiquoter
     , terminfo, text, time, transformers, unlit, unix, win32, xhtml, fileio
     , timeout
     , lintersCommon
@@ -50,13 +49,13 @@ isGhcPackage :: Package -> Bool
 isGhcPackage = (`elem` ghcPackages)
 
 -- | Package definitions, see 'Package'.
-array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps,
+array, base, binary, bytestring, cabalSyntax, cabal, changelogD, checkPpr, checkExact, countDeps,
   compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls,
   exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform,
   ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghci, ghcInternal, ghciWrapper, ghcPkg, ghcPrim,
   ghcToolchain, ghcToolchainBin, haddockLibrary, haddockApi, haddock, haskeline, hsc2hs,
-  hp2ps, hpc, hpcBin, integerGmp, iserv, iservProxy, remoteIserv, libffi, mtl,
-  osString, parsec, pretty, primitive, process, rts, runGhc, semaphoreCompat, stm, templateHaskell,
+  hp2ps, hpc, hpcBin, integerGmp, iservProxy, remoteIserv, libffi, mtl,
+  osString, parsec, pretty, primitive, process, rts, runGhc, semaphoreCompat, stm, templateHaskell, thLift, thQuasiquoter,
   terminfo, text, time, transformers, unlit, unix, win32, xhtml,
   timeout,
   lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace
@@ -67,6 +66,7 @@ binary              = lib  "binary"
 bytestring          = lib  "bytestring"
 cabalSyntax         = lib  "Cabal-syntax"    `setPath` "libraries/Cabal/Cabal-syntax"
 cabal               = lib  "Cabal"           `setPath` "libraries/Cabal/Cabal"
+changelogD          = util "changelog-d"
 checkPpr            = util "check-ppr"
 checkExact          = util "check-exact"
 countDeps           = util "count-deps"
@@ -109,9 +109,8 @@ hp2ps               = util "hp2ps"
 hpc                 = lib  "hpc"
 hpcBin              = util "hpc-bin"         `setPath` "utils/hpc"
 integerGmp          = lib  "integer-gmp"
-iserv               = util "iserv"
 iservProxy          = util "iserv-proxy"
-libffi              = top  "libffi"
+libffi              = lib  "libffi-clib"
 mtl                 = lib  "mtl"
 osString            = lib  "os-string"
 parsec              = lib  "parsec"
@@ -124,6 +123,8 @@ runGhc              = util "runghc"
 semaphoreCompat     = lib  "semaphore-compat"
 stm                 = lib  "stm"
 templateHaskell     = lib  "template-haskell"
+thLift              = lib  "template-haskell-lift"
+thQuasiquoter       = lib  "template-haskell-quasiquoter"
 terminfo            = lib  "terminfo"
 text                = lib  "text"
 time                = lib  "time"
@@ -166,9 +167,10 @@ setPath :: Package -> FilePath -> Package
 setPath pkg path = pkg { pkgPath = path }
 
 -- | Target prefix to prepend to executable names.
-crossPrefix :: Action String
-crossPrefix = do
-    cross <- flag CrossCompiling
+crossPrefix :: Stage -> Action String
+crossPrefix st = do
+    cross <- crossStage st
+    -- NB: If you modify this then it needs to align with CrossCompilePrefix in configure.ac
     targetPlatform <- setting TargetPlatformFull
     return $ if cross then targetPlatform ++ "-" else ""
 
@@ -178,26 +180,15 @@ crossPrefix = do
 -- 'Library', the function simply returns its name.
 programName :: Context -> Action String
 programName Context {..} = do
-    prefix <- crossPrefix
+    prefix <- crossPrefix stage
     -- TODO: Can we extract this information from Cabal files?
-    -- Alp: We could, but then the iserv package would have to
-    --      use Cabal conditionals + a 'profiling' flag
-    --      to declare the executable name, and I'm not sure
-    --      this is allowed (or desired for that matter).
-    return $ prefix ++ basename
-  where
-    basename
+    return $ prefix ++ programBasename package
+
+programBasename :: Package -> String
+programBasename package
       | package == ghc          = "ghc"
       | package == ghciWrapper  = "ghci" -- See Note [Hadrian's ghci-wrapper package]
       | package == hpcBin       = "hpc"
-      | package == iserv        = "ghc-iserv" ++ concat [
-                                        if wayUnit' `wayUnit` way
-                                            then suffix
-                                            else ""
-                                        | (wayUnit', suffix) <- [
-                                            (Profiling, "-prof"),
-                                            (Dynamic,   "-dyn")
-                                        ]]
       | otherwise               = pkgName package
 
 -- | The 'FilePath' to a program executable in a given 'Context'.
@@ -215,7 +206,7 @@ timeoutPath = "testsuite/timeout/install-inplace/bin/timeout" <.> exe
 -- TODO: Can we extract this information from Cabal files?
 -- | Some program packages should not be linked with Haskell main function.
 nonHsMainPackage :: Package -> Bool
-nonHsMainPackage = (`elem` [hp2ps, iserv, unlit, ghciWrapper])
+nonHsMainPackage = (`elem` [hp2ps, unlit, ghciWrapper])
 
 
 {-

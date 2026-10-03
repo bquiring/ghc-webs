@@ -44,15 +44,11 @@ module GHC.CoreToIface
       -- * Other stuff
     , toIfaceLFInfo
     , toIfaceBooleanFormula
-      -- * CgBreakInfo
-    , dehydrateCgBreakInfo
     ) where
 
 import GHC.Prelude
 
 import GHC.StgToCmm.Types
-
-import GHC.ByteCode.Types
 
 import GHC.Core
 import GHC.Core.TyCon hiding ( pprPromotionQuote )
@@ -65,8 +61,9 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCo.Tidy
 
-import GHC.Builtin.Types.Prim ( eqPrimTyCon, eqReprPrimTyCon )
-import GHC.Builtin.Types ( heqTyCon )
+import GHC.Builtin.WiredIn.Prim ( eqPrimTyCon, eqReprPrimTyCon )
+import GHC.Builtin.WiredIn.Types ( heqTyCon )
+import GHC.Builtin.WiredIn.Ids ( noinlineIdName, noinlineConstraintIdName )
 
 import GHC.Iface.Syntax
 import GHC.Data.FastString
@@ -74,7 +71,7 @@ import GHC.Data.BooleanFormula qualified as BF(BooleanFormula(..))
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Id.Make ( noinlineIdName, noinlineConstraintIdName )
+import GHC.Types.InlinePragma
 import GHC.Types.Literal
 import GHC.Types.Name
 import GHC.Types.Basic
@@ -90,7 +87,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 
-import GHC.Hs.Extension (GhcRn)
+import GHC.Hs.Extension ( GhcRn )
 
 import Data.Maybe ( isNothing, catMaybes )
 
@@ -316,7 +313,7 @@ toIfaceCoercionX fr co
       = IfaceForAllCo (toIfaceBndr tv)
                       visL
                       visR
-                      (toIfaceCoercionX fr' k)
+                      (go_mco k)
                       (toIfaceCoercionX fr' co)
                           where
                             fr' = fr `delVarSet` tv
@@ -545,10 +542,11 @@ toIfGuidance src guidance
 toIfaceBooleanFormula :: BF.BooleanFormula GhcRn -> IfaceBooleanFormula
 toIfaceBooleanFormula = go
   where
-    go (BF.Var nm   ) = IfVar    $ mkIfLclName . getOccFS . unLoc $  nm
-    go (BF.And bfs  ) = IfAnd    $ map (go . unLoc) bfs
-    go (BF.Or bfs   ) = IfOr     $ map (go . unLoc) bfs
-    go (BF.Parens bf) = IfParens $     (go . unLoc) bf
+    go (BF.Var _ nm   ) = IfVar    $ mkIfLclName . getOccFS . unLoc $  nm
+    go (BF.And _ bfs  ) = IfAnd    $ map (go . unLoc) bfs
+    go (BF.Or _ bfs   ) = IfOr     $ map (go . unLoc) bfs
+    go (BF.Parens _ bf) = IfParens $     (go . unLoc) bf
+    go (BF.XBooleanFormula _) = panic "toIfaceBooleanFormula"
 
 {-
 ************************************************************************
@@ -702,16 +700,6 @@ toIfaceLFInfo nm lfi = case lfi of
     LFLetNoEscape ->
       panic "toIfaceLFInfo: LFLetNoEscape"
 
--- Dehydrating CgBreakInfo
-
-dehydrateCgBreakInfo :: [TyVar] -> [Maybe (Id, Word)] -> Type -> BreakpointId -> CgBreakInfo
-dehydrateCgBreakInfo ty_vars idOffSets tick_ty bid =
-          CgBreakInfo
-            { cgb_tyvars = map toIfaceTvBndr ty_vars
-            , cgb_vars = map (fmap (\(i, offset) -> (toIfaceIdBndr i, offset))) idOffSets
-            , cgb_resty = toIfaceType tick_ty
-            , cgb_tick_id = bid
-            }
 
 {- Note [Inlining and hs-boot files]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,14 +1,8 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic IfaceMessage
-{-# LANGUAGE InstanceSigs #-}
 
 module GHC.Iface.Errors.Ppr
   ( IfaceMessageOpts(..)
@@ -19,6 +13,7 @@ module GHC.Iface.Errors.Ppr
   , missingInterfaceErrorReason
   , missingInterfaceErrorDiagnostic
   , readInterfaceErrorDiagnostic
+  , defaultIfaceMessageOpts
 
   , lookingForHerald
   , cantFindErrorX
@@ -29,6 +24,8 @@ module GHC.Iface.Errors.Ppr
 
 import GHC.Prelude
 
+import GHC.Builtin( knownKeyOccName_maybe )
+import GHC.Builtin.Modules( eSSENTIALS_NAME )
 import GHC.Types.Error
 import GHC.Types.Hint.Ppr () -- Outputable GhcHint
 import GHC.Types.Error.Codes
@@ -65,10 +62,13 @@ interfaceErrorHints :: IfaceMessage -> [GhcHint]
 interfaceErrorHints = \ case
   Can'tFindInterface err _looking_for ->
     missingInterfaceErrorHints err
-  Can'tFindNameInInterface {} ->
-    noHints
-  CircularImport {} ->
-    noHints
+  Can'tFindNameInInterface {} ->   noHints
+  CircularImport {} -> noHints
+  MissingKnownKey1 {} -> noHints
+  MissingKnownKey2 {} -> noHints
+  MissingKnownKey3 {} -> noHints
+  KnownKeyScopeError {} -> noHints
+  CantFindEssentials {} -> noHints
 
 missingInterfaceErrorHints :: MissingInterfaceError -> [GhcHint]
 missingInterfaceErrorHints = \case
@@ -90,8 +90,12 @@ interfaceErrorReason (Can'tFindInterface err _)
   = missingInterfaceErrorReason err
 interfaceErrorReason (Can'tFindNameInInterface {})
   = ErrorWithoutFlag
-interfaceErrorReason (CircularImport {})
-  = ErrorWithoutFlag
+interfaceErrorReason (CircularImport {})     = ErrorWithoutFlag
+interfaceErrorReason (MissingKnownKey1 {})   = ErrorWithoutFlag
+interfaceErrorReason (MissingKnownKey2 {})   = ErrorWithoutFlag
+interfaceErrorReason (MissingKnownKey3 {})   = ErrorWithoutFlag
+interfaceErrorReason (KnownKeyScopeError {}) = ErrorWithoutFlag
+interfaceErrorReason (CantFindEssentials {}) = ErrorWithoutFlag
 
 missingInterfaceErrorReason :: MissingInterfaceError -> DiagnosticReason
 missingInterfaceErrorReason = \ case
@@ -206,7 +210,7 @@ cantFindErrorX pkg_hidden_hint may_show_locations mod_or_interface (CantFindInst
           -- package flags when making suggestions.  ToDo: if the original package
           -- also has a reexport, prefer that one
           pp_sugg (SuggestVisible m mod o) = ppr m <+> provenance o
-            where provenance ModHidden = empty
+            where provenance (ModHidden {}) = empty
                   provenance (ModUnusable _) = empty
                   provenance (ModOrigin{ fromOrigUnit = e,
                                          fromExposedReexport = res,
@@ -223,7 +227,7 @@ cantFindErrorX pkg_hidden_hint may_show_locations mod_or_interface (CantFindInst
                           <+> ppr mod)
                     | otherwise = empty
           pp_sugg (SuggestHidden m mod o) = ppr m <+> provenance o
-            where provenance ModHidden =  empty
+            where provenance (ModHidden {}) =  empty
                   provenance (ModUnusable _) = empty
                   provenance (ModOrigin{ fromOrigUnit = e,
                                          fromHiddenReexport = rhs })
@@ -257,7 +261,7 @@ cantFindErrorX pkg_hidden_hint may_show_locations mod_or_interface (CantFindInst
   where
     pprMod (m, o) = text "it is bound as" <+> ppr m <+>
                                 text "by" <+> pprOrigin m o
-    pprOrigin _ ModHidden = panic "cantFindErr: bound by mod hidden"
+    pprOrigin _ (ModHidden {}) = panic "cantFindErr: bound by mod hidden"
     pprOrigin _ (ModUnusable _) = panic "cantFindErr: bound by mod unusable"
     pprOrigin m (ModOrigin e res _ f) = sep $ punctuate comma (
       if e == Just True
@@ -267,17 +271,22 @@ cantFindErrorX pkg_hidden_hint may_show_locations mod_or_interface (CantFindInst
                 .ppr.mkUnit) res ++
       if f then [text "a package flag"] else []
       )
-    pkg_hidden :: (Unit, Maybe UnitInfo) -> SDoc
-    pkg_hidden (uid, uif) =
+    pkg_hidden :: UnitInfo -> SDoc
+    pkg_hidden unit =
         text "It is a member of the hidden package"
-        <+> quotes (ppr uid)
+        <+> quotes (ppr $ unitId unit)
         --FIXME: we don't really want to show the unit id here we should
         -- show the source package id or installed package id if it's ambiguous
-        <> dot $$ maybe empty pkg_hidden_hint uif
+        <> dot $$ pkg_hidden_hint unit
 
 
-    mod_hidden pkg =
-        text "it is a hidden module in the package" <+> quotes (ppr pkg)
+    mod_hidden :: (Unit, HiddenModuleUnitVisibility) -> SDoc
+    mod_hidden (pkg, hmu) =
+        text "It is a hidden module in the" <+> pp_pkg <+> quotes (ppr pkg)
+      where
+        pp_pkg = case hmu of
+          HiddenModInVisibleUnit -> text "package"
+          HiddenModInHiddenUnit  -> text "hidden package"
 
     unusable (UnusableUnit unit reason reexport)
       = text "It is " <> (if reexport then text "reexported from the package"
@@ -295,6 +304,53 @@ interfaceErrorDiagnostic opts = \ case
   CircularImport mod ->
     text "Circular imports: module" <+> quotes (ppr mod)
     <+> text "depends on itself"
+
+  MissingKnownKey1 key -> hang (text "Could not find known key" <+> quotes (pprKnownKey key))
+                             2 (vcat [ text "in the exports of GHC.KnownKeys"
+                                     , text "occname:" <+> pp_occ (knownKeyOccName_maybe key)
+                                     , text "REMEMBER: for tycons, divide by 2!!"])
+         where
+           pp_occ (Just occ) = ppr occ
+           pp_occ Nothing    = text "Yikes: that key isn't in the known-key table"
+
+  MissingKnownKey2 key -> hang (text "Could not find known key" <+> quotes (pprKnownKey key))
+                             2 (text "in the static known-key table")
+
+  MissingKnownKey3 occ -> hang (text "Could not find known occurrence" <+> quotes (ppr occ))
+                             2 (text "in the exports of GHC.KnownKeys")
+
+  KnownKeyScopeError occ gres call_stack
+    | null gres
+    -> hang (text "Could not find known-key entity" <+> quotes (ppr occ))
+          2 (vcat [ text "in the top-level environment (unqualified, or qualified as Rebindable)"
+                  , text "Consider importing it"
+                  , prettyCallStackDoc call_stack ])
+    | otherwise
+    -> hang (text "Known-key entity" <+> quotes (ppr occ))
+          2 (text "is ambiguous in the top-level global environment" $$ ppr gres)
+
+  CantFindEssentials err reason ->
+    vcat
+      [ vcat [ hang (text "Failed to load the known-names module" <+> quotes (ppr eSSENTIALS_NAME))
+                  2 (case reason of
+                       UnknownLoadEssentialsReason -> empty
+                       LookingForEssentialsModule  -> text "which this module implicitly imports")
+             , text "Did you mean to use" <+> quotes (text "-package base") <> text "?" ]
+      , blankLine
+      , missingInterfaceErrorDiagnostic opts err
+      , blankLine
+      , case reason of
+          LookingForEssentialsModule
+            -> vcat [ text "Every module resolves known entities by implicitly importing" <+> quotes (ppr eSSENTIALS_NAME) <> dot
+                    , text "To avoid this implicit import, looking up known entities in scope instead,"
+                    , text "use" <+> quotes (text "-frebindable-known-names") <> dot
+                    ]
+          UnknownLoadEssentialsReason ->
+            hang (text "To lookup known entities in scope rather than implicitly importing GHC.Essentials" <> comma)
+               2 (vcat [ text "use" <+> quotes (text "-frebindable-known-names") <> comma <+> text "and import"
+                       , text "the necessary known entity definitions from" <+> quotes (text "ghc-internal") <> dot
+                       ])
+      ]
 
 lookingForHerald :: InterfaceLookingFor -> SDoc
 lookingForHerald looking_for =
@@ -336,8 +392,9 @@ hiModuleNameMismatchWarn requested_mod read_mod
             ]
         ]
  | otherwise =
-  -- ToDo: This will fail to have enough qualification when the package IDs
-  -- are the same
+  -- Display fully qualified unit names. Otherwise we may not have enough
+  -- qualification and the printed names could look exactly the same.
+  pprRawUnitIds $
   withPprStyle (mkUserStyle alwaysQualify AllTheWay) $
     -- we want the Modules below to be qualified with package names,
     -- so reset the NamePprCtx setting.
@@ -345,7 +402,6 @@ hiModuleNameMismatchWarn requested_mod read_mod
          , ppr requested_mod
          , text "differs from name found in the interface file"
          , ppr read_mod
-         , parens (text "if these names look the same, try again with -dppr-debug")
          ]
 
 dynamicHashMismatchError :: Module -> ModLocation -> SDoc

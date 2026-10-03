@@ -116,6 +116,7 @@ test('DumpParsedAst',      normal, compile, ['-dsuppress-uniques -ddump-parsed-a
 test('DumpParsedAstComments',  normal, compile, ['-dsuppress-uniques -ddump-parsed-ast -dkeep-comments'])
 test('DumpRenamedAst',     normal, compile, ['-dsuppress-uniques -ddump-rn-ast'])
 test('DumpTypecheckedAst', normal, compile, ['-dsuppress-uniques -ddump-tc-ast'])
+test('T12002', normal, compile, [''])
 test('T12045e', normal, compile, [''])
 test('T13087', normal, compile, [''])
 test('T13747', normal, compile, [''])
@@ -139,7 +140,7 @@ def only_MG_loc(x):
                     (EpaSpan { <combineSrcSpans: files differ> })
     """
     ls = x.split("\n")
-    mgLocs = (loc.strip() for (mg,loc) in zip(ls,ls[4:])
+    mgLocs = (loc.strip() for (mg,loc) in zip(ls,ls[11:])
                 if mg.strip().startswith("(MG"))
     return '\n'.join(mgLocs)
 test('T15279', normalise_errmsg_fun(only_MG_loc), compile, [''])
@@ -197,8 +198,8 @@ test('T20718b',  normal, compile, ['-dsuppress-uniques -ddump-parsed-ast -dkeep-
 test('T21589', normal, compile, [''])
 test('T19372consym', normal, compile, [''])
 test('ListTuplePunsSuccess1', extra_files(['ListTuplePunsSuccess1.hs']), ghci_script, ['ListTuplePunsSuccess1.script'])
-test('ListTuplePunsFamiliesCompat', expect_broken(23135), compile, [''])
-test('ListTuplePunsFamilies', [expect_broken(23135), extra_files(['ListTuplePunsFamilies.hs'])], ghci_script, ['ListTuplePunsFamilies.script'])
+test('ListTuplePunsFamiliesCompat', normal, compile, [''])
+test('ListTuplePunsFamilies', [extra_files(['ListTuplePunsFamilies.hs'])], ghci_script, ['ListTuplePunsFamilies.script'])
 
 
 test('T22155', normal, compile, ['-dsuppress-uniques -ddump-simpl -dsuppress-all -dno-typeable-binds'])

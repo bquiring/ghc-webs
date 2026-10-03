@@ -1,6 +1,10 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE CPP, NoImplicitPrelude, BangPatterns, StandaloneDeriving,
              MagicHash, UnboxedTuples #-}
+
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines Show
+
 {-# OPTIONS_HADDOCK not-home #-}
 
 #include "MachDeps.h"
@@ -50,9 +54,15 @@ module GHC.Internal.Show
         where
 
 import GHC.Internal.Base
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.List ((!!), foldr1, break)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num
 import GHC.Internal.Stack.Types
+import GHC.Internal.Prim (
+    Int#, Word#, chr#, ltWord#, negateInt#, ord#, quotRemInt#, quotRemWord#,
+    word2Int#, (+#), (==#), (<#), (<=#), (>#), (>=#),
+  )
 import GHC.Internal.Tuple (Solo (..))
 
 
@@ -590,8 +600,8 @@ instance Show KindRep where
       . showsPrec 11 p
       . showString " "
       . showsPrec 11 q
-  showsPrec d (KindRepTYPE rep) = showParen (d > 10) $
-    showString "KindRepTYPE " . showsPrec 11 rep
+  showsPrec d KindRepType       = showParen (d > 10) $ showString "KindRepType"
+  showsPrec d KindRepConstraint = showParen (d > 10) $ showString "KindRepConstraint"
   showsPrec d (KindRepTypeLitS p q) = showParen (d > 10) $
     showString "KindRepTypeLitS "
       . showsPrec 11 p

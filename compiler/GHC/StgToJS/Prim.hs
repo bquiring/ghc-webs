@@ -1155,18 +1155,17 @@ genPrim prof bound ty op = case op of
 
 ------------------------------ Unhandled primops -------------------
 
+  AnnotateStackOp                   -> unhandledPrimop op
+
   NewPromptTagOp                    -> unhandledPrimop op
   PromptOp                          -> unhandledPrimop op
   Control0Op                        -> unhandledPrimop op
-
-  NewIOPortOp                       -> unhandledPrimop op
-  ReadIOPortOp                      -> unhandledPrimop op
-  WriteIOPortOp                     -> unhandledPrimop op
 
   GetSparkOp                        -> unhandledPrimop op
   AnyToAddrOp                       -> unhandledPrimop op
   MkApUpd0_Op                       -> unhandledPrimop op
   NewBCOOp                          -> unhandledPrimop op
+  NewConAppObjOp                    -> unhandledPrimop op
   UnpackClosureOp                   -> unhandledPrimop op
   ClosureSizeOp                     -> unhandledPrimop op
   GetApStackValOp                   -> unhandledPrimop op
@@ -1192,6 +1191,8 @@ genPrim prof bound ty op = case op of
   VecQuotOp _ _ _                   -> unhandledPrimop op
   VecRemOp _ _ _                    -> unhandledPrimop op
   VecNegOp _ _ _                    -> unhandledPrimop op
+  VecAbsOp _ _ _                    -> unhandledPrimop op
+  VecSqrtOp _ _ _                   -> unhandledPrimop op
   VecIndexByteArrayOp _ _ _         -> unhandledPrimop op
   VecReadByteArrayOp _ _ _          -> unhandledPrimop op
   VecWriteByteArrayOp _ _ _         -> unhandledPrimop op
@@ -1213,6 +1214,9 @@ genPrim prof bound ty op = case op of
   VecShuffleOp _ _ _                -> unhandledPrimop op
   VecMinOp {}                       -> unhandledPrimop op
   VecMaxOp {}                       -> unhandledPrimop op
+  VecAndOp {}                       -> unhandledPrimop op
+  VecOrOp {}                        -> unhandledPrimop op
+  VecXorOp {}                       -> unhandledPrimop op
 
   PrefetchByteArrayOp3              -> noOp
   PrefetchMutableByteArrayOp3       -> noOp

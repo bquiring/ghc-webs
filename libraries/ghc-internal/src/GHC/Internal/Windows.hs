@@ -79,6 +79,7 @@ module GHC.Internal.Windows (
     ) where
 
 import GHC.Internal.Data.Bits (finiteBitSize, shiftL, shiftR, (.|.), (.&.))
+import GHC.Internal.Err (undefined)
 import GHC.Internal.Unicode (isSpace)
 import GHC.Internal.Data.OldList
 import GHC.Internal.Data.Maybe
@@ -93,6 +94,7 @@ import GHC.Internal.Enum (maxBound)
 import GHC.Internal.IO
 import GHC.Internal.Num
 import GHC.Internal.Real (fromIntegral)
+import qualified GHC.Internal.Stack.Types as Rebindable (SrcLoc(..), pushCallStack, emptyCallStack)
 import GHC.Internal.System.IO.Error
 
 import qualified GHC.Internal.Numeric

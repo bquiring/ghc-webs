@@ -3,6 +3,7 @@ module GHC.Unit.External
    , initExternalUnitCache
    , eucEPS
    , ExternalPackageState (..)
+   , KnownKeyNameMaps
    , initExternalPackageState
    , EpsStats(..)
    , addEpsInStats
@@ -30,7 +31,10 @@ import GHC.Types.Annotations ( AnnEnv, emptyAnnEnv )
 import GHC.Types.CompleteMatch
 import GHC.Types.DefaultEnv (DefaultEnv)
 import GHC.Types.TypeEnv
+import GHC.Types.Name
 import GHC.Types.Unique.DSet
+
+import GHC.Utils.Fingerprint ( Fingerprint )
 
 import GHC.Linker.Types (Linkable)
 
@@ -77,6 +81,7 @@ initExternalPackageState = EPS
   , eps_rule_base        = mkRuleBase builtinRules
   , -- Initialise the EPS rule pool with the built-in rules
     eps_mod_fam_inst_env = emptyModuleEnv
+  , eps_known_keys       = emptyModuleEnv
   , eps_complete_matches = []
   , eps_ann_env          = emptyAnnEnv
   , eps_stats            = EpsStats
@@ -149,6 +154,19 @@ data ExternalPackageState
         --
         -- See Note [Interface Files with Core Definitions]
         eps_iface_bytecode :: !(ModuleEnv (IO Linkable)),
+
+        eps_known_keys   :: ModuleEnv (Fingerprint, KnownKeyNameMaps),
+          -- ^ Cache of the known-entity maps of all loaded 'GHC.Essentials'
+          -- modules, keyed by module and the corresponding interface ABI hash.
+          --
+          -- There is a single 'ExternalPackageState' for the whole session,
+          -- so keying by module is what lets two home units resolve known
+          -- entities through two different 'GHC.Essentials' modules.
+          --
+          -- The hash is used to invalidate an entry for the purposes of
+          -- recompilation checking.
+          --
+          -- See 'GHC.Iface.Load.loadKnownKeyOccMaps'.
 
         eps_inst_env     :: !PackageInstEnv,   -- ^ The total 'InstEnv' accumulated
                                                -- from all the external-package modules

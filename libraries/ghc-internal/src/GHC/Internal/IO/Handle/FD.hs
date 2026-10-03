@@ -26,6 +26,7 @@ module GHC.Internal.IO.Handle.FD (
   mkHandleFromFD, fdToHandle, fdToHandle', handleToFd
  ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
 import GHC.Internal.Base
 import GHC.Internal.Show
 import GHC.Internal.Control.Exception (tryWithContext)
@@ -44,6 +45,7 @@ import GHC.Internal.IO.Handle.Types
 import GHC.Internal.IO.Handle.Internals
 import qualified GHC.Internal.IO.FD as FD
 import qualified GHC.Internal.System.Posix.Internals as Posix
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 -- ---------------------------------------------------------------------------
 -- Standard Handles

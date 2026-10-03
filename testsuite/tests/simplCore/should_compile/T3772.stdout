@@ -1,48 +1,7 @@
 
 ==================== Tidy Core ====================
 Result size of Tidy Core
-  = {terms: 46, types: 19, coercions: 0, joins: 0/0}
-
--- RHS size: {terms: 1, types: 0, coercions: 0, joins: 0/0}
-T3772.$trModule4 :: GHC.Internal.Prim.Addr#
-[GblId,
- Unf=Unf{Src=<vanilla>, TopLvl=True,
-         Value=True, ConLike=True, WorkFree=True, Expandable=True,
-         Guidance=IF_ARGS [] 20 0}]
-T3772.$trModule4 = "main"#
-
--- RHS size: {terms: 2, types: 0, coercions: 0, joins: 0/0}
-T3772.$trModule3 :: GHC.Internal.Types.TrName
-[GblId,
- Unf=Unf{Src=<vanilla>, TopLvl=True,
-         Value=True, ConLike=True, WorkFree=True, Expandable=True,
-         Guidance=IF_ARGS [] 10 10}]
-T3772.$trModule3 = GHC.Internal.Types.TrNameS T3772.$trModule4
-
--- RHS size: {terms: 1, types: 0, coercions: 0, joins: 0/0}
-T3772.$trModule2 :: GHC.Internal.Prim.Addr#
-[GblId,
- Unf=Unf{Src=<vanilla>, TopLvl=True,
-         Value=True, ConLike=True, WorkFree=True, Expandable=True,
-         Guidance=IF_ARGS [] 30 0}]
-T3772.$trModule2 = "T3772"#
-
--- RHS size: {terms: 2, types: 0, coercions: 0, joins: 0/0}
-T3772.$trModule1 :: GHC.Internal.Types.TrName
-[GblId,
- Unf=Unf{Src=<vanilla>, TopLvl=True,
-         Value=True, ConLike=True, WorkFree=True, Expandable=True,
-         Guidance=IF_ARGS [] 10 10}]
-T3772.$trModule1 = GHC.Internal.Types.TrNameS T3772.$trModule2
-
--- RHS size: {terms: 3, types: 0, coercions: 0, joins: 0/0}
-T3772.$trModule :: GHC.Internal.Types.Module
-[GblId,
- Unf=Unf{Src=<vanilla>, TopLvl=True,
-         Value=True, ConLike=True, WorkFree=True, Expandable=True,
-         Guidance=IF_ARGS [] 10 10}]
-T3772.$trModule
-  = GHC.Internal.Types.Module T3772.$trModule3 T3772.$trModule1
+  = {terms: 32, types: 14, coercions: 0, joins: 0/0}
 
 Rec {
 -- RHS size: {terms: 10, types: 2, coercions: 0, joins: 0/0}
@@ -50,8 +9,8 @@ $wxs :: GHC.Internal.Prim.Int# -> (# #)
 [GblId, Arity=1, Str=<1L>, Unf=OtherCon []]
 $wxs
   = \ (ww :: GHC.Internal.Prim.Int#) ->
-      case ww of ds1 {
-        __DEFAULT -> $wxs (GHC.Internal.Prim.-# ds1 1#);
+      case ww of wild1 {
+        __DEFAULT -> $wxs (GHC.Internal.Prim.-# wild1 1#);
         1# -> GHC.Internal.Types.(##)
       }
 end Rec }

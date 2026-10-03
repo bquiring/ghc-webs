@@ -50,7 +50,7 @@ The following syntax is stolen:
 
     Stolen by: :extension:`Arrows`
 
-``?varid``
+``?⟨varid⟩``
     .. index::
        single: implicit parameters
 
@@ -65,29 +65,32 @@ The following syntax is stolen:
     :ref:`discussion on quasi-quoting <quasi-quotes-list-comprehension-ambiguity>`
     for details.
 
-``$(``, ``$$(``, ``$varid``, ``$$varid``
+``$(``, ``$$(``, ``$⟨varid⟩``, ``$$⟨varid⟩``
     .. index::
        single: Template Haskell
 
     Stolen by: :extension:`TemplateHaskell`
 
-``[varid|``
+``[⟨varid⟩|``
     .. index::
        single: quasi-quotation
 
     Stolen by: :extension:`QuasiQuotes`
 
-⟨varid⟩, ``#``\ ⟨char⟩, ``#``, ⟨string⟩, ``#``, ⟨integer⟩, ``#``, ⟨float⟩, ``#``, ⟨float⟩, ``##``
+``⟨varid⟩#``, ``⟨char⟩#``, ``⟨string⟩#``, ``⟨integer⟩#``, ``⟨float⟩#``, ``⟨float⟩##``
     Stolen by: :extension:`MagicHash`
 
-⟨integer⟩, ``#(Int|Word)(8|16|32|64)?``
+``⟨integer⟩#(Int|Word)(8|16|32|64)?``
     Stolen by: :extension:`ExtendedLiterals`
 
 ``(#``, ``#)``
     Stolen by: :extension:`UnboxedTuples`
 
-⟨varid⟩, ``!``, ⟨varid⟩
-    Stolen by: :extension:`BangPatterns`
+``⟨varid⟩ !⟨varid⟩``
+    Stolen by: :extension:`BangPatterns`. Only when there are whitespaces before
+    ``!`` and no whitespace after ``!``, it is interpreted as :extension:`BangPatterns`. Other
+    cases such as ``⟨varid⟩!⟨varid⟩``, ``⟨varid⟩ ! ⟨varid⟩``, and ``⟨varid⟩! ⟨varid⟩``, are
+    interpreted as infix operators.
 
 ``pattern``
     Stolen by: :extension:`PatternSynonyms`

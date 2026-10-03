@@ -162,7 +162,7 @@ floatTopBind bind
 ************************************************************************
 -}
 
-floatBind :: LevelledBind -> (FloatStats, FloatBinds, [CoreBind])
+floatBind :: LevelledBind -> (FloatStats, FloatLets, [CoreBind])
   -- Returns a list with either
   --   * A single non-recursive binding (value or join point), or
   --   * The following, in order:
@@ -190,7 +190,7 @@ floatBind (Rec pairs)
     (fs, rhs_floats, new_non_rec_binds ++ new_rec_binds) }
   where
     do_pair :: (LevelledBndr, LevelledExpr)
-            -> (FloatStats, FloatBinds,
+            -> (FloatStats, FloatLets,
                 ([(Id,CoreExpr)],  -- Non-recursive unlifted value bindings
                  [(Id,CoreExpr)])) -- Join points and lifted value bindings
     do_pair (TB name spec, rhs)
@@ -239,7 +239,7 @@ installUnderLambdas floats e
     go e                         = install floats e
 
 ---------------
-floatList :: (a -> (FloatStats, FloatBinds, b)) -> [a] -> (FloatStats, FloatBinds, [b])
+floatList :: (a -> (FloatStats, FloatLets, b)) -> [a] -> (FloatStats, FloatLets, [b])
 floatList _ [] = (zeroStats, emptyFloats, [])
 floatList f (a:as) = case f a            of { (fs_a,  binds_a,  b)  ->
                      case floatList f as of { (fs_as, binds_as, bs) ->
@@ -312,7 +312,7 @@ but this case works just as well.
 
 floatBody :: Level
           -> LevelledExpr
-          -> (FloatStats, FloatBinds, CoreExpr)
+          -> (FloatStats, FloatLets, CoreExpr)
 
 floatBody lvl arg       -- Used rec rhss, and case-alternative rhss
   = case (floatExpr arg) of { (fsa, floats, arg') ->
@@ -342,7 +342,7 @@ expression is entered since the tick still scopes over the RHS.
 -}
 
 floatExpr :: LevelledExpr
-          -> (FloatStats, FloatBinds, CoreExpr)
+          -> (FloatStats, FloatLets, CoreExpr)
 floatExpr (Var v)   = (zeroStats, emptyFloats, Var v)
 floatExpr (Type ty) = (zeroStats, emptyFloats, Type ty)
 floatExpr (Coercion co) = (zeroStats, emptyFloats, Coercion co)
@@ -365,25 +365,58 @@ floatExpr lam@(Lam (TB _ lam_spec) _)
     (add_to_stats fs floats, floats, mkLams bndrs body') }
 
 floatExpr (Tick tickish expr)
-  | tickish `tickishScopesLike` SoftScope -- not scoped, can just float
+  -- If possible, float out past the tick
+  | let float_out_of_tick
+          -- See Note [Floating past breakpoints]
+          | Breakpoint{} <- tickish
+          = True
+          | otherwise
+          -- We can float code out of non-scoped ticks
+          = tickishHasNoScope tickish
+  , float_out_of_tick
   = case (floatExpr expr)    of { (fs, floating_defns, expr') ->
     (fs, floating_defns, Tick tickish expr') }
 
-  | not (tickishCounts tickish) || tickishCanSplit tickish
-  = case (floatExpr expr)    of { (fs, floating_defns, expr') ->
-    let -- Annotate bindings floated outwards past an scc expression
-        -- with the cc.  We mark that cc as "duplicated", though.
-        annotated_defns = wrapTick (mkNoCount tickish) floating_defns
+  -- We can't move code out of the tick
+  | otherwise
+  = assert (not (tickishCounts tickish) || tickishCanSplit tickish) $
+    case (floatExpr expr)    of { (fs, floating_defns, expr') ->
+        -- Wrap floated code with the correct tick scope, but using 'mkNoCount'
+        -- to ensure we don't duplicate counters.
+        --
+        -- See also Note [Avoiding duplicate ticks].
+    let annotated_defns = wrapTick (mkNoCount tickish) floating_defns
     in
     (fs, annotated_defns, Tick tickish expr') }
 
-  -- See Note [Floating past breakpoints]
-  | Breakpoint{} <- tickish
-  = case (floatExpr expr)    of { (fs, floating_defns, expr') ->
-    (fs, floating_defns, Tick tickish expr') }
+{- Note [Avoiding duplicate ticks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When FloatOut floats an expression through scoped ticks, it accumulates all
+the scopes on the way, e.g.
 
-  | otherwise
-  = pprPanic "floatExpr tick" (ppr tickish)
+  src<loc1>
+    let x = ..
+    in
+      src<loc2>
+      let y = ...
+      in
+        src<loc3>
+        let z = fib 100
+        in ...
+
+When we float 'z' out to the top level, it will accumulate all the intervening
+ticks:
+
+  lvl_z = src<loc1> src<loc2> src<loc3> fib 100
+
+It's important to combine these ticks up as much as possible to avoid hugely
+bloating the Core; for example if loc1 = loc3 then we should combine those two
+source notes, which requires moving src<loc1> past src<loc2> to allow
+cancellation to take place.
+
+Failing to do so can result in stacks of millions of duplicated source notes!
+This happened e.g. when compiling the LintCodes.Static testsuite file.
+-}
 
 floatExpr (Cast expr co)
   = case (floatExpr expr) of { (fs, floating_defns, expr') ->
@@ -439,7 +472,7 @@ floatExpr (Case scrut (TB case_bndr case_spec) ty alts)
 
 floatRhs :: CoreBndr
          -> LevelledExpr
-         -> (FloatStats, FloatBinds, CoreExpr)
+         -> (FloatStats, FloatLets, CoreExpr)
 floatRhs bndr rhs
   | JoinPoint join_arity <- idJoinPointHood bndr
   , Just (bndrs, body) <- try_collect join_arity rhs []
@@ -524,7 +557,7 @@ add_stats :: FloatStats -> FloatStats -> FloatStats
 add_stats (FlS a1 b1 c1) (FlS a2 b2 c2)
   = FlS (a1 + a2) (b1 + b2) (c1 + c2)
 
-add_to_stats :: FloatStats -> FloatBinds -> FloatStats
+add_to_stats :: FloatStats -> FloatLets -> FloatStats
 add_to_stats (FlS a b c) (FB tops others)
   = FlS (a + lengthBag tops)
         (b + lengthBag (flattenMajor others))
@@ -537,9 +570,9 @@ add_to_stats (FlS a b c) (FB tops others)
 *                                                                      *
 ************************************************************************
 
-Note [Representation of FloatBinds]
+Note [Representation of FloatLets]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The FloatBinds types is somewhat important.  We can get very large numbers
+The FloatLets types is somewhat important.  We can get very large numbers
 of floating bindings, often all destined for the top level.  A typical example
 is     x = [4,2,5,2,5, .... ]
 Then we get lots of small expressions like (fromInteger 4), which all get
@@ -561,17 +594,17 @@ type FloatLet = CoreBind        -- INVARIANT: a FloatLet is always lifted
 type MajorEnv = M.IntMap MinorEnv         -- Keyed by major level
 type MinorEnv = M.IntMap (Bag FloatBind)  -- Keyed by minor level
 
-data FloatBinds  = FB !(Bag FloatLet)           -- Destined for top level
+data FloatLets  = FB !(Bag FloatLet)           -- Destined for top level
                       !MajorEnv                 -- Other levels
-     -- See Note [Representation of FloatBinds]
+     -- See Note [Representation of FloatLets]
 
-instance Outputable FloatBinds where
+instance Outputable FloatLets where
   ppr (FB fbs defs)
       = text "FB" <+> (braces $ vcat
            [ text "tops ="     <+> ppr fbs
            , text "non-tops =" <+> ppr defs ])
 
-flattenTopFloats :: FloatBinds -> Bag CoreBind
+flattenTopFloats :: FloatLets -> Bag CoreBind
 flattenTopFloats (FB tops defs)
   = assertPpr (isEmptyBag (flattenMajor defs)) (ppr defs) $
     tops
@@ -589,23 +622,23 @@ flattenMajor = M.foldr (unionBags . flattenMinor) emptyBag
 flattenMinor :: MinorEnv -> Bag FloatBind
 flattenMinor = M.foldr unionBags emptyBag
 
-emptyFloats :: FloatBinds
+emptyFloats :: FloatLets
 emptyFloats = FB emptyBag M.empty
 
-unitCaseFloat :: Level -> CoreExpr -> Id -> AltCon -> [Var] -> FloatBinds
+unitCaseFloat :: Level -> CoreExpr -> Id -> AltCon -> [Var] -> FloatLets
 unitCaseFloat (Level major minor) e b con bs
   = FB emptyBag (M.singleton major (M.singleton minor floats))
   where
     floats = unitBag (FloatCase e b con bs)
 
-unitLetFloat :: Level -> FloatLet -> FloatBinds
+unitLetFloat :: Level -> FloatLet -> FloatLets
 unitLetFloat lvl@(Level major minor) b
   | isTopLvl lvl = FB (unitBag b) M.empty
   | otherwise    = FB emptyBag (M.singleton major (M.singleton minor floats))
   where
     floats = unitBag (FloatLet b)
 
-plusFloats :: FloatBinds -> FloatBinds -> FloatBinds
+plusFloats :: FloatLets -> FloatLets -> FloatLets
 plusFloats (FB t1 l1) (FB t2 l2)
   = FB (t1 `unionBags` t2) (l1 `plusMajor` l2)
 
@@ -621,8 +654,8 @@ install defn_groups expr
 
 partitionByLevel
         :: Level                -- Partitioning level
-        -> FloatBinds           -- Defns to be divided into 2 piles...
-        -> (FloatBinds,         -- Defns  with level strictly < partition level,
+        -> FloatLets           -- Defns to be divided into 2 piles...
+        -> (FloatLets,         -- Defns  with level strictly < partition level,
             Bag FloatBind)      -- The rest
 
 {-
@@ -659,9 +692,10 @@ partitionByLevel (Level major minor) (FB tops defns)
                                             Just min_defns -> M.splitLookup minor min_defns
     here_min = mb_here_min `orElse` emptyBag
 
-wrapTick :: CoreTickish -> FloatBinds -> FloatBinds
+wrapTick :: CoreTickish -> FloatLets -> FloatLets
 wrapTick t (FB tops defns)
-  = FB (mapBag wrap_bind tops)
+  = assert (not $ tickishCounts t) $
+    FB (mapBag wrap_bind tops)
        (M.map (M.map wrap_defns) defns)
   where
     wrap_defns = mapBag wrap_one
@@ -671,11 +705,15 @@ wrapTick t (FB tops defns)
 
     wrap_one (FloatLet bind)      = FloatLet (wrap_bind bind)
     wrap_one (FloatCase e b c bs) = FloatCase (maybe_tick e) b c bs
+    wrap_one (FloatTick t)        = FloatTick t  -- Doesn't happen in this pass
 
-    maybe_tick e | exprIsHNF e = tickHNFArgs t e
-                 | otherwise   = mkTick t e
-      -- we don't need to wrap a tick around an HNF when we float it
-      -- outside a tick: that is an invariant of the tick semantics
+    maybe_tick
+      -- We don't need to wrap an SCC tick around HNFs that we floated out of
+      -- the SCC, as that is an invariant of the semantics for SCCs.
       -- Conversely, inlining of HNFs inside an SCC is allowed, and
       -- indeed the HNF we're floating here might well be inlined back
       -- again, and we don't want to end up with duplicate ticks.
+      | tickishPlace t == PlaceCostCentre
+      = mkTickNoHNF t
+      | otherwise
+      = mkTick t

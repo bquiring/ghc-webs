@@ -1,8 +1,6 @@
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiWayIf            #-}
 {-# LANGUAGE RecursiveDo           #-}
-{-# LANGUAGE TupleSections         #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-
@@ -25,15 +23,14 @@ module GHC.Tc.Utils.TcMType (
   newFlexiTyVarTy,              -- Kind -> TcM TcType
   newFlexiTyVarTys,             -- Int -> Kind -> TcM [TcType]
   newOpenFlexiTyVar, newOpenFlexiTyVarTy, newOpenTypeKind,
-  newOpenFlexiFRRTyVar, newOpenFlexiFRRTyVarTy,
-  newOpenBoxedTypeKind,
+  newOpenFlexiFRRTyVarTy,
   newMetaKindVar, newMetaKindVars,
   newMetaTyVarTyAtLevel, newConcreteTyVarTyAtLevel, substConcreteTvOrigin,
-  newAnonMetaTyVar, newConcreteTyVar,
+  newAnonMetaTyVar, newConcreteTyVar, mkConcreteInfo,
   cloneMetaTyVar, cloneMetaTyVarWithInfo,
   newCycleBreakerTyVar,
-
   newMultiplicityVar,
+
   readMetaTyVar, writeMetaTyVar, writeMetaTyVarRef,
   newTauTvDetailsAtLevel, newMetaDetails, newMetaTyVarName,
   isFilledMetaTyVar_maybe, isFilledMetaTyVar, isUnfilledMetaTyVar,
@@ -42,32 +39,29 @@ module GHC.Tc.Utils.TcMType (
   -- Creating new evidence variables
   newEvVar, newEvVars, newDict,
   newWantedWithLoc, newWanted, newWanteds, cloneWanted, cloneWC, cloneWantedCtEv,
-  emitWanted, emitWantedEq, emitWantedEvVar, emitWantedEvVars,
-  emitWantedEqs,
+  emitWanted, emitWantedEq, emitWantedEvVar,
+  emitWantedEqs, emitNewExprHole,
   newTcEvBinds, newNoTcEvBinds, addTcEvBind,
-  emitNewExprHole,
 
-  newCoercionHole,
-  fillCoercionHole, isFilledCoercionHole,
+  newCoercionHole, fillCoercionHole, isFilledCoercionHole,
   checkCoercionHole,
 
   newImplication,
 
   --------------------------------
   -- Instantiation
-  newMetaTyVars, newMetaTyVarX, newMetaTyVarsX, newMetaTyVarBndrsX,
+  newMetaTyVars, newMetaTyVarX, newMetaTyVarsX,
   newMetaTyVarTyVarX,
   newTyVarTyVar, cloneTyVarTyVar,
-  newConcreteTyVarX,
   newPatTyVar, newSkolemTyVar, newWildCardX,
 
   --------------------------------
   -- Expected types
   ExpType(..), ExpSigmaType, ExpRhoType,
   mkCheckExpType, newInferExpType, newInferExpTypeFRR,
-  tcInfer, tcInferFRR,
+  runInfer, runInferRho, runInferSigma, runInferKind, runInferRhoFRR, runInferSigmaFRR,
   readExpType, readExpType_maybe, readScaledExpType,
-  expTypeToType, scaledExpTypeToType,
+  expTypeToType, scaledExpTypeToType, adjustExpTypeForCaseBranches,
   checkingExpType_maybe, checkingExpType,
   inferResultToType, ensureMonoType, promoteTcType,
 
@@ -94,7 +88,7 @@ module GHC.Tc.Utils.TcMType (
   -- * Other HsSyn functions
   mkHsDictLet, mkHsApp,
   mkHsAppTy, mkHsCaseAlt,
-  tcShortCutLit, shortCutLit, hsOverLitName,
+  tcShortCutLit, shortCutLit, hsOverLitKnownOcc,
   conLikeResTy
   ) where
 
@@ -116,7 +110,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Errors.Types
 import GHC.Tc.Zonk.TcType
 
-import GHC.Builtin.Names
+import GHC.Builtin.KnownOccs
 
 import GHC.Core.ConLike
 import GHC.Core.DataCon
@@ -133,10 +127,9 @@ import GHC.Core.UsageEnv
 import GHC.Types.Var
 import GHC.Types.Id as Id
 import GHC.Types.Name
-import GHC.Types.SourceText
 import GHC.Types.Var.Set
 
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import GHC.Types.Var.Env
 import GHC.Types.Unique.Set
 import GHC.Types.Basic ( TypeOrKind(..)
@@ -154,8 +147,9 @@ import GHC.Utils.Constants (debugIsOn)
 import Control.Monad
 import Data.IORef
 import GHC.Data.Maybe
-import qualified Data.Semigroup as Semi
 import GHC.Types.Name.Reader
+
+import qualified Data.Semigroup as Semi
 
 {-
 ************************************************************************
@@ -206,7 +200,7 @@ newWantedWithLoc loc pty
          WantedCt { ctev_dest      = dst
                   , ctev_pred      = pty
                   , ctev_loc       = loc
-                  , ctev_rewriters = emptyRewriterSet }
+                  , ctev_rewriters = emptyCoHoleSet }
 
 -- | Create a new Wanted constraint with the given 'CtOrigin', and
 -- location information taken from the 'TcM' environment.
@@ -282,7 +276,7 @@ emitWantedEq origin t_or_k role ty1 ty2
            WantedCt { ctev_pred      = pty
                     , ctev_dest      = HoleDest hole
                     , ctev_loc       = loc
-                    , ctev_rewriters = emptyRewriterSet }
+                    , ctev_rewriters = emptyCoHoleSet }
        ; return (HoleCo hole) }
   where
     pty = mkEqPredRole role ty1 ty2
@@ -296,12 +290,9 @@ emitWantedEvVar origin ty
        ; let ctev = WantedCt { ctev_pred      = ty
                              , ctev_dest      = EvVarDest new_cv
                              , ctev_loc       = loc
-                             , ctev_rewriters = emptyRewriterSet }
+                             , ctev_rewriters = emptyCoHoleSet }
        ; emitSimple $ mkNonCanonical $ CtWanted ctev
        ; return new_cv }
-
-emitWantedEvVars :: CtOrigin -> [TcPredType] -> TcM [EvVar]
-emitWantedEvVars orig = mapM (emitWantedEvVar orig)
 
 -- | Emit a new wanted expression hole
 emitNewExprHole :: RdrName         -- of the hole
@@ -350,32 +341,13 @@ newImplication
          (implicationPrototype (mkCtLocEnv env))
            { ic_warn_inaccessible = warn_inaccessible && not in_gen_code }
 
-{-
-************************************************************************
-*                                                                      *
-        Coercion holes
-*                                                                      *
-************************************************************************
--}
-
 newCoercionHole :: TcPredType -> TcM CoercionHole
 -- For the Bool, see (EIK2) in Note [Equalities with heterogeneous kinds]
 newCoercionHole pred_ty
   = do { co_var <- newEvVar pred_ty
        ; traceTc "New coercion hole:" (ppr co_var <+> dcolon <+> ppr pred_ty)
        ; ref <- newMutVar Nothing
-       ; return $ CoercionHole { ch_co_var = co_var, ch_ref = ref } }
-
--- | Put a value in a coercion hole
-fillCoercionHole :: CoercionHole -> Coercion -> TcM ()
-fillCoercionHole (CoercionHole { ch_ref = ref, ch_co_var = cv }) co = do
-  when debugIsOn $ do
-    cts <- readTcRef ref
-    whenIsJust cts $ \old_co ->
-      pprPanic "Filling a filled coercion hole" (ppr cv $$ ppr co $$ ppr old_co)
-  traceTc "Filling coercion hole" (ppr cv <+> text ":=" <+> ppr co)
-  writeTcRef ref (Just co)
-
+       ; return $ CH { ch_co_var = co_var, ch_ref = ref } }
 
 {- **********************************************************************
 *
@@ -441,30 +413,29 @@ See test case T21325.
 
 -- actual data definition is in GHC.Tc.Utils.TcType
 
-newInferExpType :: TcM ExpType
-newInferExpType = new_inferExpType Nothing
+newInferExpType :: InferInstFlag -> TcM ExpType
+newInferExpType iif = new_inferExpType iif IFRR_Any
 
-newInferExpTypeFRR :: FixedRuntimeRepContext -> TcM ExpTypeFRR
-newInferExpTypeFRR frr_orig
+newInferExpTypeFRR :: InferInstFlag -> FixedRuntimeRepContext -> TcM ExpTypeFRR
+newInferExpTypeFRR iif frr_orig
   = do { th_lvl <- getThLevel
-       ; if
-          -- See [Wrinkle: Typed Template Haskell]
-          -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | TypedBrack _ <- th_lvl
-          -> new_inferExpType Nothing
+       ; let mb_frr = case th_lvl of
+                        TypedBrack {} -> IFRR_Any
+                        _             -> IFRR_Check frr_orig
+               -- mb_frr: see [Wrinkle: Typed Template Haskell]
+               -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
 
-          | otherwise
-          -> new_inferExpType (Just frr_orig) }
+       ; new_inferExpType iif mb_frr }
 
-new_inferExpType :: Maybe FixedRuntimeRepContext -> TcM ExpType
-new_inferExpType mb_frr_orig
+new_inferExpType :: InferInstFlag -> InferFRRFlag -> TcM ExpType
+new_inferExpType iif ifrr
   = do { u <- newUnique
        ; tclvl <- getTcLevel
        ; traceTc "newInferExpType" (ppr u <+> ppr tclvl)
        ; ref <- newMutVar Nothing
        ; return (Infer (IR { ir_uniq = u, ir_lvl = tclvl
-                           , ir_ref = ref
-                           , ir_frr = mb_frr_orig })) }
+                           , ir_inst = iif, ir_frr  = ifrr
+                           , ir_ref  = ref })) }
 
 -- | Extract a type out of an ExpType, if one exists. But one should always
 -- exist. Unless you're quite sure you know what you're doing.
@@ -518,12 +489,23 @@ inferResultToType (IR { ir_uniq = u, ir_lvl = tc_lvl
   where
     -- See Note [TcLevel of ExpType]
     new_meta = case mb_frr of
-      Nothing  ->  do { rr  <- newMetaTyVarTyAtLevel tc_lvl runtimeRepTy
+      IFRR_Any ->  do { rr  <- newMetaTyVarTyAtLevel tc_lvl runtimeRepTy
                       ; newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr) }
-      Just frr -> mdo { rr  <- newConcreteTyVarTyAtLevel conc_orig tc_lvl runtimeRepTy
-                      ; tau <- newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr)
-                      ; let conc_orig = ConcreteFRR $ FixedRuntimeRepOrigin tau frr
-                      ; return tau }
+      IFRR_Check frr -> mdo { rr  <- newConcreteTyVarTyAtLevel conc_orig tc_lvl runtimeRepTy
+                            ; tau <- newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr)
+                            ; let conc_orig = ConcreteFRR $ FixedRuntimeRepOrigin tau frr
+                            ; return tau }
+
+adjustExpTypeForCaseBranches :: ExpRhoType -> [branch] -> ExpRhoType
+-- See Note [fillInferResult: multiple branches]
+adjustExpTypeForCaseBranches exp_ty branches
+  = case exp_ty of
+      Infer ir | IR { ir_inst = IIF_Sigma } <- ir
+               , branches `lengthAtLeast` 2
+               -> Infer (ir { ir_inst = IIF_DeepRho })
+               | otherwise
+               -> exp_ty
+      Check {} -> exp_ty
 
 {- Note [inferResultToType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -540,20 +522,31 @@ Note [fillInferResult] in GHC.Tc.Utils.Unify.
 -- | Infer a type using a fresh ExpType
 -- See also Note [ExpType] in "GHC.Tc.Utils.TcMType"
 --
--- Use 'tcInferFRR' if you require the type to have a fixed
+-- Use 'runInferFRR' if you require the type to have a fixed
 -- runtime representation.
-tcInfer :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
-tcInfer = tc_infer Nothing
+runInferSigma :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+runInferSigma = runInfer IIF_Sigma IFRR_Any
 
--- | Like 'tcInfer', except it ensures that the resulting type
+runInferRho :: (ExpRhoType -> TcM a) -> TcM (a, TcRhoType)
+runInferRho = runInfer IIF_DeepRho IFRR_Any
+
+runInferKind :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+-- Used for kind-checking types, where we never want deep instantiation,
+-- nor FRR checks
+runInferKind = runInfer IIF_Sigma IFRR_Any
+
+-- | Like 'runInferRho', except it ensures that the resulting type
 -- has a syntactically fixed RuntimeRep as per Note [Fixed RuntimeRep] in
 -- GHC.Tc.Utils.Concrete.
-tcInferFRR :: FixedRuntimeRepContext -> (ExpSigmaTypeFRR -> TcM a) -> TcM (a, TcSigmaTypeFRR)
-tcInferFRR frr_orig = tc_infer (Just frr_orig)
+runInferRhoFRR :: FixedRuntimeRepContext -> (ExpRhoTypeFRR -> TcM a) -> TcM (a, TcRhoTypeFRR)
+runInferRhoFRR frr_orig = runInfer IIF_DeepRho (IFRR_Check frr_orig)
 
-tc_infer :: Maybe FixedRuntimeRepContext -> (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
-tc_infer mb_frr tc_check
-  = do { res_ty <- new_inferExpType mb_frr
+runInferSigmaFRR :: FixedRuntimeRepContext -> (ExpSigmaTypeFRR -> TcM a) -> TcM (a, TcSigmaTypeFRR)
+runInferSigmaFRR frr_orig = runInfer IIF_Sigma (IFRR_Check frr_orig)
+
+runInfer :: InferInstFlag -> InferFRRFlag -> (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+runInfer iif mb_frr tc_check
+  = do { res_ty <- new_inferExpType iif mb_frr
        ; result <- tc_check res_ty
        ; res_ty <- readExpType res_ty
        ; return (result, res_ty) }
@@ -575,7 +568,7 @@ ensureMonoType res_ty
   = return ()
   | otherwise
   = do { mono_ty <- newOpenFlexiTyVarTy
-       ; _co <- unifyInvisibleType res_ty mono_ty
+       ; _co <- unifyInvisibleType InvisibleKind res_ty mono_ty
        ; return () }
 
 promoteTcType :: TcLevel -> TcType -> TcM (TcCoercionN, TcType)
@@ -601,7 +594,7 @@ promoteTcType dest_lvl ty
                 -- where alpha and rr are fresh and from level dest_lvl
       = do { rr      <- newMetaTyVarTyAtLevel dest_lvl runtimeRepTy
            ; prom_ty <- newMetaTyVarTyAtLevel dest_lvl (mkTYPEapp rr)
-           ; co <- unifyInvisibleType ty prom_ty
+           ; co <- unifyInvisibleType InvisibleKind ty prom_ty
            ; return (co, prom_ty) }
 
 {- Note [Promoting a type]
@@ -707,25 +700,28 @@ used for ScopedTypeVariables in patterns, to make sure these type
 variables only refer to other type variables, but this restriction was
 dropped, and ScopedTypeVariables can now refer to full types (GHC
 Proposal 29).
+
+Note [Name of a unification variable]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We give unification variables a /System/ Name, which is treated specially
+in two ways
+
+* It is eagerly elmininated the the unifier; see
+  GHC.Tc.Utils.Unify.nicer_to_update_tv1, and
+  GHC.Tc.Solver.Equality.canEqTyVarTyVar (nicer_to_update_tv2)
+
+* It influences the way it is tidied; see TypeRep.tidyTyVarBndr.
 -}
 
 newMetaTyVarName :: FastString -> TcM Name
--- Makes a /System/ Name, which is eagerly eliminated by
--- the unifier; see GHC.Tc.Utils.Unify.nicer_to_update_tv1, and
--- GHC.Tc.Solver.Equality.canEqTyVarTyVar (nicer_to_update_tv2)
+-- Makes a /System/ Name; see Note [Name of a unification variable]
 newMetaTyVarName str
   = newSysName (mkTyVarOccFS str)
 
 cloneMetaTyVarName :: Name -> TcM Name
+-- Makes a /System/ Name; see Note [Name of a unification variable]
 cloneMetaTyVarName name
   = newSysName (nameOccName name)
-         -- See Note [Name of an instantiated type variable]
-
-{- Note [Name of an instantiated type variable]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-At the moment we give a unification variable a System Name, which
-influences the way it is tidied; see TypeRep.tidyTyVarBndr.
--}
 
 metaInfoToTyVarName :: MetaInfo -> FastString
 metaInfoToTyVarName  meta_info =
@@ -788,17 +784,20 @@ newConcreteTyVar :: HasDebugCallStack => ConcreteTvOrigin
                  -> FastString -> TcKind -> TcM TcTyVar
 newConcreteTyVar reason fs kind
   = assertPpr (isConcreteType kind) assert_msg $
-  do { th_lvl <- getThLevel
-     ; if
-        -- See [Wrinkle: Typed Template Haskell]
-        -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-        | TypedBrack _ <- th_lvl
-        -> newNamedAnonMetaTyVar fs TauTv kind
-
-        | otherwise
-        -> newNamedAnonMetaTyVar fs (ConcreteTv reason) kind }
+  do { info <- mkConcreteInfo reason
+     ; newNamedAnonMetaTyVar fs info kind }
   where
     assert_msg = text "newConcreteTyVar: non-concrete kind" <+> ppr kind
+
+mkConcreteInfo :: ConcreteTvOrigin -> TcM MetaInfo
+-- Usually returns (ConcreteTv origin); but if we are in a typed
+-- Template Haskell bracket, return TauTv
+-- See [Wrinkle: Typed Template Haskell] in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete
+mkConcreteInfo conc_origin
+  = do { th_lvl <- getThLevel
+       ; case th_lvl of
+            TypedBrack {} -> return TauTv
+            _             -> return (ConcreteTv conc_origin) }
 
 newPatTyVar :: Name -> Kind -> TcM TcTyVar
 newPatTyVar name kind
@@ -969,35 +968,18 @@ newOpenFlexiTyVar
   = do { kind <- newOpenTypeKind
        ; newFlexiTyVar kind }
 
--- | Like 'newOpenFlexiTyVar', but ensures the type variable has a
+-- | Like 'newOpenFlexiTyVarTy', but ensures the type variable has a
 -- syntactically fixed RuntimeRep in the sense of Note [Fixed RuntimeRep]
 -- in GHC.Tc.Utils.Concrete.
-newOpenFlexiFRRTyVar :: FixedRuntimeRepContext -> TcM TcTyVar
-newOpenFlexiFRRTyVar frr_ctxt
-  = do { th_lvl <- getThLevel
-       ; case th_lvl of
-          { TypedBrack _ -- See [Wrinkle: Typed Template Haskell]
-              -> newOpenFlexiTyVar -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          ; _ ->
-   mdo { let conc_orig = ConcreteFRR $
+newOpenFlexiFRRTyVarTy :: FixedRuntimeRepContext -> TcM TcType
+newOpenFlexiFRRTyVarTy frr_ctxt
+  = mdo { let conc_orig = ConcreteFRR $
                           FixedRuntimeRepOrigin
                             { frr_context = frr_ctxt
                             , frr_type    = mkTyVarTy tv }
-        ; rr <- mkTyVarTy <$> newConcreteTyVar conc_orig (fsLit "cx") runtimeRepTy
-        ; tv <- newFlexiTyVar (mkTYPEapp rr)
-        ; return tv } } }
-
--- | See 'newOpenFlexiFRRTyVar'.
-newOpenFlexiFRRTyVarTy :: FixedRuntimeRepContext -> TcM TcType
-newOpenFlexiFRRTyVarTy frr_ctxt
-  = do { tv <- newOpenFlexiFRRTyVar frr_ctxt
-       ; return (mkTyVarTy tv) }
-
-newOpenBoxedTypeKind :: TcM TcKind
-newOpenBoxedTypeKind
-  = do { lev <- newFlexiTyVarTy (mkTyConTy levityTyCon)
-       ; let rr = mkTyConApp boxedRepDataConTyCon [lev]
-       ; return (mkTYPEapp rr) }
+        ; rr_tv <- newConcreteTyVar conc_orig (fsLit "cx") runtimeRepTy
+        ; tv <- newFlexiTyVar (mkTYPEapp (mkTyVarTy rr_tv))
+        ; return (mkTyVarTy tv) }
 
 newMetaTyVars :: [TyVar] -> TcM (Subst, [TcTyVar])
 -- Instantiate with META type variables
@@ -1013,33 +995,14 @@ newMetaTyVarsX :: Subst -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- Just like newMetaTyVars, but start with an existing substitution.
 newMetaTyVarsX subst = mapAccumLM newMetaTyVarX subst
 
-newMetaTyVarBndrsX :: Subst -> [VarBndr TyVar vis] -> TcM (Subst, [VarBndr TcTyVar vis])
-newMetaTyVarBndrsX subst bndrs = do
-  (subst, bndrs') <- newMetaTyVarsX subst (binderVars bndrs)
-  pure (subst, zipWith mkForAllTyBinder flags bndrs')
-  where
-    flags = binderFlags bndrs
-
 newMetaTyVarX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 -- Make a new unification variable tyvar whose Name and Kind come from
 -- an existing TyVar. We substitute kind variables in the kind.
 newMetaTyVarX = new_meta_tv_x TauTv
 
--- | Like 'newMetaTyVarX', but for concrete type variables.
-newConcreteTyVarX :: ConcreteTvOrigin -> Subst -> TyVar -> TcM (Subst, TcTyVar)
-newConcreteTyVarX conc subst tv
-  = do { th_lvl <- getThLevel
-       ; if
-          -- See [Wrinkle: Typed Template Haskell]
-          -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | TypedBrack _  <- th_lvl
-          -> new_meta_tv_x TauTv subst tv
-          | otherwise
-          -> new_meta_tv_x (ConcreteTv conc) subst tv }
-
 newMetaTyVarTyVarX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 -- Just like newMetaTyVarX, but make a TyVarTv
-newMetaTyVarTyVarX subst tv = new_meta_tv_x TyVarTv subst tv
+newMetaTyVarTyVarX = new_meta_tv_x TyVarTv
 
 newWildCardX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 newWildCardX subst tv
@@ -1112,7 +1075,7 @@ When we instantiate 'coerce' in the previous example, we obtain a substitution
 
 which we need to apply to the 'frr_type' field in order for the type variables
 in the error message to match up.
-This is done by the call to 'substConcreteTvOrigin' in 'instantiateSigma'.
+This is done by the call to 'substConcreteTvOrigin' in 'instantiateSigmaQL'.
 
 Wrinkle [Extending the substitution]
 
@@ -1122,7 +1085,7 @@ Wrinkle [Extending the substitution]
     bad2 :: forall {s} (z :: TYPE s). z -> z
     bad2 = coerce @z
 
-  Then 'instantiateSigma' will only instantiate the inferred type variable 'r'
+  Then 'instantiateSigmaQL' will only instantiate the inferred type variable 'r'
   of 'coerce', as it needs to leave 'a' un-instantiated so that the visible
   type application '@z' makes sense. In this case, we end up with a substitution
 
@@ -1460,7 +1423,7 @@ collect_cand_qtvs orig_ty is_dep cur_lvl bound dvs ty
     -- Uses accumulating-parameter style
     go dv (AppTy t1 t2)       = foldlM go dv [t1, t2]
     go dv (TyConApp tc tys)   = go_tc_args dv (tyConBinders tc) tys
-    go dv (FunTy _ w arg res) = foldlM go dv [w, arg, res]
+    go dv (FunTy _ w arg res) = foldlM go dv [arg, w, res]
     go dv (LitTy {})          = return dv
     go dv (CastTy ty co)      = do { dv1 <- go dv ty
                                    ; collect_cand_qtvs_co orig_ty cur_lvl bound dv1 co }
@@ -1573,13 +1536,13 @@ collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
     go_co dv (HoleCo hole)
       = do m_co <- liftZonkM (unpackCoercionHole_maybe hole)
            case m_co of
-             Just co -> go_co dv co
-             Nothing -> go_cv dv (coHoleCoVar hole)
+             Just (CPH { cph_co = co }) -> go_co dv co
+             Nothing                    -> go_cv dv (coHoleCoVar hole)
 
     go_co dv (CoVarCo cv) = go_cv dv cv
 
     go_co dv (ForAllCo { fco_tcv = tcv, fco_kind = kind_co, fco_body = co })
-      = do { dv1 <- go_co dv kind_co
+      = do { dv1 <- go_mco dv kind_co
            ; collect_cand_qtvs_co orig_ty cur_lvl (bound `extendVarSet` tcv) dv1 co }
 
     go_mco dv MRefl    = return dv
@@ -1619,7 +1582,7 @@ against any specification -- just suboptimal and confounding to users.
 
 Note [Recurring into kinds for candidateQTyVars]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-First, read Note [Closing over free variable kinds] in GHC.Core.TyCo.FVs, paying
+First, read Note [Computing deep free variables] in GHC.Core.TyCo.FVs, paying
 attention to the end of the Note about using an empty bound set when
 traversing a variable's kind.
 
@@ -1636,7 +1599,7 @@ type inference, which is seeded by the renamer and its insistence to
 use different Uniques for different variables. (In contrast, the Core
 functions work on the output of optimizations, which may introduce
 shadowing.) Without shadowing, the problem studied by
-Note [Closing over free variable kinds] in GHC.Core.TyCo.FVs cannot happen.
+Note [Computing deep free variables] in GHC.Core.TyCo.FVs cannot happen.
 
 Why it is necessary:
 Wiping the bound set would be just plain wrong here. Consider
@@ -1647,7 +1610,7 @@ We really don't want to think k1 and k2 are free here. (It's true that we'll
 never be able to fill in `hole`, but we don't want to go off the rails just
 because we have an insoluble coercion hole.) So: why is it wrong to wipe
 the bound variables here but right in Core? Because the final statement
-in Note [Closing over free variable kinds] in GHC.Core.TyCo.FVs is wrong: not
+in Note [Computing deep free variables] in GHC.Core.TyCo.FVs is wrong: not
 every variable is either free or bound. A variable can be a hole, too!
 The reasoning in that Note then breaks down.
 
@@ -2328,64 +2291,85 @@ to short-cut the process for built-in types.  We can do this in two places;
 -}
 
 tcShortCutLit :: HsOverLit GhcRn -> ExpRhoType -> TcM (Maybe (HsOverLit GhcTc))
-tcShortCutLit lit@(OverLit { ol_val = val, ol_ext = OverLitRn rebindable _}) exp_res_ty
+tcShortCutLit (OverLit { ol_val = val, ol_ext = OverLitRn rebindable _}) exp_res_ty
   | not rebindable
   , Just res_ty <- checkingExpType_maybe exp_res_ty
   = do { dflags <- getDynFlags
        ; let platform = targetPlatform dflags
        ; case shortCutLit platform val res_ty of
-            Just expr -> return $ Just $
-                         lit { ol_ext = OverLitTc False expr res_ty }
+            Just expr -> return $ Just $ OverLit
+                           { ol_ext = OverLitTc False expr res_ty
+                           , ol_val = tcOverLitVal val }
             Nothing   -> return Nothing }
   | otherwise
   = return Nothing
 
-shortCutLit :: Platform -> OverLitVal -> TcType -> Maybe (HsExpr GhcTc)
+-- | Takes an overloaded literal of either 'GhcPs' or 'GhcRn' pass and
+-- does two operations:
+--   1. Lifts the overloaded liter into a Haskell expression
+--   2. Type-checks the overloaded literal value.
+--
+-- The both results are lazily returned because:
+--   * Every call site requires the 'HsExpr GhcTc' result.
+--   * Some call sites requires the 'OverLitVal GhcTc' result.
+--
+-- Note [Short cut for overloaded literals]
+shortCutLit :: Platform -> OverLitVal (GhcPass p) -> TcType -> Maybe (HsExpr GhcTc)
 shortCutLit platform val res_ty
   = case val of
-      HsIntegral int_lit    -> go_integral int_lit
+      HsIntegral    int_lit -> go_integral    int_lit
       HsFractional frac_lit -> go_fractional frac_lit
-      HsIsString s src      -> go_string   s src
+      HsIsString    str_lit -> go_string      str_lit
   where
-    go_integral int@(IL src neg i)
+    go_integral iLit@(IL src neg i)
       | isIntTy res_ty  && platformInIntRange  platform i
-      = Just (HsLit noExtField (HsInt noExtField int))
+      = Just (HsLit noExtField (HsInt noExtField iLit'))
       | isWordTy res_ty && platformInWordRange platform i
       = Just (mkLit wordDataCon (HsWordPrim src i))
       | isIntegerTy res_ty
       = Just (HsLit noExtField (XLit $ HsInteger src i res_ty))
       | otherwise
-      = go_fractional (integralFractionalLit neg i)
+      = go_fractional (mkFractionalLitFromInteger neg i)
+
         -- The 'otherwise' case is important
         -- Consider (3 :: Float).  Syntactically it looks like an IntLit,
         -- so we'll call shortCutIntLit, but of course it's a float
         -- This can make a big difference for programs with a lot of
         -- literals, compiled without -O
+      where
+        iLit' = tcIntegralLit iLit
 
-    go_fractional f
-      | isFloatTy res_ty && valueInRange  = Just (mkLit floatDataCon  (HsFloatPrim noExtField f))
-      | isDoubleTy res_ty && valueInRange = Just (mkLit doubleDataCon (HsDoublePrim noExtField f))
-      | otherwise                         = Nothing
+    go_fractional fLit
+      | valueInRange && isFloatTy  res_ty = Just (mkLit  floatDataCon ( HsFloatPrim noExtField fLit'))
+      | valueInRange && isDoubleTy res_ty = Just (mkLit doubleDataCon (HsDoublePrim noExtField fLit'))
+      | otherwise = Nothing
       where
         valueInRange =
-          case f of
-            FL { fl_exp = e } -> (-100) <= e && e <= 100
+          let e = fl_exp fLit
+          in  (-100) <= e && e <= 100
             -- We limit short-cutting Fractional Literals to when their power of 10
             -- is less than 100, which ensures desugaring isn't slow.
 
-    go_string src s
-      | isStringTy res_ty = Just (HsLit noExtField (HsString src s))
-      | otherwise         = Nothing
+        fLit' = tcFractionalLit fLit
+
+    go_string sLit
+      | isStringTy res_ty = Just (HsLit noExtField hsStr)
+      | otherwise = Nothing
+      where
+        hsStr = HsString
+          (stringLitSourceText sLit)
+          (sl_fs sLit)
+
 
 mkLit :: DataCon -> HsLit GhcTc -> HsExpr GhcTc
 mkLit con lit = HsApp noExtField (nlHsDataCon con) (nlHsLit lit)
 
 ------------------------------
-hsOverLitName :: OverLitVal -> Name
+hsOverLitKnownOcc :: OverLitVal (GhcPass p) -> KnownOcc
 -- Get the canonical 'fromX' name for a particular OverLitVal
-hsOverLitName (HsIntegral {})   = fromIntegerName
-hsOverLitName (HsFractional {}) = fromRationalName
-hsOverLitName (HsIsString {})   = fromStringName
+hsOverLitKnownOcc (HsIntegral {})   = fromIntegerClassOpOcc
+hsOverLitKnownOcc (HsFractional {}) = fromRationalClassOpOcc
+hsOverLitKnownOcc (HsIsString {})   = fromStringClassOpOcc
 
 
 {- *********************************************************************

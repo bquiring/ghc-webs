@@ -1,11 +1,5 @@
 {-# LANGUAGE ApplicativeDo              #-}
-{-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE DerivingVia                #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE NamedFieldPuns             #-}
-{-# LANGUAGE RankNTypes                 #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 
 {- | This module implements 'addHaddockToModule', which inserts Haddock
@@ -67,7 +61,7 @@ import {-# SOURCE #-} GHC.Parser (parseIdentifier)
 import GHC.Parser.Lexer
 import GHC.Parser.HaddockLex
 import GHC.Parser.Errors.Types
-import GHC.Utils.Misc (mergeListsBy, filterOut, (<&&>))
+import GHC.Utils.Misc ( filterOut, (<&&>))
 import qualified GHC.Data.Strict as Strict
 
 {- Note [Adding Haddock comments to the syntax tree]
@@ -271,7 +265,16 @@ instance HasHaddock (Located (HsModule GhcPs)) where
     --    ) where
     --
     -- Only do this when the export list exists.
-    hsmodExports' <- traverse @Maybe addHaddock (hsmodExports mod)
+    let
+      (open_paren, close_paren, _) = am_exports mod_anns
+      l_exports = combineSrcSpans (getEpTokenSrcSpan open_paren) (getEpTokenSrcSpan close_paren)
+    hsmodExports' <- traverse @Maybe
+      (\exports ->
+        extendHdkA l_exports $ do
+          exports' <- addHaddockInterleaveItems EpNoLayout mkDocIE exports
+          registerEpTokenHdkA close_paren  -- Do not consume comments after the closing parenthesis
+          pure exports')
+      (hsmodExports mod)
 
     -- Step 3, register the import section to reject invalid comments:
     --
@@ -295,26 +298,13 @@ instance HasHaddock (Located (HsModule GhcPs)) where
     pure $ L l_mod $
       mod { hsmodExports = hsmodExports'
           , hsmodDecls = hsmodDecls'
-          , hsmodExt = (hsmodExt mod) { hsmodHaddockModHeader = headerDocs } }
+          , hsmodExt = (hsmodExt mod) { hsmodHaddockModHeader = headerDocs } }
 
-lexHsDocString :: HsDocString -> HsDoc GhcPs
+lexHsDocString :: HsDocString GhcPs -> HsDoc GhcPs
 lexHsDocString = lexHsDoc parseIdentifier
 
-lexLHsDocString :: Located HsDocString -> LHsDoc GhcPs
+lexLHsDocString :: Located (HsDocString GhcPs) -> LHsDoc GhcPs
 lexLHsDocString = fmap lexHsDocString
-
--- | Only for module exports, not module imports.
---
---    module M (a, b, c) where   -- use on this [LIE GhcPs]
---    import I (a, b, c)         -- do not use here!
---
--- Imports cannot have documentation comments anyway.
-instance HasHaddock (LocatedLI [LocatedA (IE GhcPs)]) where
-  addHaddock (L l_exports exports) =
-    extendHdkA (locA l_exports) $ do
-      exports' <- addHaddockInterleaveItems EpNoLayout mkDocIE exports
-      registerLocHdkA (srcLocSpan (srcSpanEnd (locA l_exports))) -- Do not consume comments after the closing parenthesis
-      pure $ L l_exports exports'
 
 -- Needed to use 'addHaddockInterleaveItems' in 'instance HasHaddock (Located [LIE GhcPs])'.
 instance HasHaddock (LocatedA (IE GhcPs)) where
@@ -327,7 +317,7 @@ instance HasHaddock (LocatedA (IE GhcPs)) where
       let ie' = case ie of
             IEVar ext nm _                 -> IEVar ext nm mb_ldoc
             IEThingAbs ext nm _            -> IEThingAbs ext nm mb_ldoc
-            IEThingAll ext nm _            -> IEThingAll ext nm mb_ldoc
+            IEThingAll ext ns nm _         -> IEThingAll ext ns nm mb_ldoc
             IEThingWith ext nm wild subs _ -> IEThingWith ext nm wild subs mb_ldoc
             x                              -> x
       pure $ L l_export ie'
@@ -402,8 +392,9 @@ addHaddockInterleaveItems layout get_doc_item = go
     with_layout = case layout of
       EpNoLayout -> id
       EpExplicitBraces{} -> id
-      EpVirtualBraces n ->
-        let loc_range = mempty { loc_range_col = ColumnFrom (n+1) }
+      EpVirtualBraces n' ->
+        let n = getEpaLocationCol n'
+            loc_range = mempty { loc_range_col = ColumnFrom (n+1) }
         in hoistHdkA (inLocRange loc_range)
 
 instance HasHaddock (LocatedA (HsDecl GhcPs)) where
@@ -442,10 +433,10 @@ instance HasHaddock (HsDecl GhcPs) where
   --      :: Int  -- ^ Comment on Int
   --      -> Bool -- ^ Comment on Bool
   --
-  addHaddock (SigD _ (TypeSig x names t)) = do
+  addHaddock (SigD _ (TypeSig x mods names t)) = do
       traverse_ registerHdkA names
       t' <- addHaddock t
-      pure (SigD noExtField (TypeSig x names t'))
+      pure (SigD noExtField (TypeSig x mods names t'))
 
   -- Pattern synonym type signatures:
   --
@@ -491,7 +482,7 @@ instance HasHaddock (HsDecl GhcPs) where
   --     deriving newtype (Ord {- ^ Comment on Ord N -})
   --
   addHaddock (TyClD x decl)
-    | DataDecl { tcdDExt, tcdLName, tcdTyVars, tcdFixity, tcdDataDefn = defn } <- decl
+    | DataDecl { tcdDExt, tcdLName, tcdTyVars, tcdFixity, tcdDataDefn = defn, tcdModifiers } <- decl
     = do
         registerHdkA tcdLName
         defn' <- addHaddock defn
@@ -499,7 +490,7 @@ instance HasHaddock (HsDecl GhcPs) where
           TyClD x (DataDecl {
             tcdDExt,
             tcdLName, tcdTyVars, tcdFixity,
-            tcdDataDefn = defn' })
+            tcdDataDefn = defn', tcdModifiers })
 
   -- Class declarations:
   --
@@ -510,24 +501,18 @@ instance HasHaddock (HsDecl GhcPs) where
   --      -- ^ Comment on the second method
   --
   addHaddock (TyClD _ decl)
-    | ClassDecl { tcdCExt = (x, layout, NoAnnSortKey),
+    | ClassDecl { tcdCExt = (x, layout),
                   tcdCtxt, tcdLName, tcdTyVars, tcdFixity, tcdFDs,
-                  tcdSigs, tcdMeths, tcdATs, tcdATDefs } <- decl
+                  tcdDecls, tcdModifiers } <- decl
     = do
         registerHdkA tcdLName
         registerEpTokenHdkA (acd_where x)
-        where_cls' <-
-          addHaddockInterleaveItems layout (mkDocHsDecl layout) $
-          flattenBindsAndSigs (tcdMeths, tcdSigs, tcdATs, tcdATDefs, [], [])
+        tcdDecls' <- addHaddockInterleaveItems layout (mkDocHsDecl layout) tcdDecls
         pure $
-          let (tcdMeths', tcdSigs', tcdATs', tcdATDefs', _, tcdDocs) = partitionBindsAndSigs where_cls'
-              decl' = ClassDecl { tcdCExt = (x, layout, NoAnnSortKey)
+          let decl' = ClassDecl { tcdCExt = (x, layout)
                                 , tcdCtxt, tcdLName, tcdTyVars, tcdFixity, tcdFDs
-                                , tcdSigs = tcdSigs'
-                                , tcdMeths = tcdMeths'
-                                , tcdATs = tcdATs'
-                                , tcdATDefs = tcdATDefs'
-                                , tcdDocs }
+                                , tcdDecls = tcdDecls'
+                                , tcdModifiers }
           in TyClD noExtField decl'
 
   -- Data family instances:
@@ -660,7 +645,7 @@ instance HasHaddock (LocatedAn NoEpAnns (HsDerivingClause GhcPs)) where
 --          deriving ( Eq  -- ^ Comment on Eq
 --                   , C a -- ^ Comment on C a
 --                   )
-instance HasHaddock (LocatedC (DerivClauseTys GhcPs)) where
+instance HasHaddock (LocatedA (DerivClauseTys GhcPs)) where
   addHaddock (L l_dct dct) =
     extendHdkA (locA l_dct) $
     case dct of
@@ -710,7 +695,7 @@ instance HasHaddock (LocatedA (ConDecl GhcPs)) where
     extendHdkA (locA l_con_decl) $
     case con_decl of
       ConDeclGADT { con_g_ext, con_names, con_outer_bndrs, con_inner_bndrs
-                  , con_mb_cxt, con_g_args, con_res_ty } -> do
+                  , con_mb_cxt, con_g_args, con_res_ty, con_modifiers } -> do
         con_doc' <- getConDoc (getLocA (NE.head con_names))
         con_g_args' <-
           case con_g_args of
@@ -721,46 +706,46 @@ instance HasHaddock (LocatedA (ConDecl GhcPs)) where
         con_res_ty' <- addHaddock con_res_ty
         pure $ L l_con_decl $
           ConDeclGADT { con_g_ext, con_names,
-                        con_outer_bndrs, con_inner_bndrs, con_mb_cxt,
+                        con_outer_bndrs, con_inner_bndrs, con_mb_cxt, con_modifiers,
                         con_doc = lexLHsDocString <$> con_doc',
                         con_g_args = con_g_args',
                         con_res_ty = con_res_ty' }
-      ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_args } ->
+      ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_args, con_modifiers } ->
         let
           -- See Note [Leading and trailing comments on H98 constructors]
           getTrailingLeading :: HdkM (LocatedA (ConDecl GhcPs))
           getTrailingLeading = do
             con_doc' <- getPrevNextDoc (locA l_con_decl)
             return $ L l_con_decl $
-              ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_args
+              ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_args, con_modifiers
                          , con_doc = lexLHsDocString <$> con_doc' }
 
           -- See Note [Leading and trailing comments on H98 constructors]
           getMixed :: HdkA (LocatedA (ConDecl GhcPs))
           getMixed =
             case con_args of
-              PrefixCon ts -> do
+              PrefixCon x ts -> do
                 con_doc' <- getConDoc (getLocA con_name)
                 ts' <- traverse addHaddock ts
                 pure $ L l_con_decl $
-                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt,
+                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_modifiers,
                                con_doc = lexLHsDocString <$> con_doc',
-                               con_args = PrefixCon ts' }
-              InfixCon t1 t2 -> do
+                               con_args = PrefixCon x ts' }
+              InfixCon x t1 t2 -> do
                 t1' <- addHaddock t1
                 con_doc' <- getConDoc (getLocA con_name)
                 t2' <- addHaddock t2
                 pure $ L l_con_decl $
-                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt,
+                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_modifiers,
                                con_doc = lexLHsDocString <$> con_doc',
-                               con_args = InfixCon t1' t2' }
-              RecCon (L l_rec flds) -> do
+                               con_args = InfixCon x t1' t2' }
+              RecCon x (L l_rec flds) -> do
                 con_doc' <- getConDoc (getLocA con_name)
                 flds' <- traverse addHaddock flds
                 pure $ L l_con_decl $
-                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt,
+                  ConDeclH98 { con_ext, con_name, con_forall, con_ex_tvs, con_mb_cxt, con_modifiers,
                                con_doc = lexLHsDocString <$> con_doc',
-                               con_args = RecCon (L l_rec flds') }
+                               con_args = RecCon x (L l_rec flds') }
         in
           hoistHdkA
             (\m -> do { a <- onlyTrailingOrLeading (locA l_con_decl)
@@ -788,7 +773,7 @@ onlyTrailingOrLeading l = peekHdkM $ do
 -- data/newtype declaration.
 getConDoc
   :: SrcSpan  -- Location of the data constructor
-  -> HdkA (Maybe (Located HsDocString))
+  -> HdkA (Maybe (Located (HsDocString GhcPs)))
 getConDoc l = extendHdkA l $ liftHdkA $ getPrevNextDoc l
 
 instance HasHaddock (LocatedA (HsConDeclRecField GhcPs)) where
@@ -1115,7 +1100,6 @@ runHdkA (HdkA _ m) = unHdkM m mempty
 -- To take it into account, we must register its location using registerLocHdkA
 -- or registerHdkA.
 --
--- See Note [Register keyword location].
 -- See Note [Adding Haddock comments to the syntax tree].
 registerLocHdkA :: SrcSpan -> HdkA ()
 registerLocHdkA l = HdkA (getBufSpan l) (pure ())
@@ -1183,7 +1167,7 @@ data HdkSt =
 -- | Warnings accumulated in HdkM.
 data HdkWarn
   = HdkWarnInvalidComment (PsLocated HdkComment)
-  | HdkWarnExtraComment (Located HsDocString)
+  | HdkWarnExtraComment (Located (HsDocString GhcPs))
 
 -- Restrict the range in which a HdkM computation will look up comments:
 --
@@ -1250,7 +1234,7 @@ peekHdkM m =
       (a, _) -> (a, s)
 
 -- Get the docnext or docprev comment for an AST node at the given source span.
-getPrevNextDoc :: SrcSpan -> HdkM (Maybe (Located HsDocString))
+getPrevNextDoc :: SrcSpan -> HdkM (Maybe (Located (HsDocString GhcPs)))
 getPrevNextDoc l = do
   let (l_start, l_end) = (srcSpanStart l, srcSpanEnd l)
       before_t = locRangeTo (getBufPos l_start)
@@ -1264,7 +1248,7 @@ appendHdkWarning e = HdkM $ \_ hdk_st ->
   let hdk_st' = hdk_st { hdk_st_warnings = e : hdk_st_warnings hdk_st }
   in ((), hdk_st')
 
-selectDocString :: [Located HsDocString] -> HdkM (Maybe (Located HsDocString))
+selectDocString :: [Located (HsDocString GhcPs)] -> HdkM (Maybe (Located (HsDocString GhcPs)))
 selectDocString = select . filterOut (isEmptyDocString . unLoc)
   where
     select [] = return Nothing
@@ -1273,7 +1257,7 @@ selectDocString = select . filterOut (isEmptyDocString . unLoc)
       reportExtraDocs extra_docs
       return (Just doc)
 
-reportExtraDocs :: [Located HsDocString] -> HdkM ()
+reportExtraDocs :: [Located (HsDocString GhcPs)] -> HdkM ()
 reportExtraDocs =
   traverse_ (\extra_doc -> appendHdkWarning (HdkWarnExtraComment extra_doc))
 
@@ -1321,7 +1305,7 @@ mkDocDecl layout (L l_comment hdk_comment)
     indent_mismatch = case layout of
       EpNoLayout -> False
       EpExplicitBraces{} -> False
-      EpVirtualBraces n -> n /= srcSpanStartCol (psRealSpan l_comment)
+      EpVirtualBraces n -> getEpaLocationCol n /= srcSpanStartCol (psRealSpan l_comment)
 
 mkDocIE :: PsLocated HdkComment -> Maybe (LIE GhcPs)
 mkDocIE (L l_comment hdk_comment) =
@@ -1333,11 +1317,11 @@ mkDocIE (L l_comment hdk_comment) =
   where l = noAnnSrcSpan span
         span = mkSrcSpanPs l_comment
 
-mkDocNext :: PsLocated HdkComment -> Maybe (Located HsDocString)
+mkDocNext :: PsLocated HdkComment -> Maybe (Located (HsDocString GhcPs))
 mkDocNext (L l (HdkCommentNext doc)) = Just (L (mkSrcSpanPs l) doc)
 mkDocNext _ = Nothing
 
-mkDocPrev :: PsLocated HdkComment -> Maybe (Located HsDocString)
+mkDocPrev :: PsLocated HdkComment -> Maybe (Located (HsDocString GhcPs))
 mkDocPrev (L l (HdkCommentPrev doc)) = Just (L (mkSrcSpanPs l) doc)
 mkDocPrev _ = Nothing
 
@@ -1461,7 +1445,7 @@ instance Monoid ColumnBound where
 *                                                                      *
 ********************************************************************* -}
 
-mkLHsDocTy :: LHsType GhcPs -> Maybe (Located HsDocString) -> LHsType GhcPs
+mkLHsDocTy :: LHsType GhcPs -> Maybe (Located (HsDocString GhcPs)) -> LHsType GhcPs
 mkLHsDocTy t Nothing = t
 mkLHsDocTy t (Just doc) = L (getLoc t) (HsDocTy noExtField t $ lexLHsDocString doc)
 
@@ -1474,42 +1458,11 @@ getForAllTeleLoc tele =
 getLHsTyVarBndrsLoc :: [LHsTyVarBndr flag GhcPs] -> SrcSpan
 getLHsTyVarBndrsLoc bndrs = foldr combineSrcSpans noSrcSpan $ map getLocA bndrs
 
--- | The inverse of 'partitionBindsAndSigs' that merges partitioned items back
--- into a flat list. Elements are put back into the order in which they
--- appeared in the original program before partitioning, using BufPos to order
--- them.
---
--- Precondition (unchecked): the input lists are already sorted.
-flattenBindsAndSigs
-  :: (LHsBinds GhcPs, [LSig GhcPs], [LFamilyDecl GhcPs],
-      [LTyFamInstDecl GhcPs], [LDataFamInstDecl GhcPs], [LDocDecl GhcPs])
-  -> [LHsDecl GhcPs]
-flattenBindsAndSigs (all_bs, all_ss, all_ts, all_tfis, all_dfis, all_docs) =
-  -- 'cmpBufSpan' is safe here with the following assumptions:
-  --
-  -- - 'LHsDecl' produced by 'decl_cls' in Parser.y always have a 'BufSpan'
-  -- - 'partitionBindsAndSigs' does not discard this 'BufSpan'
-  mergeListsBy cmpBufSpanA [
-    mapLL (\b -> ValD noExtField b) all_bs,
-    mapLL (\s -> SigD noExtField s) all_ss,
-    mapLL (\t -> TyClD noExtField (FamDecl noExtField t)) all_ts,
-    mapLL (\tfi -> InstD noExtField (TyFamInstD noExtField tfi)) all_tfis,
-    mapLL (\dfi -> InstD noExtField (DataFamInstD noExtField dfi)) all_dfis,
-    mapLL (\d -> DocD noExtField d) all_docs
-  ]
-
-cmpBufSpanA :: GenLocated (EpAnn a1) a2 -> GenLocated (EpAnn a3) a2 -> Ordering
-cmpBufSpanA (L la a) (L lb b) = cmpBufSpan (L (locA la) a) (L (locA lb) b)
-
 {- *********************************************************************
 *                                                                      *
 *                   General purpose utilities                          *
 *                                                                      *
 ********************************************************************* -}
-
--- Map a function over a list of located items.
-mapLL :: (a -> b) -> [GenLocated l a] -> [GenLocated l b]
-mapLL f = map (fmap f)
 
 {- Note [Old solution: Haddock in the grammar]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1543,19 +1496,4 @@ that GHC could parse successfully:
     g :: a -> Int
 
 This declaration was accepted by ghc but rejected by ghc -haddock.
--}
-
-{- Note [Register keyword location]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-At the moment, 'addHaddock' erroneously associates some comments with
-constructs that are separated by a keyword. For example:
-
-    data Foo -- | Comment for MkFoo
-      where MkFoo :: Foo
-
-We could use EPA (exactprint annotations) to fix this, but not without
-modification. For example, EpaLocation contains RealSrcSpan but not BufSpan.
-Also, the fix would be more straightforward after #19623.
-
-For examples, see tests/haddock/should_compile_flag_haddock/T17544_kw.hs
 -}

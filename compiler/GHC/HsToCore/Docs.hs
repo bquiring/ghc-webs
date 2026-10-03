@@ -1,5 +1,4 @@
 -- | Extract docs from the renamer output so they can be serialized.
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -124,9 +123,10 @@ mkExportsDocs = foldMap f
     ieExportDoc :: IE GhcRn -> Maybe (ExportDoc GhcRn)
     ieExportDoc (IEVar _ _ doc) = doc
     ieExportDoc (IEThingAbs _ _ doc) = doc
-    ieExportDoc (IEThingAll _ _ doc) = doc
+    ieExportDoc (IEThingAll _ _ _ doc) = doc
     ieExportDoc (IEThingWith _ _ _ _ doc) = doc
     ieExportDoc (IEModuleContents _ _) = Nothing
+    ieExportDoc (IEWholeNamespace _ _) = Nothing
     ieExportDoc (IEGroup _ _ _) = Nothing
     ieExportDoc (IEDoc _ _) = Nothing
     ieExportDoc (IEDocNamed _ _) = Nothing
@@ -175,7 +175,7 @@ mkDocStructureFromExportList mdl import_avails export_list =
     moduleExport alias avails =
         DsiModExport (nubSortNE orig_names) (sortAvails (nubAvails avails))
       where
-        orig_names = M.findWithDefault aliasErr alias aliasMap
+        orig_names = fromMaybe aliasErr (lookupUniqMap aliasMap alias)
         aliasErr = error $ "mkDocStructureFromExportList: "
                            ++ (moduleNameString . moduleName) mdl
                            ++ ": Can't find alias " ++ moduleNameString alias
@@ -185,9 +185,9 @@ mkDocStructureFromExportList mdl import_avails export_list =
                     NonEmpty.toList
 
     -- Map from aliases to true module names.
-    aliasMap :: Map ModuleName (NonEmpty ModuleName)
+    aliasMap :: UniqMap ModuleName (NonEmpty ModuleName)
     aliasMap =
-        M.fromListWith (S.<>) $
+        listToUniqMap_C (S.<>) $
           (this_mdl_name, this_mdl_name :| [])
           : (flip concatMap (M.toList imported) $ \(mdl, imvs) ->
               [(imv_name imv, moduleName mdl :| []) | imv <- imvs])
@@ -317,8 +317,8 @@ getMainDeclBinder _ (ValD _ d) =
     []       -> []
     (name:_) -> [name]
 getMainDeclBinder env (SigD _ d) = sigNameNoLoc env d
-getMainDeclBinder _   (ForD _ (ForeignImport _ name _ _)) = [unLoc name]
-getMainDeclBinder _   (ForD _ (ForeignExport _ _ _ _)) = []
+getMainDeclBinder _   (ForD _ (ForeignImport _ _ name _ _)) = [unLoc name]
+getMainDeclBinder _   (ForD _ (ForeignExport _ _ _ _ _)) = []
 getMainDeclBinder _ _ = []
 
 
@@ -330,13 +330,13 @@ getMainDeclBinder _ _ = []
 -- AST.
 -- See also Note [default method Name] in GHC.Iface.Recomp
 sigNameNoLoc :: forall a . (UnXRec a, HasOccName (IdP a)) => OccEnv (IdP a) -> Sig a -> [IdP a]
-sigNameNoLoc _   (TypeSig    _   ns _)         = map (unXRec @a) ns
+sigNameNoLoc _   (TypeSig    _ _     ns _)     = map (unXRec @a) ns
 sigNameNoLoc _   (ClassOpSig _ False ns _)     = map (unXRec @a) ns
 sigNameNoLoc env (ClassOpSig _ True  ns _)     = mapMaybe (lookupOccEnv env . mkDefaultMethodOcc . occName) $ map (unXRec @a) ns
 sigNameNoLoc _   (PatSynSig  _   ns _)         = map (unXRec @a) ns
 sigNameNoLoc _   (SpecSig    _   n _ _)        = [unXRec @a n]
 sigNameNoLoc _   (InlineSig  _   n _)          = [unXRec @a n]
-sigNameNoLoc _   (FixSig _ (FixitySig _ ns _)) = map (unXRec @a) ns
+sigNameNoLoc _   (FixSig _ (FixitySig _ _ ns _)) = map (unXRec @a) ns
 sigNameNoLoc _   _                             = []
 
 -- Extract the source location where an instance is defined. This is used
@@ -371,10 +371,10 @@ subordinates env instMap decl = case decl of
     data_fams = do
       DataFamInstDecl { dfid_eqn =
         FamEqn { feqn_tycon = L l _
-               , feqn_rhs   = defn }} <- unLoc <$> cid_datafam_insts d
+               , feqn_rhs   = defn }} <- unLoc <$> ng_datafam_insts (snd $ cid_ext d)
       [ (n, [], IM.empty) | Just n <- [lookupSrcSpan (locA l) instMap] ] ++ dataSubs defn
     ty_fams = do
-      TyFamInstDecl { tfid_eqn = FamEqn { feqn_tycon = L l _ } } <- unLoc <$> cid_tyfam_insts d
+      TyFamInstDecl { tfid_eqn = FamEqn { feqn_tycon = L l _ } } <- unLoc <$> ng_tyfam_insts (snd $ cid_ext d)
       [ (n, [], IM.empty) | Just n <- [lookupSrcSpan (locA l) instMap] ]
     in data_fams ++ ty_fams
 
@@ -430,9 +430,9 @@ conArgDocs (ConDeclGADT{con_g_args = args, con_res_ty = res_ty}) =
 
 h98ConArgDocs :: HsConDeclH98Details GhcRn -> IntMap (HsDoc GhcRn)
 h98ConArgDocs con_args = case con_args of
-  PrefixCon args     -> con_arg_docs 0 $ map cdf_doc args
-  InfixCon arg1 arg2 -> con_arg_docs 0 [ cdf_doc arg1, cdf_doc arg2 ]
-  RecCon _           -> IM.empty
+  PrefixCon _ args     -> con_arg_docs 0 $ map cdf_doc args
+  InfixCon _ arg1 arg2 -> con_arg_docs 0 [ cdf_doc arg1, cdf_doc arg2 ]
+  RecCon _ _           -> IM.empty
 
 gadtConArgDocs :: HsConDeclGADTDetails GhcRn -> HsType GhcRn -> IntMap (HsDoc GhcRn)
 gadtConArgDocs con_args res_ty = case con_args of
@@ -458,12 +458,12 @@ isValD _ = False
 classDecls :: TyClDecl GhcRn  -- Always a ClassDecl
            -> [(LHsDecl GhcRn, [HsDoc GhcRn])]
 classDecls decl
-  | ClassDecl { .. } <- decl
+  | ClassDecl { tcdCExt = (HsNestedGroup { .. }, _) } <- decl
   , let decls = docs ++ defs ++ sigs ++ ats
-        docs  = mkDecls (DocD noExtField) tcdDocs
-        defs  = mkDecls (ValD noExtField) tcdMeths
-        sigs  = mkDecls (SigD noExtField) tcdSigs
-        ats   = mkDecls (TyClD noExtField . FamDecl noExtField) tcdATs
+        docs  = mkDecls (DocD noExtField) ng_docs
+        defs  = mkDecls (ValD noExtField) ng_meths
+        sigs  = mkDecls (SigD noExtField) ng_sigs
+        ats   = mkDecls (TyClD noExtField . FamDecl noExtField) ng_ats
 
   = filterDecls . collectDocs . sortLocatedA $ decls
 
@@ -473,10 +473,10 @@ classDecls decl
 -- | Extract function argument docs from inside top-level decls.
 declTypeDocs :: HsDecl GhcRn -> IntMap (HsDoc GhcRn)
 declTypeDocs = \case
-  SigD  _ (TypeSig _ _ ty)          -> sigTypeDocs (unLoc (dropWildCards ty))
+  SigD  _ (TypeSig _ _ _ ty)        -> sigTypeDocs (unLoc (dropWildCards ty))
   SigD  _ (ClassOpSig _ _ _ ty)     -> sigTypeDocs (unLoc ty)
   SigD  _ (PatSynSig _ _ ty)        -> sigTypeDocs (unLoc ty)
-  ForD  _ (ForeignImport _ _ ty _)  -> sigTypeDocs (unLoc ty)
+  ForD  _ (ForeignImport _ _ _ ty _) -> sigTypeDocs (unLoc ty)
   TyClD _ (SynDecl { tcdRhs = ty }) -> typeDocs (unLoc ty)
   _                                 -> IM.empty
 
@@ -525,12 +525,12 @@ ungroup (HsGroup {..}) =
   mkDecls (ValD noExtField)   (valbinds hs_valds)
   where
     typesigs :: HsValBinds GhcRn -> [LSig GhcRn]
-    typesigs (XValBindsLR (NValBinds _ sig)) = filter (isUserSig . unLoc) sig
+    typesigs (XValBindsLR (HsVBG _ sig)) = filter (isUserSig . unLoc) sig
     typesigs ValBinds{} = error "expected XValBindsLR"
 
     valbinds :: HsValBinds GhcRn -> [LHsBind GhcRn]
-    valbinds (XValBindsLR (NValBinds binds _)) =
-      concat . snd . unzip $ binds
+    valbinds (XValBindsLR (HsVBG grps _)) =
+      concat . snd . unzip $ grps
     valbinds ValBinds{} = error "expected XValBindsLR"
 
 -- | Collect docs and attach them to the right declarations.
@@ -541,9 +541,9 @@ collectDocs :: forall p. UnXRec p => [LHsDecl p] -> [(LHsDecl p, [HsDoc p])]
 collectDocs = go [] Nothing
   where
     go docs mprev decls = case (decls, mprev) of
-      ((unXRec @p -> DocD _ (DocCommentNext s)) : ds, Nothing)   -> go (unLoc s:docs) Nothing ds
-      ((unXRec @p -> DocD _ (DocCommentNext s)) : ds, Just prev) -> finished prev docs $ go [unLoc s] Nothing ds
-      ((unXRec @p -> DocD _ (DocCommentPrev s)) : ds, mprev)     -> go (unLoc s:docs) mprev ds
+      ((unXRec @p -> DocD _ (DocCommentNext s)) : ds, Nothing)   -> go (unXRec @p s:docs) Nothing ds
+      ((unXRec @p -> DocD _ (DocCommentNext s)) : ds, Just prev) -> finished prev docs $ go [unXRec @p s] Nothing ds
+      ((unXRec @p -> DocD _ (DocCommentPrev s)) : ds, mprev)     -> go (unXRec @p s:docs) mprev ds
       (d                                  : ds, Nothing)   -> go docs (Just d) ds
       (d                                  : ds, Just prev) -> finished prev docs $ go [] (Just d) ds
       ([]                                     , Nothing)   -> []
@@ -552,8 +552,8 @@ collectDocs = go [] Nothing
     finished decl docs rest = (decl, reverse docs) : rest
 
 -- | Filter out declarations that we don't handle in Haddock
-filterDecls :: forall p doc. UnXRec p => [(LHsDecl p, doc)] -> [(LHsDecl p, doc)]
-filterDecls = filter (isHandled . unXRec @p . fst)
+filterDecls :: [(LHsDecl GhcRn, doc)] -> [(LHsDecl GhcRn, doc)]
+filterDecls = filter (isHandled . unLoc . fst)
   where
     isHandled (ForD _ (ForeignImport {})) = True
     isHandled (TyClD {})  = True
@@ -567,12 +567,13 @@ filterDecls = filter (isHandled . unXRec @p . fst)
 
 
 -- | Go through all class declarations and filter their sub-declarations
-filterClasses :: forall p doc. (IsPass p) => [(LHsDecl (GhcPass p), doc)] -> [(LHsDecl (GhcPass p), doc)]
+filterClasses :: [(LHsDecl GhcRn, doc)] -> [(LHsDecl GhcRn, doc)]
 filterClasses = map (first (fmap filterClass))
   where
-    filterClass (TyClD x c@(ClassDecl {})) =
-      TyClD x $ c { tcdSigs =
-        filter (liftA2 (||) (isUserSig . unLoc) isMinimalLSig) (tcdSigs c) }
+    filterClass :: HsDecl GhcRn -> HsDecl GhcRn
+    filterClass (TyClD x c@(ClassDecl { tcdCExt = (cd, ns) })) =
+      TyClD x $ c { tcdCExt = (cd { ng_sigs =
+        filter (liftA2 (||) (isUserSig . unLoc) isMinimalLSig) (ng_sigs cd) }, ns)}
     filterClass d = d
 
 -- | Was this signature given by the user?

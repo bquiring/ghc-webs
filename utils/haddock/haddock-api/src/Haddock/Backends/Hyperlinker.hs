@@ -28,10 +28,12 @@ import Haddock.Backends.Hyperlinker.Parser
 import Haddock.Backends.Hyperlinker.Renderer
 import Haddock.Backends.Hyperlinker.Types
 import Haddock.Backends.Hyperlinker.Utils
-import Haddock.Backends.Xhtml.Utils (renderToString)
+import Haddock.Backends.Xhtml.Utils (renderToBuilder)
 import Haddock.InterfaceFile
 import Haddock.Types
-import Haddock.Utils (Verbosity, out, verbose, writeUtf8File)
+import Haddock.Utils (Verbosity, out, verbose, mapConcurrentlyWith_)
+import System.Semaphore (AbstractSem)
+import qualified Data.ByteString.Builder as Builder
 
 -- | Generate hyperlinked source for given interfaces.
 --
@@ -50,19 +52,21 @@ ppHyperlinkedSource
   -- ^ Custom CSS file path
   -> Bool
   -- ^ Flag indicating whether to pretty-print HTML
+  -> AbstractSem
+  -- ^ Concurrency semaphore for module renders
   -> M.Map Module SrcPath
   -- ^ Paths to sources
   -> [Interface]
   -- ^ Interfaces for which we create source
   -> IO ()
-ppHyperlinkedSource verbosity isOneShot outdir libdir mstyle pretty srcs' ifaces = do
+ppHyperlinkedSource verbosity isOneShot outdir libdir mstyle pretty concSem srcs' ifaces = do
   createDirectoryIfMissing True srcdir
   unless isOneShot $ do
     let cssFile = fromMaybe (defaultCssFile libdir) mstyle
     copyFile cssFile $ srcdir </> srcCssFile
     copyFile (libdir </> "html" </> highlightScript) $
       srcdir </> highlightScript
-  mapM_ (ppHyperlinkedModuleSource verbosity srcdir pretty srcs) ifaces
+  mapConcurrentlyWith_ concSem (ppHyperlinkedModuleSource verbosity srcdir pretty srcs) ifaces
   where
     srcdir = outdir </> hypSrcDir
     srcs = (srcs', M.mapKeys moduleName srcs')
@@ -80,6 +84,7 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = do
   nc <- freshNameCache
   HieFile
     { hie_hs_file = file
+    , hie_module = thisModule
     , hie_asts = HieASTs asts
     , hie_types = types
     , hie_hs_src = rawSrc
@@ -92,7 +97,7 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = do
       mast
         | M.size asts == 1 = snd <$> M.lookupMin asts
         | otherwise = M.lookup (HiePath (mkFastString file)) asts
-      tokens' = parse parserOpts sDocContext file rawSrc
+      tokens' = parse parserOpts file rawSrc
       ast = fromMaybe (emptyHieAst fileFs) mast
       fullAst = recoverFullIfaceTypes sDocContext types ast
 
@@ -116,7 +121,7 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = do
   let tokens = fmap (\tk -> tk{tkSpan = (tkSpan tk){srcSpanFile = srcSpanFile $ nodeSpan fullAst}}) tokens'
 
   -- Produce and write out the hyperlinked sources
-  writeUtf8File path . renderToString pretty . render' fullAst $ tokens
+  Builder.writeFile path . renderToBuilder pretty . render' thisModule fullAst $ tokens
   where
     dflags = ifaceDynFlags iface
     sDocContext = DynFlags.initSDocContext dflags Outputable.defaultUserStyle
@@ -128,7 +133,7 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = do
         False -- lex Haddocks as comment tokens
         True -- produce comment tokens
         False -- produce position pragmas tokens
-    render' = render (Just srcCssFile) (Just highlightScript) srcs
+    render' thisModule = render thisModule (Just srcCssFile) (Just highlightScript) srcs
     path = srcdir </> hypSrcModuleFile (ifaceMod iface)
 
     emptyHieAst fileFs =

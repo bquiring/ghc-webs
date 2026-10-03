@@ -30,10 +30,14 @@ module GHC.Internal.Wasm.Prim.Imports (
 
 import GHC.Internal.Base
 import GHC.Internal.Exception
-import GHC.Internal.Exts
 import GHC.Internal.IO.Unsafe
 import GHC.Internal.Stable
+import GHC.Internal.Prim (
+    RealWorld, State#, makeStablePtr#, newMVar#, readMVar#,
+  )
 import GHC.Internal.Wasm.Prim.Types
+import GHC.Internal.Unsafe.Coerce ( unsafeCoerce# )
+import qualified GHC.Internal.Stack.Types as Rebindable
 
 {-# OPAQUE raiseJSException #-}
 raiseJSException :: JSVal -> a

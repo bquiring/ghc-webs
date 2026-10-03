@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ExplicitNamespaces #-}
@@ -165,7 +166,7 @@ module Prelude (
   ) where
 
 import GHC.Internal.Control.Monad
-import GHC.Internal.System.IO
+import System.IO
 import GHC.Internal.System.IO.Error
 import qualified GHC.Internal.Data.List as List
 import GHC.Internal.Data.Either
@@ -176,8 +177,12 @@ import GHC.Internal.Data.Maybe
 import GHC.Internal.Data.Traversable ( Traversable(..) )
 import GHC.Internal.Data.Tuple
 
+#if __GLASGOW_HASKELL__ >= 1000
+import GHC.Internal.Err
+import GHC.Internal.Prim (seq)
+#endif
 import GHC.Internal.Base hiding ( foldr, mapM, sequence )
-import GHC.Internal.Text.Read
+import Text.Read
 import GHC.Internal.Enum
 import GHC.Internal.Num
 import GHC.Internal.Real

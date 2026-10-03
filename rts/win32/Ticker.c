@@ -11,7 +11,11 @@
 
 static TickProc tick_proc = NULL;
 static HANDLE timer_queue = NULL;
+
+static Mutex lock; // To protect the timer and paused var below
 static HANDLE timer       = NULL;
+static bool paused;
+
 static Time tick_interval = 0;
 
 static VOID CALLBACK tick_callback(
@@ -36,12 +40,19 @@ static VOID CALLBACK tick_callback(
 // This seems to be the case starting at some point during the
 // Windows 7 lifetime and any newer versions of windows.
 
+// Forward decls
+static void startTicker(void);
+static void stopTicker(bool synchronous);
+
 void
 initTicker (Time interval, TickProc handle_tick)
 {
+    ASSERT(timer_queue == NULL);
     tick_interval = interval;
     tick_proc = handle_tick;
 
+    OS_INIT_LOCK(&lock);
+    paused = true; // starts paused
     timer_queue = CreateTimerQueue();
     if (timer_queue == NULL) {
         sysErrorBelch("CreateTimerQueue");
@@ -49,39 +60,81 @@ initTicker (Time interval, TickProc handle_tick)
     }
 }
 
+// Asynchronous. Idempotent.
 void
-startTicker(void)
+unpauseTicker(void)
 {
-    BOOL r;
+    OS_ACQUIRE_LOCK(&lock);
+    if (paused) {
+        startTicker();
+    }
+    paused = false;
+    OS_RELEASE_LOCK(&lock);
+}
 
-    r = CreateTimerQueueTimer(&timer,
-                              timer_queue,
-                              tick_callback,
-                              0,
-                              0,
-                              TimeToMS(tick_interval), // ms
-                              WT_EXECUTEINTIMERTHREAD);
+// Asynchronous. Idempotent.
+void
+pauseTicker(void)
+{
+    OS_ACQUIRE_LOCK(&lock);
+    if (!paused) {
+        /* pauseTicker is called from within the handle_tick, so stopping
+         * the ticker here /must/ be asynchronous or we will deadlock! */
+        stopTicker(false /* asynchronous */);
+    }
+    paused = true;
+    OS_RELEASE_LOCK(&lock);
+}
+
+void
+exitTicker(void)
+{
+    ASSERT(timer_queue != NULL);
+
+    OS_ACQUIRE_LOCK(&lock);
+    if (!paused) {
+        stopTicker(true /* synchronous */);
+    }
+    OS_RELEASE_LOCK(&lock);
+
+    // From the docs for DeleteTimerQueueEx:
+    //   If this parameter is INVALID_HANDLE_VALUE, the function waits
+    //   for all callback functions to complete before returning.
+    // This is a belt-and-braces approach to ensuring exitTicker is synchronous,
+    // since stopTicker(true) is already synchronous and there's only one timer.
+    HANDLE completion = INVALID_HANDLE_VALUE;
+    DeleteTimerQueueEx(timer_queue, completion);
+    timer_queue = NULL;
+}
+
+static void startTicker(void) {
+    ASSERT(timer_queue != NULL && timer == NULL);
+    DWORD interval = TimeToMS(tick_interval); // ms
+    BOOL r = CreateTimerQueueTimer(&timer,
+                                   timer_queue,
+                                   tick_callback,
+                                   NULL,     // callback param
+                                   interval, // inital interval
+                                   interval, // recurrant interval
+                                   WT_EXECUTEINTIMERTHREAD);
+    //TODO: using WT_EXECUTEINTIMERTHREAD is fine for context switching, and
+    // plausibly also ok for profile sampling but is way out for eventlog
+    // flushing. The eventlog flush does a global synchronisation of all
+    // capabilities and I/O! And with eventlog providers, it calls arbitrary
+    // user code. This is not ok! See issue #27250.
     if (r == 0) {
         sysErrorBelch("CreateTimerQueueTimer");
         stg_exit(EXIT_FAILURE);
     }
+    ASSERT(timer != NULL);
 }
 
-void
-stopTicker(void)
-{
-    if (timer_queue != NULL && timer != NULL) {
-        DeleteTimerQueueTimer(timer_queue, timer, NULL);
-        timer = NULL;
-    }
-}
-
-void
-exitTicker (bool wait)
-{
-    stopTicker();
-    if (timer_queue != NULL) {
-        DeleteTimerQueueEx(timer_queue, wait ? INVALID_HANDLE_VALUE : NULL);
-        timer_queue = NULL;
-    }
+static void stopTicker(bool synchronous) {
+    ASSERT(timer_queue != NULL && timer != NULL);
+    // From the docs for DeleteTimerQueueTimer:
+    // If this parameter is INVALID_HANDLE_VALUE, the function waits for any
+    // running timer callback functions to complete before returning.
+    HANDLE completion = synchronous ? INVALID_HANDLE_VALUE : NULL;
+    DeleteTimerQueueTimer(timer_queue, timer, completion);
+    timer = NULL;
 }

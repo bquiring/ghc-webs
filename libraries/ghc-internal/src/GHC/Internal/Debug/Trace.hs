@@ -46,11 +46,12 @@ module GHC.Internal.Debug.Trace (
         traceMarkerIO,
   ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.C.String
 import qualified GHC.Internal.Foreign.C.String.Encoding as Enc
-import GHC.Internal.Base
 import GHC.Internal.IO.Encoding
 import GHC.Internal.IO.Unsafe
+import GHC.Internal.Prim (traceEvent#, traceMarker#)
 import GHC.Internal.Ptr
 import GHC.Internal.Show
 import GHC.Internal.Stack

@@ -1,6 +1,5 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE LambdaCase #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -64,7 +63,7 @@ import GHCi.RemoteTypes
 import GHC.ByteCode.Types
 
 import GHC.Linker.Loader as Loader
-import GHC.Linker.Types (LinkedBreaks (..))
+import GHC.Linker.Types
 
 import GHC.Hs
 
@@ -84,8 +83,8 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
 
-import GHC.Builtin.Names ( toDynName )
-import GHC.Builtin.Types ( pretendNameIsInScope )
+import GHC.Builtin.KnownOccs ( toDyn_RDR )
+import GHC.Builtin.WiredIn.Types ( pretendNameIsInScope )
 
 import GHC.Data.Maybe
 import GHC.Data.FastString
@@ -151,7 +150,7 @@ getHistoryModule :: HUG.HomeUnitGraph -> History -> IO Module
 getHistoryModule hug hist = do
   let ibi = historyBreakpointId hist
   brks <- readIModBreaks hug ibi
-  return $ bi_tick_mod $ getBreakSourceId ibi brks
+  return $ getBreakSourceMod ibi brks
 
 getHistorySpan :: HUG.HomeUnitGraph -> History -> IO SrcSpan
 getHistorySpan hug hist = do
@@ -310,7 +309,7 @@ handleRunStatus step expr bindings final_ids status history0 = do
       let
         final_ic = extendInteractiveContextWithIds (hsc_IC hsc_env) final_ids
         final_names = map getName final_ids
-      liftIO $ Loader.extendLoadedEnv interp (zip final_names hvals)
+      liftIO $ Loader.extendLoadedEnv interp modifyHomePackageBytecodeState (zip final_names hvals)
       hsc_env' <- liftIO $ rttiEnvironment hsc_env{hsc_IC=final_ic}
       setSession hsc_env'
       return (ExecComplete (Right final_names) allocs)
@@ -433,7 +432,7 @@ resumeExec step mbCnt
                             , not (n `elem` old_names) ]
             interp    = hscInterp hsc_env
             dflags    = hsc_dflags hsc_env
-        liftIO $ Loader.deleteFromLoadedEnv interp new_names
+        liftIO $ Loader.deleteFromLoadedHomeEnv interp new_names
 
         case r of
           Resume { resumeStmt = expr
@@ -474,18 +473,18 @@ setupBreakpoint interp ibi cnt = do
 
 getBreakArray :: Interp -> InternalBreakpointId -> InternalModBreaks -> IO (ForeignRef BreakArray)
 getBreakArray interp InternalBreakpointId{ibi_info_mod} imbs = do
-  breaks0 <- linked_breaks . fromMaybe (panic "Loader not initialised") <$> getLoaderState interp
+  breaks0 <- bco_linked_breaks . homePackage_loaded . bco_loader_state . fromMaybe (panic "Loader not initialised") <$> getLoaderState interp
   case lookupModuleEnv (breakarray_env breaks0) ibi_info_mod of
     Just ba -> return ba
     Nothing -> do
       modifyLoaderState interp $ \ld_st -> do
-        let lb = linked_breaks ld_st
+        let lb = bco_linked_breaks . homePackage_loaded . bco_loader_state $ ld_st
 
         -- Recall that BreakArrays are allocated only at BCO link time, so if we
         -- haven't linked the BCOs we intend to break at yet, we allocate the arrays here.
         ba_env <- allocateBreakArrays interp (breakarray_env lb) [imbs]
 
-        let ld_st' = ld_st { linked_breaks = lb{breakarray_env = ba_env} }
+        let ld_st' = modifyBytecodeLoaderState modifyHomePackageBytecodeState ld_st $ \bco_state -> bco_state { bco_linked_breaks = (bco_linked_breaks bco_state) { breakarray_env = ba_env } }
         let ba = expectJust {- just computed -} $ lookupModuleEnv ba_env ibi_info_mod
 
         return
@@ -575,7 +574,7 @@ bindLocalsAtBreakpoint hsc_env apStack span Nothing = do
        ictxt1 = extendInteractiveContextWithIds ictxt0 [exn_id]
        interp = hscInterp hsc_env
    --
-   Loader.extendLoadedEnv interp [(exn_name, apStack)]
+   Loader.extendLoadedEnv interp modifyHomePackageBytecodeState [(exn_name, apStack)]
    return (hsc_env{ hsc_IC = ictxt1 }, [exn_name])
 
 -- Just case: we stopped at a breakpoint, we have information about the location
@@ -613,7 +612,7 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv span (Just ibi) = do
       debugTraceMsg (hsc_logger hsc_env) 1 $
           text "Warning: _result has been evaluated, some bindings have been lost"
 
-   us <- mkSplitUniqSupply 'I'   -- Dodgy; will give the same uniques every time
+   us <- mkSplitUniqSupply BcoTag -- Dodgy; will give the same uniques every time
    let tv_subst     = newTyVars us free_tvs
        (filtered_ids, occs'') = unzip         -- again, sync the occ-names
           [ (id, occ) | (id, Just _hv, occ) <- zip3 ids mb_hValues occs' ]
@@ -634,8 +633,8 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv span (Just ibi) = do
        names  = map idName new_ids
 
    let fhvs = catMaybes mb_hValues
-   Loader.extendLoadedEnv interp (zip names fhvs)
-   when result_ok $ Loader.extendLoadedEnv interp [(result_name, apStack_fhv)]
+   Loader.extendLoadedEnv interp modifyHomePackageBytecodeState (zip names fhvs)
+   when result_ok $ Loader.extendLoadedEnv interp modifyHomePackageBytecodeState [(result_name, apStack_fhv)]
    hsc_env1 <- rttiEnvironment hsc_env{ hsc_IC = ictxt1 }
    return (hsc_env1, if result_ok then result_name:names else names)
   where
@@ -874,7 +873,7 @@ mkTopLevEnv hsc_env modl
 mkTopLevImportedEnv :: HscEnv -> HomeModInfo -> IO GlobalRdrEnv
 mkTopLevImportedEnv hsc_env details = do
     runInteractiveHsc hsc_env
-  $ ioMsgMaybe $ hoistTcRnMessage $ runTcInteractive hsc_env
+  $ ioMsgMaybe $ hoistTcRnMessage $ runTcInteractive NoTcMPlugins hsc_env
   $ fmap (foldr plusGlobalRdrEnv emptyGlobalRdrEnv)
   $ forM imports $ \iface_import -> do
     let ImpUserSpec spec details = tcIfaceImport iface_import
@@ -882,6 +881,7 @@ mkTopLevImportedEnv hsc_env details = do
     pure $ case details of
       ImpUserAll -> importsFromIface hsc_env iface spec Nothing
       ImpUserEverythingBut ns -> importsFromIface hsc_env iface spec (Just ns)
+      ImpUserDependOnly -> emptyGlobalRdrEnv
       ImpUserExplicit x _parents_of_implicits ->
         -- TODO: Not quite right, is_explicit should refer to whether the user wrote A(..) or A(x,y).
         -- It is only used for error messages. It seems dubious even to add an import context to these GREs as
@@ -937,7 +937,7 @@ getInfo allInfo name
           ok n | n == name              = True
                        -- The one we looked for in the first place!
                | pretendNameIsInScope n = True
-                   -- See Note [pretendNameIsInScope] in GHC.Builtin.Names
+                   -- See Note [pretendNameIsInScope] in GHC.Builtin.KnownKeys
                | isExternalName n       = isJust (lookupGRE_Name rdr_env n)
                | otherwise              = True
 
@@ -1089,7 +1089,7 @@ typeKind normalise str = withSession $ \hsc_env ->
 getInstancesForType :: GhcMonad m => Type -> m [ClsInst]
 getInstancesForType ty = withSession $ \hsc_env ->
   liftIO $ runInteractiveHsc hsc_env $
-    ioMsgMaybe $ hoistTcRnMessage $ runTcInteractive hsc_env $ do
+    ioMsgMaybe $ hoistTcRnMessage $ runTcInteractive StartAndStopTcMPlugins hsc_env $ do
       -- Bring class and instances from unqualified modules into scope, this fixes #16793.
       loadUnqualIfaces hsc_env (hsc_IC hsc_env)
       matches <- findMatchingInstances ty
@@ -1118,7 +1118,7 @@ getDictionaryBindings theta = do
     ctev_pred = varType dict_var,
     ctev_dest = EvVarDest dict_var,
     ctev_loc = loc,
-    ctev_rewriters = emptyRewriterSet
+    ctev_rewriters = emptyCoHoleSet
   }
 
 -- Find instances where the head unifies with the provided type
@@ -1262,8 +1262,8 @@ compileParsedExprRemote expr@(L loc _) = withSession $ \hsc_env -> do
       loc' = locA loc
       expr_name = mkInternalName (getUnique expr_fs) (mkTyVarOccFS expr_fs) loc'
       let_stmt = L loc . LetStmt noAnn . (HsValBinds noAnn) $
-        ValBinds NoAnnSortKey
-                     [mkHsVarBind loc' (getRdrName expr_name) expr] []
+        ValBinds noExtField
+                     [VbBind $ mkHsVarBind loc' (getRdrName expr_name) expr]
 
   pstmt <- liftIO $ hscParsedStmt hsc_env let_stmt
   let (hvals_io, fix_env) = case pstmt of
@@ -1291,7 +1291,7 @@ dynCompileExpr expr = do
   parsed_expr <- parseExpr expr
   -- > Data.Dynamic.toDyn expr
   let loc = getLoc parsed_expr
-      to_dyn_expr = mkHsApp (L loc . mkHsVar . L (l2l loc) $ getRdrName toDynName)
+      to_dyn_expr = mkHsApp (L loc $ mkHsVar $ L (l2l loc) toDyn_RDR)
                             parsed_expr
   hval <- compileParsedExpr to_dyn_expr
   return (unsafeCoerce hval :: Dynamic)
@@ -1301,14 +1301,9 @@ dynCompileExpr expr = do
 
 showModule :: GhcMonad m => ModuleNodeInfo -> m String
 showModule mni = do
-    let mod = moduleNodeInfoModule mni
     withSession $ \hsc_env -> do
         let dflags = hsc_dflags hsc_env
-        interpreted <- liftIO $
-          HUG.lookupHug (hsc_HUG hsc_env) (moduleUnitId mod) (moduleName mod) >>= pure . \case
-            Nothing       -> panic "missing linkable"
-            Just mod_info -> isJust (homeModInfoByteCode mod_info)  && isNothing (homeModInfoObject mod_info)
-        return (showSDoc dflags $ showModMsg dflags interpreted (ModuleNode [] mni))
+        return (showSDoc dflags $ showModMsg dflags (ModuleNode [] mni))
 
 moduleIsBootOrNotObjectLinkable :: GhcMonad m => Module -> m Bool
 moduleIsBootOrNotObjectLinkable mod = withSession $ \hsc_env -> liftIO $

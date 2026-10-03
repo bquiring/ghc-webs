@@ -1,10 +1,9 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 module GHC.Cmm.Expr
     ( CmmExpr(..), cmmExprType, cmmExprWidth, cmmExprAlignment, maybeInvertCmmExpr
     , CmmReg(..), cmmRegType, cmmRegWidth
-    , CmmLit(..), cmmLitType
+    , CmmLit(..), cmmLitType, mkCmmFloatLit
     , AlignmentSpec(..)
       -- TODO: Remove:
     , LocalReg(..), localRegType
@@ -42,13 +41,13 @@ import GHC.Cmm.CLabel
 import GHC.Cmm.MachOp
 import GHC.Cmm.Type
 import GHC.Cmm.Reg
-import GHC.Utils.Panic (panic)
+import GHC.Utils.Panic (panic, pprPanic)
 import GHC.Utils.Outputable
+import GHC.Types.Literal.Floating
 
 import Data.Maybe
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Numeric ( fromRat )
 
 import GHC.Types.Basic (Alignment, mkAlignment, alignmentOf)
 
@@ -195,7 +194,7 @@ data CmmLit
         -- to keep the value within range, because we don't know whether
         -- it will be used as a signed or unsigned value (the CmmType doesn't
         -- distinguish between signed & unsigned).
-  | CmmFloat  Rational !Width
+  | CmmFloat !LitFloating !LitFloatingType
   | CmmVec [CmmLit]                     -- Vector literal
   | CmmLabel    CLabel                  -- Address of label
   | CmmLabelOff CLabel !Int              -- Address of label + byte offset
@@ -232,13 +231,22 @@ instance OutputableP Platform CmmLit where
 
 instance Outputable CmmLit where
   ppr (CmmInt n w) = text "CmmInt" <+> ppr n <+> ppr w
-  ppr (CmmFloat n w) = text "CmmFloat" <+> text (show n) <+> ppr w
+  ppr (CmmFloat f fty) =
+    text "CmmFloat" <+> pprLitFloating fty f <+> ppr (litFloatingTypeWidth fty)
   ppr (CmmVec xs) = text "CmmVec" <+> ppr xs
   ppr (CmmLabel _) = text "CmmLabel"
   ppr (CmmLabelOff _ _) = text "CmmLabelOff"
   ppr (CmmLabelDiffOff _ _ _ _) = text "CmmLabelDiffOff"
   ppr (CmmBlock blk) = text "CmmBlock" <+> ppr blk
   ppr CmmHighStackMark = text "CmmHighStackMark"
+
+mkCmmFloatLit :: Rational -> Width -> CmmLit
+mkCmmFloatLit r w = CmmFloat (rationalToLitFloating r) fty
+  where
+    fty = case w of
+      W32 -> LitFloat
+      W64 -> LitDouble
+      _ -> pprPanic "mkCmmFloatLit" (ppr w)
 
 cmmExprType :: Platform -> CmmExpr -> CmmType
 cmmExprType platform = \case
@@ -254,7 +262,7 @@ cmmExprType platform = \case
 cmmLitType :: Platform -> CmmLit -> CmmType
 cmmLitType platform = \case
    (CmmInt _ width)     -> cmmBits  width
-   (CmmFloat _ width)   -> cmmFloat width
+   (CmmFloat _ fty)     -> cmmFloat (litFloatingTypeWidth fty)
    (CmmVec [])          -> panic "cmmLitType: CmmVec []"
    (CmmVec (l:ls))      -> let ty = cmmLitType platform l
                           in if all (`cmmEqType` ty) (map (cmmLitType platform) ls)
@@ -435,6 +443,11 @@ pprExpr platform e
         CmmLit lit -> pprLit platform lit
         _other     -> pprExpr1 platform e
 
+-- | `op` usually, but `(op[width])` with -dppr-debug
+withDebugWidth :: Width -> SDoc -> SDoc
+withDebugWidth w doc =
+  ifPprDebug (parens (doc <> brackets (ppr w))) doc
+
 -- Here's the precedence table from GHC.Cmm.Parser:
 -- %nonassoc '>=' '>' '<=' '<' '!=' '=='
 -- %left '|'
@@ -457,15 +470,17 @@ pprExpr1 platform e = pprExpr7 platform e
 
 infixMachOp1, infixMachOp7, infixMachOp8 :: MachOp -> Maybe SDoc
 
-infixMachOp1 (MO_Eq     _) = Just (text "==")
-infixMachOp1 (MO_Ne     _) = Just (text "!=")
-infixMachOp1 (MO_Shl    _) = Just (text "<<")
-infixMachOp1 (MO_U_Shr  _) = Just (text ">>")
-infixMachOp1 (MO_U_Ge   _) = Just (text ">=")
-infixMachOp1 (MO_U_Le   _) = Just (text "<=")
-infixMachOp1 (MO_U_Gt   _) = Just (char '>')
-infixMachOp1 (MO_U_Lt   _) = Just (char '<')
-infixMachOp1 _             = Nothing
+infixMachOp1 mop = case mop of
+    (MO_Eq     w) -> Just $ withDebugWidth w (text "==")
+    (MO_Ne     w) -> Just $ withDebugWidth w (text "!=")
+    (MO_Shl    w) -> Just $ withDebugWidth w (text "<<")
+    (MO_U_Shr  w) -> Just $ withDebugWidth w (text ">>")
+    (MO_U_Ge   w) -> Just $ withDebugWidth w (text ">=")
+    (MO_U_Le   w) -> Just $ withDebugWidth w (text "<=")
+    (MO_U_Gt   w) -> Just $ withDebugWidth w (char '>')
+    (MO_U_Lt   w) -> Just $ withDebugWidth w (char '<')
+    _             -> Nothing
+    where
 
 -- %left '-' '+'
 pprExpr7 platform (CmmMachOp (MO_Add rep1) [x, CmmLit (CmmInt i rep2)]) | i < 0
@@ -475,8 +490,8 @@ pprExpr7 platform (CmmMachOp op [x,y])
    = pprExpr7 platform x <+> doc <+> pprExpr8 platform y
 pprExpr7 platform e = pprExpr8 platform e
 
-infixMachOp7 (MO_Add _)  = Just (char '+')
-infixMachOp7 (MO_Sub _)  = Just (char '-')
+infixMachOp7 (MO_Add w)  = Just $ withDebugWidth w (char '+')
+infixMachOp7 (MO_Sub w)  = Just $ withDebugWidth w (char '-')
 infixMachOp7 _           = Nothing
 
 -- %left '/' '*' '%'
@@ -485,9 +500,9 @@ pprExpr8 platform (CmmMachOp op [x,y])
    = pprExpr8 platform x <+> doc <+> pprExpr9 platform y
 pprExpr8 platform e = pprExpr9 platform e
 
-infixMachOp8 (MO_U_Quot _) = Just (char '/')
-infixMachOp8 (MO_Mul _)    = Just (char '*')
-infixMachOp8 (MO_U_Rem _)  = Just (char '%')
+infixMachOp8 (MO_U_Quot w) = Just $ withDebugWidth w (char '/')
+infixMachOp8 (MO_Mul w)    = Just $ withDebugWidth w (char '*')
+infixMachOp8 (MO_U_Rem w)  = Just $ withDebugWidth w (char '%')
 infixMachOp8 _             = Nothing
 
 pprExpr9 :: Platform -> CmmExpr -> SDoc
@@ -537,11 +552,11 @@ genMachOp platform mop args
 infixMachOp :: MachOp -> Maybe SDoc
 infixMachOp mop
         = case mop of
-            MO_And    _ -> Just $ char '&'
-            MO_Or     _ -> Just $ char '|'
-            MO_Xor    _ -> Just $ char '^'
-            MO_Not    _ -> Just $ char '~'
-            MO_S_Neg  _ -> Just $ char '-' -- there is no unsigned neg :)
+            MO_And    w -> Just $ withDebugWidth w $ char '&'
+            MO_Or     w -> Just $ withDebugWidth w $ char '|'
+            MO_Xor    w -> Just $ withDebugWidth w $ char '^'
+            MO_Not    w -> Just $ withDebugWidth w $ char '~'
+            MO_S_Neg  w -> Just $ withDebugWidth w $ char '-' -- there is no unsigned neg :)
             _ -> Nothing
 
 -- --------------------------------------------------------------------------
@@ -558,7 +573,8 @@ pprLit platform lit = case lit of
              , ppUnless (rep == wordWidth platform) $
                space <> dcolon <+> ppr rep ]
 
-    CmmFloat f rep     -> hsep [ double (fromRat f), dcolon, ppr rep ]
+    CmmFloat f fty     ->
+      hsep [ pprLitFloating fty f, dcolon, ppr (litFloatingTypeWidth fty) ]
     CmmVec lits        -> char '<' <> commafy (map (pprLit platform) lits) <> char '>'
     CmmLabel clbl      -> pdoc platform clbl
     CmmLabelOff clbl i -> pdoc platform clbl <> ppr_offset i

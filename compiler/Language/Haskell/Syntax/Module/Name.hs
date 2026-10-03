@@ -8,7 +8,7 @@ import Control.DeepSeq
 import qualified Text.ParserCombinators.ReadP as Parse
 import System.FilePath
 
-import GHC.Data.FastString
+import GHC.Data.FastString -- todo: make 'ModuleName' parametrized? we don't want to use Text here.
 
 -- | A ModuleName is essentially a simple string, e.g. @Data.List@.
 newtype ModuleName = ModuleName FastString deriving (Show, Eq)
@@ -17,7 +17,8 @@ instance Data ModuleName where
   -- don't traverse?
   toConstr x   = constr
     where
-      constr = mkConstr (dataTypeOf x) "{abstract:ModuleName}" [] Prefix
+      -- Fake a Algebraic constr. See #27129
+      constr = mkConstrTag (dataTypeOf x) "{abstract:ModuleName}" 1 [] Prefix
   gunfold _ _  = error "gunfold"
   dataTypeOf _ = mkNoRepType "ModuleName"
 

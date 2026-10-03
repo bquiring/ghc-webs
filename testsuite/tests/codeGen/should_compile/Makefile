@@ -36,7 +36,7 @@ T13233_orig:
 
 T14999:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -g -c T14999.cmm -o T14999.o
-	gdb --batch -ex 'file T14999.o' -ex 'disassemble stg_catch_frame_info' --nx | tr -s '[[:blank:]\n]'
+	gdb --batch -ex 'set disassembly-flavor intel' -ex 'file T14999.o' -ex 'disassemble stg_catch_frame_info' --nx | tr -s '[[:blank:]\n]'
 	LANG=C readelf --debug-dump=frames-interp T14999.o | tr -s '[[:blank:]\n]'
 
 T15196:
@@ -80,3 +80,6 @@ T17648:
 
 T25166:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -dno-typeable-binds -ddump-cmm T25166.hs | awk '/foo_closure/{flag=1}/}]/{flag=0}flag'
+
+T25650:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -dno-typeable-binds -ddump-cmm T25650.hs | awk '/baz_foo_closure|baz_bar_closure/{flag=1}/}]/{flag=0}flag'

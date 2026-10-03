@@ -109,6 +109,7 @@ module GHC.Data.Word64Map.Strict (
     , adjustWithKey
     , update
     , updateWithKey
+    , upsert
     , updateLookupWithKey
     , alter
     , alterF
@@ -129,6 +130,8 @@ module GHC.Data.Word64Map.Strict (
     -- ** Size
     , null
     , size
+    , sizeAtMost
+    , compareSize
 
     -- * Combine
 
@@ -164,6 +167,7 @@ module GHC.Data.Word64Map.Strict (
     , map
     , mapWithKey
     , traverseWithKey
+    , traverseWithKey_
     , traverseMaybeWithKey
     , mapAccum
     , mapAccumWithKey

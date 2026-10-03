@@ -28,12 +28,12 @@ import Data.Char
 import Data.Foldable (toList)
 import Data.List (intercalate, isPrefixOf)
 import Data.Maybe
+import qualified Data.Text as T
 import Data.Version
 import GHC
 import GHC.Core.InstEnv
 import qualified GHC.Driver.DynFlags as DynFlags
 import GHC.Driver.Ppr
-import GHC.Plugins (TopLevelFlag (..))
 import GHC.Types.SourceText
 import GHC.Unit.State
 import GHC.Utils.Outputable as Outputable
@@ -82,7 +82,7 @@ ppModule dflags sDocContext unit_state iface =
 -- | If the export item is an 'ExportDecl', get the attached Hoogle textual
 -- database entries for that export declaration.
 ppExportItem :: ExportItem DocNameI -> [String]
-ppExportItem (ExportDecl RnExportD{rnExpDHoogle = o}) = o
+ppExportItem (ExportDecl RnExportD{rnExpDHoogle = o}) = map T.unpack o
 ppExportItem _ = []
 
 ---------------------------------------------------------------------
@@ -103,7 +103,7 @@ dropHsDocTy = drop_sig_ty
     drop_ty (HsFunTy x w a b) = HsFunTy x w (drop_lty a) (drop_lty b)
     drop_ty (HsListTy x a) = HsListTy x (drop_lty a)
     drop_ty (HsTupleTy x a b) = HsTupleTy x a (map drop_lty b)
-    drop_ty (HsOpTy x p a b c) = HsOpTy x p (drop_lty a) b (drop_lty c)
+    drop_ty (HsOpTy x a b c) = HsOpTy x (drop_lty a) (drop_lty b) (drop_lty c)
     drop_ty (HsParTy x a) = HsParTy x (drop_lty a)
     drop_ty (HsKindSig x a b) = HsKindSig x (drop_lty a) b
     drop_ty (HsDocTy _ a _) = drop_ty $ unL a
@@ -134,7 +134,7 @@ out :: Outputable a => SDocContext -> a -> String
 out sDocContext = outWith $ Outputable.renderWithContext sDocContext
 
 operator :: String -> String
-operator (x : xs) | not (isAlphaNum x) && x `notElem` "_' ([{" = '(' : x : xs ++ ")"
+operator (x : xs) | not (isAlphaNum x) && x `notElem` ("_' ([{" :: String) = '(' : x : xs ++ ")"
 operator x = x
 
 commaSeparate :: Outputable a => SDocContext -> [a] -> String
@@ -164,8 +164,8 @@ ppExportD
       f (TyClD _ d@SynDecl{}) = ppSynonym sDocContext d
       f (TyClD _ d@ClassDecl{}) = ppClass sDocContext d subdocs
       f (TyClD _ (FamDecl _ d)) = ppFam sDocContext d
-      f (ForD _ (ForeignImport _ name typ _)) = [ppSig sDocContext [name] typ]
-      f (ForD _ (ForeignExport _ name typ _)) = [ppSig sDocContext [name] typ]
+      f (ForD _ (ForeignImport _ _ name typ _)) = [ppSig sDocContext [name] typ]
+      f (ForD _ (ForeignExport _ _ name typ _)) = [ppSig sDocContext [name] typ]
       f (SigD _ sig) = ppSigWithDoc sDocContext sig []
       f _ = []
 
@@ -176,7 +176,7 @@ ppExportD
 
 ppSigWithDoc :: SDocContext -> Sig GhcRn -> [(Name, DocForDecl Name)] -> [String]
 ppSigWithDoc sDocContext sig subdocs = case sig of
-  TypeSig _ names t -> concatMap (mkDocSig "" (dropWildCards t)) names
+  TypeSig _ _ names t -> concatMap (mkDocSig "" (dropWildCards t)) names
   PatSynSig _ names t -> concatMap (mkDocSig "pattern " t) names
   _ -> []
   where
@@ -195,7 +195,7 @@ ppSig sDocContext names (L _ typ) =
 
 -- note: does not yet output documentation for class methods
 ppClass :: SDocContext -> TyClDecl GhcRn -> [(Name, DocForDecl Name)] -> [String]
-ppClass sDocContext decl@(ClassDecl{}) subdocs =
+ppClass sDocContext decl@(ClassDecl{ tcdCExt = (decls, ns)}) subdocs =
   (ppDecl ++ ppTyFams) : ppMethods
   where
     ppDecl :: String
@@ -203,14 +203,15 @@ ppClass sDocContext decl@(ClassDecl{}) subdocs =
       out
         sDocContext
         decl
-          { tcdSigs = []
-          , tcdATs = []
-          , tcdATDefs = []
-          , tcdMeths = emptyLHsBinds
+          { tcdCExt = (decls
+             { ng_sigs = []
+             , ng_ats = []
+             , ng_tyfam_insts = []
+             , ng_meths = emptyLHsBinds }, ns)
           }
 
     ppMethods :: [String]
-    ppMethods = concat . map (ppSig' . unLoc . add_ctxt) $ tcdSigs decl
+    ppMethods = concat . map (ppSig' . unLoc . add_ctxt) $ ng_sigs decls
 
     ppSig' = flip (ppSigWithDoc sDocContext) subdocs
 
@@ -218,12 +219,12 @@ ppClass sDocContext decl@(ClassDecl{}) subdocs =
 
     ppTyFams :: String
     ppTyFams
-      | null $ tcdATs decl = ""
+      | null $ ng_ats decls = ""
       | otherwise =
           (" " ++) . Outputable.renderWithContext sDocContext . whereWrapper $
             concat
-              [ map pprTyFam (tcdATs decl)
-              , map (pprTyFamInstDecl NotTopLevel . unLoc) (tcdATDefs decl)
+              [ map pprTyFam (ng_ats decls)
+              , map (pprTyFamInstDecl NotTopLevel . unLoc) (ng_tyfam_insts decls)
               ]
 
     pprTyFam :: LFamilyDecl GhcRn -> SDoc
@@ -294,17 +295,17 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
   -- AZ:TODO get rid of the concatMap
   concatMap (lookupCon sDocContext subdocs) [con_name con] ++ f con_args'
   where
-    f (PrefixCon args) = [typeSig name $ (map cdf_type args) ++ [resType]]
-    f (InfixCon a1 a2) = f $ PrefixCon [a1, a2]
-    f (RecCon (L _ recs)) =
-      f (PrefixCon $ map (cdrf_spec . unLoc) recs)
+    f (PrefixCon _ args) = [typeSig name $ (map cdf_type args) ++ [resType]]
+    f (InfixCon x a1 a2) = f $ PrefixCon x [a1, a2]
+    f (RecCon _ (L _ recs)) =
+      f (PrefixCon noExtField $ map (cdrf_spec . unLoc) recs)
         ++ concat
           [ (concatMap (lookupCon sDocContext subdocs . noLocA . unLoc . foLabel . unLoc) (cdrf_names r))
             ++ [out sDocContext (map (foExt . unLoc) $ cdrf_names r) `typeSig` [resType, cdf_type $ cdrf_spec r]]
           | r <- map unLoc recs
           ]
 
-    funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsUnannotated noExtField) x y)
+    funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsModifiedFunArr noExtField [] $ HsStandardArr noExtField) x y)
     apps = foldl1 (\x y -> reL $ HsAppTy noExtField x y)
 
     typeSig nm flds =
@@ -321,7 +322,7 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
         tv, tvk :: HsType GhcRn
         tv = case bvar of
           HsBndrVar _ n -> HsTyVar noAnn NotPromoted (fmap noUserRdr n)
-          HsBndrWildCard _ -> HsWildCardTy noExtField
+          HsBndrWildCard h -> HsWildCardTy h
         tvk = case bkind of
           HsBndrNoKind _   -> tv
           HsBndrKind _ lty -> HsKindSig noAnn (reL tv) lty
@@ -349,7 +350,7 @@ ppCtor
       typeSig = operator name ++ " :: " ++ outHsSigType sDocContext con_sig_ty
       name = out sDocContext $ unL <$> names
       con_sig_ty = HsSig noExtField outer_bndrs $
-                   mkForallTys inner_bndrs phi_ty
+                   mkGadtArgTys inner_bndrs phi_ty
         where
           phi_ty = case mcxt of
             Just theta -> mkQualTy theta tau_ty
@@ -358,25 +359,25 @@ ppCtor
             case args of
               PrefixConGADT _ pos_args -> map cdf_type pos_args
               RecConGADT _ (L _ flds) -> map (cdf_type . cdrf_spec . unL) flds
-
           mkFunTy :: LHsType GhcRn -> LHsType GhcRn -> LHsType GhcRn
-          mkFunTy a b = noLocA (HsFunTy noExtField (HsUnannotated noExtField) a b)
+          mkFunTy a b = noLocA (HsFunTy noExtField (HsModifiedFunArr noExtField [] $ HsStandardArr noExtField) a b)
 
           mkQualTy :: LHsContext GhcRn -> LHsType GhcRn -> LHsType GhcRn
           mkQualTy ctxt body =
             noLocA (HsQualTy{ hst_xqual = noExtField
                             , hst_ctxt = ctxt, hst_body = body})
 
-          mkForallTy :: HsForAllTelescope GhcRn -> LHsType GhcRn -> LHsType GhcRn
-          mkForallTy tele body =
-            noLocA (HsForAllTy { hst_xforall = noExtField
+          mkGadtArgTy :: LHsGadtTelescope GhcRn -> LHsType GhcRn -> LHsType GhcRn
+          mkGadtArgTy (L l (HsGadtForAll _ tele)) body =
+            L l (HsForAllTy { hst_xforall = noExtField
                                , hst_tele = tele, hst_body = body })
+          mkGadtArgTy (L l HsGadtPar{}) body = L l (HsParTy noAnn body)
 
-          mkForallTys :: [HsForAllTelescope GhcRn] -> LHsType GhcRn -> LHsType GhcRn
-          mkForallTys = flip (foldr mkForallTy)
+          mkGadtArgTys :: [LHsGadtTelescope GhcRn] -> LHsType GhcRn -> LHsType GhcRn
+          mkGadtArgTys = flip (foldr mkGadtArgTy)
 
 ppFixity :: SDocContext -> (Name, Fixity) -> [String]
-ppFixity sDocContext (name, fixity) = [out sDocContext ((FixitySig NoNamespaceSpecifier [noLocA name] fixity) :: FixitySig GhcRn)]
+ppFixity sDocContext (name, fixity) = [out sDocContext ((FixitySig noExtField (NoNamespaceSpecifier noExtField) [noLocA name] fixity) :: FixitySig GhcRn)]
 
 ---------------------------------------------------------------------
 -- DOCUMENTATION
@@ -415,8 +416,8 @@ type Tags = [Tag]
 box :: (a -> b) -> a -> [b]
 box f x = [f x]
 
-str :: String -> [Tag]
-str a = [Str a]
+str :: T.Text -> [Tag]
+str a = [Str (T.unpack a)]
 
 -- want things like paragraph, pre etc to be handled by blank lines in the source document
 -- and things like \n and \t converted away
@@ -432,8 +433,8 @@ markupTag sDocContext =
     , markupEmpty = str ""
     , markupString = str
     , markupAppend = (++)
-    , markupIdentifier = box (TagInline "a") . str . out sDocContext
-    , markupIdentifierUnchecked = box (TagInline "a") . str . showWrapped (out sDocContext . snd)
+    , markupIdentifier = box (TagInline "a") . str . T.pack . out sDocContext
+    , markupIdentifierUnchecked = box (TagInline "a") . str . showWrapped (T.pack . out sDocContext . snd)
     , markupModule = \(ModLink m label) -> box (TagInline "a") (fromMaybe (str m) label)
     , markupWarning = box (TagInline "i")
     , markupEmphasis = box (TagInline "i")
@@ -449,7 +450,7 @@ markupTag sDocContext =
     , markupHyperlink = \(Hyperlink url mLabel) -> box (TagInline "a") (fromMaybe (str url) mLabel)
     , markupAName = const $ str ""
     , markupProperty = box TagPre . str
-    , markupExample = box TagPre . str . unlines . map exampleToString
+    , markupExample = box TagPre . str . T.unlines . map exampleToString
     , markupHeader = \(Header l h) -> box (TagInline $ "h" ++ show l) h
     , markupTable = \(Table _ _) -> str "TODO: table"
     }

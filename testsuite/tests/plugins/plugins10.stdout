@@ -1,12 +1,15 @@
 parsePlugin()
 interfacePlugin: Prelude
+interfacePlugin: GHC.Essentials
 interfacePlugin: Language.Haskell.TH
 interfacePlugin: Language.Haskell.TH.Quote
+interfacePlugin: Data.Version
+interfacePlugin: System.IO
 interfacePlugin: GHC.Internal.Base
 interfacePlugin: GHC.Internal.Data.NonEmpty
 interfacePlugin: GHC.Internal.Float
 interfacePlugin: GHC.Internal.Prim.Ext
-interfacePlugin: GHC.Internal.TH.Quote
+interfacePlugin: GHC.Internal.TH.Monad
 interfacePlugin: GHC.Internal.TH.Syntax
 typeCheckPlugin (rn)
 interfacePlugin: GHC.Internal.Stack.Types
@@ -17,7 +20,6 @@ typeCheckPlugin (rn)
 interfacePlugin: GHC.Internal.TH.Lib
 metaPlugin: (return [])
 metaPlugin: quoteExp stringify "x"
-interfacePlugin: GHC.Internal.CString
 typeCheckPlugin (rn)
 typeCheckPlugin (rn)
 typeCheckPlugin (tc)

@@ -5,6 +5,9 @@ module GHC.Toolchain.Tools.Cpp
   , Cpp(..), findCpp
   , JsCpp(..), findJsCpp
   , CmmCpp(..), findCmmCpp
+
+    -- * Lenses
+  , _cppProg, _hsCppProg, _jsCppProg, _cmmCppProg
   ) where
 
 import Control.Monad
@@ -158,10 +161,10 @@ findCmmCpp :: ProgOpt -> Cc -> M CmmCpp
 findCmmCpp progOpt cc = checking "for a Cmm preprocessor" $ do
   -- Use the specified CPP or try to use the c compiler
   foundCppProg <- findProgram "Cmm preprocessor" progOpt [] <|> pure (programFromOpt progOpt (prgPath $ ccProgram cc) [])
-  -- Check whether the C preprocessor needs -std=gnu99 (only very old toolchains need this)
-  Cc cpp <- oneOf "cc doesn't support C99" $ map checkC99Support
+  -- Check whether the C preprocessor needs -std=gnu11 (only very old toolchains need this)
+  Cc cpp <- oneOf "cc doesn't support C11" $ map checkC11Support
         [ Cc foundCppProg
-        , Cc (foundCppProg & _prgFlags %++ "-std=gnu99")
+        , Cc (foundCppProg & _prgFlags %++ "-std=gnu11")
         ]
 
   cmmCppSupportsG0 <- withTempDir $ \dir -> do
@@ -179,12 +182,27 @@ findCpp :: ProgOpt -> Cc -> M Cpp
 findCpp progOpt cc = checking "for C preprocessor" $ do
   -- Use the specified CPP or try to use the c compiler
   foundCppProg <- findProgram "C preprocessor" progOpt [] <|> pure (programFromOpt progOpt (prgPath $ ccProgram cc) [])
-  -- Check whether the C preprocessor needs -std=gnu99 (only very old toolchains need this)
-  Cc cpp2 <- oneOf "cc doesn't support C99" $ map checkC99Support
+  -- Check whether the C preprocessor needs -std=gnu11 (only very old toolchains need this)
+  Cc cpp2 <- oneOf "cc doesn't support C11" $ map checkC11Support
         [ Cc foundCppProg
-        , Cc (foundCppProg & _prgFlags %++ "-std=gnu99")
+        , Cc (foundCppProg & _prgFlags %++ "-std=gnu11")
         ]
   -- Always add the -E flag to the CPP, regardless of the user options
   let cppProgram = addFlagIfNew "-E" cpp2
   return Cpp{cppProgram}
 
+--------------------------------------------------------------------------------
+-- Lenses
+--------------------------------------------------------------------------------
+
+_cppProg :: Lens Cpp Program
+_cppProg = Lens cppProgram (\x o -> o{cppProgram = x})
+
+_hsCppProg :: Lens HsCpp Program
+_hsCppProg = Lens hsCppProgram (\x o -> o{hsCppProgram = x})
+
+_jsCppProg :: Lens JsCpp Program
+_jsCppProg = Lens jsCppProgram (\x o -> o{jsCppProgram = x})
+
+_cmmCppProg :: Lens CmmCpp Program
+_cmmCppProg = Lens cmmCppProgram (\x o -> o{cmmCppProgram = x})

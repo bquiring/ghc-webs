@@ -13,12 +13,13 @@ import GHC.Prelude
 
 import GHC.Driver.Flags ( DumpFlag (..) )
 
-import GHC.Builtin.Names ( runRWKey )
+import GHC.Builtin.KnownKeys ( runRWKey )
 
 import GHC.Types.Var.Env
 import GHC.Types.Basic
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma ( activeInFinalPhase, isOpaquePragma )
 import GHC.Types.Demand
 import GHC.Types.Cpr
 import GHC.Types.Unique.MemoFun
@@ -376,7 +377,9 @@ cprTransformBespoke id args
 -- | Get a (possibly nested) 'CprType' for an application of a 'DataCon' worker,
 -- given a saturated number of 'CprType's for its field expressions.
 -- Implements the Nested part of Note [Nested CPR].
-cprTransformDataConWork :: AnalEnv -> DataCon -> [(CprType, CoreArg)] -> CprType
+cprTransformDataConWork :: AnalEnv -> DataCon
+                        -> [(CprType, CoreArg)]   -- Info about /value/ arguments
+                        -> CprType
 cprTransformDataConWork env con args
   | null (dataConExTyCoVars con)  -- No existentials
   , wkr_arity <= mAX_CPR_SIZE -- See Note [Trimming to mAX_CPR_SIZE]

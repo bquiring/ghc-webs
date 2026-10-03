@@ -351,6 +351,7 @@ thread_stack(P_ p, P_ stack_end)
         case STOP_FRAME:
         case CATCH_FRAME:
         case RET_SMALL:
+        case ANN_FRAME:
         {
             W_ bitmap = BITMAP_BITS(info->i.layout.bitmap);
             W_ size   = BITMAP_SIZE(info->i.layout.bitmap);
@@ -467,16 +468,10 @@ thread_TSO (StgTSO *tso)
     thread_(&tso->_link);
     thread_(&tso->global_link);
 
-    switch (ACQUIRE_LOAD(&tso->why_blocked)) {
-    case BlockedOnMVar:
-    case BlockedOnMVarRead:
-    case BlockedOnBlackHole:
-    case BlockedOnMsgThrowTo:
-    case NotBlocked:
+    if (IsBlockInfoClosure(ACQUIRE_LOAD(&tso->why_blocked))) {
+        /* This also follows the block_info.prev back-link in
+         * the NotBlocked case, which may not be necessary. */
         thread_(&tso->block_info.closure);
-        break;
-    default:
-        break;
     }
     thread_(&tso->blocked_exceptions);
     thread_(&tso->bq);
@@ -578,6 +573,13 @@ update_fwd_large( bdescr *bd )
         continue;
       }
 
+    case CONSTR:
+    case CONSTR_NOCAF:
+      {
+        thread_obj(info, p);
+        continue;
+      }
+
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:
     case MUT_ARR_PTRS_FROZEN_CLEAN:
@@ -619,6 +621,10 @@ update_fwd_large( bdescr *bd )
 
     case PAP:
         thread_PAP((StgPAP *)p);
+        continue;
+
+    case AP:
+        thread_AP((StgAP *)p);
         continue;
 
     case TREC_CHUNK:
@@ -1050,7 +1056,7 @@ compact(StgClosure *static_objects,
     // 2. update forward ptrs
     for (W_ g = 0; g < RtsFlags.GcFlags.generations; g++) {
         generation *gen = &generations[g];
-        debugTrace(DEBUG_gc, "update_fwd:  %d", g);
+        debugTrace(DEBUG_gc, "update_fwd:  %" FMT_Word, g);
 
         update_fwd(gen->blocks);
         for (W_ n = 0; n < getNumCapabilities(); n++) {
@@ -1060,7 +1066,7 @@ compact(StgClosure *static_objects,
         update_fwd_large(gen->scavenged_large_objects);
         update_fwd_cnf(gen->live_compact_objects);
         if (g == RtsFlags.GcFlags.generations-1 && gen->old_blocks != NULL) {
-            debugTrace(DEBUG_gc, "update_fwd:  %d (compact)", g);
+            debugTrace(DEBUG_gc, "update_fwd:  %" FMT_Word " (compact)", g);
             update_fwd_compact(gen->old_blocks);
         }
     }
@@ -1070,7 +1076,8 @@ compact(StgClosure *static_objects,
     if (gen->old_blocks != NULL) {
         W_ blocks = update_bkwd_compact(gen);
         debugTrace(DEBUG_gc,
-                   "update_bkwd: %d (compact, old: %d blocks, now %d blocks)",
+                   "update_bkwd: %d (compact, old: %" FMT_Word " blocks, "
+                                              "now %" FMT_Word " blocks)",
                    gen->no, gen->n_old_blocks, blocks);
         gen->n_old_blocks = blocks;
     }

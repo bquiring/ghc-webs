@@ -37,6 +37,13 @@ module GHC.Internal.MVar (
     ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Maybe ( Maybe(..) )
+import GHC.Internal.Prim (
+    MVar#, RealWorld, isEmptyMVar#, makeStablePtr#, mkWeak#, newMVar#,
+    readMVar#, putMVar#, takeMVar#, tryPutMVar#, tryReadMVar#, tryTakeMVar#,
+    (/=#),
+  )
+import GHC.Internal.Prim.PtrEq ( sameMVar# )
 import GHC.Internal.Stable       ( StablePtr(..) )
 import GHC.Internal.Unsafe.Coerce ( unsafeCoerce# )
 

@@ -54,19 +54,23 @@ module GHC.Internal.RTS.Flags
 #include "Rts.h"
 #include "rts/Flags.h"
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Functor ((<$>))
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.C.String
 import GHC.Internal.Foreign.Marshal.Utils
 import GHC.Internal.Foreign.Storable
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Ptr
 import GHC.Internal.Word
-import GHC.Internal.Base
 import GHC.Internal.Enum
 import GHC.Internal.Generics (Generic)
 import GHC.Internal.IO
 import GHC.Internal.Real
 import GHC.Internal.Show
+import qualified GHC.Internal.Num as Rebindable
+import qualified GHC.Internal.Generics as Rebindable
 
 -- | 'RtsTime' is defined as a @StgWord64@ in @stg/Types.h@
 --
@@ -178,6 +182,8 @@ data MiscFlags = MiscFlags
 data IoManagerFlag =
        IoManagerFlagAuto
      | IoManagerFlagSelect        -- ^ Unix only, non-threaded RTS only
+     | IoManagerFlagSelectBis     -- ^ Unix only, non-threaded RTS only
+     | IoManagerFlagPoll          -- ^ Unix only, non-threaded RTS only
      | IoManagerFlagMIO           -- ^ cross-platform, threaded RTS only
      | IoManagerFlagWinIO         -- ^ Windows only
      | IoManagerFlagWin32Legacy   -- ^ Windows only, non-threaded RTS only
@@ -204,6 +210,8 @@ data DebugFlags = DebugFlags
     , squeeze        :: Bool -- ^ @z@ stack squeezing & lazy blackholing
     , hpc            :: Bool -- ^ @c@ coverage
     , sparks         :: Bool -- ^ @r@
+    , ipe            :: Bool -- ^ @I@
+                             --   @since ghc-experimental-10.0.0
     } deriving ( Show -- ^ @since base-4.8.0.0
                , Generic -- ^ @since base-4.15.0.0
                )
@@ -311,6 +319,8 @@ data ProfFlags = ProfFlags
     , retainerSelector         :: Maybe String
     , bioSelector              :: Maybe String
     , eraSelector              :: Word -- ^ @since base-4.20.0.0
+    , closureTypeSelector      :: Maybe String
+    , infoTableSelector        :: Maybe String
     } deriving ( Show -- ^ @since base-4.8.0.0
                , Generic -- ^ @since base-4.15.0.0
                )
@@ -350,6 +360,8 @@ data TraceFlags = TraceFlags
     , sparksSampled  :: Bool -- ^ trace spark events by a sampled method
     , sparksFull     :: Bool -- ^ trace spark events 100% accurately
     , user           :: Bool -- ^ trace user events (emitted from Haskell code)
+    , traceIpe       :: Bool -- ^ trace IPE events
+                             --   @since ghc-experimental-10.0.0
     } deriving ( Show -- ^ @since base-4.8.0.0
                , Generic -- ^ @since base-4.15.0.0
                )
@@ -579,6 +591,8 @@ getDebugFlags = do
                    (#{peek DEBUG_FLAGS, hpc} ptr :: IO CBool))
              <*> (toBool <$>
                    (#{peek DEBUG_FLAGS, sparks} ptr :: IO CBool))
+             <*> (toBool <$>
+                   (#{peek DEBUG_FLAGS, ipe} ptr :: IO CBool))
 
 getCCFlags :: IO CCFlags
 getCCFlags = do
@@ -612,12 +626,14 @@ getProfFlags = do
             <*> (peekCStringOpt =<< #{peek PROFILING_FLAGS, retainerSelector} ptr)
             <*> (peekCStringOpt =<< #{peek PROFILING_FLAGS, bioSelector} ptr)
             <*> #{peek PROFILING_FLAGS, eraSelector} ptr
+            <*> (peekCStringOpt =<< #{peek PROFILING_FLAGS, closureTypeSelector} ptr)
+            <*> (peekCStringOpt =<< #{peek PROFILING_FLAGS, infoTableSelector} ptr)
 
 getTraceFlags :: IO TraceFlags
 getTraceFlags = do
 #if defined(javascript_HOST_ARCH)
   -- The JS backend does not currently have trace flags
-  pure (TraceFlags TraceNone False False False False False False False)
+  return (TraceFlags TraceNone False False False False False False False False)
 #else
   let ptr = (#ptr RTS_FLAGS, TraceFlags) rtsFlagsPtr
   TraceFlags <$> (toEnum . fromIntegral
@@ -636,6 +652,8 @@ getTraceFlags = do
                    (#{peek TRACE_FLAGS, sparks_full} ptr :: IO CBool))
              <*> (toBool <$>
                    (#{peek TRACE_FLAGS, user} ptr :: IO CBool))
+             <*> (toBool <$>
+                   (#{peek TRACE_FLAGS, ipe} ptr :: IO CBool))
 #endif
 
 getTickyFlags :: IO TickyFlags

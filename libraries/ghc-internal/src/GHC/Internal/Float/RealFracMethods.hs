@@ -61,13 +61,22 @@ module GHC.Internal.Float.RealFracMethods
 
 import GHC.Internal.Bignum.Integer
 
-import GHC.Internal.Base hiding (uncheckedIShiftRA64#, uncheckedIShiftL64#)
-import GHC.Internal.Num () -- instance Num Integer
-                           -- (We could remove uses with a little effort)
+import GHC.Internal.Base
+import GHC.Internal.Prim (
+    eqFloat#, decodeFloat_Int#, double2Int#, float2Int#, int2Float#,
+    int2Double#, int2Word#, ltFloat#, minusFloat#, negateFloat#, negateDouble#,
+    negateInt#, uncheckedIShiftL#, uncheckedIShiftRA#, uncheckedIShiftRL#,
+    (+#), (-#), (<#), (>#), (-##), (==##), (<##) )
+
+import GHC.Internal.Num as Rebindable
+            ( fromInteger, negate ) -- For known-key names
+                                    -- and instance Num Integer
 
 #if WORD_SIZE_IN_BITS < 64
 
-import GHC.Internal.Base (uncheckedIShiftRA64#, uncheckedIShiftL64#)
+import GHC.Internal.Prim (
+    negateInt64#, subInt64#, uncheckedIShiftRA64#, uncheckedIShiftL64#,
+  )
 
 #define TO64 integerToInt64#
 #define FROM64 integerFromInt64#
@@ -75,6 +84,10 @@ import GHC.Internal.Base (uncheckedIShiftRA64#, uncheckedIShiftL64#)
 #define NEGATE64 negateInt64#
 
 #else
+
+import GHC.Internal.Prim (
+    Int#,
+  )
 
 #define TO64 integerToInt#
 #define FROM64 IS
@@ -88,8 +101,6 @@ uncheckedIShiftL64# :: Int# -> Int# -> Int#
 uncheckedIShiftL64# = uncheckedIShiftL#
 
 #endif
-
-default ()
 
 ------------------------------------------------------------------------------
 --                              Float Methods                               --
@@ -345,4 +356,3 @@ foreign import ccall unsafe "rintDouble"
 
 foreign import ccall unsafe "rintFloat"
     c_rintFloat :: Float -> Float
-

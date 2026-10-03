@@ -1,5 +1,3 @@
-
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -48,6 +46,7 @@ import GHC.Core.SimpleOpt
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 import GHC.Core.InstEnv ( CanonicalEvidence(..) )
 import GHC.Core.Make
+import GHC.Core.Make.BigTuple
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity     ( etaExpand )
 import GHC.Core.Unfold.Make
@@ -60,17 +59,19 @@ import GHC.Core.Rules
 import GHC.Core.Ppr( pprCoreBinders )
 import GHC.Core.TyCo.Compare( eqType )
 
-import GHC.Builtin.Names
-import GHC.Builtin.Types ( naturalTy, typeSymbolKind, charTy )
+import GHC.Builtin.KnownKeys( typeableClassKey )
+import GHC.Builtin.KnownOccs
+import GHC.Builtin.WiredIn.Types ( naturalTy, typeSymbolKind, charTy )
 
 import GHC.Tc.Types.Evidence
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma
 import GHC.Types.Name
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Types.Var( EvVar, mkLocalVar )
+import GHC.Types.Var( EvVar, mkLocalVar, isRuntimePiTyBinder )
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
 import GHC.Types.Unique.Set( nonDetEltsUniqSet )
@@ -197,7 +198,7 @@ dsHsBind dflags (VarBind { var_id = var
   = do  { core_expr <- dsLExpr expr
                 -- Dictionary bindings are always VarBinds,
                 -- so we only need do this here
-        ; let core_bind@(id,_) = makeCorePair dflags var False 0 core_expr
+        ; let core_bind@(id,_) = makeCorePair dflags var False core_expr
               force_var = if xopt LangExt.Strict dflags
                           then [id]
                           else []
@@ -212,11 +213,11 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
 
       ; let body' = mkOptTickBox tick body
             rhs   = core_wrap (mkLams args body')
-            core_binds@(id,_) = makeCorePair dflags fun False 0 rhs
+            core_binds@(id,_) = makeCorePair dflags fun False rhs
             force_var
                 -- Bindings are strict when -XStrict is enabled
               | xopt LangExt.Strict dflags
-              , matchGroupArity matches == 0 -- no need to force lambdas
+              , matchGroupVisArity matches == 0 -- no need to force lambdas
               = [id]
               | isBangedHsBind b
               = [id]
@@ -228,13 +229,13 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
         return (force_var, [core_binds]) }
 
 dsHsBind dflags (PatBind { pat_lhs = pat, pat_rhs = grhss
-                         , pat_ext = (ty, (rhs_tick, var_ticks))
+                         , pat_ext = ext
                          })
   = do  { rhss_nablas <- pmcGRHSs PatBindGuards grhss
-        ; body_expr <- dsGuarded grhss ty rhss_nablas
-        ; let body' = mkOptTickBox rhs_tick body_expr
+        ; body_expr <- dsGuarded grhss (patBindGRHSType ext) rhss_nablas
+        ; let body' = mkOptTickBox (patBindRHSTicks ext) body_expr
               pat'  = decideBangHood dflags pat
-        ; (force_var,sel_binds) <- mkSelectorBinds var_ticks pat PatBindRhs body'
+        ; (force_var,sel_binds) <- mkSelectorBinds (patBindVarsTicks ext) pat PatBindRhs body'
           -- We silently ignore inline pragmas; no makeCorePair
           -- Not so cool, but really doesn't matter
         ; let force_var' = if isBangedLPat pat'
@@ -304,7 +305,7 @@ dsAbsBinds dflags tyvars dicts exports
        ; let global_id' = addIdSpecialisations global_id rules
              main_bind  = makeCorePair dflags global_id'
                                        (isDefaultMethod prags)
-                                       (dictArity dicts) rhs
+                                       rhs
 
        ; return (force_vars', fromOL spec_binds ++ [main_bind]) } }
 
@@ -345,8 +346,7 @@ dsAbsBinds dflags tyvars dicts exports
              new_force_vars = get_new_force_vars force_vars
              locals       = map abe_mono exports
              all_locals   = locals ++ new_force_vars
-             tup_expr     = mkBigCoreVarTup all_locals
-             tup_ty       = exprType tup_expr
+       ; tup_expr <- mkBigCoreVarTup BoxedElements all_locals
        ; let poly_tup_rhs = mkLams tyvars $ mkLams dicts $
                             mkCoreLets ds_ev_binds $
                             mkLet aux_binds $
@@ -363,11 +363,13 @@ dsAbsBinds dflags tyvars dicts exports
                           , abe_poly = global
                           , abe_mono = local, abe_prags = spec_prags })
                           -- See Note [ABExport wrapper] in "GHC.Hs.Binds"
-                = do { tup_id  <- newSysLocalMDs tup_ty
-                     ; dsHsWrapper wrap $ \core_wrap -> do
-                     { let rhs = core_wrap $ mkLams tyvars $ mkLams dicts $
-                                 mkBigTupleSelector all_locals local tup_id $
-                                 mkVarApps (Var poly_tup_id) (tyvars ++ dicts)
+                = do { dsHsWrapper wrap $ \core_wrap -> do
+                       -- The tuple components are boxed; we select the desired
+                       -- one and unbox it; mkBigTupleCase does the unboxing.
+                       -- See Note [Boxing big tuple elements] in GHC.HsToCore.Utils.
+                     { sel_body <- mkBigTupleCase all_locals (Var local) $
+                                     mkVarApps (Var poly_tup_id) (tyvars ++ dicts)
+                     ; let rhs = core_wrap $ mkLams tyvars $ mkLams dicts sel_body
                            rhs_for_spec = Let (NonRec poly_tup_id poly_tup_rhs) rhs
                      ; (spec_binds, rules) <- dsSpecs rhs_for_spec spec_prags
                      ; let global' = (global `setInlinePragma` defaultInlinePragma)
@@ -387,7 +389,7 @@ dsAbsBinds dflags tyvars dicts exports
     mk_aux_bind (lcl_id, rhs) = let lcl_w_inline = lookupVarEnv inline_env lcl_id
                                                    `orElse` lcl_id
                                  in
-                                 makeCorePair dflags lcl_w_inline False 0 rhs
+                                 makeCorePair dflags lcl_w_inline False rhs
 
     inline_env :: IdEnv Id -- Maps a monomorphic local Id to one with
                            -- the inline pragma from the source
@@ -438,9 +440,9 @@ dsAbsBinds dflags tyvars dicts exports
 -- the unfolding in the interface file is made in `GHC.Iface.Tidy.addExternal`
 -- using this information.
 ------------------------
-makeCorePair :: DynFlags -> Id -> Bool -> Arity -> CoreExpr
+makeCorePair :: DynFlags -> Id -> Bool -> CoreExpr
              -> (Id, CoreExpr)
-makeCorePair dflags gbl_id is_default_method dict_arity rhs
+makeCorePair dflags gbl_id is_default_method rhs
   | is_default_method    -- Default methods are *always* inlined
                          -- See Note [INLINE and default methods] in GHC.Tc.TyCl.Instance
   = (gbl_id `setIdUnfolding` mkCompulsoryUnfolding' simpl_opts rhs, rhs)
@@ -457,22 +459,43 @@ makeCorePair dflags gbl_id is_default_method dict_arity rhs
     inline_prag   = idInlinePragma gbl_id
     inlinable_unf = mkInlinableUnfolding simpl_opts StableUserSrc rhs
     inline_pair
-       | Just arity <- inlinePragmaSat inline_prag
+       | AppliedToAtLeast vis_arity <- inlinePragmaSaturation inline_prag
         -- Add an Unfolding for an INLINE (but not for NOINLINE)
         -- And eta-expand the RHS; see Note [Eta-expanding INLINE things]
-       , let real_arity = dict_arity + arity
-        -- NB: The arity passed to mkInlineUnfoldingWithArity
-        --     must take account of the dictionaries
-       = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity simpl_opts StableUserSrc real_arity rhs
-         , etaExpand real_arity rhs)
+       , let runtime_arity = findSatArity vis_arity (idType gbl_id)
+        -- NB: runtime_arity: the arity passed to mkInlineUnfoldingWithArity
+        --     must take account of dictionaries and required type args
+       = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity simpl_opts StableUserSrc
+                                                              runtime_arity rhs
+         , etaExpand runtime_arity rhs)
 
        | otherwise
        = pprTrace "makeCorePair: arity missing" (ppr gbl_id) $
          (gbl_id `setIdUnfolding` mkInlineUnfoldingNoArity simpl_opts StableUserSrc rhs, rhs)
 
-dictArity :: [Var] -> Arity
--- Don't count coercion variables in arity
-dictArity dicts = count isId dicts
+findSatArity :: VisArity -> Type -> Arity
+-- Given the VisArity, find the value Arity of the function.
+-- This is the number of runtime-value arguments the function must be applied
+-- to before the INLINE pragma fires and inlines the function
+-- We must:
+--    add one for each invisible dictionary arg; and
+--    subtract one for each required type argment
+findSatArity vis_arity ty
+  = go vis_arity pi_bndrs
+  where
+    (pi_bndrs, _) = splitPiTys ty
+
+    go vis_arity (bndr : bndrs)
+      | isInvisiblePiTyBinder bndr = add_bndr bndr (go vis_arity     bndrs)
+      | vis_arity == 0             = 0
+      | otherwise                  = add_bndr bndr (go (vis_arity-1) bndrs)
+    go vis_arity []
+      | vis_arity == 0 = 0
+      | otherwise      = pprPanic "findSatArity" (ppr vis_arity $$ ppr ty)
+
+    add_bndr :: PiTyBinder -> Arity -> Arity
+    add_bndr bndr ar | isRuntimePiTyBinder bndr = ar+1
+                     | otherwise                = ar
 
 {-
 Note [Desugaring AbsBinds]
@@ -973,7 +996,7 @@ dsSpec poly_rhs (SpecPragE { spe_fn_nm = poly_nm
        ; dsSpec_help poly_nm poly_id poly_rhs spec_inl bndrs ds_call }
 
 dsSpec_help :: Name -> Id -> CoreExpr              -- Function to specialise
-            -> InlinePragma -> [Var] -> CoreExpr
+            -> InlinePragma GhcTc -> [Var] -> CoreExpr
             -> DsM (Maybe (OrdList (Id,CoreExpr), CoreRule))
 dsSpec_help poly_nm poly_id poly_rhs spec_inl orig_bndrs ds_call
   = do { -- Decompose the call
@@ -991,7 +1014,9 @@ dsSpec_help poly_nm poly_id poly_rhs spec_inl orig_bndrs ds_call
              is_local v = v `elemVarSet` locals
 
              -- Find `rule_bndrs`: (S2) of Note [Desugaring new-form SPECIALISE pragmas]
-             rule_bndrs = scopedSort (exprsSomeFreeVarsList is_local rule_lhs_args)
+             -- We have to do closeOverKinds beccause exprsSomeFreeVars is shallow
+             rule_bndrs = scopedSort $ dVarSetElems $ closeOverKindsDSet $
+                          exprsSomeFreeVarsDSet is_local rule_lhs_args
 
              -- getRenamings: (S3) of  Note [Desugaring new-form SPECIALISE pragmas]
              rn_binds     = getRenamings orig_bndrs binds rule_bndrs
@@ -1000,7 +1025,7 @@ dsSpec_help poly_nm poly_id poly_rhs spec_inl orig_bndrs ds_call
              known_vars   = mkVarSet rule_bndrs `extendVarSetList` bindersOfBinds rn_binds
              picked_binds = pickSpecBinds is_local known_vars binds
 
-             -- Fins `spec_bndrs`: (S5) of Note [Desugaring new-form SPECIALISE pragmas]
+             -- Find `spec_bndrs`: (S5) of Note [Desugaring new-form SPECIALISE pragmas]
              -- Make spec_bndrs, the variables to pass to the specialised
              -- function, by filtering out the rule_bndrs that aren't needed
              spec_binds_bndr_set = mkVarSet (bindersOfBinds picked_binds)
@@ -1077,11 +1102,12 @@ dsSpec_help poly_nm poly_id poly_rhs spec_inl orig_bndrs ds_call
     inl_prag_act  = inlinePragmaActivation id_inl
     spec_prag_act = inlinePragmaActivation spec_inl
     no_act_spec = case inlinePragmaSpec spec_inl of
-                    NoInline _   -> isNeverActive  spec_prag_act
-                    Opaque _     -> isNeverActive  spec_prag_act
-                    _            -> isAlwaysActive spec_prag_act
-    rule_act | no_act_spec = inl_prag_act    -- Inherit
-             | otherwise   = spec_prag_act   -- Specified by user
+                    NoInline -> isNeverActive  spec_prag_act
+                    Opaque   -> isNeverActive  spec_prag_act
+                    _        -> isAlwaysActive spec_prag_act
+    rule_act :: ActivationGhc
+    rule_act | no_act_spec = inl_prag_act  -- Inherit
+             | otherwise   = spec_prag_act -- Specified by user
 
     is_dfun = case idDetails poly_id of
       DFunId {} -> True
@@ -1115,7 +1141,7 @@ decomposeCall poly_id ds_call
 
     -- Is this SPECIALISE pragma useless?
 checkUselessSpecPrag :: Id -> [CoreExpr]
-   -> [Var] -> Bool -> InlinePragma -> Activation
+   -> [Var] -> Bool -> InlinePragma (GhcPass p) -> ActivationGhc
    ->  Maybe UselessSpecialisePragmaReason
 checkUselessSpecPrag poly_id rule_lhs_args
                      spec_bndrs no_act_spec spec_inl rule_act
@@ -1191,8 +1217,7 @@ getCastedVar (Var v)           = Just (v, MRefl)
 getCastedVar (Cast (Var v) co) = Just (v, MCo co)
 getCastedVar _                 = Nothing
 
-specFunInlinePrag :: Id -> InlinePragma
-                  -> InlinePragma -> InlinePragma
+specFunInlinePrag :: Id -> InlinePragma GhcTc -> InlinePragma GhcTc -> InlinePragma GhcTc
 -- See Note [Activation pragmas for SPECIALISE]
 specFunInlinePrag poly_id id_inl spec_inl
   | not (isDefaultInlinePragma spec_inl)    = spec_inl
@@ -1597,9 +1622,13 @@ dsHsWrapper hs_wrap thing_inside
 ds_hs_wrapper :: HsWrapper
               -> ((CoreExpr -> CoreExpr) -> DsM a)
               -> DsM a
-ds_hs_wrapper wrap = go wrap
+ds_hs_wrapper hs_wrap
+  = go hs_wrap
   where
     go WpHole            k = k $ \e -> e
+    go (WpSubType w)     k = go (optSubTypeHsWrapper w) k
+                             -- See (DSST3) in Note [Deep subsumption and WpSubType]
+                             --             in GHC.Tc.Types.Evidence
     go (WpTyApp ty)      k = k $ \e -> App e (Type ty)
     go (WpEvLam ev)      k = k $ Lam ev
     go (WpTyLam tv)      k = k $ Lam tv
@@ -1612,13 +1641,13 @@ ds_hs_wrapper wrap = go wrap
     go (WpCompose c1 c2) k = go c1 $ \w1 ->
                              go c2 $ \w2 ->
                              k (w1 . w2)
-    go (WpFun c1 c2 st)  k = -- See Note [Desugaring WpFun]
-                             do { x <- newSysLocalDs st
-                                ; go c1 $ \w1 ->
-                                  go c2 $ \w2 ->
-                                  let app f a = mkCoreApp (text "dsHsWrapper") f a
-                                      arg     = w1 (Var x)
-                                  in k (\e -> (Lam x (w2 (app e arg)))) }
+    go (WpFun w_co c1 c2 t _) k = -- See Note [Desugaring WpFun]
+                              do { x <- newSysLocalDs (mkScaled (subMultCoRKind w_co) t)
+                                 ; go c1 $ \w1 ->
+                                   go c2 $ \w2 ->
+                                   let app f a = mkCoreApp f a
+                                       arg     = w1 (Var x)
+                                   in k (\e -> (Lam x (w2 (app e arg)))) }
 
 --------------------------------------
 dsTcEvBinds_s :: [TcEvBinds] -> ([CoreBind] -> DsM a) -> DsM a
@@ -1724,7 +1753,7 @@ dsEvTerm (EvExpr e)          = return e
 dsEvTerm (EvTypeable ty ev)  = dsEvTypeable ty ev
 dsEvTerm (EvFun { et_tvs = tvs, et_given = given
                 , et_binds = ev_binds, et_body = wanted_id })
-  = do { dsEvBinds ev_binds $ \ds_ev_binds ->
+  = do { dsTcEvBinds ev_binds $ \ds_ev_binds ->
          return $ (mkLams (tvs ++ given) $
                    mkCoreLets ds_ev_binds $
                    Var wanted_id) }
@@ -1741,7 +1770,7 @@ dsEvTypeable :: Type -> EvTypeable -> DsM CoreExpr
 -- This code is tightly coupled to the representation
 -- of TypeRep, in base library Data.Typeable.Internal
 dsEvTypeable ty ev
-  = do { tyCl <- dsLookupTyCon typeableClassName    -- Typeable
+  = do { tyCl <- dsLookupKnownKeyTyCon typeableClassKey    -- Typeable
        ; let kind = typeKind ty
              typeable_data_con = tyConSingleDataCon tyCl  -- "Data constructor"
                                                     -- for Typeable
@@ -1756,10 +1785,10 @@ type TypeRepExpr = CoreExpr
 -- | Returns a @CoreExpr :: TypeRep ty@
 ds_ev_typeable :: Type -> EvTypeable -> DsM CoreExpr
 ds_ev_typeable ty (EvTypeableTyCon tc kind_ev)
-  = do { mkTrCon <- dsLookupGlobalId mkTrConName
+  = do { mkTrCon <- dsLookupKnownOccId mkTrConOcc
                     -- mkTrCon :: forall k (a :: k). TyCon -> TypeRep k -> TypeRep a
-       ; someTypeRepTyCon <- dsLookupTyCon someTypeRepTyConName
-       ; someTypeRepDataCon <- dsLookupDataCon someTypeRepDataConName
+       ; someTypeRepTyCon <- dsLookupKnownOccTyCon someTypeRepTyConOcc
+       ; someTypeRepDataCon <- dsLookupKnownOccDataCon someTypeRepDataConOcc
                     -- SomeTypeRep :: forall k (a :: k). TypeRep a -> SomeTypeRep
 
        ; tc_rep <- tyConRep tc                      -- :: TyCon
@@ -1788,7 +1817,7 @@ ds_ev_typeable ty (EvTypeableTyApp ev1 ev2)
   | Just (t1,t2) <- splitAppTy_maybe ty
   = do { e1  <- getRep ev1 t1
        ; e2  <- getRep ev2 t2
-       ; mkTrAppChecked <- dsLookupGlobalId mkTrAppCheckedName
+       ; mkTrAppChecked <- dsLookupKnownOccId mkTrAppCheckedOcc
                     -- mkTrAppChecked :: forall k1 k2 (a :: k1 -> k2) (b :: k1).
                     --                   TypeRep a -> TypeRep b -> TypeRep (a b)
        ; let (_, k1, k2) = splitFunTy (typeKind t1)  -- drop the multiplicity,
@@ -1804,7 +1833,7 @@ ds_ev_typeable ty (EvTypeableTrFun evm ev1 ev2)
   = do { e1 <- getRep ev1 t1
        ; e2 <- getRep ev2 t2
        ; em <- getRep evm m
-       ; mkTrFun <- dsLookupGlobalId mkTrFunName
+       ; mkTrFun <- dsLookupKnownOccId mkTrFunOcc
                     -- mkTrFun :: forall (m :: Multiplicity) r1 r2 (a :: TYPE r1) (b :: TYPE r2).
                     --            TypeRep m -> TypeRep a -> TypeRep b -> TypeRep (a % m -> b)
        ; let r1 = getRuntimeRep t1
@@ -1815,7 +1844,7 @@ ds_ev_typeable ty (EvTypeableTrFun evm ev1 ev2)
 
 ds_ev_typeable ty (EvTypeableTyLit ev)
   = -- See Note [Typeable for Nat and Symbol] in GHC.Tc.Instance.Class
-    do { fun  <- dsLookupGlobalId tr_fun
+    do { fun  <- dsLookupKnownOccId tr_fun
        ; dict <- dsEvTerm ev       -- Of type KnownNat/KnownSymbol
        ; return (mkApps (mkTyApps (Var fun) [ty]) [ dict ]) }
   where
@@ -1824,9 +1853,9 @@ ds_ev_typeable ty (EvTypeableTyLit ev)
     -- tr_fun is the Name of
     --       typeNatTypeRep    :: KnownNat    a => TypeRep a
     -- of    typeSymbolTypeRep :: KnownSymbol a => TypeRep a
-    tr_fun | ty_kind `eqType` naturalTy      = typeNatTypeRepName
-           | ty_kind `eqType` typeSymbolKind = typeSymbolTypeRepName
-           | ty_kind `eqType` charTy         = typeCharTypeRepName
+    tr_fun | ty_kind `eqType` naturalTy      = typeNatTypeRepOcc
+           | ty_kind `eqType` typeSymbolKind = typeSymbolTypeRepOcc
+           | ty_kind `eqType` charTy         = typeCharTypeRepOcc
            | otherwise = panic "dsEvTypeable: unknown type lit kind"
 
 ds_ev_typeable ty ev
@@ -1840,7 +1869,7 @@ getRep :: EvTerm          -- ^ EvTerm for @Typeable ty@
 --   typeRep# :: forall k (a::k). Typeable k a -> TypeRep a
 getRep ev ty
   = do { typeable_expr <- dsEvTerm ev
-       ; typeRepId     <- dsLookupGlobalId typeRepIdName
+       ; typeRepId     <- dsLookupKnownOccId typeRepIdOcc
        ; let ty_args = [typeKind ty, ty]
        ; return (mkApps (mkTyApps (Var typeRepId) ty_args) [ typeable_expr ]) }
 

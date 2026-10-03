@@ -1,8 +1,3 @@
-{-# LANGUAGE DeriveFunctor       #-}
-{-# LANGUAGE GADTs               #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
-
 -- (c) The University of Glasgow 2006
 --
 -- FamInstEnv: Type checked family instance declarations
@@ -51,7 +46,7 @@ import GHC.Core.Reduction
 import GHC.Core.RoughMap
 import GHC.Core.FVs( orphNamesOfAxiomLHS )
 
-import GHC.Builtin.Types.Literals( tryMatchFam )
+import GHC.Builtin.WiredIn.TypeLits( tryMatchFam )
 
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -248,10 +243,10 @@ pprFamInst (FamInst { fi_flavor = flavor, fi_axiom = ax
     ppr_tc_sort = case flavor of
                      SynFamilyInst             -> text "type"
                      DataFamilyInst tycon
-                       | isDataTyCon     tycon -> text "data"
-                       | isNewTyCon      tycon -> text "newtype"
-                       | isAbstractTyCon tycon -> text "data"
-                       | otherwise             -> text "WEIRD" <+> ppr tycon
+                       | isBoxedDataTyCon tycon -> text "data"
+                       | isNewTyCon       tycon -> text "newtype"
+                       | isAbstractTyCon  tycon -> text "data"
+                       | otherwise              -> text "WEIRD" <+> ppr tycon
 
     debug_stuff = vcat [ text "Coercion axiom:" <+> ppr ax
                        , text "Tvs:" <+> ppr tvs
@@ -338,7 +333,7 @@ mkImportedFamInst fam mb_tcs axiom orphan
          -- Maybe we should store it in the IfaceFamInst?
      flavor = case splitTyConApp_maybe rhs of
                 Just (tc, _)
-                  | Just ax' <- tyConFamilyCoercion_maybe tc
+                  | Just ax' <- tyConDataFamCoercion_maybe tc
                   , ax' == axiom
                   -> DataFamilyInst tc
                 _ -> SynFamilyInst
@@ -450,12 +445,11 @@ familyInstances envs tc
   = familyNameInstances envs (tyConName tc)
 
 familyNameInstances :: (FamInstEnv, FamInstEnv) -> Name -> [FamInst]
-familyNameInstances (pkg_fie, home_fie) fam
+familyNameInstances (pkg_fie, home_fie) fam_nm
   = get home_fie ++ get pkg_fie
   where
     get :: FamInstEnv -> [FamInst]
-    get (FamIE _ env) = lookupRM [RML_KnownTc fam] env
-
+    get (FamIE _ env) = lookupRM [RML_KnownTc fam_nm] env
 
 -- | Makes no particular effort to detect conflicts.
 unionFamInstEnv :: FamInstEnv -> FamInstEnv -> FamInstEnv
@@ -606,12 +600,10 @@ data InjectivityCheckResult
 injectiveBranches :: [Bool] -> CoAxBranch -> CoAxBranch
                   -> InjectivityCheckResult
 injectiveBranches injectivity
-                  ax1@(CoAxBranch { cab_tvs = tvs1, cab_lhs = lhs1, cab_rhs = rhs1 })
-                  ax2@(CoAxBranch { cab_tvs = tvs2, cab_lhs = lhs2, cab_rhs = rhs2 })
+                  ax1@(CoAxBranch { cab_lhs = lhs1, cab_rhs = rhs1 })
+                  ax2@(CoAxBranch { cab_lhs = lhs2, cab_rhs = rhs2 })
   -- See Note [Verifying injectivity annotation], case 1.
-  = let getInjArgs  = filterByList injectivity
-        in_scope    = mkInScopeSetList (tvs1 ++ tvs2)
-    in case tcUnifyTyForInjectivity True in_scope rhs1 rhs2 of
+  = case tcUnifyTysForInjectivity True [rhs1] [rhs2] of
              -- True = two-way pre-unification
        Nothing -> InjectivityAccepted
          -- RHS are different, so equations are injective.
@@ -633,6 +625,7 @@ injectiveBranches injectivity
                   -- Payload of InjectivityUnified used only for check 1B2, only
                   -- for closed type families
         where
+          getInjArgs  = filterByList injectivity
           lhs1Subst = Type.substTys subst (getInjArgs lhs1)
           lhs2Subst = Type.substTys subst (getInjArgs lhs2)
 
@@ -840,7 +833,8 @@ lookupFamInstEnvByTyCon :: FamInstEnvs -> TyCon -> [FamInst]
 lookupFamInstEnvByTyCon (pkg_ie, home_ie) fam_tc
   = get pkg_ie ++ get home_ie
   where
-    get (FamIE _ rm) = lookupRM [RML_KnownTc (tyConName fam_tc)] rm
+    fam_nm = tyConName fam_tc
+    get (FamIE _ rm) = lookupRM [RML_KnownTc fam_nm] rm
 
 lookupFamInstEnv
     :: FamInstEnvs
@@ -1025,26 +1019,24 @@ data FamInstLookupMode a where
   WantConflicts :: FamInst -> FamInstLookupMode FamInst
   WantMatches  :: FamInstLookupMode FamInstMatch
 
-lookup_fam_inst_env'          -- The worker, local to this module
-    :: forall a . FamInstLookupMode a
-    -> FamInstEnv
-    -> TyCon -> [Type]        -- What we are looking for
-    -> [a]
-lookup_fam_inst_env' lookup_mode (FamIE _ ie) fam match_tys
-  | isOpenFamilyTyCon fam
-  , let xs = rm_fun (lookupRM' rough_tmpl ie)   -- The common case
-    -- Avoid doing any of the allocation below if there are no instances to look at.
-  , not $ null xs
-  = mapMaybe' check_fun xs
-  | otherwise = []
-  where
-    rough_tmpl :: [RoughMatchLookupTc]
-    rough_tmpl = RML_KnownTc (tyConName fam) : map typeToRoughMatchLookupTc match_tys
+lookup_fam_inst_env           -- The worker, local to this module
+    :: forall a
+    .  FamInstLookupMode a
+    -> FamInstEnvs
+    -> TyCon -> [Type] -- What we are looking for
+    -> [a]             -- Successful matches
 
-    rm_fun :: (Bag FamInst, [FamInst]) -> [FamInst]
-    (rm_fun, check_fun) = case lookup_mode of
-                            WantConflicts fam_inst -> (snd, unify_fun fam_inst)
-                            WantMatches -> (bagToList . fst, match_fun)
+-- Precondition: the tycon is saturated (or over-saturated)
+
+lookup_fam_inst_env lookup_mode envs fam match_tys
+  = mapMaybe' check_fun $
+    famInstEnvCandidates lookup_mode envs fam match_tys
+  where
+    check_fun :: FamInst -> Maybe a
+    check_fun =
+      case lookup_mode of
+        WantConflicts fam_inst -> unify_fun fam_inst
+        WantMatches            -> match_fun
 
     -- Function used for finding unifiers
     unify_fun orig_fam_inst item@(FamInst { fi_axiom = old_axiom, fi_tys = tpl_tys, fi_tvs = tpl_tvs })
@@ -1067,10 +1059,10 @@ lookup_fam_inst_env' lookup_mode (FamIE _ ie) fam match_tys
                             , fi_tys = tpl_tys }) =  do
       subst <- tcMatchTys tpl_tys match_tys1
       return (FamInstMatch { fim_instance = item
-                             , fim_tys      = substTyVars subst tpl_tvs `chkAppend` match_tys2
-                             , fim_cos      = assert (all (isJust . lookupCoVar subst) tpl_cvs) $
-                                               substCoVars subst tpl_cvs
-                             })
+                           , fim_tys      = substTyVars subst tpl_tvs `chkAppend` match_tys2
+                           , fim_cos      = assert (all (isJust . lookupCoVar subst) tpl_cvs) $
+                                            substCoVars subst tpl_cvs
+                           })
         where
           (match_tys1, match_tys2) = split_tys tpl_tys
 
@@ -1090,21 +1082,25 @@ lookup_fam_inst_env' lookup_mode (FamIE _ ie) fam match_tys
     pre_rough_split_tys
       = (pre_match_tys1, pre_match_tys2)
 
-lookup_fam_inst_env           -- The worker, local to this module
-    :: FamInstLookupMode a
-    -> FamInstEnvs
-    -> TyCon -> [Type]        -- What we are looking for
-    -> [a]         -- Successful matches
+-- | All candidate 'FamInst's for a type or data family application,
+-- roughly filtered using 'RoughMap'.
+--
+-- See Note [FamInstEnv].
+famInstEnvCandidates
+  :: FamInstLookupMode a -> FamInstEnvs -> TyCon -> [Type] -> [FamInst]
+famInstEnvCandidates mode (pkg_ie, home_ie) fam match_tys
+  | not (isOpenFamilyTyCon fam) = []
+  | otherwise
+  = from home_ie ++ from pkg_ie
+  where
+    fam_nm = tyConName fam
+    rough_tmpl = RML_KnownTc fam_nm : map typeToRoughMatchLookupTc match_tys
+    pick = case mode of WantMatches      -> bagToList . fst
+                        WantConflicts {} -> snd
+    from (FamIE _ ie) = pick (lookupRM' rough_tmpl ie)
 
--- Precondition: the tycon is saturated (or over-saturated)
-
-lookup_fam_inst_env match_fun (pkg_ie, home_ie) fam tys
-  =  lookup_fam_inst_env' match_fun home_ie fam tys
-  ++ lookup_fam_inst_env' match_fun pkg_ie  fam tys
-
-{-
-Note [Over-saturated matches]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Over-saturated matches]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 It's ok to look up an over-saturated type constructor.  E.g.
      type family F a :: * -> *
      type instance F (a,b) = Either (a->b)
@@ -1178,6 +1174,7 @@ reduceTyFamApp_maybe envs role tc tys
   | Phantom <- role
   = Nothing
 
+  -- Open type families & data families
   | case role of
       Representational -> isOpenFamilyTyCon     tc
       _                -> isOpenTypeFamilyTyCon tc
@@ -1193,15 +1190,18 @@ reduceTyFamApp_maybe envs role tc tys
   = let co = mkUnbranchedAxInstCo role ax inst_tys inst_cos
     in Just $ coercionRedn co
 
-  | Just ax <- isClosedSynFamilyTyConWithAxiom_maybe tc
-  , Just (ind, inst_tys, inst_cos) <- chooseBranch ax tys
-  = let co = mkAxInstCo role (BranchedAxiom ax ind) inst_tys inst_cos
-    in Just $ coercionRedn co
-
-  | Just builtin_fam  <- isBuiltInSynFamTyCon_maybe tc
-  , Just (rewrite,ts,ty) <- tryMatchFam builtin_fam tys
-  = let co = mkAxiomCo rewrite (map mkNomReflCo ts)
-    in Just $ mkReduction co ty
+  -- Closed type families
+  | Just ctf <- closedTypeFamily_maybe tc
+  = case ctf of
+      CTF (Just ax)
+        | Just (ind, inst_tys, inst_cos) <- chooseBranch ax tys
+        -> let co = mkAxInstCo role (BranchedAxiom ax ind) inst_tys inst_cos
+           in Just $ coercionRedn co
+      CTF_BuiltIn builtin_fam
+        | Just (rewrite,ts,ty) <- tryMatchFam builtin_fam tys
+        -> let co = mkAxiomCo rewrite (map mkNomReflCo ts)
+           in Just $ mkReduction co ty
+      _ -> Nothing
 
   | otherwise
   = Nothing
@@ -1336,7 +1336,7 @@ topNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe Reduction
 --      * newtypes
 -- returning an appropriate Representational coercion.  Specifically, if
 --   topNormaliseType_maybe env ty = Just (co, ty')
--- then
+-- then postconditions:
 --   (a) co :: ty ~R ty'
 --   (b) ty' is not a newtype, and is not a type-family or data-family redex
 --
@@ -1358,8 +1358,8 @@ topNormaliseType_maybe env ty
     unwrapNewTypeStepper' rec_nts tc tys
       = (, MRefl) <$> unwrapNewTypeStepper rec_nts tc tys
 
-      -- second coercion below is the kind coercion relating the original type's kind
-      -- to the normalised type's kind
+    -- The 'MCoercionN' is a kind coercion relating the original type's kind
+    -- to the normalised type's kind
     tyFamStepper :: NormaliseStepper (Coercion, MCoercionN)
     tyFamStepper rec_nts tc tys  -- Try to step a type/data family
       = case topReduceTyFamApp_maybe env tc tys of

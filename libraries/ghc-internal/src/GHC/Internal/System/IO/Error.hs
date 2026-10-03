@@ -84,12 +84,12 @@ module GHC.Internal.System.IO.Error (
     modifyIOError,
   ) where
 
-import GHC.Internal.Control.Exception.Base
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 
+import GHC.Internal.Control.Exception.Base
 import GHC.Internal.Data.Either
 import GHC.Internal.Data.Maybe
-
-import GHC.Internal.Base
 import GHC.Internal.Exception.Type
 import GHC.Internal.IO
 import GHC.Internal.IO.Exception

@@ -77,6 +77,7 @@ AC_DEFUN([FP_INSTALL_WINDOWS_TOOLCHAIN],[
 # $2 the location that the windows toolchain will be installed in relative to the libdir
 AC_DEFUN([FP_SETUP_WINDOWS_TOOLCHAIN],[
 
+    # TODO: UPDATE COMMENT
     # N.B. The parameters which get plopped in the `settings` file used by the
     # resulting compiler are computed in `FP_SETTINGS`. Specifically, we use
     # $$topdir-relative paths instead of fullpaths to the toolchain, by replacing
@@ -130,8 +131,8 @@ AC_DEFUN([FP_SETUP_WINDOWS_TOOLCHAIN],[
     AR="${mingwbin}llvm-ar.exe"
     RANLIB="${mingwbin}llvm-ranlib.exe"
     OBJDUMP="${mingwbin}llvm-objdump.exe"
-    DLLTOOL="${mingwbin}llvm-dlltool.exe"
     WindresCmd="${mingwbin}llvm-windres.exe"
+    DlltoolCmd="${mingwbin}llvm-dlltool.exe"
     LLC="${mingwbin}llc.exe"
     OPT="${mingwbin}opt.exe"
     LLVMAS="${mingwbin}clang.exe"
@@ -145,11 +146,11 @@ AC_DEFUN([FP_SETUP_WINDOWS_TOOLCHAIN],[
     dnl We override the USER_* flags here since the user delegated
     dnl configuration to the bundled windows toolchain, and these are the
     dnl options required by the bundled windows toolchain.
-    USER_CFLAGS="$CFLAGS"
     USER_CPP_ARGS="$CONF_CPP_OPTS_STAGE2"
-    USER_CXXFLAGS="$CXXFLAGS"
     USER_HS_CPP_ARGS="$HaskellCPPArgs"
-    USER_LDFLAGS="$CONF_GCC_LINKER_OPTS_STAGE2"
+    USER_CONF_CC_OPTS_STAGE2="$CONF_CC_OPTS_STAGE2"
+    USER_CONF_CXX_OPTS_STAGE2="$CONF_CXX_OPTS_STAGE2"
+    USER_CONF_GCC_LINKER_OPTS_STAGE2="$CONF_GCC_LINKER_OPTS_STAGE2"
     USER_JS_CPP_ARGS="$JavaScriptCPPArgs"
     USER_CMM_CPP_ARGS="$CmmCPPArgs"
 ])

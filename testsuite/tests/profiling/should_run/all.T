@@ -28,12 +28,14 @@ def normalise_InfoProv_ipName(str):
 
 test('staticcallstack001',
      [ omit_ways(ghci_ways + ['ghci-ext-prof']), # produces a different stack
+       omit_ways(llvm_ways), # -finfo-table-map does not work with -fllvm (#26435)
        normalise_fun(normalise_InfoProv_ipName)
      ], compile_and_run,
      ['-O0 -g3 -fdistinct-constructor-tables -finfo-table-map'])
 
 test('staticcallstack002',
      [ omit_ways(ghci_ways + ['ghci-ext-prof']), # produces a different stack
+       omit_ways(llvm_ways), # -finfo-table-map does not work with -fllvm (#26435)
        normalise_fun(normalise_InfoProv_ipName)
      ], compile_and_run,
      ['-O0 -g3 -fdistinct-constructor-tables -finfo-table-map'])
@@ -206,6 +208,8 @@ test('ignore_scc', [grep_prof("ignore_scc.hs"), test_opts_dot_prof], compile_and
 
 test('T21446', [], makefile_test, ['T21446'])
 
+test('T27225', [only_ways(['prof'])], compile_and_run, ['-O'])
+test('T27225b', [only_ways(['prof'])], compile_and_run, ['-O'])
 
 test('scc-prof-overloaded001',
      [grep_prof("scc-prof-overloaded001.hs"), test_opts_dot_prof],

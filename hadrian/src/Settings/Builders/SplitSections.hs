@@ -4,15 +4,15 @@ module Settings.Builders.SplitSections where
 import Expression
 import Packages
 import Settings
+import Settings.Builders.Common
 import Flavour.Type
 
-import Oracles.Setting
 
 -- | Does it make sense to enable or disable split sections?
 splitSectionsArgs :: Args
 splitSectionsArgs = do
   pkg <- getPackage
-  osx <- expr isOsxTarget
+  osx <- staged isOsxTarget
   notSt0 <- notStage0
   flav <- expr flavour
   if ( ghcSplitSections flav
@@ -32,8 +32,5 @@ splitSectionsArgs = do
         , builder (Ghc CompileCWithGhc) ? arg "-fsplit-sections"
         , builder (Ghc CompileCppWithGhc) ? arg "-fsplit-sections"
         , builder (Cc CompileC) ? arg "-ffunction-sections" <> arg "-fdata-sections"
-        , builder MergeObjects ? ifM (expr isWinTarget)
-            (pure ["-T", "driver/utils/merge_sections_pe.ld"])
-            (pure ["-T", "driver/utils/merge_sections.ld"])
         ]
     ) else mempty

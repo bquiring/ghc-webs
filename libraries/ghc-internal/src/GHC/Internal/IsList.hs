@@ -2,6 +2,9 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE TypeFamilies #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines toList, fromList etc
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.IsList
@@ -19,10 +22,13 @@ module GHC.Internal.IsList
   ( IsList(..)
   ) where
 
-import GHC.Internal.Base
+import GHC.Internal.Base (NonEmpty(..), String, id)
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Functor.ZipList (ZipList(..))
 import GHC.Internal.Stack
 import GHC.Internal.Data.Version ( Version(..), makeVersion )
+import GHC.Internal.Types (Int)
+import qualified GHC.Internal.Base as Rebindable
 
 -- | The 'IsList' class and its methods are intended to be used in
 --   conjunction with the OverloadedLists extension.

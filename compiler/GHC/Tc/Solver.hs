@@ -1,4 +1,4 @@
-{-# LANGUAGE MultiWayIf, RecursiveDo, TupleSections #-}
+{-# LANGUAGE MultiWayIf, RecursiveDo #-}
 
 module GHC.Tc.Solver(
        InferMode(..), simplifyInfer, findInferredDiff,
@@ -102,17 +102,14 @@ captureTopConstraints :: TcM a -> TcM (a, WantedConstraints)
 -- calling this, so that the reportUnsolved has access to the most
 -- complete GlobalRdrEnv
 captureTopConstraints thing_inside
-  = do { static_wc_var <- TcM.newTcRef emptyWC ;
-       ; (mb_res, lie) <- TcM.updGblEnv (\env -> env { tcg_static_wc = static_wc_var } ) $
-                          TcM.tryCaptureConstraints thing_inside
-       ; stWC <- TcM.readTcRef static_wc_var
+  = do { (mb_res, lie) <- TcM.tryCaptureConstraints thing_inside
 
        -- See GHC.Tc.Utils.Monad Note [Constraints and errors]
        -- If the thing_inside threw an exception, but generated some insoluble
        -- constraints, report the latter before propagating the exception
        -- Otherwise they will be lost altogether
        ; case mb_res of
-           Just res -> return (res, lie `andWC` stWC)
+           Just res -> return (res, lie)
            Nothing  -> do { _ <- simplifyTop lie; failM } }
                 -- This call to simplifyTop is the reason
                 -- this function is here instead of GHC.Tc.Utils.Monad
@@ -659,41 +656,114 @@ equality constraint, but it is also important to detect custom type errors:
 
 To see that we can't call `foo (MkT2)`, we must detect that `NotInt Int` is insoluble
 because it is a custom type error.
-Failing to do so proved quite inconvenient for users, as evidence by the
+Failing to do so proved quite inconvenient for users, as evidenced by the
 tickets #11503 #14141 #16377 #20180.
 Test cases: T11503, T14141.
 
-Examples of constraints that tcCheckGivens considers insoluble:
+To do this, tcCheckGivens calls getInertInsols, which returns all Given
+constraints that are definitely insoluble. See Note [When is a constraint insoluble?].
+
+Note [When is a constraint insoluble?]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Whether a constraint is insoluble matters for accurate pattern-match
+warnings, as explained in Note [Pattern match warnings with insoluble Givens].
+
+We consider a constraint to be insoluble if it definitely cannot be solved,
+no matter what information we might further discover. For example, the following
+constraints are insoluble:
+
   - Int ~ Bool,
   - Coercible Float Word,
-  - TypeError msg.
+  - TypeError msg
+  - TypeError msg ~ Int
+  - Unsatisfiable msg
 
-Non-examples:
-  - constraints which we know aren't satisfied,
-    e.g. Show (Int -> Int) when no such instance is in scope,
-  - Eq (TypeError msg),
-  - C (Int ~ Bool), with @class C (c :: Constraint)@.
+Many constraints that look like they can't be solved are in fact not reported
+as insoluble, as there might still be a possibility (no matter how remote) that
+they can still be solved:
+
+  1: Show (Int -> Int)
+
+  Reason: even though there is no relevant instance in scope, this constraint
+  could later get solved by a new instance.
+
+  2: C (Int ~ Bool), where C :: Constraint -> Constraint
+
+  Reason: even though 'Int ~ Bool' is insoluble, the constraint 'C (Int ~ Bool)'
+  might be soluble, e.g. if 'C' is a class and we have 'instance forall c. C c',
+  or 'C' is a type family and we have 'type instance C c = (() :: Constraint)'.
+
+  3: Nested occurences of TypeError don't always lead to insolubility. For
+     example, none of the following constraints are definitely insoluble:
+
+    (a) F alpha (TypeError msg)    -- 'F' is an arity 2 type family
+    (b) Eq (TypeError msg)
+    (c) c (TypeError msg)          -- 'c' is a metavariable
+    (d) (TC alpha) (TypeError msg) -- 'TC' is an arity 1 type family
+    (e) TypeError msg ~ rhs        -- (depends on rhs)
+
+  None of these constraints are definitely insoluble:
+
+    (a) Can be solved if 'F' reduces, e.g. 'alpha := Int', 'type instance F Int a = (() :: Constraint)'.
+    (b) Can be solved by 'instance forall x. Eq x'.
+    (c) Can be solved if 'c' unifies with 'C', as in example (2).
+    (d) Can be solved if 'TC alpha' reduces to 'C', as in example (2).
+    (e) If 'rhs' is a rigid type such as 'Int' or 'Maybe Char', then this
+        constraint is definitely insoluble. Otherwise, however, the constraint
+        could be soluble:
+          - rhs = G alpha, for an arity 1 type family G
+            G alpha could reduce to TypeError msg.
+          - rhs = k, for a skolem type variable k.
+            We could instantiate k to something else, and then the constraint
+            could become soluble.
+
+  For this reason, we are careful to not pull out certain occurrences of TypeError,
+  e.g. inside type family applications and class constraints.
+  See Note [Custom type errors in constraints].
 -}
 
 tcCheckGivens :: InertSet -> Bag EvVar -> TcM (Maybe InertSet)
--- ^ Return (Just new_inerts) if the Givens are satisfiable, Nothing if definitely
--- contradictory.
+-- ^ Return (Just new_inerts) if the Givens are satisfiable,
+--          Nothing if definitely contradictory.
+-- So Nothing says something definite; if in doubt return Just
 --
 -- See Note [Pattern match warnings with insoluble Givens] above.
-tcCheckGivens inerts given_ids = do
-  (sat, new_inerts) <- runTcSInerts inerts $ do
-    traceTcS "checkGivens {" (ppr inerts <+> ppr given_ids)
-    lcl_env <- TcS.getLclEnv
-    let given_loc = mkGivenLoc topTcLevel (getSkolemInfo unkSkol) (mkCtLocEnv lcl_env)
-    let given_cts = mkGivens given_loc (bagToList given_ids)
-    -- See Note [Superclasses and satisfiability]
-    solveSimpleGivens given_cts
-    insols <- getInertInsols
-    insols <- try_harder insols
-    traceTcS "checkGivens }" (ppr insols)
-    return (isEmptyBag insols)
-  return $ if sat then Just new_inerts else Nothing
+tcCheckGivens inerts given_ids
+  = do { traceTc "checkGivens {" (ppr inerts <+> ppr given_ids)
+
+       ; lcl_env <- TcM.getLclEnv
+       ; let given_loc = mkGivenLoc topTcLevel (getSkolemInfo unkSkol) (mkCtLocEnv lcl_env)
+             given_cts = mkGivens given_loc (bagToList given_ids)
+             -- See Note [Superclasses and satisfiability]
+
+       ; mb_res <- tryM                $  -- try_to_solve may throw an exception;
+                                          --   e.g. reduction stack overflow
+                   discardErrs         $  -- An exception is not an error;
+                                          --   just means "not definitely unsat"
+                   runTcSInerts inerts $
+                   try_to_solve given_cts
+
+       -- If mb_res = Left err, solving threw an exception, e.g. reduction stack
+       -- overflow.  So return the original incoming inerts to say "not definitely
+       -- unsatisfiable".  See (CF3) in Note [Exploiting closed type families], and
+       -- test T15753c.
+       ; let res = case mb_res of
+                     Right res -> res
+                     Left {}   -> Just inerts
+
+       ; traceTc "checkGivens }" (ppr res)
+       ; return res }
+
   where
+    try_to_solve :: [Ct] -> TcS (Maybe InertSet)
+    try_to_solve given_cts
+      = do { solveSimpleGivens given_cts
+           ; insols <- getInertInsols
+           ; insols <- try_harder insols
+           ; if isEmptyBag insols
+             then do { new_inerts <- getInertSet; return (Just new_inerts) }
+             else return Nothing } -- Definitely unsatisfiable
+
     try_harder :: Cts -> TcS Cts
     -- Maybe we have to search up the superclass chain to find
     -- an unsatisfiable constraint.  Example: pmcheck/T3927b.
@@ -709,34 +779,32 @@ tcCheckGivens inerts given_ids = do
 
 tcCheckWanteds :: InertSet -> ThetaType -> TcM Bool
 -- ^ Return True if the Wanteds are soluble, False if not
-tcCheckWanteds inerts wanteds = do
-  cts <- newWanteds PatCheckOrigin wanteds
-  (sat, _new_inerts) <- runTcSInerts inerts $ do
-    traceTcS "checkWanteds {" (ppr inerts <+> ppr wanteds)
-    -- See Note [Superclasses and satisfiability]
-    wcs <- solveWanteds (mkSimpleWC cts)
-    traceTcS "checkWanteds }" (ppr wcs)
-    return (isSolvedWC wcs)
-  return sat
+tcCheckWanteds inerts wanteds
+  = do { cts <- newWanteds PatCheckOrigin wanteds
+       ; runTcSInerts inerts $
+         do { traceTcS "checkWanteds {" (ppr inerts <+> ppr wanteds)
+              -- See Note [Superclasses and satisfiability]
+            ; wcs <- solveWanteds (mkSimpleWC cts)
+            ; traceTcS "checkWanteds }" (ppr wcs)
+            ; return (isSolvedWC wcs) } }
 
 -- | Normalise a type as much as possible using the given constraints.
 -- See @Note [tcNormalise]@.
 tcNormalise :: InertSet -> Type -> TcM Type
 tcNormalise inerts ty
   = do { norm_loc <- getCtLocM PatCheckOrigin Nothing
-       ; (res, _new_inerts) <- runTcSInerts inerts $
-             do { traceTcS "tcNormalise {" (ppr inerts)
-                ; ty' <- rewriteType norm_loc ty
-                ; traceTcS "tcNormalise }" (ppr ty')
-                ; pure ty' }
-       ; return res }
+       ; runTcSInerts inerts $
+         do { traceTcS "tcNormalise {" (ppr inerts)
+            ; ty' <- rewriteType norm_loc ty
+            ; traceTcS "tcNormalise }" (ppr ty')
+            ; pure ty' } }
 
 {- Note [Superclasses and satisfiability]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Expand superclasses before starting, because (Int ~ Bool), has
 (Int ~~ Bool) as a superclass, which in turn has (Int ~N# Bool)
 as a superclass, and it's the latter that is insoluble.  See
-Note [The equality types story] in GHC.Builtin.Types.Prim.
+Note [The equality types story] in GHC.Builtin.WiredIn.Prim.
 
 If we fail to prove unsatisfiability we (arbitrarily) try just once to
 find superclasses, using try_harder.  Reason: we might have a type
@@ -861,7 +929,7 @@ instance Outputable InferMode where
   ppr EagerDefaulting = text "EagerDefaulting"
   ppr NoRestrictions  = text "NoRestrictions"
 
-simplifyInfer :: TopLevelFlag
+simplifyInfer :: TopLevelFlag          -- Syntactically top-level
               -> TcLevel               -- Used when generating the constraints
               -> InferMode
               -> [TcIdSigInst]         -- Any signatures (possibly partial)
@@ -1021,22 +1089,22 @@ findInferredDiff annotated_theta inferred_theta
   | null annotated_theta   -- Short cut the common case when the user didn't
   = return inferred_theta  -- write any constraints in the partial signature
   | otherwise
-  = pushTcLevelM_ $
+  = TcM.pushTcLevelM_ $
     do { lcl_env   <- TcM.getLclEnv
        ; given_ids <- mapM TcM.newEvVar annotated_theta
        ; wanteds   <- newWanteds AnnOrigin inferred_theta
        ; let given_loc = mkGivenLoc topTcLevel (getSkolemInfo unkSkol) (mkCtLocEnv lcl_env)
              given_cts = mkGivens given_loc given_ids
 
-       ; (residual, _) <- runTcS $
-                          do { _ <- solveSimpleGivens given_cts
-                             ; solveSimpleWanteds (listToBag (map mkNonCanonical wanteds)) }
+       ; (residual_wc, _) <- runTcS $
+                             do { _ <- solveSimpleGivens given_cts
+                                ; solveSimpleWanteds (listToBag (map mkNonCanonical wanteds)) }
          -- NB: There are no meta tyvars fromn this level annotated_theta
          -- because we have either promoted them or unified them
          -- See `Note [Quantification and partial signatures]` Wrinkle 2
 
        ; return (map (box_pred . ctPred) $
-                 bagToList residual) }
+                 bagToList (wc_simple residual_wc)) }
   where
      box_pred :: PredType -> PredType
      box_pred pred = case classifyPredType pred of

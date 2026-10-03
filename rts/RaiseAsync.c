@@ -28,7 +28,7 @@
 static void blockedThrowTo (Capability *cap,
                             StgTSO *target, MessageThrowTo *msg);
 
-static void removeFromQueues(Capability *cap, StgTSO *tso);
+static void unblockAndAppendToRunQueue(Capability *cap, StgTSO *tso);
 
 static void removeFromMVarBlockedQueue (StgTSO *tso);
 
@@ -62,8 +62,10 @@ throwToSingleThreaded__ (Capability *cap, StgTSO *tso, StgClosure *exception,
         return;
     }
 
-    // Remove it from any blocking queues
-    removeFromQueues(cap,tso);
+    // Remove it from any blocking queues and add it to the run queue
+    unblockAndAppendToRunQueue(cap,tso);
+    ASSERT(tso->why_blocked == NotBlocked ||
+           tso->why_blocked == ThreadMigrating);
 
     raiseAsync(cap, tso, exception, stop_at_atomically, stop_here);
 }
@@ -233,7 +235,6 @@ throwTo (Capability *cap,       // the Capability we hold
 uint32_t
 throwToMsg (Capability *cap, MessageThrowTo *msg)
 {
-    StgWord status;
     StgTSO *target = ACQUIRE_LOAD(&msg->target);
     Capability *target_cap;
 
@@ -268,9 +269,9 @@ check_target:
         return THROWTO_BLOCKED;
     }
 
-    status = ACQUIRE_LOAD(&target->why_blocked);
+    StgThreadWhyBlocked why_blocked = ACQUIRE_LOAD(&target->why_blocked);
 
-    switch (status) {
+    switch (UntagWhyBlocked(why_blocked)) {
     case NotBlocked:
     {
         if ((target->flags & TSO_BLOCKEX) == 0) {
@@ -354,7 +355,7 @@ check_target:
         StgMVar *mvar;
         StgInfoTable *info USED_IF_THREADS;
 
-        mvar = (StgMVar *)target->block_info.closure;
+        mvar = target->block_info.mvar;
 
         // ASSUMPTION: tso->block_info must always point to a
         // closure.  In the threaded RTS it does.
@@ -370,9 +371,10 @@ check_target:
 
         // we have the MVar, let's check whether the thread
         // is still blocked on the same MVar.
-        if ((target->why_blocked != BlockedOnMVar
-             && target->why_blocked != BlockedOnMVarRead)
-            || (StgMVar *)target->block_info.closure != mvar) {
+        StgThreadWhyBlocked why_blocked_still = ACQUIRE_LOAD(&target->why_blocked);
+        if ((   why_blocked_still != BlockedOnMVar
+             && why_blocked_still != BlockedOnMVarRead)
+            || target->block_info.mvar != mvar) {
             unlockClosure((StgClosure *)mvar, info);
             goto retry;
         }
@@ -471,7 +473,7 @@ check_target:
             blockedThrowTo(cap,target,msg);
             return THROWTO_BLOCKED;
         } else {
-            removeFromQueues(cap,target);
+            unblockAndAppendToRunQueue(cap,target);
             raiseAsync(cap, target, msg->exception, false, NULL);
             return THROWTO_SUCCESS;
         }
@@ -490,7 +492,7 @@ check_target:
         goto retry;
 
     default:
-        barf("throwTo: unrecognised why_blocked (%d)", target->why_blocked);
+        barf("throwTo: unrecognised why_blocked (%d)", why_blocked);
     }
     barf("throwTo");
 }
@@ -612,20 +614,11 @@ awakenBlockedExceptionQueue (Capability *cap, StgTSO *tso)
     tso->blocked_exceptions = END_BLOCKED_EXCEPTIONS_QUEUE;
 }
 
-/* -----------------------------------------------------------------------------
-   Remove a thread from blocking queues.
-
-   This is for use when we raise an exception in another thread, which
-   may be blocked.
-
-   Precondition: we have exclusive access to the TSO, via the same set
-   of conditions as throwToSingleThreaded() (c.f.).
-   -------------------------------------------------------------------------- */
-
+// Helper for unblockAndAppendToRunQueue
 static void
 removeFromMVarBlockedQueue (StgTSO *tso)
 {
-    StgMVar *mvar = (StgMVar*)tso->block_info.closure;
+    StgMVar *mvar = tso->block_info.mvar;
     StgMVarTSOQueue *q = (StgMVarTSOQueue*)tso->_link;
 
     if (q == (StgMVarTSOQueue*)END_TSO_QUEUE) {
@@ -664,13 +657,24 @@ removeFromMVarBlockedQueue (StgTSO *tso)
     tso->_link = END_TSO_QUEUE;
 }
 
-static void
-removeFromQueues(Capability *cap, StgTSO *tso)
-{
-  switch (tso->why_blocked) {
+/* -----------------------------------------------------------------------------
+   Remove a thread from blocking queues (if any) and add it to the run queue
+   (if it wasn't on the run queue already).
 
-  case NotBlocked:
-  case ThreadMigrating:
+   This is for use when we raise an exception in another thread, which
+   may be blocked.
+
+   Precondition: we have exclusive access to the TSO, via the same set
+   of conditions as throwToSingleThreaded() (c.f.).
+   -------------------------------------------------------------------------- */
+
+static void
+unblockAndAppendToRunQueue(Capability *cap, StgTSO *tso)
+{
+  switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked))) {
+
+  case NotBlocked:      // Already on the run queue
+  case ThreadMigrating: // Not added to the run queue
       return;
 
   case BlockedOnSTM:
@@ -680,16 +684,16 @@ removeFromQueues(Capability *cap, StgTSO *tso)
     // perhaps have a debugging test to make sure that this really
     // happens and that the 'zombie' transaction does not get
     // committed.
-    goto done;
+    break;
 
   case BlockedOnMVar:
   case BlockedOnMVarRead:
       removeFromMVarBlockedQueue(tso);
-      goto done;
+      break;
 
   case BlockedOnBlackHole:
       // nothing to do
-      goto done;
+      break;
 
   case BlockedOnMsgThrowTo:
   {
@@ -708,21 +712,22 @@ removeFromQueues(Capability *cap, StgTSO *tso)
   case BlockedOnWrite:
   case BlockedOnDoProc:
       // These blocking reasons are only used by some I/O managers
-      syncIOCancel(cap, tso);
-      goto done;
+      syncIOCancel(cap->iomgr, tso);
+      return;
 
   case BlockedOnDelay:
       // This blocking reasons is only used by some I/O managers
-      syncDelayCancel(cap, tso);
-      goto done;
+      syncDelayCancel(cap->iomgr, tso);
+      return;
 
   default:
-      barf("removeFromQueues: %d", tso->why_blocked);
+      barf("unblockAndAppendToRunQueue: %d", tso->why_blocked);
   }
 
- done:
-  RELAXED_STORE(&tso->why_blocked, NotBlocked);
+  // The cases above that use return add the TSO to the run queue themselves
+  // (or don't need to). For the rest (that use break) we do it here.
   appendToRunQueue(cap, tso);
+  RELEASE_STORE(&tso->why_blocked, NotBlocked);
 }
 
 /* -----------------------------------------------------------------------------
@@ -1063,9 +1068,9 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
         };
 
         case CATCH_RETRY_FRAME:
-            // CATCH_RETY frame within an atomically block: if we're executing
+            // CATCH_RETRY frame within an atomically block: if we're executing
             // the lhs code, abort the inner transaction and continue; if we're
-            // executing thr rhs, continue (no nested transaction to abort. See
+            // executing the rhs, continue (no nested transaction to abort. See
             // Note [catchRetry# implementation]). Eventually we will hit the
             // outer transaction that will get frozen (see above).
             //
@@ -1074,18 +1079,8 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
             // possible validity cannot have caused the exception
             // and will not be visible after the abort.
         {
-            if (!((StgCatchRetryFrame *)frame) -> running_alt_code) {
-                debugTraceCap(DEBUG_stm, cap, "raiseAsync: traversing CATCH_RETRY frame (lhs)");
-                StgTRecHeader *trec = tso -> trec;
-                StgTRecHeader *outer = trec -> enclosing_trec;
-                stmAbortTransaction(cap, trec);
-                stmFreeAbortedTRec(cap, trec);
-                tso -> trec = outer;
-            }
-            else
-            {
-                debugTraceCap(DEBUG_stm, cap, "raiseAsync: traversing CATCH_RETRY frame (rhs)");
-            }
+            debugTraceCap(DEBUG_stm, cap, "raiseAsync: traversing CATCH_RETRY frame");
+            stmAbortNestedCatchRetryTransaction(cap, tso, (StgCatchRetryFrame *)frame);
             break;
         };
 
@@ -1099,6 +1094,11 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
                 tso->flags |= TSO_BLOCKEX;
                 tso->flags &= ~TSO_INTERRUPTIBLE;
             }
+            // see Note [GHCi unboxed tuples stack spills] in
+            // StgMiscClosures.cmm
+            if (*frame == (W_)&stg_ctoi_t_info) {
+                tso->ctoi_tuple_spill_words = frame[CTOI_OLD_TUPLE_SPILL_WORDS_OFFSET];
+            }
             break;
         }
 
@@ -1110,9 +1110,9 @@ done:
     IF_DEBUG(sanity, checkTSO(tso));
 
     // wake it up
-    if (tso->why_blocked != NotBlocked) {
-        tso->why_blocked = NotBlocked;
+    if (RELAXED_LOAD(&tso->why_blocked) != NotBlocked) {
         appendToRunQueue(cap,tso);
+        RELEASE_STORE(&tso->why_blocked, NotBlocked);
     }
 
     return tso;

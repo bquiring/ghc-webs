@@ -1,20 +1,21 @@
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
+                                      -- in module Language.Haskell.Syntax.Extension
 module Language.Haskell.Syntax.ImpExp ( module Language.Haskell.Syntax.ImpExp, IsBootInterface(..) ) where
 
+import Language.Haskell.Syntax.Doc (LHsDoc)
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Module.Name
 import Language.Haskell.Syntax.ImpExp.IsBoot ( IsBootInterface(..) )
 
-import Data.Eq (Eq)
+import Data.Eq (Eq(..))
 import Data.Data (Data)
-import Data.Bool (Bool)
+import Data.Bool (Bool(..))
 import Data.Maybe (Maybe)
 import Data.String (String)
 import Data.Int (Int)
 
 import Control.DeepSeq
-import {-# SOURCE #-} GHC.Hs.Doc (LHsDoc) -- ROMES:TODO Discuss in #21592 whether this is parsed AST or base AST
 
 {-
 ************************************************************************
@@ -57,7 +58,7 @@ data ImportDecl pass
       ideclSafe       :: Bool,          -- ^ True => safe import
       ideclQualified  :: ImportDeclQualifiedStyle, -- ^ If/how the import is qualified.
       ideclAs         :: Maybe (XRec pass ModuleName),  -- ^ as Module
-      ideclImportList :: Maybe (ImportListInterpretation, XRec pass [LIE pass])
+      ideclImportList :: Maybe (ImportListInterpretation, [LIE pass])
                                        -- ^ Explicit import list (EverythingBut => hiding, names)
     }
   | XImportDecl !(XXImportDecl pass)
@@ -98,7 +99,7 @@ data IE pass
         -- @
 
         -- See Note [Located RdrNames] in GHC.Hs.Expr
-  | IEThingAll  (XIEThingAll pass) (LIEWrappedName pass) (Maybe (ExportDoc pass))
+  | IEThingAll  (XIEThingAll pass) (NamespaceSpecifier pass) (LIEWrappedName pass) (Maybe (ExportDoc pass))
         -- ^ Imported or exported thing with wildcard subordinate list (e.g. @(..)@)
         --
         -- The thing is a Class\/Type and the All refers to methods\/constructors
@@ -128,6 +129,14 @@ data IE pass
         --
         -- @
         -- module Mod ( module Mod2 )
+        -- @
+  | IEWholeNamespace (XIEWholeNamespace pass) (NamespaceSpecifier pass)
+        -- ^ Import or export of an entire namespace of the current module.
+        --
+        -- @
+        -- module Mod ( type .., data .. )
+        -- import Mod ( type .. ) as T       -- type constructors (incl. classes and associated types)
+        -- import Mod ( data .. ) as D       -- data constructors and terms (incl. operators and field selectors)
         -- @
   | IEGroup (XIEGroup pass) Int (LHsDoc pass)
         -- ^ A Haddock section in an export list.
@@ -180,3 +189,33 @@ data IEWrappedName p
 
 -- | Located name with possible adornment
 type LIEWrappedName p = XRec p (IEWrappedName p)
+
+-- | Optional namespace specifier for:
+--
+-- * import/export items
+-- * fixity signatures
+-- * @WARNING@ and @DEPRECATED@ pragmas
+--
+-- Examples:
+--
+-- @
+-- module M (data ..) where
+--        -- ↑ DataNamespaceSpecifier
+--
+-- import Data.Proxy as T (type ..)
+--                      -- ↑ TypeNamespaceSpecifier
+--
+-- {-# WARNING in "x-partial" data Head "don't use this pattern synonym" #-}
+--                          -- ↑ DataNamespaceSpecifier
+--
+-- {-# DEPRECATED type D "This type was deprecated" #-}
+--              -- ↑ TypeNamespaceSpecifier
+--
+-- infixr 6 data $
+--        -- ↑ DataNamespaceSpecifier
+-- @
+data NamespaceSpecifier p
+  = NoNamespaceSpecifier (XNoNamespaceSpecifier p)
+  | TypeNamespaceSpecifier (XTypeNamespaceSpecifier p)
+  | DataNamespaceSpecifier (XDataNamespaceSpecifier p)
+  | XNamespaceSpecifier !(XXNamespaceSpecifier p)

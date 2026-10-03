@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase   #-}
 {-# LANGUAGE ViewPatterns #-}
 
 -----------------------------------------------------------------------------
@@ -40,7 +39,7 @@ import GHC.StgToJS.Utils
 import GHC.StgToJS.Profiling
 import GHC.StgToJS.Ids
 
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import GHC.Stg.Syntax
 import GHC.Core.DataCon
 

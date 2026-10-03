@@ -1,11 +1,8 @@
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE ViewPatterns #-}
 
@@ -25,7 +22,7 @@ module GHC.Driver.Make (
 
         topSortModuleGraph,
 
-        ms_home_srcimps, ms_home_imps,
+        ms_srcimps, ms_home_imps,
 
         hscSourceToIsBoot,
         findExtraSigImports,
@@ -56,8 +53,6 @@ import GHC.Tc.Utils.Monad  ( initIfaceCheck, concatMapM )
 
 import GHC.Runtime.Interpreter
 import qualified GHC.Linker.Loader as Linker
-import GHC.Linker.Types
-
 
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Pipeline
@@ -72,7 +67,7 @@ import GHC.Driver.MakeSem
 import GHC.Driver.Downsweep
 import GHC.Driver.MakeAction
 
-import GHC.ByteCode.Types
+import GHC.Types.UnresolvedImport
 
 import GHC.Iface.Load      ( cannotFindModule, readIface )
 import GHC.IfaceToCore     ( typecheckIface )
@@ -109,13 +104,14 @@ import GHC.Unit.Module.ModDetails
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import GHC.Types.Unique.Set
 
 import Control.Concurrent.MVar
 import Control.Monad
 import qualified Control.Monad.Catch as MC
 import Data.IORef
 import Data.Maybe
-import Data.List (sortOn, groupBy, sortBy)
+import Data.List (sort, sortOn, groupBy, sortBy)
 import qualified Data.List as List
 import System.FilePath
 
@@ -158,10 +154,12 @@ depanal :: GhcMonad m =>
         -> Bool          -- ^ allow duplicate roots
         -> m ModuleGraph
 depanal excluded_mods allow_dup_roots = do
+    hsc_env <- getSession
+    let sec = initSourceErrorContext (hsc_dflags hsc_env)
     (errs, mod_graph) <- depanalE mkUnknownDiagnostic Nothing excluded_mods allow_dup_roots
     if isEmptyMessages errs
       then pure mod_graph
-      else throwErrors (fmap GhcDriverMessage errs)
+      else throwErrors sec (fmap GhcDriverMessage errs)
 
 -- | Perform dependency analysis like in 'depanal'.
 -- In case of errors, the errors and an empty module graph are returned.
@@ -236,7 +234,7 @@ depanalPartial diag_wrapper msg excluded_mods allow_dup_roots = do
     liftIO $ flushFinderCaches (hsc_FC hsc_env) (hsc_unit_env hsc_env)
 
     (errs, mod_graph) <- liftIO $ downsweep
-      hsc_env diag_wrapper msg (mgModSummaries old_graph)
+      hsc_env diag_wrapper msg (mgModSummaries old_graph) Nothing
       excluded_mods allow_dup_roots
     return (unionManyMessages errs, mod_graph)
 
@@ -313,16 +311,17 @@ warnUnknownModules hsc_env dflags mod_graph = do
   where
     diag_opts = initDiagOpts dflags
 
-    unit_mods = Set.fromList (map ms_mod_name
+    unit_mods :: UniqSet ModuleName
+    unit_mods = mkUniqSet (map ms_mod_name
                   (filter (\ms -> ms_unitid ms == homeUnitId_ dflags)
                        (mgModSummaries mod_graph)))
 
     reexported_mods = reexportedModules dflags
     hidden_mods     = hiddenModules dflags
 
-    hidden_warns = hidden_mods `Set.difference` unit_mods
+    hidden_warns = hidden_mods `minusUniqSet` unit_mods
 
-    lookupModule mn = findImportedModule hsc_env mn NoPkgQual
+    lookupModule mn = findImportedModule hsc_env LookupUser mn NoPkgQual
 
     check_reexport mn = do
       fr <- lookupModule (reexportFrom mn)
@@ -337,7 +336,7 @@ warnUnknownModules hsc_env dflags mod_graph = do
     final_msgs hidden_warns reexported_warns
           =
         unionManyMessages $
-          [warn (DriverUnknownHiddenModules (homeUnitId_ dflags) (Set.toList hidden_warns)) | not (Set.null hidden_warns)]
+          [warn (DriverUnknownHiddenModules (homeUnitId_ dflags) (sort $ nonDetEltsUniqSet hidden_warns)) | not (isEmptyUniqSet hidden_warns)]
           ++ [warn (DriverUnknownReexportedModules (homeUnitId_ dflags) reexported_warns) | not (null reexported_warns)]
 
 -- | Describes which modules of the module graph need to be loaded.
@@ -441,9 +440,11 @@ loadWithCache cache diag_wrapper how_much = do
     msg <- mkBatchMsg <$> getSession
     (errs, mod_graph) <- depanalE diag_wrapper (Just msg) [] False                        -- #17459
     success <- load' cache how_much diag_wrapper (Just msg) mod_graph
+    hsc_env <- getSession
+    let sec = initSourceErrorContext (hsc_dflags hsc_env)
     if isEmptyMessages errs
       then pure success
-      else throwErrors (fmap GhcDriverMessage errs)
+      else throwErrors sec (fmap GhcDriverMessage errs)
 
 -- Note [Unused packages]
 -- ~~~~~~~~~~~~~~~~~~~~~~
@@ -458,9 +459,9 @@ warnUnusedPackages us dflags mod_graph =
 
         home_mod_sum = filter (\ms -> homeUnitId_ dflags == ms_unitid ms) (mgModSummaries mod_graph)
 
-    -- Only need non-source imports here because SOURCE imports are always HPT
         loadedPackages = concat $
-          mapMaybe (\(_st, fs, mn) -> lookupModulePackage us (unLoc mn) fs)
+          mapMaybe (lookupModulePackage us)
+            $ filter ((NotBoot ==) . ui_boot) -- Only need non-source imports here because SOURCE imports are always HPT
             $ concatMap ms_imps home_mod_sum
 
         used_args = Set.fromList (map unitId loadedPackages)
@@ -472,6 +473,10 @@ warnUnusedPackages us dflags mod_graph =
                   ui <- lookupUnit us u
                   -- Which are not explicitly used
                   guard (Set.notMember (unitId ui) used_args)
+                  -- Exclude units with no exposed modules. This covers packages which only
+                  -- provide C object code or link flags (e.g. system-cxx-std-lib).
+                  -- See #24120.
+                  guard (not $ null $ unitExposedModules ui)
                   return (unitId ui, unitPackageName ui, unitPackageVersion ui, flag)
 
         unusedArgs = sortOn (\(u,_,_,_) -> u) $ mapMaybe resolve (explicitUnits us)
@@ -629,11 +634,12 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     let dflags = hsc_dflags hsc_env
     let logger = hsc_logger hsc_env
     let interp = hscInterp hsc_env
+    let sec = initSourceErrorContext dflags
 
     -- The "bad" boot modules are the ones for which we have
     -- B.hs-boot in the module graph, but no B.hs
     -- The downsweep should have ensured this does not happen
-    -- (see msDeps)
+    -- (see GHC.Driver.Downsweep.calcDeps)
     let all_home_mods =
           Set.fromList [ Module (ms_unitid s) (ms_mod_name s)
                     | s <- mgModSummaries mod_graph, isBootSummary s == NotBoot]
@@ -659,7 +665,7 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
                   mkPlainErrorMsgEnvelope noSrcSpan
                   $ GhcDriverMessage
                   $ DriverModuleNotFound (moduleUnit m) (moduleName m)
-              throwErrors $ mkMessages $ listToBag [mkModuleNotFoundError not_found | not_found <- not_found_mods]
+              throwErrors sec $ mkMessages $ listToBag [mkModuleNotFoundError not_found | not_found <- not_found_mods]
 
     checkHowMuch how_much $ do
 
@@ -819,7 +825,7 @@ pruneCache hpt summ
 unload :: Interp -> HscEnv -> IO ()
 unload interp hsc_env
   = case ghcLink (hsc_dflags hsc_env) of
-        LinkInMemory -> Linker.unload interp hsc_env []
+        LinkInMemory -> Linker.unload interp hsc_env
         _other -> return ()
 
 
@@ -1189,6 +1195,7 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
     (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt build_plan
     runPipelines n_jobs hsc_env diag_wrapper mHscMessage pipelines
     res <- collect_result
+    let sec = initSourceErrorContext (hsc_dflags hsc_env)
 
     let completed = [m | Just (Just m) <- res]
 
@@ -1196,7 +1203,7 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
     -- of the upsweep.
     case cycle of
         Just mss -> do
-          throwOneError $ cyclicModuleErr mss
+          throwOneError sec $ cyclicModuleErr mss
         Nothing  -> do
           let success_flag = successIf (all isJust res)
           return (success_flag, completed)
@@ -1228,32 +1235,8 @@ upsweep_mod :: HscEnv
             -> Int  -- total number of modules
             -> IO HomeModInfo
 upsweep_mod hsc_env mHscMessage old_hmi summary mod_index nmods =  do
-  hmi <- compileOne' mHscMessage hsc_env summary
-          mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
-
-  -- MP: This is a bit janky, because before you add the entries you have to extend the HPT with the module
-  -- you just compiled. Another option, would be delay adding anything until after upsweep has finished, but I
-  -- am unsure if this is sound (wrt running TH splices for example).
-  -- This function only does anything if the linkable produced is a BCO, which
-  -- used to only happen with the bytecode backend, but with
-  -- @-fprefer-byte-code@, @HomeModInfo@ has bytecode even when generating
-  -- object code, see #25230.
-  hscInsertHPT hmi hsc_env
-  addSptEntries (hsc_env)
-                (homeModInfoByteCode hmi)
-
-  return hmi
-
--- | Add the entries from a BCO linkable to the SPT table, see
--- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
-addSptEntries :: HscEnv -> Maybe Linkable -> IO ()
-addSptEntries hsc_env mlinkable =
-  hscAddSptEntries hsc_env
-     [ spt
-     | linkable <- maybeToList mlinkable
-     , bco <- linkableBCOs linkable
-     , spt <- bc_spt_entries bco
-     ]
+  compileOne' mHscMessage hsc_env summary
+              mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
 
 
 -- Note [When source is considered modified]
@@ -1416,8 +1399,13 @@ warnUnnecessarySourceImports sccs = do
   when (diag_wopt Opt_WarnUnusedImports diag_opts) $ do
     let check ms =
            let mods_in_this_cycle = map moduleNodeInfoModuleName ms in
-           [ warn i | (ModuleNodeCompile m) <- ms, i <- ms_home_srcimps m,
-                      unLoc i `notElem`  mods_in_this_cycle ]
+           -- NB: source imports can only refer to the current package,
+           -- so these are all home imports.
+           [ warn (ui_mod_name e)
+           | (ModuleNodeCompile m) <- ms
+           , e <- ms_srcimps m
+           , unLoc (ui_mod_name e) `notElem` mods_in_this_cycle
+           ]
 
         warn :: Located ModuleName -> MsgEnvelope GhcMessage
         warn (L loc mod) = GhcDriverMessage <$> mkPlainMsgEnvelope diag_opts
@@ -1616,12 +1604,13 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
     executeCompileNodeFixed hsc_env MakeEnv{diag_wrapper, env_messager} mod loc =
       wrapAction diag_wrapper hsc_env $ do
         forM_ env_messager $ \hscMessage -> hscMessage hsc_env (k, n) UpToDate (ModuleNode [] (ModuleNodeFixed mod loc))
-        read_result <- readIface (hsc_logger hsc_env) (hsc_dflags hsc_env) (hsc_NC hsc_env) (mnkToModule mod) (ml_hi_file loc)
+        read_result <- readIface (hsc_hooks hsc_env) (hsc_logger hsc_env) (hsc_dflags hsc_env) (hsc_NC hsc_env) (mnkToModule mod) (ml_hi_file loc)
+        let sec = initSourceErrorContext (hsc_dflags hsc_env)
         case read_result of
           M.Failed interface_err ->
             let mn = mnkModuleName mod
                 err = Can'tFindInterface (BadIfaceFile interface_err) (LookingForModule (gwib_mod mn) (gwib_isBoot mn))
-            in throwErrors $ singleMessage $ mkPlainErrorMsgEnvelope noSrcSpan (GhcDriverMessage (DriverInterfaceError err))
+            in throwErrors sec $ singleMessage $ mkPlainErrorMsgEnvelope noSrcSpan (GhcDriverMessage (DriverInterfaceError err))
           M.Succeeded iface -> do
             details <- genModDetails hsc_env iface
             mb_object <- findObjectLinkableMaybe (mi_module iface) loc
@@ -1864,24 +1853,20 @@ Also closely related are
 -}
 
 executeLinkNode :: HomeUnitGraph -> (Int, Int) -> UnitId -> [NodeKey] -> RunMakeM ()
-executeLinkNode hug kn uid deps = do
+executeLinkNode hug kn@(k, _) uid deps = do
   withCurrentUnit uid $ do
-    MakeEnv{..} <- ask
+    make_env@MakeEnv{..} <- ask
     let dflags = hsc_dflags hsc_env
-    let hsc_env' = setHUG hug hsc_env
         msg' = (\messager -> \recomp -> messager hsc_env kn recomp (LinkNode deps uid)) <$> env_messager
 
-    linkresult <- liftIO $ withAbstractSem compile_sem $ do
-                            link (ghcLink dflags)
-                                (hsc_logger hsc_env')
-                                (hsc_tmpfs hsc_env')
-                                (hsc_FC hsc_env')
-                                (hsc_hooks hsc_env')
-                                dflags
-                                (hsc_unit_env hsc_env')
-                                True -- We already decided to link
-                                msg'
-                                (hsc_HPT hsc_env')
+    linkresult <- lift $ MaybeT $ withAbstractSem compile_sem $ withLoggerHsc k make_env $ \lcl_hsc_env -> do
+                             let hsc_env' = setHUG hug lcl_hsc_env
+                             wrapAction diag_wrapper hsc_env' $ do
+                               link (ghcLink dflags)
+                                 hsc_env'
+                                 True -- We already decided to link
+                                 msg'
+                                 (hsc_HPT hsc_env')
     case linkresult of
       Failed -> fail "Link Failed"
       Succeeded -> return ()

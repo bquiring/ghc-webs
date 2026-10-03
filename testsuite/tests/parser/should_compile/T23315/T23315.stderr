@@ -10,24 +10,28 @@
     (AnnsModule
      (EpTok
       (EpaSpan { T23315.hsig:1:1-9 }))
-     (NoEpTok)
+     (EpTok
+      (EpaSpan { <no location info> }))
      (EpTok
       (EpaSpan { T23315.hsig:1:18-22 }))
+     ((,,)
+      (EpTok (EpaSpan { <no location info> }))
+      (EpTok (EpaSpan { <no location info> }))
+      [])
      []
      []
      (Nothing))
     (EpaComments
      []))
    (EpVirtualBraces
-    (1))
+    (EpaSpan { T23315.hsig:3:1 }))
    (Nothing)
    (Nothing))
   (Just
    (L
     (EpAnn
      (EpaSpan { T23315.hsig:1:11-16 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     {ModuleName: T23315}))
@@ -36,8 +40,7 @@
   [(L
     (EpAnn
      (EpaSpan { T23315.hsig:2:1-12 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (DocD
@@ -47,6 +50,7 @@
        { T23315.hsig:2:1-12 }
        (WithHsDocIdentifiers
         (MultiLineDocString
+         (NoExtField)
          (HsDocStringNext)
          (:|
           (L
@@ -58,8 +62,7 @@
   ,(L
     (EpAnn
      (EpaSpan { T23315.hsig:3:1-7 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (SigD
@@ -71,6 +74,7 @@
         (NormalSyntax))
        (Nothing)
        (Nothing))
+      []
       [(L
         (EpAnn
          (EpaSpan { T23315.hsig:3:1 })
@@ -85,8 +89,7 @@
        (L
         (EpAnn
          (EpaSpan { T23315.hsig:3:6-7 })
-         (AnnListItem
-          [])
+         []
          (EpaComments
           []))
         (HsSig
@@ -96,23 +99,19 @@
          (L
           (EpAnn
            (EpaSpan { T23315.hsig:3:6-7 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsTupleTy
            (AnnParens
-            (EpTok
-             (EpaSpan { T23315.hsig:3:6 }))
-            (EpTok
-             (EpaSpan { T23315.hsig:3:7 })))
+            (EpTok (EpaSpan { T23315.hsig:3:6 }))
+            (EpTok (EpaSpan { T23315.hsig:3:7 })))
            (HsBoxedOrConstraintTuple)
            []))))))))
   ,(L
     (EpAnn
      (EpaSpan { T23315.hsig:4:1-14 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (DocD
@@ -122,6 +121,7 @@
        { T23315.hsig:4:1-14 }
        (WithHsDocIdentifiers
         (MultiLineDocString
+         (NoExtField)
          (HsDocStringPrevious)
          (:|
           (L

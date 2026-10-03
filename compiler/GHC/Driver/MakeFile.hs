@@ -23,6 +23,7 @@ import GHC.Driver.DynFlags
 import GHC.Utils.Misc
 import GHC.Driver.Env
 import GHC.Driver.Errors.Types
+import GHC.Types.UnresolvedImport
 import qualified GHC.SysTools as SysTools
 import GHC.Data.Graph.Directed ( SCC(..) )
 import GHC.Data.OsPath (unsafeDecodeUtf)
@@ -55,6 +56,7 @@ import Data.IORef
 import qualified Data.Set as Set
 import GHC.Iface.Errors.Types
 import Data.Either
+import GHC.Data.Bag (listToBag)
 
 -----------------------------------------------------------------
 --
@@ -215,13 +217,13 @@ processDeps :: DynFlags
 --
 -- For {-# SOURCE #-} imports the "hi" will be "hi-boot".
 
-processDeps _ _ _ _ _ (CyclicSCC nodes)
+processDeps _ hsc_env _ _ _ (CyclicSCC nodes)
   =     -- There shouldn't be any cycles; report them
-    throwOneError $ cyclicModuleErr nodes
+    throwOneError (initSourceErrorContext (hsc_dflags hsc_env)) $ cyclicModuleErr nodes
 
-processDeps _ _ _ _ _ (AcyclicSCC (InstantiationNode _uid node))
+processDeps _ hsc_env _ _ _ (AcyclicSCC (InstantiationNode _uid node))
   =     -- There shouldn't be any backpack instantiations; report them as well
-    throwOneError $
+    throwOneError (initSourceErrorContext (hsc_dflags hsc_env)) $
       mkPlainErrorMsgEnvelope noSrcSpan $
       GhcDriverMessage $ DriverInstantiationNodeInDependencyGeneration node
 
@@ -237,19 +239,6 @@ processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC (ModuleNode _ (ModuleN
               obj_file  = msObjFilePath node
               obj_files = insertSuffixes obj_file extra_suffixes
 
-              do_imp loc is_boot pkg_qual imp_mod
-                = do { mb_hi <- findDependency hsc_env loc pkg_qual imp_mod
-                                               is_boot include_pkg_deps
-                     ; case mb_hi of {
-                           Nothing      -> return () ;
-                           Just hi_file -> do
-                     { let hi_files = insertSuffixes hi_file extra_suffixes
-                           write_dep (obj,hi) = writeDependency root hdl [obj] hi
-
-                        -- Add one dependency for each suffix;
-                        -- e.g.         A.o   : B.hi
-                        --              A.x_o : B.x_hi
-                     ; mapM_ write_dep (obj_files `zip` hi_files) }}}
 
 
                 -- Emit std dependency of the object(s) on the source file
@@ -280,42 +269,57 @@ processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC (ModuleNode _ (ModuleN
 
                 -- Emit a dependency for each import
 
-        ; let do_imps is_boot idecls = sequence_
-                    [ do_imp loc is_boot mb_pkg mod
-                    | (_lvl, mb_pkg, L loc mod) <- idecls,
-                      mod `notElem` excl_mods ]
+        ; let find_deps imps = sequence
+                    [ findDependency hsc_env imp include_pkg_deps
+                    | imp <- imps
+                    , unLoc (ui_mod_name imp) `notElem` excl_mods
+                    ]
 
-        ; do_imps IsBoot (map ((,,) NormalLevel NoPkgQual) (ms_srcimps node))
-        ; do_imps NotBoot (ms_imps node)
+              do_imp hi_file = do
+                let hi_files = insertSuffixes hi_file extra_suffixes
+                    write_dep (obj,hi) = writeDependency root hdl [obj] hi
+
+                 -- Add one dependency for each suffix;
+                 -- e.g.         A.o   : B.hi
+                 --              A.x_o : B.x_hi
+                mapM_ write_dep (obj_files `zip` hi_files)
+
+        ; (missing_dep_errs, deps) <- partitionEithers <$> find_deps (ms_imps node)
+
+        ; if null missing_dep_errs
+            then mapM_ (mapM_ do_imp) deps
+            else do
+              let sec = initSourceErrorContext (hsc_dflags hsc_env)
+              throwErrors sec (mkMessages (listToBag missing_dep_errs))
         }
 
-
 findDependency  :: HscEnv
-                -> SrcSpan
-                -> PkgQual              -- package qualifier, if any
-                -> ModuleName           -- Imported module
-                -> IsBootInterface      -- Source import
+                -> UnresolvedImport PkgQual   -- The import to find
                 -> Bool                 -- Record dependency on package modules
-                -> IO (Maybe FilePath)  -- Interface file
-findDependency hsc_env srcloc pkg imp is_boot include_pkg_deps = do
+                -> IO (Either (MsgEnvelope GhcMessage) (Maybe FilePath))  -- Interface file
+findDependency hsc_env imp include_pkg_deps = do
   -- Find the module; this will be fast because
-  -- we've done it once during downsweep
-  r <- findImportedModuleWithIsBoot hsc_env imp is_boot pkg
+  -- we've done it once during downsweep.
+  r <- resolveImport hsc_env imp
   case r of
     Found loc _
         -- Home package: just depend on the .hi or hi-boot file
         | isJust (ml_hs_file loc) || include_pkg_deps
-        -> return (Just (ml_hi_file loc))
+        -> return (Right (Just (ml_hi_file loc)))
 
         -- Not in this package: we don't need a dependency
         | otherwise
-        -> return Nothing
+        -> return (Right Nothing)
 
     fail ->
-        throwOneError $
+      return $
+        Left $
           mkPlainErrorMsgEnvelope srcloc $
           GhcDriverMessage $ DriverInterfaceError $
-             (Can'tFindInterface (cannotFindModule hsc_env imp fail) (LookingForModule imp is_boot))
+             (Can'tFindInterface (cannotFindModule hsc_env mod_name fail) (LookingForModule mod_name is_boot))
+  where
+    L srcloc mod_name = ui_mod_name imp
+    is_boot           = ui_boot imp
 
 -----------------------------
 writeDependency :: FilePath -> Handle -> [FilePath] -> FilePath -> IO ()
@@ -324,7 +328,7 @@ writeDependency :: FilePath -> Handle -> [FilePath] -> FilePath -> IO ()
 writeDependency root hdl targets dep
   = do let -- We need to avoid making deps on
            --     c:/foo/...
-           -- on cygwin as make gets confused by the :
+           -- on Windows as make gets confused by the :
            -- Making relative deps avoids some instances of this.
            dep' = makeRelative root dep
            forOutput = escapeSpaces . reslash Forwards . normalise

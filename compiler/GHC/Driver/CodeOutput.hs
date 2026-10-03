@@ -4,8 +4,6 @@
 \section{Code output phase}
 -}
 
-{-# LANGUAGE ScopedTypeVariables #-}
-
 module GHC.Driver.CodeOutput
    ( codeOutput
    , outputForeignStubs
@@ -18,6 +16,7 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.ForeignSrcLang
 import GHC.Data.FastString
+import GHC.Core.Lint ( lintMessage )
 
 import GHC.CmmToAsm     ( nativeCodeGen )
 import GHC.CmmToLlvm    ( llvmCodeGen )
@@ -37,7 +36,7 @@ import GHC.Driver.LlvmConfigCache  (LlvmConfigCache)
 import GHC.Driver.Ppr
 import GHC.Driver.Backend
 
-import GHC.Data.OsPath
+import GHC.Data.OsPath qualified as OsPath
 import qualified GHC.Data.ShortText as ST
 import GHC.Data.Stream           ( liftIO )
 import qualified GHC.Data.Stream as Stream
@@ -50,18 +49,16 @@ import GHC.Utils.Outputable
 import GHC.Utils.Logger
 import GHC.Utils.Exception ( bracket )
 import GHC.Utils.Ppr (Mode(..))
-import GHC.Utils.Panic.Plain ( pgmError )
+import GHC.Utils.Panic.Plain ( panic, pgmError )
 
 import GHC.Unit
 import GHC.Unit.Finder      ( mkStubPaths )
 
-import GHC.Types.SrcLoc
 import GHC.Types.CostCentre
 import GHC.Types.ForeignStubs
 import GHC.Types.Unique.DSM
+import GHC.Types.Unique.Supply ( UniqueTag(..) )
 
-import System.Directory
-import System.FilePath
 import System.IO
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -109,10 +106,7 @@ codeOutput logger tmpfs llvm_config dflags unit_state this_mod filenm location g
                   (text "CmmLint"<+>brackets (ppr this_mod))
                   (const ()) $ do
                 { case cmmLint (targetPlatform dflags) cmm of
-                        Just err -> do { logMsg logger
-                                                   MCInfo -- See Note [MCInfo for Lint] in "GHC.Core.Lint"
-                                                   noSrcSpan
-                                                   $ withPprStyle defaultDumpStyle err
+                        Just err -> do { lintMessage logger err
                                        ; ghcExit logger 1
                                        }
                         Nothing  -> return ()
@@ -124,33 +118,39 @@ codeOutput logger tmpfs llvm_config dflags unit_state this_mod filenm location g
                   { a <- linted_cmm_stream
                   ; let stubs = genForeignStubs a
                   ; emitInitializerDecls this_mod stubs
+                  ; emitFinalizerDecls this_mod stubs
                   ; return (stubs, a) }
 
-        ; let dus1 = newTagDUniqSupply 'n' dus0
+        ; let dus1 = newTagDUniqSupply CodeGenTag dus0
         ; (stubs, a) <- case backendCodeOutput (backend dflags) of
-                 NcgCodeOutput  -> outputAsm logger dflags this_mod location filenm dus1
-                                             final_stream
-                 ViaCCodeOutput -> outputC logger dflags filenm dus1 final_stream pkg_deps
-                 LlvmCodeOutput -> outputLlvm logger llvm_config dflags filenm dus1 final_stream
-                 JSCodeOutput   -> outputJS logger llvm_config dflags filenm final_stream
+             Just NcgCodeOutput  -> outputAsm logger dflags this_mod location filenm dus1
+                                              final_stream
+             Just ViaCCodeOutput -> outputC logger dflags filenm dus1 final_stream pkg_deps
+             Just LlvmCodeOutput -> outputLlvm logger llvm_config dflags filenm dus1 final_stream
+             Just JSCodeOutput   -> outputJS logger llvm_config dflags filenm final_stream
+             Nothing             -> panic $ "backendCodeOutput: " ++ show (backend dflags) ++ " doesn't support code output"
         ; stubs_exist <- outputForeignStubs logger tmpfs dflags unit_state this_mod location stubs
         ; return (filenm, stubs_exist, foreign_fps, a)
         }
 
 -- | See Note [Initializers and finalizers in Cmm] in GHC.Cmm.InitFini for details.
-emitInitializerDecls :: Module -> ForeignStubs -> CgStream RawCmmGroup ()
-emitInitializerDecls this_mod (ForeignStubs _ cstub)
-  | initializers <- getInitializers cstub
-  , not $ null initializers =
-      let init_array = CmmData sect statics
-          lbl = mkInitializerArrayLabel this_mod
-          sect = Section InitArray lbl
+emitInitializerDecls, emitFinalizerDecls :: Module -> ForeignStubs -> CgStream RawCmmGroup ()
+emitInitializerDecls = emitInitFiniArrayDecls InitArray mkInitializerArrayLabel getInitializers
+emitFinalizerDecls   = emitInitFiniArrayDecls FiniArray mkFinalizerArrayLabel   getFinalizers
+
+emitInitFiniArrayDecls :: SectionType -> (Module -> CLabel) -> (CStub -> [CLabel])
+                       -> Module -> ForeignStubs -> CgStream RawCmmGroup ()
+emitInitFiniArrayDecls sect_type mk_lbl get_labels this_mod (ForeignStubs _ cstub)
+  | labels <- get_labels cstub
+  , not $ null labels =
+      let lbl     = mk_lbl this_mod
+          sect    = Section sect_type lbl
           statics = CmmStaticsRaw lbl
             [ CmmStaticLit $ CmmLabel fn_name
-            | fn_name <- initializers
+            | fn_name <- labels
             ]
-    in Stream.yield [init_array]
-emitInitializerDecls _ _ = return ()
+    in Stream.yield [CmmData sect statics]
+emitInitFiniArrayDecls _ _ _ _ _ = return ()
 
 doOutput :: String -> (Handle -> IO a) -> IO a
 doOutput filenm io_action = bracket (openFile filenm WriteMode) hClose io_action
@@ -213,7 +213,7 @@ outputAsm logger dflags this_mod location filenm dus cmm_stream = do
   {-# SCC "OutputAsm" #-} doOutput filenm $
     \h -> {-# SCC "NativeCodeGen" #-}
       fmap fst $
-      runUDSMT dus $ setTagUDSMT 'n' $
+      runUDSMT dus $ setTagUDSMT CodeGenTag $
       nativeCodeGen logger (toolSettings dflags) ncg_config location h cmm_stream
 
 {-
@@ -301,10 +301,15 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
                    mk_include i = "#include \"" ++ ST.unpack i ++ "\"\n"
                in case mrts_pkg of
                     Just rts_pkg -> concatMap mk_include (unitIncludes rts_pkg)
-                    -- This case only happens when compiling foreign stub for the rts
-                    -- library itself. The only time we do this at the moment is for
-                    -- IPE information for the RTS info tables
-                    Nothing -> ""
+                    -- The Nothing case only happens when compiling
+                    -- foreign stubs for the rts library itself (e.g.
+                    -- building with +ipe), and the rts unit is not
+                    -- registered yet.
+                    --
+                    -- The generated stubs may still use RTS API, so
+                    -- we must ensure that Rts.h is included,
+                    -- otherwise we may run into regressions (#26779).
+                    Nothing -> "#include \"Rts.h\"\n"
 
             -- wrapper code mentions the ffi_arg type, which comes from ffi.h
             ffi_includes
@@ -323,10 +328,9 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
         stub_h_file_exists <-
           case mkStubPaths (initFinderOpts dflags) (moduleName mod) location of
             Nothing -> pure False
-            Just path -> do
-              let stub_h = unsafeDecodeUtf path
-              createDirectoryIfMissing True (takeDirectory stub_h)
-              outputForeignStubs_help stub_h stub_h_output_w
+            Just stub_h -> do
+              OsPath.createDirectoryIfMissing True (OsPath.takeDirectory stub_h)
+              outputForeignStubs_help (OsPath.unsafeDecodeUtf stub_h) stub_h_output_w
                     ("#include <HsFFI.h>\n" ++ cplusplus_hdr) cplusplus_ftr
 
         putDumpFileMaybe logger Opt_D_dump_foreign
@@ -334,15 +338,8 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
 
         stub_c_file_exists
            <- outputForeignStubs_help stub_c stub_c_output_w
-                ("#define IN_STG_CODE 0\n" ++
-                 "#include <Rts.h>\n" ++
-                 rts_includes ++
-                 ffi_includes ++
-                 cplusplus_hdr)
-                 cplusplus_ftr
-           -- We're adding the default hc_header to the stub file, but this
-           -- isn't really HC code, so we need to define IN_STG_CODE==0 to
-           -- avoid the register variables etc. being enabled.
+                (rts_includes ++
+                 ffi_includes) ""
 
         return (stub_h_file_exists, if stub_c_file_exists
                                        then Just stub_c
@@ -350,7 +347,6 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
  where
    cplusplus_hdr = "#if defined(__cplusplus)\nextern \"C\" {\n#endif\n"
    cplusplus_ftr = "#if defined(__cplusplus)\n}\n#endif\n"
-
 
 -- It is more than likely that the stubs file will
 -- turn out to be empty, in which case no file should be created.

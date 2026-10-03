@@ -15,13 +15,13 @@
 #include "Signals.h"
 #include "Schedule.h"
 #include "Prelude.h"
-#include "RaiseAsync.h"
 #include "RtsUtils.h"
 #include "Capability.h"
 #include "Select.h"
 #include "IOManagerInternals.h"
 #include "Stats.h"
 #include "GetTime.h"
+#include "FdWakeup.h"
 
 # if defined(HAVE_SYS_SELECT_H)
 #  include <sys/select.h>
@@ -53,6 +53,39 @@
 #define TimeToLowResTimeRoundDown(t) (t)
 #define TimeToLowResTimeRoundUp(t)   (t)
 #endif
+
+void initCapabilityIOManagerSelect(CapIOManager *iomgr)
+{
+    iomgr->blocked_queue_hd = END_TSO_QUEUE;
+    iomgr->blocked_queue_tl = END_TSO_QUEUE;
+    iomgr->sleeping_queue   = END_TSO_QUEUE;
+
+#if defined(HAVE_PREEMPTION)
+    newFdWakeup(&iomgr->interrupt_fd_r, &iomgr->interrupt_fd_w);
+
+    /* Would never happen in a standalone process, but could plausibly happen
+     * if the RTS is used within another process that already has many open fds.
+     */
+    if (iomgr->interrupt_fd_r < 0 || iomgr->interrupt_fd_r >= (int)FD_SETSIZE ||
+        iomgr->interrupt_fd_w < 0 || iomgr->interrupt_fd_w >= (int)FD_SETSIZE) {
+        barf("initCapabilityIOManagerSelect: fds out of select range");
+    }
+#endif
+}
+
+void freeCapabilityIOManagerSelect(CapIOManager *iomgr)
+{
+#if defined(HAVE_PREEMPTION)
+    closeFdWakeup(iomgr->interrupt_fd_r, iomgr->interrupt_fd_w);
+#endif
+}
+
+void interruptIOManagerSelect(CapIOManager *iomgr)
+{
+#if defined(HAVE_PREEMPTION)
+    sendFdWakeup(iomgr->interrupt_fd_w);
+#endif
+}
 
 /*
  * Return the time since the program started, in LowResTime,
@@ -93,9 +126,8 @@ LowResTime getDelayTarget (HsInt us)
  * if this is true, then our time has expired.
  * (idea due to Andy Gill).
  */
-static bool wakeUpSleepingThreads (Capability *cap, LowResTime now)
+static bool wakeUpSleepingThreads (CapIOManager *iomgr, LowResTime now)
 {
-    CapIOManager *iomgr = cap->iomgr;
     StgTSO *tso;
     bool flag = false;
 
@@ -105,11 +137,10 @@ static bool wakeUpSleepingThreads (Capability *cap, LowResTime now)
             break;
         }
         iomgr->sleeping_queue = tso->_link;
-        RELAXED_STORE(&tso->why_blocked, NotBlocked);
-        tso->_link = END_TSO_QUEUE;
         IF_DEBUG(scheduler, debugBelch("Waking up sleeping thread %"
                                        FMT_StgThreadID "\n", tso->id));
-        pushOnRunQueue(cap,tso);
+        pushOnRunQueue(iomgr->cap,tso);
+        RELEASE_STORE(&tso->why_blocked, NotBlocked);
         flag = true;
     }
     return flag;
@@ -216,10 +247,9 @@ static enum FdState fdPollWriteState (int fd)
  * not write handles.
  *
  */
-void
-awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
+bool
+awaitCompletedTimeoutsOrIOSelect(CapIOManager *iomgr, bool wait)
 {
-    CapIOManager *iomgr = cap->iomgr;
     StgTSO *tso, *prev, *next;
     fd_set rfd,wfd;
     int numFound;
@@ -227,6 +257,7 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
     bool seen_bad_fd = false;
     struct timeval tv, *ptv;
     LowResTime now;
+    bool interrupt = false; /* got interrupted up via interruptIOManager */
 
     IF_DEBUG(scheduler,
              debugBelch("scheduler: checking for threads blocked on I/O");
@@ -244,8 +275,8 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
     do {
 
       now = getLowResTimeOfDay();
-      if (wakeUpSleepingThreads(cap, now)) {
-          return;
+      if (wakeUpSleepingThreads(iomgr, now)) {
+          return true;
       }
 
       /*
@@ -253,6 +284,16 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
        */
       FD_ZERO(&rfd);
       FD_ZERO(&wfd);
+
+#if defined(HAVE_PREEMPTION)
+      /* We're always interested in our interrupt fd */
+      {
+          int fd = iomgr->interrupt_fd_r;
+          maxfd = (fd > maxfd) ? fd : maxfd;
+          ASSERT(fd >= 0 && fd < (int)FD_SETSIZE); // checked during init
+          FD_SET(fd, &rfd);
+      }
+#endif
 
       for(tso = iomgr->blocked_queue_hd;
           tso != END_TSO_QUEUE;
@@ -268,7 +309,7 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
        * So the (int) cast should be removed across the code base once
        * GHC requires a version of FreeBSD that has that change in it.
        */
-        switch (ACQUIRE_LOAD(&tso->why_blocked)) {
+        switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked))) {
         case BlockedOnRead:
           {
             int fd = tso->block_info.fd;
@@ -355,28 +396,37 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
            */
 #if defined(RTS_USER_SIGNALS)
           if (RtsFlags.MiscFlags.install_signal_handlers && signals_pending()) {
-              startSignalHandlers(cap);
-              return; /* still hold the lock */
+              startSignalHandlers(iomgr->cap);
+              return true; /* still hold the lock */
           }
 #endif
 
           /* we were interrupted, return to the scheduler immediately.
            */
           if (getSchedState() >= SCHED_INTERRUPTING) {
-              return; /* still hold the lock */
+              return true; /* still hold the lock */
           }
 
           /* check for threads that need waking up
            */
-          wakeUpSleepingThreads(cap, getLowResTimeOfDay());
+          wakeUpSleepingThreads(iomgr, getLowResTimeOfDay());
 
           /* If new runnable threads have arrived, stop waiting for
            * I/O and run them.
            */
-          if (!emptyRunQueue(cap)) {
-              return; /* still hold the lock */
+          if (!emptyRunQueue(iomgr->cap)) {
+              return true; /* still hold the lock */
           }
       }
+
+#if defined(HAVE_PREEMPTION)
+      /* If the interrupt_fd_r is ready, collect it */
+      if (FD_ISSET(iomgr->interrupt_fd_r, &rfd)) {
+          collectFdWakeup(iomgr->interrupt_fd_r);
+          interrupt = true;
+          debugTrace(DEBUG_iomanager, "Received interrupt in select I/O manager");
+      }
+#endif
 
       /* Step through the waiting queue, unblocking every thread that now has
        * a file descriptor in a ready state.
@@ -397,7 +447,7 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
               int fd;
               enum FdState fd_state = RTS_FD_IS_BLOCKING;
 
-              switch (tso->why_blocked) {
+              switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked))) {
               case BlockedOnRead:
                   fd = tso->block_info.fd;
 
@@ -429,22 +479,26 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
                   IF_DEBUG(scheduler,
                       debugBelch("Killing blocked thread %" FMT_StgThreadID
                                  " on bad fd=%i\n", tso->id, fd));
-                  raiseAsync(cap, tso,
-                      (StgClosure *)blockedOnBadFD_closure, false, NULL);
+
+                  /* Fill in the outcome and error on the TSO's stack frame */
+                  setTsoIOOpOutcome(tso, IOOpOutcomeFailed, EBADF);
+                  pushOnRunQueue(iomgr->cap,tso);
+                  RELEASE_STORE(&tso->why_blocked, NotBlocked);
                   break;
               case RTS_FD_IS_READY:
                   IF_DEBUG(scheduler,
                       debugBelch("Waking up blocked thread %" FMT_StgThreadID "\n",
                                  tso->id));
-                  tso->why_blocked = NotBlocked;
-                  tso->_link = END_TSO_QUEUE;
-                  pushOnRunQueue(cap,tso);
+                 /* Fill in the outcome and result on the TSO's stack frame */
+                  setTsoIOOpOutcome(tso, IOOpOutcomeSuccess, 0);
+                  pushOnRunQueue(iomgr->cap,tso);
+                  RELEASE_STORE(&tso->why_blocked, NotBlocked);
                   break;
               case RTS_FD_IS_BLOCKING:
                   if (prev == NULL)
                       iomgr->blocked_queue_hd = tso;
                   else
-                      setTSOLink(cap, prev, tso);
+                      setTSOLink(iomgr->cap, prev, tso);
                   prev = tso;
                   break;
               }
@@ -460,7 +514,9 @@ awaitCompletedTimeoutsOrIOSelect(Capability *cap, bool wait)
       }
 
     } while (wait && getSchedState() == SCHED_RUNNING
-                  && emptyRunQueue(cap));
+                  && emptyRunQueue(iomgr->cap)
+                  && !interrupt);
+    return !interrupt;
 }
 
 #endif /* IOMGR_ENABLED_SELECT */

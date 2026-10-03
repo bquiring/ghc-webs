@@ -35,7 +35,8 @@ void sendMessage(Capability *from_cap, Capability *to_cap, Message *msg)
             i != &stg_MSG_TRY_WAKEUP_info &&
             i != &stg_IND_info && // can happen if a MSG_BLACKHOLE is revoked
             i != &stg_WHITEHOLE_info &&
-            i != &stg_MSG_CLONE_STACK_info) {
+            i != &stg_MSG_CLONE_STACK_info &&
+            i != &stg_MSG_UPD_TSO_FLAG_info) {
             barf("sendMessage: %p", i);
         }
     }
@@ -47,9 +48,11 @@ void sendMessage(Capability *from_cap, Capability *to_cap, Message *msg)
     recordClosureMutated(from_cap,(StgClosure*)msg);
 
     if (to_cap->running_task == NULL) {
-        to_cap->running_task = myTask();
-            // precond for releaseCapability_()
-        releaseCapability_(to_cap,false);
+        /* Precond for releaseCapability_ is: running_task || always_wakeup.
+         * We have running_task == NULL, hence we must use always_wakeup. This
+         * is ok since the inbox is now non-empty, so we wake a task anyway.
+         */
+        releaseCapability_(to_cap, true /*always_wakeup*/);
     } else {
         interruptCapability(to_cap);
     }
@@ -63,6 +66,62 @@ void sendMessage(Capability *from_cap, Capability *to_cap, Message *msg)
    Handle a message
    ------------------------------------------------------------------------- */
 
+/*
+Note [TSO owner may change in between Msg being sent and received]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a message is sent from Capability (C1) to a target TSO (T2) (e.g.
+MessageUpdTSOFlag, MessageCloneStack, ...), it is queued on the TSO's owner
+Capability (C3) inbox (inboxes are owned by Capabilities, not TSOs).
+
+At a later point, the Capability (C3) will process its inbox. Upon receiving
+the message meant for a specific TSO (T2), it must first always check that the
+TSO's owner is *still* itself (C3).
+
+The target TSO (T2) may have migrated after the message was queued on its old
+capability (C3). In that case we must forward the request to the new owner
+(say, C4); otherwise the Capability C3 could be modifying a TSO it no longer
+owns, racing with its actual owner mutating it, since it is no longer the owner.
+
+The message meant for a TSO should only be executed when the receiving
+Capability is still the owner of that TSO. Otherwise, it must be forwarded to
+the new owner.
+
+The general pattern is one where there's a top-level function which assumes it
+can be called by capabilities other than the TSO's owner. The function checks
+whether the current capability is the TSO owner. If yes, execute the action. If
+not, then it sends a message to the current TSO's owner. On receiving the
+message, the new capability will just call that top-level function, which will
+ensure the message is forwarded again if the TSO owner changed.
+It will look something like:
+
+  runMyMsg(Capability *from, StgTSO *target, ...) {
+
+#if defined(THREADED_RTS)
+    Capability *owner = RELAXED_LOAD(&target->cap)
+    if (owner != from) {
+      MessageMyMsg* msg = ...
+      sendMessage(cap, owner, msg)
+      return
+    }
+#endif
+
+    actuallyDoTheWork(...)
+  }
+
+  executeMessage(...) {
+
+    if (i == &stg_MY_MSG_info) {
+
+      MessageMyMsg* msg = (MessageMyMsg*) m
+      runMyMsg(cap, m->tso, ...)
+
+    }
+  }
+
+See example `updThreadFlag` and `executeMessage`'s `stg_MSG_UPD_TSO_FLAG_info`,
+or `tryWakeUpThread` and `stg_MSG_TRY_WAKEUP_info` for two live examples.
+*/
+
 #if defined(THREADED_RTS)
 
 void
@@ -75,8 +134,8 @@ loop:
     if (i == &stg_MSG_TRY_WAKEUP_info)
     {
         StgTSO *tso = ((MessageWakeup *)m)->tso;
-        debugTraceCap(DEBUG_sched, cap, "message: try wakeup thread %"
-                      FMT_StgThreadID, tso->id);
+        debugTraceCap(DEBUG_sched, cap,
+                      "message: try wakeup thread %" FMT_StgThreadID, tso->id);
         tryWakeupThread(cap, tso);
     }
     else if (i == &stg_MSG_THROWTO_info)
@@ -91,8 +150,8 @@ loop:
             goto loop;
         }
 
-        debugTraceCap(DEBUG_sched, cap, "message: throwTo %ld -> %ld",
-                      (W_)t->source->id, (W_)t->target->id);
+        debugTraceCap(DEBUG_sched, cap, "message: throwTo %" FMT_StgThreadID
+                      " -> %" FMT_StgThreadID, t->source->id, t->target->id);
 
         r = throwToMsg(cap, t);
 
@@ -135,7 +194,13 @@ loop:
     }
     else if(i == &stg_MSG_CLONE_STACK_info){
         MessageCloneStack *cloneStackMessage = (MessageCloneStack*) m;
-        handleCloneStackMessage(cloneStackMessage);
+        handleCloneStackMessage(cap, cloneStackMessage);
+    }
+    else if(i == &stg_MSG_UPD_TSO_FLAG_info){
+        MessageUpdTSOFlag *u = (MessageUpdTSOFlag*) m;
+
+        StgTSO *tso = RELAXED_LOAD(&u->tso);
+        updThreadFlag(cap, tso, u->flag, u->set);
     }
     else
     {
@@ -176,16 +241,22 @@ uint32_t messageBlackHole(Capability *cap, MessageBlackHole *msg)
     // BLACKHOLE has already been updated, and GC has shorted out the
     // indirection, so the pointer no longer points to a BLACKHOLE at
     // all.
-    if (bh_info != &stg_BLACKHOLE_info &&
-        bh_info != &stg_CAF_BLACKHOLE_info &&
-        bh_info != &__stg_EAGER_BLACKHOLE_info &&
-        bh_info != &stg_WHITEHOLE_info) {
-        // if it is a WHITEHOLE, then a thread is in the process of
-        // trying to BLACKHOLE it.  But we know that it was once a
-        // BLACKHOLE, so there is at least a valid pointer in the
-        // payload, so we can carry on.
+    if (!IS_BLACKHOLE_OR_WHITEHOLE_INFO(bh_info)) {
         return 0;
     }
+
+    // If we see a WHITEHOLE then we should wait for it to turn into a BLACKHOLE.
+    // Otherwise we might look at the indirectee and segfault.
+    // See "Exception handling" in Note [Thunks, blackholes, and indirections]
+    // We might be looking at a *fresh* THUNK being WHITEHOLE-d so we can't
+    // guarantee that the indirectee is a valid pointer.
+#if defined(THREADED_RTS)
+    if (bh_info == &stg_WHITEHOLE_info) {
+      while(ACQUIRE_LOAD(&bh->header.info) == &stg_WHITEHOLE_info) {
+        busy_wait_nop();
+      }
+    }
+#endif
 
     // The blackhole must indirect to a TSO, a BLOCKING_QUEUE, an IND,
     // or a value.
@@ -247,7 +318,8 @@ uint32_t messageBlackHole(Capability *cap, MessageBlackHole *msg)
         // NB. we check to make sure that the owner is not the same as
         // the current thread, since in that case it will not be on
         // the run queue.
-        if (owner->why_blocked == NotBlocked && owner->id != msg->tso->id) {
+        if (RELAXED_LOAD(&owner->why_blocked) == NotBlocked &&
+            owner->id != msg->tso->id) {
             promoteInRunQueue(cap, owner);
         }
 
@@ -308,7 +380,8 @@ uint32_t messageBlackHole(Capability *cap, MessageBlackHole *msg)
                       msg->tso->id, owner->id);
 
         // See above, #3838
-        if (owner->why_blocked == NotBlocked && owner->id != msg->tso->id) {
+        if (RELAXED_LOAD(&owner->why_blocked) == NotBlocked &&
+            owner->id != msg->tso->id) {
             promoteInRunQueue(cap, owner);
         }
 
@@ -329,10 +402,7 @@ StgTSO * blackHoleOwner (StgClosure *bh)
 
     info = RELAXED_LOAD(&bh->header.info);
 
-    if (info != &stg_BLACKHOLE_info &&
-        info != &stg_CAF_BLACKHOLE_info &&
-        info != &__stg_EAGER_BLACKHOLE_info &&
-        info != &stg_WHITEHOLE_info) {
+    if (!IS_BLACKHOLE_OR_WHITEHOLE_INFO(info)) {
         return NULL;
     }
 

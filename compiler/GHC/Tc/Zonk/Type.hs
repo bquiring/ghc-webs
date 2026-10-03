@@ -1,5 +1,4 @@
-{-# LANGUAGE GADTs #-}
-
+{-# LANGUAGE OverloadedRecordDot #-}
 {-
 (c) The University of Glasgow 2006
 (c) The AQUA Project, Glasgow University, 1996-1998
@@ -36,10 +35,7 @@ module GHC.Tc.Zonk.Type (
 
 import GHC.Prelude
 
-import GHC.Builtin.Types
-
-import GHC.Core.TyCo.Ppr ( pprTyVar )
-
+import GHC.Builtin.WiredIn.Types
 import GHC.Hs
 
 import {-# SOURCE #-} GHC.Tc.Gen.Splice (runTopSplice)
@@ -48,7 +44,7 @@ import GHC.Tc.Types.TcRef
 import GHC.Tc.TyCl.Build ( TcMethInfo, MethInfo )
 import GHC.Tc.Utils.Env ( tcLookupGlobalOnly )
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Monad ( newZonkAnyType, setSrcSpanA, liftZonkM, traceTc, addErr )
+import GHC.Tc.Utils.Monad ( newUnusedType, setSrcSpanA, liftZonkM, traceTc, addErr )
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Errors.Types
 import GHC.Tc.Zonk.Env
@@ -60,9 +56,13 @@ import GHC.Tc.Zonk.TcType
     , checkCoercionHole
     , zonkCoVar )
 
-import GHC.Core.Type
 import GHC.Core.Coercion
+import GHC.Core.ConLike
+import GHC.Core.PatSyn (PatSyn(..))
+import GHC.Core.TyCo.Ppr ( pprTyVar )
+import GHC.Core.Type
 import GHC.Core.TyCon
+import GHC.Core.TyCo.Rep( CoercionPlusHoles(..) )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
@@ -93,6 +93,7 @@ import Control.Monad
 import Control.Monad.Trans.Class ( lift )
 import Data.List.NonEmpty ( NonEmpty )
 import Data.Foldable ( toList )
+import Data.Traversable ( for )
 
 {- Note [What is zonking?]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -152,7 +153,7 @@ I.1. GHC.Tc.Zonk.Monad - the ZonkM monad
   as used in GHC.Tc.Zonk.TcType.
 
   Crucially, it never errors. It is the monad we use when reporting errors
-  (see ErrCtxt), and it would be quite bad if we could error in the middle
+  (see HsCtxt), and it would be quite bad if we could error in the middle
   of reporting an error!
 
 I.2. GHC.Tc.Zonk.TcType - zonking types in the typechecker
@@ -470,11 +471,11 @@ commitFlexi DefaultFlexi tv zonked_kind
        ; return manyDataConTy }
   | Just (ConcreteFRR origin) <- isConcreteTyVar_maybe tv
   = do { addErr $ TcRnZonkerMessage (ZonkerCannotDefaultConcrete origin)
-       ; return (anyTypeOfKind zonked_kind) }
+       ; newUnusedType tv.varName zonked_kind }
   | otherwise
-  = do { traceTc "Defaulting flexi tyvar to ZonkAny:" (pprTyVar tv)
-          -- See Note [Any types] in GHC.Builtin.Types, esp wrinkle (Any4)
-       ; newZonkAnyType zonked_kind }
+  = do { traceTc "Defaulting flexi tyvar to UnusedType:" (pprTyVar tv)
+          -- See Note [The types Any and UnusedType] in GHC.Builtin.WiredIn.Types, esp wrinkle (Any6)
+       ; newUnusedType tv.varName zonked_kind }
 
 zonkCoVarOcc :: CoVar -> ZonkTcM Coercion
 zonkCoVarOcc cv
@@ -485,10 +486,11 @@ zonkCoVarOcc cv
           _        -> mkCoVarCo <$> (lift $ liftZonkM $ zonkCoVar cv) }
 
 zonkCoHole :: CoercionHole -> ZonkTcM Coercion
-zonkCoHole hole@(CoercionHole { ch_ref = ref, ch_co_var = cv })
+zonkCoHole hole@(CH { ch_ref = ref, ch_co_var = cv })
   = do { contents <- readTcRef ref
        ; case contents of
-           Just co -> do { co' <- zonkCoToCo co
+           Just (CPH { cph_co = co })
+                   -> do { co' <- zonkCoToCo co
                          ; lift $ liftZonkM $ checkCoercionHole cv co' }
 
               -- This next case should happen only in the presence of
@@ -647,23 +649,25 @@ zonkTopDecls :: Bag EvBind
              -> LHsBinds GhcTc
              -> [LRuleDecl GhcTc] -> [LTcSpecPrag]
              -> [LForeignDecl GhcTc]
+             -> [PatSyn]
              -> TcM (TypeEnv,
                      Bag EvBind,
                      LHsBinds GhcTc,
                      [LForeignDecl GhcTc],
                      [LTcSpecPrag],
-                     [LRuleDecl    GhcTc])
-zonkTopDecls ev_binds binds rules imp_specs fords
+                     [LRuleDecl    GhcTc],
+                     [PatSyn])
+zonkTopDecls ev_binds binds rules imp_specs fords pat_syns
   = initZonkEnv DefaultFlexi $
     runZonkBndrT (zonkEvBinds ev_binds)   $ \ ev_binds' ->
     runZonkBndrT (zonkRecMonoBinds binds) $ \ binds'    ->
      -- Top level is implicitly recursive
-  do  { rules' <- zonkRules rules
-      ; specs' <- zonkLTcSpecPrags imp_specs
-      ; fords' <- zonkForeignExports fords
-      ; ty_env <- zonkEnvIds <$> getZonkEnv
-      ; return (ty_env, ev_binds', binds', fords', specs', rules') }
-
+  do  { rules'    <- zonkRules rules
+      ; specs'    <- zonkLTcSpecPrags imp_specs
+      ; fords'    <- zonkForeignExports fords
+      ; pat_syns' <- traverse zonkPatSyn pat_syns
+      ; ty_env    <- zonkEnvIds <$> getZonkEnv
+      ; return (ty_env, ev_binds', binds', fords', specs', rules', pat_syns') }
 
 ---------------------------------------------
 zonkLocalBinds :: HsLocalBinds GhcTc
@@ -674,13 +678,11 @@ zonkLocalBinds (EmptyLocalBinds x)
 zonkLocalBinds (HsValBinds _ (ValBinds {}))
   = panic "zonkLocalBinds" -- Not in typechecker output
 
-zonkLocalBinds (HsValBinds x (XValBindsLR (NValBinds binds sigs)))
-  = do  { new_binds <- traverse go binds
-        ; return (HsValBinds x (XValBindsLR (NValBinds new_binds sigs))) }
+zonkLocalBinds (HsValBinds x (XValBindsLR (HsVBG binds sigs)))
+  = do  { new_binds <- mapM go binds
+        ; return (HsValBinds x (XValBindsLR (HsVBG new_binds sigs))) }
   where
-    go (r,b)
-      = do { b' <- zonkRecMonoBinds b
-           ; return (r,b') }
+    go (r,b) = do { b' <- zonkRecMonoBinds b; return (r,b') }
 
 zonkLocalBinds (HsIPBinds x (IPBinds dict_binds binds )) = do
     new_binds <- noBinders $ mapM (wrapLocZonkMA zonk_ip_bind) binds
@@ -709,15 +711,16 @@ zonk_lbind = wrapLocZonkMA zonk_bind
 
 zonk_bind :: HsBind GhcTc -> ZonkTcM (HsBind GhcTc)
 zonk_bind bind@(PatBind { pat_lhs = pat, pat_rhs = grhss
-                        , pat_mult = mult_ann
-                        , pat_ext = (ty, ticks)})
+                        , pat_mods = mods
+                        , pat_ext = ext })
   = do  { new_pat   <- don'tBind $ zonkPat pat            -- Env already extended
         ; new_grhss <- zonkGRHSs zonkLExpr grhss
-        ; new_ty    <- zonkTcTypeToTypeX ty
-        ; new_mult  <- zonkMultAnn mult_ann
+        ; new_ty    <- zonkTcTypeToTypeX $ patBindGRHSType ext
+        ; new_mult  <- zonkTcTypeToTypeX $ patBindMult ext
         ; return (bind { pat_lhs = new_pat, pat_rhs = new_grhss
-                       , pat_mult = new_mult
-                       , pat_ext = (new_ty, ticks) }) }
+                       , pat_mods = mods
+                       , pat_ext = ext { patBindGRHSType = new_ty
+                                       , patBindMult = new_mult }}) }
 
 zonk_bind (VarBind { var_ext = x
                    , var_id = var, var_rhs = expr })
@@ -807,25 +810,14 @@ zonk_bind (PatSynBind x bind@(PSB { psb_id   = L loc id
                        , psb_def  = lpat'
                        , psb_dir  = dir' } } }
 
-zonkMultAnn :: HsMultAnn GhcTc -> ZonkTcM (HsMultAnn GhcTc)
-zonkMultAnn (HsUnannotated mult)
-  = do { mult' <- zonkTcTypeToTypeX mult
-       ; return (HsUnannotated mult') }
-zonkMultAnn (HsLinearAnn mult)
-  = do { mult' <- zonkTcTypeToTypeX mult
-       ; return (HsLinearAnn mult') }
-zonkMultAnn (HsExplicitMult mult hs_ty)
-  = do { mult' <- zonkTcTypeToTypeX mult
-       ; return (HsExplicitMult mult' hs_ty) }
-
 zonkPatSynDetails :: HsPatSynDetails GhcTc
                   -> ZonkTcM (HsPatSynDetails GhcTc)
-zonkPatSynDetails (PrefixCon as)
-  = PrefixCon <$> traverse zonkLIdOcc as
-zonkPatSynDetails (InfixCon a1 a2)
-  = InfixCon <$> zonkLIdOcc a1 <*> zonkLIdOcc a2
-zonkPatSynDetails (RecCon flds)
-  = RecCon <$> mapM zonkPatSynField flds
+zonkPatSynDetails (PrefixCon x as)
+  = PrefixCon x <$> traverse zonkLIdOcc as
+zonkPatSynDetails (InfixCon x a1 a2)
+  = InfixCon x <$> zonkLIdOcc a1 <*> zonkLIdOcc a2
+zonkPatSynDetails (RecCon x flds)
+  = RecCon x <$> mapM zonkPatSynField flds
 
 zonkPatSynField :: RecordPatSynField GhcTc -> ZonkTcM (RecordPatSynField GhcTc)
 zonkPatSynField (RecordPatSynField x y) =
@@ -960,6 +952,8 @@ zonkExpr (HsOverLit x lit)
   = do  { lit' <- zonkOverLit lit
         ; return (HsOverLit x lit') }
 
+zonkExpr (HsQualLit _ lit) = case lit of
+
 zonkExpr (HsLam x lam_variant matches)
   = do new_matches <- zonkMatchGroup zonkLExpr matches
        return (HsLam x lam_variant new_matches)
@@ -1077,32 +1071,28 @@ zonkExpr (HsProc x pat body)
         ; return (HsProc x new_pat new_body) }
 
 -- StaticPointers extension
-zonkExpr (HsStatic (fvs, ty) expr)
+zonkExpr (HsStatic (ty, fs) expr)
   = do new_ty <- zonkTcTypeToTypeX ty
-       HsStatic (fvs, new_ty) <$> zonkLExpr expr
+       new_fs <- zonkExpr fs
+       HsStatic (new_ty, new_fs) <$> zonkLExpr expr
 
 zonkExpr (HsEmbTy x _) = dataConCantHappen x
 zonkExpr (HsQual x _ _) = dataConCantHappen x
 zonkExpr (HsForAll x _ _) = dataConCantHappen x
 zonkExpr (HsFunArr x _ _ _) = dataConCantHappen x
+zonkExpr (HsStar x) = dataConCantHappen x
 
 zonkExpr (XExpr (WrapExpr co_fn expr))
   = runZonkBndrT (zonkCoFn co_fn) $ \ new_co_fn ->
     do new_expr <- zonkExpr expr
        return (XExpr (WrapExpr new_co_fn new_expr))
 
-zonkExpr (XExpr (ExpandedThingTc thing e))
-  = do e' <- zonkExpr e
-       return $ XExpr (ExpandedThingTc thing e')
+zonkExpr (XExpr (ExpandedThingTc (HSE thing e)))
+  = do e' <- zonkLExpr e
+       return $ XExpr (ExpandedThingTc (HSE thing e'))
 
-
-zonkExpr (XExpr (ConLikeTc con tvs tys))
-  = XExpr . ConLikeTc con tvs <$> mapM zonk_scale tys
-  where
-    zonk_scale (Scaled m ty) = Scaled <$> zonkTcTypeToTypeX m <*> pure ty
-    -- Only the multiplicity can contain unification variables
-    -- The tvs come straight from the data-con, and so are strictly redundant
-    -- See Wrinkles of Note [Typechecking data constructors] in GHC.Tc.Gen.Head
+zonkExpr e@(XExpr (ConLikeTc {}))
+  = return e
 
 zonkExpr (XExpr (HsRecSelTc (FieldOcc occ (L l v))))
   = do { v' <- zonkIdOcc v
@@ -1212,10 +1202,14 @@ zonkCmdTop :: LHsCmdTop GhcTc -> ZonkTcM (LHsCmdTop GhcTc)
 zonkCmdTop cmd = wrapLocZonkMA (zonk_cmd_top) cmd
 
 zonk_cmd_top :: HsCmdTop GhcTc -> ZonkTcM (HsCmdTop GhcTc)
-zonk_cmd_top (HsCmdTop (CmdTopTc stack_tys ty ids) cmd)
+zonk_cmd_top (HsCmdTop (CmdTopTc { ctt_stack  = stack_tys
+                                 , ctt_arr_ty = arr_ty
+                                 , ctt_res_ty = res_ty
+                                 , ctt_table  = CST ids }) cmd)
   = do new_cmd <- zonkLCmd cmd
        new_stack_tys <- zonkTcTypeToTypeX stack_tys
-       new_ty <- zonkTcTypeToTypeX ty
+       new_arr_ty <- zonkTcTypeToTypeX arr_ty
+       new_res_ty <- zonkTcTypeToTypeX res_ty
        new_ids <- mapSndM zonkExpr ids
 
        massert (definitelyLiftedType new_stack_tys)
@@ -1223,18 +1217,32 @@ zonk_cmd_top (HsCmdTop (CmdTopTc stack_tys ty ids) cmd)
          -- but indeed it should always be lifted due to the typing
          -- rules for arrows
 
-       return (HsCmdTop (CmdTopTc new_stack_tys new_ty new_ids) new_cmd)
+       let new_cmd_top =
+             CmdTopTc { ctt_stack  = new_stack_tys
+                      , ctt_arr_ty = new_arr_ty
+                      , ctt_res_ty = new_res_ty
+                      , ctt_table  = CST new_ids }
+
+       return (HsCmdTop new_cmd_top new_cmd)
 
 -------------------------------------------------------------------------
 zonkCoFn :: HsWrapper -> ZonkBndrTcM HsWrapper
 zonkCoFn WpHole   = return WpHole
+zonkCoFn (WpSubType w)     = do { w' <- zonkCoFn w
+                                ; return (WpSubType w') }
 zonkCoFn (WpCompose c1 c2) = do { c1' <- zonkCoFn c1
                                 ; c2' <- zonkCoFn c2
                                 ; return (WpCompose c1' c2') }
-zonkCoFn (WpFun c1 c2 t1)  = do { c1' <- zonkCoFn c1
-                                ; c2' <- zonkCoFn c2
-                                ; t1' <- noBinders $ zonkScaledTcTypeToTypeX t1
-                                ; return (WpFun c1' c2' t1') }
+zonkCoFn (WpFun w arg res t1 t2) =
+  do { w' <- noBinders $
+               case w of
+                 EqMultCo co -> EqMultCo <$> zonkCoToCo co
+                 OneSubMult w -> OneSubMult <$> zonkTcTypeToTypeX w
+     ; arg' <- zonkCoFn arg
+     ; res' <- zonkCoFn res
+     ; t1' <- noBinders $ zonkTcTypeToTypeX t1
+     ; t2' <- noBinders $ zonkTcTypeToTypeX t2
+     ; return (WpFun w' arg' res' t1' t2') }
 zonkCoFn (WpCast co)   = WpCast  <$> noBinders (zonkCoToCo co)
 zonkCoFn (WpEvLam ev)  = WpEvLam <$> zonkEvBndrX ev
 zonkCoFn (WpEvApp arg) = WpEvApp <$> noBinders (zonkEvTerm arg)
@@ -1549,7 +1557,8 @@ zonk_pat (SumPat tys pat alt arity )
         ; pat' <- zonkPat pat
         ; return (SumPat tys' pat' alt arity) }
 
-zonk_pat p@(ConPat { pat_args = args
+zonk_pat p@(ConPat { pat_con = L con_loc con
+                   , pat_args = args
                    , pat_con_ext = p'@(ConPatTc
                      { cpt_tvs = tyvars
                      , cpt_dicts = evs
@@ -1568,8 +1577,15 @@ zonk_pat p@(ConPat { pat_args = args
         ; new_binds   <- zonkTcEvBinds binds
         ; new_wrapper <- zonkCoFn wrapper
         ; new_args    <- zonkConStuff args
+        ; new_con     <- case con of
+            RealDataCon {} -> return con
+              -- Data constructors never contain metavariables: they are
+              -- fully zonked before we look at any value bindings.
+            PatSynCon ps   -> PatSynCon <$> noBinders (zonkPatSyn ps)
+              -- Pattern synonyms can contain metavariables, see e.g. T26465c.
         ; pure $ p
-                 { pat_args = new_args
+                 { pat_con = L con_loc new_con
+                 , pat_args = new_args
                  , pat_con_ext = p'
                    { cpt_arg_tys = new_tys
                    , cpt_tvs = new_tyvars
@@ -1614,37 +1630,42 @@ zonk_pat (InvisPat ty tp)
   = do { ty' <- noBinders $ zonkTcTypeToTypeX ty
        ; return (InvisPat ty' tp) }
 
+zonk_pat (ModifiedPat x mods p)
+  = do  { p' <- zonkPat p
+        ; return (ModifiedPat x mods p') }
+
 zonk_pat (XPat ext) = case ext of
-  { ExpansionPat orig pat->
+  { ExpansionPat orig pat ->
     do { pat' <- zonk_pat pat
        ; return $ XPat $ ExpansionPat orig pat' }
   ; CoPat co_fn pat ty ->
-    do { co_fn' <- zonkCoFn co_fn
-       ; pat'   <- zonkPat (noLocA pat)
-       ; ty'    <- noBinders $ zonkTcTypeToTypeX ty
-       ; return (XPat $ CoPat co_fn' (unLoc pat') ty')
+    do { co_fn'   <- zonkCoFn co_fn
+       ; pat'     <- zonk_pat pat
+       ; ty'      <- noBinders $ zonkTcTypeToTypeX ty
+       ; return (XPat $ CoPat co_fn' pat' ty')
        } }
 
-zonk_pat pat = pprPanic "zonk_pat" (ppr pat)
+zonk_pat pat@(SplicePat {}) = pprPanic "zonk_pat" (ppr pat)
+zonk_pat pat@(QualLitPat {}) = pprPanic "zonk_pat" (ppr pat)
 
 ---------------------------
 zonkConStuff :: HsConPatDetails GhcTc
              -> ZonkBndrTcM (HsConPatDetails GhcTc)
-zonkConStuff (PrefixCon pats)
+zonkConStuff (PrefixCon x pats)
   = do  { pats' <- zonkPats pats
-        ; return (PrefixCon pats') }
+        ; return (PrefixCon x pats') }
 
-zonkConStuff (InfixCon p1 p2)
+zonkConStuff (InfixCon x p1 p2)
   = do  { p1' <- zonkPat p1
         ; p2' <- zonkPat p2
-        ; return (InfixCon p1' p2') }
+        ; return (InfixCon x p1' p2') }
 
-zonkConStuff (RecCon (HsRecFields x rpats dd))
+zonkConStuff (RecCon xx (HsRecFields x rpats dd))
   = do  { pats' <- zonkPats (map (hfbRHS . unLoc) rpats)
         ; let rpats' = zipWith (\(L l rp) p' ->
                                   L l (rp { hfbRHS = p' }))
                                rpats pats'
-        ; return (RecCon (HsRecFields x rpats' dd)) }
+        ; return (RecCon xx (HsRecFields x rpats' dd)) }
         -- Field selectors have declared types; hence no zonking
 
 ---------------------------
@@ -1652,6 +1673,45 @@ zonkPats :: Traversable f => f (LPat GhcTc) -> ZonkBndrTcM (f (LPat GhcTc))
 zonkPats = traverse zonkPat
 {-# SPECIALISE zonkPats :: [LPat GhcTc] -> ZonkBndrTcM [LPat GhcTc] #-}
 {-# SPECIALISE zonkPats :: NonEmpty (LPat GhcTc) -> ZonkBndrTcM (NonEmpty (LPat GhcTc)) #-}
+
+---------------------------
+
+-- | Perform a final zonk-to-type for a pattern synonym.
+--
+-- See Note [Metavariables in pattern synonyms] in GHC.Tc.TyCl.PatSyn.
+zonkPatSyn :: PatSyn -> ZonkTcM PatSyn
+zonkPatSyn
+  ps@( MkPatSyn
+     { psArgs       = arg_tys
+     , psUnivTyVars = univ_tvs
+     , psReqTheta   = req_theta
+     , psExTyVars   = ex_tvs
+     , psProvTheta  = prov_theta
+     , psResultTy   = res_ty
+     , psMatcher    = (matcherNm, matcherTy, matcherDummyArg)
+     , psBuilder    = mbBuilder
+     }) =
+  runZonkBndrT (zonkTyVarBindersX univ_tvs) $ \ univ_tvs' ->
+  do { req_theta'  <- zonkTcTypesToTypesX req_theta
+     ; res_ty'     <- zonkTcTypeToTypeX   res_ty
+     ; runZonkBndrT (zonkTyVarBindersX ex_tvs) $ \ ex_tvs' ->
+  do { prov_theta' <- zonkTcTypesToTypesX prov_theta
+     ; arg_tys'    <- zonkTcTypesToTypesX arg_tys
+     ; matcherTy'  <- zonkTcTypeToTypeX   matcherTy
+     ; mbBuilder'  <- for mbBuilder $ \ (builderNm, builderTy, builderDummyArg) ->
+                        do { builderTy' <- zonkTcTypeToTypeX builderTy
+                           ; return (builderNm, builderTy', builderDummyArg) }
+     ; return $
+        ps
+          { psArgs       = arg_tys'
+          , psUnivTyVars = univ_tvs'
+          , psReqTheta   = req_theta'
+          , psExTyVars   = ex_tvs'
+          , psProvTheta  = prov_theta'
+          , psResultTy   = res_ty'
+          , psMatcher    = (matcherNm, matcherTy', matcherDummyArg)
+          , psBuilder    = mbBuilder'
+          } } }
 
 {-
 ************************************************************************
@@ -1667,11 +1727,11 @@ zonkForeignExports ls = mapM (wrapLocZonkMA zonkForeignExport) ls
 
 zonkForeignExport :: ForeignDecl GhcTc -> ZonkTcM (ForeignDecl GhcTc)
 zonkForeignExport (ForeignExport { fd_name = i, fd_e_ext = co
-                                 , fd_fe = spec })
+                                 , fd_fe = spec, fd_modifiers = mods })
   = do { i' <- zonkLIdOcc i
        ; return (ForeignExport { fd_name = i'
                                , fd_sig_ty = undefined, fd_e_ext = co
-                               , fd_fe = spec }) }
+                               , fd_fe = spec, fd_modifiers = mods }) }
 zonkForeignExport for_imp
   = return for_imp     -- Foreign imports don't need zonking
 
@@ -1764,7 +1824,7 @@ zonkEvTerm (EvFun { et_tvs = tvs, et_given = evs
                   , et_binds = ev_binds, et_body = body_id })
   = runZonkBndrT (zonkTyBndrsX tvs)       $ \ new_tvs      ->
     runZonkBndrT (zonkEvBndrsX evs)       $ \ new_evs      ->
-    runZonkBndrT (zonkEvBinds ev_binds)   $ \ new_ev_binds ->
+    runZonkBndrT (zonkTcEvBinds ev_binds) $ \ new_ev_binds ->
   do { new_body_id  <- zonkIdOcc body_id
      ; return (EvFun { et_tvs = new_tvs, et_given = new_evs
                      , et_binds = new_ev_binds, et_body = new_body_id }) }
@@ -1858,8 +1918,9 @@ zonk_tc_ev_binds (EvBinds bs)    = zonkEvBinds bs
 
 zonkEvBindsVar :: EvBindsVar -> ZonkBndrTcM (Bag EvBind)
 zonkEvBindsVar (EvBindsVar { ebv_binds = ref })
-  = do { bs <- readTcRef ref
+  = do { EBS { ebs_binds = bs }  <- readTcRef ref
        ; zonkEvBinds (evBindMapBinds bs) }
+
 zonkEvBindsVar (CoEvBindsVar {}) = return emptyBag
 
 zonkEvBinds :: Bag EvBind -> ZonkBndrTcM (Bag EvBind)
@@ -1951,4 +2012,3 @@ Quantifying here is awkward because (a) the data type is big and (b)
 finding the free type vars of an expression is necessarily monadic
 operation. (consider /\a -> f @ b, where b is side-effected to a)
 -}
-

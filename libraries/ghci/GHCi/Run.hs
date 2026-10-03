@@ -19,6 +19,7 @@ import GHCi.CreateBCO
 import GHCi.InfoTable
 #endif
 
+import GHCi.Coverage
 import qualified GHC.InfoProv as InfoProv
 import GHCi.Debugger
 import GHCi.FFI
@@ -34,8 +35,11 @@ import Control.DeepSeq
 import Control.Exception
 import Control.Monad
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Short as BS
+import qualified Data.ByteString.Short.Internal as BS
 import qualified Data.ByteString.Unsafe as B
+#if defined(PROFILING)
+import GHC.Data.ShortByteString
+#endif
 import GHC.Exts
 import qualified GHC.Exts.Heap as Heap
 import GHC.Stack
@@ -57,7 +61,7 @@ run m = case m of
 #if defined(javascript_HOST_ARCH)
   LoadObj p                   -> withCString p loadJS
   InitLinker                  -> notSupportedJS m
-  LoadDLL {}                  -> notSupportedJS m
+  LoadDLLs {}                 -> notSupportedJS m
   LoadArchive {}              -> notSupportedJS m
   UnloadObj {}                -> notSupportedJS m
   AddLibrarySearchPath {}     -> notSupportedJS m
@@ -69,7 +73,7 @@ run m = case m of
   LookupClosure str           -> lookupJSClosure str
 #else
   InitLinker -> initObjLinker RetainCAFs
-  LoadDLL str -> fmap toRemotePtr <$> loadDLL str
+  LoadDLLs strs -> fmap (map toRemotePtr) <$> loadDLLs strs
   LoadArchive str -> loadArchive str
   LoadObj str -> loadObj str
   UnloadObj str -> unloadObj str
@@ -88,6 +92,7 @@ run m = case m of
     fmap toRemotePtr <$> lookupSymbolInDLL (fromRemotePtr dll) str
   FreeHValueRefs rs -> mapM_ freeRemoteRef rs
   AddSptEntry fpr r -> localRef r >>= sptAddEntry fpr
+  AddHpcModule modl ticks hash tickboxes -> hpcAddModule modl ticks hash tickboxes
   EvalStmt opts r -> evalStmt opts r
   ResumeStmt opts r -> resumeStmt opts r
   AbandonStmt r -> abandonStmt r
@@ -125,6 +130,7 @@ run m = case m of
   Shutdown            -> unexpectedMessage m
   RunTH {}            -> unexpectedMessage m
   RunModFinalizers {} -> unexpectedMessage m
+  CustomMessage {}    -> unexpectedMessage m
 
 unexpectedMessage :: Message a -> b
 unexpectedMessage m = error ("GHCi.Run.Run: unexpected message: " ++ show m)
@@ -134,12 +140,12 @@ foreign import javascript "((ptr,off) => globalThis.h$loadJS(h$decodeUtf8z(ptr,o
 
 foreign import javascript "((ptr,off) => globalThis.h$lookupClosure(h$decodeUtf8z(ptr,off)))" lookupJSClosure# :: CString -> State# RealWorld -> (# State# RealWorld, Int# #)
 
-lookupJSClosure' :: String -> IO Int
-lookupJSClosure' str = withCString str $ \cstr -> IO (\s ->
+lookupJSClosure' :: BS.ShortByteString -> IO Int
+lookupJSClosure' str = BS.useAsCString str $ \cstr -> IO (\s ->
   case lookupJSClosure# cstr s of
     (# s', r #) -> (# s', I# r #))
 
-lookupJSClosure :: String -> IO (Maybe HValueRef)
+lookupJSClosure :: BS.ShortByteString -> IO (Maybe HValueRef)
 lookupJSClosure str = lookupJSClosure' str >>= \case
   0 -> pure Nothing
   r -> pure (Just (RemoteRef (RemotePtr (fromIntegral r))))
@@ -358,10 +364,18 @@ withBreakAction opts breakMVar statusMVar mtid act
        if is_exception
        then pure Nothing
        else do
-         info_mod <- peekCString (Ptr info_mod#)
+         info_mod <- BS.packCString (Ptr info_mod#)
          info_mod_uid <- BS.packCString (Ptr info_mod_uid#)
          pure (Just (EvalBreakpoint info_mod info_mod_uid (I# infox#)))
      putMVar statusMVar $ EvalBreak apStack_r breakpoint resume_r ccs
+
+     -- Block until this thread is resumed (by the thread which took the
+     -- `ResumeContext` from the `statusMVar`).
+     --
+     -- The `onBreak` function must have been called from `rts/Interpreter.c`
+     -- when interpreting a `BRK_FUN`. After taking from the MVar, the function
+     -- returns to the continuation on the stack which is where the interpreter
+     -- was stopped.
      takeMVar breakMVar
 
    resetBreakAction stablePtr = do
@@ -425,15 +439,15 @@ mkString0 bs = B.unsafeUseAsCStringLen bs $ \(cstr,len) -> do
   pokeElemOff (ptr :: Ptr CChar) len 0
   return (castRemotePtr (toRemotePtr ptr))
 
-mkCostCentres :: String -> [(String,String)] -> IO [RemotePtr CostCentre]
+mkCostCentres :: RemotePtr () -> [(BS.ShortByteString, BS.ShortByteString)] -> IO [RemotePtr CostCentre]
 #if defined(PROFILING)
 mkCostCentres mod ccs = do
-  c_module <- newCString mod
+  let c_module = fromRemotePtr $ castRemotePtr mod
   mapM (mk_one c_module) ccs
  where
   mk_one c_module (decl_path,srcspan) = do
-    c_name <- newCString decl_path
-    c_srcspan <- newCString srcspan
+    c_name <- newCStringFromSBS decl_path
+    c_srcspan <- newCStringFromSBS srcspan
     toRemotePtr <$> c_mkCostCentre c_name c_module c_srcspan
 
 foreign import ccall unsafe "mkCostCentre"

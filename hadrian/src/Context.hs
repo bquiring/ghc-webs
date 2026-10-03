@@ -3,15 +3,15 @@ module Context (
     Context (..), vanillaContext, stageContext,
 
     -- * Expressions
-    getStage, getPackage, getWay, getBuildPath, getHieBuildPath, getPackageDbLoc, getStagedTarget,
+    getStage, staged, succStaged, getPackage, getWay, getBuildPath, getHieBuildPath, getPackageDbLoc, getStagedTarget,
 
     -- * Paths
     contextDir, buildPath, buildDir, pkgInplaceConfig, pkgSetupConfigFile, pkgSetupConfigDir,
     pkgHaddockFile, pkgRegisteredLibraryFile, pkgRegisteredLibraryFileName,
-    pkgLibraryFile, pkgGhciLibraryFile,
+    pkgLibraryFile,
     pkgConfFile, pkgStampFile, resourcePath, objectPath, contextPath, getContextPath, libPath, distDir,
     distDynDir,
-    haddockStatsFilesDir, ensureConfigured, autogenPath, rtsContext, rtsBuildPath, libffiBuildPath
+    haddockStatsFilesDir, ensureConfigured, autogenPath, rtsContext, rtsBuildPath
     ) where
 
 import Base
@@ -28,6 +28,12 @@ import Hadrian.Haskell.Cabal.Type
 -- | Get the 'Stage' of the current 'Context'.
 getStage :: Expr Context b Stage
 getStage = stage <$> getContext
+
+staged :: (Stage -> Action a) -> Expr Context b a
+staged f = getStage >>= \stage -> expr (f stage)
+
+succStaged :: (Stage -> Action a) -> Expr Context b a
+succStaged f = getStage >>= \stage -> expr (f (succStage stage))
 
 getInplace :: Expr Context b Inplace
 getInplace = iplace <$> getContext
@@ -93,14 +99,6 @@ rtsContext stage = vanillaContext stage rts
 rtsBuildPath :: Stage -> Action FilePath
 rtsBuildPath stage = buildPath (rtsContext stage)
 
--- | Build directory for in-tree 'libffi' library.
-libffiBuildPath :: Stage -> Action FilePath
-libffiBuildPath stage = buildPath $ Context
-    stage
-    libffi
-    (error "libffiBuildPath: way not set.")
-    (error "libffiBuildPath: inplace not set.")
-
 pkgFileName :: Context -> Package -> String -> String -> Action FilePath
 pkgFileName context package prefix suffix = do
     pid  <- pkgUnitId (stage context) package
@@ -128,7 +126,9 @@ pkgSetupConfigFile context = pkgSetupConfigDir context <&> (-/- "setup-config")
 pkgHaddockFile :: Context -> Action FilePath
 pkgHaddockFile Context {..} = do
     root <- buildRoot
-    version <- pkgUnitId stage package
+    -- We don't want to use the hash in the html documentation because it
+    -- makes it harder for non-boot packages to link to boot packages, see #26635
+    version <- pkgSimpleIdentifier package
     return $ root -/- "doc/html/libraries" -/- version -/- pkgName package <.> "haddock"
 
 -- | Path to the registered ghc-pkg library file of a given 'Context', e.g.:
@@ -154,13 +154,6 @@ pkgLibraryFile :: Context -> Action FilePath
 pkgLibraryFile context@Context {..} = do
     extension <- libsuf stage way
     pkgFile context "libHS" extension
-
--- | Path to the GHCi library file of a given 'Context', e.g.:
--- @_build/stage1/libraries/array/build/HSarray-0.5.1.0.o@.
-pkgGhciLibraryFile :: Context -> Action FilePath
-pkgGhciLibraryFile context@Context {..} = do
-    let extension = "" <.> osuf way
-    pkgFile context "HS" extension
 
 -- | Path to the configuration file of a given 'Context'.
 pkgConfFile :: Context -> Action FilePath

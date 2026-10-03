@@ -36,6 +36,8 @@ module GHC.Internal.IO.Handle.Text (
         memcpy, hPutStrLn, hGetContents',
     ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.IO
 import GHC.Internal.IO.Buffer
 import qualified GHC.Internal.IO.BufferedIO as Buffered
@@ -55,8 +57,8 @@ import GHC.Internal.System.IO.Error
 import GHC.Internal.Data.Either (Either(..))
 import GHC.Internal.Data.Maybe
 
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.IORef
-import GHC.Internal.Base
 import GHC.Internal.Real
 import GHC.Internal.Word
 import GHC.Internal.Ptr
@@ -361,19 +363,18 @@ unpack_nl !buf !r !w acc0
 -- -----------------------------------------------------------------------------
 -- hGetContents
 
--- hGetContents on a DuplexHandle only affects the read side: you can
--- carry on writing to it afterwards.
-
 -- | Computation 'hGetContents' @hdl@ returns the list of characters
 -- corresponding to the unread portion of the channel or file managed
 -- by @hdl@, which is put into an intermediate state, /semi-closed/.
--- In this state, @hdl@ is effectively closed,
--- but items are read from @hdl@ on demand and accumulated in a special
--- list returned by 'hGetContents' @hdl@.
+-- In this state, @hdl@ is treated like a closed handle, with the
+-- following exceptions:
 --
--- Any operation that fails because a handle is closed,
--- also fails if a handle is semi-closed.  The only exception is
--- 'GHC.Internal.System.IO.hClose'.  A semi-closed handle becomes closed:
+-- * Characters can be read from @hdl@ by evaluating portions of the
+--   list returned by 'hGetContents' @hdl@.
+-- * If the handle allows for independent reading and writing, as it is
+--   the case for socket handles, writing continues to be possible.
+--
+-- A semi-closed handle becomes closed:
 --
 --  * if 'GHC.Internal.System.IO.hClose' is applied to it;
 --

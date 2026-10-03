@@ -97,8 +97,8 @@ createThread(Capability *cap, W_ size)
 
     // Always start with the compiled code evaluator
     tso->what_next = ThreadRunGHC;
-    tso->block_info.closure = (StgClosure *)END_TSO_QUEUE;
-    tso->why_blocked  = NotBlocked;
+    tso->block_info.prev = END_TSO_QUEUE;
+    tso->why_blocked = NotBlocked;
     tso->blocked_exceptions = END_BLOCKED_EXCEPTIONS_QUEUE;
     tso->bq = (StgBlockingQueue *)END_TSO_QUEUE;
     tso->flags = 0;
@@ -113,6 +113,8 @@ createThread(Capability *cap, W_ size)
     tso->tot_stack_size = stack->stack_size;
 
     ASSIGN_Int64((W_*)&(tso->alloc_limit), 0);
+
+    tso->ctoi_tuple_spill_words = 0;
 
     tso->trec = NO_TREC;
     tso->label = NULL;
@@ -289,13 +291,12 @@ tryWakeupThread (Capability *cap, StgTSO *tso)
     }
 #endif
 
-    switch (ACQUIRE_LOAD(&tso->why_blocked))
+    switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked)))
     {
     case BlockedOnMVar:
     case BlockedOnMVarRead:
     {
         if (tso->_link == END_TSO_QUEUE) {
-            tso->block_info.closure = (StgClosure*)END_TSO_QUEUE;
             goto unblock;
         } else {
             return;
@@ -322,9 +323,6 @@ tryWakeupThread (Capability *cap, StgTSO *tso)
     }
 
     case BlockedOnSTM:
-        tso->block_info.closure = &stg_STM_AWOKEN_closure;
-        goto unblock;
-
     case BlockedOnBlackHole:
     case ThreadMigrating:
         goto unblock;
@@ -337,8 +335,8 @@ tryWakeupThread (Capability *cap, StgTSO *tso)
 unblock:
     // just run the thread now, if the BH is not really available,
     // we'll block again.
-    tso->why_blocked = NotBlocked;
     appendToRunQueue(cap,tso);
+    RELEASE_STORE(&tso->why_blocked, NotBlocked);
 
     // We used to set the context switch flag here, which would
     // trigger a context switch a short time in the future (at the end
@@ -369,9 +367,56 @@ migrateThread (Capability *from, StgTSO *tso, Capability *to)
     traceEventMigrateThread (from, tso, to->no);
     // ThreadMigrating tells the target cap that it needs to be added to
     // the run queue when it receives the MSG_TRY_WAKEUP.
-    tso->why_blocked = ThreadMigrating;
+    tso->block_info.unused = END_TSO_QUEUE;
+    RELEASE_STORE(&tso->why_blocked, ThreadMigrating);
     tso->cap = to;
     tryWakeupThread(from, tso);
+}
+
+/* ----------------------------------------------------------------------------
+   {set,unset}ThreadFlag
+
+   sets or unsets a flag in a given TSO
+   ------------------------------------------------------------------------- */
+
+void setThreadFlag(Capability *from, StgTSO *tso, StgWord32 flag)
+{
+    updThreadFlag(from, tso, flag, true);
+}
+
+void unsetThreadFlag(Capability *from, StgTSO *tso, StgWord32 flag)
+{
+    updThreadFlag(from, tso, flag, false);
+}
+
+void
+updThreadFlag(Capability *from USED_IF_THREADS, StgTSO *tso, StgWord32 flag, StgBool set /* true=set, false=unset */)
+{
+#if defined(THREADED_RTS)
+    // If we're the current owner of the thread we want to modify, do it.
+    // Otherwise, we must forward the message to the actual owner.
+    // When executing the upd message, we check again that we're still the TSO
+    // owner (which may have changed since the message was queued on this cap.)
+    // See Note [TSO owner may change in between Msg being sent and received]
+    Capability *tso_owner = RELAXED_LOAD(&tso->cap);
+    if (from != tso_owner) {
+      MessageUpdTSOFlag *msg;
+      msg = (MessageUpdTSOFlag *)allocate(from,sizeofW(MessageUpdTSOFlag));
+      msg->tso  = tso;
+      msg->flag = flag;
+      msg->set  = set;
+      SET_HDR_RELEASE(msg, &stg_MSG_UPD_TSO_FLAG_info, CCS_SYSTEM);
+      sendMessage(from, tso_owner, (Message*)msg);
+      return;
+    }
+#endif
+
+    if (set) {
+      tso->flags |= flag;
+    }
+    else {
+      tso->flags &= ~flag;
+    }
 }
 
 /* ----------------------------------------------------------------------------
@@ -440,7 +485,7 @@ checkBlockingQueues (Capability *cap, StgTSO *tso)
         // thing the result would be the same in almost all cases. See #20093.
         p = UNTAG_CLOSURE(bq->bh);
         const StgInfoTable *pinfo = ACQUIRE_LOAD(&p->header.info);
-        if (pinfo != &stg_BLACKHOLE_info ||
+        if (!IS_BLACKHOLE_INFO(pinfo) ||
             (RELAXED_LOAD(&((StgInd *)p)->indirectee) != (StgClosure*)bq))
         {
             wakeBlockingQueue(cap,bq);
@@ -464,10 +509,7 @@ updateThunk (Capability *cap, StgTSO *tso, StgClosure *thunk, StgClosure *val)
     const StgInfoTable *i;
 
     i = ACQUIRE_LOAD(&thunk->header.info);
-    if (i != &stg_BLACKHOLE_info &&
-        i != &stg_CAF_BLACKHOLE_info &&
-        i != &__stg_EAGER_BLACKHOLE_info &&
-        i != &stg_WHITEHOLE_info) {
+    if (!IS_BLACKHOLE_OR_WHITEHOLE_INFO(i)) {
         updateWithIndirection(cap, thunk, val);
         return;
     }
@@ -567,7 +609,7 @@ threadStackOverflow (Capability *cap, StgTSO *tso)
 
         debugTrace(DEBUG_gc,
                    "threadStackOverflow of TSO %" FMT_StgThreadID " (%p): stack"
-                   " too large (now %ld; max is %ld)", tso->id, tso,
+                   " too large (now %ld; max is %u)", tso->id, tso,
                    (long)tso->stackobj->stack_size, RtsFlags.GcFlags.maxStkSize);
         IF_DEBUG(gc,
                  /* If we're debugging, just print out the top of the stack */
@@ -625,7 +667,7 @@ threadStackOverflow (Capability *cap, StgTSO *tso)
     }
 
     debugTraceCap(DEBUG_sched, cap,
-                  "allocating new stack chunk of size %d bytes",
+                  "allocating new stack chunk of size %" FMT_Word " bytes",
                   chunk_size * sizeof(W_));
 
     // Charge the current thread for allocating stack.  Stack usage is
@@ -795,8 +837,6 @@ threadStackUnderflow (Capability *cap, StgTSO *tso)
 
 /* ----------------------------------------------------------------------------
    Implementation of tryPutMVar#
-
-   NOTE: this should be kept in sync with stg_tryPutMVarzh in PrimOps.cmm
    ------------------------------------------------------------------------- */
 
 bool performTryPutMVar(Capability *cap, StgMVar *mvar, StgClosure *value)
@@ -850,9 +890,9 @@ loop:
 
     // save why_blocked here, because waking up the thread destroys
     // this information
-    StgWord why_blocked = ACQUIRE_LOAD(&tso->why_blocked);
+    StgThreadWhyBlocked why_blocked = ACQUIRE_LOAD(&tso->why_blocked);
     ASSERT(why_blocked == BlockedOnMVarRead || why_blocked == BlockedOnMVar);
-    ASSERT(tso->block_info.closure == (StgClosure*)mvar);
+    ASSERT(tso->block_info.mvar == mvar);
 
     // actually perform the takeMVar
     StgStack* stack = tso->stackobj;
@@ -894,7 +934,7 @@ StgMutArrPtrs *listThreads(Capability *cap)
     }
 
     // Allocate a suitably-sized array...
-    StgMutArrPtrs *arr = allocateMutArrPtrs(cap, n_threads, cap->r.rCCCS);
+    StgMutArrPtrs *arr = allocateMutArrPtrs(cap, n_threads, NULL, cap->r.rCCCS);
     if (RTS_UNLIKELY(arr == NULL)) goto end;
 
     // Populate it...
@@ -923,29 +963,30 @@ end:
 void
 printThreadBlockage(StgTSO *tso)
 {
-  switch (ACQUIRE_LOAD(&tso->why_blocked)) {
+  switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked))) {
 #if defined(mingw32_HOST_OS)
     case BlockedOnDoProc:
-    debugBelch("is blocked on proc (request: %u)", tso->block_info.async_result->reqID);
+    debugBelch("is blocked on proc (request: %" FMT_Word ")",
+               tso->block_info.async_reqID);
     break;
 #endif
 #if !defined(THREADED_RTS)
   case BlockedOnRead:
-    debugBelch("is blocked on read from fd %d", (int)(tso->block_info.fd));
+    debugBelch("is blocked on waitRead#");
     break;
   case BlockedOnWrite:
-    debugBelch("is blocked on write to fd %d", (int)(tso->block_info.fd));
+    debugBelch("is blocked on waitWrite#");
     break;
   case BlockedOnDelay:
-    debugBelch("is blocked until %ld", (long)(tso->block_info.target));
+    debugBelch("is blocked on delay#");
     break;
 #endif
     break;
   case BlockedOnMVar:
-    debugBelch("is blocked on an MVar @ %p", tso->block_info.closure);
+    debugBelch("is blocked on an MVar @ %p", tso->block_info.mvar);
     break;
   case BlockedOnMVarRead:
-    debugBelch("is blocked on atomic MVar read @ %p", tso->block_info.closure);
+    debugBelch("is blocked on atomic MVar read @ %p", tso->block_info.mvar);
     break;
     break;
   case BlockedOnBlackHole:
@@ -1020,7 +1061,7 @@ printAllThreads(void)
   debugBelch("other threads:\n");
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
     for (t = generations[g].threads; t != END_TSO_QUEUE; t = next) {
-      if (t->why_blocked != NotBlocked) {
+      if (RELAXED_LOAD(&t->why_blocked) != NotBlocked) {
           printThreadStatus(t);
       }
       next = t->global_link;
@@ -1055,3 +1096,38 @@ printThreadQueue(StgTSO *t)
 }
 
 #endif /* DEBUG */
+
+/*
+ * restoreStackInvariants: restore stack invariants
+ *
+ * This should be called after restoring a captured stack from
+ * sp .. sp + words
+ */
+void
+restoreStackInvariants(StgTSO *tso, StgPtr sp, StgWord words)
+{
+    StgPtr end = sp + words;
+    StgPtr frame = sp;
+
+    /*
+       Restore ctoi_tuple_spill_words invariants after adding stack:
+
+         - set the saved value in the last stg_ctoi_t frame to the current
+              tso->ctoi_tuple_spill_words
+         - set tso->ctoi_tuple_spill_words to the value in the first stg_ctoi_t frame
+
+       See Note [GHCi unboxed tuples stack spills] in StgMiscClosures.cmm.
+     */
+     StgPtr first_ctoi_frame = NULL, last_ctoi_frame = NULL;
+     while (frame < end) {
+        if (*(StgWord*)frame == (StgWord)&stg_ctoi_t_info) {
+            if(first_ctoi_frame == NULL) first_ctoi_frame = frame;
+            last_ctoi_frame = frame;
+        }
+        frame += stack_frame_sizeW((StgClosure *)frame);
+    }
+    if(last_ctoi_frame != NULL) {
+        last_ctoi_frame[CTOI_OLD_TUPLE_SPILL_WORDS_OFFSET] = tso->ctoi_tuple_spill_words;
+        tso->ctoi_tuple_spill_words = first_ctoi_frame[CTOI_TUPLE_INFO_OFFSET] >> 24;
+    }
+}

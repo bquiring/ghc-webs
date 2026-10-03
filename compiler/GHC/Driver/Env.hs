@@ -1,7 +1,7 @@
-{-# LANGUAGE LambdaCase #-}
 module GHC.Driver.Env
    ( Hsc(..)
    , HscEnv (..)
+   , HasHscEnv (..)
    , hsc_mod_graph
    , setModuleGraph
    , hscUpdateFlags
@@ -13,6 +13,7 @@ module GHC.Driver.Env
    , hsc_HUE
    , hsc_HUG
    , hsc_all_home_unit_ids
+   , hscUnitIndex
    , hscUpdateLoggerFlags
    , hscUpdateHUG
    , hscInsertHPT
@@ -24,6 +25,8 @@ module GHC.Driver.Env
    , mkInteractiveHscEnv
    , runInteractiveHsc
    , hscEPS
+   , hscEUD
+   , hscUIC
    , hscInterp
    , prepareAnnotations
    , discardIC
@@ -49,12 +52,14 @@ import GHC.Driver.Errors ( printOrThrowDiagnostics )
 import GHC.Driver.Errors.Types ( GhcMessage )
 import GHC.Driver.Config.Logger (initLogFlags)
 import GHC.Driver.Config.Diagnostic (initDiagOpts, initPrintConfig)
-import GHC.Driver.Env.Types ( Hsc(..), HscEnv(..) )
+import GHC.Driver.Env.Types ( Hsc(..), HscEnv(..), HasHscEnv (..) )
 
 import GHC.Runtime.Context
 import GHC.Runtime.Interpreter.Types (Interp)
 
 import GHC.Unit
+import GHC.Unit.External.Database
+import GHC.Unit.External.Index
 import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.ModDetails
@@ -85,10 +90,12 @@ import GHC.Types.Annotations
 import GHC.Types.CompleteMatch
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Builtin.Names
+
+import GHC.Builtin.Modules( gHC_PRIM )
 
 import Data.IORef
 import qualified Data.Set as Set
+import GHC.Types.Name.Reader (ExactRdrName(..))
 
 runHsc :: HscEnv -> Hsc a -> IO a
 runHsc hsc_env hsc = do
@@ -177,16 +184,16 @@ configured via command-line flags (in `GHC.setTopSessionDynFlags`).
 
 -- Note [hsc_type_env_var hack]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- hsc_type_env_var is used to initialize tcg_type_env_var, and
+-- hsc_type_env_var is used to initialize tcg_knot_vars, and
 -- eventually it is the mutable variable that is queried from
 -- if_rec_types to get a TypeEnv.  So, clearly, it's something
 -- related to knot-tying (see Note [Tying the knot]).
 -- hsc_type_env_var is used in two places: initTcRn (where
--- it initializes tcg_type_env_var) and initIfaceCheck
+-- it initializes tcg_knot_vars) and initIfaceCheck
 -- (where it initializes if_rec_types).
 --
 -- But why do we need a way to feed a mutable variable in?  Why
--- can't we just initialize tcg_type_env_var when we start
+-- can't we just initialize tcg_knot_vars when we start
 -- typechecking?  The problem is we need to knot-tie the
 -- EPS, and we may start adding things to the EPS before type
 -- checking starts.
@@ -221,6 +228,15 @@ configured via command-line flags (in `GHC.setTopSessionDynFlags`).
 hscEPS :: HscEnv -> IO ExternalPackageState
 hscEPS hsc_env = readIORef (euc_eps (ue_eps (hsc_unit_env hsc_env)))
 
+hscEUD :: HscEnv -> IO (ExternalUnitDatabases UnitId)
+hscEUD = readExternalUnitDatabases . hscUIC
+
+hscUnitIndex :: HscEnv -> IO UnitIndex
+hscUnitIndex hsc_env = ueUI (hsc_unit_env hsc_env)
+
+hscUIC :: HscEnv -> UnitIndexCache
+hscUIC hsc_env = ue_uic (hsc_unit_env hsc_env)
+
 --------------------------------------------------------------------------------
 -- * Queries on Transitive Closure
 --------------------------------------------------------------------------------
@@ -245,17 +261,17 @@ hugCompleteSigsBelow hsc uid mn = foldr (++) [] <$>
   hugSomeThingsBelowUs (md_complete_matches . hm_details) False hsc uid mn
 
 -- | Find instances visible from the given set of imports
-hugInstancesBelow :: HscEnv -> UnitId -> ModuleNameWithIsBoot -> IO (InstEnv, [(Module, FamInstEnv)])
+hugInstancesBelow :: HscEnv -> UnitId -> ModuleNameWithIsBoot -> IO (InstEnv, [FamInst])
 hugInstancesBelow hsc_env uid mnwib = do
- let mn = gwib_mod mnwib
+ let mn = mkModule uid (gwib_mod mnwib)
  (insts, famInsts) <-
      unzip . concat <$>
        hugSomeThingsBelowUs (\mod_info ->
                                   let details = hm_details mod_info
                                   -- Don't include instances for the current module
-                                  in if moduleName (mi_module (hm_iface mod_info)) == mn
+                                  in if fmap toUnitId (mi_module (hm_iface mod_info)) == mn
                                        then []
-                                       else [(md_insts details, [(mi_module $ hm_iface mod_info, extendFamInstEnvList emptyFamInstEnv $ md_fam_insts details)])])
+                                       else [(md_insts details, md_fam_insts details)])
                           True -- Include -hi-boot
                           hsc_env
                           uid
@@ -270,7 +286,7 @@ hugSomeThingsBelowUs :: (HomeModInfo -> [a]) -> Bool -> HscEnv -> UnitId -> Modu
 -- These things are currently stored in the EPS for home packages. (See #25795 for
 -- progress in removing these kind of checks; and making these functions of
 -- `UnitEnv` rather than `HscEnv`)
--- See Note [Downsweep and the ModuleGraph]
+-- See Note [The ModuleGraph]
 hugSomeThingsBelowUs _ _ hsc_env _ _ | isOneShot (ghcMode (hsc_dflags hsc_env)) = return []
 hugSomeThingsBelowUs extract include_hi_boot hsc_env uid mn
   = let hug = hsc_HUG hsc_env
@@ -429,12 +445,12 @@ discardIC hsc_env
   dflags = ic_dflags old_ic
   old_ic = hsc_IC hsc_env
   empty_ic = emptyInteractiveContext dflags
+  home_unit = hsc_home_unit hsc_env
   keep_external_name ic_name
-    | nameIsFromExternalPackage home_unit old_name = old_name
+    | ExactName old_name <- ic_name old_ic
+    , nameIsFromExternalPackage home_unit old_name = ExactName old_name
+    | ExactOcc old_occ <- ic_name old_ic = ExactOcc old_occ
     | otherwise = ic_name empty_ic
-    where
-    home_unit = hsc_home_unit hsc_env
-    old_name = ic_name old_ic
 
 
 --------------------------------------------------------------------------------

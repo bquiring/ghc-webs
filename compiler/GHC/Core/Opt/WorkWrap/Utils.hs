@@ -16,6 +16,7 @@ module GHC.Core.Opt.WorkWrap.Utils
    , mkAbsentFiller
    , isWorkerSmallEnough, dubiousDataConInstArgTys
    , boringSplit, usefulSplit, workWrapArity
+   , canUnboxType, canUnboxTyCon
    )
 where
 
@@ -29,9 +30,9 @@ import GHC.Core.Subst
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.Coercion
-import GHC.Core.Predicate( isDictTy )
 import GHC.Core.Reduction
 import GHC.Core.FamInstEnv
+import GHC.Core.Predicate( isEqualityClass, isPredTy )
 import GHC.Core.TyCon
 import GHC.Core.TyCon.Set
 import GHC.Core.TyCon.RecWalk
@@ -41,7 +42,6 @@ import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Demand
 import GHC.Types.Cpr
-import GHC.Types.Id.Make ( voidArgId, voidPrimId )
 import GHC.Types.Var.Env
 import GHC.Types.Basic
 import GHC.Types.Unique.Supply
@@ -51,7 +51,8 @@ import GHC.Data.FastString
 import GHC.Data.OrdList
 import GHC.Data.List.SetOps
 
-import GHC.Builtin.Types ( tupleDataCon )
+import GHC.Builtin.WiredIn.Types ( tupleDataCon )
+import GHC.Builtin.WiredIn.Ids ( voidArgId, voidPrimId )
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
@@ -239,10 +240,10 @@ mkWwBodies opts fun_id ww_arity arg_vars res_ty demands res_cpr
                 = (work_args, work_args, work_marks)
 
               call_work work_fn  = mkVarApps (Var work_fn) work_call_args
-              call_rhs fn_rhs = mkAppsBeta fn_rhs fn_args
-                                  -- See Note [Join points and beta-redexes]
+              call_rhs fn_rhs = mkApps fn_rhs fn_args
+                   -- See Note [Join points and beta-redexes] in GHC.Core.Lint
               wrapper_body = mkLams cloned_arg_vars . wrap_fn_cpr . wrap_fn_str . call_work
-                                  -- See Note [Call-by-value for worker args]
+                   -- See Note [Call-by-value for worker args]
               work_seq_str_flds = mkStrictFieldSeqs (zip work_lam_args work_call_str)
               worker_body = mkLams work_lam_args . work_seq_str_flds . work_fn_cpr . call_rhs
               worker_args_dmds= [ idDemandInfo v | v <- work_call_args, isId v]
@@ -277,14 +278,6 @@ mkWwBodies opts fun_id ww_arity arg_vars res_ty demands res_cpr
     n_dmds = length demands
     arity_ok | isJoinId fun_id = ww_arity <= n_dmds
              | otherwise       = ww_arity == n_dmds
-
--- | Version of 'GHC.Core.mkApps' that does beta reduction on-the-fly.
--- PRECONDITION: The arg expressions are not free in any of the lambdas binders.
-mkAppsBeta :: CoreExpr -> [CoreArg] -> CoreExpr
--- The precondition holds for our call site in mkWwBodies, because all the FVs
--- of as are either cloned_arg_vars (and thus fresh) or fresh worker args.
-mkAppsBeta (Lam b body) (a:as) = bindNonRec b a $! mkAppsBeta body as
-mkAppsBeta f            as     = mkApps f as
 
 -- See Note [Limit w/w arity]
 isWorkerSmallEnough :: Int -> Int -> [Var] -> Bool
@@ -523,36 +516,6 @@ Solution is simple: put the void argument /last/:
 
 c.f Note [SpecConstr void argument insertion] in GHC.Core.Opt.SpecConstr
 
-Note [Join points and beta-redexes]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Originally, the worker would invoke the original function by calling it with
-arguments, thus producing a beta-redex for the simplifier to munch away:
-
-  \x y z -> e => (\x y z -> e) wx wy wz
-
-Now that we have special rules about join points, however, this is Not Good if
-the original function is itself a join point, as then it may contain invocations
-of other join points:
-
-  join j1 x = ...
-  join j2 y = if y == 0 then 0 else j1 y
-
-  =>
-
-  join j1 x = ...
-  join $wj2 y# = let wy = I# y# in (\y -> if y == 0 then 0 else jump j1 y) wy
-  join j2 y = case y of I# y# -> jump $wj2 y#
-
-There can't be an intervening lambda between a join point's declaration and its
-occurrences, so $wj2 here is wrong. But of course, this is easy enough to fix:
-
-  ...
-  let join $wj2 y# = let wy = I# y# in let y = wy in if y == 0 then 0 else j1 y
-  ...
-
-Hence we simply do the beta-reduction here. (This would be harder if we had to
-worry about hygiene, but luckily wy is freshly generated.)
-
 Note [Freshen WW arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When we do a worker/wrapper split, we must freshen the arg vars of the original
@@ -611,7 +574,7 @@ see #17478.
 -- 's' will be 'Demand' or 'Cpr'.
 data DataConPatContext s
   = DataConPatContext
-  { dcpc_dc      :: !DataCon
+  { dcpc_dc      :: !DataCon  -- INVARIANT: canUnboxTyCon is true of this DataCon's tycon
   , dcpc_tc_args :: ![Type]
   , dcpc_co      :: !Coercion
   , dcpc_args    :: ![s]
@@ -664,7 +627,7 @@ canUnboxArg fam_envs ty (n :* sd)
 
   -- From here we are strict and not absent
   | Just (tc, tc_args, co) <- normSplitTyConApp_maybe fam_envs ty
-  , Just dc <- tyConSingleAlgDataCon_maybe tc
+  , Just [dc] <- canUnboxTyCon tc  -- tc is never a newtype
   , let arity = dataConRepArity dc
   , Just (Unboxed, dmds) <- viewProd arity sd -- See Note [Boxity analysis]
   , dmds `lengthIs` dataConRepArity dc
@@ -682,7 +645,7 @@ canUnboxResult :: FamInstEnvs -> Type -> Cpr
 canUnboxResult fam_envs ty cpr
   | Just (con_tag, arg_cprs) <- asConCpr cpr
   , Just (tc, tc_args, co) <- normSplitTyConApp_maybe fam_envs ty
-  , Just dcs <- tyConAlgDataCons_maybe tc <|> open_body_ty_warning
+  , Just dcs <- canUnboxTyCon tc <|> open_body_ty_warning
   , dcs `lengthAtLeast` con_tag -- This might not be true if we import the
                                 -- type constructor via a .hs-boot file (#8743)
   , let dc = dcs `getNth` (con_tag - fIRST_TAG)
@@ -702,8 +665,101 @@ canUnboxResult fam_envs ty cpr
     -- See Note [non-algebraic or open body type warning]
     open_body_ty_warning = warnPprTrace True "canUnboxResult: non-algebraic or open body type" (ppr ty) Nothing
 
-{- Note [Which types are unboxed?]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+canUnboxType :: HasDebugCallStack => Type -> Maybe [DataCon]
+canUnboxType arg_ty = case tyConAppTyCon_maybe arg_ty of
+                        Just tc -> canUnboxTyCon tc
+                        Nothing -> Nothing
+
+canUnboxTyCon :: HasDebugCallStack => TyCon -> Maybe [DataCon]
+-- True for
+--   boxed algebraic datatypes
+--   unboxed tuples and sums
+--
+-- False for
+--   class dictionaries, except equality classes and tuples
+--               See Note [Do not unbox class dictionaries]
+--
+-- Precondition: tc is not a newtype
+canUnboxTyCon tc
+  | Just cls <- tyConClass_maybe tc
+  , not (isEqualityClass cls)
+  = Nothing     -- See (DNB2) and (DNB1) in Note [Do not unbox class dictionaries]
+
+  | otherwise
+  = assertPpr (not (isNewTyCon tc)) (ppr tc) $  -- Check precondition
+    tyConDataCons_maybe tc
+
+{- Note [Do not unbox class dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We never unbox class dictionaries in worker/wrapper.
+
+1. INLINABLE functions
+   If we have
+      f :: Ord a => [a] -> Int -> a
+      {-# INLINABLE f #-}
+   and we worker/wrapper f, we'll get a worker with an INLINABLE pragma
+   (see Note [Worker/wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap),
+   which can still be specialised by the type-class specialiser, something like
+      fw :: Ord a => [a] -> Int# -> a
+
+   BUT if f is strict in the Ord dictionary, we might unpack it, to get
+      fw :: (a->a->Bool) -> [a] -> Int# -> a
+   and the type-class specialiser can't specialise that. An example is #6056.
+
+   Historical note: #14955 describes how I got this fix wrong the first time.
+   I got aware of the issue in T5075 by the change in boxity of loop between
+   demand analysis runs.
+
+2. -fspecialise-aggressively.  As #21286 shows, the same phenomenon can occur
+   occur without INLINABLE, when we use -fexpose-all-unfoldings and
+   -fspecialise-aggressively to do vigorous cross-module specialisation.
+
+3. #18421 found that unboxing a dictionary can also make the worker less likely
+   to inline; the inlining heuristics seem to prefer to inline a function
+   applied to a dictionary over a function applied to a bunch of functions.
+
+TL;DR we /never/ unbox class dictionaries. Unboxing the dictionary, and passing
+a raft of higher-order functions isn't a huge win anyway -- you really want to
+specialise the function.
+
+Wrinkle (DNB1): we /do not/ to unbox tuple dictionaries either.  We used to
+  have a special case to unbox tuple dictionaries (#23398), but it ultimately
+  turned out to be a very bad idea (see !19747#note_626297).   In summary:
+
+  - If w/w unboxes tuple dictionaries we get things like
+         case d of CTuple2 d1 d2 -> blah
+    rather than
+         let { d1 = sc_sel1 d; d2 = sc_sel2 d } in blah
+    The latter works much better with the specialiser: when `d` is instantiated
+    to some useful dictionary the `sc_sel1 d` selection can fire.
+
+   - The attempt to deal with unpacking dictionaries with `case` led to
+     significant extra complexity in the type-class specialiser (#26158) that is
+     rendered unnecessary if we only take do superclass selection with superclass
+     selectors, never with `case` expressions.
+
+     Even with that extra complexity, specialisation was /still/ sometimes worse,
+     and sometimes /tremendously/ worse (a factor of 70x); see #19747.
+
+   - Suppose f :: forall a. (% Eq a, Show a %) => blah
+     The specialiser is perfectly capable of specialising a call like
+             f @Int (% dEqInt, dShowInt %)
+     so the tuple doesn't get in the way.
+
+   - It's simpler and more uniform.  There is nothing special about constraint
+     tuples; anyone can write   class (C1 a, C2 a) => D a  where {}
+
+Wrinkle (DNB2): we /do/ want to unbox equality dictionaries,
+  for (~), (~~), and Coercible (#23398).  Their payload is a single unboxed
+  coercion.  We never want to specialise on `(t1 ~ t2)`.  All that would do is
+  to make a copy of the function's RHS with a particular coercion.  Unlike
+  normal class methods, that does not unlock any new optimisation
+  opportunities in the specialised RHS.
+
+Note [Which types are unboxed?]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Worker/wrapper will unbox
 
   1. A strict data type argument, that
@@ -740,7 +796,7 @@ Worker/wrapper will unbox
      contains types of kind `TYPE rr`, but not of kind `CONSTRAINT rr`.
      This is annoying; there is no real reason for this except that we don't
      have TYPE/CONSTAINT polymorphism.  See Note [TYPE and CONSTRAINT]
-     in GHC.Builtin.Types.Prim.
+     in GHC.Builtin.WiredIn.Prim.
 
 The respective tests are in 'canUnboxArg' and
 'canUnboxResult', respectively.
@@ -819,23 +875,26 @@ C) Unlift *any* (non-boot exported) functions arguments if they are strict.
       an impedance matcher function. Leading to massive code bloat.
       Essentially we end up creating a impromptu wrapper function
       wherever we wouldn't inline the wrapper with a W/W approach.
-    ~ There is the option of achieving this without eta-expansion if we instead expand
-      the partial application code to check for demands on the calling convention and
-      for it to evaluate the arguments. The main downsides there would be the complexity
-      of the implementation and that it carries a certain overhead even for functions who
-      don't take advantage of this functionality. I haven't tried this approach because it's
-      not trivial to implement and doing W/W splits seems to work well enough.
+    ~ There is the option of achieving this without eta-expansion if we instead
+      expand the partial application code to check for demands on the calling
+      convention and for it to evaluate the arguments. The main downsides there
+      would be the complexity of the implementation and that it carries a
+      certain overhead even for functions who don't take advantage of this
+      functionality. I haven't tried this approach because it's not trivial to
+      implement and doing W/W splits seems to work well enough.
 
-Currently we use the first approach A) by default, with a flag that allows users to fall back to the
-more aggressive approach B).
+Currently we use the first approach A) by default, with a flag that allows users
+to fall back to the more aggressive approach B).
 
-I also tried the third approach C) using eta-expansion at call sites to avoid modifying the PAP-handling
-code which wasn't fruitful. See https://gitlab.haskell.org/ghc/ghc/-/merge_requests/5614#note_389903.
-We could still try to do C) in the future by having PAP calls which will evaluate the required arguments
-before calling the partially applied function. But this would be neither a small nor simple change so we
-stick with A) and a flag for B) for now.
+I also tried the third approach C) using eta-expansion at call sites to avoid
+modifying the PAP-handling code which wasn't fruitful. See
+https://gitlab.haskell.org/ghc/ghc/-/merge_requests/5614#note_389903.  We could
+still try to do C) in the future by having PAP calls which will evaluate the
+required arguments before calling the partially applied function. But this would
+be neither a small nor simple change so we stick with A) and a flag for B) for
+now.
 
-See also Note [EPT enforcement] and Note [CBV Function Ids]
+See also Note [EPT enforcement] and Note [CBV Function Ids: overview]
 
 Note [Worker/wrapper for strict arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -859,7 +918,7 @@ an "eval" (see `GHC.StgToCmm.Expr.cgCase`).  A call (f (a:as)) will
 have the wrapper inlined, and will drop the `case x`, so no eval
 happens at all.
 
-The worker `$wf` is a CBV function (see `Note [CBV Function Ids]`
+The worker `$wf` is a CBV function (see `Note [CBV Function Ids: overview]`
 in GHC.Types.Id.Info) and the code generator guarantees that every
 call to `$wf` has a properly tagged argument (see `GHC.Stg.EnforceEpt.Rewrite`).
 
@@ -936,7 +995,7 @@ mkWWstr_one opts arg str_mark =
     _ | isTyVar arg -> do_nothing
 
     DropAbsent
-      | Just absent_filler <- mkAbsentFiller opts arg str_mark
+      | Just absent_filler <- mkAbsentFiller (wo_module opts) arg str_mark
          -- Absent case.  Drop the argument from the worker.
          -- We can't always handle absence for arbitrary
          -- unlifted types, so we need to choose just the cases we can
@@ -949,7 +1008,7 @@ mkWWstr_one opts arg str_mark =
 
     DontUnbox
       | isStrictDmd arg_dmd || isMarkedStrict str_mark
-      , wwUseForUnlifting opts  -- See Note [CBV Function Ids]
+      , wwUseForUnlifting opts  -- See Note [WW for calling convention]
       , not (isFunTy arg_ty)
       , not (isUnliftedType arg_ty) -- Already unlifted!
         -- NB: function arguments have a fixed RuntimeRep,
@@ -1007,14 +1066,20 @@ unbox_one_arg opts arg_var
 --
 -- If @mkAbsentFiller _ id == Just e@, then @e@ is an absent filler with the
 -- same type as @id@. Otherwise, no suitable filler could be found.
-mkAbsentFiller :: WwOpts -> Id -> StrictnessMark -> Maybe CoreExpr
-mkAbsentFiller opts arg str
+mkAbsentFiller :: Module -> Id -> StrictnessMark -> Maybe CoreExpr
+mkAbsentFiller mod arg str
+  -- We never make a filler for a constraint type: it might be speculatively
+  -- evaluated or have a field projected out of it.
+  -- See (AF4) in Note [Absent fillers], and
+  -- Note [Don't make fillers for constraint types].
+  | isPredTy arg_ty
+  = Nothing
+
   -- The lifted case: bind 'absentError'. See (AF1) in Note [Absent fillers]
   -- We want to use this case if possible, because we get a nice runtime panic message
   -- if we are wrong (like we were in #11126).  Otherwise we fall through to the
   -- less-desirable mkLitRubbish case.
   | mightBeLiftedType arg_ty
-  , not (isDictTy arg_ty)                 -- See (AF4) in Note [Absent fillers]
   , not (isStrictDmd (idDemandInfo arg))  -- See (AF2)
   , not (isMarkedStrict str)              --    in Note [Absent fillers]
   = Just (mkAbsentErrorApp arg_ty msg)
@@ -1041,7 +1106,7 @@ mkAbsentFiller opts arg str
               -- will have different lengths and hence different costs for
               -- the inliner leading to different inlining.
               -- See also Note [Unique Determinism] in GHC.Types.Unique
-    file_msg = text "In module" <+> quotes (ppr $ wo_module opts)
+    file_msg = text "In module" <+> quotes (ppr mod)
 
 {- Note [Worker/wrapper for Strictness and Absence]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1216,12 +1281,13 @@ Needless to say, there are some wrinkles:
      But that also means we emit a rubbish lit for other args that have
      cardinality 'C_10' (say, the arg to a bottoming function) where we could've
      used an error-thunk.
-     NB from Andreas: But I think using an error thunk there would be dodgy no matter what
-     for example if we decide to pass the argument to the bottoming function cbv.
-     As we might do if the function in question is a worker.
-     See Note [CBV Function Ids] in GHC.Types.Id.Info. So I just left the strictness check
-     in place on top of threading through the marks from the constructor. It's a *really* cheap
-     and easy check to make anyway.
+
+     NB from Andreas: But I think using an error thunk there would be dodgy no
+     matter what for example if we decide to pass the argument to the bottoming
+     function cbv.  As we might do if the function in question is a worker.  See
+     Note [CBV Function Ids: overview] in GHC.Types.Id.Info. So I just left the
+     strictness check in place on top of threading through the marks from the
+     constructor. It's a *really* cheap and easy check to make anyway.
 
 (AF3) We can only emit a LitRubbish if the arg's type `arg_ty` is mono-rep, e.g.
      of the form `TYPE rep` where `rep` is not (and doesn't contain) a variable.
@@ -1234,27 +1300,8 @@ Needless to say, there are some wrinkles:
      have to be representation monomorphic. But in the future, we might allow
      levity polymorphism, e.g. a polymorphic levity variable in 'BoxedRep'.
 
-(AF4) Consider (#24934)
-         f :: (a~b) => blah {-# INLINE f #-}
-         f d x = case eq_sel d of co -> body
-     In #24934 it turned out that `co` was unused; and we discarded the
-     entire case-scrutinisation via the `exprOkToDiscard` test in
-     `GHC.Core.Opt.Simplify.Iteration.rebuildCase`.  So now `d` is absent.
-     But in the /unfolding/ for some reason we did not discard the `case`;
-     so when we inline `f` we end up evaluating that `d` argument.  So we had
-     better not replace it with an error thunk!
-
-     The root of it is this: `exprOkToDiscard` assumes that a dictionary is
-     non-bottom (Note [exprOkForSpeculation and type classes]); but then we replace
-     the (a~b) dictionary with an error thunk, breaking the invariant that every
-     dictionary is non-bottom.  (If -XDictsStrict is on, the invariant is even
-     more important.)
-
-     Simple solution: never use an error thunk for a dictionary; instead fall
-     through to mkRubbishLit.  (The only downside is that we lose the compiler
-     debugging advantages of (AF1).)
-
-     This is quite delicate.
+(AF4) We never make an absent filler for a constraint type.
+      See Note [Don't make fillers for constraint types].
 
 While (AF1) and (AF2) are simply an optimisation in terms of compiler debugging
 experience, (AF3) should be irrelevant in most programs, if not all.
@@ -1275,6 +1322,65 @@ fragile
        ...f (MkT a (absentError Int# "blah"))...
    because `MkT` is strict in its Int# argument, so we get an absentError
    exception when we shouldn't.  Very annoying!
+
+Note [Don't make fillers for constraint types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We never make absent fillers for constraint types (see `isPredTy`).
+Here's why.
+
+GHC relies on a dictionary value never being bottom (see
+Note [NON-BOTTOM-DICTS invariant] in GHC.Core).  GHC uses "speculation" to
+evaluate guaranteed-non-bottom values: see
+  Note [Speculative evaluation] in GHC.CoreToStg.Prep.
+  Note [exprOkForSpeculation and type classes] in GHC.Core.Utils
+
+This speculative evaluation is fundamentally incompatible with replacing a
+dictionary with an absent filler.  Attempts to to do so gave rise to a
+succession of bugs including:
+
+  * #24934: we evaluated an absent dictionary
+  * #25924: we selected a superclass from an absent dictionary
+  * #27627: we still got it wrong for unary classes
+  * Test T27627f: type families complicate the picture
+
+It's surprisingly subtle.
+
+* Consider (#27627)
+    class Eq a => UC a where {}
+
+    let u :: UC Int           -- UC Int is a "non-terminating type"
+        u = error "Absent"
+    let e :: Eq Int           -- Eq Int is a "terminating type"
+        e = $p1UC u
+
+  We clearly don't want to make an absent filler for `e`, because we'll speculatively
+  evaluate it.  But if we speculatively evalutate `e` that will force `u`, so we
+  must not make an absent filler for `u` either!!
+
+* Type families complicate things too. Consider
+     type family F a :: Constraint
+     type instance F W = TC W
+
+     a :: F W => Int -> Int      -- (F W) argument is absent
+
+  Here `(F W)` doesn't look like a /dictionary/ type, becuase it's a type-family
+  application; see test `T27627f`.
+
+TL;DR: we play safe: we never make an absent filler for any /constraint-kinded/ type,
+using `isPredTy` to decide: `mkAbsentFiller` returns `Nothing` for any constraint
+type, so worker/wrapper keeps the real argument.
+
+Prior failed approaches
+
+We used to paper over this. !13233 replaced the error thunk for an absent
+dictionary with a rubbish literal, so that it could at least be evaluated
+without complaint. But #25924 showed that this is not enough, because we do not
+only evaluate the absent dictionary, we also select a superclass from it.
+
+We could instead teach speculation to leave absent bindings alone, and we do
+that too (see Note [Speculative evaluation] in GHC.CoreToStg.Prep). But that is
+not a guarantee. After optimisation a binding that holds an absent filler may no
+longer be marked absent, so we cannot rely on the demand to protect us.
 
 Note [Unboxing through unboxed tuples]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1352,7 +1458,8 @@ findTypeShape fam_envs ty
        | Just (HetReduction (Reduction _ rhs) _) <- topReduceTyFamApp_maybe fam_envs tc tc_args
        = go rec_tc rhs
 
-       | Just con <- tyConSingleAlgDataCon_maybe tc
+       | not (isNewTyCon tc)
+       , Just con <- tyConSingleDataCon_maybe tc
        , Just rec_tc <- if isTupleTyCon tc
                         then Just rec_tc
                         else checkRecTc rec_tc tc

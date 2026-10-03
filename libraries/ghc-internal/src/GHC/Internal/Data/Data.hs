@@ -11,6 +11,13 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE TypeOperators #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+{-# OPTIONS_GHC -fexclude-known-key-define=IntRep  #-}
+{-# OPTIONS_GHC -fexclude-known-key-define=FloatRep  #-}
+    -- Defines Data
+    -- Careful!  Don't confuse this IntRep, FloatRep with the ones from RuntimeRep,
+    --           which are the /real/ known-key entity.
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Data.Data
@@ -61,6 +68,7 @@ module GHC.Internal.Data.Data (
         mkIntType,
         mkFloatType,
         mkCharType,
+        mkPrimCon,
         mkNoRepType,
         -- ** Observers
         dataTypeName,
@@ -94,7 +102,6 @@ module GHC.Internal.Data.Data (
         constrIndex,
         -- ** From strings to constructors and vice versa: all data types
         showConstr,
-        readConstr,
 
         -- * Convenience functions: take type constructors apart
         tyconUQname,
@@ -110,23 +117,20 @@ module GHC.Internal.Data.Data (
 
 ------------------------------------------------------------------------------
 
+import GHC.Internal.Base hiding( RuntimeRep(..), Any )
 import GHC.Internal.Data.Functor.Const
 import GHC.Internal.Data.Either
-import GHC.Internal.Data.Eq
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Data.Monoid
-import GHC.Internal.Data.NonEmpty ( NonEmpty(..) )
 import GHC.Internal.Data.Ord
 import GHC.Internal.Data.List (findIndex)
 import GHC.Internal.Data.Typeable
 import GHC.Internal.Data.Version( Version(..) )
-import GHC.Internal.Base hiding (Any, IntRep, FloatRep, NonEmpty(..))
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.List
 import GHC.Internal.Num
-import GHC.Internal.Read
 import GHC.Internal.Show
 import GHC.Internal.Tuple (Solo (..))
-import GHC.Internal.Text.Read( reads )
 
 -- Imports for the instances
 import GHC.Internal.Data.Functor.Identity -- So we can give Data instance for Identity
@@ -143,6 +147,12 @@ import GHC.Internal.Arr               -- So we can give Data instance for Array
 import qualified GHC.Internal.Generics as Generics (Fixity(..))
 import GHC.Internal.Generics hiding (Fixity(..))
                              -- So we can give Data instance for U1, V1, ...
+import qualified GHC.Internal.TH.Syntax as TH
+import GHC.Internal.Functor.ZipList (ZipList(..))
+import GHC.Internal.Exts (SpecConstrAnnotation(..))
+
+import GHC.Internal.Data.Typeable.Internal as Rebindable
+import qualified GHC.Internal.Stack.Types  as Rebindable
 
 ------------------------------------------------------------------------------
 --
@@ -678,32 +688,6 @@ constrFixity = confixity
 showConstr :: Constr -> String
 showConstr = constring
 
-
--- | Lookup a constructor via a string
-readConstr :: DataType -> String -> Maybe Constr
-readConstr dt str =
-      case dataTypeRep dt of
-        AlgRep cons -> idx cons
-        IntRep      -> mkReadCon (\i -> (mkPrimCon dt str (IntConstr i)))
-        FloatRep    -> mkReadCon ffloat
-        CharRep     -> mkReadCon (\c -> (mkPrimCon dt str (CharConstr c)))
-        NoRep       -> Nothing
-  where
-
-    -- Read a value and build a constructor
-    mkReadCon :: Read t => (t -> Constr) -> Maybe Constr
-    mkReadCon f = case (reads str) of
-                    [(t,"")] -> Just (f t)
-                    _ -> Nothing
-
-    -- Traverse list of algebraic datatype constructors
-    idx :: [Constr] -> Maybe Constr
-    idx cons = case filter ((==) str . showConstr) cons of
-                [] -> Nothing
-                hd : _ -> Just hd
-
-    ffloat :: Double -> Constr
-    ffloat =  mkPrimCon dt str . FloatConstr . toRational
 
 ------------------------------------------------------------------------------
 --
@@ -1353,3 +1337,69 @@ deriving instance Data DecidedStrictness
 
 -- | @since base-4.12.0.0
 deriving instance Data a => Data (Down a)
+
+----------------------------------------------------------------------------
+-- Data instances for GHC.Internal.TH.Syntax
+
+deriving instance Data TH.AnnLookup
+deriving instance Data TH.AnnTarget
+deriving instance Data TH.Bang
+deriving instance Data TH.BndrVis
+deriving instance Data TH.Body
+deriving instance Data TH.Bytes
+deriving instance Data TH.Callconv
+deriving instance Data TH.Clause
+deriving instance Data TH.Con
+deriving instance Data TH.Dec
+deriving instance Data TH.DecidedStrictness
+deriving instance Data TH.DerivClause
+deriving instance Data TH.DerivStrategy
+deriving instance Data TH.DocLoc
+deriving instance Data TH.Exp
+deriving instance Data TH.FamilyResultSig
+deriving instance Data TH.Fixity
+deriving instance Data TH.FixityDirection
+deriving instance Data TH.Foreign
+deriving instance Data TH.FunDep
+deriving instance Data TH.Guard
+deriving instance Data TH.Info
+deriving instance Data TH.InjectivityAnn
+deriving instance Data TH.Inline
+deriving instance Data TH.Lit
+deriving instance Data TH.Loc
+deriving instance Data TH.Match
+deriving instance Data TH.ModName
+deriving instance Data TH.Module
+deriving instance Data TH.ModuleInfo
+deriving instance Data TH.Name
+deriving instance Data TH.NameFlavour
+deriving instance Data TH.NameSpace
+deriving instance Data TH.NamespaceSpecifier
+deriving instance Data TH.OccName
+deriving instance Data TH.Overlap
+deriving instance Data TH.Pat
+deriving instance Data TH.PatSynArgs
+deriving instance Data TH.PatSynDir
+deriving instance Data TH.Phases
+deriving instance Data TH.PkgName
+deriving instance Data TH.Pragma
+deriving instance Data TH.Range
+deriving instance Data TH.Role
+deriving instance Data TH.RuleBndr
+deriving instance Data TH.RuleMatch
+deriving instance Data TH.Safety
+deriving instance Data TH.SourceStrictness
+deriving instance Data TH.SourceUnpackedness
+deriving instance Data TH.Specificity
+deriving instance Data TH.Stmt
+deriving instance Data TH.TyLit
+deriving instance Data TH.TySynEqn
+deriving instance Data TH.Type
+deriving instance Data TH.TypeFamilyHead
+deriving instance Data flag => Data (TH.TyVarBndr flag)
+
+-- | @since base-4.14.0.0
+deriving instance Data a => Data (ZipList a)
+
+-- | @since base-4.3.0.0
+deriving instance Data SpecConstrAnnotation

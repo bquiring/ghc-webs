@@ -6,20 +6,15 @@ module Rules.Register (
 
 import Base
 import Context
-import Expression ( getContextData )
-import Flavour
 import Oracles.Setting
 import Hadrian.BuildPath
 import Hadrian.Expression
 import Hadrian.Haskell.Cabal
-import Oracles.Flag (platformSupportsGhciObjects)
 import Packages
-import Rules.Rts
 import Settings
 import Target
 import Utilities
 
-import Hadrian.Haskell.Cabal.Type
 import qualified Text.Parsec      as Parsec
 import qualified Data.Set         as Set
 import qualified Data.Char        as Char
@@ -52,14 +47,6 @@ configurePackageRules = do
           isGmp <- (== "gmp") <$> interpretInContext ctx getBignumBackend
           when isGmp $
             need [buildP -/- "include/ghc-gmp.h"]
-        when (pkg == text) $ do
-          simdutf <- textWithSIMDUTF <$> flavour
-          when simdutf $ do
-            -- This is required, otherwise you get Error: hadrian:
-            -- Encountered missing or private dependencies:
-            -- system-cxx-std-lib ==1.0
-            cxxStdLib <- systemCxxStdLibConfPath $ PackageDbLoc stage Inplace
-            need [cxxStdLib]
         Cabal.configurePackage ctx
 
     root -/- "**/autogen/cabal_macros.h" %> \out -> do
@@ -91,13 +78,8 @@ parseToBuildSubdirectory root = do
 -- * Registering
 
 registerPackages :: [Context] -> Action ()
-registerPackages ctxs = do
+registerPackages ctxs =
     need =<< mapM pkgRegisteredLibraryFile ctxs
-
-    -- Dynamic RTS library files need symlinks (Rules.Rts.rtsRules).
-    forM_ ctxs $ \ ctx -> when (package ctx == rts) $ do
-        ways <- interpretInContext ctx (getLibraryWays <> getRtsWays)
-        needRtsSymLinks (stage ctx) ways
 
 -- | Register a package and initialise the corresponding package database if
 -- need be. Note that we only register packages in 'Stage0' and 'Stage1'.
@@ -112,7 +94,13 @@ registerPackageRules rs stage iplace = do
         -- leads to errors in GHC).
         buildWithResources rs $
             target (Context stage compiler vanilla iplace) (GhcPkg Recache stage) [] []
-        writeFileLines stamp []
+        writeFileLinesAtomic stamp []
+
+    -- Special rule for registering system-cxx-std-lib
+    root -/- relativePackageDbPath (PackageDbLoc stage iplace) -/- systemCxxStdLibConf %> \file -> do
+        copyFile ("mk" -/- "system-cxx-std-lib-1.0.conf") file
+        buildWithResources rs $
+            target (Context stage compiler vanilla iplace) (GhcPkg Recache stage) [] []
 
     -- Register a package.
     root -/- relativePackageDbPath (PackageDbLoc stage iplace) -/- "*.conf" %> \conf -> do
@@ -121,7 +109,18 @@ registerPackageRules rs stage iplace = do
         pkgName <- getPackageNameFromConfFile conf
         let pkg = unsafeFindPackageByName pkgName
 
-        when (pkg == compiler) $ need =<< ghcLibDeps stage iplace
+        when (pkg == compiler) $ do
+            baseDeps <- ghcLibDeps stage iplace
+            jsTarget <- isJsTarget stage
+            wasmTarget <- isWasmTarget stage
+            libPath <- stageLibPath stage
+            let jsDeps
+                  | jsTarget  = ["ghc-interp.js"]
+                  | otherwise = []
+                wasmDeps
+                  | wasmTarget = ["dyld.mjs", "post-link.mjs", "prelude.mjs"]
+                  | otherwise  = []
+            need (baseDeps ++ map (libPath -/-) (jsDeps ++ wasmDeps))
 
         -- Only used in guard when Stage0 {} but can be GlobalLibs or InTreeLibs
         isBoot <- (pkg `notElem`) <$> stagePackages stage
@@ -139,7 +138,7 @@ buildConfFinal :: [(Resource, Int)] -> Context -> FilePath -> Action ()
 buildConfFinal rs context@Context {..} _conf = do
     depPkgIds <- cabalDependencies context
     ensureConfigured context
-    ways <- interpretInContext context (getLibraryWays <> if package == rts then getRtsWays else mempty)
+    ways <- interpretInContext context (getLibraryWays <> if package `elem` [rts, libffi] then getRtsWays else mempty)
     stamps <- mapM pkgStampFile [ context { way = w } | w <- Set.toList ways ]
     confs <- mapM (\pkgId -> packageDbPath (PackageDbLoc stage Final) <&> (-/- pkgId <.> "conf")) depPkgIds
     -- Important to need these together to avoid introducing a linearisation. This is not the most critical place
@@ -153,7 +152,7 @@ buildConfFinal rs context@Context {..} _conf = do
 
     -- Special package cases (these should ideally be rolled into Cabal).
     when (package == rts) $ do
-        jsTarget <- isJsTarget
+        jsTarget <- isJsTarget (succStage stage)
 
         -- If Cabal knew about "generated-headers", we could read them from the
         -- 'configuredCabal' information, and just "need" them here.
@@ -287,28 +286,10 @@ parseCabalName s = bimap show id (Cabal.runParsecParser parser "<parseCabalName>
       where
         component = CabalCharParsing.munch1 (\c ->  Char.isAlphaNum c || c == '.')
 
-
-
--- | Return extra library targets.
-extraTargets :: Context -> Action [FilePath]
-extraTargets context
-    | package context == rts  = needRtsLibffiTargets (Context.stage context)
-    | otherwise               = return []
-
 -- | Given a library 'Package' this action computes all of its targets. Needing
 -- all the targets should build the library such that it is ready to be
 -- registered into the package database.
--- See 'Rules.packageTargets' for the explanation of the @includeGhciLib@
--- parameter.
-libraryTargets :: Bool -> Context -> Action [FilePath]
-libraryTargets includeGhciLib context@Context {..} = do
+libraryTargets :: Context -> Action [FilePath]
+libraryTargets context = do
     libFile  <- pkgLibraryFile     context
-    ghciLib  <- pkgGhciLibraryFile context
-    ghciObjsSupported <- platformSupportsGhciObjects
-    ghci     <- if ghciObjsSupported && includeGhciLib && not (wayUnit Dynamic way)
-                then interpretInContext context $ getContextData buildGhciLib
-                else return False
-    extra    <- extraTargets context
-    return $ [ libFile ]
-          ++ [ ghciLib | ghci ]
-          ++ extra
+    return [ libFile ]

@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Safe #-}
 
 -- |
@@ -57,11 +58,15 @@ module Control.Monad
      liftM4,
      liftM5,
      ap,
+     thenM,
      -- **  Strict monadic functions
      (<$!>)
      ) where
 
 import GHC.Internal.Control.Monad
+#if __GLASGOW_HASKELL__ < 1000
+import Data.Function (const)
+#endif
 
 {- $naming
 
@@ -87,3 +92,18 @@ The functions in this module use the following naming conventions:
 > mfilter :: MonadPlus m => (a -> Bool) -> m a -> m a
 
 -}
+
+#if __GLASGOW_HASKELL__ < 1000
+
+-- | Sequence two monadic actions, discarding the result of the first one.
+--
+-- Defined as `thenM ma mb = ma >>= const mb`.
+--
+-- This can be used to define `(*>) = thenM`.
+--
+-- @since 4.23.0.0
+thenM :: (Monad m) => m a -> m b -> m b
+thenM ma mb = ma >>= const mb
+{-# INLINEABLE thenM #-}
+
+#endif

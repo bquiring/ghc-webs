@@ -25,14 +25,14 @@
 #  define RTS_THUNK_INFO(i) extern const W_(i)[]
 #  define RTS_INFO(i)       extern const W_(i)[]
 #  define RTS_CLOSURE(i)    extern W_(i)[]
-#  define RTS_FUN_DECL(f)   extern DLL_IMPORT_RTS StgFunPtr f(void)
+#  define RTS_FUN_DECL(f)   extern StgFunPtr f(void)
 #else
-#  define RTS_RET_INFO(i)   extern DLL_IMPORT_RTS const StgRetInfoTable i
-#  define RTS_FUN_INFO(i)   extern DLL_IMPORT_RTS const StgFunInfoTable i
-#  define RTS_THUNK_INFO(i) extern DLL_IMPORT_RTS const StgThunkInfoTable i
-#  define RTS_INFO(i)       extern DLL_IMPORT_RTS const StgInfoTable i
-#  define RTS_CLOSURE(i)    extern DLL_IMPORT_RTS StgClosure i
-#  define RTS_FUN_DECL(f)   extern DLL_IMPORT_RTS StgFunPtr f(void)
+#  define RTS_RET_INFO(i)   extern const StgRetInfoTable i
+#  define RTS_FUN_INFO(i)   extern const StgFunInfoTable i
+#  define RTS_THUNK_INFO(i) extern const StgThunkInfoTable i
+#  define RTS_INFO(i)       extern const StgInfoTable i
+#  define RTS_CLOSURE(i)    extern StgClosure i
+#  define RTS_FUN_DECL(f)   extern StgFunPtr f(void)
 #endif
 
 #if defined(TABLES_NEXT_TO_CODE)
@@ -65,6 +65,7 @@ RTS_RET(stg_stack_underflow_frame_d);
 RTS_RET(stg_stack_underflow_frame_v16);
 RTS_RET(stg_stack_underflow_frame_v32);
 RTS_RET(stg_stack_underflow_frame_v64);
+RTS_RET(stg_ann_frame);
 RTS_RET(stg_keepAlive_frame);
 RTS_RET(stg_restore_cccs_d);
 RTS_RET(stg_restore_cccs_v16);
@@ -95,7 +96,7 @@ RTS_RET(stg_ctoi_D1);
 RTS_RET(stg_ctoi_L1);
 RTS_RET(stg_ctoi_V);
 
-RTS_FUN_DECL(stg_ctoi_t);
+RTS_RET(stg_ctoi_t);
 RTS_RET(stg_ctoi_t0);
 RTS_RET(stg_ctoi_t1);
 RTS_RET(stg_ctoi_t2);
@@ -105,66 +106,6 @@ RTS_RET(stg_ctoi_t5);
 RTS_RET(stg_ctoi_t6);
 RTS_RET(stg_ctoi_t7);
 RTS_RET(stg_ctoi_t8);
-RTS_RET(stg_ctoi_t9);
-
-RTS_RET(stg_ctoi_t10);
-RTS_RET(stg_ctoi_t11);
-RTS_RET(stg_ctoi_t12);
-RTS_RET(stg_ctoi_t13);
-RTS_RET(stg_ctoi_t14);
-RTS_RET(stg_ctoi_t15);
-RTS_RET(stg_ctoi_t16);
-RTS_RET(stg_ctoi_t17);
-RTS_RET(stg_ctoi_t18);
-RTS_RET(stg_ctoi_t19);
-
-RTS_RET(stg_ctoi_t20);
-RTS_RET(stg_ctoi_t21);
-RTS_RET(stg_ctoi_t22);
-RTS_RET(stg_ctoi_t23);
-RTS_RET(stg_ctoi_t24);
-RTS_RET(stg_ctoi_t25);
-RTS_RET(stg_ctoi_t26);
-RTS_RET(stg_ctoi_t27);
-RTS_RET(stg_ctoi_t28);
-RTS_RET(stg_ctoi_t29);
-
-RTS_RET(stg_ctoi_t30);
-RTS_RET(stg_ctoi_t31);
-RTS_RET(stg_ctoi_t32);
-RTS_RET(stg_ctoi_t33);
-RTS_RET(stg_ctoi_t34);
-RTS_RET(stg_ctoi_t35);
-RTS_RET(stg_ctoi_t36);
-RTS_RET(stg_ctoi_t37);
-RTS_RET(stg_ctoi_t38);
-RTS_RET(stg_ctoi_t39);
-
-RTS_RET(stg_ctoi_t40);
-RTS_RET(stg_ctoi_t41);
-RTS_RET(stg_ctoi_t42);
-RTS_RET(stg_ctoi_t43);
-RTS_RET(stg_ctoi_t44);
-RTS_RET(stg_ctoi_t45);
-RTS_RET(stg_ctoi_t46);
-RTS_RET(stg_ctoi_t47);
-RTS_RET(stg_ctoi_t48);
-RTS_RET(stg_ctoi_t49);
-
-RTS_RET(stg_ctoi_t50);
-RTS_RET(stg_ctoi_t51);
-RTS_RET(stg_ctoi_t52);
-RTS_RET(stg_ctoi_t53);
-RTS_RET(stg_ctoi_t54);
-RTS_RET(stg_ctoi_t55);
-RTS_RET(stg_ctoi_t56);
-RTS_RET(stg_ctoi_t57);
-RTS_RET(stg_ctoi_t58);
-RTS_RET(stg_ctoi_t59);
-
-RTS_RET(stg_ctoi_t60);
-RTS_RET(stg_ctoi_t61);
-RTS_RET(stg_ctoi_t62);
 
 RTS_RET(stg_primcall);
 RTS_RET(stg_apply_interp);
@@ -206,11 +147,11 @@ RTS_ENTRY(stg_MUT_VAR_CLEAN);
 RTS_ENTRY(stg_MUT_VAR_DIRTY);
 RTS_ENTRY(stg_END_TSO_QUEUE);
 RTS_ENTRY(stg_GCD_CAF);
-RTS_ENTRY(stg_STM_AWOKEN);
 RTS_ENTRY(stg_MSG_TRY_WAKEUP);
 RTS_ENTRY(stg_MSG_THROWTO);
 RTS_ENTRY(stg_MSG_BLACKHOLE);
 RTS_ENTRY(stg_MSG_CLONE_STACK);
+RTS_ENTRY(stg_MSG_UPD_TSO_FLAG);
 RTS_ENTRY(stg_MSG_NULL);
 RTS_ENTRY(stg_MVAR_TSO_QUEUE);
 RTS_ENTRY(stg_catch);
@@ -233,6 +174,11 @@ RTS_ENTRY(stg_END_STM_CHUNK_LIST);
 RTS_ENTRY(stg_NO_TREC);
 RTS_ENTRY(stg_COMPACT_NFDATA_CLEAN);
 RTS_ENTRY(stg_COMPACT_NFDATA_DIRTY);
+RTS_ENTRY(stg_CLOSURE_TABLE_NULL);
+RTS_ENTRY(stg_TIMEOUT_QUEUE);
+RTS_ENTRY(stg_TIMEOUT_QUEUE_EMPTY);
+RTS_ENTRY(stg_ASYNCIOOP);
+RTS_ENTRY(stg_ASYNCIO_LIVE0);
 RTS_ENTRY(stg_SRT_1);
 RTS_ENTRY(stg_SRT_2);
 RTS_ENTRY(stg_SRT_3);
@@ -253,23 +199,27 @@ RTS_ENTRY(stg_SRT_16);
 /* closures */
 
 RTS_CLOSURE(stg_END_TSO_QUEUE_closure);
-RTS_CLOSURE(stg_STM_AWOKEN_closure);
 RTS_CLOSURE(stg_NO_FINALIZER_closure);
+RTS_CLOSURE(stg_DEAD_SLOT_closure);
 RTS_CLOSURE(stg_dummy_ret_closure);
 RTS_CLOSURE(stg_forceIO_closure);
+RTS_CLOSURE(stg_CLOSURE_TABLE_NULL_closure);
+RTS_CLOSURE(stg_TIMEOUT_QUEUE_EMPTY_closure);
+RTS_CLOSURE(stg_ASYNCIO_LIVE0_closure);
 
 RTS_CLOSURE(stg_END_STM_WATCH_QUEUE_closure);
 RTS_CLOSURE(stg_END_STM_CHUNK_LIST_closure);
 RTS_CLOSURE(stg_NO_TREC_closure);
 
 RTS_ENTRY(stg_NO_FINALIZER);
+RTS_ENTRY(stg_DEAD_SLOT);
 
 #if IN_STG_CODE
-extern DLL_IMPORT_RTS StgWordArray stg_CHARLIKE_closure;
-extern DLL_IMPORT_RTS StgWordArray stg_INTLIKE_closure;
+extern StgWordArray stg_CHARLIKE_closure;
+extern StgWordArray stg_INTLIKE_closure;
 #else
-extern DLL_IMPORT_RTS StgIntCharlikeClosure stg_CHARLIKE_closure[];
-extern DLL_IMPORT_RTS StgIntCharlikeClosure stg_INTLIKE_closure[];
+extern StgIntCharlikeClosure stg_CHARLIKE_closure[MAX_CHARLIKE - MIN_CHARLIKE + 1];
+extern StgIntCharlikeClosure stg_INTLIKE_closure[MAX_INTLIKE - MIN_INTLIKE + 1];
 #endif
 
 /* StgStartup */
@@ -412,10 +362,16 @@ RTS_FUN_DECL(stg_gc_l1);
 RTS_FUN_DECL(stg_gc_pp);
 RTS_FUN_DECL(stg_gc_ppp);
 RTS_FUN_DECL(stg_gc_pppp);
+RTS_FUN_DECL(stg_gc_ppppp);
+RTS_FUN_DECL(stg_gc_ip);
+RTS_FUN_DECL(stg_gc_pi);
+RTS_FUN_DECL(stg_gc_ii);
+RTS_FUN_DECL(stg_gc_bpp);
 
 RTS_RET(stg_gc_fun);
 RTS_FUN_DECL(__stg_gc_fun);
 
+/* Blocking for various primops */
 RTS_FUN_DECL(stg_yield_noregs);
 RTS_FUN_DECL(stg_yield_to_interpreter);
 RTS_FUN_DECL(stg_block_noregs);
@@ -427,19 +383,19 @@ RTS_RET(stg_block_takemvar);
 RTS_RET(stg_block_readmvar);
 RTS_FUN_DECL(stg_block_putmvar);
 RTS_RET(stg_block_putmvar);
-#if defined(mingw32_HOST_OS)
-RTS_FUN_DECL(stg_block_async);
-RTS_RET(stg_block_async);
-RTS_FUN_DECL(stg_block_async_void);
-RTS_RET(stg_block_async_void);
-#endif
 RTS_FUN_DECL(stg_block_stmwait);
 RTS_FUN_DECL(stg_block_throwto);
 RTS_RET(stg_block_throwto);
 
-RTS_FUN_DECL(stg_readIOPortzh);
-RTS_FUN_DECL(stg_writeIOPortzh);
-RTS_FUN_DECL(stg_newIOPortzh);
+/* Blocking for I/O primops */
+RTS_FUN_DECL(stg_block_io_unit);
+RTS_RET(stg_block_io_unit);
+RTS_FUN_DECL(stg_block_io_int);
+RTS_RET(stg_block_io_int);
+#if defined(mingw32_HOST_OS)
+RTS_FUN_DECL(stg_block_async);
+RTS_RET(stg_block_async);
+#endif
 
 /* Entry/exit points from StgStartup.cmm */
 
@@ -507,7 +463,6 @@ RTS_FUN_DECL(stg_takeMVarzh);
 RTS_FUN_DECL(stg_putMVarzh);
 RTS_FUN_DECL(stg_readMVarzh);
 RTS_FUN_DECL(stg_tryTakeMVarzh);
-RTS_FUN_DECL(stg_tryPutMVarzh);
 RTS_FUN_DECL(stg_tryReadMVarzh);
 
 RTS_FUN_DECL(stg_waitReadzh);
@@ -579,6 +534,7 @@ RTS_FUN_DECL(stg_runRWzh);
 
 RTS_FUN_DECL(stg_newBCOzh);
 RTS_FUN_DECL(stg_mkApUpd0zh);
+RTS_FUN_DECL(stg_newConAppObjzh);
 
 RTS_FUN_DECL(stg_retryzh);
 RTS_FUN_DECL(stg_catchRetryzh);
@@ -612,6 +568,8 @@ RTS_FUN_DECL(stg_castWord64ToDoublezh);
 RTS_FUN_DECL(stg_castDoubleToWord64zh);
 RTS_FUN_DECL(stg_castWord32ToFloatzh);
 RTS_FUN_DECL(stg_castFloatToWord32zh);
+
+RTS_FUN_DECL(stg_annotateStackzh);
 
 /* Other misc stuff */
 // See wiki:commentary/compiler/backends/ppr-c#prototypes
@@ -665,7 +623,11 @@ extern StgWord      CCS_SYSTEM[];
 //    'GHC.StgToCmm.Prof'
 // as opposed to real prototype declared in
 //    'rts/include/rts/prof/CCS.h'
+#if IN_STG_CODE
+EFF_(enterFunCCS);
+#else
 void enterFunCCS (void *reg, void *ccsfn);
+#endif
 void * pushCostCentre (void *ccs, void *cc);
 
 // Capability.c

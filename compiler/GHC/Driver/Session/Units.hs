@@ -1,7 +1,5 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE TupleSections #-}
 module GHC.Driver.Session.Units (initMake, initMulti) where
 
 -- The official GHC API
@@ -27,7 +25,6 @@ import qualified GHC.Unit.State as State
 import GHC.Types.SrcLoc
 import GHC.Types.SourceError
 
-import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Monad       ( liftIO, mapMaybeM )
@@ -37,9 +34,10 @@ import System.IO
 import System.Exit
 import System.FilePath
 import Control.Monad
+import Data.Containers.ListUtils (nubOrdOn)
 import Data.List ( partition, (\\) )
 import qualified Data.Set as Set
-import Prelude
+import GHC.Prelude
 import GHC.ResponseFile (expandResponse)
 import Data.Bifunctor
 import GHC.Data.Graph.Directed
@@ -131,16 +129,14 @@ initMulti unitArgsFiles lintDynFlagsAndSrcs = do
   let home_units = HUG.allUnits initial_home_graph
 
   home_unit_graph <- forM initial_home_graph $ \homeUnitEnv -> do
-    let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
-        hue_flags = homeUnitEnv_dflags homeUnitEnv
+    let hue_flags = homeUnitEnv_dflags homeUnitEnv
         dflags = homeUnitEnv_dflags homeUnitEnv
-    (dbs,unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags cached_unit_dbs home_units
+    (unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags (hscUIC hsc_env) home_units
 
     updated_dflags <- liftIO $ updatePlatformConstants dflags mconstants
     emptyHpt <- liftIO $ emptyHomePackageTable
     pure $ HomeUnitEnv
       { homeUnitEnv_units = unit_state
-      , homeUnitEnv_unit_dbs = Just dbs
       , homeUnitEnv_dflags = updated_dflags
       , homeUnitEnv_hpt = emptyHpt
       , homeUnitEnv_home_unit = Just home_unit
@@ -149,8 +145,15 @@ initMulti unitArgsFiles lintDynFlagsAndSrcs = do
   checkUnitCycles initial_dflags home_unit_graph
 
   let dflags = homeUnitEnv_dflags $ HUG.unitEnv_lookup mainUnitId home_unit_graph
-  unitEnv <- assertUnitEnvInvariant <$> (liftIO $ initUnitEnv mainUnitId home_unit_graph (ghcNameVersion dflags) (targetPlatform dflags))
-  let final_hsc_env = hsc_env { hsc_unit_env = unitEnv }
+  newUnitEnv <-  do
+    env <- liftIO $ initUnitEnv mainUnitId home_unit_graph (ghcNameVersion dflags) (targetPlatform dflags)
+    -- We need to reuse the 'UnitIndexCache' as we used it above in 'initUnits'.
+    -- See Note [Sharing 'UnitInfo's across the 'UnitEnv'] why this must be shared.
+    pure $ assertUnitEnvInvariant $ env
+      { ue_uic = hscUIC hsc_env
+      }
+
+  let final_hsc_env = hsc_env { hsc_unit_env = newUnitEnv }
 
   GHC.setSession final_hsc_env
 
@@ -206,7 +209,7 @@ checkDuplicateUnits dflags flags =
 
   where
     uids = map (second homeUnitId_) flags
-    deduplicated_uids = ordNubOn snd uids
+    deduplicated_uids = nubOrdOn snd uids
     duplicate_ids = Set.fromList (map snd uids \\ map snd deduplicated_uids)
 
     duplicate_flags = filter (flip Set.member duplicate_ids . snd) uids
@@ -241,7 +244,7 @@ createUnitEnvFromFlags unitDflags = do
   unitEnvList <- forM unitDflags $ \dflags -> do
     emptyHpt <- emptyHomePackageTable
     let newInternalUnitEnv =
-          HUG.mkHomeUnitEnv emptyUnitState Nothing dflags emptyHpt Nothing
+          HUG.mkHomeUnitEnv emptyUnitState dflags emptyHpt Nothing
     return (homeUnitId_ dflags, newInternalUnitEnv)
   let activeUnit = fst $ NE.head unitEnvList
   return (HUG.hugFromList (NE.toList unitEnvList), activeUnit)

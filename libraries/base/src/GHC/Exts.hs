@@ -1,4 +1,6 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
+{-# OPTIONS_HADDOCK not-home #-}
 
 -- |
 --
@@ -26,12 +28,6 @@ module GHC.Exts
      -- **  Legacy interface for arrays of arrays
      module GHC.Internal.ArrayArray,
      -- *  Primitive operations
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.BCO,
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.mkApUpd0#,
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.newBCO#,
      module GHC.Prim,
      module GHC.Prim.Ext,
      -- **  Running 'RealWorld' state thread
@@ -55,7 +51,6 @@ module GHC.Exts
      sameMVar#,
      sameMutVar#,
      sameTVar#,
-     sameIOPort#,
      samePromptTag#,
      -- **  Compat wrapper
      atomicModifyMutVar#,
@@ -79,12 +74,12 @@ module GHC.Exts
      -- **  Overloaded string literals
      IsString(..),
      -- **  CString
-     unpackCString#,
-     unpackAppendCString#,
-     unpackFoldrCString#,
-     unpackCStringUtf8#,
-     unpackNBytes#,
-     cstringLength#,
+     CS.unpackCString#,
+     CS.unpackAppendCString#,
+     CS.unpackFoldrCString#,
+     CS.unpackCStringUtf8#,
+     CS.unpackNBytes#,
+     CS.cstringLength#,
      -- *  Debugging
      -- **  Breakpoints
      breakpoint,
@@ -130,9 +125,6 @@ import GHC.Prim hiding
   -- whereFrom# is similarly internal.
   , whereFrom#
   , isByteArrayWeaklyPinned#, isMutableByteArrayWeaklyPinned#
-
-  -- deprecated
-  , BCO, mkApUpd0#, newBCO#
 
   -- Don't re-export vector FMA instructions
   , fmaddFloatX4#
@@ -255,17 +247,152 @@ import GHC.Prim hiding
   , minWord8X16#
   , minWord8X32#
   , minWord8X64#
+#if __GLASGOW_HASKELL__ >= 1000
+  -- Don't re-export vector logical primops
+  , andDoubleX2#
+  , andDoubleX4#
+  , andDoubleX8#
+  , andFloatX16#
+  , andFloatX4#
+  , andFloatX8#
+  , andInt16X16#
+  , andInt16X32#
+  , andInt16X8#
+  , andInt32X16#
+  , andInt32X4#
+  , andInt32X8#
+  , andInt64X2#
+  , andInt64X4#
+  , andInt64X8#
+  , andInt8X16#
+  , andInt8X32#
+  , andInt8X64#
+  , andWord16X16#
+  , andWord16X32#
+  , andWord16X8#
+  , andWord32X16#
+  , andWord32X4#
+  , andWord32X8#
+  , andWord64X2#
+  , andWord64X4#
+  , andWord64X8#
+  , andWord8X16#
+  , andWord8X32#
+  , andWord8X64#
+  , orDoubleX2#
+  , orDoubleX4#
+  , orDoubleX8#
+  , orFloatX16#
+  , orFloatX4#
+  , orFloatX8#
+  , orInt16X16#
+  , orInt16X32#
+  , orInt16X8#
+  , orInt32X16#
+  , orInt32X4#
+  , orInt32X8#
+  , orInt64X2#
+  , orInt64X4#
+  , orInt64X8#
+  , orInt8X16#
+  , orInt8X32#
+  , orInt8X64#
+  , orWord16X16#
+  , orWord16X32#
+  , orWord16X8#
+  , orWord32X16#
+  , orWord32X4#
+  , orWord32X8#
+  , orWord64X2#
+  , orWord64X4#
+  , orWord64X8#
+  , orWord8X16#
+  , orWord8X32#
+  , orWord8X64#
+  , xorDoubleX2#
+  , xorDoubleX4#
+  , xorDoubleX8#
+  , xorFloatX16#
+  , xorFloatX4#
+  , xorFloatX8#
+  , xorInt16X16#
+  , xorInt16X32#
+  , xorInt16X8#
+  , xorInt32X16#
+  , xorInt32X4#
+  , xorInt32X8#
+  , xorInt64X2#
+  , xorInt64X4#
+  , xorInt64X8#
+  , xorInt8X16#
+  , xorInt8X32#
+  , xorInt8X64#
+  , xorWord16X16#
+  , xorWord16X32#
+  , xorWord16X8#
+  , xorWord32X16#
+  , xorWord32X4#
+  , xorWord32X8#
+  , xorWord64X2#
+  , xorWord64X4#
+  , xorWord64X8#
+  , xorWord8X16#
+  , xorWord8X32#
+  , xorWord8X64#
+  -- Don't re-export vector square root and absolute value
+  , absInt8X16#
+  , absInt16X8#
+  , absInt32X4#
+  , absInt64X2#
+  , absInt8X32#
+  , absInt16X16#
+  , absInt32X8#
+  , absInt64X4#
+  , absInt8X64#
+  , absInt16X32#
+  , absInt32X16#
+  , absInt64X8#
+  , absFloatX4#
+  , absDoubleX2#
+  , absFloatX8#
+  , absDoubleX4#
+  , absFloatX16#
+  , absDoubleX8#
+  , sqrtFloatX4#
+  , sqrtDoubleX2#
+  , sqrtFloatX8#
+  , sqrtDoubleX4#
+  , sqrtFloatX16#
+  , sqrtDoubleX8#
+#endif
+
+#if __GLASGOW_HASKELL__ >= 1001
+  -- Don't re-export box/unbox
+  , box, unbox
+#endif
   )
-import qualified GHC.Prim as Prim
-  ( BCO, mkApUpd0#, newBCO# )
 
 import GHC.Prim.Ext
 
+import qualified GHC.Types as CS (
+  unpackCString#,
+  unpackAppendCString#,
+  unpackFoldrCString#,
+  unpackCStringUtf8#,
+  unpackNBytes#,
+  cstringLength# )
 import GHC.Types hiding (
+  unpackCString#,
+  unpackAppendCString#,
+  unpackFoldrCString#,
+  unpackCStringUtf8#,
+  unpackNBytes#,
+  cstringLength#,
   IO,   -- Exported from "GHC.IO"
   Type, -- Exported from "Data.Kind"
   -- GHC's internal representation of 'TyCon's, for 'Typeable'
   Module, TrName, TyCon, TypeLitSort, KindRep, KindBndr,
+  UnusedType,
   Unit#,
   Solo#(..),
   Tuple0#,
@@ -395,4 +522,5 @@ import GHC.Types hiding (
   Sum61#,
   Sum62#,
   Sum63#,
+  Sum64#,
   )

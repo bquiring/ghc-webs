@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveGeneric   #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE Safe            #-}
@@ -26,6 +27,7 @@
 -- proposal
 -- #289](https://github.com/haskell/core-libraries-committee/issues/289). These
 -- declarations are now instead available from the @ghc-experimental@ package.
+-- @ghc-experimental@ contains additional metrics not added to the API here.
 
 module GHC.Stats
     ( -- * Runtime statistics
@@ -36,11 +38,13 @@ module GHC.Stats
 
 
 import Prelude (Bool,IO,Read,Show,(<$>))
-
 import qualified GHC.Internal.Stats as Internal
 import GHC.Generics (Generic)
 import Data.Word (Word64,Word32)
 import Data.Int (Int64)
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Essentials as Rebindable
+#endif
 
 -- | Time values from the RTS, using a fixed resolution of nanoseconds.
 type RtsTime = Int64

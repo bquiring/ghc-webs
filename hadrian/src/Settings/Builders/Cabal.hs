@@ -5,14 +5,13 @@ import Hadrian.Haskell.Cabal
 
 import Builder
 import Context
-import Flavour
 import Packages
 import Settings.Builders.Common
 import qualified Settings.Builders.Common as S
 import Control.Exception (assert)
 import qualified Data.Set as Set
-import Settings.Program (programContext, ghcWithInterpreter)
-import GHC.Toolchain (ccLinkProgram, tgtCCompilerLink)
+import Settings.Program (programContext)
+import GHC.Toolchain (ccLinkProgram, tgtCCompilerLink, targetPlatformTriple)
 import GHC.Toolchain.Program (prgFlags)
 
 cabalBuilderArgs :: Args
@@ -84,15 +83,22 @@ commonCabalArgs :: Stage -> Args
 commonCabalArgs stage = do
   pkg       <- getPackage
   package_id <- expr $ pkgUnitId stage pkg
+  -- We don't want to use the hash in the html documentation because it
+  -- makes it harder for non-boot packages to link to boot packages, see #26635
+  package_simple_id <- expr $ pkgSimpleIdentifier pkg
   let prefix = "${pkgroot}" ++ (if windowsHost then "" else "/..")
+  let compilerStage = predStage stage  -- the GHC that builds packages in this stage
+      isCross = case stage of
+        Stage0 {} -> return False
+        _         -> expr (crossStage compilerStage)
   mconcat [ -- Don't strip libraries when cross compiling.
             -- TODO: We need to set @--with-strip=(stripCmdPath :: Action FilePath)@,
             -- and if it's @:@ disable stripping as well. As it is now, I believe
             -- we might have issues with stripping on Windows, as I can't see a
             -- consumer of 'stripCmdPath'.
             -- TODO: See https://github.com/snowleopard/hadrian/issues/549.
-              flag CrossCompiling ? pure [ "--disable-executable-stripping"
-                                         , "--disable-library-stripping" ]
+              isCross ? pure [ "--disable-executable-stripping"
+                             , "--disable-library-stripping" ]
             -- We don't want to strip the debug RTS
             , S.package rts ? pure [ "--disable-executable-stripping"
                                   , "--disable-library-stripping" ]
@@ -111,7 +117,7 @@ commonCabalArgs stage = do
             --
             -- This doesn't hold if we move the @doc@ folder anywhere else.
             , arg "--htmldir"
-            , arg $ "${pkgroot}/../../doc/html/libraries/" ++ package_id
+            , arg $ "${pkgroot}/../../doc/html/libraries/" ++ package_simple_id
 
             -- These trigger a need on each dependency, so every important to need
             -- them in parallel or  it linearises the build of Ghc and GhcPkg
@@ -128,7 +134,6 @@ commonCabalArgs stage = do
             ]
 
 -- TODO: Isn't vanilla always built? If yes, some conditions are redundant.
--- TODO: Need compiler_stage1_CONFIGURE_OPTS += --disable-library-for-ghci?
 -- TODO: should `elem` be `wayUnit`?
 -- This approach still doesn't work. Previously libraries were build only in the
 -- Default flavours and not using context.
@@ -136,11 +141,6 @@ libraryArgs :: Args
 libraryArgs = do
     flavourWays <- getLibraryWays
     contextWay  <- getWay
-    package     <- getPackage
-    stage       <- getStage
-    withGhci    <- expr $ ghcWithInterpreter stage
-    dynPrograms <- expr (flavour >>= dynamicGhcPrograms)
-    ghciObjsSupported <- expr platformSupportsGhciObjects
     let ways = Set.insert contextWay flavourWays
         hasVanilla = vanilla `elem` ways
         hasProfiling = any (wayUnit Profiling) ways
@@ -155,11 +155,7 @@ libraryArgs = do
          , if hasProfilingShared
             then "--enable-profiling-shared"
             else "--disable-profiling-shared"
-         , if ghciObjsSupported &&
-              (hasVanilla || hasProfiling) &&
-              package /= rts && withGhci && not dynPrograms
-           then  "--enable-library-for-ghci"
-           else "--disable-library-for-ghci"
+         , "--disable-library-for-ghci"
          , if hasDynamic
            then  "--enable-shared"
            else "--disable-shared" ]
@@ -188,28 +184,30 @@ configureArgs cFlags' ldFlags' = do
             values <- unwords <$> expr
             not (null values) ?
                 arg ("--configure-option=" ++ key ++ "=" ++ values)
-        cFlags   = mconcat [ remove ["-Werror"] cArgs
-                           , getStagedCCFlags
+        cFlags   = mconcat [ getStagedCCFlags
                            -- See https://github.com/snowleopard/hadrian/issues/523
                            , arg $ "-iquote"
 
                            , arg $ top -/- pkgPath pkg
                            , cFlags'
                            ]
-        ldFlags  = ldArgs <> ldFlags'
-    mconcat
+    useSystemFfi <- staged $ buildFlag  UseSystemFfi
+    let predStage' s = case s of {Stage0 {} -> stage0InTree ; _ -> predStage s }
+    mconcat $
         [ conf "CFLAGS"   cFlags
-        , conf "LDFLAGS"  ldFlags
-        , conf "--with-iconv-includes"    $ arg =<< getSetting IconvIncludeDir
-        , conf "--with-iconv-libraries"   $ arg =<< getSetting IconvLibDir
-        , conf "--with-gmp-includes"      $ arg =<< getSetting GmpIncludeDir
-        , conf "--with-gmp-libraries"     $ arg =<< getSetting GmpLibDir
-        , conf "--with-curses-libraries"  $ arg =<< getSetting CursesLibDir
-        -- ROMES:TODO: how is the Host set to TargetPlatformFull? That would be the target
-        , conf "--host"                   $ arg =<< getSetting TargetPlatformFull
+        , conf "LDFLAGS"  ldFlags'
+        , conf "--with-iconv-includes"    $ arg =<< staged (buildSetting IconvIncludeDir)
+        , conf "--with-iconv-libraries"   $ arg =<< staged (buildSetting IconvLibDir)
+        , conf "--with-gmp-includes"      $ arg =<< staged (buildSetting GmpIncludeDir)
+        , conf "--with-gmp-libraries"     $ arg =<< staged (buildSetting GmpLibDir)
+        , conf "--with-curses-libraries"  $ arg =<< staged (buildSetting CursesLibDir)
+        , conf "--with-ffi-includes"      $ arg =<< staged (buildSetting FfiIncludeDir)
+        , conf "--with-ffi-libraries"     $ arg =<< staged (buildSetting FfiLibDir)
+        , conf "--host"                   $ arg =<< flip queryTarget targetPlatformTriple  . predStage' =<< getStage
+        , conf "--target"                 $ arg =<< flip queryTarget targetPlatformTriple =<< getStage
         , conf "--with-cc" $ arg =<< getBuilderPath . (Cc CompileC) =<< getStage
         , ghcVersionH
-        ]
+        ] ++ if useSystemFfi then [arg "--configure-option=--with-system-libffi"] else []
 
 bootPackageConstraints :: Args
 bootPackageConstraints = (stage0InTree ==) <$> getStage ? do

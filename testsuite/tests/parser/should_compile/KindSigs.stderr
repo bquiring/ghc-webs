@@ -8,11 +8,16 @@
    (EpAnn
     (EpaSpan { KindSigs.hs:1:1 })
     (AnnsModule
-     (NoEpTok)
+     (EpTok
+      (EpaSpan { <no location info> }))
      (EpTok
       (EpaSpan { KindSigs.hs:6:1-6 }))
      (EpTok
       (EpaSpan { KindSigs.hs:6:17-21 }))
+     ((,,)
+      (EpTok (EpaSpan { <no location info> }))
+      (EpTok (EpaSpan { <no location info> }))
+      [])
      []
      []
      (Just
@@ -23,15 +28,14 @@
      []
      []))
    (EpVirtualBraces
-    (1))
+    (EpaSpan { KindSigs.hs:8:1 }))
    (Nothing)
    (Nothing))
   (Just
    (L
     (EpAnn
      (EpaSpan { KindSigs.hs:6:8-15 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     {ModuleName: KindSigs}))
@@ -39,32 +43,32 @@
   [(L
     (EpAnn
      (EpaSpan { KindSigs.hs:8:1-16 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (ImportDecl
      (XImportDeclPass
-      (EpAnn
-       (EpaSpan { KindSigs.hs:8:1-16 })
-       (EpAnnImportDecl
+      (EpAnnImportDecl
+       (EpTok
+        (EpaSpan { KindSigs.hs:8:1-6 }))
+       (Nothing)
+       (Nothing)
+       (Nothing)
+       (Nothing)
+       (Nothing)
+       (Nothing)
+       ((,,,)
         (EpTok
-         (EpaSpan { KindSigs.hs:8:1-6 }))
-        (Nothing)
-        (Nothing)
-        (Nothing)
-        (Nothing)
-        (Nothing)
-        (Nothing))
-       (EpaComments
+         (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
         []))
       (NoSourceText)
-      (False))
+      (UserWrittenImport))
      (L
       (EpAnn
        (EpaSpan { KindSigs.hs:8:8-16 })
-       (AnnListItem
-        [])
+       []
        (EpaComments
         []))
       {ModuleName: Data.Kind})
@@ -78,8 +82,7 @@
   [(L
     (EpAnn
      (EpaSpan { KindSigs.hs:(11,1)-(12,21) })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -92,24 +95,29 @@
         []
         (EpTok
          (EpaSpan { KindSigs.hs:11:1-4 }))
-        (NoEpTok)
+        (EpTok
+         (EpaSpan { <no location info> }))
         (EpTok
          (EpaSpan { KindSigs.hs:11:6-11 }))
-        (NoEpUniTok)
-        (NoEpTok)
-        (NoEpTok)
+        (EpUniTok
+         (EpaSpan { <no location info> })
+         (NormalSyntax))
+        (EpTok
+         (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { <no location info> }))
         (EpTok
          (EpaSpan { KindSigs.hs:11:19-23 }))
-        (NoEpTok)
-        (NoEpTok)
-        (NoEpTok))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> })))
        (ClosedTypeFamily
         (Just
          [(L
            (EpAnn
             (EpaSpan { KindSigs.hs:12:3-21 })
-            (AnnListItem
-             [])
+            []
             (EpaComments
              []))
            (FamEqn
@@ -134,12 +142,12 @@
               (L
                (EpAnn
                 (EpaSpan { KindSigs.hs:12:7 })
-                (AnnListItem
-                 [])
+                []
                 (EpaComments
                  []))
                (HsTyVar
-                (NoEpTok)
+                (EpTok
+                 (EpaSpan { <no location info> }))
                 (NotPromoted)
                 (L
                  (EpAnn
@@ -154,8 +162,7 @@
             (L
              (EpAnn
               (EpaSpan { KindSigs.hs:12:11-21 })
-              (AnnListItem
-               [])
+              []
               (EpaComments
                []))
              (HsKindSig
@@ -165,12 +172,12 @@
               (L
                (EpAnn
                 (EpaSpan { KindSigs.hs:12:11-13 })
-                (AnnListItem
-                 [])
+                []
                 (EpaComments
                  []))
                (HsTyVar
-                (NoEpTok)
+                (EpTok
+                 (EpaSpan { <no location info> }))
                 (NotPromoted)
                 (L
                  (EpAnn
@@ -184,12 +191,12 @@
               (L
                (EpAnn
                 (EpaSpan { KindSigs.hs:12:18-21 })
-                (AnnListItem
-                 [])
+                []
                 (EpaComments
                  []))
                (HsTyVar
-                (NoEpTok)
+                (EpTok
+                 (EpaSpan { <no location info> }))
                 (NotPromoted)
                 (L
                  (EpAnn
@@ -215,16 +222,18 @@
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:11:17 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsTvb
            (AnnTyVarBndr
             []
             []
-            (NoEpTok)
-            (NoEpUniTok))
+            (EpTok
+             (EpaSpan { <no location info> }))
+            (EpUniTok
+             (EpaSpan { <no location info> })
+             (NormalSyntax)))
            (HsBndrRequired
             (NoExtField))
            (HsBndrVar
@@ -253,8 +262,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:15:1-51 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -281,16 +289,18 @@
        [(L
          (EpAnn
           (EpaSpan { KindSigs.hs:15:10 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsTvb
           (AnnTyVarBndr
            []
            []
-           (NoEpTok)
-           (NoEpUniTok))
+           (EpTok
+            (EpaSpan { <no location info> }))
+           (EpUniTok
+            (EpaSpan { <no location info> })
+            (NormalSyntax)))
           (HsBndrRequired
            (NoExtField))
           (HsBndrVar
@@ -310,24 +320,20 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:15:14-51 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsTupleTy
         (AnnParens
-         (EpTok
-          (EpaSpan { KindSigs.hs:15:14 }))
-         (EpTok
-          (EpaSpan { KindSigs.hs:15:51 })))
+         (EpTok (EpaSpan { KindSigs.hs:15:14 }))
+         (EpTok (EpaSpan { KindSigs.hs:15:51 })))
         (HsBoxedOrConstraintTuple)
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:15:16-26 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:15:27 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:15:27 })))]
            (EpaComments
             []))
           (HsKindSig
@@ -337,12 +343,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:15:16-18 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -356,12 +362,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:15:23-26 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -375,14 +381,14 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:15:29-32 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:15:33 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:15:33 })))]
            (EpaComments
             []))
           (HsTyVar
-           (NoEpTok)
+           (EpTok
+            (EpaSpan { <no location info> }))
            (NotPromoted)
            (L
             (EpAnn
@@ -396,8 +402,7 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:15:35-49 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsKindSig
@@ -407,8 +412,7 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:15:35-41 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsAppTy
@@ -416,12 +420,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:15:35-39 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -435,12 +439,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:15:41 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -454,12 +458,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:15:46-49 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -473,8 +477,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:16:1-54 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -501,16 +504,18 @@
        [(L
          (EpAnn
           (EpaSpan { KindSigs.hs:16:11 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsTvb
           (AnnTyVarBndr
            []
            []
-           (NoEpTok)
-           (NoEpUniTok))
+           (EpTok
+            (EpaSpan { <no location info> }))
+           (EpUniTok
+            (EpaSpan { <no location info> })
+            (NormalSyntax)))
           (HsBndrRequired
            (NoExtField))
           (HsBndrVar
@@ -530,8 +535,7 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:16:15-54 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsTupleTy
@@ -544,10 +548,9 @@
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:16:18-28 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:16:29 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:16:29 })))]
            (EpaComments
             []))
           (HsKindSig
@@ -557,12 +560,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:16:18-20 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -576,12 +579,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:16:25-28 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -595,14 +598,14 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:16:31-34 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:16:35 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:16:35 })))]
            (EpaComments
             []))
           (HsTyVar
-           (NoEpTok)
+           (EpTok
+            (EpaSpan { <no location info> }))
            (NotPromoted)
            (L
             (EpAnn
@@ -616,8 +619,7 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:16:37-51 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsKindSig
@@ -627,8 +629,7 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:16:37-43 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsAppTy
@@ -636,12 +637,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:16:37-41 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -655,12 +656,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:16:43 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -674,12 +675,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:16:48-51 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -693,8 +694,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:19:1-26 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -723,12 +723,11 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:19:12-26 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsListTy
-        (AnnParensSquare
+        ((,)
          (EpTok
           (EpaSpan { KindSigs.hs:19:12 }))
          (EpTok
@@ -736,8 +735,7 @@
         (L
          (EpAnn
           (EpaSpan { KindSigs.hs:19:14-24 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsKindSig
@@ -747,12 +745,12 @@
           (L
            (EpAnn
             (EpaSpan { KindSigs.hs:19:14-16 })
-            (AnnListItem
-             [])
+            []
             (EpaComments
              []))
            (HsTyVar
-            (NoEpTok)
+            (EpTok
+             (EpaSpan { <no location info> }))
             (NotPromoted)
             (L
              (EpAnn
@@ -766,12 +764,12 @@
           (L
            (EpAnn
             (EpaSpan { KindSigs.hs:19:21-24 })
-            (AnnListItem
-             [])
+            []
             (EpaComments
              []))
            (HsTyVar
-            (NoEpTok)
+            (EpTok
+             (EpaSpan { <no location info> }))
             (NotPromoted)
             (L
              (EpAnn
@@ -785,8 +783,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:22:1-44 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (SigD
@@ -798,6 +795,7 @@
         (NormalSyntax))
        (Nothing)
        (Nothing))
+      []
       [(L
         (EpAnn
          (EpaSpan { KindSigs.hs:22:1-3 })
@@ -812,8 +810,7 @@
        (L
         (EpAnn
          (EpaSpan { KindSigs.hs:22:8-44 })
-         (AnnListItem
-          [])
+         []
          (EpaComments
           []))
         (HsSig
@@ -823,35 +820,33 @@
          (L
           (EpAnn
            (EpaSpan { KindSigs.hs:22:8-44 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsFunTy
            (NoExtField)
-           (HsUnannotated
-            (EpArrow
-             (EpUniTok
-              (EpaSpan { KindSigs.hs:22:22-23 })
-              (NormalSyntax))))
+           (HsModifiedFunArr
+            (NoExtField)
+            []
+            (HsStandardArr
+             (EpArrow
+              (EpUniTok
+               (EpaSpan { KindSigs.hs:22:22-23 })
+               (NormalSyntax)))))
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:22:8-20 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsParTy
              ((,)
-              (EpTok
-               (EpaSpan { KindSigs.hs:22:8 }))
-              (EpTok
-               (EpaSpan { KindSigs.hs:22:20 })))
+              (EpTok (EpaSpan { KindSigs.hs:22:8 }))
+              (EpTok (EpaSpan { KindSigs.hs:22:20 })))
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:22:9-19 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsKindSig
@@ -861,12 +856,12 @@
                (L
                 (EpAnn
                  (EpaSpan { KindSigs.hs:22:9-11 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsTyVar
-                 (NoEpTok)
+                 (EpTok
+                  (EpaSpan { <no location info> }))
                  (NotPromoted)
                  (L
                   (EpAnn
@@ -880,12 +875,12 @@
                (L
                 (EpAnn
                  (EpaSpan { KindSigs.hs:22:16-19 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsTyVar
-                 (NoEpTok)
+                 (EpTok
+                  (EpaSpan { <no location info> }))
                  (NotPromoted)
                  (L
                   (EpAnn
@@ -899,26 +894,28 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:22:25-44 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsFunTy
              (NoExtField)
-             (HsUnannotated
-              (EpArrow
-               (EpUniTok
-                (EpaSpan { KindSigs.hs:22:30-31 })
-                (NormalSyntax))))
+             (HsModifiedFunArr
+              (NoExtField)
+              []
+              (HsStandardArr
+               (EpArrow
+                (EpUniTok
+                 (EpaSpan { KindSigs.hs:22:30-31 })
+                 (NormalSyntax)))))
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:22:25-28 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -932,21 +929,17 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:22:33-44 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsParTy
                ((,)
-                (EpTok
-                 (EpaSpan { KindSigs.hs:22:33 }))
-                (EpTok
-                 (EpaSpan { KindSigs.hs:22:44 })))
+                (EpTok (EpaSpan { KindSigs.hs:22:33 }))
+                (EpTok (EpaSpan { KindSigs.hs:22:44 })))
                (L
                 (EpAnn
                  (EpaSpan { KindSigs.hs:22:34-43 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsKindSig
@@ -956,27 +949,24 @@
                  (L
                   (EpAnn
                    (EpaSpan { KindSigs.hs:22:34-35 })
-                   (AnnListItem
-                    [])
+                   []
                    (EpaComments
                     []))
                   (HsTupleTy
                    (AnnParens
-                    (EpTok
-                     (EpaSpan { KindSigs.hs:22:34 }))
-                    (EpTok
-                     (EpaSpan { KindSigs.hs:22:35 })))
+                    (EpTok (EpaSpan { KindSigs.hs:22:34 }))
+                    (EpTok (EpaSpan { KindSigs.hs:22:35 })))
                    (HsBoxedOrConstraintTuple)
                    []))
                  (L
                   (EpAnn
                    (EpaSpan { KindSigs.hs:22:40-43 })
-                   (AnnListItem
-                    [])
+                   []
                    (EpaComments
                     []))
                   (HsTyVar
-                   (NoEpTok)
+                   (EpTok
+                    (EpaSpan { <no location info> }))
                    (NotPromoted)
                    (L
                     (EpAnn
@@ -990,8 +980,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:23:1-12 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (ValD
@@ -1008,23 +997,22 @@
        (Unqual
         {OccName: qux}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { KindSigs.hs:23:1-12 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:23:1-12 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -1042,16 +1030,20 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { KindSigs.hs:23:5-7 })
+            (EpAnn
+             (EpaSpan { KindSigs.hs:23:5-7 })
+             []
+             (EpaComments
+              []))
             [(L
               (EpAnn
                (EpaSpan { KindSigs.hs:23:5 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (WildPat
@@ -1059,8 +1051,7 @@
             ,(L
               (EpAnn
                (EpaSpan { KindSigs.hs:23:7 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (WildPat
@@ -1089,8 +1080,7 @@
                (L
                 (EpAnn
                  (EpaSpan { KindSigs.hs:23:11-12 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsVar
@@ -1100,23 +1090,21 @@
                    (EpaSpan { KindSigs.hs:23:11-12 })
                    (NameAnnOnly
                     (NameParens
-                     (EpTok
-                      (EpaSpan { KindSigs.hs:23:11 }))
-                     (EpTok
-                      (EpaSpan { KindSigs.hs:23:12 })))
+                     (EpTok (EpaSpan { KindSigs.hs:23:11 }))
+                     (EpTok (EpaSpan { KindSigs.hs:23:12 })))
                     [])
                    (EpaComments
                     []))
                   (Exact
-                   {Name: ()}))))))
+                   (ExactName
+                    {Name: ()})))))))
              [])
             (EmptyLocalBinds
              (NoExtField)))))])))))
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:26:1-29 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -1145,8 +1133,7 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:26:13-29 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsExplicitListTy
@@ -1161,8 +1148,7 @@
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:26:16-27 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsKindSig
@@ -1172,12 +1158,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:26:16-19 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1191,12 +1177,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:26:24-27 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1210,8 +1196,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:27:1-45 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -1240,13 +1225,13 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:27:14-45 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsExplicitListTy
         ((,,)
-         (NoEpTok)
+         (EpTok
+          (EpaSpan { <no location info> }))
          (EpTok
           (EpaSpan { KindSigs.hs:27:14 }))
          (EpTok
@@ -1255,10 +1240,9 @@
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:27:16-27 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:27:28 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:27:28 })))]
            (EpaComments
             []))
           (HsKindSig
@@ -1268,12 +1252,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:27:16-19 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1287,12 +1271,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:27:24-27 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1306,8 +1290,7 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:27:30-42 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsKindSig
@@ -1317,12 +1300,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:27:30-34 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1336,12 +1319,12 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:27:39-42 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
@@ -1355,8 +1338,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:28:1-44 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -1383,16 +1365,18 @@
        [(L
          (EpAnn
           (EpaSpan { KindSigs.hs:28:12 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsTvb
           (AnnTyVarBndr
            []
            []
-           (NoEpTok)
-           (NoEpUniTok))
+           (EpTok
+            (EpaSpan { <no location info> }))
+           (EpUniTok
+            (EpaSpan { <no location info> })
+            (NormalSyntax)))
           (HsBndrRequired
            (NoExtField))
           (HsBndrVar
@@ -1412,26 +1396,23 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:28:16-44 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsExplicitTupleTy
-        ((,,)
+        ((,)
          (EpTok
           (EpaSpan { KindSigs.hs:28:16 }))
-         (EpTok
-          (EpaSpan { KindSigs.hs:28:17 }))
-         (EpTok
-          (EpaSpan { KindSigs.hs:28:44 })))
+         (AnnParens
+          (EpTok (EpaSpan { KindSigs.hs:28:17 }))
+          (EpTok (EpaSpan { KindSigs.hs:28:44 }))))
         (IsPromoted)
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:28:19-39 })
-           (AnnListItem
-            [(AddCommaAnn
-              (EpTok
-               (EpaSpan { KindSigs.hs:28:40 })))])
+           [(AddCommaAnn
+             (EpTok
+              (EpaSpan { KindSigs.hs:28:40 })))]
            (EpaComments
             []))
           (HsKindSig
@@ -1441,13 +1422,13 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:28:19-29 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsExplicitListTy
              ((,,)
-              (NoEpTok)
+              (EpTok
+               (EpaSpan { <no location info> }))
               (EpTok
                (EpaSpan { KindSigs.hs:28:19 }))
               (EpTok
@@ -1456,14 +1437,14 @@
              [(L
                (EpAnn
                 (EpaSpan { KindSigs.hs:28:20-22 })
-                (AnnListItem
-                 [(AddCommaAnn
-                   (EpTok
-                    (EpaSpan { KindSigs.hs:28:23 })))])
+                [(AddCommaAnn
+                  (EpTok
+                   (EpaSpan { KindSigs.hs:28:23 })))]
                 (EpaComments
                  []))
                (HsTyVar
-                (NoEpTok)
+                (EpTok
+                 (EpaSpan { <no location info> }))
                 (NotPromoted)
                 (L
                  (EpAnn
@@ -1477,12 +1458,12 @@
              ,(L
                (EpAnn
                 (EpaSpan { KindSigs.hs:28:25-28 })
-                (AnnListItem
-                 [])
+                []
                 (EpaComments
                  []))
                (HsTyVar
-                (NoEpTok)
+                (EpTok
+                 (EpaSpan { <no location info> }))
                 (NotPromoted)
                 (L
                  (EpAnn
@@ -1496,12 +1477,11 @@
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:28:34-39 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsListTy
-             (AnnParensSquare
+             ((,)
               (EpTok
                (EpaSpan { KindSigs.hs:28:34 }))
               (EpTok
@@ -1509,12 +1489,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:28:35-38 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -1528,12 +1508,12 @@
         ,(L
           (EpAnn
            (EpaSpan { KindSigs.hs:28:42 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsTyVar
-           (NoEpTok)
+           (EpTok
+            (EpaSpan { <no location info> }))
            (NotPromoted)
            (L
             (EpAnn
@@ -1547,8 +1527,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:31:1-31 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (TyClD
@@ -1577,8 +1556,7 @@
       (L
        (EpAnn
         (EpaSpan { KindSigs.hs:31:21-31 })
-        (AnnListItem
-         [])
+        []
         (EpaComments
          []))
        (HsKindSig
@@ -1588,12 +1566,12 @@
         (L
          (EpAnn
           (EpaSpan { KindSigs.hs:31:21-23 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsTyVar
-          (NoEpTok)
+          (EpTok
+           (EpaSpan { <no location info> }))
           (NotPromoted)
           (L
            (EpAnn
@@ -1607,12 +1585,12 @@
         (L
          (EpAnn
           (EpaSpan { KindSigs.hs:31:28-31 })
-          (AnnListItem
-           [])
+          []
           (EpaComments
            []))
          (HsTyVar
-          (NoEpTok)
+          (EpTok
+           (EpaSpan { <no location info> }))
           (NotPromoted)
           (L
            (EpAnn
@@ -1626,8 +1604,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:34:1-22 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (SigD
@@ -1639,6 +1616,7 @@
         (NormalSyntax))
        (Nothing)
        (Nothing))
+      []
       [(L
         (EpAnn
          (EpaSpan { KindSigs.hs:34:1-4 })
@@ -1653,8 +1631,7 @@
        (L
         (EpAnn
          (EpaSpan { KindSigs.hs:34:9-22 })
-         (AnnListItem
-          [])
+         []
          (EpaComments
           []))
         (HsSig
@@ -1664,21 +1641,17 @@
          (L
           (EpAnn
            (EpaSpan { KindSigs.hs:34:9-22 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (HsParTy
            ((,)
-            (EpTok
-             (EpaSpan { KindSigs.hs:34:9 }))
-            (EpTok
-             (EpaSpan { KindSigs.hs:34:22 })))
+            (EpTok (EpaSpan { KindSigs.hs:34:9 }))
+            (EpTok (EpaSpan { KindSigs.hs:34:22 })))
            (L
             (EpAnn
              (EpaSpan { KindSigs.hs:34:10-21 })
-             (AnnListItem
-              [])
+             []
              (EpaComments
               []))
             (HsKindSig
@@ -1688,12 +1661,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:34:10-13 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -1707,12 +1680,12 @@
              (L
               (EpAnn
                (EpaSpan { KindSigs.hs:34:18-21 })
-               (AnnListItem
-                [])
+               []
                (EpaComments
                 []))
               (HsTyVar
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (NotPromoted)
                (L
                 (EpAnn
@@ -1726,8 +1699,7 @@
   ,(L
     (EpAnn
      (EpaSpan { KindSigs.hs:35:1-11 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (ValD
@@ -1744,23 +1716,22 @@
        (Unqual
         {OccName: true}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { KindSigs.hs:35:1-11 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { KindSigs.hs:35:1-11 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -1778,11 +1749,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -1808,8 +1784,7 @@
                (L
                 (EpAnn
                  (EpaSpan { KindSigs.hs:35:8-11 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsVar

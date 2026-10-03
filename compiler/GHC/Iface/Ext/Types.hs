@@ -1,10 +1,5 @@
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE DeriveTraversable          #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE PatternSynonyms            #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
 
 {-
 Types for the .hie file format are defined here.
@@ -19,14 +14,12 @@ import GHC.Prelude
 import GHC.Settings.Config
 import GHC.Utils.Binary
 import GHC.Data.FastString
-import GHC.Builtin.Utils
 import GHC.Iface.Type
 import GHC.Unit.Module            ( ModuleName, Module )
 import GHC.Types.Name
 import GHC.Utils.Outputable hiding ( (<>) )
 import GHC.Types.SrcLoc
 import GHC.Types.Avail
-import GHC.Types.Unique
 import qualified GHC.Utils.Outputable as O ( (<>) )
 import GHC.Utils.Panic
 import GHC.Core.ConLike           ( ConLike(..) )
@@ -98,10 +91,6 @@ data HieFile = HieFile
 
 type NameEntityInfo = M.Map Name (S.Set EntityInfo)
 
-instance Binary NameEntityInfo where
-  put_ bh m = put_ bh $ M.toList m
-  get bh = fmap M.fromList (get bh)
-
 instance Binary HieFile where
   put_ bh hf = do
     put_ bh $ hie_hs_file hf
@@ -170,6 +159,18 @@ data HieType a
   | HCoercionTy
     deriving (Functor, Foldable, Traversable, Eq)
 
+instance Outputable a => Outputable (HieType a) where
+  ppr (HTyVarTy name) = ppr name
+  ppr (HAppTy fun arg) = parens $ ppr fun <+> ppr arg
+  ppr (HTyConApp tc args) = parens $ ppr tc <+> ppr args
+  ppr (HForAllTy ((name, ty), flag) body) =
+    text "forall" <+> ppr flag <+> ppr name O.<> text ":" <+> ppr ty O.<> text "." <+> ppr body
+  ppr (HFunTy mult arg res) = parens $ ppr arg <+> arrow <+> ppr res <+> ppr mult
+  ppr (HQualTy ctxt ty) = parens $ ppr ctxt <+> text "=>" <+> ppr ty
+  ppr (HLitTy lit) = ppr lit
+  ppr (HCastTy ty) = text "cast" <+> ppr ty
+  ppr HCoercionTy = text "<coercion>"
+
 type HieTypeFlat = HieType TypeIndex
 
 -- | Roughly isomorphic to the original core 'Type'.
@@ -232,6 +233,10 @@ newtype HieArgs a = HieArgs [(Bool,a)]
 instance Binary (HieArgs TypeIndex) where
   put_ bh (HieArgs xs) = put_ bh xs
   get bh = HieArgs <$> get bh
+
+instance Outputable a => Outputable (HieArgs a) where
+  ppr (HieArgs args) = braces $ hsep $ punctuate comma $ map pprArg args
+    where pprArg (vis, ty) = (if vis then id else parens) (ppr ty)
 
 
 -- A HiePath is just a lexical FastString. We use a lexical FastString to avoid
@@ -766,7 +771,6 @@ instance Binary TyVarScope where
 data HieName
   = ExternalName !Module !OccName !SrcSpan
   | LocalName !OccName !SrcSpan
-  | KnownKeyName !Unique
   deriving (Eq)
 
 instance Ord HieName where
@@ -774,34 +778,28 @@ instance Ord HieName where
     -- TODO (int-index): Perhaps use RealSrcSpan in HieName?
   compare (LocalName a b) (LocalName c d) = compare a c S.<> leftmost_smallest b d
     -- TODO (int-index): Perhaps use RealSrcSpan in HieName?
-  compare (KnownKeyName a) (KnownKeyName b) = nonDetCmpUnique a b
-    -- Not actually non deterministic as it is a KnownKey
   compare ExternalName{} _ = LT
   compare LocalName{} ExternalName{} = GT
-  compare LocalName{} _ = LT
-  compare KnownKeyName{} _ = GT
 
 instance Outputable HieName where
   ppr (ExternalName m n sp) = text "ExternalName" <+> ppr m <+> ppr n <+> ppr sp
   ppr (LocalName n sp) = text "LocalName" <+> ppr n <+> ppr sp
-  ppr (KnownKeyName u) = text "KnownKeyName" <+> ppr u
 
 hieNameOcc :: HieName -> OccName
 hieNameOcc (ExternalName _ occ _) = occ
 hieNameOcc (LocalName occ _) = occ
-hieNameOcc (KnownKeyName u) =
-  case lookupKnownKeyName u of
-    Just n -> nameOccName n
-    Nothing -> pprPanic "hieNameOcc:unknown known-key unique"
-                        (ppr u)
 
 toHieName :: Name -> HieName
-toHieName name
-  | isKnownKeyName name = KnownKeyName (nameUnique name)
-  | isExternalName name = ExternalName (nameModule name)
-                                       (nameOccName name)
-                                       (removeBufSpan $ nameSrcSpan name)
-  | otherwise = LocalName (nameOccName name) (removeBufSpan $ nameSrcSpan name)
+toHieName name =
+  case nameModule_maybe name of
+    Nothing -> LocalName occName span
+    Just m -> ExternalName m occName span
+  where
+    occName :: OccName
+    occName = nameOccName name
+
+    span :: SrcSpan
+    span = removeBufSpan $ nameSrcSpan name
 
 
 {- Note [Capture Entity Information]

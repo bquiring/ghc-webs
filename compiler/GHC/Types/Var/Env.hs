@@ -12,8 +12,10 @@ module GHC.Types.Var.Env (
         elemVarEnv, disjointVarEnv, anyVarEnv,
         extendVarEnv, extendVarEnv_C, extendVarEnv_Acc,
         extendVarEnvList,
-        plusVarEnv, plusVarEnv_C, plusVarEnv_CD, plusMaybeVarEnv_C,
-        plusVarEnvList, alterVarEnv,
+        strictPlusVarEnv, plusVarEnv, plusVarEnv_C,
+        strictPlusVarEnv_C, strictPlusVarEnv_C_Directly,
+        plusVarEnv_CD, plusMaybeVarEnv_C,
+        plusVarEnvList, alterVarEnv, upsertVarEnv,
         delVarEnvList, delVarEnv,
         minusVarEnv,
         lookupVarEnv, lookupVarEnv_NF, lookupWithDefaultVarEnv,
@@ -38,7 +40,7 @@ module GHC.Types.Var.Env (
         isEmptyDVarEnv, foldDVarEnv, nonDetStrictFoldDVarEnv,
         mapDVarEnv, filterDVarEnv,
         modifyDVarEnv,
-        alterDVarEnv,
+        alterDVarEnv, upsertDVarEnv,
         plusDVarEnv, plusDVarEnv_C,
         unitDVarEnv,
         delDVarEnv,
@@ -507,10 +509,12 @@ mkVarEnv_Directly :: [(Unique, a)] -> VarEnv a
 zipVarEnv         :: [Var] -> [a] -> VarEnv a
 unitVarEnv        :: Var -> a -> VarEnv a
 alterVarEnv       :: (Maybe a -> Maybe a) -> VarEnv a -> Var -> VarEnv a
+upsertVarEnv      :: (Maybe a -> a) -> VarEnv a -> Var -> VarEnv a
 extendVarEnv      :: VarEnv a -> Var -> a -> VarEnv a
 extendVarEnv_C    :: (a->a->a) -> VarEnv a -> Var -> a -> VarEnv a
 extendVarEnv_Acc  :: (a->b->b) -> (a->b) -> VarEnv b -> Var -> a -> VarEnv b
 plusVarEnv        :: VarEnv a -> VarEnv a -> VarEnv a
+strictPlusVarEnv  :: VarEnv a -> VarEnv a -> VarEnv a
 plusVarEnvList    :: [VarEnv a] -> VarEnv a
 extendVarEnvList  :: VarEnv a -> [(Var, a)] -> VarEnv a
 varEnvDomain      :: VarEnv elt -> UnVarSet
@@ -522,6 +526,8 @@ delVarEnvList     :: Foldable f => VarEnv a -> f Var -> VarEnv a
 delVarEnv         :: VarEnv a -> Var -> VarEnv a
 minusVarEnv       :: VarEnv a -> VarEnv b -> VarEnv a
 plusVarEnv_C      :: (a -> a -> a) -> VarEnv a -> VarEnv a -> VarEnv a
+strictPlusVarEnv_C :: (a -> a -> a) -> VarEnv a -> VarEnv a -> VarEnv a
+strictPlusVarEnv_C_Directly :: (Unique -> a -> a -> a) -> VarEnv a -> VarEnv a -> VarEnv a
 plusVarEnv_CD     :: (a -> a -> a) -> VarEnv a -> a -> VarEnv a -> a -> VarEnv a
 plusMaybeVarEnv_C :: (a -> a -> Maybe a) -> VarEnv a -> VarEnv a -> VarEnv a
 mapVarEnv         :: (a -> b) -> VarEnv a -> VarEnv b
@@ -543,11 +549,14 @@ elemVarEnv       = elemUFM
 elemVarEnvByKey  = elemUFM_Directly
 disjointVarEnv   = disjointUFM
 alterVarEnv      = alterUFM
+upsertVarEnv     = upsertUFM
 extendVarEnv     = addToUFM
 extendVarEnv_C   = addToUFM_C
 extendVarEnv_Acc = addToUFM_Acc
 extendVarEnvList = addListToUFM
 plusVarEnv_C     = plusUFM_C
+strictPlusVarEnv_C = strictPlusUFM_C
+strictPlusVarEnv_C_Directly = strictPlusUFM_C_Directly
 plusVarEnv_CD    = plusUFM_CD
 plusMaybeVarEnv_C = plusMaybeUFM_C
 delVarEnvList    = delListFromUFM
@@ -556,6 +565,7 @@ delVarEnvList    = delListFromUFM
 delVarEnv        = delFromUFM
 minusVarEnv      = minusUFM
 plusVarEnv       = plusUFM
+strictPlusVarEnv = strictPlusUFM
 plusVarEnvList   = plusUFMList
 -- lookupVarEnv is very hot (in part due to being called by substTyVar),
 -- if it's not inlined than the mere allocation of the Just constructor causes
@@ -662,6 +672,9 @@ mapMaybeDVarEnv f = mapMaybeUDFM f
 
 alterDVarEnv :: (Maybe a -> Maybe a) -> DVarEnv a -> Var -> DVarEnv a
 alterDVarEnv = alterUDFM
+
+upsertDVarEnv :: (Maybe a -> a) -> DVarEnv a -> Var -> DVarEnv a
+upsertDVarEnv = upsertUDFM
 
 plusDVarEnv :: DVarEnv a -> DVarEnv a -> DVarEnv a
 plusDVarEnv = plusUDFM

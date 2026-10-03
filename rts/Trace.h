@@ -70,16 +70,37 @@ enum CapsetType { CapsetTypeCustom = CAPSET_TYPE_CUSTOM,
 #define DEBUG_continuation RtsFlags.DebugFlags.continuation
 #define DEBUG_iomanager   RtsFlags.DebugFlags.iomanager
 
-// Event-enabled flags
-// These semantically booleans but we use a dense packing to minimize their
-// cache impact.
-extern uint8_t TRACE_sched;
-extern uint8_t TRACE_gc;
-extern uint8_t TRACE_nonmoving_gc;
-extern uint8_t TRACE_spark_sampled;
-extern uint8_t TRACE_spark_full;
-extern uint8_t TRACE_cap;
-/* extern uint8_t TRACE_user; */  // only used in Trace.c
+// These trace flags are shorthand for the members of the RuntimeTraceFlagCache
+// struct. Within the RTS, these should be treated as read-only variables.
+#define TRACE_sched         ((const bool)RuntimeTraceFlagCache.scheduler)
+#define TRACE_gc            ((const bool)RuntimeTraceFlagCache.gc)
+#define TRACE_nonmoving_gc  ((const bool)RuntimeTraceFlagCache.nonmoving_gc)
+#define TRACE_spark_sampled ((const bool)RuntimeTraceFlagCache.spark_sampled)
+#define TRACE_spark_full    ((const bool)RuntimeTraceFlagCache.spark_full)
+#define TRACE_user          ((const bool)RuntimeTraceFlagCache.user)
+#define TRACE_cap           ((const bool)RuntimeTraceFlagCache.cap)
+#define TRACE_ipe           ((const bool)RuntimeTraceFlagCache.ipe)
+
+/*
+ * Runtime trace flags.
+ */
+typedef struct {
+  bool scheduler;
+  bool gc;
+  bool nonmoving_gc;
+  bool spark_sampled;
+  bool spark_full;
+  bool user;
+  bool cap;
+  bool ipe;
+} RUNTIME_TRACE_FLAG_CACHE;
+
+/*
+ * These flags should be used to determine whether or not some value should
+ * be traced at runtime, rather than the values in RtsFlags. These flags can
+ * be modified at runtime using setTraceFlag in `rts/EventLogWriter.h`.
+ */
+extern RUNTIME_TRACE_FLAG_CACHE RuntimeTraceFlagCache;
 
 // -----------------------------------------------------------------------------
 // Posting events
@@ -92,7 +113,7 @@ extern uint8_t TRACE_cap;
 // -----------------------------------------------------------------------------
 
 #if defined(DEBUG)
-void traceBegin (const char *str, ...);
+void traceBegin (const char *str, ...) STG_PRINTF_ATTR(1, 2);
 void traceEnd (void);
 #endif
 
@@ -135,6 +156,52 @@ void traceGcEvent_ (Capability *cap, EventTypeNum tag);
     }
 
 void traceGcEventAtT_ (Capability *cap, StgWord64 ts, EventTypeNum tag);
+
+/*
+ * Record a nonmoving GC event.
+ */
+#define traceConcMarkBegin()                                           \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingGcEvent_(EVENT_CONC_MARK_BEGIN);                 \
+    }
+#define traceConcMarkEnd(marked_obj_count)                             \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceConcMarkEnd_(marked_obj_count);                           \
+    }
+#define traceConcSyncBegin()                                           \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingGcEvent_(EVENT_CONC_SYNC_BEGIN);                 \
+    }
+#define traceConcSyncEnd()                                             \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingGcEvent_(EVENT_CONC_SYNC_END);                   \
+    }
+#define traceConcSweepBegin()                                          \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingGcEvent_(EVENT_CONC_SWEEP_BEGIN);                \
+    }
+#define traceConcSweepEnd()                                            \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingGcEvent_(EVENT_CONC_SWEEP_END);                  \
+    }
+#define traceConcUpdRemSetFlush(cap)                                   \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceConcUpdRemSetFlush_(cap);                                 \
+    }
+#define traceNonmovingHeapCensus(blk_size, census)                     \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingHeapCensus_(blk_size, census);                   \
+    }
+#define traceNonmovingPrunedSegments(pruned_segments, free_segments)   \
+    if (RTS_UNLIKELY(TRACE_nonmoving_gc)) {                            \
+        traceNonmovingPrunedSegments_(pruned_segments, free_segments); \
+    }
+
+void traceNonmovingGcEvent_ (EventTypeNum tag);
+void traceConcMarkEnd_(StgWord32 marked_obj_count);
+void traceConcUpdRemSetFlush_(Capability *cap);
+void traceNonmovingHeapCensus_(uint16_t blk_size, const struct NonmovingAllocCensus *census);
+void traceNonmovingPrunedSegments_(uint32_t pruned_segments, uint32_t free_segments);
 
 /*
  * Record a heap event
@@ -198,7 +265,8 @@ void traceSparkEvent_ (Capability *cap, EventTypeNum tag, StgWord info1);
         traceCap_(cap, msg, ##__VA_ARGS__);     \
     }
 
-void traceCap_(Capability *cap, char *msg, ...);
+void traceCap_(Capability *cap, char *msg, ...)
+    STG_PRINTF_ATTR(2, 3);
 
 /*
  * Emit a trace message
@@ -208,7 +276,8 @@ void traceCap_(Capability *cap, char *msg, ...);
         trace_(msg, ##__VA_ARGS__);             \
     }
 
-void trace_(char *msg, ...);
+void trace_(char *msg, ...)
+    STG_PRINTF_ATTR(1, 2);
 
 /*
  * A message or event emitted by the program
@@ -309,7 +378,7 @@ void traceHeapBioProfSampleBegin(StgInt era, StgWord64 time);
 void traceHeapProfSampleEnd(StgInt era);
 void traceHeapProfSampleString(const char *label, StgWord residency);
 #if defined(PROFILING)
-void traceHeapProfCostCentre(StgWord32 ccID,
+void traceHeapProfCostCentre(StgInt ccID,
                              const char *label,
                              const char *module,
                              const char *srcloc,
@@ -320,17 +389,6 @@ void traceProfSampleCostCentre(Capability *cap,
                                CostCentreStack *stack, StgWord ticks);
 void traceProfBegin(void);
 #endif /* PROFILING */
-
-void traceConcMarkBegin(void);
-void traceConcMarkEnd(StgWord32 marked_obj_count);
-void traceConcSyncBegin(void);
-void traceConcSyncEnd(void);
-void traceConcSweepBegin(void);
-void traceConcSweepEnd(void);
-void traceConcUpdRemSetFlush(Capability *cap);
-void traceNonmovingHeapCensus(uint16_t blk_size,
-                              const struct NonmovingAllocCensus *census);
-void traceNonmovingPrunedSegments(uint32_t pruned_segments, uint32_t free_segments);
 
 void traceIPE(const InfoProvEnt *ipe);
 void flushTrace(void);
@@ -384,6 +442,7 @@ void flushTrace(void);
 #define traceConcSweepEnd() /* nothing */
 #define traceConcUpdRemSetFlush(cap) /* nothing */
 #define traceNonmovingHeapCensus(blk_size, census) /* nothing */
+#define traceNonmovingPrunedSegments(pruned_segments, free_segments) /* nothing */
 
 #define flushTrace() /* nothing */
 
@@ -600,7 +659,7 @@ INLINE_HEADER void traceEventRunThread(Capability *cap STG_UNUSED,
 
 INLINE_HEADER void traceEventStopThread(Capability          *cap    STG_UNUSED,
                                         StgTSO              *tso    STG_UNUSED,
-                                        StgThreadReturnCode  status STG_UNUSED,
+                                        EventThreadStatus    status STG_UNUSED,
                                         StgWord32           info    STG_UNUSED)
 {
     traceSchedEvent2(cap, EVENT_STOP_THREAD, tso, status, info);

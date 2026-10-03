@@ -148,6 +148,13 @@ test('T7785', [ only_ways(['optasm']),
                grep_errmsg(r'SPEC') ],
       compile, ['-ddump-cse'])
 
+# T7803: we expect NO calls to the overloaded 'exp5Tail' in T7803.hs
+# In the bug report #7803, the unspecialised call was signalled by 'exp5Tail'
+#    in foo1's Core, so we grep for that; also for 'foo1', lest we dump nothing
+# One module, T7803.hs, has OPTIONS_GHC -ddump-simpl
+test('T7803', [ grep_errmsg(r'exp5Tail|foo1') ],
+     multimod_compile, ['T7803', '-O2 -v0 -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+
 test('T7702',
      [extra_files(['T7702plugin']),
       pre_cmd('$MAKE -s --no-print-directory -C T7702plugin package.T7702 TOP={top}'),
@@ -190,6 +197,7 @@ test('T9400', only_ways(['optasm']), compile, ['-O0 -ddump-simpl -dsuppress-uniq
 test('T9441a', [only_ways(['optasm']), check_errmsg(r'f1 = f2') ], compile, ['-ddump-simpl -dsuppress-ticks'])
 test('T9441b', [only_ways(['optasm']), check_errmsg(r'Rec {') ], compile, ['-ddump-simpl'])
 test('T9441c', [only_ways(['optasm']), check_errmsg(r'Rec {') ], compile, ['-ddump-simpl'])
+test('T9445', only_ways(['optasm']), compile, ['-Wno-missing-methods'])
 test('T9583', only_ways(['optasm']), compile, [''])
 test('T9565', only_ways(['optasm']), compile, [''])
 test('T5821', only_ways(['optasm']), compile, [''])
@@ -227,6 +235,7 @@ test('T9509',
 test('T12603',
      normal,
      makefile_test, ['T12603'])
+test('T12640', [grep_errmsg(r'force-inline')], compile, ['-O2 -ddump-rule-firings'])
 test('T12877', normal, makefile_test, ['T12877'])
 test('T13027', normal, compile, [''])
 test('T13025',
@@ -270,7 +279,8 @@ test('T14140',
      normal,
      makefile_test, ['T14140'])
 
-test('T14272', normal, compile, [''])
+# T14272 used to cause a compiler heap overflow in optasm: #16539
+test('T14272', only_ways(['optasm']), compile, [''])
 test('T14270a', normal, compile, [''])
 test('T14152', [ only_ways(['optasm']), check_errmsg(r'dead code') ], compile, ['-ddump-simpl'])
 test('T14152a', [extra_files(['T14152.hs']), pre_cmd('cp T14152.hs T14152a.hs'),
@@ -278,6 +288,7 @@ test('T14152a', [extra_files(['T14152.hs']), pre_cmd('cp T14152.hs T14152a.hs'),
                 compile, ['-fno-exitification -ddump-simpl'])
 test('T13990', normal, compile, ['-dcore-lint -O'])
 test('T14650', normal, compile, ['-O2'])
+test('T14908', normal, multimod_compile, ['T14908', '-O2 -v0'])
 test('T14959', normal, compile, ['-O'])
 test('T14978',
      normal,
@@ -295,6 +306,10 @@ test('T15631',
      normal,
      makefile_test, ['T15631'])
 test('T15673', normal, compile, ['-O'])
+test('T16122', [when(wordsize(32), skip)],
+     multimod_compile_filter,
+     ['T16122', '-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds',
+      "sed -n '/^f = /,/^$/p;/^g = /,/^$/p'"])
 test('T16288', normal, multimod_compile, ['T16288B', '-O -dcore-lint -v0'])
 test('T16348', normal, compile, ['-O'])
 test('T16918', normal, compile, ['-O'])
@@ -470,6 +485,9 @@ test('T22272', normal, multimod_compile, ['T22272', '-O -fexpose-all-unfoldings 
 # go should become a join point
 test('T22428', [grep_errmsg(r'jump go') ], compile, ['-O -ddump-simpl -dsuppress-uniques -dno-typeable-binds -dsuppress-unfoldings'])
 
+test('TrickyJoins', normal, compile, [''])
+test('T26642', [unless(have_profiling(), skip)], compile, ['-O -prof -fprof-auto-calls'])
+
 test('T22459', normal, compile, [''])
 test('T22623', normal, multimod_compile, ['T22623', '-O -v0'])
 test('T22662', normal, compile, [''])
@@ -519,7 +537,10 @@ test('T24229a', [ grep_errmsg(r'wfoo') ], compile, ['-O2 -ddump-simpl -dno-typea
 test('T24229b', [ grep_errmsg(r'wfoo') ], compile, ['-O2 -ddump-simpl -dno-typeable-binds -dsuppress-all -dsuppress-uniques -dppr-cols=99999'])
 test('T24370', normal, compile, ['-O'])
 test('T24551', normal, compile, ['-O -dcore-lint'])
-test('T24726', normal, compile, ['-dcore-lint -dsuppress-uniques'])
+
+# If optimizations are enabled, the rule just fires and -drule-check will report nothing
+test('T24726', [ omit_ways(opt_ways) ], compile, ['-dcore-lint -dsuppress-uniques'])
+
 test('T24768', normal, compile, ['-O'])
 test('T24770', [ grep_errmsg(r'Dead') ], compile, ['-O'])
 test('T24808', [ grep_errmsg(r'myFunction') ], compile, ['-O -ddump-simpl'])
@@ -535,12 +556,17 @@ test('T25160', normal, compile, ['-O -ddump-rules'])
 test('T25197', [req_th, extra_files(["T25197_TH.hs"]), only_ways(['optasm'])], multimod_compile, ['T25197', '-O2 -v0'])
 test('T25389', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dno-typeable-binds'])
 test('T24359a', normal, compile, ['-O -ddump-rules'])
+test('T24606', [grep_errmsg(r'fAlternativeRWST')], compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-idinfo -dsuppress-coercions -dsuppress-coercion-types'])
 test('T25713', [grep_errmsg('W:::')], compile, ['-O -ddump-simpl'])
+test('T26323b', normal, compile, ['-O'])
 
 test('T25883', normal, compile_grep_core, [''])
 test('T25883b', normal, compile_grep_core, [''])
 test('T25883c', normal, compile_grep_core, [''])
 test('T25883d', [extra_files(['T25883d_import.hs'])], multimod_compile_filter, ['T25883d', '-O -ddump-simpl -dno-typeable-binds -dsuppress-all -dsuppress-uniques', r'grep -e "y ="'])
+
+test('T26588', normal, compile, ['-package containers -O'])
+test('T26589', normal, compile, ['-O'])
 
 test('T25976', [grep_errmsg('Dead Code')], compile, ['-O -ddump-simpl -dsuppress-uniques -dno-typeable-binds'])
 
@@ -557,3 +583,47 @@ test('T26051',   [ grep_errmsg(r'\$wspecMe')
 test('T26115', [grep_errmsg(r'DFun')], compile, ['-O -ddump-simpl -dsuppress-uniques'])
 test('T26116', normal, compile, ['-O -ddump-rules'])
 test('T26117', [grep_errmsg(r'==')], compile, ['-O -ddump-simpl -dsuppress-uniques'])
+test('T26349',  normal, compile, ['-O -ddump-rules'])
+test('T26681',  normal, compile, ['-O'])
+
+test('T26941', [extra_files(['T26941_aux.hs']), req_profiling], multimod_compile, ['T26941', '-v0 -O -prof'])
+
+# T26709: we expect three `case` expressions not four
+test('T26709', [grep_errmsg(r'case')],
+       multimod_compile,
+       ['T26709', '-O -ddump-simpl -dsuppress-uniques -dno-typeable-binds'])
+test('T26682',  normal, multimod_compile, ['T26682', '-O -v0'])
+
+# T26615: we expect NO calls to overloaded functions in T26615.hs
+# In the bug report #26615, the overloaded calls were signalled by a dictionary
+#    argument like fEqList_xxxx, so we grep for that. Not a very robust test
+test('T26615',  [grep_errmsg(r'fEqList')], multimod_compile, ['T26615', '-O -fspec-constr -ddump-simpl -dsuppress-uniques'])
+
+# T26722: there should be no reboxing in $wg
+test('T26722', [grep_errmsg(r'SPEC')], compile, ['-O -dno-typeable-binds'])
+
+test('T26805', [grep_errmsg(r'fromInteger')], compile, ['-O -dno-typeable-binds -ddump-simpl -dsuppress-uniques'])
+test('T26826', normal, compile, ['-O'])
+test('T26903', [grep_errmsg(r'reverse')], compile, ['-O -dno-typeable-binds -ddump-simpl -dsuppress-uniques -dsuppress-all'])
+test('T18032', normal, compile, ['-O -dsuppress-all -dsuppress-uniques -dno-typeable-binds -ddump-simpl'])
+test('T25718', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+test('T25718a', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+test('T25718b', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+test('T25718c', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+test('T19166', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+# #4081: the strict field of T should be unboxed once, outside the loop.
+test('T4081', normal, compile, ['-O -ddump-simpl -dsuppress-uniques -dsuppress-all -dno-typeable-binds'])
+test('T27261', [extra_files(['T27261_aux.hs'])], multimod_compile, ['T27261', '-v0 -O'])
+test('T27296', [], makefile_test, ['T27296'])
+test('T27296b', [], makefile_test, ['T27296b'])
+test('T27589', [grep_errmsg(r'wombat')], compile, ['-O -ddump-simpl -dno-typeable-binds -dsuppress-uniques'])
+test('T27590', [grep_errmsg(r'wombat')], compile, ['-O -ddump-simpl -dno-typeable-binds -dsuppress-uniques'])
+test('T27556', [only_ways('ghci'), extra_hc_opts('-O -fno-unoptimized-core-for-interpreter')], ghci_script, ['T27556.script'])
+
+# Check the stack of source notes at the top of the body of 'ordering'
+# is in the correct order.
+test('T27749',
+     multiline_grep_errmsg(r'ordering\n.*\n(\s+src<[^>]*>\n)+'),
+     compile, ['-O -g3 -ddump-simpl -dsuppress-uniques'])
+
+test('T27629', only_ways(['optasm']), makefile_test, ['T27629'])

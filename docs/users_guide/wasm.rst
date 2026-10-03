@@ -134,7 +134,7 @@ To start GHCi with the browser mode, use the following GHC flag:
 
     Enable wasm ghci browser mode, see :ref:`wasm-ghci`.
 
-::
+.. code:: none
 
    $ wasm32-wasi-ghc --interactive -fghci-browser
    GHCi, version 9.13.20250320: https://www.haskell.org/ghc/  :? for help
@@ -192,6 +192,18 @@ See below for other optional GHC flags of wasm ghci browser mode:
 
     Specify the port that the ``dyld`` HTTP server should listen on.
     Defaults to a random idle port.
+
+.. ghc-flag:: -fghci-browser-assets-dir
+    :shortdesc: User-specified assets root directory
+    :type: dynamic
+
+    :default: ``$PWD``
+
+    The HTTP server also exposes an ``/assets`` endpoint that allows
+    the users to fetch custom assets with sensible default MIME type,
+    e.g. `http://127.0.0.1:8080/assets/index.html` would fetch
+    `index.html` in the assets root directory with ``text/html`` MIME
+    type.
 
 .. ghc-flag:: -fghci-browser-redirect-wasi-console
     :shortdesc: Redirect wasi console stdout/stderr back to host ghci.
@@ -265,7 +277,7 @@ backend’s JavaScript FFI, which we’ll now abbreviate as JSFFI.
 Marshalable types and ``JSVal``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-JSFFI supports all boxed marshalable foreign types in C FFI:
+JSFFI supports all lifted marshalable foreign types in C FFI:
 
 -  ``Bool``
 -  ``Char``
@@ -298,8 +310,14 @@ types in JSFFI. Some caveats to keep in mind:
    results in type errors, so keep this in mind. As for ``Int`` /
    ``Word``, they are 32-bit since the GHC wasm backend is based on
    ``wasm32`` .
--  JSFFI doesn’t support unboxed foreign types like ``Int#``,
-   ``ByteArray#``, etc, even when ``UnliftedFFITypes`` is enabled.
+-  JSFFI doesn’t support unboxed foreign types like ``Int#``, even
+   when ``UnliftedFFITypes`` is enabled. The only supported unlifted
+   types are ``ByteArray#`` and ``MutableByteArray#``, they may only
+   be used as JSFFI import argument types, with the same semantics in
+   C FFI: the pointer to the payload is passed to JavaScript. Be
+   careful and avoid calling back into Haskell in such cases,
+   otherwise GC may occur and the pointer may be invalidated if it's
+   unpinned!
 
 In addition to the above types, JSFFI supports the ``JSVal`` type and
 its ``newtype``\ s as argument/result types. ``JSVal`` is defined in
@@ -633,7 +651,7 @@ When linking a wasm module that makes use of JSFFI, correct link-time
 arguments must be passed to GHC and this needs to be adjusted on a
 per-project basis:
 
-.. code:: haskell
+.. code:: none
 
    ghc -no-hs-main -optl-mexec-model=reactor -optl-Wl,--export=my_func
 

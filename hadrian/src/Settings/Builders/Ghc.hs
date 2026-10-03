@@ -10,7 +10,6 @@ import Packages
 import Settings.Builders.Common
 import Settings.Warnings
 import qualified Context as Context
-import Rules.Libffi (libffiName)
 import qualified Data.Set as Set
 import Data.Version.Extra
 
@@ -35,19 +34,26 @@ compileAndLinkHs = (builder (Ghc CompileHs) ||^ builder (Ghc LinkHs)) ? do
     useColor <- shakeColor <$> expr getShakeOptions
     let hasVanilla = elem vanilla ways
         hasDynamic = elem dynamic ways
+        hasProfiling = elem profiling ways
+        hasProfilingDynamic = elem profilingDynamic ways
     hieFiles <- ghcHieFiles <$> expr flavour
     stage <- getStage
     hie_path <- getHieBuildPath
     mconcat [ arg "-Wall"
-            , arg "-Wcompat"
             , not useColor ? builder (Ghc CompileHs) ?
               -- N.B. Target.trackArgument ignores this argument from the
               -- input hash to avoid superfluous recompilation, avoiding
               -- #18672.
               arg "-fdiagnostics-color=never"
             , (hasVanilla && hasDynamic) ? builder (Ghc CompileHs) ?
-              platformSupportsSharedLibs ? way vanilla ?
+              targetSupportsSharedLibs stage ? way vanilla ?
               arg "-dynamic-too"
+            , (hasProfiling && hasProfilingDynamic) ? builder (Ghc CompileHs) ?
+              targetSupportsSharedLibs stage ? way profiling ? mconcat
+              [ arg "-dynamic-too"
+              , arg "-dynosuf", arg $ osuf profilingDynamic
+              , arg "-dynhisuf", arg $ hisuf profilingDynamic
+              ]
             , commonGhcArgs
             , ghcLinkArgs
             , defaultGhcWarningsArgs
@@ -56,7 +62,6 @@ compileAndLinkHs = (builder (Ghc CompileHs) ||^ builder (Ghc LinkHs)) ? do
                   [ arg "-fwrite-ide-info"
                   , arg "-hiedir", arg hie_path
                   ]
-            , getInputs
             , arg "-o", arg =<< getOutput ]
 
 compileC :: Args
@@ -72,7 +77,6 @@ compileC = builder (Ghc CompileCWithGhc) ? do
             , mconcat (map (map ("-optc" ++) <$>) ccArgs)
             , defaultGhcWarningsArgs
             , arg "-c"
-            , getInputs
             , arg "-o"
             , arg =<< getOutput ]
 
@@ -89,7 +93,6 @@ compileCxx = builder (Ghc CompileCppWithGhc) ? do
             , mconcat (map (map ("-optcxx" ++) <$>) ccArgs)
             , defaultGhcWarningsArgs
             , arg "-c"
-            , getInputs
             , arg "-o"
             , arg =<< getOutput ]
 
@@ -100,19 +103,17 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
     libDirs <- getContextData extraLibDirs
     fmwks   <- getContextData frameworks
     way     <- getWay
+    st      <- getStage
 
     -- Relative path from the output (rpath $ORIGIN).
     originPath <- dropFileName <$> getOutput
     context <- getContext
     distPath <- expr (Context.distDynDir context)
 
-    useSystemFfi <- expr (flag UseSystemFfi)
-    buildPath <- getBuildPath
-    libffiName' <- libffiName
     debugged <- buildingCompilerStage' . ghcDebugged =<< expr flavour
 
-    osxTarget <- expr isOsxTarget
-    winTarget <- expr isWinTarget
+    osxTarget <- expr (isOsxTarget st)
+    winTarget <- expr (isWinTarget st)
 
     let
         dynamic = Dynamic `wayUnit` way
@@ -127,17 +128,6 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
                 metaOrigin | osxTarget = "@loader_path"
                            | otherwise = "$ORIGIN"
 
-        -- TODO: an alternative would be to generalize by linking with extra
-        -- bundled libraries, but currently the rts is the only use case. It is
-        -- a special case when `useSystemFfi == True`: the ffi library files
-        -- are not actually bundled with the rts. Perhaps ffi should be part of
-        -- rts's extra libraries instead of extra bundled libraries in that
-        -- case. Care should be take as to not break the make build.
-        rtsFfiArg = package rts ? not useSystemFfi ? mconcat
-            [ arg ("-L" ++ buildPath)
-            , arg ("-l" ++ libffiName')
-            ]
-
         -- This is the -rpath argument that is required for the bindist scenario
         -- to work. Indeed, when you install a bindist, the actual executables
         -- end up nested somewhere under $libdir, with the wrapper scripts
@@ -150,7 +140,7 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
                 [ arg "-dynamic"
                 -- TODO what about windows?
                 , isLibrary pkg ? pure [ "-shared", "-dynload", "deploy" ]
-                , notStage0 ? targetSupportsRPaths ? mconcat
+                , notStage0 ? staged targetSupportsRPaths ? mconcat
                       [ arg ("-optl-Wl,-rpath," ++ rpath)
                       , isProgram pkg ? arg ("-optl-Wl,-rpath," ++ bindistRpath)
                       -- The darwin and Windows linkers don't support/require the -zorigin option
@@ -166,9 +156,8 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
             , (not (nonHsMainPackage pkg) && not (isLibrary pkg)) ? arg "-rtsopts"
             , pure [ "-l" ++ lib    | lib    <- libs    ]
             , pure [ "-L" ++ libDir | libDir <- libDirs ]
-            , rtsFfiArg
             , osxTarget ? pure (concat [ ["-framework", fmwk] | fmwk <- fmwks ])
-            , debugged ? packageOneOf [ghc, iservProxy, iserv, remoteIserv] ?
+            , debugged ? packageOneOf [ghc, iservProxy, remoteIserv] ?
               arg "-debug"
             ]
 
@@ -182,7 +171,7 @@ findHsDependencies = builder (Ghc FindHsDependencies) ? do
             , arg "-include-pkg-deps"
             , arg "-dep-makefile", arg =<< getOutput
             , pure $ concat [ ["-dep-suffix", wayPrefix w] | w <- Set.toList ways ]
-            , getInputs ]
+            ]
 
 haddockGhcArgs :: Args
 haddockGhcArgs = mconcat [ commonGhcArgs

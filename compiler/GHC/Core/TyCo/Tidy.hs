@@ -334,7 +334,7 @@ tidyCo env co
     go (TyConAppCo r tc cos) = TyConAppCo r tc $! strictMap go cos
     go (AppCo co1 co2)       = (AppCo $! go co1) $! go co2
     go (ForAllCo tv visL visR h co)
-      = ((((ForAllCo $! tvp) $! visL) $! visR) $! (go h)) $! (tidyCo envp co)
+      = ((((ForAllCo $! tvp) $! visL) $! visR) $! (go_mco h)) $! (tidyCo envp co)
       where (envp, tvp) = tidyVarBndr env tv
             -- the case above duplicates a bit of work in tidying h and the kind
             -- of tv. But the alternative is to use coercionKind, which seems worse.
@@ -357,7 +357,7 @@ tidyCo env co
 
     go_cv cv = tidyTyCoVarOcc env cv
 
-    go_hole (CoercionHole cv r) = (CoercionHole $! go_cv cv) r
+    go_hole (CH cv r) = (CH $! go_cv cv) r
     -- Tidy even the holes; tidied types should have tidied kinds
 
 tidyCos :: TidyEnv -> [Coercion] -> [Coercion]

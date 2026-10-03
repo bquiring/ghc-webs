@@ -7,6 +7,7 @@ module Flavour
   , addArgs
   , splitSections
   , enableThreadSanitizer
+  , enableUBSan
   , enableLateCCS
   , enableHashUnitIds
   , enableDebugInfo, enableTickyGhc
@@ -14,6 +15,7 @@ module Flavour
   , enableProfiledGhc
   , disableDynamicGhcPrograms
   , disableDynamicLibs
+  , enableProfiledLibs
   , disableProfiledLibs
   , enableLinting
   , enableHaddock
@@ -33,6 +35,9 @@ import Data.Either
 import Data.Map (Map)
 import qualified Data.Map as M
 import qualified Data.Set as Set
+import GHC.Toolchain.Target
+import Oracles.Flag
+import Oracles.Setting
 import Packages
 import Flavour.Type
 import Settings.Parser
@@ -42,6 +47,7 @@ import Text.Parsec.Combinator as P
 import Text.Parsec.Char as P
 import Control.Monad.Except
 import UserSettings
+import BindistConfig
 
 
 flavourTransformers :: Map String (Flavour -> Flavour)
@@ -53,19 +59,22 @@ flavourTransformers = M.fromList
     , "no_split_sections" =: noSplitSections
     , "thread_sanitizer" =: enableThreadSanitizer False
     , "thread_sanitizer_cmm" =: enableThreadSanitizer True
+    , "ubsan"            =: enableUBSan
     , "llvm"             =: viaLlvmBackend
     , "profiled_ghc"     =: enableProfiledGhc
     , "no_dynamic_ghc"   =: disableDynamicGhcPrograms
     , "no_dynamic_libs"  =: disableDynamicLibs
     , "native_bignum"    =: useNativeBignum
     , "text_simdutf"     =: enableTextWithSIMDUTF
+    , "with_profiled_libs" =: enableProfiledLibs
     , "no_profiled_libs" =: disableProfiledLibs
     , "omit_pragmas"     =: omitPragmas
     , "ipe"              =: enableIPE
     , "fully_static"     =: fullyStatic
     , "host_fully_static" =: hostFullyStatic
     , "collect_timings"  =: collectTimings
-    , "assertions"       =: enableAssertions
+    , "assertions"        =: enableAssertions Stage2
+    , "assertions_stage1" =: enableAssertions Stage1
     , "debug_ghc"        =: debugGhc Stage2
     , "debug_stage1_ghc" =: debugGhc Stage1
     , "lint"             =: enableLinting
@@ -133,8 +142,9 @@ addArgs args' fl = fl { extraArgs = extraArgs fl <> args' }
 -- in unix and/or hsc2hs to make cross-compiling unix completely free
 -- from warnings.
 werror :: Flavour -> Flavour
-werror =
-  addArgs $ mconcat
+werror = addArgs $ do
+  stage <- getStage
+  mconcat
     [ builder Ghc
         ? notStage0
         ? mconcat
@@ -143,10 +153,6 @@ werror =
             -- unix has many unused imports
           , package unix
               ? mconcat [arg "-Wwarn=unused-imports", arg "-Wwarn=unused-top-binds"]
-            -- semaphore-compat relies on sem_getvalue as provided by unix, which is
-            -- not implemented on Darwin and therefore throws a deprecation warning
-          , package semaphoreCompat
-              ? mconcat [arg "-Wwarn=deprecations"]
           ]
     , builder Ghc
         ? package rts
@@ -156,6 +162,15 @@ werror =
           , arg "-optc-Wno-error=unknown-pragmas"
             -- rejected inlinings are highly dependent upon toolchain and way
           , arg "-optc-Wno-error=inline"
+            -- when building unregisterised, gcc 15+ complains "error:
+            -- function called through a non-compatible type" with
+            -- -Werror (#27404). no corresponding -Wno-foo for it so
+            -- -Wno-error is needed.
+            --
+            -- TODO: get rid of EFF_ altogether (#14647) and make sure
+            -- unregisterised backend emits clean C without needing
+            -- these hacks.
+          , queryTargetTarget stage tgtUnregisterised ? arg "-optc-Wno-error"
           ]
       -- N.B. We currently don't build the boot libraries' C sources with -Werror
       -- as this tends to be a portability nightmare.
@@ -164,9 +179,10 @@ werror =
 -- | Build C and Haskell objects with debugging information.
 enableDebugInfo :: Flavour -> Flavour
 enableDebugInfo = addArgs $ notStage0 ? mconcat
-    [ builder (Ghc CompileHs) ? pure ["-g3"]
-    , builder (Ghc CompileCWithGhc) ? pure ["-optc-g3"]
-    , builder (Cc CompileC) ? arg "-g3"
+    [ builder (Ghc CompileHs) ? pure ["-g3", "-optc-fno-omit-frame-pointer"]
+    , builder (Ghc CompileCWithGhc) ? pure ["-optc-g3", "-optc-fno-omit-frame-pointer"]
+    , builder (Ghc CompileCppWithGhc) ? pure ["-optcxx-g3", "-optcxx-fno-omit-frame-pointer"]
+    , builder (Cc CompileC) ? pure ["-g3", "-fno-omit-frame-pointer"]
     , builder (Cabal Setup) ? arg "--disable-library-stripping"
     , builder (Cabal Setup) ? arg "--disable-executable-stripping"
     ]
@@ -174,7 +190,7 @@ enableDebugInfo = addArgs $ notStage0 ? mconcat
 -- | Enable the ticky-ticky profiler in stage2 GHC
 enableTickyGhc :: Flavour -> Flavour
 enableTickyGhc f =
-    (addArgs (orM [stage1, cross] ? mconcat
+    (addArgs (stage1 ? mconcat
       [ builder (Ghc CompileHs) ? tickyArgs
       , builder (Ghc LinkHs) ? tickyArgs
       ]) f) { ghcThreaded = (< Stage2) }
@@ -258,49 +274,87 @@ enableThreadSanitizer instrumentCmm = addArgs $ notStage0 ? mconcat
         ]
     ]
 
--- | Use the LLVM backend in stages 1 and later.
-viaLlvmBackend :: Flavour -> Flavour
-viaLlvmBackend = addArgs $ notStage0 ? builder Ghc ? arg "-fllvm"
+-- | Whether or not @-shared-libsan@ should be passed to clang at
+-- link-time.
+--
+-- clang defaults to @-static-libsan@ on linux. In general,
+-- @-static-libsan@ is problematic when multiple copies of the
+-- sanitizer runtimes coexist in the same address space due to being
+-- linked into multiple Haskell libraries. So we should explicitly
+-- specify @-shared-libsan@ when using clang; it doesn't hurt on other
+-- platforms where it's already the default. gcc doesn't support this
+-- flag though.
+--
+-- On Linux, a small downside of @-shared-libsan@ is the
+-- clang-specific sanitizer runtime shared library path needs to be
+-- manually specified via
+-- @export LD_LIBRARY_PATH=$(dirname $(clang -print-libgcc-file-name -rtlib=compiler-rt))@
+-- for @ld.so@ to find it at runtime.
+needSharedLibSAN :: Stage -> Action Bool
+needSharedLibSAN = buildFlag CcLlvmBackend
 
--- | Build the GHC executable with profiling enabled in stages 2 and later. It
--- is also recommended that you use this with @'dynamicGhcPrograms' = False@
--- since GHC does not support loading of profiled libraries with the
--- dynamically-linker.
+-- | Build all stage1+ C/C++ code with UndefinedBehaviorSanitizer
+-- support:
+-- https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+enableUBSan :: Flavour -> Flavour
+enableUBSan =
+  addArgs $
+    notStage0
+      ? mconcat
+        [ package rts
+            ? builder (Cabal Flags)
+            ? arg "+ubsan"
+            <> (staged needSharedLibSAN ? arg "+shared-libsan"),
+          builder (Ghc CompileHs) ? arg "-optc-fsanitize=undefined",
+          builder (Ghc CompileCWithGhc) ? arg "-optc-fsanitize=undefined",
+          builder (Ghc CompileCppWithGhc) ? arg "-optcxx-fsanitize=undefined",
+          builder (Ghc LinkHs)
+            ? arg "-optc-fsanitize=undefined"
+            <> arg "-optl-fsanitize=undefined"
+            <> (staged needSharedLibSAN ? arg "-optl-shared-libsan"),
+          builder (Cc CompileC) ? arg "-fsanitize=undefined",
+          builder Testsuite ? arg "--config=have_ubsan=True"
+        ]
+
+-- | Use the LLVM backend in target stages
+viaLlvmBackend :: Flavour -> Flavour
+viaLlvmBackend = addArgs $ staged buildingForTarget ? builder Ghc ? arg "-fllvm"
+
+-- | Build the GHC executable with profiling enabled in stages 2 and
+-- later.
 enableProfiledGhc :: Flavour -> Flavour
 enableProfiledGhc flavour =
-  enableLateCCS flavour
-    { rtsWays = do
-        ws <- rtsWays flavour
-        mconcat
-          [ pure ws
-          , buildingCompilerStage' (>= Stage2) ? pure (foldMap profiled_ways ws)
-          ]
-    , libraryWays = mconcat
-        [ libraryWays flavour
-        , buildingCompilerStage' (>= Stage2) ? pure (Set.singleton profiling)
-        ]
-    , ghcProfiled = (>= Stage2)
-    }
-    where
-      profiled_ways w
-        | wayUnit Dynamic w = Set.empty
-        | otherwise         = Set.singleton (w <> profiling)
+  enableLateCCS $ enableProfiledLibs flavour { ghcProfiled = (>= Stage2) }
 
 -- | Disable 'dynamicGhcPrograms'.
 disableDynamicGhcPrograms :: Flavour -> Flavour
-disableDynamicGhcPrograms flavour = flavour { dynamicGhcPrograms = pure False }
+disableDynamicGhcPrograms flavour = flavour { dynamicGhcPrograms = const (pure False) }
 
 -- | Don't build libraries in dynamic 'Way's.
 disableDynamicLibs :: Flavour -> Flavour
 disableDynamicLibs flavour =
   flavour { libraryWays = prune $ libraryWays flavour,
             rtsWays = prune $ rtsWays flavour,
-            dynamicGhcPrograms = pure False
+            dynamicGhcPrograms = const (pure False)
           }
   where
     prune :: Ways -> Ways
     prune = fmap $ Set.filter (not . wayUnit Dynamic)
 
+-- | Build libraries and the RTS in profiled ways (opposite of
+-- 'disableProfiledLibs').
+enableProfiledLibs :: Flavour -> Flavour
+enableProfiledLibs flavour =
+  flavour
+    { libraryWays = addProfilingWays $ libraryWays flavour,
+      rtsWays = addProfilingWays $ rtsWays flavour
+    }
+  where
+    addProfilingWays :: Ways -> Ways
+    addProfilingWays ways = do
+      ws <- ways
+      buildProfiled <- notStage0
+      pure $ if buildProfiled then ws <> Set.map (<> profiling) ws else ws
 
 -- | Don't build libraries in profiled 'Way's.
 disableProfiledLibs :: Flavour -> Flavour
@@ -320,7 +374,7 @@ useNativeBignum flavour =
 -- | Enable building the @text@ package with @simdutf@ support.
 enableTextWithSIMDUTF :: Flavour -> Flavour
 enableTextWithSIMDUTF flavour = flavour {
-  textWithSIMDUTF = True
+  textWithSIMDUTF = buildingForTarget
 }
 
 enableHashUnitIds :: Flavour -> Flavour
@@ -339,9 +393,15 @@ omitPragmas = addArgs
 -- | Build stage2 dependencies with options to enable IPE debugging
 -- information.
 enableIPE :: Flavour -> Flavour
-enableIPE = addArgs
-    $ notStage0 ? builder (Ghc CompileHs)
-    ? pure ["-finfo-table-map", "-fdistinct-constructor-tables"]
+enableIPE =
+  addArgs $
+    mconcat
+      [ notStage0
+          ? builder (Ghc CompileHs)
+          ? pure
+            ["-finfo-table-map", "-fdistinct-constructor-tables"],
+        builder Testsuite ? arg "--config=ghc_with_ipe=True"
+      ]
 
 enableLateCCS :: Flavour -> Flavour
 enableLateCCS = addArgs
@@ -349,12 +409,12 @@ enableLateCCS = addArgs
   ? ((Profiling `wayUnit`) <$> getWay)
   ? arg "-fprof-late"
 
--- | Enable assertions for the stage2 compiler
-enableAssertions :: Flavour -> Flavour
-enableAssertions flav = flav { ghcDebugAssertions = f }
+-- | Enable -DDEBUG assertions in the compiler, at a specified stage
+enableAssertions :: Stage -> Flavour -> Flavour
+enableAssertions stage flav = flav { ghcDebugAssertions = f }
   where
-    f Stage2 = True
-    f st = ghcDebugAssertions flav st
+    f s | s == stage = True
+        | otherwise  = ghcDebugAssertions flav s
 
 -- | Build the stage3 compiler using the non-moving GC.
 enableBootNonmovingGc :: Flavour -> Flavour
@@ -401,17 +461,35 @@ fullyStatic flavour =
 -- libraries.
 hostFullyStatic :: Flavour -> Flavour
 hostFullyStatic flavour =
-    addArgs staticExec $ disableDynamicGhcPrograms flavour
+    addArgs staticExec . noDynamicRts $ disableDynamicGhcPrograms flavour
   where
     -- Unlike 'fullyStatic', we need to ensure these flags are only
     -- applied to host code.
     staticExec :: Args
-    staticExec = stage0 ? mconcat
+    staticExec = stage1 ? mconcat
         [
           builder (Ghc CompileHs) ? pure [ "-fPIC", "-static" ]
         , builder (Ghc CompileCWithGhc) ? pure [ "-fPIC", "-optc", "-static"]
         , builder (Ghc LinkHs) ? pure [ "-optl", "-static" ]
         ]
+    noDynamicRts :: Flavour -> Flavour
+    noDynamicRts f =
+       f
+         { rtsWays = do
+             ws <- rtsWays f
+             mconcat
+               [ notM stage1 ? pure ws,
+                 stage1
+                   ? pure (ws `Set.difference` Set.fromList [dynamic, profilingDynamic, threadedDynamic, threadedDebugDynamic, threadedProfilingDynamic, threadedDebugProfilingDynamic, debugDynamic, debugProfilingDynamic])
+               ]
+         , libraryWays = do
+             ws <- libraryWays f
+             mconcat
+               [ notM stage1 ? pure ws,
+                 stage1
+                   ? pure (ws `Set.difference` Set.fromList [dynamic, profilingDynamic, threadedDynamic, threadedDebugDynamic, threadedProfilingDynamic, threadedDebugProfilingDynamic, debugDynamic, debugProfilingDynamic ])
+               ]
+         }
 
 -- | Build stage2 dependencies with options to enable collection of compiler
 -- stats.
@@ -453,7 +531,7 @@ It now also offers a more "old-school" interface, in the form of
 @foo.bar.baz = v@ or @foo.bar.baz += v@ expressions, that one can
 pass on the command line that invokes hadrian:
 
-> $ hadrian/build --flavour=quickest -j "stage1.ghc-bin.ghc.link.opts += -v3"
+> $ hadrian/build --flavour=quick -j "stage1.ghc-bin.ghc.link.opts += -v3"
 
 or in a file at <build root>/hadrian.settings, where <build root>
 is the build root to be used for the build, which is _build by default.

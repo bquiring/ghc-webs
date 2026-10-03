@@ -1,7 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE BinaryLiterals #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module GHC.CmmToAsm.RV64.CodeGen
@@ -13,7 +9,6 @@ where
 
 import Control.Monad
 import Data.Maybe
-import Data.Word
 import GHC.Cmm
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
@@ -59,6 +54,7 @@ import GHC.Utils.Misc
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Types.Literal.Floating
 
 -- For an overview of an NCG's structure, see Note [General layout of an NCG]
 
@@ -580,13 +576,12 @@ getRegister' config plat expr =
           -- sign-extended on load!
           let imm = OpImm . ImmInteger $ narrowU w i
            in pure (Any (intFormat w) (\dst -> unitOL $ annExpr expr (MOV (OpReg w dst) imm)))
-        CmmFloat 0 w -> do
-          let op = litToImm' lit
+        CmmFloat f fty | isPositiveZeroLF f -> do
+          let w = litFloatingTypeWidth fty
+              op = litToImm' lit
           pure (Any (floatFormat w) (\dst -> unitOL $ annExpr expr (MOV (OpReg w dst) op)))
-        CmmFloat _f W8 -> pprPanic "getRegister' (CmmLit:CmmFloat), no support for bytes" (pdoc plat expr)
-        CmmFloat _f W16 -> pprPanic "getRegister' (CmmLit:CmmFloat), no support for halfs" (pdoc plat expr)
-        CmmFloat f W32 -> do
-          let word = castFloatToWord32 (fromRational f) :: Word32
+        CmmFloat f LitFloat -> do
+          let word = castFloatToWord32 (litFloatingToHostFloat f)
           intReg <- getNewRegNat (intFormat W32)
           return
             ( Any
@@ -599,8 +594,8 @@ getRegister' config plat expr =
                       ]
                 )
             )
-        CmmFloat f W64 -> do
-          let word = castDoubleToWord64 (fromRational f) :: Word64
+        CmmFloat f LitDouble -> do
+          let word = castDoubleToWord64 (litFloatingToHostDouble f)
           intReg <- getNewRegNat (intFormat W64)
           return
             ( Any
@@ -613,7 +608,6 @@ getRegister' config plat expr =
                       ]
                 )
             )
-        CmmFloat _f _w -> pprPanic "getRegister' (CmmLit:CmmFloat), unsupported float lit" (pdoc plat expr)
         CmmVec _lits -> pprPanic "getRegister' (CmmLit:CmmVec): " (pdoc plat expr)
         CmmLabel lbl -> do
           let op = OpImm (ImmCLbl lbl)
@@ -724,7 +718,7 @@ getRegister' config plat expr =
               ( \dst ->
                   code
                     `appOL` code_x
-                    `snocOL` annExpr expr (FCVT IntToFloat (OpReg to dst) (OpReg from reg_x)) -- (Signed ConVerT Float)
+                    `snocOL` annExpr expr (FCVT IntToFloat (OpReg to dst) (OpReg from reg_x) Rne) -- (Signed ConVerT Float)
               )
         MO_SF_Round from to ->
           pure
@@ -732,7 +726,7 @@ getRegister' config plat expr =
               (floatFormat to)
               ( \dst ->
                   code
-                    `snocOL` annExpr expr (FCVT IntToFloat (OpReg to dst) (OpReg from reg)) -- (Signed ConVerT Float)
+                    `snocOL` annExpr expr (FCVT IntToFloat (OpReg to dst) (OpReg from reg) Rne) -- (Signed ConVerT Float)
               )
         -- TODO: Can this case happen?
         MO_FS_Truncate from to
@@ -744,7 +738,7 @@ getRegister' config plat expr =
                       code
                         `snocOL`
                         -- W32 is the smallest width to convert to. Decrease width afterwards.
-                        annExpr expr (FCVT FloatToInt (OpReg W32 dst) (OpReg from reg))
+                        annExpr expr (FCVT FloatToInt (OpReg W32 dst) (OpReg from reg) Rtz)
                         `appOL` signExtendAdjustPrecission W32 to dst dst -- (float convert (-> zero) signed)
                   )
         MO_FS_Truncate from to ->
@@ -753,7 +747,7 @@ getRegister' config plat expr =
               (intFormat to)
               ( \dst ->
                   code
-                    `snocOL` annExpr expr (FCVT FloatToInt (OpReg to dst) (OpReg from reg))
+                    `snocOL` annExpr expr (FCVT FloatToInt (OpReg to dst) (OpReg from reg) Rtz)
                     `appOL` truncateReg from to dst -- (float convert (-> zero) signed)
               )
         MO_UU_Conv from to
@@ -775,9 +769,18 @@ getRegister' config plat expr =
                     `appOL` truncateReg from to dst
               )
         MO_SS_Conv from to -> ss_conv from to reg code
-        MO_FF_Conv from to -> return $ Any (floatFormat to) (\dst -> code `snocOL` annExpr e (FCVT FloatToFloat (OpReg to dst) (OpReg from reg)))
+        MO_FF_Conv from to -> return $ Any (floatFormat to) (\dst -> code `snocOL` annExpr e (FCVT FloatToFloat (OpReg to dst) (OpReg from reg) Rne))
         MO_WF_Bitcast w    -> return $ Any (floatFormat w)  (\dst -> code `snocOL` MOV (OpReg w dst) (OpReg w reg))
-        MO_FW_Bitcast w    -> return $ Any (intFormat w)    (\dst -> code `snocOL` MOV (OpReg w dst) (OpReg w reg))
+        MO_FW_Bitcast w ->
+          return
+            $ Any
+              (intFormat w)
+              ( \dst ->
+                  code
+                    `snocOL` MOV (OpReg w dst) (OpReg w reg)
+                    -- FMV.X.W sign-extends the value, so truncate the result
+                    `appOL` truncateReg W64 w dst
+              )
 
         -- Conversions
         -- TODO: Duplication with MO_UU_Conv
@@ -874,32 +877,16 @@ getRegister' config plat expr =
           )
 
     -- 2. Shifts. x << n, x >> n.
-    CmmMachOp (MO_Shl w) [x, CmmLit (CmmInt n _)]
-      | w == W32,
-        0 <= n,
-        n < 32 -> do
-          (reg_x, _format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `snocOL` annExpr expr (SLL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-                    `appOL` truncateReg w w dst
-              )
-    CmmMachOp (MO_Shl w) [x, CmmLit (CmmInt n _)]
-      | w == W64,
-        0 <= n,
-        n < 64 -> do
-          (reg_x, _format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `snocOL` annExpr expr (SLL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-                    `appOL` truncateReg w w dst
-              )
+    CmmMachOp (MO_Shl w) [x, CmmLit (CmmInt n _)] | fitsIn12bitImm n -> do
+      (reg_x, _format_x, code_x) <- getSomeReg x
+      return
+        $ Any
+          (intFormat w)
+          ( \dst ->
+              code_x
+                `snocOL` annExpr expr (SLL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
+                `appOL` truncateReg w w dst
+          )
     CmmMachOp (MO_S_Shr w) [x, CmmLit (CmmInt n _)] | fitsIn12bitImm n -> do
       (reg_x, format_x, code_x) <- getSomeReg x
       (reg_x', code_x') <- signExtendReg (formatToWidth format_x) w reg_x
@@ -910,83 +897,19 @@ getRegister' config plat expr =
               code_x
                 `appOL` code_x'
                 `snocOL` annExpr expr (SRA (OpReg w dst) (OpReg w reg_x') (OpImm (ImmInteger n)))
+                `appOL` truncateReg w w dst
           )
-    CmmMachOp (MO_S_Shr w) [x, y] -> do
+    CmmMachOp (MO_U_Shr w) [x, CmmLit (CmmInt n _)] | fitsIn12bitImm n -> do
       (reg_x, format_x, code_x) <- getSomeReg x
-      (reg_y, _format_y, code_y) <- getSomeReg y
-      (reg_x', code_x') <- signExtendReg (formatToWidth format_x) w reg_x
       return
         $ Any
           (intFormat w)
           ( \dst ->
               code_x
-                `appOL` code_x'
-                `appOL` code_y
-                `snocOL` annExpr expr (SRA (OpReg w dst) (OpReg w reg_x') (OpReg w reg_y))
-          )
-    CmmMachOp (MO_U_Shr w) [x, CmmLit (CmmInt n _)]
-      | w == W8,
-        0 <= n,
-        n < 8 -> do
-          (reg_x, format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `appOL` truncateReg (formatToWidth format_x) w reg_x
-                    `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-              )
-    CmmMachOp (MO_U_Shr w) [x, CmmLit (CmmInt n _)]
-      | w == W16,
-        0 <= n,
-        n < 16 -> do
-          (reg_x, format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `appOL` truncateReg (formatToWidth format_x) w reg_x
-                    `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-              )
-    CmmMachOp (MO_U_Shr w) [x, y] | w == W8 || w == W16 -> do
-      (reg_x, format_x, code_x) <- getSomeReg x
-      (reg_y, _format_y, code_y) <- getSomeReg y
-      return
-        $ Any
-          (intFormat w)
-          ( \dst ->
-              code_x
-                `appOL` code_y
                 `appOL` truncateReg (formatToWidth format_x) w reg_x
-                `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y))
+                `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
+                `appOL` truncateReg w w dst
           )
-    CmmMachOp (MO_U_Shr w) [x, CmmLit (CmmInt n _)]
-      | w == W32,
-        0 <= n,
-        n < 32 -> do
-          (reg_x, _format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-              )
-    CmmMachOp (MO_U_Shr w) [x, CmmLit (CmmInt n _)]
-      | w == W64,
-        0 <= n,
-        n < 64 -> do
-          (reg_x, _format_x, code_x) <- getSomeReg x
-          return
-            $ Any
-              (intFormat w)
-              ( \dst ->
-                  code_x
-                    `snocOL` annExpr expr (SRL (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)))
-              )
-
     -- 3. Logic &&, ||
     CmmMachOp (MO_And w) [CmmReg reg, CmmLit (CmmInt n _)]
       | fitsIn12bitImm n ->

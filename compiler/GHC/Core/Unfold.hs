@@ -41,6 +41,8 @@ import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.DataCon
 import GHC.Core.Type
+import GHC.Core.Class( Class )
+import GHC.Core.Predicate( isUnaryClass )
 
 import GHC.Types.Id
 import GHC.Types.Literal
@@ -51,8 +53,10 @@ import GHC.Types.ForeignCall
 import GHC.Types.Tickish
 
 import GHC.Builtin.PrimOps
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
+
 import GHC.Data.Bag
+
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 
@@ -148,10 +152,12 @@ updateCaseScaling n opts = opts { unfoldingCaseScaling = n }
 updateReportPrefix :: Maybe String -> UnfoldingOpts -> UnfoldingOpts
 updateReportPrefix n opts = opts { unfoldingReportPrefix = n }
 
-data ArgSummary = TrivArg       -- Nothing interesting
-                | NonTrivArg    -- Arg has structure
-                | ValueArg      -- Arg is a con-app or PAP
-                                -- ..or con-like. Note [Conlike is interesting]
+data ArgSummary
+  = TrivArg       -- Nothing interesting
+  | NonTrivArg    -- Arg has structure
+  | ValueArg      -- Arg is a con-app or PAP
+                  -- ..or con-like. See (IA1) in Note [Interesting arguments]
+                  --                          in GHC.Core.Opt.Simplify.Utils
 
 instance Outputable ArgSummary where
   ppr TrivArg    = text "TrivArg"
@@ -274,6 +280,14 @@ inlining a saturated call is no bigger than `body`.  Some wrinkles:
   whose body is, in some sense, just as small as (g x y z).
   But `inlineBoringOk` doesn't attempt anything fancy; it just looks
   for a function call with trivial arguments, Keep it simple.
+
+(IB6) If we have an unfolding (K op) where K is a unary-class data constructor,
+  we want to inline it!  So that we get calls (f op), which in turn can see (in
+  STG land) that `op` is already evaluated and properly tagged. (If `op` isn't
+  trivial we will have baled out before we get to the Var case.)  This made
+  a big difference in benchmarks for the `effectful` library; details in !10479.
+
+  See Note [Unary class magic] in GHC/Core/TyCon.
 -}
 
 inlineBoringOk :: CoreExpr -> Bool
@@ -287,6 +301,7 @@ inlineBoringOk e
     is_fun = isValFun e
 
     go :: Int -> CoreExpr -> Bool
+    -- credit = #(value lambdas) = #(value args)
     go credit (Lam x e) | isRuntimeVar x  = go (credit+1) e
                         | otherwise       = go credit e      -- See (IB3)
 
@@ -305,13 +320,15 @@ inlineBoringOk e
     go credit (Tick _ e) = go credit e      -- dubious
     go credit (Cast e _) = go credit e      -- See (IB3)
 
+    -- Lit: we assume credit >= 0; literals aren't functions
     go _      (Lit l)    = litIsTrivial l && boringCxtOk
 
-      -- We assume credit >= 0; literals aren't functions
     go credit (Var v) | isDataConWorkId v, is_fun = boringCxtOk  -- See (IB2)
+                      | isUnaryClassId v          = boringCxtOk  -- See (IB6)
                       | credit >= 0               = boringCxtOk
                       | otherwise                 = boringCxtNotOk
-    go _      _                                   = boringCxtNotOk
+
+    go _ _ = boringCxtNotOk
 
 isValFun :: CoreExpr -> Bool
 -- True of functions with at least
@@ -622,6 +639,7 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
         where
           is_top_arg (Var v) | v `elem` top_args = Just v
           is_top_arg (Cast e _) = is_top_arg e
+          is_top_arg (Tick _t e) = is_top_arg e
           is_top_arg _ = Nothing
 
       where
@@ -688,11 +706,13 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
     size_up_call :: Id -> [CoreExpr] -> Int -> ExprSize
     size_up_call fun val_args voids
        = case idDetails fun of
-           FCallId _        -> sizeN (callSize (length val_args) voids)
-           DataConWorkId dc -> conSize    dc (length val_args)
-           PrimOpId op _    -> primOpSize op (length val_args)
-           ClassOpId {}     -> classOpSize opts top_args val_args
-           _                -> funSize opts top_args fun (length val_args) voids
+           FCallId _                     -> sizeN (callSize (length val_args) voids)
+           DataConWorkId dc              -> conSize    dc (length val_args)
+           PrimOpId op _                 -> primOpSize op (length val_args)
+           ClassOpId cls _               -> classOpSize opts cls top_args val_args
+           _ | fun `hasKey` buildIdKey   -> buildSize
+             | fun `hasKey` augmentIdKey -> augmentSize
+             | otherwise                 -> funSize opts top_args fun (length val_args) voids
 
     ------------
     size_up_alt (Alt _con _bndrs rhs) = size_up rhs `addSizeN` 10
@@ -757,21 +777,30 @@ litSize _other = 0    -- Must match size of nullary constructors
                       -- Key point: if  x |-> 4, then x must inline unconditionally
                       --            (eg via case binding)
 
-classOpSize :: UnfoldingOpts -> [Id] -> [CoreExpr] -> ExprSize
--- See Note [Conlike is interesting]
-classOpSize _ _ []
-  = sizeZero
-classOpSize opts top_args (arg1 : other_args)
-  = SizeIs size arg_discount 0
+classOpSize :: UnfoldingOpts -> Class -> [Id] -> [CoreExpr] -> ExprSize
+-- See (IA1) in Note [Interesting arguments] in GHC.Core.Opt.Simplify.Utils
+classOpSize _opts _cls _top_args []
+  = sizeZero   -- A non-applied classop
+classOpSize opts cls top_args (dict_arg:other_val_args)
+  = SizeIs size (arg_discount dict_arg) 0
   where
-    size = 20 + (10 * length other_args)
+    size | isUnaryClass cls = 0    -- See (UCM4) in Note [Unary class magic] in GHC.Core.TyCon
+         | otherwise        = 20 + (10 * length other_val_args)
+
     -- If the class op is scrutinising a lambda bound dictionary then
     -- give it a discount, to encourage the inlining of this function
-    -- The actual discount is rather arbitrarily chosen
-    arg_discount = case arg1 of
-                     Var dict | dict `elem` top_args
-                              -> unitBag (dict, unfoldingDictDiscount opts)
-                     _other   -> emptyBag
+    arg_discount (Cast arg _co)                    = arg_discount arg
+    arg_discount (Var dict) | dict `elem` top_args = unitBag (dict, dict_discount)
+    arg_discount _                                 = emptyBag
+
+    -- If we have (class-op d arg1 .. argn) then it's super-good to inline
+    -- to expose `d`; not only can we do the dictionary selection
+    -- (class-op d), but that will likely expose a lambda which we can then
+    -- apply.  In that case (n > 0), we add `unfoldingFunAppDiscount`.
+    -- See the discussion on #26831, esp "Delicate inlining".
+    dict_discount
+      | null other_val_args = unfoldingDictDiscount opts
+      | otherwise           = unfoldingDictDiscount opts + unfoldingFunAppDiscount opts
 
 -- | The size of a function call
 callSize
@@ -798,11 +827,9 @@ jumpSize _n_val_args _voids = 0   -- Jumps are small, and we don't want penalise
   -- better solution?
 
 funSize :: UnfoldingOpts -> [Id] -> Id -> Int -> Int -> ExprSize
--- Size for functions that are not constructors or primops
+-- Size for function calls where the function is not a constructor or primops
 -- Note [Function applications]
 funSize opts top_args fun n_val_args voids
-  | fun `hasKey` buildIdKey   = buildSize
-  | fun `hasKey` augmentIdKey = augmentSize
   | otherwise = SizeIs size arg_discount res_discount
   where
     some_val_args = n_val_args > 0
@@ -831,6 +858,8 @@ conSize dc n_val_args
 
 -- See Note [Unboxed tuple size and result discount]
   | isUnboxedTupleDataCon dc = SizeIs 0 emptyBag 10
+
+  | isUnaryClassDataCon dc = sizeZero
 
 -- See Note [Constructor size and result discount]
   | otherwise = SizeIs 10 emptyBag 10

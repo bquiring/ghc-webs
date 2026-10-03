@@ -1,8 +1,3 @@
-
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -18,16 +13,17 @@
 module GHC.Tc.Gen.Expr
        ( tcCheckPolyExpr, tcCheckPolyExprNC,
          tcCheckMonoExpr, tcCheckMonoExprNC,
-         tcMonoExpr, tcMonoExprNC,
+         tcInferExpr, tcInferSigma,
          tcInferRho, tcInferRhoNC,
-         tcPolyLExpr, tcPolyExpr, tcExpr, tcPolyLExprSig,
+         tcMonoLExpr, tcMonoLExprNC,
+         tcInferRhoFRR, tcInferRhoFRRNC,
+         tcPolyLExpr,  tcPolyLExprSig, tcPolyLExprNC,
+         tcPolyExpr, tcExpr,
          tcSyntaxOp, tcSyntaxOpGen, SyntaxOpType(..), synKnownType,
          tcCheckId,
          ) where
 
 import GHC.Prelude
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import {-# SOURCE #-} GHC.Tc.Gen.Splice
   ( tcTypedSplice, tcTypedBracket, tcUntypedBracket, getUntypedSpliceBody )
@@ -35,59 +31,71 @@ import {-# SOURCE #-} GHC.Tc.Gen.Splice
 import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Rename.Utils
-import GHC.Tc.Utils.Monad
-import GHC.Tc.Utils.Unify
-import GHC.Types.Basic
-import GHC.Types.FieldLabel
-import GHC.Types.Unique.FM
-import GHC.Types.Unique.Map
-import GHC.Types.Unique.Set
-import GHC.Core.Multiplicity
-import GHC.Core.UsageEnv
-import GHC.Tc.Errors.Types hiding (HoleError)
-import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
-import GHC.Tc.Utils.Instantiate
+import GHC.Rename.Env         ( addUsedGRE, getUpdFieldLbls )
+
+import GHC.Tc.Gen.Expand( tcExpand )
 import GHC.Tc.Gen.App
 import GHC.Tc.Gen.Head
+import GHC.Tc.Gen.Do
 import GHC.Tc.Gen.Bind        ( tcLocalBinds )
-import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
-import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Rename.Env         ( addUsedGRE, getUpdFieldLbls )
-import GHC.Tc.Utils.Env
+import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Arrow
 import GHC.Tc.Gen.Match( tcBody, tcLambdaMatches, tcCaseMatches
                        , tcGRHSNE, tcDoStmts )
-import GHC.Tc.Gen.HsType
-import GHC.Tc.Utils.TcMType
+import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Tc.Zonk.TcType
-import GHC.Tc.Types.Origin
+import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType as TcType
-import GHC.Types.Id
-import GHC.Types.Id.Info
+import GHC.Tc.Utils.Monad
+import GHC.Tc.Utils.Unify
+import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
+import GHC.Tc.Utils.Instantiate
+import GHC.Tc.Utils.Env
+import GHC.Tc.Types.Origin
+import GHC.Tc.Types.Evidence
+import GHC.Tc.Errors.Types hiding (HoleError)
+
+import GHC.Core.Multiplicity
+import GHC.Core.UsageEnv
+import GHC.Core.FamInstEnv    ( FamInstEnvs )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Types.Name
-import GHC.Types.Name.Env
-import GHC.Types.Name.Set
-import GHC.Types.Name.Reader
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Coercion
-import GHC.Tc.Types.Evidence
-import GHC.Builtin.Types
-import GHC.Builtin.Names
-import GHC.Builtin.Uniques ( mkBuiltinUnique )
-import GHC.Driver.DynFlags
+import GHC.Core.Predicate( decomposeIPPred )
+
+import GHC.Types.Basic
+import GHC.Types.Unique.FM
+import GHC.Types.Unique.Map
+import GHC.Types.Unique.Set
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.Name
+import GHC.Types.Name.Env
+import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
+
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs
+import GHC.Builtin.Uniques ( mkBuiltinUnique )
+
+import GHC.Driver.DynFlags
+
 import GHC.Utils.Misc
-import GHC.Data.List.SetOps
-import GHC.Data.Maybe
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
+import GHC.Data.List.SetOps
+import GHC.Data.Maybe
+import GHC.Data.FastString (fastStringToShortText)
+
 import Control.Monad
 import qualified Data.List.NonEmpty as NE
+
+import qualified GHC.LanguageExtensions as LangExt
 
 {-
 ************************************************************************
@@ -113,11 +121,11 @@ tcCheckPolyExprNC expr res_ty = tcPolyLExprNC expr (mkCheckExpType res_ty)
 -----------------
 -- These versions take an ExpType
 tcPolyLExpr, tcPolyLExprNC :: LHsExpr GhcRn -> ExpSigmaType
-                           -> TcM (LHsExpr GhcTc)
+                            -> TcM (LHsExpr GhcTc)
 
 tcPolyLExpr (L loc expr) res_ty
-  = setSrcSpanA loc  $  -- Set location /first/; see GHC.Tc.Utils.Monad
-    addExprCtxt expr $  -- Note [Error contexts in generated code]
+  = setSrcSpanA loc   $  -- Set the error location context first
+    addExprCtxt expr  $  -- Note [Error contexts in generated code]
     do { expr' <- tcPolyExpr expr res_ty
        ; return (L loc expr') }
 
@@ -168,14 +176,14 @@ tcPolyExprCheck expr res_ty
              ; return (HsPar x (L loc e')) }
 
       -- Look through any untyped splices (#24559)
-      -- c.f. Note [Looking through Template Haskell splices in splitHsApps]
+      -- See Note [Type Checking Template Haskell Splices]
       tc_body (HsUntypedSplice splice_res _)
         = do { body <- getUntypedSpliceBody splice_res
              ; tc_body body }
 
       -- The special case for lambda: go to tcLambdaMatches, passing pat_tys
       tc_body e@(HsLam x lam_variant matches)
-        = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches pat_tys
+        = do { (wrap, matches') <-  tcLambdaMatches e lam_variant matches pat_tys
                                                    (mkCheckExpType rho_ty)
                -- NB: tcLambdaMatches concludes with deep skolemisation,
                --     if DeepSubsumption is on;  hence no need to do that here
@@ -196,6 +204,9 @@ tcPolyExprCheck expr res_ty
                     -> TcM (HsExpr GhcTc)
     outer_skolemise (Left ty) thing_inside
       = do { (wrap, expr') <- tcSkolemiseExpectedType ty thing_inside
+           ; traceTc "outer_skol" (vcat [ text "wrap" <+> ppr wrap
+                                        , text "expr'" <+> ppr expr'
+                                        , text "wrapped" <+> ppr (mkHsWrap wrap expr') ])
            ; return (mkHsWrap wrap expr') }
     outer_skolemise (Right sig) thing_inside
       = do { (wrap, expr') <- tcSkolemiseCompleteSig sig thing_inside
@@ -209,9 +220,9 @@ tcPolyExprCheck expr res_ty
     inner_skolemise Shallow rho_ty thing_inside
       = -- We have already done shallow skolemisation, so nothing further to do
         thing_inside rho_ty
-    inner_skolemise Deep rho_ty thing_inside
+    inner_skolemise deep rho_ty thing_inside
       = -- Try deep skolemisation
-        do { (wrap, expr') <- tcSkolemise Deep ctxt rho_ty thing_inside
+        do { (wrap, expr') <- tcSkolemise deep ctxt rho_ty thing_inside
            ; return (mkHsWrap wrap expr') }
 
     ctxt = case res_ty of
@@ -225,17 +236,34 @@ tcPolyExprCheck expr res_ty
 *                                                                      *
 ********************************************************************* -}
 
+tcInferSigma :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcSigmaType)
+tcInferSigma = tcInferExpr IIF_Sigma
+
 tcInferRho, tcInferRhoNC :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcRhoType)
 -- Infer a *rho*-type. The return type is always instantiated.
-tcInferRho (L loc expr)
-  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
+tcInferRho   = tcInferExpr   IIF_DeepRho
+tcInferRhoNC = tcInferExprNC IIF_DeepRho
+
+tcInferRhoFRR, tcInferRhoFRRNC :: FixedRuntimeRepContext -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcRhoType)
+-- Infer a *rho*-type. The return type is always instantiated.
+tcInferRhoFRR   frr = tc_infer_expr    (IFRR_Check frr) IIF_DeepRho
+tcInferRhoFRRNC frr = tc_infer_expr_NC (IFRR_Check frr) IIF_DeepRho
+
+tcInferExpr, tcInferExprNC :: InferInstFlag -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcType)
+tcInferExpr   = tc_infer_expr    IFRR_Any
+tcInferExprNC = tc_infer_expr_NC IFRR_Any
+
+tc_infer_expr, tc_infer_expr_NC :: InferFRRFlag -> InferInstFlag
+                                -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcType)
+tc_infer_expr ifrr iif (L loc expr)
+  = setSrcSpanA loc  $  -- Set the error location context first
     addExprCtxt expr $  -- Note [Error contexts in generated code]
-    do { (expr', rho) <- tcInfer (tcExpr expr)
+    do { (expr', rho) <- runInfer iif ifrr (tcExpr expr)
        ; return (L loc expr', rho) }
 
-tcInferRhoNC (L loc expr)
-  = setSrcSpanA loc $
-    do { (expr', rho) <- tcInfer (tcExpr expr)
+tc_infer_expr_NC ifrr iif (L loc expr)
+  = setSrcSpanA loc  $
+    do { (expr', rho) <- runInfer iif ifrr (tcExpr expr)
        ; return (L loc expr', rho) }
 
 ---------------
@@ -244,26 +272,32 @@ tcCheckMonoExpr, tcCheckMonoExprNC
     -> TcRhoType         -- Expected type
                          -- Definitely no foralls at the top
     -> TcM (LHsExpr GhcTc)
-tcCheckMonoExpr   expr res_ty = tcMonoExpr   expr (mkCheckExpType res_ty)
-tcCheckMonoExprNC expr res_ty = tcMonoExprNC expr (mkCheckExpType res_ty)
+tcCheckMonoExpr   expr res_ty = tcMonoLExpr  expr (mkCheckExpType res_ty)
+tcCheckMonoExprNC expr res_ty = tcMonoLExprNC expr (mkCheckExpType res_ty)
 
 ---------------
-tcMonoExpr, tcMonoExprNC
+tcMonoLExpr, tcMonoLExprNC
     :: LHsExpr GhcRn     -- Expression to type check
     -> ExpRhoType        -- Expected type
                          -- Definitely no foralls at the top
     -> TcM (LHsExpr GhcTc)
 
-tcMonoExpr (L loc expr) res_ty
-  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
+tcMonoLExpr (L loc expr) res_ty
+  = setSrcSpanA loc   $ -- Set the error location context first
     addExprCtxt expr $  -- Note [Error contexts in generated code]
     do  { expr' <- tcExpr expr res_ty
         ; return (L loc expr') }
 
-tcMonoExprNC (L loc expr) res_ty
+tcMonoLExprNC (L loc expr) res_ty
   = setSrcSpanA loc $
     do  { expr' <- tcExpr expr res_ty
         ; return (L loc expr') }
+
+---------------
+tcCollectApp :: HsExpr GhcRn -> ExpRhoType -> TcM (HsExpr GhcTc)
+tcCollectApp the_app res_ty
+  = do { (fun, args) <- splitHsApps the_app
+       ; tcApp the_app fun args res_ty }
 
 ---------------
 tcExpr :: HsExpr GhcRn
@@ -276,24 +310,26 @@ tcExpr :: HsExpr GhcRn
 --   - HsVar           lone variables, to ensure that they can get an
 --                     impredicative instantiation (via Quick Look
 --                     driven by res_ty (in checking mode)).
---   - HsApp           value applications
---   - HsAppType       type applications
 --   - ExprWithTySig   (e :: type)
 --   - HsRecSel        overloaded record fields
---   - ExpandedThingRn renamer/pre-typechecker expansions
 --   - HsOpApp         operator applications
 --   - HsOverLit       overloaded literals
+--   - HsApp           value applications
+--   - HsAppType       type applications
+
 -- These constructors are the union of
 --   - ones taken apart by GHC.Tc.Gen.Head.splitHsApps
 --   - ones understood by GHC.Tc.Gen.Head.tcInferAppHead_maybe
+-- HsType and HsTypeApp are a little special as
+-- before calling tcApp on them we run splitHsApps on the
+-- expression and try to break them up further
+-- and then call tcApp on the maximal application chain.
 -- See Note [Application chains and heads] in GHC.Tc.Gen.App
-tcExpr e@(HsVar {})              res_ty = tcApp e res_ty
-tcExpr e@(HsApp {})              res_ty = tcApp e res_ty
-tcExpr e@(OpApp {})              res_ty = tcApp e res_ty
-tcExpr e@(HsAppType {})          res_ty = tcApp e res_ty
-tcExpr e@(ExprWithTySig {})      res_ty = tcApp e res_ty
-
-tcExpr (XExpr e)                 res_ty = tcXExpr e res_ty
+tcExpr e@(HsVar {})              res_ty = tcApp e e [] res_ty
+tcExpr e@(ExprWithTySig {})      res_ty = tcApp e e [] res_ty
+tcExpr e@(XExpr (HsRecSelRn{}))  res_ty = tcApp e e [] res_ty
+tcExpr e@(HsAppType {})          res_ty = tcCollectApp e res_ty
+tcExpr e@(HsApp {})              res_ty = tcCollectApp e res_ty
 
 -- Typecheck an occurrence of an unbound Id
 --
@@ -314,11 +350,11 @@ tcExpr e@(HsLit x lit) res_ty
        ; tcWrapResult e (HsLit x (convertLit lit)) lit_ty res_ty }
 
 tcExpr (HsPar x expr) res_ty
-  = do { expr' <- tcMonoExprNC expr res_ty
+  = do { expr' <- tcMonoLExprNC expr res_ty
        ; return (HsPar x expr') }
 
 tcExpr (HsPragE x prag expr) res_ty
-  = do { expr' <- tcMonoExpr expr res_ty
+  = do { expr' <- tcMonoLExpr expr res_ty
        ; return (HsPragE x (tcExprPrag prag) expr') }
 
 tcExpr (NegApp x expr neg_expr) res_ty
@@ -333,16 +369,15 @@ tcExpr e@(HsIPVar _ x) res_ty
           -- Create a unification type variable of kind 'Type'.
           -- (The type of an implicit parameter must have kind 'Type'.)
        ; let ip_name = mkStrLitTy (hsIPNameFS x)
-       ; ipClass <- tcLookupClass ipClassName
-       ; ip_var <- emitWantedEvVar origin (mkClassPred ipClass [ip_name, ip_ty])
+             origin  = IPOccOrigin x
+       ; ip_class <- tcLookupKnownKeyClass ipClassKey
+       ; let ip_pred = mkClassPred ip_class [ip_name, ip_ty]
+       ; ip_dict <- emitWantedEvVar origin ip_pred
+       ; let (ip_op, _) = decomposeIPPred ip_pred
+             wrap = mkWpEvVarApps [ip_dict] <.> mkWpTyApps [ip_name, ip_ty]
        ; tcWrapResult e
-                   (fromDict ipClass ip_name ip_ty (mkHsVar (noLocA ip_var)))
-                   ip_ty res_ty }
-  where
-  -- Coerces a dictionary for `IP "x" t` into `t`.
-  fromDict ipClass x ty = mkHsWrap $ mkWpCastR $
-                          unwrapIP $ mkClassPred ipClass [x,ty]
-  origin = IPOccOrigin x
+               (mkHsWrap wrap (mkHsVar (noLocA ip_op)))
+               ip_ty res_ty }
 
 tcExpr e@(HsLam x lam_variant matches) res_ty
   = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches [] res_ty
@@ -362,7 +397,7 @@ tcExpr e@(HsOverLit _ lit) res_ty
          -- See Note [Short cut for overloaded literals] in GHC.Tc.Utils.TcMType
        ; case mb_res of
            Just lit' -> return (HsOverLit noExtField lit')
-           Nothing   -> tcApp e res_ty }
+           Nothing   -> tcApp e e [] res_ty }
            -- Why go via tcApp? See Note [Typechecking overloaded literals]
 
 {- Note [Typechecking overloaded literals]
@@ -392,6 +427,7 @@ tricky:
   We can only take this short-cut if rebindable syntax is off; see `tcShortCutLit`.
 -}
 
+tcExpr e@HsQualLit{} _ = pprPanic "tcExpr: HsQualLit" (ppr e)
 
 {-
 ************************************************************************
@@ -472,7 +508,7 @@ tcExpr (ExplicitSum _ alt arity expr) res_ty
 
 tcExpr (HsLet x binds expr) res_ty
   = do  { (binds', expr') <- tcLocalBinds binds $
-                             tcMonoExpr expr res_ty
+                             tcMonoLExpr expr res_ty
         ; return (HsLet x binds' expr') }
 
 tcExpr (HsCase ctxt scrut matches) res_ty
@@ -493,16 +529,15 @@ tcExpr (HsCase ctxt scrut matches) res_ty
           --     case id        of {..}
           --     case (\v -> v) of {..}
           -- This design choice is discussed in #17790
-        ; (scrut', scrut_ty) <- tcScalingUsage mult $ tcInferRho scrut
-
-        ; hasFixedRuntimeRep_syntactic FRRCase scrut_ty
+        ; (scrut', scrut_ty) <- tcScalingUsage mult $ tcInferRhoFRR FRRCase scrut
         ; matches' <- tcCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches res_ty
         ; return (HsCase ctxt scrut' matches') }
 
 tcExpr (HsIf x pred b1 b2) res_ty
   = do { pred'    <- tcCheckMonoExpr pred boolTy
-       ; (u1,b1') <- tcCollectingUsage $ tcMonoExpr b1 res_ty
-       ; (u2,b2') <- tcCollectingUsage $ tcMonoExpr b2 res_ty
+       ; let res_ty' = adjustExpTypeForCaseBranches res_ty [b1,b2]
+       ; (u1,b1') <- tcCollectingUsage $ tcMonoLExpr b1 res_ty'
+       ; (u2,b2') <- tcCollectingUsage $ tcMonoLExpr b2 res_ty'
        ; tcEmitBindingUsage (supUE u1 u2)
        ; return (HsIf x pred' b1' b2') }
 
@@ -537,6 +572,22 @@ tcExpr (HsMultiIf _ alts) res_ty
        ; return (HsMultiIf res_ty alts') }
 
 tcExpr (HsDo _ do_or_lc stmts) res_ty
+  | DoExpr{} <- do_or_lc
+  -- ApplicativeDo are typechecked using tcDoStmts
+  = do isApplicativeDo <- xoptM LangExt.ApplicativeDo
+       if isApplicativeDo
+         then tcDoStmts do_or_lc stmts res_ty
+         -- Expand expression on the fly otherwise
+         -- See Note [Typechecking by expansion: overview]
+         else do { hse <- expandDoStmts do_or_lc stmts
+                 ; tcHsExpansion hse res_ty }
+  | MDoExpr{} <- do_or_lc
+  = do hse <- expandDoStmts do_or_lc stmts
+       tcHsExpansion hse res_ty
+  | otherwise
+  -- ListComp and MonadComp are handled by legacy tcDoStmts for now,
+  -- The ultimate goal is to handle them via expandDoStmts.
+  -- GHCiStmts are handled completely separate
   = tcDoStmts do_or_lc stmts res_ty
 
 tcExpr (HsProc x pat cmd) res_ty
@@ -551,45 +602,71 @@ tcExpr (HsProc x pat cmd) res_ty
 -- and wrap (static e) in a call to
 --    fromStaticPtr :: IsStatic p => StaticPtr a -> p a
 
-tcExpr (HsStatic fvs expr) res_ty
+tcExpr (HsStatic free_names expr) res_ty
   = do  { res_ty          <- expTypeToType res_ty
         ; (co, (p_ty, expr_ty)) <- matchExpectedAppTy res_ty
-        ; (expr', lie)    <- captureConstraints $
-            addErrCtxt (StaticFormCtxt expr) $
-              tcCheckPolyExprNC expr expr_ty
+        ; (expr', lie) <- captureConstraints $
+                          addErrCtxt (StaticFormCtxt expr) $
+                          tcCheckPolyExprNC expr expr_ty
 
-        -- Check that the free variables of the static form are closed.
+        -- Check that the free variables of the static form are top-level defined
         -- It's OK to use nonDetEltsUniqSet here as the only side effects of
         -- checkClosedInStaticForm are error messages.
-        ; mapM_ checkClosedInStaticForm $ nonDetEltsUniqSet fvs
+        -- See (SF2) Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
+        ; mapM_ check_free_name (nonDetEltsUniqSet free_names)
+
+        -- Emit an implication that captures the constraints of `expr`,
+        -- but with a `ic_info` of StaticFormSkol
+        -- See #13499 for an explanation of why this is the right thing to do:
+        -- the enclosing skolems must be in scope.
+        ; tc_lvl <- getTcLevel  -- No need to bump the level
+        ; (implic, ev_binds) <- buildImplicationFor tc_lvl StaticFormSkol [] [] lie
+        ; emitImplications implic
+        ; let expr'' = mkLHsWrap (mkWpLet ev_binds) expr'
 
         -- Require the type of the argument to be Typeable.
-        ; typeableClass <- tcLookupClass typeableClassName
+        ; typeableClass <- tcLookupKnownKeyClass typeableClassKey
         ; typeable_ev <- emitWantedEvVar StaticOrigin $
-                  mkTyConApp (classTyCon typeableClass)
-                             [liftedTypeKind, expr_ty]
-
-        -- Insert the constraints of the static form in a global list for later
-        -- validation.  See #13499 for an explanation of why this really isn't the
-        -- right thing to do: the enclosing skolems aren't in scope any more!
-        -- Static forms really aren't well worked out yet.
-        ; emitStaticConstraints lie
+                         mkTyConApp (classTyCon typeableClass)
+                                    [liftedTypeKind, expr_ty]
 
         -- Wrap the static form with the 'fromStaticPtr' call.
-        ; fromStaticPtr <- newMethodFromName StaticOrigin fromStaticPtrName
-                                             [p_ty]
+        --   fromStaticPtr :: forall p. (IsStatic p) =>
+        --                    forall a. (Typeable a) =>
+        --                    StaticPtr a -> p a
+        ; fromStaticPtr <- newKnownOccMethod StaticOrigin
+                                    fromStaticPtrClassOpOcc [p_ty]
+        ; static_ptr_ty_con <- tcLookupKnownOccTyCon staticPtrTyConOcc
         ; let wrap = mkWpEvVarApps [typeable_ev] <.> mkWpTyApps [expr_ty]
-        ; loc <- getSrcSpanM
-        ; static_ptr_ty_con <- tcLookupTyCon staticPtrTyConName
-        ; return $ mkHsWrapCo co $ HsApp noExtField
-                            (L (noAnnSrcSpan loc) $ mkHsWrap wrap fromStaticPtr)
-                            (L (noAnnSrcSpan loc) (HsStatic (fvs, mkTyConApp static_ptr_ty_con [expr_ty]) expr'))
+              static_expr_ty = mkTyConApp static_ptr_ty_con [expr_ty]
+        ; return $ mkHsWrapCo co $
+          HsStatic (static_expr_ty, mkHsWrap wrap fromStaticPtr)
+                   expr''
         }
+  where
+    check_free_name :: Name -> TcM ()
+    -- Check for free /term/ vars not defined at top level
+    -- We use isExternalName as a proxy for top-level-defined
+    check_free_name n
+      = do { mb_thing <- tcLookupLcl_maybe n
+           ; case mb_thing of
+               Nothing  -> return ()  -- Imports, tycons, classes allowed
+               Just (ATcId {})  -> unless (isExternalName n) $
+                                   addErrTc (TcRnStaticFormNotClosed n)
+
+               Just (ATyVar {}) -> return ()  -- Free type variables are allowed
+
+                   -- Not really expecting these, but we'll get an error from
+                   -- elsewhere, so don't produce an error here
+               Just (ATcTyCon {})      -> return ()
+               Just (APromotionErr {}) -> return ()
+               Just (AGlobal {})       -> return () }
 
 tcExpr (HsEmbTy _ _)      _ = failWith (TcRnIllegalTypeExpr TypeKeywordSyntax)
 tcExpr (HsQual _ _ _)     _ = failWith (TcRnIllegalTypeExpr ContextArrowSyntax)
 tcExpr (HsForAll _ _ _)   _ = failWith (TcRnIllegalTypeExpr ForallTelescopeSyntax)
 tcExpr (HsFunArr _ _ _ _) _ = failWith (TcRnIllegalTypeExpr FunctionArrowSyntax)
+tcExpr (HsStar _)         _ = failWith (TcRnIllegalTypeExpr StarKindSyntax)
 
 {-
 ************************************************************************
@@ -640,6 +717,7 @@ tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
 -- in the renamer. See Note [Overview of record dot syntax] in
 -- GHC.Hs.Expr. This is why we match on 'rupd_flds = Left rbnds' here
 -- and panic otherwise.
+-- WIP: To be fixed soon expandRecordUpd needs to return HsExpansion and not a separate ds_res_ty
 tcExpr expr@(RecordUpd { rupd_expr = record_expr
                        , rupd_flds =
                            RegularRecUpdFields
@@ -647,23 +725,24 @@ tcExpr expr@(RecordUpd { rupd_expr = record_expr
                              , recUpdFields  = rbnds }
                        })
        res_ty
-  = assert (notNull rbnds) $
+  = assert (notNull rbnds) $ mkExpandedExprTc expr <$>
     do  { -- Expand the record update. See Note [Record Updates].
-        ; (ds_expr, ds_res_ty, err_ctxt)
+
+        ; (ds_expr, ds_res_ty, err_msg)
             <- expandRecordUpd record_expr possible_parents rbnds res_ty
+        ; addErrCtxt err_msg $
+          do { -- Typecheck the expanded expression.
+               expr' <- tcExpr ds_expr (Check ds_res_ty)
+               -- NB: it's important to use ds_res_ty and not res_ty here.
+               -- Test case: T18802b.
 
-          -- Typecheck the expanded expression.
-        ; expr' <- addErrCtxt err_ctxt $
-                   tcExpr (mkExpandedExpr expr ds_expr) (Check ds_res_ty)
-            -- NB: it's important to use ds_res_ty and not res_ty here.
-            -- Test case: T18802b.
-
-        ; addErrCtxt err_ctxt $ tcWrapResultMono expr expr' ds_res_ty res_ty
-            -- We need to unify the result type of the expanded
-            -- expression with the expected result type.
-            --
-            -- See Note [Unifying result types in tcRecordUpd].
-            -- Test case: T10808.
+             ; tcWrapResultMono expr expr' ds_res_ty res_ty
+             -- We need to unify the result type of the expanded
+             -- expression with the expected result type.
+             --
+             -- See Note [Unifying result types in tcRecordUpd].
+             -- Test case: T10808.
+             }
         }
 
 tcExpr e@(RecordUpd { rupd_flds = OverloadedRecUpdFields {}}) _
@@ -685,19 +764,6 @@ tcExpr (ArithSeq _ witness seq) res_ty
 {-
 ************************************************************************
 *                                                                      *
-                Record dot syntax
-*                                                                      *
-************************************************************************
--}
-
--- These terms have been replaced by their expanded expressions in the renamer. See
--- Note [Overview of record dot syntax].
-tcExpr (HsGetField _ _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsGetField: Not implemented"
-tcExpr (HsProjection _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsProjection: Not implemented"
-
-{-
-************************************************************************
-*                                                                      *
                 Template Haskell
 *                                                                      *
 ************************************************************************
@@ -706,18 +772,8 @@ tcExpr (HsProjection _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsProjection: Not 
 -- Here we get rid of it and add the finalizers to the global environment.
 -- See Note [Delaying modFinalizers in untyped splices] in GHC.Rename.Splice.
 tcExpr (HsTypedSplice ext splice)   res_ty = tcTypedSplice ext splice res_ty
-tcExpr e@(HsTypedBracket _ext body)    res_ty = tcTypedBracket e body res_ty
-
+tcExpr e@(HsTypedBracket _ext body) res_ty = tcTypedBracket e body res_ty
 tcExpr e@(HsUntypedBracket ps body) res_ty = tcUntypedBracket e body ps res_ty
-tcExpr (HsUntypedSplice splice _)   res_ty
-  -- Since `tcApp` deals with `HsUntypedSplice` (in `splitHsApps`), you might
-  -- wonder why we don't delegate to `tcApp` as we do for `HsVar`, etc.
-  -- (See the initial block of equations for `tcExpr`.) But we can't do this
-  -- for `HsUntypedSplice`; to see why, read Wrinkle (UTS1) in
-  -- Note [Looking through Template Haskell splices in splitHsApps] in
-  -- GHC.Tc.Gen.Head.
-  = do { expr <- getUntypedSpliceBody splice
-       ; tcExpr expr res_ty }
 
 {-
 ************************************************************************
@@ -727,10 +783,12 @@ tcExpr (HsUntypedSplice splice _)   res_ty
 ************************************************************************
 -}
 
-tcExpr (HsOverLabel {})    ty = pprPanic "tcExpr:HsOverLabel"  (ppr ty)
-tcExpr (SectionL {})       ty = pprPanic "tcExpr:SectionL"    (ppr ty)
-tcExpr (SectionR {})       ty = pprPanic "tcExpr:SectionR"    (ppr ty)
-
+-- See Note [Typechecking by expansion: overview]
+tcExpr e res_ty
+  = do { mb_hse <- tcExpand e
+       ; case mb_hse of
+           Just hse -> tcHsExpansion hse res_ty
+           Nothing  -> pprPanic "tcExpr: unhandled case:" (ppr e) }
 
 {-
 ************************************************************************
@@ -740,36 +798,12 @@ tcExpr (SectionR {})       ty = pprPanic "tcExpr:SectionR"    (ppr ty)
 ************************************************************************
 -}
 
-tcXExpr :: XXExprGhcRn -> ExpRhoType -> TcM (HsExpr GhcTc)
+tcHsExpansion :: HsExpansion GhcRn -> ExpRhoType -> TcM (HsExpr GhcTc)
+tcHsExpansion (HSE { hse_ctxt = o, hse_exp = e }) res_ty
+   = do { e' <- tcMonoLExpr e res_ty
+        ; return $ XExpr $ ExpandedThingTc $
+          HSE { hse_ctxt = o, hse_exp = e' } }
 
-tcXExpr (PopErrCtxt (L loc e)) res_ty
-  = popErrCtxt $ -- See Part 3 of Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
-      setSrcSpanA loc $
-      tcExpr e res_ty
-
-tcXExpr xe@(ExpandedThingRn o e') res_ty
-  | OrigStmt ls@(L loc s@LetStmt{}) <- o
-  , HsLet x binds e <- e'
-  =  do { (binds', e') <-  setSrcSpanA loc $
-                           addStmtCtxt s $
-                           tcLocalBinds binds $
-                           tcMonoExprNC e res_ty -- NB: Do not call tcMonoExpr here as it adds
-                                                 -- a duplicate error context
-        ; return $ mkExpandedStmtTc ls (HsLet x binds' e')
-        }
-  | OrigStmt ls@(L loc s@LastStmt{}) <- o
-  =  setSrcSpanA loc $
-          addStmtCtxt s $
-          mkExpandedStmtTc ls <$> tcExpr e' res_ty
-                -- It is important that we call tcExpr (and not tcApp) here as
-                -- `e` is the last statement's body expression
-                -- and not a HsApp of a generated (>>) or (>>=)
-                -- This improves error messages e.g. tests: DoExpansion1, DoExpansion2, DoExpansion3
-  | OrigStmt ls@(L loc _) <- o
-  = setSrcSpanA loc $
-       mkExpandedStmtTc ls <$> tcApp (XExpr xe) res_ty
-
-tcXExpr xe res_ty = tcApp (XExpr xe) res_ty
 
 {-
 ************************************************************************
@@ -785,8 +819,8 @@ tcArithSeq :: Maybe (SyntaxExpr GhcRn) -> ArithSeqInfo GhcRn -> ExpRhoType
 tcArithSeq witness seq@(From expr) res_ty
   = do { (wrap, elt_mult, elt_ty, wit') <- arithSeqEltType witness res_ty
        ; expr' <-tcScalingUsage elt_mult $ tcCheckPolyExpr expr elt_ty
-       ; enum_from <- newMethodFromName (ArithSeqOrigin seq)
-                              enumFromName [elt_ty]
+       ; enum_from <- newKnownOccMethod (ArithSeqOrigin seq)
+                              enumFromClassOpOcc [elt_ty]
        ; return $ mkHsWrap wrap $
          ArithSeq enum_from wit' (From expr') }
 
@@ -794,8 +828,8 @@ tcArithSeq witness seq@(FromThen expr1 expr2) res_ty
   = do { (wrap, elt_mult, elt_ty, wit') <- arithSeqEltType witness res_ty
        ; expr1' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr1 elt_ty
        ; expr2' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr2 elt_ty
-       ; enum_from_then <- newMethodFromName (ArithSeqOrigin seq)
-                              enumFromThenName [elt_ty]
+       ; enum_from_then <- newKnownOccMethod (ArithSeqOrigin seq)
+                              enumFromThenClassOpOcc [elt_ty]
        ; return $ mkHsWrap wrap $
          ArithSeq enum_from_then wit' (FromThen expr1' expr2') }
 
@@ -803,8 +837,8 @@ tcArithSeq witness seq@(FromTo expr1 expr2) res_ty
   = do { (wrap, elt_mult, elt_ty, wit') <- arithSeqEltType witness res_ty
        ; expr1' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr1 elt_ty
        ; expr2' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr2 elt_ty
-       ; enum_from_to <- newMethodFromName (ArithSeqOrigin seq)
-                              enumFromToName [elt_ty]
+       ; enum_from_to <- newKnownOccMethod (ArithSeqOrigin seq)
+                              enumFromToClassOpOcc [elt_ty]
        ; return $ mkHsWrap wrap $
          ArithSeq enum_from_to wit' (FromTo expr1' expr2') }
 
@@ -813,8 +847,8 @@ tcArithSeq witness seq@(FromThenTo expr1 expr2 expr3) res_ty
         ; expr1' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr1 elt_ty
         ; expr2' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr2 elt_ty
         ; expr3' <- tcScalingUsage elt_mult $ tcCheckPolyExpr expr3 elt_ty
-        ; eft <- newMethodFromName (ArithSeqOrigin seq)
-                              enumFromThenToName [elt_ty]
+        ; eft <- newKnownOccMethod (ArithSeqOrigin seq)
+                              enumFromThenToClassOpOcc [elt_ty]
         ; return $ mkHsWrap wrap $
           ArithSeq eft wit' (FromThenTo expr1' expr2' expr3') }
 
@@ -871,7 +905,7 @@ tcInferTupArgs boxity args
          ; return (Missing (Scaled mult arg_ty), arg_ty) }
   tc_infer_tup_arg i (Present x lexpr@(L l expr))
     = do { (expr', arg_ty) <- case boxity of
-             Unboxed -> tcInferFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
+             Unboxed -> runInferRhoFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
              Boxed   -> do { arg_ty <- newFlexiTyVarTy liftedTypeKind
                            ; L _ expr' <- tcCheckPolyExpr lexpr arg_ty
                            ; return (expr', arg_ty) }
@@ -909,7 +943,7 @@ tcSyntaxOpGen :: CtOrigin
               -> ([TcSigmaTypeFRR] -> [Mult] -> TcM a)
               -> TcM (a, SyntaxExprTc)
 tcSyntaxOpGen orig (SyntaxExprRn op) arg_tys res_ty thing_inside
-  = do { (expr, sigma) <- tcInferAppHead (op, VACall op 0 noSrcSpan)
+  = do { (expr, sigma) <- tcInferAppHead (op, noSrcSpan)
              -- Ugh!! But all this code is scheduled for demolition anyway
        ; traceTc "tcSyntaxOpGen" (ppr op $$ ppr expr $$ ppr sigma)
        ; (result, expr_wrap, arg_wraps, res_wrap)
@@ -939,7 +973,7 @@ tcSynArgE :: CtOrigin
           -> SyntaxOpType                -- ^ shape it is expected to have
           -> ([TcSigmaTypeFRR] -> [Mult] -> TcM a) -- ^ check the arguments
           -> TcM (a, HsWrapper)
-           -- ^ returns a wrapper :: (type of right shape) "->" (type passed in)
+           -- ^ returns a wrapper :: (type of right shape) ~~> (type passed in)
 tcSynArgE orig op sigma_ty syn_ty thing_inside
   = do { (skol_wrap, (result, ty_wrapper))
            <- tcSkolemise Shallow GenSigCtxt sigma_ty $ \rho_ty ->
@@ -960,10 +994,10 @@ tcSynArgE orig op sigma_ty syn_ty thing_inside
            ; return (result, mkWpCastN list_co) }
 
     go rho_ty (SynFun arg_shape res_shape)
-      = do { ( match_wrapper                         -- :: (arg_ty -> res_ty) "->" rho_ty
+      = do { ( match_wrapper                         -- :: (arg_ty -> res_ty) ~~> rho_ty
              , ( ( (result, arg_ty, res_ty, op_mult)
-                 , res_wrapper )                     -- :: res_ty_out "->" res_ty
-               , arg_wrapper1, [], arg_wrapper2 ) )  -- :: arg_ty "->" arg_ty_out
+                 , res_wrapper )                     -- :: res_ty_out ~~> res_ty
+               , arg_wrapper1, [], arg_wrapper2 ) )  -- :: arg_ty ~~> arg_ty_out
                <- matchExpectedFunTys herald GenSigCtxt 1 (mkCheckExpType rho_ty) $
                   \ [ExpFunPatTy arg_ty] res_ty ->
                   do { arg_tc_ty <- expTypeToType (scaledThing arg_ty)
@@ -986,7 +1020,7 @@ tcSynArgE orig op sigma_ty syn_ty thing_inside
                           ; return (result, arg_tc_ty, res_tc_ty, arg_mult) }}
 
            ; let fun_wrap = mkWpFun (arg_wrapper2 <.> arg_wrapper1) res_wrapper
-                              (Scaled op_mult arg_ty) res_ty
+                              (EqMultCo $ mkNomReflCo op_mult, arg_ty) res_ty
                -- NB: arg_ty comes from matchExpectedFunTys, so it has a
                -- fixed RuntimeRep, as needed to call mkWpFun.
            ; return (result, match_wrapper <.> fun_wrap) }
@@ -1013,7 +1047,7 @@ tcSynArgA :: CtOrigin
 tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
   = do { (match_wrapper, arg_tys, res_ty)
            <- matchActualFunTys herald orig (length arg_shapes) sigma_ty
-              -- match_wrapper :: sigma_ty "->" (arg_tys -> res_ty)
+              -- match_wrapper :: sigma_ty ~~> (arg_tys -> res_ty)
        ; ((result, res_wrapper), arg_wrappers)
            <- tc_syn_args_e (map scaledThing arg_tys) arg_shapes $ \ arg_results arg_res_mults ->
               tc_syn_arg    res_ty  res_shape  $ \ res_results ->
@@ -1043,12 +1077,12 @@ tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
            ; return (result, idHsWrapper) }
     tc_syn_arg res_ty SynRho thing_inside
       = do { (inst_wrap, rho_ty) <- topInstantiate orig res_ty
-               -- inst_wrap :: res_ty "->" rho_ty
+               -- inst_wrap :: res_ty ~~> rho_ty
            ; result <- thing_inside [rho_ty]
            ; return (result, inst_wrap) }
     tc_syn_arg res_ty SynList thing_inside
       = do { (inst_wrap, rho_ty) <- topInstantiate orig res_ty
-               -- inst_wrap :: res_ty "->" rho_ty
+               -- inst_wrap :: res_ty ~~> rho_ty
            ; (list_co, elt_ty)   <- matchExpectedListTy rho_ty
                -- list_co :: [elt_ty] ~N rho_ty
            ; result <- thing_inside [elt_ty]
@@ -1056,7 +1090,8 @@ tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
     tc_syn_arg _ (SynFun {}) _
       = pprPanic "tcSynArgA hits a SynFun" (ppr orig)
     tc_syn_arg res_ty (SynType the_ty) thing_inside
-      = do { wrap   <- tcSubType orig GenSigCtxt res_ty the_ty
+      = do { wrap   <- addSubTypeCtxt res_ty the_ty $
+                       tcSubType orig GenSigCtxt Nothing res_ty the_ty
            ; result <- thing_inside []
            ; return (result, wrap) }
 
@@ -1185,13 +1220,34 @@ Wrinkle [Using IdSig]
 
 Note [Type-directed record disambiguation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-GHC currently supports an additional type-directed disambiguation
-mechanism, which is deprecated and scheduled for removal as part of
-GHC proposal #366 https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst.
+Deprecation notice:
+  The type-directed disambiguation mechanism for record updates described in
+  this Note is deprecated, as per GHC proposal #366 (https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst).
+  The removal of type-directed disambiguation for record updates is tracked
+  in GHC ticket #19461, but progress towards this goal has stalled.
 
-To perform this disambiguation, when there are multiple possible parents for
-a record update, the renamer defers to the typechecker.
-See GHC.Tc.Gen.Expr.disambiguateRecordBinds, and in particular the auxiliary
+  Why? There are several suggested replacement mechanisms, such as:
+    1. using module qualification to disambiguate,
+    2. using OverloadedRecordUpdate for type-directed disambiguation
+      (as described in Note [Overview of record dot syntax] in GHC.Hs.Expr).
+  However, these solutions do not work in all situations:
+    1. Module qualification doesn't work for fields defined in the current module,
+       nor to disambiguate between constructors of different data family instances
+       of a given parent data family TyCon.
+    2. OverloadedRecordUpdate does not allow for type-changing record update,
+       nor can it deal with fields with existentials or polytypes.
+  There are also some avenues to improve the renamer's ability to disambiguate:
+    - GHC ticket #23032 suggests using as-patterns to disambiguate in the renamer.
+    - GHC proposal https://github.com/ghc-proposals/ghc-proposals/pull/537
+      suggests a syntactic form of type-directed disambiguation that could be
+      carried out in the renamer.
+  Neither of these have been accepted/implemented at the time of writing (Sept 2025).
+  This means that removal of type-directed disambiguation is currently stalled.
+
+GHC tries to disambiguate record updates in the renamer, as described in
+Note [Disambiguating record updates] in GHC.Rename.Pat. However, if the renamer
+is unable to disambiguate, the renamer will defer to the typechecker: see
+GHC.Tc.Gen.Expr.disambiguateRecordBinds, and in particular the auxiliary
 function identifyParentLabels, which picks a parent for the record update
 using the following additional mechanisms:
 
@@ -1287,11 +1343,11 @@ expandRecordUpd :: LHsExpr GhcRn
                            -- Expanded record update expression
                         , TcType
                            -- result type of expanded record update
-                        , ErrCtxtMsg
+                        , HsCtxt
                            -- error context to push when typechecking
                            -- the expanded code
                         )
-expandRecordUpd record_expr possible_parents rbnds res_ty
+expandRecordUpd record_expr@(L lspan _) possible_parents rbnds res_ty
   = do {  -- STEP 0: typecheck the record_expr, the record to be updated.
           --
           -- Until GHC proposal #366 is implemented, we still use the type of
@@ -1454,28 +1510,27 @@ expandRecordUpd record_expr possible_parents rbnds res_ty
                                       generatedSrcSpan
                        in (genVarPat fld_nm, genLHsVar fld_nm)
 
-       -- STEP 2 (b): expand to HsCase, as per note [Record Updates]
+       -- STEP 2 (b): expand to HsCase, as per Note [Record Updates]
        ; let ds_expr :: HsExpr GhcRn
-             ds_expr = HsLet noExtField let_binds (L gen case_expr)
+             ds_expr = HsLet noExtField let_binds (wrapGenSpan case_expr)
 
              case_expr :: HsExpr GhcRn
-             case_expr = HsCase RecUpd record_expr
-                       $ mkMatchGroup (Generated OtherExpansion DoPmc) (wrapGenSpan matches)
+             case_expr = HsCase RecUpd (wrapGenSpan' (locA lspan) (unLoc record_expr))
+                       $ mkMatchGroup (Generated OtherExpansion DoPmc) noAnn (wrapGenSpan matches)
              matches :: [LMatch GhcRn (LHsExpr GhcRn)]
              matches = map make_pat (NE.toList relevant_cons)
 
              let_binds :: HsLocalBindsLR GhcRn GhcRn
              let_binds = HsValBinds noAnn $ XValBindsLR
-                       $ NValBinds upd_ids_lhs (map mk_idSig upd_ids)
+                       $ HsVBG upd_ids_lhs (map mk_idSig upd_ids)
              upd_ids_lhs :: [(RecFlag, LHsBindsLR GhcRn GhcRn)]
              upd_ids_lhs = [ (NonRecursive, [genSimpleFunBind (idName id) [] rhs])
                            | (_, (id, rhs)) <- upd_ids ]
              mk_idSig :: (Name, (Id, LHsExpr GhcRn)) -> LSig GhcRn
-             mk_idSig (_, (id, _)) = L gen $ XSig $ IdSig id
+             mk_idSig (_, (id, _)) = wrapGenSpan (XSig $ IdSig id)
                -- We let-bind variables using 'IdSig' in order to accept
                -- record updates involving higher-rank types.
                -- See Wrinkle [Using IdSig] in Note [Record Updates].
-             gen = noAnnSrcSpan generatedSrcSpan
 
         ; traceTc "expandRecordUpd" $
             vcat [ text "relevant_con:" <+> ppr relevant_con
@@ -1483,7 +1538,6 @@ expandRecordUpd record_expr possible_parents rbnds res_ty
                  , text "ds_res_ty:" <+> ppr ds_res_ty
                  , text "ds_expr:" <+> ppr ds_expr
                  ]
-
         ; return (ds_expr, ds_res_ty, RecordUpdCtxt relevant_cons upd_fld_names ex_tvs) }
 
 
@@ -1697,7 +1751,7 @@ tcRecordField con_like flds_w_tys (L loc (FieldOcc rdr (L l sel_name))) rhs
       = do { addErrTc (badFieldConErr (getName con_like) field_lbl)
            ; return Nothing }
   where
-        field_lbl = FieldLabelString $ occNameFS $ rdrNameOcc rdr
+        field_lbl = FieldLabelString $ fastStringToShortText $ occNameFS $ rdrNameOcc rdr
 
 
 checkMissingFields ::  ConLike -> HsRecordBinds GhcRn -> [Scaled TcType] -> TcM ()
@@ -1752,138 +1806,3 @@ checkMissingFields con_like rbinds arg_tys
     field_strs = conLikeImplBangs con_like
 
     fl `elemField` flds = any (\ fl' -> flSelector fl == fl') flds
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Static Pointers}
-*                                                                      *
-************************************************************************
--}
-
--- | Checks if the given name is closed and emits an error if not.
---
--- See Note [Not-closed error messages].
-checkClosedInStaticForm :: Name -> TcM ()
-checkClosedInStaticForm name = do
-    type_env <- getLclTypeEnv
-    case checkClosed type_env name of
-      Nothing -> return ()
-      Just reason -> addErrTc $ explain name reason
-  where
-    -- See Note [Checking closedness].
-    checkClosed :: TcTypeEnv -> Name -> Maybe NotClosedReason
-    checkClosed type_env n = checkLoop type_env (unitNameSet n) n
-
-    checkLoop :: TcTypeEnv -> NameSet -> Name -> Maybe NotClosedReason
-    checkLoop type_env visited n =
-      -- The @visited@ set is an accumulating parameter that contains the set of
-      -- visited nodes, so we avoid repeating cycles in the traversal.
-      case lookupNameEnv type_env n of
-        Just (ATcId { tct_id = tcid, tct_info = info }) -> case info of
-          ClosedLet   -> Nothing
-          NotLetBound -> Just NotLetBoundReason
-          NonClosedLet fvs type_closed -> listToMaybe $
-            -- Look for a non-closed variable in fvs
-            [ NotClosed n' reason
-            | n' <- nameSetElemsStable fvs
-            , not (elemNameSet n' visited)
-            , Just reason <- [checkLoop type_env (extendNameSet visited n') n']
-            ] ++
-            if type_closed then
-              []
-            else
-              -- We consider non-let-bound variables easier to figure out than
-              -- non-closed types, so we report non-closed types to the user
-              -- only if we cannot spot the former.
-              [ NotTypeClosed $ tyCoVarsOfType (idType tcid) ]
-        -- The binding is closed.
-        _ -> Nothing
-
-    -- Converts a reason into a human-readable sentence.
-    --
-    -- @explain name reason@ starts with
-    --
-    -- "<name> is used in a static form but it is not closed because it"
-    --
-    -- and then follows a list of causes. For each id in the path, the text
-    --
-    -- "uses <id> which"
-    --
-    -- is appended, yielding something like
-    --
-    -- "uses <id> which uses <id1> which uses <id2> which"
-    --
-    -- until the end of the path is reached, which is reported as either
-    --
-    -- "is not let-bound"
-    --
-    -- when the final node is not let-bound, or
-    --
-    -- "has a non-closed type because it contains the type variables:
-    -- v1, v2, v3"
-    --
-    -- when the final node has a non-closed type.
-    --
-    explain :: Name -> NotClosedReason -> TcRnMessage
-    explain = TcRnStaticFormNotClosed
-
--- Note [Not-closed error messages]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- When variables in a static form are not closed, we go through the trouble
--- of explaining why they aren't.
---
--- Thus, the following program
---
--- > {-# LANGUAGE StaticPointers #-}
--- > module M where
--- >
--- > f x = static g
--- >   where
--- >     g = h
--- >     h = x
---
--- produces the error
---
---    'g' is used in a static form but it is not closed because it
---    uses 'h' which uses 'x' which is not let-bound.
---
--- And a program like
---
--- > {-# LANGUAGE StaticPointers #-}
--- > module M where
--- >
--- > import Data.Typeable
--- > import GHC.StaticPtr
--- >
--- > f :: Typeable a => a -> StaticPtr TypeRep
--- > f x = const (static (g undefined)) (h x)
--- >   where
--- >     g = h
--- >     h = typeOf
---
--- produces the error
---
---    'g' is used in a static form but it is not closed because it
---    uses 'h' which has a non-closed type because it contains the
---    type variables: 'a'
---
-
--- Note [Checking closedness]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- @checkClosed@ checks if a binding is closed and returns a reason if it is
--- not.
---
--- The bindings define a graph where the nodes are ids, and there is an edge
--- from @id1@ to @id2@ if the rhs of @id1@ contains @id2@ among its free
--- variables.
---
--- When @n@ is not closed, it has to exist in the graph some node reachable
--- from @n@ that it is not a let-bound variable or that it has a non-closed
--- type. Thus, the "reason" is a path from @n@ to this offending node.
---
--- When @n@ is not closed, we traverse the graph reachable from @n@ to build
--- the reason.
---

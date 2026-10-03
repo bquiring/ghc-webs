@@ -1,10 +1,10 @@
-deriving-via-fail5.hs:8:1: error: [GHC-10283]
-    • Couldn't match representation of type ‘a’ with that of ‘b’
+deriving-via-fail5.hs:8:1: error: [GHC-25897]
+    • Couldn't match representation of type ‘b’ with that of ‘a’
         arising from a use of ‘GHC.Internal.Prim.coerce’
-      ‘a’ is a rigid type variable bound by
+      ‘b’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
-      ‘b’ is a rigid type variable bound by
+      ‘a’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
     • In the expression:
@@ -24,13 +24,13 @@ deriving-via-fail5.hs:8:1: error: [GHC-10283]
         showsPrec :: Int -> Foo4 a -> ShowS
           (bound at deriving-via-fail5.hs:8:1)
 
-deriving-via-fail5.hs:8:1: error: [GHC-10283]
-    • Couldn't match representation of type ‘a’ with that of ‘b’
+deriving-via-fail5.hs:8:1: error: [GHC-25897]
+    • Couldn't match representation of type ‘b’ with that of ‘a’
         arising from a use of ‘GHC.Internal.Prim.coerce’
-      ‘a’ is a rigid type variable bound by
+      ‘b’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
-      ‘b’ is a rigid type variable bound by
+      ‘a’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
     • In the expression:
@@ -47,13 +47,13 @@ deriving-via-fail5.hs:8:1: error: [GHC-10283]
     • Relevant bindings include
         show :: Foo4 a -> String (bound at deriving-via-fail5.hs:8:1)
 
-deriving-via-fail5.hs:8:1: error: [GHC-10283]
-    • Couldn't match representation of type ‘a’ with that of ‘b’
+deriving-via-fail5.hs:8:1: error: [GHC-25897]
+    • Couldn't match representation of type ‘b’ with that of ‘a’
         arising from a use of ‘GHC.Internal.Prim.coerce’
-      ‘a’ is a rigid type variable bound by
+      ‘b’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
-      ‘b’ is a rigid type variable bound by
+      ‘a’ is a rigid type variable bound by
         the instance declaration
         at deriving-via-fail5.hs:(8,1)-(9,24)
     • In the expression:

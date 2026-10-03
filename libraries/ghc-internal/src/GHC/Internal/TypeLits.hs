@@ -17,6 +17,7 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE RoleAnnotations #-}
 {-# LANGUAGE QuantifiedConstraints #-}
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 
 {-|
 GHC's @DataKinds@ language extension lifts data constructors, natural
@@ -77,10 +78,9 @@ module GHC.Internal.TypeLits
 
   ) where
 
-import GHC.Internal.Base ( Bool(..), Eq(..), Functor(..), Ord(..), Ordering(..), String
-                , (.), otherwise, withDict, Void, (++)
-                , errorWithoutStackTrace)
-import GHC.Internal.Types(Symbol, Char, TYPE, Coercible)
+import GHC.Internal.Base
+import GHC.Internal.Err(errorWithoutStackTrace)
+import GHC.Internal.Magic.Dict(WithDict(..))
 import GHC.Internal.TypeError(ErrorMessage(..), TypeError)
 import GHC.Internal.Num(Integer, fromInteger)
 import GHC.Internal.Show(Show(..), appPrec, appPrec1, showParen, showString)

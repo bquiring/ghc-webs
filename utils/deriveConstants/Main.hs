@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 {- ------------------------------------------------------------------------
 
 (c) The GHC Team, 1992-2012
@@ -65,7 +67,17 @@ main = do opts <- parseArgs
                                 "mingw32" -> Windows
                                 _         -> DefaultOS
                          verbose = o_verbose opts
-                         gccFlags = o_gccFlags opts
+                         gccFlags0 = o_gccFlags opts
+                          -- nm applied to COFF files doesn't correctly report
+                          -- the size of global variable symbols (it reports 0)
+                          -- except for Common symbols (probably because the
+                          -- merge algorithm of Common symbols takes symbol size
+                          -- into account). So we force the use of `-fcommon`
+                          -- here.
+                          -- As far as we know, it is only required on Windows
+                          -- but enabling it on other platforms does no harm, so
+                          -- we enable it unconditionally.
+                         gccFlags = "-fcommon" : gccFlags0
                      rs <- case os of
                              JS -> getWantedJS
                              _  -> getWanted verbose os tmpdir gccProg gccFlags nmProg
@@ -383,8 +395,8 @@ wanteds os = concat
           ,fieldOffset Both "StgRegTable" "rCurrentTSO"
           ,fieldOffset Both "StgRegTable" "rCurrentNursery"
           ,fieldOffset Both "StgRegTable" "rHpAlloc"
+          ,structField C    "StgRegTable" "rCurrentAlloc"
           ,structField C    "StgRegTable" "rRet"
-          ,structField C    "StgRegTable" "rNursery"
 
           ,defIntOffset Both "stgEagerBlackholeInfo"
                              "FUN_OFFSET(stgEagerBlackholeInfo)"
@@ -392,7 +404,6 @@ wanteds os = concat
           ,defIntOffset Both "stgGCFun"    "FUN_OFFSET(stgGCFun)"
 
           ,fieldOffset Both "Capability" "r"
-          ,fieldOffset C    "Capability" "lock"
           ,structField C    "Capability" "no"
           ,structField C    "Capability" "mut_lists"
           ,structField C    "Capability" "context_switch"
@@ -402,6 +413,8 @@ wanteds os = concat
           ,structField C    "Capability" "weak_ptr_list_hd"
           ,structField C    "Capability" "weak_ptr_list_tl"
           ,structField C    "Capability" "n_run_queue"
+          ,structField C    "Capability" "pinned_object_block"
+          ,structField C    "Capability" "iomgr"
 
           ,structField Both "bdescr" "start"
           ,structField Both "bdescr" "free"
@@ -410,18 +423,11 @@ wanteds os = concat
           ,structField C    "bdescr" "link"
           ,structField Both "bdescr" "flags"
 
-          ,structSize C  "generation"
           ,structField C "generation" "n_new_large_words"
-          ,structField C "generation" "weak_ptr_list"
 
           ,structSize Both   "CostCentreStack"
-          ,structField C     "CostCentreStack" "ccsID"
           ,structFieldH Both "CostCentreStack" "mem_alloc"
           ,structFieldH Both "CostCentreStack" "scc_count"
-          ,structField C     "CostCentreStack" "prevStack"
-
-          ,structField C "CostCentre" "ccID"
-          ,structField C "CostCentre" "link"
 
           ,structField C     "StgHeader" "info"
           ,structField_ Both "StgHeader_ccs" "StgHeader" "prof.ccs"
@@ -443,10 +449,13 @@ wanteds os = concat
           ,closureSize  C    "StgStopFrame"
           ,closureSize  C    "StgDeadThreadFrame"
           ,closureField C    "StgDeadThreadFrame" "result"
+          ,closureSize  Both "StgAnnFrame"
+          ,closureField C    "StgAnnFrame" "ann"
 
-          ,closureSize  Both "StgMutArrPtrs"
-          ,closureField Both "StgMutArrPtrs" "ptrs"
-          ,closureField Both "StgMutArrPtrs" "size"
+          ,closureSize    Both "StgMutArrPtrs"
+          ,closureField   Both "StgMutArrPtrs" "ptrs"
+          ,closureField   Both "StgMutArrPtrs" "size"
+          ,closurePayload C    "StgMutArrPtrs" "payload"
 
           ,closureSize  Both "StgSmallMutArrPtrs"
           ,closureField Both "StgSmallMutArrPtrs" "ptrs"
@@ -456,31 +465,26 @@ wanteds os = concat
           ,closurePayload C    "StgArrBytes" "payload"
 
           ,closureField  C    "StgTSO"      "_link"
-          ,closureField  C    "StgTSO"      "global_link"
           ,closureField  C    "StgTSO"      "what_next"
           ,closureField  C    "StgTSO"      "why_blocked"
           ,closureField  C    "StgTSO"      "block_info"
           ,closureField  C    "StgTSO"      "blocked_exceptions"
           ,closureField  C    "StgTSO"      "id"
           ,closureField  C    "StgTSO"      "cap"
-          ,closureField  C    "StgTSO"      "saved_errno"
           ,closureField  C    "StgTSO"      "trec"
           ,closureField  C    "StgTSO"      "flags"
-          ,closureField  C    "StgTSO"      "dirty"
-          ,closureField  C    "StgTSO"      "bq"
           ,closureField  C    "StgTSO"      "label"
           ,closureField  C    "StgTSO"      "bound"
           ,closureField  Both "StgTSO"      "alloc_limit"
           ,closureField_ Both "StgTSO_cccs" "StgTSO" "prof.cccs"
           ,closureField  Both "StgTSO"      "stackobj"
+          ,closureField  Both "StgTSO"      "ctoi_tuple_spill_words"
 
           ,closureField       Both "StgStack" "sp"
           ,closureFieldOffset Both "StgStack" "stack"
           ,closureField       C    "StgStack" "stack_size"
           ,closureField       C    "StgStack" "dirty"
           ,closureField       C    "StgStack" "marking"
-
-          ,structSize C "StgTSOProfInfo"
 
           ,closureField Both "StgUpdateFrame" "updatee"
           ,closureField Both "StgOrigThunkInfoFrame" "info_ptr"
@@ -503,18 +507,14 @@ wanteds os = concat
           ,closureFieldGcptr C "StgAP" "fun"
           ,closurePayload    C "StgAP" "payload"
 
-          ,thunkSize         C "StgAP_STACK"
           ,closureField      C "StgAP_STACK" "size"
           ,closureFieldGcptr C "StgAP_STACK" "fun"
           ,closurePayload    C "StgAP_STACK" "payload"
 
-          ,closureSize       C "StgContinuation"
           ,closureField      C "StgContinuation" "apply_mask_frame"
           ,closureField      C "StgContinuation" "mask_frame_offset"
           ,closureField      C "StgContinuation" "stack_size"
           ,closurePayload    C "StgContinuation" "stack"
-
-          ,thunkSize C "StgSelector"
 
           ,closureFieldGcptr C "StgInd" "indirectee"
 
@@ -535,10 +535,6 @@ wanteds os = concat
           ,closureField C "StgCatchRetryFrame" "running_alt_code"
           ,closureField C "StgCatchRetryFrame" "first_code"
           ,closureField C "StgCatchRetryFrame" "alt_code"
-
-          ,closureField C "StgTVarWatchQueue" "closure"
-          ,closureField C "StgTVarWatchQueue" "next_queue_entry"
-          ,closureField C "StgTVarWatchQueue" "prev_queue_entry"
 
           ,closureSize  C "StgTVar"
           ,closureField C "StgTVar" "current_value"
@@ -579,29 +575,19 @@ wanteds os = concat
           ,closureSize  C "StgStableName"
           ,closureField C "StgStableName" "sn"
 
-          ,closureSize  C "StgBlockingQueue"
-          ,closureField C "StgBlockingQueue" "bh"
-          ,closureField C "StgBlockingQueue" "owner"
-          ,closureField C "StgBlockingQueue" "queue"
-          ,closureField C "StgBlockingQueue" "link"
-
           ,closureSize  C "MessageBlackHole"
           ,closureField C "MessageBlackHole" "link"
           ,closureField C "MessageBlackHole" "tso"
           ,closureField C "MessageBlackHole" "bh"
 
-          ,closureSize  C "StgCompactNFData"
           ,closureField C "StgCompactNFData" "totalW"
-          ,closureField C "StgCompactNFData" "autoBlockW"
           ,closureField C "StgCompactNFData" "nursery"
-          ,closureField C "StgCompactNFData" "last"
           ,closureField C "StgCompactNFData" "hp"
           ,closureField C "StgCompactNFData" "hpLim"
           ,closureField C "StgCompactNFData" "hash"
           ,closureField C "StgCompactNFData" "result"
 
           ,structSize   C "StgCompactNFDataBlock"
-          ,structField  C "StgCompactNFDataBlock" "self"
           ,structField  C "StgCompactNFDataBlock" "owner"
           ,structField  C "StgCompactNFDataBlock" "next"
 
@@ -615,12 +601,11 @@ wanteds os = concat
                           "RTS_FLAGS" "DebugFlags.sanity"
           ,structField_ C "RtsFlags_DebugFlags_weak"
                           "RTS_FLAGS" "DebugFlags.weak"
+          ,structField_ C "RtsFlags_DebugFlags_zero_on_gc"
+                          "RTS_FLAGS" "DebugFlags.zero_on_gc"
           ,structField_ C "RtsFlags_GcFlags_initialStkSize"
                           "RTS_FLAGS" "GcFlags.initialStkSize"
-          ,structField_ C "RtsFlags_MiscFlags_tickInterval"
-                          "RTS_FLAGS" "MiscFlags.tickInterval"
 
-          ,structSize   C "StgFunInfoExtraFwd"
           ,structField  C "StgFunInfoExtraFwd" "slow_apply"
           ,structField  C "StgFunInfoExtraFwd" "fun_type"
           ,structFieldH Both "StgFunInfoExtraFwd" "arity"
@@ -634,11 +619,9 @@ wanteds os = concat
           ,structField_ C    "StgFunInfoExtraRev_bitmap_offset" "StgFunInfoExtraRev" "b.bitmap_offset"
 
           ,structField C "StgLargeBitmap" "size"
-          ,fieldOffset C "StgLargeBitmap" "bitmap"
 
           ,structSize  C "snEntry"
           ,structField C "snEntry" "sn_obj"
-          ,structField C "snEntry" "addr"
 
           ,structSize  C "spEntry"
           ,structField C "spEntry" "addr"
@@ -646,12 +629,24 @@ wanteds os = concat
            -- Note that this conditional part only affects the C headers.
            -- That's important, as it means we get the same PlatformConstants
            -- type on all platforms.
-          ,if os == Just Windows
-           then concat [structSize  C "StgAsyncIOResult"
-                       ,structField C "StgAsyncIOResult" "reqID"
-                       ,structField C "StgAsyncIOResult" "len"
-                       ,structField C "StgAsyncIOResult" "errCode"]
-           else []
+          ,[]
+
+           -- struct HsIface
+          ,structField C "HsIface" "Z0T_closure"
+          ,structField C "HsIface" "True_closure"
+          ,structField C "HsIface" "False_closure"
+          ,structField C "HsIface" "heapOverflow_closure"
+          ,structField C "HsIface" "cannotCompactFunction_closure"
+          ,structField C "HsIface" "cannotCompactPinned_closure"
+          ,structField C "HsIface" "cannotCompactMutable_closure"
+          ,structField C "HsIface" "nestedAtomically_closure"
+          ,structField C "HsIface" "noMatchingContinuationPrompt_closure"
+          ,structField C "HsIface" "divZZeroException_closure"
+          ,structField C "HsIface" "underflowException_closure"
+          ,structField C "HsIface" "overflowException_closure"
+          ,structField C "HsIface" "raisePrimIOException_info"
+          ,structField C "HsIface" "unpackCStringzh_info"
+          ,structField C "HsIface" "unpackCStringUtf8zh_info"
 
           -- pre-compiled thunk types
           ,constantWord Haskell "MAX_SPEC_SELECTEE_SIZE" "MAX_SPEC_SELECTEE_SIZE"
@@ -749,7 +744,7 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
                               ++ "Workaround: You may want to pass\n"
                               ++ "    --with-nm=$(xcrun --find nm-classic)\n"
                               ++ "to 'configure'.\n"
-             Just x     -> die ("unexpected value round-tripped for CONTROL_GROUP_CONST_291: " ++ show x)
+             Just x     -> die ("unexpected value round-tripped for CONTROL_GROUP_CONST_291: " ++ show x ++ "\n" ++ show m ++ "\n" ++ xs)
 
          mapM (lookupResult m) (wanteds (Just os))
     where headers = ["#define IN_STG_CODE 0",
@@ -762,9 +757,6 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
                      "",
                      "#define PROFILING",
                      "#define THREADED_RTS",
-                     -- We need to define this if we want StgAsyncIOResult
-                     -- struct to be present after CPP
-                     --
                      -- FIXME: rts/PosixSource.h should include ghcplatform.h
                      -- which should set this. There is a mismatch host/target
                      -- again...
@@ -839,14 +831,23 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
           -- and returns ("MAX_Vanilla_REG", 11)
           parseNmLine line
               = case words line of
-                ('_' : n) : "C" : s : _ -> mkP n s
-                n : "C" : s : _ -> mkP n s
-                [n, "D", _, s] -> mkP n s
-                [s, "O", "*COM*", _, n] -> mkP n s
+                -- in common section
+                (n : "C" : s : _ )           -> mkP n s -- nm format (ELF, COFF)
+                [s, "O", "*COM*", _, n]      -> mkP n s -- objdump format (ELF)
+                -- in .bss section
+                [n, "B", _, s ]              -> mkP n s -- nm format (ELF)
+                [_, "g", "O", ".bss", s, n]  -> mkP n s -- objdump format (ELF)
+                -- in data section
+                [n, "D", _, s]               -> mkP n s -- nm format (ELF)
+                [_, "g", "O", ".data", s, n] -> mkP n s -- objdump format (ELF)
                 _ -> Nothing
-              where mkP r s = case (stripPrefix prefix r, readHex s) of
+              where mkP r s = case (stripPrefix prefix (strip_ r), readHex s) of
                         (Just name, [(size, "")]) -> Just (name, size)
                         _ -> Nothing
+                    -- strip leading underscore: some platforms (e.g. Darwin) add one
+                    strip_ = \case
+                      ('_':n) -> n
+                      n       -> n
 
           -- On AIX, `nm` isn't able to tell us the symbol size, so we
           -- need to use `objdump --syms`. However, unlike on OpenBSD,

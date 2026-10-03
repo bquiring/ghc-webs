@@ -1,15 +1,4 @@
 {-# LANGUAGE AllowAmbiguousTypes     #-} -- for unXRec, etc.
-{-# LANGUAGE ConstraintKinds         #-}
-{-# LANGUAGE DataKinds               #-}
-{-# LANGUAGE DeriveDataTypeable      #-}
-{-# LANGUAGE EmptyCase               #-}
-{-# LANGUAGE EmptyDataDeriving       #-}
-{-# LANGUAGE FlexibleContexts        #-}
-{-# LANGUAGE FlexibleInstances       #-}
-{-# LANGUAGE GADTs                   #-}
-{-# LANGUAGE MultiParamTypeClasses   #-}
-{-# LANGUAGE RankNTypes              #-}
-{-# LANGUAGE ScopedTypeVariables     #-}
 {-# LANGUAGE TypeFamilyDependencies  #-}
 {-# LANGUAGE UndecidableInstances    #-} -- Wrinkle in Note [Trees That Grow]
                                          -- in module Language.Haskell.Syntax.Extension
@@ -20,6 +9,7 @@ module Language.Haskell.Syntax.Extension where
 -- This module captures the type families to precisely identify the extension
 -- points for GHC.Hs syntax
 
+import Control.DeepSeq
 import Data.Type.Equality (type (~))
 
 import Data.Data hiding ( Fixity )
@@ -27,6 +17,7 @@ import Data.Kind (Type)
 
 import Data.Eq
 import Data.Ord
+import Text.Show
 
 {-
 Note [Trees That Grow]
@@ -73,6 +64,9 @@ See also Note [IsPass] and Note [NoGhcTc] in GHC.Hs.Extension.
 data NoExtField = NoExtField
   deriving (Data,Eq,Ord)
 
+instance NFData NoExtField where
+  rnf NoExtField = ()
+
 -- | Used when constructing a term with an unused extension point.
 noExtField :: NoExtField
 noExtField = NoExtField
@@ -106,7 +100,10 @@ can only do that if the extension field was strict (#18764).
 See also [DataConCantHappen and strict fields].
 -}
 data DataConCantHappen
-  deriving (Data,Eq,Ord)
+  deriving (Data,Eq,Ord,Show)
+
+instance NFData DataConCantHappen where
+  rnf = dataConCantHappen
 
 -- | Eliminate a 'DataConCantHappen'. See Note [Constructor cannot occur].
 dataConCantHappen :: DataConCantHappen -> a
@@ -119,7 +116,7 @@ dataConCantHappen x = case x of {}
 -- See Note [XRec and SrcSpans in the AST]
 type family XRec p a = r | r -> a
 
-type family Anno a = b -- See Note [XRec and Anno in the AST] in GHC.Parser.Annotation
+type family Anno a -- See Note [XRec and Anno in the AST] in GHC.Parser.Annotation
 
 {-
 Note [XRec and SrcSpans in the AST]
@@ -216,6 +213,7 @@ type family XXHsLocalBindsLR x x'
 -- HsValBindsLR type families
 type family XValBinds    x x'
 type family XXValBindsLR x x'
+type family XXValBinds   x x'
 
 -- HsBindLR type families
 type family XFunBind    x x'
@@ -250,6 +248,13 @@ type family XMinimalSig       x
 type family XSCCFunSig        x
 type family XCompleteMatchSig x
 type family XXSig             x
+
+-- Inline Pragma families
+type family XInlinePragma   x
+type family XXInlinePragma  x
+
+-- Inline Activation family
+type family XXActivation   x
 
 -- FixitySig type families
 type family XFixitySig          x
@@ -364,6 +369,11 @@ type family XTyFamInstD    x
 type family XXInstDecl     x
 
 -- -------------------------------------
+-- OverlapMode type families
+type family XOverlapMode  x
+type family XXOverlapMode x
+
+-- -------------------------------------
 -- DerivDecl type families
 type family XCDerivDecl      x
 type family XXDerivDecl      x
@@ -379,6 +389,22 @@ type family XViaStrategy      x
 -- DefaultDecl type families
 type family XCDefaultDecl      x
 type family XXDefaultDecl      x
+
+-- -------------------------------------
+-- CCallTarget type family
+type family XStaticTarget  x
+type family XDynamicTarget x
+type family XXCCallTarget  x
+
+-- -------------------------------------
+-- CType type family
+type family XCType  x
+type family XXCType x
+
+-- -------------------------------------
+-- Header type family
+type family XHeader  x
+type family XXHeader x
 
 -- -------------------------------------
 -- ForeignDecl type families
@@ -422,6 +448,17 @@ type family XWarning        x
 type family XXWarnDecl      x
 
 -- -------------------------------------
+-- WarningTxt type families
+type family XDeprecatedTxt x
+type family XWarningTxt    x
+type family XXWarningTxt   x
+
+-- -------------------------------------
+-- InWarningCategory type families
+type family XInWarningCategory  x
+type family XXInWarningCategory x
+
+-- -------------------------------------
 -- AnnDecl type families
 type family XHsAnnotation  x
 type family XXAnnDecl      x
@@ -452,6 +489,7 @@ type family XOverLabel      x
 type family XIPVar          x
 type family XOverLitE       x
 type family XLitE           x
+type family XQualLitE       x
 type family XLam            x
 type family XLamCase        x
 type family XApp            x
@@ -487,6 +525,7 @@ type family XTick           x
 type family XBinTick        x
 type family XPragE          x
 type family XEmbTy          x
+type family XStar           x
 type family XHole           x
 type family XForAll         x
 type family XQual           x
@@ -597,8 +636,9 @@ type family XXParStmtBlock x x'
 type family XHsChar x
 type family XHsCharPrim x
 type family XHsString x
-type family XHsMultilineString x
 type family XHsStringPrim x
+type family XHsNatural x
+type family XHsDouble x
 type family XHsInt x
 type family XHsIntPrim x
 type family XHsWordPrim x
@@ -619,6 +659,22 @@ type family XXLit x
 type family XOverLit  x
 type family XXOverLit x
 
+-- -------------------------------------
+-- HsQualLit type families
+type family XQualLit  x
+type family XXQualLit x
+
+-- -------------------------------------
+-- QualLitVal type families
+type family XQualLitString  x
+type family XXQualLitVal x
+
+-- Type families for the HsDocString extension points
+type family XMultiLineDocString x
+type family XNestedDocString x
+type family XGeneratedDocString x
+type family XXHsDocString x
+
 -- =====================================================================
 -- Type families for the HsPat extension points
 
@@ -636,11 +692,13 @@ type family XConPat      x
 type family XViewPat     x
 type family XSplicePat   x
 type family XLitPat      x
+type family XQualLitPat  x
 type family XNPat        x
 type family XNPlusKPat   x
 type family XSigPat      x
 type family XEmbTyPat    x
 type family XInvisPat    x
+type family XModifiedPat x
 type family XCoPat       x
 type family XXPat        x
 type family XHsFieldBind x
@@ -705,13 +763,6 @@ type family XWildCardTy      x
 type family XXType           x
 
 -- ---------------------------------------------------------------------
--- HsTyLit type families
-type family XNumTy           x
-type family XStrTy           x
-type family XCharTy          x
-type family XXTyLit          x
-
--- ---------------------------------------------------------------------
 -- HsForAllTelescope type families
 type family XHsForAllVis        x
 type family XHsForAllInvis      x
@@ -753,6 +804,7 @@ type family XIEThingAbs        x
 type family XIEThingAll        x
 type family XIEThingWith       x
 type family XIEModuleContents  x
+type family XIEWholeNamespace  x
 type family XIEGroup           x
 type family XIEDoc             x
 type family XIEDocNamed        x
@@ -767,7 +819,36 @@ type family XIEType p
 type family XIEData p
 type family XXIEWrappedName p
 
+-- -------------------------------------
+-- FractionalLit type families
+type family XFractionalLit  x
+type family XXFractionalLit x
 
+-- -------------------------------------
+
+-- NamespaceSpecifier type families
+type family XNoNamespaceSpecifier p
+type family XTypeNamespaceSpecifier p
+type family XDataNamespaceSpecifier p
+type family XXNamespaceSpecifier p
+
+-- IntegralLit type families
+type family XIntegralLit  x
+type family XXIntegralLit x
+
+-- -------------------------------------
+-- StringLit type families
+type family XStringLit  x
+type family XXStringLit x
+
+-- =====================================================================
+-- BooleanFormula type families
+
+type family XBFVar           p
+type family XBFAnd           p
+type family XBFOr            p
+type family XBFParens        p
+type family XXBooleanFormula p
 
 -- =====================================================================
 -- Misc

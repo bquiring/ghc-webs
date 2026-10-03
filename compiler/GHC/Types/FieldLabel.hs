@@ -1,7 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable FieldLabelString
 
 {-
 %
@@ -50,19 +47,20 @@ import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Types.Name
 
-import GHC.Data.FastString.Env
-import GHC.Types.Unique (Uniquable(..))
 import GHC.Utils.Outputable
 import GHC.Utils.Binary
+import GHC.Data.FastString
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+import Language.Haskell.Syntax.Text
 
 import Control.DeepSeq
 import Data.Bool
 import Data.Data
+import qualified Data.Map as M
 
 -- | A map from labels to all the auxiliary information
-type FieldLabelEnv = DFastStringEnv FieldLabel
+type FieldLabelEnv = M.Map HText FieldLabel
 
 -- | Fields in an algebraic record type; see Note [FieldLabel].
 data FieldLabel = FieldLabel {
@@ -79,7 +77,7 @@ data FieldLabel = FieldLabel {
 
 -- | User-visible label of a field.
 flLabel :: FieldLabel -> FieldLabelString
-flLabel = FieldLabelString . occNameFS . nameOccName . flSelector
+flLabel = FieldLabelString . fastStringToShortText . occNameFS . nameOccName . flSelector
 
 instance HasOccName FieldLabel where
   occName = nameOccName . flSelector
@@ -88,12 +86,6 @@ instance Outputable FieldLabel where
     ppr fl = ppr (flLabel fl) <> whenPprDebug (braces (ppr (flSelector fl))
                                                 <> ppr (flHasDuplicateRecordFields fl)
                                                 <> ppr (flHasFieldSelector fl))
-
-instance Outputable FieldLabelString where
-  ppr (FieldLabelString l) = ppr l
-
-instance Uniquable FieldLabelString where
-  getUnique (FieldLabelString fs) = getUnique fs
 
 -- | Flag to indicate whether the DuplicateRecordFields extension is enabled.
 data DuplicateRecordFields

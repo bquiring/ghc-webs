@@ -1,9 +1,12 @@
-{-# OPTIONS_GHC -Wno-noncanonical-monoid-instances #-}
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines Generic, Generic1 etc
 
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DeriveFunctor              #-}
+{-# LANGUAGE DeriveFoldable             #-}
 {-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DeriveTraversable          #-}
 {-# LANGUAGE EmptyDataDeriving          #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
@@ -733,28 +736,39 @@ module GHC.Internal.Generics  (
 import GHC.Internal.Data.Either     ( Either (..) )
 import GHC.Internal.Data.Maybe      ( Maybe(..), fromMaybe )
 import GHC.Internal.Data.Ord        ( Down(..) )
-import GHC.Internal.Bignum.Integer ( Integer, integerToInt )
 import GHC.Internal.Prim        ( Addr#, Char#, Double#, Float#, Int#, Word# )
 import GHC.Internal.Ptr         ( Ptr(..) )
-import GHC.Internal.Types
+import GHC.Internal.Base hiding( Any, foldr ) -- clashes with the Semigroup
+import GHC.Internal.Num  -- For deriving
+import GHC.Internal.Ix  -- For deriving
+import GHC.Internal.Enum  -- For deriving
 
 -- Needed for instances
-import GHC.Internal.Ix      ( Ix )
-import GHC.Internal.Base    ( Alternative(..), Applicative(..), Functor(..)
-                   , Monad(..), MonadPlus(..), NonEmpty(..), String, coerce
-                   , Semigroup(..), Monoid(..), Void )
-import GHC.Internal.Classes ( Eq(..), Ord(..) )
-import GHC.Internal.Enum    ( Bounded, Enum )
-import GHC.Internal.Read    ( Read(..) )
-import GHC.Internal.Show    ( Show(..), showString, showChar, showParen, appPrec )
+import GHC.Internal.Err (errorWithoutStackTrace)
+import GHC.Internal.Prim    ( coerce )
+import GHC.Internal.Read    ( Read )
+import GHC.Internal.Show
 import GHC.Internal.Stack.Types ( SrcLoc(..) )
 import GHC.Internal.Tuple   (Solo (..))
 import GHC.Internal.Unicode ( GeneralCategory(..) )
 import GHC.Internal.Fingerprint.Type ( Fingerprint(..) )
+import GHC.Internal.Data.Semigroup.Internal
+import GHC.Internal.Data.Monoid
+import GHC.Internal.Data.Foldable
+import GHC.Internal.Data.Traversable
+import GHC.Internal.Data.Functor.Const
+import GHC.Internal.Functor.ZipList
+import GHC.Internal.IO.Exception ( ExitCode(..) )
+import GHC.Internal.ByteOrder ( ByteOrder(..) )
+import GHC.Internal.Data.Version
+import GHC.Internal.Data.Functor.Identity
 
 -- Needed for metadata
 import GHC.Internal.Data.Proxy   ( Proxy(..) )
 import GHC.Internal.TypeLits ( KnownSymbol, KnownNat, Nat, symbolVal, natVal )
+
+import qualified GHC.Internal.Num  as Rebindable
+import qualified GHC.Internal.Read as Rebindable
 
 --------------------------------------------------------------------------------
 -- Representation types
@@ -1423,6 +1437,10 @@ class Generic1 (f :: k -> Type) where
 -- type/ like 'Generically' decouples the instance from the type
 -- class.
 --
+-- Note that if you don't generate parent and child instances using the same
+-- method, the result may be incongruous; for example, in previous versions
+-- `mconcat` didn't use the correct `(<>)`, instead preferring a Generic version.
+--
 -- @since base-4.17.0.0
 newtype Generically a = Generically a
 
@@ -1432,12 +1450,14 @@ instance (Generic a, Semigroup (Rep a ())) => Semigroup (Generically a) where
   Generically a <> Generically b = Generically (to (from a <> from b :: Rep a ()))
 
 -- | @since base-4.17.0.0
-instance (Generic a, Monoid (Rep a ())) => Monoid (Generically a) where
+instance (Generic a, Semigroup a, Monoid (Rep a ())) => Monoid (Generically a) where
   mempty :: Generically a
   mempty = Generically (to (mempty :: Rep a ()))
 
-  mappend :: Generically a -> Generically a -> Generically a
-  mappend = (<>)
+  -- https://github.com/haskell/core-libraries-committee/issues/324
+  mconcat :: [Generically a] -> Generically a
+  mconcat = foldr (coerce @(a -> a -> a) (<>)) mempty
+  {-# INLINE mconcat #-}
 
 -- | A type whose instances are defined generically, using the
 -- 'Generic1' representation. 'Generically1' is a higher-kinded
@@ -1879,3 +1899,194 @@ instance SingKind DecidedStrictness where
   fromSing SDecidedLazy   = DecidedLazy
   fromSing SDecidedStrict = DecidedStrict
   fromSing SDecidedUnpack = DecidedUnpack
+
+-- | @since base-4.7.0.0
+deriving instance Generic (Dual a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 Dual
+
+-- | @since base-4.7.0.0
+deriving instance Generic (Endo a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic All
+
+-- | @since base-4.7.0.0
+deriving instance Generic Any
+
+-- | @since base-4.7.0.0
+deriving instance Generic (Sum a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 Sum
+
+-- | @since base-4.7.0.0
+deriving instance Generic (Product a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 Product
+
+-- | @since base-4.8.0.0
+deriving instance Generic (Alt f a)
+
+-- | @since base-4.8.0.0
+deriving instance Generic1 (Alt f)
+
+-- | @since base-4.7.0.0
+deriving instance Generic (First a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 First
+
+-- | @since base-4.7.0.0
+deriving instance Generic (Last a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 Last
+
+-- | @since base-4.12.0.0
+deriving instance Generic (Ap f a)
+
+-- | @since base-4.12.0.0
+deriving instance Generic1 (Ap f)
+
+-- | @since base-4.9.0.0
+instance Foldable U1 where
+    foldMap _ _ = mempty
+    {-# INLINE foldMap #-}
+    fold _ = mempty
+    {-# INLINE fold #-}
+    foldr _ z _ = z
+    {-# INLINE foldr #-}
+    foldl _ z _ = z
+    {-# INLINE foldl #-}
+    foldl1 _ _ = errorWithoutStackTrace "foldl1: U1"
+    foldr1 _ _ = errorWithoutStackTrace "foldr1: U1"
+    length _   = 0
+    null _     = True
+    elem _ _   = False
+    sum _      = 0
+    product _  = 1
+
+-- | @since base-4.9.0.0
+deriving instance Foldable V1
+
+-- | @since base-4.9.0.0
+deriving instance Foldable Par1
+
+-- | @since base-4.9.0.0
+deriving instance Foldable f => Foldable (Rec1 f)
+
+-- | @since base-4.9.0.0
+deriving instance Foldable (K1 i c)
+
+-- | @since base-4.9.0.0
+deriving instance Foldable f => Foldable (M1 i c f)
+
+-- | @since base-4.9.0.0
+deriving instance (Foldable f, Foldable g) => Foldable (f :+: g)
+
+-- | @since base-4.9.0.0
+deriving instance (Foldable f, Foldable g) => Foldable (f :*: g)
+
+-- | @since base-4.9.0.0
+deriving instance (Foldable f, Foldable g) => Foldable (f :.: g)
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UAddr
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UChar
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UDouble
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UFloat
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UInt
+
+-- | @since base-4.9.0.0
+deriving instance Foldable UWord
+
+-- | @since base-4.9.0.0
+instance Traversable U1 where
+    traverse _ _ = pure U1
+    {-# INLINE traverse #-}
+    sequenceA _ = pure U1
+    {-# INLINE sequenceA #-}
+    mapM _ _ = pure U1
+    {-# INLINE mapM #-}
+    sequence _ = pure U1
+    {-# INLINE sequence #-}
+
+-- | @since base-4.9.0.0
+deriving instance Traversable V1
+
+-- | @since base-4.9.0.0
+deriving instance Traversable Par1
+
+-- | @since base-4.9.0.0
+deriving instance Traversable f => Traversable (Rec1 f)
+
+-- | @since base-4.9.0.0
+deriving instance Traversable (K1 i c)
+
+-- | @since base-4.9.0.0
+deriving instance Traversable f => Traversable (M1 i c f)
+
+-- | @since base-4.9.0.0
+deriving instance (Traversable f, Traversable g) => Traversable (f :+: g)
+
+-- | @since base-4.9.0.0
+deriving instance (Traversable f, Traversable g) => Traversable (f :*: g)
+
+-- | @since base-4.9.0.0
+deriving instance (Traversable f, Traversable g) => Traversable (f :.: g)
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UAddr
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UChar
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UDouble
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UFloat
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UInt
+
+-- | @since base-4.9.0.0
+deriving instance Traversable UWord
+
+-- | @since base-4.9.0.0
+deriving instance Generic (Const a b)
+
+-- | @since base-4.9.0.0
+deriving instance Generic1 (Const a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic (ZipList a)
+
+-- | @since base-4.7.0.0
+deriving instance Generic1 ZipList
+
+-- TODO: since when??
+deriving instance Generic ExitCode
+
+-- | @since base-4.15.0.0
+deriving instance Generic ByteOrder
+
+-- | @since base-4.9.0.0
+deriving instance Generic Version
+
+-- | @since base-4.8.0.0
+deriving instance Generic (Identity a)
+
+-- | @since base-4.8.0.0
+deriving instance Generic1 Identity

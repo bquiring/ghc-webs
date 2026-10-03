@@ -1,5 +1,3 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-
@@ -25,8 +23,8 @@ module GHC.HsToCore.Utils (
         dsHandleMonadicFailure,
         mkCoLetMatchResult, mkViewMatchResult, mkGuardedMatchResult,
         matchCanFail, mkEvalMatchResult,
-        mkCoPrimCaseMatchResult, mkCoAlgCaseMatchResult, mkCoSynCaseMatchResult,
-        wrapBind, wrapBinds,
+        mkCoPrimCaseMatchResult, mkDataConCase, mkCoSynCaseMatchResult,
+        wrapBind, wrapBinds, bindMatchId,
 
         mkErrorAppDs, mkCastDs, mkFailExpr,
 
@@ -35,6 +33,7 @@ module GHC.HsToCore.Utils (
         -- LHs tuples
         mkLHsPatTup, mkVanillaTuplePat,
         mkBigLHsVarTupId, mkBigLHsTupId, mkBigLHsVarPatTupId, mkBigLHsPatTupId,
+        mkHsBoxApp, mkUnboxViewPat,
 
         mkSelectorBinds,
 
@@ -44,8 +43,6 @@ module GHC.HsToCore.Utils (
     ) where
 
 import GHC.Prelude
-
-import Language.Haskell.Syntax.Basic (Boxity(..))
 
 import {-# SOURCE #-} GHC.HsToCore.Match ( matchSimply )
 import {-# SOURCE #-} GHC.HsToCore.Expr  ( dsLExpr, dsSyntaxExpr )
@@ -57,7 +54,8 @@ import GHC.HsToCore.Monad
 
 import GHC.Core.Utils
 import GHC.Core.Make
-import GHC.Types.Id.Make
+import GHC.Core.Make.Box ( boxTy )
+import GHC.Core.Make.BigTuple
 import GHC.Types.Id
 import GHC.Types.Literal
 import GHC.Core.TyCon
@@ -66,12 +64,12 @@ import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Core.TyCo.Rep( Scaled(..) )
-import GHC.Builtin.Types
 import GHC.Core.ConLike
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
+import GHC.Types.Id.Make( DataConBoxer(..) )
 import GHC.Unit.Module
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Types.SrcLoc
@@ -80,6 +78,9 @@ import GHC.Utils.Misc
 import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import qualified GHC.LanguageExtensions as LangExt
+
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Ids
 
 import GHC.Rename.Env ( irrefutableConLikeTc )
 import GHC.Tc.Types.Evidence
@@ -180,7 +181,7 @@ In fact, even GHC.Core.Subst.simplOptExpr will do this, and simpleOptExpr
 runs on the output of the desugarer, so all is well by the end of
 the desugaring pass.
 
-See also Note [Match Ids] in GHC.HsToCore.Match
+See also Note [Match Ids] in GHC.HsToCore.Monad
 
 ************************************************************************
 *                                                                      *
@@ -253,18 +254,25 @@ wrapBind new old body   -- NB: this function must deal with term
   | new==old    = body  -- variables, type variables or coercion variables
   | otherwise   = Let (NonRec new (varToCoreExpr old)) body
 
+-- | Like 'wrapBind', but for a 'MatchId'.
+bindMatchId :: Id -> MatchId -> CoreExpr -> CoreExpr
+bindMatchId new (MatchId { matchId = old, matchCo = MRefl }) body
+  = wrapBind new old body
+bindMatchId new mid body
+  = Let (NonRec new (matchIdExpr mid)) body
+
 -- Used to force variables when desugaring strict binders. It's crucial that the
 -- variable is shadowed by the case binder. See Wrinkle 1 in
 -- Note [Desugar Strict binds] in GHC.HsToCore.Binds.
 seqVar :: Var -> CoreExpr -> CoreExpr
 seqVar var body = mkDefaultCase (Var var) var body
 
-mkCoLetMatchResult :: CoreBind -> MatchResult CoreExpr -> MatchResult CoreExpr
+mkCoLetMatchResult :: HasDebugCallStack => CoreBind -> MatchResult CoreExpr -> MatchResult CoreExpr
 mkCoLetMatchResult bind = fmap (mkCoreLet bind)
 
 -- (mkViewMatchResult var' viewExpr mr) makes the expression
 -- let var' = viewExpr in mr
-mkViewMatchResult :: Id -> CoreExpr -> MatchResult CoreExpr -> MatchResult CoreExpr
+mkViewMatchResult :: HasDebugCallStack => Id -> CoreExpr -> MatchResult CoreExpr -> MatchResult CoreExpr
 mkViewMatchResult var' viewExpr = fmap $ mkCoreLet $ NonRec var' viewExpr
 
 mkEvalMatchResult :: Id -> Type -> MatchResult CoreExpr -> MatchResult CoreExpr
@@ -276,16 +284,24 @@ mkGuardedMatchResult pred_expr mr = MR_Fallible $ \fail -> do
   body <- runMatchResult fail mr
   return (mkIfThenElse pred_expr body fail)
 
-mkCoPrimCaseMatchResult :: Id                  -- Scrutinee
-                        -> Type                      -- Type of the case
-                        -> [(Literal, MatchResult CoreExpr)]  -- Alternatives
-                        -> MatchResult CoreExpr               -- Literals are all unlifted
+mkCoPrimCaseMatchResult
+  :: HasDebugCallStack
+  => MatchId                            -- ^ Scrutinee
+  -> Type                               -- ^ Type of the case
+  -> [(Literal, MatchResult CoreExpr)]  -- ^ Alternatives (Literals are all unlifted)
+  -> MatchResult CoreExpr
 mkCoPrimCaseMatchResult var ty match_alts
-  = MR_Fallible mk_case
+  = assertPpr (definitelyUnliftedType _scrut_ty)
+    (text "mkCoPrimCaseMatchResult: unexpected lifted scrutinee type"
+       <+> ppr _scrut_ty <+> dcolon <+> ppr (typeKind _scrut_ty))
+  $ MR_Fallible mk_case
   where
+    _scrut_ty = matchIdType var
+
     mk_case fail = do
-        alts <- mapM (mk_alt fail) sorted_alts
-        return (Case (Var var) var ty (Alt DEFAULT [] fail : alts))
+      alts <- mapM (mk_alt fail) sorted_alts
+      return (mkWildCase (matchIdExpr var) (matchIdScaledType var) ty
+                         (Alt DEFAULT [] fail : alts))
 
     sorted_alts = sortWith fst match_alts       -- Right order for a Case
     mk_alt fail (lit, mr)
@@ -298,43 +314,16 @@ data CaseAlt a = MkCaseAlt{ alt_pat :: a,
                             alt_wrapper :: HsWrapper,
                             alt_result :: MatchResult CoreExpr }
 
-mkCoAlgCaseMatchResult
-  :: Id -- ^ Scrutinee
-  -> Type -- ^ Type of exp
-  -> NonEmpty (CaseAlt DataCon) -- ^ Alternatives (bndrs *include* tyvars, dicts)
-  -> MatchResult CoreExpr
-mkCoAlgCaseMatchResult var ty match_alts
-  | isNewtype  -- Newtype case; use a let
-  = assert (null match_alts_tail && null (tail arg_ids1)) $
-    mkCoLetMatchResult (NonRec arg_id1 newtype_rhs) match_result1
-
-  | otherwise
-  = mkDataConCase var ty match_alts
-  where
-    isNewtype = isNewTyCon (dataConTyCon (alt_pat alt1))
-
-        -- [Interesting: because of GADTs, we can't rely on the type of
-        --  the scrutinised Id to be sufficiently refined to have a TyCon in it]
-
-    alt1@MkCaseAlt{ alt_bndrs = arg_ids1, alt_result = match_result1 } :| match_alts_tail
-      = match_alts
-    -- Stuff for newtype
-    arg_id1       = assert (notNull arg_ids1) $ head arg_ids1
-    var_ty        = idType var
-    (tc, ty_args) = tcSplitTyConApp var_ty      -- Don't look through newtypes
-                                                -- (not that splitTyConApp does, these days)
-    newtype_rhs = unwrapNewTypeBody tc ty_args (Var var)
-
-mkCoSynCaseMatchResult :: Id -> Type -> CaseAlt PatSyn -> MatchResult CoreExpr
+mkCoSynCaseMatchResult :: MatchId -> Type -> CaseAlt PatSyn -> MatchResult CoreExpr
 mkCoSynCaseMatchResult var ty alt = MR_Fallible $ mkPatSynCase var ty alt
 
-mkPatSynCase :: Id -> Type -> CaseAlt PatSyn -> CoreExpr -> DsM CoreExpr
+mkPatSynCase :: MatchId -> Type -> CaseAlt PatSyn -> CoreExpr -> DsM CoreExpr
 mkPatSynCase var ty alt fail = do
     matcher_id <- dsLookupGlobalId matcher_name
     matcher <- dsLExpr $ mkLHsWrap wrapper $
                          nlHsTyApp matcher_id [getRuntimeRep ty, ty]
     cont <- mkCoreLams bndrs <$> runMatchResult fail match_result
-    return $ mkCoreApps matcher [Var var, ensure_unstrict cont, Lam voidArgId fail]
+    return $ mkCoreApps matcher [matchIdExpr var, ensure_unstrict cont, Lam voidArgId fail]
   where
     MkCaseAlt{ alt_pat = psyn,
                alt_bndrs = bndrs,
@@ -347,7 +336,7 @@ mkPatSynCase var ty alt fail = do
     ensure_unstrict cont | needs_void_lam = Lam voidArgId cont
                          | otherwise      = cont
 
-mkDataConCase :: Id -> Type -> NonEmpty (CaseAlt DataCon) -> MatchResult CoreExpr
+mkDataConCase :: MatchId -> Type -> NonEmpty (CaseAlt DataCon) -> MatchResult CoreExpr
 mkDataConCase var ty alts@(alt1 :| _)
     = liftA2 mk_case mk_default mk_alts
     -- The liftA2 combines the failability of all the alternatives and the default
@@ -359,12 +348,12 @@ mkDataConCase var ty alts@(alt1 :| _)
     sorted_alts :: [ CaseAlt DataCon ]
     sorted_alts  = sortWith (dataConTag . alt_pat) $ NEL.toList alts
 
-    var_ty       = idType var
+    var_ty       = matchIdType var
     (_, ty_args) = tcSplitTyConApp var_ty -- Don't look through newtypes
                                           -- (not that splitTyConApp does, these days)
 
     mk_case :: Maybe CoreAlt -> [CoreAlt] -> CoreExpr
-    mk_case def alts = mkWildCase (Var var) (idScaledType var) ty $
+    mk_case def alts = mkWildCase (matchIdExpr var) (matchIdScaledType var) ty $
       maybeToList def ++ alts
 
     mk_alts :: MatchResult [CoreAlt]
@@ -380,7 +369,7 @@ mkDataConCase var ty alts@(alt1 :| _)
           Just (DCB boxer) -> do
             us <- newUniqueSupply
             let (rep_ids, binds) = initUs_ us (boxer ty_args args)
-            let rep_ids' = map (scaleVarBy (idMult var)) rep_ids
+            let rep_ids' = map (scaleVarBy (matchIdMult var)) rep_ids
               -- Upholds the invariant that the binders of a case expression
               -- must be scaled by the case multiplicity. See Note [Case
               -- expression invariants] in CoreSyn.
@@ -554,10 +543,10 @@ There are three cases.
        let { t = case e of Just (Just v) -> Solo v
            ; v = case t of Solo v -> v }
        in t `seq` body
-    The 'Solo' is a one-tuple; see Note [One-tuples] in GHC.Builtin.Types
+    The 'Solo' is a one-tuple; see Note [One-tuples] in GHC.Builtin.WiredIn.Types
     Note that forcing 't' makes the pattern match happen,
-    but does not force 'v'.  That's why we call `mkBigCoreVarTupSolo`
-    in `mkSelectorBinds`
+    but does not force 'v'.  That's why we use the 'BareElements' layout
+    (which preserves one-tuples) in `mkSelectorBinds`
 
   * The pattern binds no variables
         let !(True,False) = e in body
@@ -576,7 +565,7 @@ There are three cases.
      - Forcing 't' will force the pattern to match fully;
        e.g. will diverge if (snd e) is bottom
      - But 'a' itself is not forced; it is wrapped in a one-tuple
-       (see Note [One-tuples] in GHC.Builtin.Types)
+       (see Note [One-tuples] in GHC.Builtin.WiredIn.Types)
 
   *   !(Just x) = e
     ==>
@@ -674,15 +663,17 @@ mkSelectorBinds ticks pat ctx val_expr
        ; return ( val_var, (val_var, val_expr) : binds) }
 
   | otherwise                          -- General case (C)
-  = do { tuple_var  <- newSysLocalMDs tuple_ty
+  = do { local_tuple <- mkBigCoreVarTup BareElements binders
+       ; let tuple_ty = exprType local_tuple
+       ; tuple_var  <- newSysLocalMDs tuple_ty
        ; error_expr <- mkErrorAppDs pAT_ERROR_ID tuple_ty (ppr pat')
        ; tuple_expr <- matchSimply val_expr ctx ManyTy pat
                                    local_tuple error_expr
        ; let mk_tup_bind tick binder
-               = (binder, mkOptTickBox tick $
-                          mkBigTupleSelectorSolo local_binders binder
-                                           tuple_var (Var tuple_var))
-             tup_binds = zipWith mk_tup_bind ticks' binders
+               = do { sel <- mkBigTupleSelector BareElements local_binders binder
+                                                tuple_var (Var tuple_var)
+                    ; return (binder, mkOptTickBox tick sel) }
+       ; tup_binds <- zipWithM mk_tup_bind ticks' binders
        ; return (tuple_var, (tuple_var, tuple_expr) : tup_binds) }
   where
     pat' = strip_bangs pat
@@ -693,8 +684,6 @@ mkSelectorBinds ticks pat ctx val_expr
     ticks'  = ticks ++ repeat []
 
     local_binders = map localiseId binders      -- See Note [Localise pattern binders]
-    local_tuple   = mkBigCoreVarTupSolo binders
-    tuple_ty      = exprType local_tuple
 
 strip_bangs :: LPat (GhcPass p) -> LPat (GhcPass p)
 -- Remove outermost bangs and parens
@@ -746,19 +735,90 @@ mkVanillaTuplePat :: [LPat GhcTc] -> Boxity -> Pat GhcTc
 -- A vanilla tuple pattern simply gets its type from its sub-patterns
 mkVanillaTuplePat pats box = TuplePat (map hsLPatType pats) pats box
 
--- The Big equivalents for the source tuple expressions
+-- | Build a "big tuple" of the given variables, always using the 'BoxedElements'
+-- big tuple layout.
+--
+-- Source syntax analogue of 'mkBigCoreVarTup'.
 mkBigLHsVarTupId :: [Id] -> LHsExpr GhcTc
-mkBigLHsVarTupId ids = mkBigLHsTupId (map nlHsVar ids)
+mkBigLHsVarTupId ids =
+  mkBigLHsTupId [ mkHsBoxApp (idType v) (nlHsVar v) | v <- ids ]
 
 mkBigLHsTupId :: [LHsExpr GhcTc] -> LHsExpr GhcTc
 mkBigLHsTupId = mkChunkified (\e -> mkLHsTupleExpr e noExtField)
 
--- The Big equivalents for the source tuple patterns
+-- | Converse of 'mkBigLHsVarTupId': matches a big tuple, binding the
+-- given variables.
+--
+-- Always uses the 'BoxedElements' big tuple layout.
 mkBigLHsVarPatTupId :: [Id] -> LPat GhcTc
-mkBigLHsVarPatTupId bs = mkBigLHsPatTupId (map nlVarPat bs)
+mkBigLHsVarPatTupId bs =
+  mkBigLHsPatTupId [ mkUnboxViewPat (idType v) (nlVarPat v) | v <- bs ]
 
 mkBigLHsPatTupId :: [LPat GhcTc] -> LPat GhcTc
 mkBigLHsPatTupId = mkChunkified mkLHsPatTup
+
+{- Note [Boxing big tuple elements]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+At certain points while desugaring we need to collect up binders into a "big
+tuple" (see Note [Big tuples] in GHC.Core.Make.BigTuple). Specifically, this happens for
+
+  - parallel comprehensions (GHC.HsToCore.ListComp.{deListComp,dsMcStmt}),
+    which 'zip'/'mzip' the per-branch tuples of binders together;
+
+  - @then@/@group@/@using@ statements (GHC.HsToCore.ListComp.{dsTransStmt,dsMcStmt})
+    which pass the bound variables through the @using@ function and 'unzip' the
+    grouped result;
+
+  - recursive @do@ blocks (@mdo@/@rec@), in 'GHC.HsToCore.Expr.dsDo', which tie
+    the knot through 'mfix' over a tuple of the recursive binders;
+
+  - arrows, in "GHC.HsToCore.Arrows", which thread the command environment
+    through arrow combinators by using a big tuple.
+
+Some of these binders may have an unboxed type (e.g. Int#); we must thus box
+them before putting them into the big tuple. We do this using the magic Id @box@:
+
+  box :: forall {r} (a :: TYPE r). a -> Box a
+
+where 'Box' is the type described in Note [Boxing constructors]
+in GHC.Builtin.WiredIn.Types.Box. Similarly, when we need to unbox again, we use:
+
+  unbox :: forall {r} (a :: TYPE r). Box a -> a
+
+Building a big tuple thus boxes each element; conversely, we must unbox each
+element when unboxing. Concretely:
+
+  - At the HsSyn level, 'mkBigLHsVarTupId' boxes (using 'mkHsBoxApp') and
+    'mkBigLHsVarPatTupId' unboxes (using the 'mkUnboxViewPat' view pattern).
+
+  - At the Core level, 'mkBigCoreVarTup' and 'mkBigCoreTup' box each element,
+    and 'mkBigTupleCase' / 'mkBigTupleSelector' unboxes them again.
+
+Note that even types of kind Type are boxed in this way: we may only learn that
+a binder is lifted after constraint solving, so the typechecker
+(which builds these tuple types, e.g. in GHC.Tc.Gen.Match) always boxes, and
+the desugarer must follow suit to stay type-correct.
+-}
+
+-- | @mkHsBoxApp ty e@ constructs the syntax @box \@ty e@, which allows us to
+-- box the expression @e :: ty@ regardless of its runtime representation.
+--
+-- See Note [Boxing big tuple elements].
+mkHsBoxApp :: Type -> LHsExpr GhcTc -> LHsExpr GhcTc
+mkHsBoxApp ty e
+  = mkLHsWrap (mkWpTyApps [getRuntimeRep ty, ty]) (nlHsVar boxId) `nlHsApp` e
+
+-- | @mkUnboxViewPat ty p@ constructs syntax for the view pattern
+-- @unbox \@ty -> p@, which matches a scrutinee of type @boxTy ty@ by unboxing
+-- it (to type @ty@) and running the inner pattern @p@ against the result.
+--
+-- See Note [Boxing big tuple elements].
+mkUnboxViewPat :: Type -> LPat GhcTc -> LPat GhcTc
+mkUnboxViewPat ty inner
+  = noLocA (ViewPat (boxTy ty)
+                    (mkLHsWrap (mkWpTyApps [getRuntimeRep ty, ty]) (nlHsVar unboxId))
+                    inner)
+
 
 {-
 ************************************************************************
@@ -904,7 +964,8 @@ dsHandleMonadicFailure ctx pat res_ty match m_fail_op =
           -- that's the non-ApplicativeDo code path
           mkErrorAppDs pAT_ERROR_ID res_ty (matchDoContextErrString ctx)
         Just fail_op -> do
-          fail_msg <- mkStringExpr (mk_fail_msg dflags ctx pat)
+          mk_str <- getMkStringIds dsLookupKnownKeyId
+          let fail_msg = mkStringExprWith mk_str (mk_fail_msg dflags ctx pat)
           dsSyntaxExpr fail_op [fail_msg]
       body fail_expr
 
@@ -994,7 +1055,7 @@ isTrueLHsExpr (L _ (HsVar _ (L _ v)))
      || v `hasKey` getUnique trueDataConId
                                               = Just return
         -- trueDataConId doesn't have the same unique as trueDataCon
-isTrueLHsExpr (L _ (XExpr (ConLikeTc con _ _)))
+isTrueLHsExpr (L _ (XExpr (ConLikeTc con)))
   | con `hasKey` getUnique trueDataCon = Just return
 isTrueLHsExpr (L _ (XExpr (HsTick tickish e)))
     | Just ticks <- isTrueLHsExpr e

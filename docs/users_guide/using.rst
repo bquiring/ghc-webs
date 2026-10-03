@@ -58,9 +58,10 @@ Windows.
 Options overview
 ----------------
 
-GHC's behaviour is controlled by options, which for historical reasons
-are also sometimes referred to as command-line flags or arguments.
-Options can be specified in three ways:
+GHC's behaviour is controlled by options. Options can be specified in four ways:
+(1) directly on the command line; (2) via files (response files); (3) in source
+files, using a pragma; and (4) when using GHCi, from within GHCi.
+
 
 Command-line arguments
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -76,7 +77,8 @@ An invocation of GHC takes the following form:
 
     ghc [argument...]
 
-Command-line arguments are either options or file names.
+Command-line arguments are either options, file names or response file arguments
+(see further below).
 
 Command-line options begin with ``-``. They may *not* be grouped:
 ``-vO`` is different from ``-v -O``. Options need not precede filenames:
@@ -84,17 +86,6 @@ e.g., ``ghc *.o -o foo``. All options are processed and then applied to
 all files; you cannot, for example, invoke
 ``ghc -c -O1 Foo.hs -O2 Bar.hs`` to apply different optimisation levels
 to the files ``Foo.hs`` and ``Bar.hs``.
-
-In addition to passing arguments via the command-line, arguments can be passed
-via GNU-style response files. For instance,
-
-.. code-block:: bash
-
-    $ cat response-file
-    -O1
-    Hello.hs
-    -o Hello
-    $ ghc @response-file
 
 .. note::
 
@@ -118,9 +109,55 @@ via GNU-style response files. For instance,
         ``-fspecialise`` will not be enabled, since the ``-fno-specialise``
         overrides the ``-fspecialise`` implied by ``-O1``.
 
+
+Command-line arguments in response files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+GHC's use of response files is similar to that of GCC. A response file argument
+is ``@`` followed immediately by the absolute or relative path identifying the
+response file.
+
+.. note::
+
+    In PowerShell, ``@`` is used to identify a splatting variable. Consequently,
+    GHC response file arguments must be enclosed in quotation marks on the
+    command line to avoid parsing errors.
+
+A response file argument is equivalent to the command-line arguments in the
+response file in the order that they appear in the file. A response file can
+include a response file argument.
+
+In a response file:
+
+* any unescaped whitespace is assumed to separate command-line arguments and is
+  otherwise ignored;
+* a backslash character (``\``) always escapes the following character; and
+* matching pairs of unescaped single quote (``'``) or double quote (``"``)
+  characters escape blocks of characters.
+
+For example,
+
+.. code-block:: bash
+
+    $ cat response-file1
+    -O1
+    @response-file2
+
+    $ cat response-file2
+    Hello.hs
+    -o Hello
+
+    $ ghc @response-file1
+
+is equivalent to,
+
+.. code-block:: bash
+
+    $ ghc -O1 Hello.hs -o Hello
+
 .. _source-file-options:
 
-Command line options in source files
+Command-line options in source files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. index::
@@ -410,12 +447,18 @@ The available mode flags are:
     exit.
 
 .. ghc-flag:: --show-iface ⟨file⟩
-    :shortdesc: display the contents of an interface file.
+    :shortdesc: display contents of an interface file.
     :type: mode
     :category: modes
 
-    Read the interface in ⟨file⟩ and dump it as text to ``stdout``. For
-    example ``ghc --show-iface M.hi``.
+    Read an interface file and dump relevent parts of it as text to ``stdout``.
+
+.. ghc-flag:: --show-byte-code ⟨file⟩
+    :shortdesc: display contents of a bytecode file.
+    :type: mode
+    :category: modes
+
+    Read a bytecode file and dump relevant parts of it as text to ``stdout``.
 
 .. ghc-flag:: --supported-extensions
               --supported-languages
@@ -756,7 +799,7 @@ The GHC Jobserver Protocol was specified in `GHC Proposal #540 <https://github.c
 
 This protocol allows
 a server to dynamically invoke many instances of a client process,
-while restricting all of those instances to use no more than <n> capabilities.
+while restricting all of those instances to use no more than ⟨n⟩ capabilities.
 This is achieved by coordination over a system semaphore (either a POSIX
 semaphore in the case of Linux and Darwin, or a Win32 semaphore
 in the case of Windows platforms).
@@ -797,7 +840,12 @@ There are two kinds of participants in the GHC Jobserver protocol:
 
     Perform compilation in parallel when possible, coordinating with other
     processes through the semaphore ⟨sem⟩ (specified as a string).
-    Error if the semaphore doesn't exist.
+
+    If the semaphore cannot be opened (e.g. the socket does not exist
+    or its protocol version is incompatible with this GHC), GHC emits
+    a :ghc-flag:`-Wsemaphore-open-failure` warning and compiles
+    sequentially, using only the implicit token inherited from the
+    parent process.
 
     Use of ``-jsem`` will override use of :ghc-flag:`-j[⟨n⟩]`,
     and vice-versa.
@@ -863,7 +911,7 @@ units easier.
     cabal file resides. Thus, all paths used in the compiler are assumed to be relative
     to this directory. When there are multiple home units the compiler is often
     not operating in the standard directory and instead where the cabal.project
-    file is located. In this case the `-working-dir` option can be passed which specifies
+    file is located. In this case the ``-working-dir`` option can be passed which specifies
     the path from the current directory to the directory the unit assumes to be its root,
     normally the directory which contains the cabal file.
 
@@ -910,12 +958,16 @@ units easier.
     units will see this module as if it was defined in this unit.
 
     The simple form of the flag allows the reexport of a single module at the
-    same name::
+    same name:
+
+    .. code-block:: none
 
       -reexported-module A
 
-    the complicated version of the flag allows the module to be renamed when
-    reexported::
+    The complicated version of the flag allows the module to be renamed when
+    reexported:
+
+    .. code-block:: none
 
       -reexported-module "A as B"
 
@@ -1594,48 +1646,97 @@ Some flags only make sense for particular target platforms.
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-msse4.2`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX instructions.
 
 .. ghc-flag:: -mavx2
     :shortdesc: (x86 only) Enable support for AVX2 SIMD extensions
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-mavx`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX2 instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX2 instructions.
+
+.. ghc-flag:: -mavx512bw
+    :shortdesc: (x86 only) Enable support for AVX-512BW SIMD extensions
+    :type: dynamic
+    :category: platform-options
+
+    :since: 10.0.1
+    :implies: :ghc-flag:`-mavx512f`
+
+    (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512BW instructions.
 
 .. ghc-flag:: -mavx512cd
-    :shortdesc: (x86 only) Enable support for AVX512-CD SIMD extensions
+    :shortdesc: (x86 only) Enable support for AVX-512CD SIMD extensions
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-mavx512f`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX512-CD instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512CD instructions.
+
+.. ghc-flag:: -mavx512dq
+    :shortdesc: (x86 only) Enable support for AVX-512DQ SIMD extensions
+    :type: dynamic
+    :category: platform-options
+
+    :since: 10.0.1
+    :implies: :ghc-flag:`-mavx512f`
+
+    (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512DQ instructions.
 
 .. ghc-flag:: -mavx512er
-    :shortdesc: (x86 only) Enable support for AVX512-ER SIMD extensions
+    :shortdesc: (x86 only, deprecated) Enable support for AVX-512ER SIMD extensions
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-mavx512f`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX512-ER instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512ER instructions.
+
+    The AVX-512ER extension is deprecated and not supported by newer LLVM versions.
 
 .. ghc-flag:: -mavx512f
-    :shortdesc: (x86 only) Enable support for AVX512-F SIMD extensions
+    :shortdesc: (x86 only) Enable support for AVX-512F SIMD extensions
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-mavx2`, :ghc-flag:`-mfma`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX512-F instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512F instructions.
 
 .. ghc-flag:: -mavx512pf
-    :shortdesc: (x86 only) Enable support for AVX512-PF SIMD extensions
+    :shortdesc: (x86 only, deprecated) Enable support for AVX-512PF SIMD extensions
     :type: dynamic
     :category: platform-options
 
+    :implies: :ghc-flag:`-mavx512f`
+
     (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
-    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86_64 AVX512-PF instructions.
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512PF instructions.
+
+    The AVX-512PF extension is deprecated and not supported by newer LLVM versions.
+
+.. ghc-flag:: -mavx512vl
+    :shortdesc: (x86 only) Enable support for AVX-512VL SIMD extensions
+    :type: dynamic
+    :category: platform-options
+
+    :since: 10.0.1
+    :implies: :ghc-flag:`-mavx512f`
+
+    (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 AVX-512VL instructions.
 
 .. ghc-flag:: -msse
     :shortdesc: (x86 only) Use SSE for floating-point operations
@@ -1690,6 +1791,7 @@ Some flags only make sense for particular target platforms.
     :category: platform-options
 
     :since: 9.14.1
+    :implies: :ghc-flag:`-msse3`
 
     (x86 only) Use the SSSE3 instruction set to
     implement some vector operations
@@ -1697,11 +1799,13 @@ Some flags only make sense for particular target platforms.
     or the :ref:`LLVM backend <llvm-code-gen>`).
 
 .. ghc-flag:: -msse4
-    :shortdesc: (x86 only) Use SSE4 for floating-point operations
+    :shortdesc: (x86 only) Use SSE4.1 for floating-point operations
     :type: dynamic
     :category: platform-options
 
-    (x86 only) Use the SSE4 instruction set to
+    :implies: :ghc-flag:`-mssse3`
+
+    (x86 only) Use the SSE4.1 instruction set to
     implement some floating point and bit operations(whether using the :ref:`native code generator <native-code-gen>`
     or the :ref:`LLVM backend <llvm-code-gen>`).
 
@@ -1709,6 +1813,8 @@ Some flags only make sense for particular target platforms.
     :shortdesc: (x86 only) Use SSE4.2 for floating-point operations
     :type: dynamic
     :category: platform-options
+
+    :implies: :ghc-flag:`-msse4`
 
     (x86 only, added in GHC 7.4.1) Use the SSE4.2 instruction set to
     implement some floating point and bit operations,
@@ -1747,6 +1853,7 @@ Some flags only make sense for particular target platforms.
     :default: off by default, except for Aarch64 where it's on by default.
 
     :since: 9.8.1
+    :implies: (on x86) :ghc-flag:`-mavx`
 
     Use native FMA instructions to implement the fused multiply-add floating-point
     operations of the form ``x * y + z``.
@@ -1758,6 +1865,27 @@ Some flags only make sense for particular target platforms.
     When this flag is disabled, GHC falls back to the C implementation of fused
     multiply-add, which might perform non-IEEE-compliant software emulation on
     some platforms (depending on the implementation of the C standard library).
+
+.. ghc-flag:: -mgfni
+    :shortdesc: (x86 only) Use GFNI for advanced bit manipulations
+    :type: dynamic
+    :category: platform-options
+
+    :since: 10.0.1
+
+    (x86 only) This flag allows the code generator (whether the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`) to emit x86 GFNI instructions.
+
+.. ghc-flag:: -mla664
+    :shortdesc: (LoongArch only) Used for new instructions for la664 uarch
+    :type: dynamic
+    :category: platform-options
+
+    :default: off by default, avoid to generate invalid instructions for non-la664 uarchs.
+
+    GHC currently does not use LA664 specific instructions,
+    so this flag has no effect when used with the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`.
 
 Haddock
 -------

@@ -273,7 +273,7 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
     if (RtsFlags.GcFlags.nurseryChunkSize == 0) {
         new_n_nurseries = to;
     } else {
-        memcount total_alloc = to * RtsFlags.GcFlags.minAllocAreaSize;
+        memcount total_alloc = to * (size_t) RtsFlags.GcFlags.minAllocAreaSize;
         new_n_nurseries =
             stg_max(to, total_alloc / RtsFlags.GcFlags.nurseryChunkSize);
     }
@@ -326,10 +326,6 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
         }
     }
 
-#if defined(THREADED_RTS) && defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 0)
-    newThreadLocalKey(&gctKey);
-#endif
-
     initGcThreads(from, to);
 }
 
@@ -351,9 +347,6 @@ freeStorage (bool free_heap)
     closeMutex(&sm_mutex);
 #endif
     stgFree(nurseries);
-#if defined(THREADED_RTS) && defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 0)
-    freeThreadLocalKey(&gctKey);
-#endif
     freeGcThreads();
 }
 
@@ -881,7 +874,8 @@ resizeNurseriesEach (W_ blocks)
 
         node = capNoToNumaNode(i);
         if (nursery_blocks < blocks) {
-            debugTrace(DEBUG_gc, "increasing size of nursery from %d to %d blocks",
+            debugTrace(DEBUG_gc, "increasing size of nursery from %" FMT_Word
+                                 " to %" FMT_Word " blocks",
                        nursery_blocks, blocks);
             nursery->blocks = allocNursery(node, nursery->blocks,
                                            blocks-nursery_blocks);
@@ -890,7 +884,8 @@ resizeNurseriesEach (W_ blocks)
         {
             bdescr *next_bd;
 
-            debugTrace(DEBUG_gc, "decreasing size of nursery from %d to %d blocks",
+            debugTrace(DEBUG_gc, "decreasing size of nursery from %" FMT_Word
+                                 " to %" FMT_Word " blocks",
                        nursery_blocks, blocks);
 
             bd = nursery->blocks;
@@ -905,7 +900,8 @@ resizeNurseriesEach (W_ blocks)
             // might have gone just under, by freeing a large block, so make
             // up the difference.
             if (nursery_blocks < blocks) {
-                debugTrace(DEBUG_gc, "reincreasing size of nursery from %d to %d blocks",
+                debugTrace(DEBUG_gc, "reincreasing size of nursery from"
+                                     " %" FMT_Word " to %" FMT_Word " blocks",
                              nursery_blocks, blocks);
                 nursery->blocks = allocNursery(node, nursery->blocks,
                                                blocks-nursery_blocks);
@@ -997,7 +993,7 @@ move_STACK (StgStack *src, StgStack *dest)
 void
 accountAllocation(Capability *cap, W_ n)
 {
-    TICK_ALLOC_RTS(WDS(n));
+    TICK_ALLOC_RTS(n*sizeof(W_));
     CCS_ALLOC(cap->r.rCCCS,n);
     if (cap->r.rCurrentTSO != NULL) {
         // cap->r.rCurrentTSO->alloc_limit -= n*sizeof(W_)
@@ -1040,29 +1036,31 @@ accountAllocation(Capability *cap, W_ n)
  *
  *   During GC the RTS overwrites closures with forwarding pointers, this can
  *   leave slop behind depending on the size of the closure being
- *   overwritten. See Note [zeroing slop when overwriting closures].
+ *   overwritten. See Note [marking slop when overwriting immutable closures].
  *
- * Under various ways we actually zero slop so we can linearly scan over blocks
- * of closures. This trick is used by the sanity checking code and the heap
- * profiler, see Note [skipping slop in the heap profiler].
+ * To allow the heap profiler, the LDV profiler and the sanity checker to
+ * linearly scan over heap blocks, slop must be identifiable without reading
+ * stale heap pointers.
+ * See Note [Skipping slop when scanning the heap] in ClosureMacros.h
  *
- * In general we zero:
+ * Shrunk-array slop has a further, concurrent reader: the non-moving GC mark
+ * thread scans SmallMutArrPtrs payloads while the mutator may be shrinking
+ * them, so it must identify the slop with the right memory ordering. See Note
+ * [Slop marker memory ordering] in ClosureMacros.h.
  *
+ * For pinned/large-object alignment slop we use explicit zeroing:
  *  - Pinned object alignment slop, see MEMSET_SLOP_W in allocatePinned.
  *  - Large object alignment slop, see MEMSET_SLOP_W in allocatePinned.
- *  - Shrunk array slop, see OVERWRITING_CLOSURE_MUTABLE.
  *
- * Note that this is necessary even in the vanilla (e.g. non-profiling) RTS
- * since the user may trigger a heap census via +RTS -hT, which can be used
- * even when not linking against the profiled RTS. Failing to zero slop
- * due to array shrinking has resulted in a few nasty bugs (#17572, #9666).
- * However, since array shrink may result in large amounts of slop (unlike
- * alignment), we take care to only zero such slop when heap profiling or DEBUG
- * are enabled.
+ * For shrunk-array slop we write an O(1) marker in all build modes.
+ * See Note [shrink-array slop marker] in PrimOps.cmm for the encoding.
+ * This replaces the old approach of zeroing the entire slop region, which was a
+ * no-op in vanilla (non-profiling, non-debug) builds and caused heap-census
+ * crashes (#19048, #17572, #9666).
  *
- * When performing LDV profiling or using a (single threaded) debug RTS we zero
- * slop even when overwriting immutable closures, see Note [zeroing slop when
- * overwriting closures].
+ * When performing LDV profiling or using a (single threaded) debug RTS we mark
+ * slop even when overwriting immutable closures, see Note [marking slop when
+ * overwriting immutable closures].
  */
 
 /*
@@ -1213,7 +1211,7 @@ allocateMightFail (Capability *cap, W_ n)
  * When profiling we zero the space used for alignment. This allows us to
  * traverse pinned blocks in the heap profiler.
  *
- * See Note [skipping slop in the heap profiler]
+ * See Note [Skipping slop when scanning the heap] in ClosureMacros.h
  */
 #define MEMSET_SLOP_W(p, val, len_w) memset(p, val, (len_w) * sizeof(W_))
 
@@ -1825,25 +1823,6 @@ StgWord calcTotalCompactW (void)
 #include <libkern/OSCacheControl.h>
 #endif
 
-/* __builtin___clear_cache is supported since GNU C 4.3.6.
- * We pick 4.4 to simplify condition a bit.
- */
-#define GCC_HAS_BUILTIN_CLEAR_CACHE (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 4))
-
-#if defined(__clang__)
-/* clang defines __clear_cache as a builtin on some platforms.
- * For example on armv7-linux-androideabi. The type slightly
- * differs from gcc.
- */
-extern void __clear_cache(void * begin, void * end);
-#elif defined(__GNUC__) && !GCC_HAS_BUILTIN_CLEAR_CACHE
-/* __clear_cache is a libgcc function.
- * It existed before __builtin___clear_cache was introduced.
- * See #8562.
- */
-extern void __clear_cache(char * begin, char * end);
-#endif /* __GNUC__ */
-
 /* On ARM and other platforms, we need to flush the cache after
    writing code into memory, so the processor reliably sees it. */
 void flushExec (W_ len, AdjustorExecutable exec_addr)
@@ -1856,26 +1835,11 @@ void flushExec (W_ len, AdjustorExecutable exec_addr)
   /* On iOS we need to use the special 'sys_icache_invalidate' call. */
   sys_icache_invalidate(exec_addr, len);
 #elif defined(wasm32_HOST_ARCH)
-#elif defined(__clang__)
-  unsigned char* begin = (unsigned char*)exec_addr;
-  unsigned char* end   = begin + len;
-# if __has_builtin(__builtin___clear_cache)
-  __builtin___clear_cache((void*)begin, (void*)end);
-# else
-  __clear_cache((void*)begin, (void*)end);
-# endif
-#elif defined(__GNUC__)
-  /* For all other platforms, fall back to a libgcc builtin. */
-  unsigned char* begin = (unsigned char*)exec_addr;
-  unsigned char* end   = begin + len;
-# if GCC_HAS_BUILTIN_CLEAR_CACHE
-  __builtin___clear_cache((void*)begin, (void*)end);
-# else
-  /* For all other platforms, fall back to a libgcc builtin. */
-  __clear_cache((void*)begin, (void*)end);
-# endif
 #else
-#error Missing support to flush the instruction cache
+  /* For all other platforms, fall back to __builtin___clear_cache. */
+  unsigned char* begin = (unsigned char*)exec_addr;
+  unsigned char* end   = begin + len;
+  __builtin___clear_cache((void*)begin, (void*)end);
 #endif
 }
 

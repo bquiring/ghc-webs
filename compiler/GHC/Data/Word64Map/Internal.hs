@@ -3,6 +3,8 @@
 
 {-# OPTIONS_HADDOCK not-home #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
+-- Speeds up otherwise unoptimized ghcs by 5-25% (#27814)
+{-# OPTIONS_GHC -O2 #-}
 
 
 -----------------------------------------------------------------------------
@@ -72,6 +74,8 @@ module GHC.Data.Word64Map.Internal (
     -- * Query
     , null
     , size
+    , sizeAtMost
+    , compareSize
     , member
     , notMember
     , lookup
@@ -98,8 +102,10 @@ module GHC.Data.Word64Map.Internal (
     , adjustWithKey
     , update
     , updateWithKey
+    , upsert
     , updateLookupWithKey
     , alter
+    , alterLookup
     , alterF
 
     -- * Combine
@@ -167,6 +173,7 @@ module GHC.Data.Word64Map.Internal (
     , map
     , mapWithKey
     , traverseWithKey
+    , traverseWithKey_
     , traverseMaybeWithKey
     , mapAccum
     , mapAccumWithKey
@@ -520,12 +527,35 @@ null _   = False
 -- > size empty                                   == 0
 -- > size (singleton 1 'a')                       == 1
 -- > size (fromList([(1,'a'), (2,'c'), (3,'b')])) == 3
+--
+-- See also: 'compareSize'
 size :: Word64Map a -> Int
 size = go 0
   where
     go !acc (Bin _ _ l r) = go (go acc l) r
     go acc (Tip _ _) = 1 + acc
     go acc Nil = acc
+
+-- | Check if the map is <= n in O(min(|map|,n))
+sizeAtMost :: Word64Map a -> Int -> Bool
+sizeAtMost map n = compareSize map n /= GT
+
+-- | \(O(\min(n,c))\). Compare the number of entries in the map to an @Int@.
+--
+-- @compareSize m c@ returns the same result as @compare ('size' m) c@ but is
+-- more efficient when @c@ is smaller than the size of the map.
+compareSize :: Word64Map a -> Int -> Ordering
+compareSize Nil c0 = compare 0 c0
+compareSize _ c0 | c0 <= 0 = GT
+compareSize t c0 = compare 0 (go t (c0 - 1))
+  where
+    go (Bin _ _ _ _) 0 = -1
+    go (Bin _ _ l r) c
+      | c' < 0 = c'
+      | otherwise = go r c'
+      where
+        c' = go l (c - 1)
+    go _ c = c -- Must be Tip (Nil is never a child of Bin)
 
 -- | \(O(\min(n,W))\). Is the key a member of the map?
 --
@@ -940,6 +970,24 @@ updateWithKey f k t@(Tip ky y)
   | otherwise     = t
 updateWithKey _ _ Nil = Nil
 
+-- | \(O(\min(n,W))\). Update the value at a key or insert a value if the key is
+-- not in the map.
+--
+-- @
+-- let inc = maybe 1 (+1)
+-- upsert inc 100 (fromList [(100,1),(300,2)]) == fromList [(100,2),(300,2)]
+-- upsert inc 200 (fromList [(100,1),(300,2)]) == fromList [(100,1),(200,1),(300,2)]
+-- @
+upsert :: (Maybe a -> a) -> Key -> Word64Map a -> Word64Map a
+upsert f !k t@(Bin p m l r)
+  | nomatch k p m = link k (Tip k (f Nothing)) p t
+  | zero k m = Bin p m (upsert f k l) r
+  | otherwise = Bin p m l (upsert f k r)
+upsert f !k t@(Tip ky y)
+  | k == ky = Tip ky (f (Just y))
+  | otherwise = link k (Tip k (f Nothing)) ky t
+upsert f !k Nil = Tip k (f Nothing)
+
 -- | \(O(\min(n,W))\). Lookup and update.
 -- The function returns original value, if it is updated.
 -- This is different behavior than 'Data.Map.updateLookupWithKey'.
@@ -985,6 +1033,52 @@ alter f k t@(Tip ky y)
 alter f k Nil     = case f Nothing of
                       Just x -> Tip k x
                       Nothing -> Nil
+
+-- | \(O(\min(n,W))\). The expression (@'alterLookup' f k map@) alters
+-- the value @x@ at @k@, or absence thereof, and returns the result of the
+-- alteration. 'alterLookup' can be used to insert, delete, or update a
+-- value in a 'Word64Map'.
+--
+-- * If the value is deleted, return 'Nothing'.
+-- * If the value is updated, return the new value.
+--
+-- This is subtly different to 'Data.Map.updateLookupWithKey' which returns the
+-- original value if the values is deleted.
+-- It is also different to 'updateLookupWithKey' which always returns the original
+-- value.
+--
+-- >>> let f x = if x == Just "a" then Just ("new a") else Nothing
+-- >>> alterLookup f 5 (fromList [(5,"a"), (3,"b")])
+-- (Just "new a",fromList [(3,"b"),(5,"new a")])
+-- >>> alterLookup f 7 (fromList [(5,"a"), (3,"b")])
+-- (Nothing,fromList [(3,"b"),(5,"a")])
+-- >>> alterLookup f 3 (fromList [(5,"a"), (3,"b")])
+-- (Nothing,fromList [(5,"a")])
+alterLookup :: (Maybe a -> Maybe a) -> Key -> Word64Map a -> (Maybe a, Word64Map a)
+alterLookup f !k t@(Bin p m l r)
+  | nomatch k p m =
+      case f Nothing of
+        Nothing -> (Nothing, t)
+        Just x -> (Just x, link k (Tip k x) p t)
+  | zero k m =
+      let !(res, l') = alterLookup f k l
+      in (res, binCheckLeft p m l' r)
+  | otherwise =
+      let !(res, r') = alterLookup f k r
+      in (res, binCheckRight p m l r')
+alterLookup f k t@(Tip ky y)
+  | k==ky =
+      case f (Just y) of
+        Just x -> (Just x, Tip ky x)
+        Nothing -> (Nothing, Nil)
+  | otherwise =
+      case f Nothing of
+        Just x -> (Just x, link k (Tip k x) ky t)
+        Nothing -> (Nothing, Tip ky y)
+alterLookup f k Nil =
+  case f Nothing of
+    Just x -> (Just x, Tip k x)
+    Nothing -> (Nothing, Nil)
 
 -- | \(O(\min(n,W))\). The expression (@'alterF' f k map@) alters the value @x@ at
 -- @k@, or absence thereof.  'alterF' can be used to inspect, insert, delete,
@@ -2433,6 +2527,16 @@ traverseWithKey f = go
       | m < 0     = liftA2 (flip (Bin p m)) (go r) (go l)
       | otherwise = liftA2 (Bin p m) (go l) (go r)
 {-# INLINE traverseWithKey #-}
+
+-- | \(O(n)\). Visit each key\/value pair in ascending key order, discarding
+-- the results.
+traverseWithKey_ :: Applicative t => (Key -> a -> t ()) -> Word64Map a -> t ()
+traverseWithKey_ f = go
+  where
+    go Nil = pure ()
+    go (Tip k v) = f k v
+    go (Bin _ _ l r) = go l *> go r
+{-# INLINE traverseWithKey_ #-}
 
 -- | \(O(n)\). The function @'mapAccum'@ threads an accumulating
 -- argument through the map in ascending order of keys.

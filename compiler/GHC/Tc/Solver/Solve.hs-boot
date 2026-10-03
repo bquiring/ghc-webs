@@ -1,8 +1,6 @@
 module GHC.Tc.Solver.Solve where
 
-import Prelude( Bool )
 import GHC.Tc.Solver.Monad( TcS )
-import GHC.Tc.Types.Constraint( Cts, Implication )
+import GHC.Tc.Types.Constraint( Cts, WantedConstraints )
 
-solveSimpleWanteds :: Cts -> TcS Cts
-trySolveImplication :: Implication -> TcS Bool
+solveSimpleWanteds :: Cts -> TcS WantedConstraints

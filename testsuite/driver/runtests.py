@@ -21,14 +21,14 @@ from pathlib import Path
 # We don't actually need subprocess in runtests.py, but:
 # * We do need it in testlibs.py
 # * We can't import testlibs.py until after we have imported ctypes
-# * If we import ctypes before subprocess on cygwin, then sys.exit(0)
-#   says "Aborted" and we fail with exit code 134.
+# * If we import ctypes before subprocess on some Windows environments,
+#   then sys.exit(0) says "Aborted" and we fail with exit code 134.
 # So we import it here first, so that the testsuite doesn't appear to fail.
 import subprocess
 
 import asyncio
 
-from testutil import getStdout, str_warn, str_info, print_table, shorten_metric_name
+from testutil import getStdout, str_warn, str_info, print_table, shorten_metric_name, str_removeprefix
 from testglobals import getConfig, ghc_env, TestConfig, t, \
                         TestOptions, brokens, PerfMetric
 from my_typing import TestName
@@ -79,11 +79,12 @@ parser.add_argument("--summary-file", help="file in which to save the (human-rea
 parser.add_argument("--unexpected-output-dir", help="directory in which to place unexpected output")
 parser.add_argument("--target-wrapper", help="wrapper executable to use when executing binaries compiled for the target")
 parser.add_argument("--only", action="append", help="just this test (can be give multiple --only= flags)")
+parser.add_argument("--skip", action="append", help="skip this test (can be given multiple --skip= flags)")
 parser.add_argument("--way", action="append", help="just this way")
 parser.add_argument("--skipway", action="append", help="skip this way")
 parser.add_argument("--threads", type=int, help="threads to run simultaneously")
 parser.add_argument("--verbose", type=int, choices=[0,1,2,3,4,5], help="verbose (Values 0 through 5 accepted)")
-parser.add_argument("--junit", type=argparse.FileType('wb'), help="output testsuite summary in JUnit format")
+parser.add_argument("--junit", type=Path, help="output testsuite summary in JUnit format")
 parser.add_argument("--broken-test", action="append", default=[], help="a test name to mark as broken for this run")
 parser.add_argument("--test-env", default='local', help="Override default chosen test-env.")
 parser.add_argument("--perf-baseline", type=GitRef, metavar='COMMIT', help="Baseline commit for performance comparsons.")
@@ -91,8 +92,10 @@ perf_group.add_argument("--skip-perf-tests", action="store_true", help="skip per
 perf_group.add_argument("--only-perf-tests", action="store_true", help="Only do performance tests")
 parser.add_argument("--ignore-perf-failures", choices=['increases','decreases','all'],
                         help="Do not fail due to out-of-tolerance perf tests")
-parser.add_argument("--only-report-hadrian-deps", type=argparse.FileType('w'),
+parser.add_argument("--only-report-hadrian-deps", type=Path,
                         help="Dry run the testsuite and report all extra hadrian dependencies needed on the given file")
+parser.add_argument("--force-colors", action="store_true",
+                        help="emit ANSI colors even when stdout is not a tty (e.g. for CI logs)")
 
 args = parser.parse_args()
 
@@ -132,8 +135,11 @@ if args.unexpected_output_dir:
     config.unexpected_output_dir = Path(args.unexpected_output_dir)
 
 if args.only:
-    config.only = args.only
+    config.only = set(args.only)
     config.run_only_some_tests = True
+
+if args.skip:
+    config.skip = set(args.skip)
 
 if args.way:
     for way in args.way:
@@ -182,16 +188,13 @@ elif args.ignore_perf_failures == 'decreases':
 if args.test_env:
     config.test_env = args.test_env
 
-config.cygwin = False
 config.msys = False
 
 if windows:
     h = os.popen('uname -s', 'r')
     v = h.read()
     h.close()
-    if v.startswith("CYGWIN"):
-        config.cygwin = True
-    elif v.startswith("MINGW") or v.startswith("MSYS"):
+    if v.startswith("MINGW") or v.startswith("MSYS"):
 # msys gives "MINGW32"
 # msys2 gives "MINGW_NT-6.2" or "MSYS_NT-6.3"
         config.msys = True
@@ -258,7 +261,9 @@ def supports_colors():
     return True
 
 config.supports_colors = supports_colors()
-term_color.enable_color = config.supports_colors
+# config.supports_colors deliberately stays tty-based: it also guards
+# terminal-title updates, which must not end up in a CI log.
+term_color.enable_color = config.supports_colors or args.force_colors
 
 # This has to come after arg parsing as the args can change the compiler
 get_compiler_info()
@@ -274,12 +279,6 @@ def format_path(path):
             # letter representation. Otherwise it thinks we're adding two env
             # variables E and /Foo when we add E:/Foo.
             path = re.sub('([a-zA-Z]):', '/\\1', path)
-        if config.cygwin:
-            # On cygwin we can't put "c:\foo" in $PATH, as : is a
-            # field separator. So convert to /cygdrive/c/foo instead.
-            # Other pythons use ; as the separator, so no problem.
-            path = re.sub('([a-zA-Z]):', '/cygdrive/\\1', path)
-            path = re.sub('\\\\', '/', path)
     return path
 
 # On Windows we need to set $PATH to include the paths to all the DLLs
@@ -300,7 +299,7 @@ if windows:
     for line in pkginfo.split('\n'):
         if line.startswith('library-dirs:'):
             path = line.rstrip()
-            path = re.sub('^library-dirs: ', '', path)
+            path = str_removeprefix(path, 'library-dirs: ')
             # Use string.replace instead of re.sub, because re.sub
             # interprets backslashes in the replacement string as
             # escape sequences.
@@ -592,7 +591,7 @@ else:
         print(Perf.allow_changes_string([(m.change, m.stat) for m in t.metrics]))
         print('-' * 25)
 
-    summary(t, sys.stdout, color=config.supports_colors)
+    summary(t, sys.stdout, color=term_color.enable_color, junit_path=args.junit)
 
     # Write perf stats if any exist or if a metrics file is specified.
     stats_metrics = [stat for (_, stat, __) in t.metrics] # type: List[PerfStat]
@@ -615,14 +614,14 @@ else:
             summary(t, f)
 
     if args.junit:
-        junit(t).write(args.junit)
-        args.junit.close()
+        with args.junit.open("wb") as f:
+            junit(t).write(f)
 
     if config.only_report_hadrian_deps:
       print("WARNING - skipping all tests and only reporting required hadrian dependencies:", config.hadrian_deps)
-      for d in config.hadrian_deps:
-        print(d,file=config.only_report_hadrian_deps)
-      config.only_report_hadrian_deps.close()
+      with config.only_report_hadrian_deps.open("w") as f:
+          for d in config.hadrian_deps:
+            print(d, file=f)
 
 if len(t.unexpected_failures) > 0 or \
    len(t.unexpected_stat_failures) > 0 or \

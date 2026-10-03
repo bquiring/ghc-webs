@@ -8,9 +8,9 @@ T14273.hs:7:27: warning: [GHC-39999] [-Wdeferred-type-errors (in -Wdefault)]
       Potentially matching instances:
         instance (Show a, Show b) => Show (Either a b)
           -- Defined in ‘GHC.Internal.Data.Either’
-        instance Show Ordering -- Defined in ‘GHC.Internal.Show’
+        instance Show Integer -- Defined in ‘GHC.Internal.Show’
         ...plus 26 others
-        ...plus 49 instances involving out-of-scope types
+        ...plus 36 instances involving out-of-scope types
         (use -fprint-potential-instances to see them all)
     • In the first argument of ‘Just’, namely ‘(show _a)’
       In the expression: Just (show _a)
@@ -28,30 +28,30 @@ T14273.hs:7:32: warning: [GHC-88464] [-Wtyped-holes (in -Wdefault)]
         pleaseShow :: Bool -> a -> Maybe String (bound at T14273.hs:6:1)
       Constraints include Show a (from T14273.hs:5:1-49)
       Valid hole fits include
-        a :: a (bound at T14273.hs:7:17)
         k :: String (bound at T14273.hs:10:1)
+        a :: a (bound at T14273.hs:7:17)
         otherwise :: Bool
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Base’))
-        False :: Bool
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
-           (and originally defined in ‘GHC.Internal.Types’))
-        True :: Bool
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
-           (and originally defined in ‘GHC.Internal.Types’))
-        LT :: Ordering
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
-           (and originally defined in ‘GHC.Internal.Types’))
+        () :: () (bound at <wired into compiler>)
         EQ :: Ordering
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
+          (imported from ‘Prelude’
+           (and originally defined in ‘GHC.Internal.Types’))
+        False :: Bool
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Types’))
         GT :: Ordering
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Types’))
-        () :: () (bound at <wired into compiler>)
+        LT :: Ordering
+          (imported from ‘Prelude’
+           (and originally defined in ‘GHC.Internal.Types’))
+        True :: Bool
+          (imported from ‘Prelude’
+           (and originally defined in ‘GHC.Internal.Types’))
         pi :: forall a. Floating a => a
           with pi @Double
-          (imported from ‘Prelude’ at T14273.hs:1:8-40
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Float’))
 
 T14273.hs:13:10: warning: [GHC-39999] [-Wdeferred-type-errors (in -Wdefault)]
@@ -61,7 +61,7 @@ T14273.hs:13:10: warning: [GHC-39999] [-Wdeferred-type-errors (in -Wdefault)]
       Potentially matching instances:
         instance (Show a, Show b) => Show (Either a b)
           -- Defined in ‘GHC.Internal.Data.Either’
-        instance Show Ordering -- Defined in ‘GHC.Internal.Show’
+        instance Show Integer -- Defined in ‘GHC.Internal.Show’
         ...plus 26 others
         ...plus 29 instances involving out-of-scope types
         (use -fprint-potential-instances to see them all)

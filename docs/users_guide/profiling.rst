@@ -290,7 +290,7 @@ allocation and time) to whatever the current cost-centre stack is at the
 time the cost is incurred.
 
 The mechanism is simple: whenever the program evaluates an expression
-with an SCC annotation, ``{-# SCC c -#} E``, the cost centre ``c`` is
+with an SCC annotation, ``{-# SCC c #-} E``, the cost centre ``c`` is
 pushed on the current stack, and the entry count for this stack is
 incremented by one. The stack also sometimes has to be saved and
 restored; in particular when the program creates a thunk (a lazy
@@ -678,11 +678,11 @@ enclosed between ``+RTS ... -RTS`` as usual):
 
     Sets the interval that the RTS clock ticks at, which is also the sampling
     interval of the time and allocation profile. The default is 0.001 seconds
-    when profiling, and 0.01 otherwise. The runtime uses a single timer signal
-    to count ticks; this timer signal is used to control the context switch
+    when profiling, and 0.01 otherwise. The runtime uses a single timer event
+    to count ticks; this timer event is used to control the context switch
     timer (:ref:`using-concurrent`) and the heap profiling timer
     :ref:`rts-options-heap-prof`. Also, the time profiler uses the RTS timer
-    signal directly to record time profiling samples.
+    event directly to record time profiling samples.
 
     Normally, setting the :rts-flag:`-V ⟨secs⟩` option directly is not
     necessary: the resolution of the RTS timer is adjusted automatically if a
@@ -1003,6 +1003,11 @@ follows:
     The flags below are marked with ``:noindex:`` to avoid duplicate
     ID warnings from Sphinx.
 
+.. rts-flag:: -hT ⟨type⟩
+    :noindex:
+
+    Restrict the profile to closures with the specified closure types.
+
 .. rts-flag:: -hc ⟨name⟩
     :noindex:
 
@@ -1049,6 +1054,13 @@ follows:
     *Requires* :ghc-flag:`-prof`. Restrict the profile to closures with one of the specified
     biographies, where ⟨bio⟩ is one of ``lag``, ``drag``, ``void``, or
     ``use``.
+
+.. rts-flag:: -hi ⟨addr⟩
+    :noindex:
+
+    Restrict the profile to closures with specified info table addresses. The
+    address should start with ``0x`` and be lowercase hexadecimal, just like the
+    addresses produced by :rts-flag:`-hi`.
 
 For example, the following options will generate a retainer profile
 restricted to ``Branch`` and ``Leaf`` constructors:

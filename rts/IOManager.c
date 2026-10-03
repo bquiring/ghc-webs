@@ -33,8 +33,18 @@
 #include "posix/Signals.h"
 #endif
 
+#if defined(IOMGR_ENABLED_SELECTBIS)
+#include "posix/SelectBis.h"
+#include "posix/Timeout.h"
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+#include "posix/Poll.h"
+#include "posix/Timeout.h"
+#endif
+
 #if defined(IOMGR_ENABLED_MIO_POSIX)
-#include "posix/Signals.h"
+#include "posix/MIO.h"
 #include "Prelude.h"
 #endif
 
@@ -80,6 +90,17 @@
 #pragma GCC diagnostic ignored "-Wmissing-noreturn"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+/* Sanity check that the size of the C struct StgAsyncIOOp matches the
+ * corresponding info table declaration in StgMiscClosures.cmm:
+ * INFO_TABLE_CONSTR(stg_ASYNCIOOP, ...)
+ * We put this check here since it has to live somewhere, and the main users
+ * of StgAsyncIOOp are I/O managers.
+ */
+GHC_STATIC_ASSERT(sizeof(StgAsyncIOOp)
+               == sizeof(StgHeader)
+                + sizeof(StgPtr)  * stg_ASYNCIOOP_NUM_PTRS
+                + sizeof(StgWord) * stg_ASYNCIOOP_NUM_NONPTRS,
+                "sizeof(StgAsyncIOOp) does not match expected size");
 
 /* Global var to tell us which I/O manager impl we are using */
 IOManagerType iomgr_type;
@@ -98,6 +119,22 @@ parseIOManagerFlag(const char *iomgrstr, IO_MANAGER_FLAG *flag)
     if (strcmp("select", iomgrstr) == 0) {
 #if defined(IOMGR_ENABLED_SELECT)
         *flag = IO_MNGR_FLAG_SELECT;
+        return IOManagerAvailable;
+#else
+        return IOManagerUnavailable;
+#endif
+    }
+    else if (strcmp("selectbis", iomgrstr) == 0) {
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        *flag = IO_MNGR_FLAG_SELECTBIS;
+        return IOManagerAvailable;
+#else
+        return IOManagerUnavailable;
+#endif
+    }
+    else if (strcmp("poll", iomgrstr) == 0) {
+#if defined(IOMGR_ENABLED_POLL)
+        *flag = IO_MNGR_FLAG_POLL;
         return IOManagerAvailable;
 #else
         return IOManagerUnavailable;
@@ -202,6 +239,10 @@ void selectIOManager(void)
 #else // !defined(THREADED_RTS)
 #if   defined(IOMGR_DEFAULT_NON_THREADED_SELECT)
             iomgr_type = IO_MANAGER_SELECT;
+#elif defined(IOMGR_DEFAULT_NON_THREADED_SELECTBIS)
+            iomgr_type = IO_MANAGER_SELECTBIS;
+#elif defined(IOMGR_DEFAULT_NON_THREADED_POLL)
+            iomgr_type = IO_MANAGER_POLL;
 #elif defined(IOMGR_DEFAULT_NON_THREADED_WINIO)
             iomgr_type = IO_MANAGER_WINIO;
 #elif defined(IOMGR_DEFAULT_NON_THREADED_WIN32_LEGACY)
@@ -215,6 +256,18 @@ void selectIOManager(void)
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MNGR_FLAG_SELECT:
             iomgr_type = IO_MANAGER_SELECT;
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MNGR_FLAG_SELECTBIS:
+            iomgr_type = IO_MANAGER_SELECTBIS;
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MNGR_FLAG_POLL:
+            iomgr_type = IO_MANAGER_POLL;
             break;
 #endif
 
@@ -259,6 +312,14 @@ char * showIOManager(void)
         case IO_MANAGER_SELECT:
             return "select";
 #endif
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            return "selectbis";
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            return "poll";
+#endif
 #if defined(IOMGR_ENABLED_MIO_POSIX)
         case IO_MANAGER_MIO_POSIX:
             return "mio";
@@ -280,29 +341,46 @@ char * showIOManager(void)
     }
 }
 
+/* Allocate a CapIOManager for a given Capability. Having this helps us keep
+ * struct CapIOManager opaque from most of the rest of the RTS.
+ */
+CapIOManager *allocCapabilityIOManager(Capability *cap)
+{
+    CapIOManager *iomgr = stgMallocBytes(sizeof(CapIOManager),
+                                         "allocCapabilityIOManager");
+    iomgr->cap = cap; /* link back */
+    return iomgr;
+}
 
-/* Allocate and initialise the per-capability CapIOManager that lives in each
- * Capability. Called from initCapability(), which is done in the RTS startup
- * in initCapabilities(), and later at runtime via setNumCapabilities().
+
+/* Initialise the per-capability CapIOManager that lives in each Capability.
+ * Called from initCapability(), which is done in the RTS startup in
+ * initCapabilities(), and later at runtime via setNumCapabilities().
  *
  * Note that during RTS startup this is called _before_ the storage manager
  * is initialised, so this is not allowed to allocate on the GC heap.
  */
-void initCapabilityIOManager(Capability *cap)
+void initCapabilityIOManager(CapIOManager *iomgr)
 {
     debugTrace(DEBUG_iomanager, "initialising I/O manager %s for cap %d",
-               showIOManager(), cap->no);
-
-    CapIOManager *iomgr =
-      (CapIOManager *) stgMallocBytes(sizeof(CapIOManager),
-                                      "initCapabilityIOManager");
+               showIOManager(), iomgr->cap->no);
 
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-            iomgr->blocked_queue_hd = END_TSO_QUEUE;
-            iomgr->blocked_queue_tl = END_TSO_QUEUE;
-            iomgr->sleeping_queue   = END_TSO_QUEUE;
+            initCapabilityIOManagerSelect(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            initCapabilityIOManagerSelectBis(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            initCapabilityIOManagerPoll(iomgr);
             break;
 #endif
 
@@ -321,28 +399,43 @@ void initCapabilityIOManager(Capability *cap)
         default:
             break;
     }
+}
 
-    cap->iomgr = iomgr;
+
+void freeCapabilityIOManager(CapIOManager *iomgr)
+{
+    switch (iomgr_type) {
+#if defined(IOMGR_ENABLED_SELECT)
+        case IO_MANAGER_SELECT:
+            freeCapabilityIOManagerSelect(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            freeCapabilityIOManagerSelectBis(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            freeCapabilityIOManagerPoll(iomgr);
+            break;
+#endif
+        default:
+            break;
+    }
 }
 
 
 /* Called late in the RTS initialisation
  */
-void initIOManager(void)
+void startIOManager(void)
 {
-    debugTrace(DEBUG_iomanager, "initialising %s I/O manager", showIOManager());
+    debugTrace(DEBUG_iomanager, "starting %s I/O manager", showIOManager());
 
     switch (iomgr_type) {
 
-#if defined(IOMGR_ENABLED_SELECT)
-        case IO_MANAGER_SELECT:
-            /* Make the exception CAF a GC root. See initBuiltinGcRoots for
-             * similar examples. We throw this exception if a thread tries to
-             * wait on an invalid FD.
-             */
-            getStablePtr((StgPtr)blockedOnBadFD_closure);
-            break;
-#endif
 #if defined(IOMGR_ENABLED_MIO_POSIX)
         case IO_MANAGER_MIO_POSIX:
             /* Posix implementation in posix/Signals.c
@@ -388,7 +481,7 @@ void initIOManager(void)
 /* Called from forkProcess in the child process on the surviving capability.
  */
 void
-initIOManagerAfterFork(Capability **pcap)
+restartIOManager(CapIOManager *iomgr, Capability **pcap)
 {
 
     switch (iomgr_type) {
@@ -408,6 +501,8 @@ initIOManagerAfterFork(Capability **pcap)
             break;
 #endif
         /* The IO_MANAGER_SELECT needs no initialisation */
+        /* The IO_MANAGER_SELECTBIS needs no initialisation */
+        /* The IO_MANAGER_POLL needs no initialisation */
 
         /* No impl for any of the Windows I/O managers, since no forking. */
         default:
@@ -418,7 +513,7 @@ initIOManagerAfterFork(Capability **pcap)
 
 /* Called from setNumCapabilities.
  */
-void notifyIOManagerCapabilitiesChanged(Capability **pcap)
+void notifyIOManagerCapabilitiesChanged(CapIOManager *iomgr, Capability **pcap)
 {
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_MIO_POSIX)
@@ -487,92 +582,37 @@ exitIOManager(bool wait_threads)
     }
 }
 
-/* Wakeup hook: called from the scheduler's wakeUpRts (currently only in
- * threaded mode).
- */
-void wakeupIOManager(void)
-{
-    switch (iomgr_type) {
-
-#if defined(IOMGR_ENABLED_MIO_POSIX)
-        case IO_MANAGER_MIO_POSIX:
-            /* MIO Posix implementation in posix/Signals.c */
-            ioManagerWakeup();
-            break;
-#endif
-#if defined(IOMGR_ENABLED_MIO_WIN32)
-        case IO_MANAGER_MIO_WIN32:
-            /* MIO Windows implementation in win32/ThrIOManager.c
-             * Yes, this is shared with the WinIO (threaded) impl.
-             */
-            ioManagerWakeup();
-            break;
-#endif
-#if defined(IOMGR_ENABLED_WINIO)
-        case IO_MANAGER_WINIO:
-#if defined(THREADED_RTS)
-            /* WinIO threaded implementation in win32/ThrIOManager.c
-             * Yes, this is shared with the MIO win32 impl.
-             */
-            ioManagerWakeup();
-#endif
-            break;
-#endif
-        default:
-            break;
-    }
-}
-
-void markCapabilityIOManager(evac_fn evac, void *user, Capability *cap)
+void markCapabilityIOManager(evac_fn evac, void *user, CapIOManager *iomgr)
 {
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-        {
-            CapIOManager *iomgr = cap->iomgr;
             evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_hd);
             evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_tl);
             evac(user, (StgClosure **)(void *)&iomgr->sleeping_queue);
             break;
-        }
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS) \
+ || defined(IOMGR_ENABLED_POLL)
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+#endif
+            markClosureTable(evac, user, &iomgr->aiop_table);
+            evac(user, (StgClosure **)(void *)&iomgr->timeout_queue);
+            break;
 #endif
 
 #if defined(IOMGR_ENABLED_WIN32_LEGACY)
         case IO_MANAGER_WIN32_LEGACY:
-        {
-            CapIOManager *iomgr = cap->iomgr;
             evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_hd);
             evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_tl);
             break;
-        }
 #endif
         default:
-            break;
-    }
-}
-
-
-void scavengeTSOIOManager(StgTSO *tso)
-{
-    switch (iomgr_type) {
-
-            /* case IO_MANAGER_SELECT:
-             * BlockedOn{Read,Write} uses block_info.fd
-             * BlockedOnDelay        uses block_info.target
-             * both of these are not GC pointers, so there is nothing to do.
-             */
-
-            /* case IO_MANAGER_WIN32_LEGACY:
-             * BlockedOn{Read,Write,DoProc} uses block_info.async_result
-             * The StgAsyncIOResult async_result is allocated on the C heap.
-             * It'd probably be better if it used the GC heap. If it did we'd
-             * scavenge it here.
-             */
-
-        default:
-            /* All the other I/O managers do not use I/O-related why_blocked
-             * reasons, so there are no cases to handle.
-             */
             break;
     }
 }
@@ -595,24 +635,28 @@ setIOManagerControlFd(uint32_t cap_no, int fd) {
 #endif
 
 
-bool anyPendingTimeoutsOrIO(Capability *cap)
+bool anyPendingTimeoutsOrIO(CapIOManager *iomgr)
 {
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-        {
-            CapIOManager *iomgr = cap->iomgr;
             return (iomgr->blocked_queue_hd != END_TSO_QUEUE)
                 || (iomgr->sleeping_queue   != END_TSO_QUEUE);
-        }
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            return anyPendingTimeoutsOrIOSelectBis(iomgr);
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            return anyPendingTimeoutsOrIOPoll(iomgr);
 #endif
 
 #if defined(IOMGR_ENABLED_WIN32_LEGACY)
         case IO_MANAGER_WIN32_LEGACY:
-        {
-            CapIOManager *iomgr = cap->iomgr;
             return (iomgr->blocked_queue_hd != END_TSO_QUEUE);
-        }
 #endif
 
     /* For the purpose of the scheduler, the threaded I/O managers never have
@@ -654,13 +698,25 @@ bool anyPendingTimeoutsOrIO(Capability *cap)
 }
 
 
-void pollCompletedTimeoutsOrIO(Capability *cap)
+void pollCompletedTimeoutsOrIO(CapIOManager *iomgr)
 {
     debugTrace(DEBUG_iomanager, "polling for completed IO or timeouts");
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-          awaitCompletedTimeoutsOrIOSelect(cap, false);
+          awaitCompletedTimeoutsOrIOSelect(iomgr, false);
+          break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+          pollCompletedTimeoutsOrIOSelectBis(iomgr);
+          break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+          pollCompletedTimeoutsOrIOPoll(iomgr);
           break;
 #endif
 
@@ -672,7 +728,7 @@ void pollCompletedTimeoutsOrIO(Capability *cap)
 #if defined(IOMGR_ENABLED_WINIO)
         case IO_MANAGER_WINIO:
 #endif
-          awaitCompletedTimeoutsOrIOWin32(cap, false);
+          awaitCompletedTimeoutsOrIOWin32(iomgr->cap, false);
           break;
 #endif
         default:
@@ -681,13 +737,27 @@ void pollCompletedTimeoutsOrIO(Capability *cap)
 }
 
 
-void awaitCompletedTimeoutsOrIO(Capability *cap)
+bool awaitCompletedTimeoutsOrIO(CapIOManager *iomgr)
 {
     debugTrace(DEBUG_iomanager, "waiting for completed IO or timeouts");
+    ASSERT(emptyRunQueue(iomgr->cap));
+    bool completed = true; // wait completed or interrupted?
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-          awaitCompletedTimeoutsOrIOSelect(cap, true);
+          completed = awaitCompletedTimeoutsOrIOSelect(iomgr, true);
+          break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+          completed = awaitCompletedTimeoutsOrIOSelectBis(iomgr);
+          break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+          completed = awaitCompletedTimeoutsOrIOPoll(iomgr);
           break;
 #endif
 
@@ -699,20 +769,70 @@ void awaitCompletedTimeoutsOrIO(Capability *cap)
 #if defined(IOMGR_ENABLED_WINIO)
         case IO_MANAGER_WINIO:
 #endif
-          awaitCompletedTimeoutsOrIOWin32(cap, true);
+          completed = awaitCompletedTimeoutsOrIOWin32(iomgr->cap, true);
           break;
 #endif
         default:
-            barf("pollCompletedTimeoutsOrIO not implemented");
+            barf("awaitCompletedTimeoutsOrIO not implemented");
     }
-    ASSERT(!emptyRunQueue(cap) || getSchedState() != SCHED_RUNNING);
+    ASSERT(!emptyRunQueue(iomgr->cap) ||
+           getSchedState() != SCHED_RUNNING ||
+           !completed);
+    return completed;
 }
 
 
-void syncIOWaitReady(Capability   *cap,
-                     StgTSO       *tso,
-                     IOReadOrWrite rw,
-                     HsInt         fd)
+/* Interrupt the I/O manager if it is blocked in awaitCompletedTimeoutsOrIO,
+ * causing it to return early and return false.
+ */
+void interruptIOManager(CapIOManager *iomgr)
+{
+    debugTrace(DEBUG_iomanager, "Interrupting the I/O manager...");
+    switch (iomgr_type) {
+
+#if defined(IOMGR_ENABLED_SELECT)
+        case IO_MANAGER_SELECT:
+            interruptIOManagerSelect(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            interruptIOManagerSelectBis(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            interruptIOManagerPoll(iomgr);
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_WIN32_LEGACY)
+        case IO_MANAGER_WIN32_LEGACY:
+            abandonRequestWait();
+            break;
+#endif
+
+#if defined(IOMGR_ENABLED_WINIO)
+        case IO_MANAGER_WINIO:
+            /* FIXME: no support yet for interrupting in WinIO I/O manager
+             * See issue #27403
+             */
+            break;
+#endif
+
+        default:
+            break;
+    }
+}
+
+
+/* CMM primop. Result is true on success, or false on allocation failure. */
+IOSubmitResult syncIOWaitReady(CapIOManager      *iomgr,
+                               StgTSO            *tso,
+                               enum IOReadOrWrite rw,
+                               HsInt              fd)
 {
     debugTrace(DEBUG_iomanager,
                "thread %ld waiting for %s I/O readiness on fd %d",
@@ -722,12 +842,22 @@ void syncIOWaitReady(Capability   *cap,
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
         {
-            StgWord why_blocked = rw == IORead ? BlockedOnRead : BlockedOnWrite;
+            StgThreadWhyBlocked why_blocked = (rw == IORead ? BlockedOnRead
+                                                            : BlockedOnWrite)
+                                            | BlockInfoForceNonClosure;
             tso->block_info.fd = fd;
+            appendToIOBlockedQueue(iomgr, tso);
             RELEASE_STORE(&tso->why_blocked, why_blocked);
-            appendToIOBlockedQueue(cap, tso);
-            break;
+            return IOSubmitResultAsyncContinue;
         }
+#endif
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            return syncIOWaitReadySelectBis(iomgr, tso, rw, fd);
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            return syncIOWaitReadyPoll(iomgr, tso, rw, fd);
 #endif
         default:
             barf("waitRead# / waitWrite# not available for current I/O manager");
@@ -735,37 +865,59 @@ void syncIOWaitReady(Capability   *cap,
 }
 
 
-void syncIOCancel(Capability *cap, StgTSO *tso)
+void syncIOCancel(CapIOManager *iomgr, StgTSO *tso)
 {
     debugTrace(DEBUG_iomanager, "cancelling I/O for thread %ld", (long) tso->id);
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-            removeThreadFromDeQueue(cap, &cap->iomgr->blocked_queue_hd,
-                                         &cap->iomgr->blocked_queue_tl, tso);
+            removeThreadFromDeQueue(iomgr->cap,
+                                    &iomgr->blocked_queue_hd,
+                                    &iomgr->blocked_queue_tl,
+                                    tso);
+            appendToRunQueue(iomgr->cap, tso);
+            RELEASE_STORE(&tso->why_blocked, NotBlocked);
+            break;
+#endif
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+            syncIOCancelSelectBis(iomgr, tso);
+            break;
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+            syncIOCancelPoll(iomgr, tso);
             break;
 #endif
 #if defined(IOMGR_ENABLED_WIN32_LEGACY)
         case IO_MANAGER_WIN32_LEGACY:
-            removeThreadFromDeQueue(cap, &cap->iomgr->blocked_queue_hd,
-                                         &cap->iomgr->blocked_queue_tl, tso);
-            abandonWorkRequest(tso->block_info.async_result->reqID);
+            removeThreadFromDeQueue(iomgr->cap,
+                                    &iomgr->blocked_queue_hd,
+                                    &iomgr->blocked_queue_tl,
+                                    tso);
+            abandonWorkRequest(tso->block_info.async_reqID);
+            appendToRunQueue(iomgr->cap, tso);
+            RELEASE_STORE(&tso->why_blocked, NotBlocked);
             break;
 #endif
         default:
             barf("syncIOCancel not supported for I/O manager %d", iomgr_type);
     }
+    ASSERT(tso->why_blocked == NotBlocked);
 }
 
 
 #if defined(IOMGR_ENABLED_SELECT)
-static void insertIntoSleepingQueue(Capability *cap, StgTSO *tso, LowResTime target);
+static void insertIntoSleepingQueue(CapIOManager *iomgr, StgTSO *tso, LowResTime target);
 #endif
 
 
-void syncDelay(Capability *cap, StgTSO *tso, HsInt us_delay)
+/* CMM primop. Result is true on success, or false on allocation failure. */
+bool syncDelay(CapIOManager *iomgr, StgTSO *tso, HsInt us_delay)
 {
-    debugTrace(DEBUG_iomanager, "thread %ld waiting for %lld us", tso->id, us_delay);
+    debugTrace(DEBUG_iomanager, "thread %" FMT_StgThreadID
+                                " waiting for %" FMT_Word " us",
+                                tso->id, us_delay);
     ASSERT(tso->why_blocked == NotBlocked);
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
@@ -773,10 +925,20 @@ void syncDelay(Capability *cap, StgTSO *tso, HsInt us_delay)
         {
             LowResTime target = getDelayTarget(us_delay);
             tso->block_info.target = target;
-            RELEASE_STORE(&tso->why_blocked, BlockedOnDelay);
-            insertIntoSleepingQueue(cap, tso, target);
-            break;
+            insertIntoSleepingQueue(iomgr, tso, target);
+            RELEASE_STORE(&tso->why_blocked, BlockedOnDelay | BlockInfoForceNonClosure);
+            return true;
         }
+#endif
+#if defined(IOMGR_ENABLED_SELECTBIS) \
+ || defined(IOMGR_ENABLED_POLL)
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+#endif
+            return syncDelayTimeout(iomgr, tso, us_delay);
 #endif
 #if defined(IOMGR_ENABLED_WIN32_LEGACY)
         case IO_MANAGER_WIN32_LEGACY:
@@ -784,20 +946,15 @@ void syncDelay(Capability *cap, StgTSO *tso, HsInt us_delay)
              * would make the primops more consistent.
              */
         {
-            StgAsyncIOResult *ares = stgMallocBytes(sizeof(StgAsyncIOResult),
-                                                    "syncDelay");
-            ares->reqID   = addDelayRequest(us_delay);
-            ares->len     = 0;
-            ares->errCode = 0;
-            tso->block_info.async_result = ares;
+            tso->block_info.async_reqID = addDelayRequest(us_delay);
 
             /* Having all async-blocked threads reside on the blocked_queue
              * simplifies matters, so set the status to OnDoProc and put the
              * delayed thread on the blocked_queue.
              */
+            appendToIOBlockedQueue(iomgr, tso);
             RELEASE_STORE(&tso->why_blocked, BlockedOnDoProc);
-            appendToIOBlockedQueue(cap, tso);
-            break;
+            return true;
         }
 #endif
         default:
@@ -806,13 +963,27 @@ void syncDelay(Capability *cap, StgTSO *tso, HsInt us_delay)
 }
 
 
-void syncDelayCancel(Capability *cap, StgTSO *tso)
+void syncDelayCancel(CapIOManager *iomgr, StgTSO *tso)
 {
     debugTrace(DEBUG_iomanager, "cancelling delay for thread %ld", (long) tso->id);
     switch (iomgr_type) {
 #if defined(IOMGR_ENABLED_SELECT)
         case IO_MANAGER_SELECT:
-            removeThreadFromQueue(cap, &cap->iomgr->sleeping_queue, tso);
+            ASSERT(tso->why_blocked == (BlockedOnDelay | BlockInfoForceNonClosure));
+            removeThreadFromQueue(iomgr->cap, &iomgr->sleeping_queue, tso);
+            appendToRunQueue(iomgr->cap, tso);
+            RELEASE_STORE(&tso->why_blocked, NotBlocked);
+            break;
+#endif
+#if defined(IOMGR_ENABLED_SELECTBIS) \
+ || defined(IOMGR_ENABLED_POLL)
+#if defined(IOMGR_ENABLED_SELECTBIS)
+        case IO_MANAGER_SELECTBIS:
+#endif
+#if defined(IOMGR_ENABLED_POLL)
+        case IO_MANAGER_POLL:
+#endif
+            syncDelayCancelTimeout(iomgr, tso);
             break;
 #endif
         /* Note: no case for IO_MANAGER_WIN32_LEGACY despite it having a case
@@ -825,18 +996,18 @@ void syncDelayCancel(Capability *cap, StgTSO *tso)
         default:
             barf("syncDelayCancel not supported for I/O manager %d", iomgr_type);
     }
+    ASSERT(tso->why_blocked == NotBlocked);
 }
 
 
 #if defined(IOMGR_ENABLED_SELECT) || defined(IOMGR_ENABLED_WIN32_LEGACY)
-void appendToIOBlockedQueue(Capability *cap, StgTSO *tso)
+void appendToIOBlockedQueue(CapIOManager *iomgr, StgTSO *tso)
 {
-    CapIOManager *iomgr = cap->iomgr;
     ASSERT(tso->_link == END_TSO_QUEUE);
     if (iomgr->blocked_queue_hd == END_TSO_QUEUE) {
         iomgr->blocked_queue_hd = tso;
     } else {
-        setTSOLink(cap, iomgr->blocked_queue_tl, tso);
+        setTSOLink(iomgr->cap, iomgr->blocked_queue_tl, tso);
     }
     iomgr->blocked_queue_tl = tso;
 }
@@ -851,9 +1022,8 @@ void appendToIOBlockedQueue(Capability *cap, StgTSO *tso)
  * used. This is a wart that should be excised.
  */
 // TODO: move to Select.c and rename
-static void insertIntoSleepingQueue(Capability *cap, StgTSO *tso, LowResTime target)
+static void insertIntoSleepingQueue(CapIOManager *iomgr, StgTSO *tso, LowResTime target)
 {
-    CapIOManager *iomgr = cap->iomgr;
     StgTSO *prev = NULL;
     StgTSO *t = iomgr->sleeping_queue;
     while (t != END_TSO_QUEUE && t->block_info.target < target) {
@@ -865,7 +1035,7 @@ static void insertIntoSleepingQueue(Capability *cap, StgTSO *tso, LowResTime tar
     if (prev == NULL) {
         iomgr->sleeping_queue = tso;
     } else {
-        setTSOLink(cap, prev, tso);
+        setTSOLink(iomgr->cap, prev, tso);
     }
 }
 #endif

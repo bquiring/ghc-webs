@@ -41,11 +41,15 @@ module GHC.Internal.IO.Encoding.UTF16 (
 
 import GHC.Internal.Base
 import GHC.Internal.Real
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num
 -- import GHC.Internal.IO
 import GHC.Internal.IO.Buffer
 import GHC.Internal.IO.Encoding.Failure
 import GHC.Internal.IO.Encoding.Types
+import GHC.Internal.Prim (
+    chr#, uncheckedIShiftL#, word2Int#, word16ToWord#, (+#), (-#),
+  )
 import GHC.Internal.Word
 import GHC.Internal.Data.Bits
 import GHC.Internal.IORef

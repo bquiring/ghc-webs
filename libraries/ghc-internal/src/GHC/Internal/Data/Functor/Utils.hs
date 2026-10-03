@@ -9,10 +9,10 @@
 -----------------------------------------------------------------------------
 module GHC.Internal.Data.Functor.Utils where
 
-import GHC.Internal.Data.Coerce (Coercible, coerce)
-import GHC.Internal.Base ( Applicative(..), Functor(..), Maybe(..), Monad (..)
-                , Monoid(..), Ord(..), Semigroup(..), ($), liftM, otherwise )
+import GHC.Internal.Base
+import GHC.Internal.Data.Coerce (coerce)
 import qualified GHC.Internal.List as List
+import GHC.Internal.Maybe (Maybe(..))
 
 -- We don't expose Max and Min because, as Edward Kmett pointed out to me,
 -- there are two reasonable ways to define them. One way is to use Maybe, as we

@@ -6,6 +6,7 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE MagicHash #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -93,20 +94,27 @@ module GHC.Internal.Data.Typeable
 
       -- * For backwards compatibility
     , typeOf1, typeOf2, typeOf3, typeOf4, typeOf5, typeOf6, typeOf7
+
       -- Jank
-    , I.trLiftedRep
+    , I.trLiftedRep, I.typeRep#
+    , I.mkTrCon, I.SomeTypeRep(..)
     ) where
 
+import GHC.Internal.Base
 import qualified GHC.Internal.Data.Typeable.Internal as I
-import GHC.Internal.Data.Typeable.Internal (Typeable)
 import GHC.Internal.Data.Type.Equality
 
 import GHC.Internal.Data.Either
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Data.Proxy
+import GHC.Internal.Err (error)
 import GHC.Internal.Fingerprint.Type
 import GHC.Internal.Show
-import GHC.Internal.Base
+import GHC.Internal.Data.Typeable.Internal( Typeable )
+
+import qualified GHC.Internal.Data.Typeable.Internal as Rebindable
+import qualified GHC.Internal.Stack.Types as Rebindable
+
 
 -- | A quantified type representation.
 type TypeRep = I.SomeTypeRep

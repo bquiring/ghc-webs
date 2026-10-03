@@ -78,7 +78,7 @@ module System.Mem.Weak (
         -- this handler will be ignored.
         setFinalizerExceptionHandler,
         getFinalizerExceptionHandler,
-        printToHandleFinalizerExceptionHandler,
+        GHC.Weak.printToHandleFinalizerExceptionHandler,
 
         -- * A precise semantics
 
@@ -91,6 +91,7 @@ module System.Mem.Weak (
 
 import Prelude
 import GHC.Internal.Weak
+import GHC.Weak
 
 -- | A specialised version of 'mkWeak', where the key and the value are
 -- the same object:

@@ -56,12 +56,19 @@ data Opts = Opts
     , optOpt       :: ProgOpt
     , optLlvmAs    :: ProgOpt
     , optWindres   :: ProgOpt
+    , optDlltool   :: ProgOpt
     , optOtool     :: ProgOpt
     , optInstallNameTool :: ProgOpt
     -- Note we don't actually configure LD into anything but
     -- see #23857 and #22550 for the very unfortunate story.
     , optLd        :: ProgOpt
     , optUnregisterised :: Maybe Bool
+
+    -- dwarf unwinding
+    , optDwarfUnwind :: Maybe Bool
+    , optLibdwIncludes :: Maybe FilePath
+    , optLibdwLibraries :: Maybe FilePath
+
     , optTablesNextToCode :: Maybe Bool
     , optUseLibFFIForAdjustors :: Maybe Bool
     , optLdOverride :: Maybe Bool
@@ -108,10 +115,14 @@ emptyOpts = Opts
     , optOpt       = po0
     , optLlvmAs    = po0
     , optWindres   = po0
+    , optDlltool   = po0
     , optLd        = po0
     , optOtool     = po0
     , optInstallNameTool = po0
     , optUnregisterised = Nothing
+    , optDwarfUnwind = Nothing
+    , optLibdwIncludes = Nothing
+    , optLibdwLibraries = Nothing
     , optTablesNextToCode = Nothing
     , optUseLibFFIForAdjustors = Nothing
     , optLdOverride = Nothing
@@ -123,7 +134,7 @@ emptyOpts = Opts
 
 _optCc, _optCxx, _optCpp, _optHsCpp, _optJsCpp, _optCmmCpp, _optCcLink, _optAr,
     _optRanlib, _optNm, _optReadelf, _optMergeObjs, _optLlc, _optOpt, _optLlvmAs,
-    _optWindres, _optLd, _optOtool, _optInstallNameTool
+    _optWindres, _optDlltool, _optLd, _optOtool, _optInstallNameTool
     :: Lens Opts ProgOpt
 _optCc      = Lens optCc      (\x o -> o {optCc=x})
 _optCxx     = Lens optCxx     (\x o -> o {optCxx=x})
@@ -141,6 +152,7 @@ _optLlc     = Lens optLlc     (\x o -> o {optLlc=x})
 _optOpt     = Lens optOpt     (\x o -> o {optOpt=x})
 _optLlvmAs  = Lens optLlvmAs  (\x o -> o {optLlvmAs=x})
 _optWindres = Lens optWindres (\x o -> o {optWindres=x})
+_optDlltool = Lens optDlltool (\x o -> o {optDlltool=x})
 _optLd      = Lens optLd (\x o -> o {optLd=x})
 _optOtool   = Lens optOtool (\x o -> o {optOtool=x})
 _optInstallNameTool = Lens optInstallNameTool (\x o -> o {optInstallNameTool=x})
@@ -157,12 +169,17 @@ _optOutput = Lens optOutput (\x o -> o {optOutput=x})
 _optTargetPrefix :: Lens Opts (Maybe String)
 _optTargetPrefix = Lens optTargetPrefix (\x o -> o {optTargetPrefix=x})
 
-_optLocallyExecutable, _optUnregisterised, _optTablesNextToCode, _optUseLibFFIForAdjustors, _optLdOvveride :: Lens Opts (Maybe Bool)
+_optLocallyExecutable, _optUnregisterised, _optTablesNextToCode, _optUseLibFFIForAdjustors, _optLdOvveride, _optDwarfUnwind :: Lens Opts (Maybe Bool)
 _optLocallyExecutable = Lens optLocallyExecutable (\x o -> o {optLocallyExecutable=x})
 _optUnregisterised = Lens optUnregisterised (\x o -> o {optUnregisterised=x})
+_optDwarfUnwind = Lens optDwarfUnwind (\x o -> o {optDwarfUnwind=x})
 _optTablesNextToCode = Lens optTablesNextToCode (\x o -> o {optTablesNextToCode=x})
 _optUseLibFFIForAdjustors = Lens optUseLibFFIForAdjustors (\x o -> o {optUseLibFFIForAdjustors=x})
 _optLdOvveride = Lens optLdOverride (\x o -> o {optLdOverride=x})
+
+_optLibdwIncludes, _optLibdwLibraries :: Lens Opts (Maybe FilePath)
+_optLibdwIncludes = Lens optLibdwIncludes (\x o -> o {optLibdwIncludes=x})
+_optLibdwLibraries = Lens optLibdwLibraries (\x o -> o {optLibdwLibraries=x})
 
 _optVerbosity :: Lens Opts Int
 _optVerbosity = Lens optVerbosity (\x o -> o {optVerbosity=x})
@@ -185,6 +202,7 @@ options =
     , enableDisable "libffi-adjustors" "the use of libffi for adjustors, even on platforms which have support for more efficient, native adjustor implementations." _optUseLibFFIForAdjustors
     , enableDisable "ld-override" "override gcc's default linker" _optLdOvveride
     , enableDisable "locally-executable" "the use of a target prefix which will be added to all tool names when searching for toolchain components" _optLocallyExecutable
+    , enableDisable "dwarf-unwind" "Enable DWARF unwinding support in the runtime system via elfutils' libdw" _optDwarfUnwind
     ] ++
     concat
     [ progOpts "cc" "C compiler" _optCc
@@ -203,9 +221,13 @@ options =
     , progOpts "opt" "LLVM opt utility" _optOpt
     , progOpts "llvm-as" "Assembler used for LLVM backend (typically clang)" _optLlvmAs
     , progOpts "windres" "windres utility" _optWindres
+    , progOpts "dlltool" "Windows dll utility" _optDlltool
     , progOpts "ld" "linker" _optLd
     , progOpts "otool" "otool utility" _optOtool
     , progOpts "install-name-tool" "install-name-tool utility" _optInstallNameTool
+    ] ++
+    [ Option [] ["libdw-includes"] (ReqArg (set _optLibdwIncludes . Just) "PATH") "Look for libdw headers in this extra path"
+    , Option [] ["libdw-libraries"] (ReqArg (set _optLibdwLibraries . Just) "PATH") "Look for the libdw library in this extra path"
     ]
   where
     progOpts :: String -> String -> Lens Opts ProgOpt -> [OptDescr (Opts -> Opts)]
@@ -267,13 +289,9 @@ formatOpts = [
 
 validateOpts :: Opts -> [String]
 validateOpts opts = mconcat
-    [ assertJust _optTriple "missing --triple flag"
-    , assertJust _optOutput "missing --output flag"
+    [ ["missing --triple flag" | isNothing (optTriple opts)]
+    , ["missing --output flag" | isNothing (optOutput opts)]
     ]
-  where
-    assertJust :: Lens Opts (Maybe a) -> String -> [String]
-    assertJust lens msg =
-      [ msg | Nothing <- pure $ view lens opts ]
 
 main :: IO ()
 main = do
@@ -441,15 +459,15 @@ mkTarget opts = do
     cmmCpp <- findCmmCpp (optCmmCpp opts) cc0
     cc <- addPlatformDepCcFlags archOs cc0
     readelf <- optional $ findReadelf (optReadelf opts)
-    ccLink <- findCcLink tgtLlvmTarget (optLd opts) (optCcLink opts) (ldOverrideWhitelist archOs && fromMaybe True (optLdOverride opts)) archOs cc readelf
-
-    ar <- findAr tgtVendor (optAr opts)
     -- TODO: We could have
     -- ranlib <- if arNeedsRanlib ar
     --              then Just <$> findRanlib (optRanlib opts)
     --              else return Nothing
     -- but in order to match the configure output, for now we do
-    ranlib <- Just <$> findRanlib (optRanlib opts)
+    ranlib <- findRanlib (optRanlib opts)
+    ar <- findAr tgtVendor (optAr opts)
+    ccLink <- findCcLink tgtLlvmTarget (optLd opts) (optCcLink opts) (ldOverrideWhitelist archOs && fromMaybe True (optLdOverride opts)) archOs cc readelf ar ranlib
+
 
     nm <- findNm (optNm opts)
     mergeObjs <- optional $ findMergeObjs (optMergeObjs opts) cc ccLink nm
@@ -458,17 +476,13 @@ mkTarget opts = do
       throwE "Neither a object-merging tool (e.g. ld -r) nor an ar that supports -L is available"
 
     -- LLVM toolchain
-    llc <- optional $ findProgram "llc" (optLlc opts) ["llc"]
-    opt <- optional $ findProgram "opt" (optOpt opts) ["opt"]
-    llvmAs <- optional $ findProgram "llvm assembler" (optLlvmAs opts) ["clang"]
+    llc <- optional $ findLlvmProgram "llc" (optLlc opts) "llc" True
+    opt <- optional $ findLlvmProgram "opt" (optOpt opts) "opt" True
+    llvmAs <- optional $ findLlvmProgram "llvm assembler" (optLlvmAs opts) "clang" True
 
-    -- Windows-specific utilities
-    windres <-
-        case archOS_OS archOs of
-          OSMinGW32 -> do
-            windres <- findProgram "windres" (optWindres opts) ["windres"]
-            return (Just windres)
-          _ -> return Nothing
+    -- for windows, also used for cross compiling
+    windres <- optional $ findProgram "windres" (optWindres opts) ["windres"]
+    dlltool <- optional $ findLlvmProgram "dlltool" (optDlltool opts) "llvm-dlltool" False
 
     -- Darwin-specific utilities
     (otool, installNameTool) <-
@@ -486,6 +500,10 @@ mkTarget opts = do
     tgtSupportsSubsectionsViaSymbols <- checkSubsectionsViaSymbols archOs cc
     tgtSupportsIdentDirective <- checkIdentDirective cc
     tgtSupportsGnuNonexecStack <- checkGnuNonexecStack archOs cc
+    tgtHasLibm <- checkTargetHasLibm cc
+    tgtRTSWithLibdw <- case optDwarfUnwind opts of
+      Just True -> checkTargetHasLibdw cc (optLibdwIncludes opts) (optLibdwLibraries opts)
+      _         -> pure Nothing
 
     -- code generator configuration
     tgtUnregisterised <- determineUnregisterised archOs (optUnregisterised opts)
@@ -512,13 +530,14 @@ mkTarget opts = do
                    , tgtCmmCPreprocessor = cmmCpp
                    , tgtAr = ar
                    , tgtCCompilerLink = ccLink
-                   , tgtRanlib = ranlib
+                   , tgtRanlib = Just ranlib
                    , tgtNm = nm
                    , tgtMergeObjs = mergeObjs
                    , tgtLlc = llc
                    , tgtOpt = opt
                    , tgtLlvmAs = llvmAs
                    , tgtWindres = windres
+                   , tgtDlltool = dlltool
                    , tgtOtool = otool
                    , tgtInstallNameTool = installNameTool
                    , tgtWordSize
@@ -526,6 +545,8 @@ mkTarget opts = do
                    , tgtUnregisterised
                    , tgtTablesNextToCode
                    , tgtUseLibffiForAdjustors = tgtUseLibffi
+                   , tgtHasLibm
+                   , tgtRTSWithLibdw
                    , tgtSymbolsHaveLeadingUnderscore
                    , tgtSupportsSubsectionsViaSymbols
                    , tgtSupportsIdentDirective
@@ -534,4 +555,3 @@ mkTarget opts = do
                    }
     return t
 
---- ROMES:TODO: fp_settings.m4 in general which I don't think was ported completely (e.g. the basenames and windows llvm-XX and such)

@@ -8,9 +8,16 @@
    (EpAnn
     (EpaSpan { mod185.hs:1:1 })
     (AnnsModule
-     (NoEpTok)
-     (NoEpTok)
-     (NoEpTok)
+     (EpTok
+      (EpaSpan { <no location info> }))
+     (EpTok
+      (EpaSpan { <no location info> }))
+     (EpTok
+      (EpaSpan { <no location info> }))
+     ((,,)
+      (EpTok (EpaSpan { <no location info> }))
+      (EpTok (EpaSpan { <no location info> }))
+      [])
      []
      []
      (Just
@@ -21,7 +28,7 @@
      []
      []))
    (EpVirtualBraces
-    (1))
+    (EpaDelta { <no location info> } (SameLine 0) []))
    (Nothing)
    (Nothing))
   (Nothing)
@@ -29,34 +36,34 @@
   [(L
     (EpAnn
      (EpaSpan { mod185.hs:3:1-24 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (ImportDecl
      (XImportDeclPass
-      (EpAnn
-       (EpaSpan { mod185.hs:3:1-24 })
-       (EpAnnImportDecl
+      (EpAnnImportDecl
+       (EpTok
+        (EpaSpan { mod185.hs:3:1-6 }))
+       (Nothing)
+       (Nothing)
+       (Nothing)
+       (Just
         (EpTok
-         (EpaSpan { mod185.hs:3:1-6 }))
-        (Nothing)
-        (Nothing)
-        (Nothing)
-        (Just
-         (EpTok
-          (EpaSpan { mod185.hs:3:16-24 })))
-        (Nothing)
-        (Nothing))
-       (EpaComments
+         (EpaSpan { mod185.hs:3:16-24 })))
+       (Nothing)
+       (Nothing)
+       ((,,,)
+        (EpTok
+         (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
         []))
       (NoSourceText)
-      (False))
+      (UserWrittenImport))
      (L
       (EpAnn
        (EpaSpan { mod185.hs:3:8-14 })
-       (AnnListItem
-        [])
+       []
        (EpaComments
         []))
       {ModuleName: Prelude})
@@ -70,8 +77,7 @@
   [(L
     (EpAnn
      (EpaSpan { mod185.hs:5:1-24 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     (ValD
@@ -88,23 +94,22 @@
        (Unqual
         {OccName: main}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { mod185.hs:5:1-24 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { mod185.hs:5:1-24 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -122,11 +127,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -152,8 +162,7 @@
                (L
                 (EpAnn
                  (EpaSpan { mod185.hs:5:8-24 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsVar

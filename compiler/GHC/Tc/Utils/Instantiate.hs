@@ -1,6 +1,4 @@
-{-# LANGUAGE FlexibleContexts, RecursiveDo #-}
-{-# LANGUAGE DisambiguateRecordFields #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecursiveDo #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 
@@ -13,7 +11,6 @@
 module GHC.Tc.Utils.Instantiate (
      topSkolemise, skolemiseRequired,
      topInstantiate,
-     instantiateSigma,
      instCall, instDFunType, instStupidTheta, instTyVarsWith,
      newWanted, newWanteds,
 
@@ -31,8 +28,7 @@ module GHC.Tc.Utils.Instantiate (
      newClsInst, newFamInst,
      tcGetInsts, tcGetInstEnvs, getOverlapFlag,
      tcExtendLocalInstEnv,
-     instCallConstraints, newMethodFromName,
-     tcSyntaxName,
+     instCallConstraints, newKnownOccMethod, newKnownKeyMethod,
 
      -- Simple functions over evidence variables
      tyCoVarsOfWC,
@@ -44,8 +40,8 @@ import GHC.Prelude
 import GHC.Driver.Session
 import GHC.Driver.Env
 
-import GHC.Builtin.Types  ( integerTyConName )
-import GHC.Builtin.Names
+import GHC.Builtin.KnownOccs( rationalTyConOcc )
+import GHC.Builtin.WiredIn.Types( integerTy )
 
 import GHC.Hs
 import GHC.Hs.Syn.Type   ( hsLitType )
@@ -55,45 +51,38 @@ import GHC.Core.FamInstEnv
 import GHC.Core ( isOrphan ) -- For the Coercion constructor
 import GHC.Core.Type
 import GHC.Core.TyCo.Ppr ( debugPprType )
-import GHC.Core.TyCo.Tidy ( tidyType )
 import GHC.Core.Class( Class )
 import GHC.Core.Coercion.Axiom
 
-import {-# SOURCE #-}   GHC.Tc.Gen.Expr( tcCheckPolyExpr, tcSyntaxOp )
+import {-# SOURCE #-}   GHC.Tc.Gen.Expr( tcSyntaxOp )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.Env
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Instance.FunDeps
-import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic )
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Errors.Types
-import GHC.Tc.Zonk.Monad ( ZonkM )
 
 import GHC.Rename.Utils( mkRnSyntaxExpr )
 
 import GHC.Types.Id.Make( mkDictFunId )
-import GHC.Types.Basic ( TypeOrKind(..), Arity, VisArity )
-import GHC.Types.SourceText
+import GHC.Types.Arity ( VisArity )
+import GHC.Types.Basic ( TypeOrKind(..) )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Var.Env
 import GHC.Types.Id
 import GHC.Types.Name
-import GHC.Types.Name.Env
-import GHC.Types.Name.Reader (WithUserRdr(..))
 import GHC.Types.Var
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Outputable
-import GHC.Utils.Unique (sameUnique)
 
 import GHC.Unit.State
 import GHC.Unit.External
-import GHC.Unit.Module.Warnings
 
 import Data.List ( mapAccumL )
 import qualified Data.List.NonEmpty as NE
@@ -108,31 +97,36 @@ import Data.Function ( on )
 ************************************************************************
 -}
 
-newMethodFromName
-  :: CtOrigin              -- ^ why do we need this?
-  -> Name                  -- ^ name of the method
+newKnownOccMethod
+  :: HasDebugCallStack
+  => CtOrigin              -- ^ why do we need this?
+  -> KnownOcc              -- ^ name of the method
   -> [TcRhoType]           -- ^ types with which to instantiate the class
   -> TcM (HsExpr GhcTc)
--- ^ Used when 'Name' is the wired-in name for a wired-in class method,
+-- ^ Used when 'KnownOcc' is the known occ for a known-occ class method,
 -- so the caller knows its type for sure, which should be of form
 --
 -- > forall a. C a => <blah>
 --
--- 'newMethodFromName' is supposed to instantiate just the outer
+-- 'newMethodFromKnownKey' is supposed to instantiate just the outer
 -- type variable and constraint
+newKnownOccMethod origin occ ty_args
+  = do { id <- tcLookupKnownOccId occ
+       ; finish_nkko origin id ty_args }
 
-newMethodFromName origin name ty_args
-  = do { id <- tcLookupId name
-              -- Use tcLookupId not tcLookupGlobalId; the method is almost
-              -- always a class op, but with -XRebindableSyntax GHC is
-              -- meant to find whatever thing is in scope, and that may
-              -- be an ordinary function.
+newKnownKeyMethod  -- Same as newKnownOccMethod, but with a KnownKey
+  :: HasDebugCallStack => CtOrigin -> KnownKey -> [TcRhoType]-> TcM (HsExpr GhcTc)
+newKnownKeyMethod origin key ty_args
+  = do { id <- tcLookupKnownKeyId key
+       ; finish_nkko origin id ty_args }
 
-       ; let ty = piResultTys (idType id) ty_args
+finish_nkko :: HasDebugCallStack => CtOrigin -> Id -> [TcRhoType] -> TcM (HsExpr GhcTc)
+finish_nkko origin id ty_args
+  = do { let ty = piResultTys (idType id) ty_args
              (theta, _caller_knows_this) = tcSplitPhiTy ty
-       ; wrap <- assert (not (isForAllTy ty) && isSingleton theta) $
+       ; wrap <- assertPpr (not (isForAllTy ty) && isSingleton theta)
+                   (ppr id <+> dcolon <+> ppr (idType id) $$ ppr ty_args) $
                  instCall origin ty_args theta
-
        ; return (mkHsWrap wrap (mkHsVar (noLocA id))) }
 
 {-
@@ -279,66 +273,43 @@ skolemiseRequired skolem_info n_req sigma
 topInstantiate :: CtOrigin -> TcSigmaType -> TcM (HsWrapper, TcRhoType)
 -- Instantiate outer invisible binders (both Inferred and Specified)
 -- If    top_instantiate ty = (wrap, inner_ty)
--- then  wrap :: inner_ty "->" ty
+-- then  wrap :: inner_ty ~~> ty
 -- NB: returns a type with no (=>),
 --     and no invisible forall at the top
 topInstantiate orig sigma
-  | (tvs,   body1) <- tcSplitSomeForAllTyVars isInvisibleForAllTyFlag sigma
-  , (theta, body2) <- tcSplitPhiTy body1
+  | (tvs,   phi_ty)  <- tcSplitSomeForAllTyVars isInvisibleForAllTyFlag sigma
+  , (theta, body_ty) <- tcSplitPhiTy phi_ty
   , not (null tvs && null theta)
-  = do { (_, wrap1, body3) <- instantiateSigma orig noConcreteTyVars tvs theta body2
-           -- Why 'noConcreteTyVars' here?
+  = do { (subst, inst_tvs) <- newMetaTyVarsX empty_subst tvs
+           -- No need to worry about concrete tyvars here (c.f. instantiateSigmaQL)
            -- See Note [Representation-polymorphism checking built-ins]
            -- in GHC.Tc.Utils.Concrete.
 
+       ; let inst_theta = substTheta subst theta
+             inst_body  = substTy subst body_ty
+
+       ; wrap1 <- instCall orig (mkTyVarTys inst_tvs) inst_theta
+
        -- Loop, to account for types like
        --       forall a. Num a => forall b. Ord b => ...
-       ; (wrap2, body4) <- topInstantiate orig body3
+       ; (wrap2, inner_body) <- topInstantiate orig inst_body
 
-       ; return (wrap2 <.> wrap1, body4) }
-
-  | otherwise = return (idHsWrapper, sigma)
-
-instantiateSigma :: CtOrigin
-                 -> ConcreteTyVars -- ^ concreteness information
-                 -> [TyVar]
-                 -> TcThetaType -> TcSigmaType
-                 -> TcM ([TcTyVar], HsWrapper, TcSigmaType)
--- (instantiate orig tvs theta ty)
--- instantiates the type variables tvs, emits the (instantiated)
--- constraints theta, and returns the (instantiated) type ty
-instantiateSigma orig concs tvs theta body_ty
-  = do { rec (subst, inst_tvs) <- mapAccumLM (new_meta subst) empty_subst tvs
-       ; let inst_theta  = substTheta subst theta
-             inst_body   = substTy subst body_ty
-             inst_tv_tys = mkTyVarTys inst_tvs
-
-       ; wrap <- instCall orig inst_tv_tys inst_theta
-       ; traceTc "Instantiating"
+       ; traceTc "topInstantiate"
                  (vcat [ text "origin" <+> pprCtOrigin orig
                        , text "tvs"   <+> ppr tvs
                        , text "theta" <+> ppr theta
                        , text "type" <+> debugPprType body_ty
-                       , text "with" <+> vcat (map debugPprType inst_tv_tys)
+                       , text "with" <+> ppr inst_tvs
                        , text "theta:" <+> ppr inst_theta ])
 
-      ; return (inst_tvs, wrap, inst_body) }
+      ; return (wrap2 <.> wrap1, inner_body) }
+
+  | otherwise
+  = return (idHsWrapper, sigma)
+
   where
-    in_scope = mkInScopeSet (tyCoVarsOfType (mkSpecSigmaTy tvs theta body_ty))
-               -- mkSpecSigmaTy: Inferred vs Specified is not important here;
-               --                We just want an accurate free-var set
-    empty_subst = mkEmptySubst in_scope
-    new_meta :: Subst -> Subst -> TyVar -> TcM (Subst, TcTyVar)
-    new_meta final_subst subst tv
-      -- Is this a type variable that must be instantiated to a concrete type?
-      -- If so, create a ConcreteTv metavariable instead of a plain TauTv.
-      -- See Note [Representation-polymorphism checking built-ins] in GHC.Tc.Utils.Concrete.
-      | Just conc_orig0 <- lookupNameEnv concs (tyVarName tv)
-      , let conc_orig = substConcreteTvOrigin final_subst body_ty conc_orig0
-      -- See Note [substConcreteTvOrigin].
-      = newConcreteTyVarX conc_orig subst tv
-      | otherwise
-      = newMetaTyVarX subst tv
+    empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType sigma))
+
 
 instTyVarsWith :: CtOrigin -> [TyVar] -> [TcType] -> TcM Subst
 -- Use this when you want to instantiate (forall a b c. ty) with
@@ -810,126 +781,29 @@ newNonTrivialOverloadedLit
                       \_ _ -> return ()
         ; let L _ witness = mkHsSyntaxApps (l2l loc) fi' [nlHsLit hs_lit]
         ; res_ty <- readExpType res_ty
-        ; return (lit { ol_ext = OverLitTc { ol_rebindable = rebindable
-                                           , ol_witness = witness
-                                           , ol_type = res_ty } }) }
+        ; return (OverLit
+            { ol_ext = OverLitTc
+                { ol_rebindable = rebindable
+                , ol_witness = witness
+                , ol_type = res_ty
+                }
+            , ol_val = tcOverLitVal val
+            })
+        }
   where
     orig = LiteralOrigin lit
 
 ------------
-mkOverLit :: OverLitVal -> TcM (HsLit GhcTc)
+mkOverLit :: OverLitVal GhcRn -> TcM (HsLit GhcTc)
 mkOverLit (HsIntegral i)
-  = do  { integer_ty <- tcMetaTy integerTyConName
-        ; return (XLit $ HsInteger  (il_text i) (il_value i) integer_ty) }
+  = return (XLit $ HsInteger  (il_text i) (il_value i) integerTy)
 
 mkOverLit (HsFractional r)
-  = do  { rat_ty <- tcMetaTy rationalTyConName
-        ; return (XLit $ HsRat r rat_ty) }
+  = do  { rat_ty <- tcMetaKnownOccTy rationalTyConOcc
+        ; return (XLit $ HsRat (tcFractionalLit r) rat_ty) }
 
-mkOverLit (HsIsString src s) = return (HsString src s)
-
-{-
-************************************************************************
-*                                                                      *
-                Re-mappable syntax
-
-     Used only for arrow syntax -- find a way to nuke this
-*                                                                      *
-************************************************************************
-
-Suppose we are doing the -XRebindableSyntax thing, and we encounter
-a do-expression.  We have to find (>>) in the current environment, which is
-done by the rename. Then we have to check that it has the same type as
-Control.Monad.(>>).  Or, more precisely, a compatible type. One 'customer' had
-this:
-
-  (>>) :: HB m n mn => m a -> n b -> mn b
-
-So the idea is to generate a local binding for (>>), thus:
-
-        let then72 :: forall a b. m a -> m b -> m b
-            then72 = ...something involving the user's (>>)...
-        in
-        ...the do-expression...
-
-Now the do-expression can proceed using then72, which has exactly
-the expected type.
-
-In fact tcSyntaxName just generates the RHS for then72, because we only
-want an actual binding in the do-expression case. For literals, we can
-just use the expression inline.
--}
-
-tcSyntaxName :: CtOrigin
-             -> TcType                  -- ^ Type to instantiate it at
-             -> (Name, HsExpr GhcRn)    -- ^ (Standard name, user name)
-             -> TcM (Name, HsExpr GhcTc)
-                                        -- ^ (Standard name, suitable expression)
--- USED ONLY FOR CmdTop (sigh) ***
--- See Note [CmdSyntaxTable] in "GHC.Hs.Expr"
-
-tcSyntaxName orig ty (std_nm, HsVar _ (L _ (WithUserRdr _ user_nm)))
-  | std_nm == user_nm
-  = do rhs <- newMethodFromName orig std_nm [ty]
-       return (std_nm, rhs)
-
-tcSyntaxName orig ty (std_nm, user_nm_expr) = do
-    std_id <- tcLookupId std_nm
-    let
-        ([tv], _, tau) = tcSplitSigmaTy (idType std_id)
-        sigma1         = substTyWith [tv] [ty] tau
-        -- Actually, the "tau-type" might be a sigma-type in the
-        -- case of locally-polymorphic methods.
-
-    span <- getSrcSpanM
-    addErrCtxtM (syntaxNameCtxt user_nm_expr orig sigma1 span) $ do
-
-        -- Check that the user-supplied thing has the
-        -- same type as the standard one.
-        -- Tiresome jiggling because tcCheckSigma takes a located expression
-     expr <- tcCheckPolyExpr (L (noAnnSrcSpan span) user_nm_expr) sigma1
-     hasFixedRuntimeRepRes std_nm user_nm_expr sigma1
-     return (std_nm, unLoc expr)
-
-syntaxNameCtxt :: HsExpr GhcRn -> CtOrigin -> Type -> SrcSpan
-               -> TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)
-syntaxNameCtxt name orig ty loc tidy_env =
-  return (tidy_env, SyntaxNameCtxt name orig (tidyType tidy_env ty) loc)
-
-{-
-************************************************************************
-*                                                                      *
-                FixedRuntimeRep
-*                                                                      *
-************************************************************************
--}
-
--- | Check that the result type of an expression has a fixed runtime representation.
---
--- Used only for arrow operations such as 'arr', 'first', etc.
-hasFixedRuntimeRepRes :: Name -> HsExpr GhcRn -> TcSigmaType -> TcM ()
-hasFixedRuntimeRepRes std_nm user_expr ty = mapM_ do_check mb_arity
-  where
-   do_check :: Arity -> TcM ()
-   do_check arity =
-     let res_ty = nTimes arity (snd . splitPiTy) ty
-     in hasFixedRuntimeRep_syntactic (FRRArrow $ ArrowFun user_expr) res_ty
-   mb_arity :: Maybe Arity
-   mb_arity -- arity of the arrow operation, counting type-level arguments
-     | sameUnique std_nm arrAName     -- result used as an argument in, e.g., do_premap
-     = Just 3
-     | sameUnique std_nm composeAName -- result used as an argument in, e.g., dsCmdStmt/BodyStmt
-     = Just 5
-     | sameUnique std_nm firstAName   -- result used as an argument in, e.g., dsCmdStmt/BodyStmt
-     = Just 4
-     | sameUnique std_nm appAName     -- result used as an argument in, e.g., dsCmd/HsCmdArrApp/HsHigherOrderApp
-     = Just 2
-     | sameUnique std_nm choiceAName  -- result used as an argument in, e.g., HsCmdIf
-     = Just 5
-     | sameUnique std_nm loopAName    -- result used as an argument in, e.g., HsCmdIf
-     = Just 4
-     | otherwise
-     = Nothing
+mkOverLit (HsIsString sLit)
+  = return $ HsString (stringLitSourceText sLit) (sl_fs sLit)
 
 {-
 ************************************************************************
@@ -939,7 +813,7 @@ hasFixedRuntimeRepRes std_nm user_expr ty = mapM_ do_check mb_arity
 ************************************************************************
 -}
 
-getOverlapFlag :: Maybe OverlapMode   -- User pragma if any
+getOverlapFlag :: Maybe (OverlapMode GhcTc) -- User pragma if any
                -> TcM OverlapFlag
 -- Construct the OverlapFlag from the global module flags,
 -- but if the overlap_mode argument is (Just m),
@@ -963,9 +837,9 @@ getOverlapFlag overlap_mode_prag
 
               overlap_mode
                 | Just m <- overlap_mode_prag = m
-                | incoherent_ok               = Incoherent NoSourceText
-                | overlap_ok                  = Overlaps   NoSourceText
-                | otherwise                   = NoOverlap  NoSourceText
+                | incoherent_ok               = Incoherent noAnn
+                | overlap_ok                  = Overlaps   noAnn
+                | otherwise                   = NoOverlap  noAnn
 
               -- final_overlap_mode: the `-fspecialise-incoherents` flag controls the
               -- meaning of the `Incoherent` overlap mode: as either an Incoherent overlap
@@ -973,18 +847,25 @@ getOverlapFlag overlap_mode_prag
               -- See GHC.Core.InstEnv Note [Coherence and specialisation: overview]
               final_overlap_mode
                 | Incoherent s <- overlap_mode
-                , noncanonical_incoherence       = NonCanonical s
-                | otherwise                      = overlap_mode
+                , noncanonical_incoherence    = NonCanonical s
+                | otherwise                   = overlap_mode
 
-        ; return (OverlapFlag { isSafeOverlap = safeLanguageOn dflags
-                              , overlapMode   = final_overlap_mode }) }
+              final_overlap_flag = OverlapFlag (safeLanguageOn dflags) $
+                case final_overlap_mode of
+                  NoOverlap    s -> NoOverlap    s
+                  Overlappable s -> Overlappable s
+                  Overlapping  s -> Overlapping  s
+                  Overlaps     s -> Overlaps     s
+                  Incoherent   s -> Incoherent   s
+                  NonCanonical s -> NonCanonical s
 
+        ; return $ final_overlap_flag }
 
 tcGetInsts :: TcM [ClsInst]
 -- Gets the local class instances.
 tcGetInsts = fmap tcg_insts getGblEnv
 
-newClsInst :: Maybe OverlapMode   -- User pragma
+newClsInst :: Maybe (OverlapMode GhcTc)   -- User pragma
            -> Name -> [TyVar] -> ThetaType
            -> Class -> [Type] -> Maybe (WarningTxt GhcRn) -> TcM ClsInst
 newClsInst overlap_mode dfun_name tvs theta clas tys warn

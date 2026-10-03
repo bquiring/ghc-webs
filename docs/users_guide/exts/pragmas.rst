@@ -58,10 +58,9 @@ prefixing it with "``-X``"; for example ``-XForeignFunctionInterface``.
 
 A list of all supported language extensions can be obtained by invoking
 ``ghc --supported-extensions`` (see :ghc-flag:`--supported-extensions`).
+Alternatively see :ref:`table`.
 
-Any extension from the ``Extension`` type defined in
-:cabal-ref:`Language.Haskell.Extension.` may be used. GHC will report an error
-if any of the requested extensions are not supported.
+GHC will report an error if any of the requested extensions are not supported.
 
 .. _options-pragma:
 
@@ -486,17 +485,18 @@ behaviour:
    optimisation level etc.
 
 -  Like ``INLINE``, the ``INLINABLE`` pragma retains a copy of the
-   original RHS for inlining purposes, and persists it in the interface
+   RHS for inlining purposes, and persists it in the interface
    file, regardless of the size of the RHS.
+   The RHS will be carefully optimised so that, when the function
+   inlines, GHC behaves as if the original RHS had been inlined.
 
 -  One way to use ``INLINABLE`` is in conjunction with the special
    function ``inline`` (:ref:`special-ids`). The call ``inline f`` tries
    very hard to inline ``f``. To make sure that ``f`` can be inlined, it
    is a good idea to mark the definition of ``f`` as ``INLINABLE``, so
    that GHC guarantees to expose an unfolding regardless of how big it
-   is. Moreover, by annotating ``f`` as ``INLINABLE``, you ensure that
-   ``f``\'s original RHS is inlined, rather than whatever random
-   optimised version of ``f`` GHC's optimiser has produced.
+   is. You can also provide an explicit :ref:`phase-control` on the
+   ``INLINABLE`` pragma to ensure that RULES have a chance of firing first.
 
 -  The ``INLINABLE`` pragma also works with ``SPECIALISE``: if you mark
    function ``f`` as ``INLINABLE``, then you can subsequently
@@ -570,6 +570,12 @@ optionally specify a phase number, thus:
 -  "``NOINLINE[~k] f``" means: be willing to inline ``f`` until phase
    ``k``, but from phase ``k`` onwards do not inline it.
 
+-  "``INLINEABLE[k] f``" means: do not inline ``f`` until phase ``k``, but
+   from phase ``k`` onwards GHC is free to inline it.
+
+-  "``INLINEABLE[~k] f``" means: GHC is free to inline ``f`` until phase
+   ``k``, but from phase ``k`` onwards do not inline it.
+
 The same information is summarised here:
 
 .. code-block:: none
@@ -579,6 +585,8 @@ The same information is summarised here:
       {-# INLINE   [~2] f #-}  --      Yes                No
       {-# NOINLINE [2]  f #-}  --      No                 Maybe
       {-# NOINLINE [~2] f #-}  --      Maybe              No
+      {-# INLINEABLE [2]  f #-} --     No                 Maybe
+      {-# INLINEABLE [~2] f #-} --     Maybe              No
 
       {-# INLINE   f #-}       --      Yes                Yes
       {-# NOINLINE f #-}       --      No                 No

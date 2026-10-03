@@ -1,4 +1,3 @@
-{-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE OverloadedStrings          #-}
 -----------------------------------------------------------------------------
 -- |
@@ -76,7 +75,7 @@ initJSMState tag supply = JEnv { prefix = tag
                                , ids    = supply
                                }
 initJSM :: IO JEnv
-initJSM = do supply <- mkSplitUniqSupply 'j'
+initJSM = do supply <- mkSplitUniqSupply JsTag
              return (initJSMState "js" supply)
 
 update_stream :: UniqSupply -> JSM ()

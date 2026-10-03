@@ -1,4 +1,10 @@
+{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE Safe #-}
+
+{-# LANGUAGE StandaloneDeriving #-}
+
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- |
 --
@@ -20,3 +26,19 @@ module GHC.ByteOrder
      ) where
 
 import GHC.Internal.ByteOrder
+
+#if __GLASGOW_HASKELL__ >= 1001
+
+import qualified GHC.Essentials as Rebindable
+import Text.Read
+
+{-NOTE:
+    The following instance is technically an orphan, but practically it is not,
+    since ordinary users should not use @ghc-internal@ directly and thus get
+    'ByteOrder' only through this module.
+-}
+
+-- | @since base-4.11.0.0
+deriving instance Read ByteOrder
+
+#endif

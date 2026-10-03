@@ -39,16 +39,21 @@ module GHC.Internal.System.Environment.Blank
       unsetEnv,
   ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Classes (Eq(..))
 import GHC.Internal.Data.Functor
 import GHC.Internal.Data.List (elem, null, takeWhile)
 import GHC.Internal.Foreign.C.String
-import GHC.Internal.Base
+import GHC.Internal.Base (String, otherwise, ($))
 #if defined(mingw32_HOST_OS)
+import GHC.Internal.Base ((.))
+import qualified GHC.Internal.Num as Rebindable
 import GHC.Internal.Foreign.Ptr
 import GHC.Internal.Windows
 import GHC.Internal.Control.Monad
 import GHC.Internal.Data.List (lookup)
 #else
+import GHC.Internal.Base (return)
 import GHC.Internal.Foreign.C.Error
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Real (fromIntegral)
@@ -59,6 +64,7 @@ import GHC.Internal.IO.Exception
 import GHC.Internal.System.IO.Error
 import GHC.Internal.Control.Exception.Base
 import GHC.Internal.Data.Maybe
+import GHC.Internal.Types (Bool(..), IO)
 
 import GHC.Internal.System.Environment
     (
@@ -72,6 +78,9 @@ import GHC.Internal.System.Environment
 #if !defined(mingw32_HOST_OS)
 import qualified GHC.Internal.System.Environment as Environment
 #endif
+
+import qualified GHC.Internal.Base as Rebindable
+
 
 #include "HsBaseConfig.h"
 

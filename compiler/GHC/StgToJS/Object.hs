@@ -1,8 +1,4 @@
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE Rank2Types                 #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE ViewPatterns               #-}
 {-# LANGUAGE MagicHash                  #-}
 {-# LANGUAGE MultiWayIf                 #-}
@@ -76,7 +72,6 @@ import           Data.List (sortOn)
 import qualified Data.List as List
 import           Data.Map (Map)
 import qualified Data.Map as M
-import           Data.Word
 import           Data.Semigroup
 import           System.IO
 
@@ -410,12 +405,10 @@ readObjectBlocks file bids = do
 --------------------------------------------------------------------------------
 
 putEnum :: Enum a => WriteBinHandle -> a -> IO ()
-putEnum bh x | n > 65535 = error ("putEnum: out of range: " ++ show n)
-             | otherwise = put_ bh n
-  where n = fromIntegral $ fromEnum x :: Word16
+putEnum bh x = put_ bh (fromEnum x)
 
 getEnum :: Enum a => ReadBinHandle -> IO a
-getEnum bh = toEnum . fromIntegral <$> (get bh :: IO Word16)
+getEnum bh = toEnum <$> (get bh)
 
 -- | Helper to convert Int to Int32
 toI32 :: Int -> Int32

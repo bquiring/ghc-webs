@@ -11,12 +11,24 @@ module GHC.Internal.Char
     ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Err (error)
 import GHC.Internal.Show
+import GHC.Internal.Prim (chr#, int2Word#, leWord#, Int#, Char#)
 
 -- | The 'Prelude.toEnum' method restricted to the type 'Data.Char.Char'.
 chr :: Int -> Char
-chr i@(I# i#)
- | isTrue# (int2Word# i# `leWord#` 0x10FFFF##) = C# (chr# i#)
- | otherwise
-    = errorWithoutStackTrace ("Prelude.chr: bad argument: " ++ showSignedInt (I# 9#) i "")
+chr (I# i#) = C# (safe_chr# i#)
 
+{-# INLINABLE safe_chr# #-}
+safe_chr# :: Int# -> Char#
+safe_chr# i#
+ | isTrue# (int2Word# i# `leWord#` 0x10FFFF##) = chr# i#
+ | otherwise = chr_error i#
+
+{-# NOINLINE chr_error #-}
+chr_error :: Int# -> Char#
+chr_error i# = error ("Data.Char.chr: argument outside Unicode range: 0..1114111: " ++ showSignedInt (I# 9#) (I# i#) "")
+-- It's not really "Data.Char", but we assume that
+-- the majority of users will import it from "base:Data.Char"
+-- and not from "ghc-internal:GHC.Internal.Char".

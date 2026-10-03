@@ -1,5 +1,3 @@
-{-# LANGUAGE BinaryLiterals, ScopedTypeVariables #-}
-
 --
 --  (c) The University of Glasgow 2002-2006
 --
@@ -34,22 +32,29 @@ module GHC.Iface.Binary (
 
 import GHC.Prelude
 
-import GHC.Builtin.Utils   ( isKnownKeyName, lookupKnownKeyName )
-import GHC.Unit
-import GHC.Unit.Module.ModIface
-import GHC.Types.Name
-import GHC.Platform.Profile
-import GHC.Types.Unique.FM
+import GHC.Builtin   ( knownKeyOccMap, wiredInNamesMap )
+import GHC.Builtin.Uniques( knownUniqueTupleName )
+
 import GHC.Utils.Panic
 import GHC.Utils.Binary as Binary
-import GHC.Data.FastMutInt
-import GHC.Types.Unique
 import GHC.Utils.Outputable
-import GHC.Types.Name.Cache
+
+import GHC.Types.Name
+import GHC.Types.Unique
 import GHC.Types.SrcLoc
+import GHC.Types.Name.Cache
+import GHC.Types.Unique.FM
+
+import GHC.Unit
+import GHC.Unit.Module.ModIface
+
+import GHC.Platform.Profile
 import GHC.Platform
 import GHC.Settings.Constants
 import GHC.Iface.Type (IfaceType(..), getIfaceType, putIfaceType, ifaceTypeSharedByte)
+
+import GHC.Data.FastMutInt
+import GHC.Data.Maybe( orElse )
 
 import Control.Monad
 import Data.Array
@@ -63,7 +68,8 @@ import System.IO.Unsafe
 import Data.Typeable (Typeable)
 import qualified GHC.Data.Strict as Strict
 import Data.Function ((&))
-
+import GHC.Types.Name.Env
+import Data.Maybe
 
 -- ---------------------------------------------------------------------------
 -- Reading and writing binary interface files
@@ -620,25 +626,27 @@ initNameReaderTable cache = do
       }
 
 data BinSymbolTable = BinSymbolTable {
-        bin_symtab_next :: !FastMutInt, -- The next index to use
-        bin_symtab_map  :: !(IORef (UniqFM Name (Int,Name)))
-                                -- indexed by Name
+        bin_symtab_next :: !FastMutInt,
+                        -- ^ The next index to use
+        bin_symtab_map  :: !(IORef (NameEnv Int, ModuleEnv [(Int,Name)]))
+                        -- ^ Deduplication indexed by Name
+                        -- ; Group table data by module for serialization
   }
 
 initNameWriterTable :: IO (WriterTable, BinaryWriter Name)
 initNameWriterTable = do
   symtab_next <- newFastMutInt 0
-  symtab_map <- newIORef emptyUFM
+  symtab_map <- newIORef (emptyNameEnv, emptyModuleEnv)
   let bin_symtab =
         BinSymbolTable
           { bin_symtab_next = symtab_next
-          , bin_symtab_map = symtab_map
+          , bin_symtab_map  = symtab_map
           }
 
   let put_symtab bh = do
         name_count <- readFastMutInt symtab_next
-        symtab_map <- readIORef symtab_map
-        putSymbolTable bh name_count symtab_map
+        (_, symtab_tbl) <- readIORef symtab_map
+        putSymbolTable bh name_count symtab_tbl
         pure name_count
 
   return
@@ -649,58 +657,151 @@ initNameWriterTable = do
     )
 
 
-putSymbolTable :: WriteBinHandle -> Int -> UniqFM Name (Int,Name) -> IO ()
+{- |
+The symbol table payload will look like:
+
+  <total name count>
+  $modules.size
+  for (mod, names) in $modules:
+    $mod
+    $names.size
+    for table_ix, occ in $names
+      $table_ix
+      $name.occ
+      $name.is_known_key
+-}
+putSymbolTable :: WriteBinHandle -> Int -> ModuleEnv [(Int, Name)] -> IO ()
 putSymbolTable bh name_count symtab = do
     put_ bh name_count
-    let names = elems (array (0,name_count-1) (nonDetEltsUFM symtab))
-      -- It's OK to use nonDetEltsUFM here because the elements have
-      -- indices that array uses to create order
-    mapM_ (\n -> serialiseName bh n symtab) names
+    put_ bh (sizeModuleEnv symtab)
+    forM_ (moduleEnvToList symtab) $ \(mod,names) -> do
+      put_ bh mod
+      put_ bh (length names)
+      forM_ names $ \(table_ix, name) -> do
+        let occ = assertPpr (isExternalName name) (ppr name) (nameOccName name)
+        put_ bh table_ix
+        put_ bh occ
+        put_ bh (isKnownKeyName name)
 
-
+-- | Decode the symbol table -- layout set by 'putSymbolTable'.
 getSymbolTable :: ReadBinHandle -> NameCache -> IO (SymbolTable Name)
+-- Create an array of Names for the symbols and add them to the NameCache
 getSymbolTable bh name_cache = do
     sz <- get bh :: IO Int
-    -- create an array of Names for the symbols and add them to the NameCache
     updateNameCache' name_cache $ \cache0 -> do
-        mut_arr <- newArray_ (0, sz-1) :: IO (IOArray Int Name)
-        cache <- foldGet' (fromIntegral sz) bh cache0 $ \i (uid, mod_name, occ) cache -> do
-          let mod = mkModule uid mod_name
-          case lookupOrigNameCache cache mod occ of
-            Just name -> do
-              writeArray mut_arr (fromIntegral i) name
-              return cache
-            Nothing   -> do
+      mut_arr <- newArray_ (0, sz-1) :: IO (IOArray Int Name)
+      mods_sz <- get bh :: IO Int
+      cache <-
+        foldGet' (fromIntegral mods_sz) bh cache0 $ \_mod_ix (mod,mod_nms_sz) cache1 ->
+          foldGet' (fromIntegral (mod_nms_sz::Int)) bh cache1 (deserialise_one mut_arr mod)
+      arr <- unsafeFreeze mut_arr
+      return (cache, arr)
+  where
+    deserialise_one :: (IOArray Int Name)
+                    -> Module
+                    -> Word -> (Int, OccName, Bool)
+                    -> OrigNameCache -> IO OrigNameCache
+    deserialise_one mut_arr mod _mod_nms_ix (table_ix, occ, is_known_key) cache2 = do
+      case lookupOrigNameCache cache2 mod occ of
+        Just name -> do
+          writeArray mut_arr table_ix name
+          return cache2
+        Nothing
+          | is_known_key -> do
+              let uniq = lookupOccEnv knownKeyOccMap occ `orElse`
+                           pprPanic "getSymbolTable" (ppr occ)
+              extend_cache_with (mkKnownKeyName uniq mod occ noSrcSpan)
+          | otherwise -> do
               uniq <- takeUniqFromNameCache name_cache
-              let name      = mkExternalName uniq mod occ noSrcSpan
-                  new_cache = extendOrigNameCache cache mod occ name
-              writeArray mut_arr (fromIntegral i) name
-              return new_cache
-        arr <- unsafeFreeze mut_arr
-        return (cache, arr)
-
-serialiseName :: WriteBinHandle -> Name -> UniqFM key (Int,Name) -> IO ()
-serialiseName bh name _ = do
-    let mod = assertPpr (isExternalName name) (ppr name) (nameModule name)
-    put_ bh (moduleUnit mod, moduleName mod, nameOccName name)
+              extend_cache_with (mkExternalName uniq mod occ noSrcSpan)
+      where
+        extend_cache_with name = do
+          let cache3 = extendOrigNameCache cache2 mod occ name
+          writeArray mut_arr table_ix name
+          return cache3
 
 
--- Note [Symbol table representation of names]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- An occurrence of a name in an interface file is serialized as a single 32-bit
--- word. The format of this word is:
---  00xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
---   A normal name. x is an index into the symbol table
---  10xxxxxx xxyyyyyy yyyyyyyy yyyyyyyy
---   A known-key name. x is the Unique's Char, y is the int part. We assume that
---   all known-key uniques fit in this space. This is asserted by
---   GHC.Builtin.Utils.knownKeyNamesOkay.
---
--- During serialization we check for known-key things using isKnownKeyName.
--- During deserialization we use lookupKnownKeyName to get from the unique back
--- to its corresponding Name.
+{-
+Note [Symbol table representation of names]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For serialisation we divide Names into two classes:
+  * Compact     Names are serialised simply as their unique.
+  * Non-compact Names are entered into the Symbol Table of the interface file,
+                      and serialised as the index into that table
 
+In more detail:
+* Compact Names comprise
+  - All WiredIn Names
+  - All Names related to tuples, whether WiredIn or not.  See (ST2) below.
+
+* The key property of a compact Name is that GHC can compute the Name from
+  its Unique, via `lookupCompactName`:
+    - For most wired-in names, we look up in the `wiredInNameMap`.
+    - For names related to tuples, we use `knownUniqueTupleName`
+  Tuples aren't included in the wired-in names map: see (ST1) below
+
+* Serialisation is done by `putName`:
+  - When we serialise a compact Name,
+    we serialise it as a single 32-bit word:
+      10xxxxxx xxyyyyyy yyyyyyyy yyyyyyyy
+    where xxxx is the tag, and yyyy is the payload.
+    The function `wiredInNamesOkay` checks that the wired-in names all have
+    uniques that fit into the `yyy` field.
+
+  - When we serialise a non-compact name:
+      - We look it up in the (stateful, growing) symbol table
+      - If it not there we add it to the symbol table
+      - We serialise the occurrenc to a single 32-bit word:
+          00xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+        where `xxxxx` is an index into the symbol table.
+
+* Deserialision is done by `getName`.  We read a 32-bit word
+  - If the MSB is `10` it must be a compact name, so we use
+    `lookupCompactName` to get from the Unique to the Name.
+  - If the MSB is `00` it must be a non-compact Name,
+    so we look it up in the symbol table.
+
+Wrinkles:
+
+(ST1) There are many, many tuple types and constructors, so we don't put
+  them in the wiredInNameMap. Instead we put them in a distinct part of the
+  Unique namespace, and provide
+     knownUniqueTupleName :: Unique -> Maybe Name
+  to identify such a Unique and map it to the corresponding Name.
+  See Note [Infinite families of known-key names].
+
+(ST2) A wired-in data constructor, like (#,#) has a related, also wired-in
+  (promoted) type constructor; see `mkPromotedDataCon`.  That type constructor
+  in turn contains its `TyConRepName` (e.g. $tc'(#,#)) to support Typeable.
+
+  That `TyConRepName` is built by `mkPrelTyConRepName`, but it is /not/
+  wired-in.  Why not? Because its definition involves fingerprints etc.  (Maybe
+  it could be made wired-in, but it would tricky, and there is no point.)
+
+  Nevertheless, although it is not wired-in, it is /compact/; that is, we can
+  serialise and de-serialise it using the mechanisms above.
+
+  This idea is, however, entirely optional.  You could delete the line in
+  `isCompactName` that tests for `knownUniqueTupleName` and then the
+  TyConRepNames would be serialised as non-compact names, and everything would
+  work. Fewer tests, but Typeable-heavy code might have bigger interface files.
+-}
+
+isCompactName :: Name -> Bool
+-- See Note [Symbol table representation of names]
+isCompactName n
+  | isWiredInName n                              = True   -- This will catch tuples too!
+  | isJust (knownUniqueTupleName (nameUnique n)) = True   -- Optional: see wrinkle (ST2)
+  | otherwise                                    = False
+
+lookupCompactName :: Unique -> Name
+-- See Note [Symbol table representation of names]
+lookupCompactName u
+  | Just n <- knownUniqueTupleName u               = n    -- See wrinkle (ST1)
+  | Just n <- lookupUFM_Directly wiredInNamesMap u = n
+  | otherwise = pprPanic "lookupCompactName" (ppr u $$ char tag $$ ppr ix)
+  where
+     (tag, ix) = unpkUniqueGrimily u
 
 -- See Note [Symbol table representation of names]
 putName :: BinSymbolTable -> WriteBinHandle -> Name -> IO ()
@@ -708,24 +809,34 @@ putName BinSymbolTable{
                bin_symtab_map = symtab_map_ref,
                bin_symtab_next = symtab_next }
         bh name
-  | isKnownKeyName name
-  , let (c, u) = unpkUnique (nameUnique name) -- INVARIANT: (ord c) fits in 8 bits
+  | isCompactName name
+  , let (c, u) = unpkUniqueGrimily (nameUnique name) -- INVARIANT: (ord c) fits in 8 bits
   = -- assert (u < 2^(22 :: Int))
     put_ bh (0x80000000
              .|. (fromIntegral (ord c) `shiftL` 22)
              .|. (fromIntegral u :: Word32))
 
   | otherwise
-  = do symtab_map <- readIORef symtab_map_ref
-       case lookupUFM symtab_map name of
-         Just (off,_) -> put_ bh (fromIntegral off :: Word32)
+  = do (symtab_map,symtab_tbl) <- readIORef symtab_map_ref
+       case lookupNameEnv symtab_map name of
+         Just off -> put_ bh (fromIntegral off :: Word32)
          Nothing -> do
-            off <- readFastMutInt symtab_next
-            -- massert (off < 2^(30 :: Int))
-            writeFastMutInt symtab_next (off+1)
-            writeIORef symtab_map_ref
-                $! addToUFM symtab_map name (off,name)
-            put_ bh (fromIntegral off :: Word32)
+          off <- freshIndex
+          let mod = nameModule name
+          let mod_nms = fromMaybe [] (lookupModuleEnv symtab_tbl mod)
+
+          let !symtab_map' = extendNameEnv symtab_map name off
+          let !symtab_tbl' = extendModuleEnv symtab_tbl mod ((off,name):mod_nms)
+          writeIORef symtab_map_ref $! ( symtab_map',  symtab_tbl' )
+
+          put_ bh (fromIntegral off :: Word32)
+  where
+    freshIndex :: IO Int
+    freshIndex = do
+      off <- readFastMutInt symtab_next
+      -- massert (off < 2^(30 :: Int))
+      writeFastMutInt symtab_next (off+1)
+      return off
 
 -- See Note [Symbol table representation of names]
 getSymtabName :: SymbolTable Name
@@ -734,16 +845,10 @@ getSymtabName symtab bh = do
     i :: Word32 <- get bh
     case i .&. 0xC0000000 of
       0x00000000 -> return $! symtab ! fromIntegral i
-
-      0x80000000 ->
-        let
+      0x80000000 -> return $! lookupCompactName u
+        where
           tag = chr (fromIntegral ((i .&. 0x3FC00000) `shiftR` 22))
           ix  = fromIntegral i .&. 0x003FFFFF
-          u   = mkUnique tag ix
-        in
-          return $! case lookupKnownKeyName u of
-                      Nothing -> pprPanic "getSymtabName:unknown known-key unique"
-                                          (ppr i $$ ppr u $$ char tag $$ ppr ix)
-                      Just n  -> n
+          u   = mkUniqueGrimilyWithTag tag ix
 
       _ -> pprPanic "getSymtabName:unknown name tag" (ppr i)

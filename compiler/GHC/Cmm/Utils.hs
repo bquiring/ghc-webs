@@ -1,6 +1,3 @@
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
-
 -----------------------------------------------------------------------------
 --
 -- Cmm utilities.
@@ -16,10 +13,9 @@ module GHC.Cmm.Utils(
 
         -- CmmLit
         zeroCLit, mkIntCLit,
-        mkWordCLit, packHalfWordsCLit,
+        mkWordCLit,
         mkByteStringCLit, mkFileEmbedLit,
         mkDataLits, mkRODataLits,
-        mkStgWordCLit,
 
         -- CmmExpr
         mkIntExpr, zeroExpr,
@@ -41,10 +37,11 @@ module GHC.Cmm.Utils(
 
         baseExpr, spExpr, hpExpr, spLimExpr, hpLimExpr,
         currentTSOExpr, currentNurseryExpr, cccsExpr,
+        myCapabilityExpr,
 
         -- Tagging
         cmmTagMask, cmmPointerMask, cmmUntag, cmmIsTagged, cmmIsNotTagged,
-        cmmConstrTag1, mAX_PTR_TAG, tAG_MASK,
+        cmmConstrTag1,
 
         -- Overlap and usage
         regsOverlap, globalRegsOverlap, regUsedIn, globalRegUsedIn,
@@ -70,6 +67,7 @@ import GHC.Core.TyCon     ( PrimRep(..), PrimElemRep(..) )
 import GHC.Types.RepType  ( NvUnaryType, SlotTy (..), typePrimRepU )
 
 import GHC.Platform
+import GHC.Platform.Tag (tAG_MASK)
 import GHC.Runtime.Heap.Layout
 import GHC.Cmm
 import GHC.Cmm.BlockId
@@ -115,6 +113,9 @@ slotCmmType platform = \case
    PtrUnliftedSlot -> gcWord platform
    PtrLiftedSlot   -> gcWord platform
    WordSlot        -> bWord platform
+   Word8Slot       -> b8
+   Word16Slot      -> b16
+   Word32Slot      -> b32
    Word64Slot      -> b64
    FloatSlot       -> f32
    DoubleSlot      -> f64
@@ -161,12 +162,16 @@ typeForeignHint = primRepForeignHint . typePrimRepU
 --
 ---------------------------------------------------
 
--- XXX: should really be Integer, since Int doesn't necessarily cover
--- the full range of target Ints.
-mkIntCLit :: Platform -> Int -> CmmLit
+-- | Make a word-width 'CmmLit' for a target 'Int' value.
+-- Uses 'TargetInt' (= 'Int64') rather than host 'Int' to avoid
+-- truncation when cross-compiling from a 32-bit host to a 64-bit target.
+-- See Note [TargetInt] in GHC.Platform.
+mkIntCLit :: Platform -> TargetInt -> CmmLit
 mkIntCLit platform i = CmmInt (toInteger i) (wordWidth platform)
 
-mkIntExpr :: Platform -> Int -> CmmExpr
+-- | Make a word-width 'CmmExpr' for a target 'Int' value.
+-- See Note [TargetInt] in GHC.Platform.
+mkIntExpr :: Platform -> TargetInt -> CmmExpr
 mkIntExpr platform i = CmmLit $! mkIntCLit platform i
 
 zeroCLit :: Platform -> CmmLit
@@ -210,22 +215,6 @@ mkRODataLits lbl lits
     needsRelocation (CmmLabel _)      = True
     needsRelocation (CmmLabelOff _ _) = True
     needsRelocation _                 = False
-
-mkStgWordCLit :: Platform -> StgWord -> CmmLit
-mkStgWordCLit platform wd = CmmInt (fromStgWord wd) (wordWidth platform)
-
-packHalfWordsCLit :: Platform -> StgHalfWord -> StgHalfWord -> CmmLit
--- Make a single word literal in which the lower_half_word is
--- at the lower address, and the upper_half_word is at the
--- higher address
--- ToDo: consider using half-word lits instead
---       but be careful: that's vulnerable when reversed
-packHalfWordsCLit platform lower_half_word upper_half_word
-   = case platformByteOrder platform of
-       BigEndian    -> mkWordCLit platform ((l `shiftL` halfWordSizeInBits platform) .|. u)
-       LittleEndian -> mkWordCLit platform (l .|. (u `shiftL` halfWordSizeInBits platform))
-    where l = fromStgHalfWord lower_half_word
-          u = fromStgHalfWord upper_half_word
 
 ---------------------------------------------------
 --
@@ -294,7 +283,7 @@ cmmIndexExpr platform width base idx =
   cmmOffsetExpr platform base byte_off
   where
     idx_w = cmmExprWidth platform idx
-    byte_off = CmmMachOp (MO_Shl idx_w) [idx, mkIntExpr platform (widthInLog width)]
+    byte_off = CmmMachOp (MO_Shl idx_w) [idx, mkIntExpr platform (toTargetInt (widthInLog width))]
 
 cmmLoadIndex :: Platform -> CmmType -> CmmExpr -> Int -> CmmExpr
 cmmLoadIndex platform ty expr ix =
@@ -395,12 +384,6 @@ cmmMkAssign platform expr uq =
 --      Tagging
 --
 ---------------------------------------------------
-
-tAG_MASK :: Platform -> Int
-tAG_MASK platform = (1 `shiftL` pc_TAG_BITS (platformConstants platform)) - 1
-
-mAX_PTR_TAG :: Platform -> Int
-mAX_PTR_TAG = tAG_MASK
 
 -- Tag bits mask
 cmmTagMask, cmmPointerMask :: Platform -> CmmExpr
@@ -586,7 +569,7 @@ blockTicks b = reverse $ foldBlockNodesF goStmt b []
 -- Access to common global registers
 
 baseExpr, spExpr, hpExpr, currentTSOExpr, currentNurseryExpr,
-  spLimExpr, hpLimExpr, cccsExpr :: Platform -> CmmExpr
+  spLimExpr, hpLimExpr, cccsExpr, myCapabilityExpr :: Platform -> CmmExpr
 baseExpr           p = CmmReg $ baseReg           p
 spExpr             p = CmmReg $ spReg             p
 spLimExpr          p = CmmReg $ spLimReg          p
@@ -595,3 +578,5 @@ hpLimExpr          p = CmmReg $ hpLimReg          p
 currentTSOExpr     p = CmmReg $ currentTSOReg     p
 currentNurseryExpr p = CmmReg $ currentNurseryReg p
 cccsExpr           p = CmmReg $ cccsReg           p
+myCapabilityExpr   p =
+  cmmRegOff (baseReg p) $ negate $ pc_OFFSET_Capability_r $ platformConstants p

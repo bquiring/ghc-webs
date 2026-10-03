@@ -12,8 +12,9 @@ import GHC.Driver.Flags
 import GHC.Core
 import GHC.Core.Rules
 import GHC.Core.Ppr     ( pprCoreBindings, pprCoreExpr )
-import GHC.Core.Opt.OccurAnal ( occurAnalysePgm, occurAnalyseExpr )
+import GHC.Core.Opt.OccurAnal ( OccurAnalOpts(..), occurAnalysePgm, occurAnalyseExpr )
 import GHC.Core.Stats   ( coreBindsSize, coreBindsStats, exprSize )
+import GHC.Core.FVs     ( exprFreeVars )
 import GHC.Core.Utils   ( mkTicks, stripTicksTop )
 import GHC.Core.Lint    ( LintPassResultConfig, dumpPassResult, lintPassResult )
 import GHC.Core.Opt.Simplify.Iteration ( simplTopBinds, simplExpr, simplImpRules )
@@ -35,7 +36,7 @@ import GHC.Unit.Module.ModGuts
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Basic
+import GHC.Types.InlinePragma
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Tickish
@@ -65,15 +66,19 @@ simplifyExpr :: Logger
              -> SimplifyExprOpts
              -> CoreExpr
              -> IO CoreExpr
--- simplifyExpr is called by the driver to simplify an
--- expression typed in at the interactive prompt
+-- ^ Simplify an expression using 'simplExprGently'.
+--
+-- See 'simplExprGently' for details.
 simplifyExpr logger euc opts expr
   = withTiming logger (text "Simplify [expr]") (const ()) $
     do  { eps <- eucEPS euc ;
         ; let fam_envs = ( eps_fam_inst_env eps
                          , extendFamInstEnvList emptyFamInstEnv $ se_fam_inst opts
                          )
-              simpl_env = mkSimplEnv (se_mode opts) fam_envs
+              -- See Note [Seed the in-scope set for open expressions]
+              simpl_env = setInScopeSet base_env
+                            (getInScope base_env `extendInScopeSetSet` exprFreeVars expr)
+              base_env  = mkSimplEnv (se_mode opts) fam_envs
               top_env_cfg = se_top_env_cfg opts
               read_eps_rules = eps_rule_base <$> eucEPS euc
               read_ruleenv = updExternalPackageRules emptyRuleEnv <$> read_eps_rules
@@ -93,24 +98,61 @@ simplifyExpr logger euc opts expr
         ; return expr'
         }
 
+{- Note [Seed the in-scope set for open expressions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An invariant of the Simplifier is that the in-scope set contains all the free
+variables of the expression being simplified.  Why?  So that the Simplifier
+never invents a "fresh" binder that accidentally captures one of those free
+variables.
+
+'simplifyExpr' establishes that invariant by initialising the in-scope set with
+the free variables of the expression it is given.  For a closed expression this
+adds nothing.
+
+But how can 'simplifyExpr' be handed an /open/ expression in the first place?
+The whole-module pipeline never does so: 'simplifyPgm' only ever simplifies
+closed bindings.  The one caller that can is 'hscCompileCoreExpr' (in
+GHC.Driver.Main.Passes), which compiles a single Core expression, and is itself
+reached from just two places:
+
+  * GHCi, for an expression typed at the prompt, and in particular in the
+    debugger (see below);
+  * Template Haskell, when running a splice (see GHC.Tc.Gen.Splice).
+
+So this is never on the critical path for mainstream compilation.
+
+Here is how the debugger hands us an open expression (test break006).  We are
+stopped at a breakpoint in
+    mymap f (x:xs) = f x : ...
+where the debugger knows that 'x :: Int' but not yet the result type of 'f'.  So
+it invents a RuntimeUnk skolem 'a' and gives 'f :: Int -> a'.  The user then
+types
+    let y = f x
+GHCi type-checks that and, to hand the result back to the interpreter (see
+GHC.Tc.Module.tcGhciStmts), wraps it as
+    returnIO @[Any] [unsafeCoerce# @LiftedRep @LiftedRep @a @Any y]
+in which the skolem 'a' is free.
+
+When the Simplifier instantiates that 'unsafeCoerce#', it builds a substitution
+mapping unsafeCoerce#'s quantified type variables to (LiftedRep, LiftedRep, a,
+Any), whose range therefore mentions 'a'.  The in-scope set of a substitution
+must contain the free variables of its range (see Note [The substitution
+invariant] in GHC.Core.TyCo.Subst).  Without the seeding above that invariant is
+broken, and in a compiler built with assertions substTy's sanity check fails
+(#17833, and its duplicate #21118). -}
+
 simplExprGently :: SimplEnv -> CoreExpr -> SimplM CoreExpr
--- Simplifies an expression
---      does occurrence analysis, then simplification
---      and repeats (twice currently) because one pass
---      alone leaves tons of crud.
--- Used (a) for user expressions typed in at the interactive prompt
---      (b) the LHS and RHS of a RULE
---      (c) Template Haskell splices
+-- ^ Simplifies an expression by doing occurrence analysis, then simplification,
+-- and repeating (twice currently), because one pass alone leaves tons of crud.
+--
+-- Used only:
+--
+--   1. for user expressions typed in at the interactive prompt (see 'GHC.Driver.Main.hscStmt'),
+--   2. for Template Haskell splices (see 'GHC.Tc.Gen.Splice.runMeta').
 --
 -- The name 'Gently' suggests that the SimplMode is InitialPhase,
--- and in fact that is so.... but the 'Gently' in simplExprGently doesn't
--- enforce that; it just simplifies the expression twice
-
--- It's important that simplExprGently does eta reduction; see
--- Note [Simplify rule LHS] above.  The
--- simplifier does indeed do eta reduction (it's in GHC.Core.Opt.Simplify.completeLam)
--- but only if -O is on.
-
+-- and in fact that is so.... but the 'Gently' in 'simplExprGently' doesn't
+-- enforce that; it just simplifies the expression twice.
 simplExprGently env expr = do
     expr1 <- simplExpr env (occurAnalyseExpr expr)
     simplExpr env (occurAnalyseExpr expr1)
@@ -210,8 +252,15 @@ simplifyPgm logger unit_env name_ppr_ctx opts
       = do {
                 -- Occurrence analysis
            let { tagged_binds = {-# SCC "OccAnal" #-}
-                     occurAnalysePgm this_mod active_unf active_rule
-                                     local_rules binds
+                     occurAnalysePgm
+                       this_mod
+                       OccurAnalOpts
+                         { oa_active_unf = active_unf
+                         , oa_active_rule = active_rule
+                         , oa_can_drop = const True
+                         }
+                       local_rules
+                       binds
                } ;
            Logger.putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
                      FormatCore

@@ -42,7 +42,7 @@ import GHC.Core.TyCo.Tidy
 import GHC.Core.TyCo.FVs
 import GHC.Core.Class
 import GHC.Core.Predicate( scopedSort )
-import GHC.Core.Multiplicity( pprArrowWithMultiplicity )
+import GHC.Core.Multiplicity( pprArrowWithModifiers )
 
 import GHC.Types.Var
 
@@ -53,6 +53,8 @@ import GHC.Types.Var.Env
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+
+import GHC.Base ( Multiplicity(..) )
 import GHC.Types.Basic ( PprPrec(..), topPrec, sigPrec, opPrec
                        , funPrec, appPrec, maybeParen )
 
@@ -130,8 +132,14 @@ tidyToIfaceTypeX env ty = toIfaceTypeX (mkVarSet free_tcvs) (tidyType env' ty)
 
 ------------
 pprCo, pprParendCo :: Coercion -> SDoc
-pprCo       co = getPprStyle $ \ sty -> pprIfaceCoercion (tidyToIfaceCoSty co sty)
-pprParendCo co = getPprStyle $ \ sty -> pprParendIfaceCoercion (tidyToIfaceCoSty co sty)
+-- Print a coercion without its type
+-- Honour -dsuppress-coercions
+pprCo       co = sdocOption sdocSuppressCoercions $ \case
+                 True  -> angleBrackets (text "Co:" <> int (coercionSize co))
+                 False -> getPprStyle $ \ sty -> pprIfaceCoercion (tidyToIfaceCoSty co sty)
+pprParendCo co = sdocOption sdocSuppressCoercions $ \case
+                 True  -> angleBrackets (text "Co:" <> int (coercionSize co))
+                 False -> getPprStyle $ \ sty -> pprParendIfaceCoercion (tidyToIfaceCoSty co sty)
 
 tidyToIfaceCoSty :: Coercion -> PprStyle -> IfaceCoercion
 tidyToIfaceCoSty co sty
@@ -241,11 +249,10 @@ debug_ppr_ty prec (FunTy { ft_af = af, ft_mult = mult, ft_arg = arg, ft_res = re
   = maybeParen prec funPrec $
     sep [debug_ppr_ty funPrec arg, arr <+> debug_ppr_ty prec res]
   where
-    arr = pprArrowWithMultiplicity af $
-          case mult of
-            OneTy  -> Left True
-            ManyTy -> Left False
-            _      -> Right (debug_ppr_ty appPrec mult)
+    arr = case mult of
+      OneTy  -> pprArrowWithModifiers [] af One
+      ManyTy -> pprArrowWithModifiers [] af Many
+      _      -> pprArrowWithModifiers [debug_ppr_ty appPrec mult] af Many
 
 debug_ppr_ty prec (TyConApp tc tys)
   | null tys  = ppr tc
@@ -343,8 +350,10 @@ pprTypeApp tc tys
 pprWithInvisibleBitsWhen :: Bool -> SDoc -> SDoc
 pprWithInvisibleBitsWhen b
   = updSDocContext $ \ctx ->
-      if b then ctx { sdocPrintExplicitKinds   = True
+      if b then ctx { sdocPrintExplicitKinds       = True
                     , sdocPrintExplicitRuntimeReps = True }
+  -- NB: not turning on LinearTypes by default here.
+  -- See pprWithInvisibleBits, which can enable LinearTypes for pretty-printing.
            else ctx
 
 -- | This variant preserves any use of TYPE in a type, effectively
@@ -361,7 +370,7 @@ pprWithTYPE ty = updSDocContext (\ctx -> ctx { sdocPrintExplicitRuntimeReps = Tr
 -- In that case we want to print @T [a]@, where @T@ is the family 'TyCon'
 pprSourceTyCon :: TyCon -> SDoc
 pprSourceTyCon tycon
-  | Just (fam_tc, tys) <- tyConFamInst_maybe tycon
+  | Just (fam_tc, tys) <- tyConDataFamInst_maybe tycon
   = ppr $ fam_tc `TyConApp` tys        -- can't be FunTyCon
   | otherwise
   = ppr tycon

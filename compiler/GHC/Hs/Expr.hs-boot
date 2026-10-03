@@ -1,7 +1,3 @@
-{-# LANGUAGE RoleAnnotations #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
 
@@ -19,8 +15,11 @@ import Language.Haskell.Syntax.Expr
   , GRHSs
   , HsUntypedSplice
   , HsTypedSplice
+  , HsMatchContext
+  , HsStmtContext
   )
-import GHC.Hs.Extension ( OutputableBndrId, GhcPass )
+import Language.Haskell.Syntax.Extension (LIdP)
+import GHC.Hs.Extension ( OutputableBndrId, GhcPass, GhcRn)
 import GHC.Types.Name   ( Name )
 import Data.Bool  ( Bool )
 import Data.Maybe ( Maybe )
@@ -52,3 +51,8 @@ data HsUntypedSpliceResult thing
       , utsplice_result            :: thing
       }
   | HsUntypedSpliceNested SplicePointName
+
+type HsMatchContextRn = HsMatchContext (LIdP GhcRn)
+type HsStmtContextRn = HsStmtContext (LIdP GhcRn)
+
+data HoleKind

@@ -1,6 +1,6 @@
 cabal-version:  2.2
 name:           ghc-prim
-version:        0.13.1
+version:        0.14.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD-3-Clause
 license-file:   LICENSE
@@ -25,6 +25,10 @@ Library
     default-language: Haskell2010
 
     build-depends: ghc-internal
+
+    ghc-options: -frebindable-known-names
+         -- Do not create dependencies on GHC.Essentials!
+         -- It doesn't exist yet.
 
     other-modules:
       -- dummy module to make Hadrian/GHC build a valid library...

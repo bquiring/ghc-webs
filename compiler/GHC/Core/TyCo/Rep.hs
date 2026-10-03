@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-
 {-# OPTIONS_HADDOCK not-home #-}
 
 {-
@@ -17,7 +15,7 @@ Note [The Type-related module hierarchy]
   GHC.Core.TyCo.FVs        imports GHC.Core.TyCo.Rep
   GHC.Core.TyCo.Subst      imports GHC.Core.TyCo.{Rep, FVs, Ppr}
   GHC.Core.TyCo.Tidy       imports GHC.Core.TyCo.{Rep, FVs}
-  GHC.Builtin.Types.Prim   imports GHC.Core.TyCo.Rep ( including mkTyConTy )
+  GHC.Builtin.WiredIn.Prim imports GHC.Core.TyCo.Rep ( including mkTyConTy )
   GHC.Core.Coercion        imports GHC.Core.Type
 -}
 
@@ -37,9 +35,14 @@ module GHC.Core.TyCo.Rep (
         -- * Coercions
         Coercion(..), CoSel(..), FunSel(..),
         UnivCoProvenance(..),
-        CoercionHole(..), coHoleCoVar, setCoHoleCoVar,
+        CoercionHole(..), CoercionPlusHoles(..), coHoleCoVar, setCoHoleCoVar,
         CoercionN, CoercionR, CoercionP, KindCoercion,
-        MCoercion(..), MCoercionR, MCoercionN,
+        MCoercion(..), MCoercionR, MCoercionN, KindMCoercion,
+
+        -- CoHoleSet
+        --   CoHoleSet(..) is exported concretely only for zonkCoHoleSet
+        CoHoleSet(..), emptyCoHoleSet, isEmptyCoHoleSet, elemCoHoleSet,
+        addRewriter, unitCoHoleSet, unionCoHoleSet, delCoHoleSet,
 
         -- * Functions over types
         mkNakedTyConTy, mkTyVarTy, mkTyVarTys,
@@ -69,7 +72,7 @@ module GHC.Core.TyCo.Rep (
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprType, pprCo, pprTyLit )
-import {-# SOURCE #-} GHC.Builtin.Types
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
 import {-# SOURCE #-} GHC.Core.TyCo.FVs( tyCoVarsOfType ) -- Use in assertions
 import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstraint )
 
@@ -78,11 +81,12 @@ import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstr
 -- friends:
 import GHC.Types.Var
 import GHC.Types.Var.Set( elemVarSet )
+import GHC.Types.Unique.Set
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 
 -- others
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 
 import GHC.Types.Basic ( LeftOrRight(..), pickLR )
 import GHC.Utils.Outputable
@@ -93,6 +97,7 @@ import GHC.Utils.Binary
 
 -- libraries
 import qualified Data.Data as Data hiding ( TyCon )
+import Data.Coerce
 import Data.IORef ( IORef )   -- for CoercionHole
 import Control.DeepSeq
 
@@ -529,6 +534,13 @@ looks like
 Note that we must cast `a` by a cv bound in the same type in order to
 make this work out.
 
+Notice that the corresponding /term/ looks like (Lam a expr):
+  * If `a` is a type variable, that lambda has no runtime significance;
+    it is erased
+  * If `a` is a coercion variable, we pass a (zero-width) runtime argument;
+    it is not erased
+The relevant predicate on the binder is `isRuntimeVar`.
+
 See also https://gitlab.haskell.org/ghc/ghc/-/wikis/dependent-haskell/phase2
 which gives a general road map that covers this space.  Having this feature in
 Core does *not* mean we have it in source Haskell.  See #15710 about that.
@@ -656,7 +668,7 @@ represented by evidence of type p.
 %*                                                                      *
 %************************************************************************
 
-These functions are here so that they can be used by GHC.Builtin.Types.Prim,
+These functions are here so that they can be used by GHC.Builtin.WiredIn.Prim,
 which in turn is imported by Type
 -}
 
@@ -680,7 +692,7 @@ mkTyCoVarTys = map mkTyCoVarTy
 infixr 3 `mkFunTy`, `mkInvisFunTy`, `mkVisFunTyMany`
 
 mkNakedFunTy :: FunTyFlag -> Kind -> Kind -> Kind
--- See Note [Naked FunTy] in GHC.Builtin.Types
+-- See Note [Naked FunTy] in GHC.Builtin.WiredIn.Types
 -- Always Many multiplicity; kinds have no linearity
 mkNakedFunTy af arg res
  =  FunTy { ft_af   = af, ft_mult = manyDataConTy
@@ -806,6 +818,34 @@ tcMkScaledFunTy (Scaled mult arg) res = tcMkVisFunTy mult arg res
 %************************************************************************
 -}
 
+type CoercionN = Coercion       -- always Nominal
+type CoercionR = Coercion       -- always Representational
+type CoercionP = Coercion       -- always Phantom
+
+type MCoercionN = MCoercion     -- alwyas Nominal
+type MCoercionR = MCoercion     -- always Representational
+
+{- Note [KindCoercion]
+~~~~~~~~~~~~~~~~~~~~~~
+A KindCoercion  kco :: k1 ~r k2  is a Coercion with these properties:
+   (a) It is Nominal; that is r=Nominal
+   (b) Both (k1::Type) and (k2::Type); it is homogeneous
+
+The coercion in (a) ForAllCo and (b) CastTy is a KindCoercion.
+
+The invariants of KindCoercion allow `isReflKindCo` to elminate GRefl,
+whereas isReflCo cannot.  In particular, consider a KindCoercion
+     kco = GRefl r k (MCo kk)) :: k ~ (k |> kk)
+Since `kco`is a KindCoercion, we know that
+     r = Nominal
+     k :: Type  and   (k |> kk) :: Type
+Hence kk must be Refl. And hence kco = GRefl N k MRefl, which is
+the same as Refl.  See `isReflKindCo`.
+-}
+
+type KindCoercion  = CoercionN    -- See Note [KindCoercion]
+type KindMCoercion = MCoercionN   -- See Note [KindCoercion]
+
 -- | A 'Coercion' is concrete evidence of the equality/convertibility
 -- of two types.
 
@@ -829,7 +869,7 @@ data Coercion
 
   -- GRefl :: "e" -> _ -> Maybe N -> e
   -- See Note [Generalized reflexive coercion]
-  | GRefl Role Type MCoercionN  -- See Note [Refl invariant]
+  | GRefl Role Type KindMCoercion  -- See Note [Refl invariant]
           -- Use (Refl ty), not (GRefl Nominal ty MRefl)
           -- Use (GRefl Representational _ _), not (SubCo (GRefl Nominal _ _))
 
@@ -853,7 +893,7 @@ data Coercion
       , fco_visL :: !ForAllTyFlag -- Visibility of coercionLKind
       , fco_visR :: !ForAllTyFlag -- Visibility of coercionRKind
                                   -- See (FC7) of Note [ForAllCo]
-      , fco_kind :: KindCoercion
+      , fco_kind :: KindMCoercion -- See (FC8) of Note [ForAllCo]
       , fco_body :: Coercion }
          -- ForAllCo :: _ -> N -> e -> e
 
@@ -911,6 +951,15 @@ data Coercion
                                      -- Only present during typechecking
   deriving Data.Data
 
+-- | A semantically more meaningful type to represent what may or may not be a
+-- useful 'Coercion'.
+data MCoercion
+  = MRefl
+    -- A trivial Reflexivity coercion
+  | MCo Coercion
+    -- Other coercions
+  deriving Data.Data
+
 data CoSel  -- See Note [SelCo]
   = SelTyCon Int Role  -- Decomposes (T co1 ... con); zero-indexed
                        -- Invariant: Given: SelCo (SelTyCon i r) co
@@ -932,11 +981,6 @@ data FunSel  -- See Note [SelCo]
   | SelRes   -- Result of function
   deriving( Eq, Data.Data, Ord )
 
-type CoercionN = Coercion       -- always nominal
-type CoercionR = Coercion       -- always representational
-type CoercionP = Coercion       -- always phantom
-type KindCoercion = CoercionN   -- always nominal
-
 instance Outputable Coercion where
   ppr = pprCo
 
@@ -944,7 +988,6 @@ instance Outputable CoSel where
   ppr (SelTyCon n r) = text "Tc" <> parens (int n <> comma <> pprOneCharRole r)
   ppr SelForAll      = text "All"
   ppr (SelFun fs)    = text "Fun" <> parens (ppr fs)
-
 
 pprOneCharRole :: Role -> SDoc
 pprOneCharRole Nominal          = char 'N'
@@ -980,17 +1023,6 @@ instance NFData CoSel where
   rnf (SelTyCon n r) = rnf n `seq` rnf r `seq` ()
   rnf SelForAll      = ()
   rnf (SelFun fs)    = rnf fs `seq` ()
-
--- | A semantically more meaningful type to represent what may or may not be a
--- useful 'Coercion'.
-data MCoercion
-  = MRefl
-    -- A trivial Reflexivity coercion
-  | MCo Coercion
-    -- Other coercions
-  deriving Data.Data
-type MCoercionR = MCoercion
-type MCoercionN = MCoercion
 
 instance Outputable MCoercion where
   ppr MRefl    = text "MRefl"
@@ -1059,19 +1091,21 @@ The Coercion form SelCo allows us to decompose a structural coercion, one
 between ForallTys, or TyConApps, or FunTys.
 
 There are three forms, split by the CoSel field inside the SelCo:
-SelTyCon, SelForAll, and SelFun.
+SelTyCon, SelForAll, and SelFun.  The typing rules below are directly
+checked by the SelCo case of GHC.Core.Lint.lintCoercion.
 
 * SelTyCon:
 
-      co : (T s1..sn) ~r0 (T t1..tn)
-      T is a data type, not a newtype, nor an arrow type
-      r = tyConRole tc r0 i
+      co : (T s1..sn) ~r (T t1..tn)
+      T is not a saturated FunTyCon (use SelFun for that)
+      T is injective at role r
+      ri = tyConRole tc r i
       i < n    (i is zero-indexed)
       ----------------------------------
-      SelCo (SelTyCon i r) co : si ~r ti
+      SelCo (SelTyCon i ri) co : si ~ri ti
 
-  "Not a newtype": see Note [SelCo and newtypes]
-  "Not an arrow type": see SelFun below
+  "Injective at role r": see Note [SelCo and newtypes]
+  "Not saturated FunTyCon": see SelFun below
 
    See Note [SelCo Cached Roles]
 
@@ -1277,6 +1311,14 @@ Several things to note here
          fco_visL = fco_visR = coreTyLamForAllTyFlag
   c.f. (FT2) in Note [ForAllTy]
 
+(FC8) We /represent/ a ForAllCo { fco_tcv = tcv, fco_kind = kmco } as follows:
+      * The tcv::TyCoVar has a kind (like any Var), say tcv::ki
+      * The kind-coercion `kmco` is a KindMCoercion:
+        - If kmco = MRefl, then the coercion in the typing rule is (Refl ki)
+        - If kmco = MCo kco, then the coercion in the typing rule is `co`,
+                             /and/ ki = coercionLKind kco
+      So in the common MRefl case, the kind of `tcv` plays a useful role.
+
 Note [Predicate coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have
@@ -1440,6 +1482,10 @@ SelCo, we'll get out a representational coercion. That is:
 
 Yikes! Clearly, this is terrible. The solution is simple: forbid
 SelCo to be used on newtypes if the internal coercion is representational.
+More specifically, we use isInjectiveTyCon to determine whether
+T is injective at role r:
+* Newtypes and datatypes are both injective at Nominal role, but
+* Newtypes are not injective at Representational role
 See the SelCo equation for GHC.Core.Lint.lintCoercion.
 
 This is not just some corner case discovered by a segfault somewhere;
@@ -1531,13 +1577,23 @@ data UnivCoProvenance
       -- ^ From a plugin, which asserts that this coercion is sound.
       --   The string and the variable set are for the use by the plugin.
 
+  | SubMultProv -- ^ A submultiplicity coercion
+
+  | CanonicalProv
+      -- ^ Used to coerce a type to the canonical type of its runtime
+      -- representation.
+      --
+      -- See Note [The canonical type of a RuntimeRep] in GHC.Core.Make.Box.
+
   deriving (Eq, Ord, Data.Data)
   -- Why Ord?  See Note [Ord instance of IfaceType] in GHC.Iface.Type
 
 instance Outputable UnivCoProvenance where
-  ppr PhantomProv      = text "(phantom)"
-  ppr ProofIrrelProv   = text "(proof irrel)"
-  ppr (PluginProv str) = parens (text "plugin" <+> brackets (text str))
+  ppr PhantomProv          = text "(phantom)"
+  ppr (ProofIrrelProv {})  = text "(proof irrel)"
+  ppr (PluginProv str)     = parens (text "plugin" <+> brackets (text str))
+  ppr SubMultProv          = text "(sub-mult)"
+  ppr CanonicalProv        = text "(canonical)"
 
 instance NFData UnivCoProvenance where
   rnf p = p `seq` ()
@@ -1546,6 +1602,8 @@ instance Binary UnivCoProvenance where
   put_ bh PhantomProv    = putByte bh 1
   put_ bh ProofIrrelProv = putByte bh 2
   put_ bh (PluginProv a) = putByte bh 3 >> put_ bh a
+  put_ bh SubMultProv    = putByte bh 4
+  put_ bh CanonicalProv  = putByte bh 5
   get bh = do
       tag <- getByte bh
       case tag of
@@ -1553,8 +1611,9 @@ instance Binary UnivCoProvenance where
            2 -> return ProofIrrelProv
            3 -> do a <- get bh
                    return $ PluginProv a
+           4 -> return SubMultProv
+           5 -> return CanonicalProv
            _ -> panic ("get UnivCoProvenance " ++ show tag)
-
 
 {- Note [Phantom coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1596,7 +1655,7 @@ Here,
   co3 = UnivCo ProofIrrelProv Nominal (CoercionTy co1) (CoercionTy co2) [co5]
   where
     co5 :: (a1 ~# Bool) ~# (a2 ~# Bool)
-    co5 = TyConAppCo Nominal (~#) [<Consraint#>, <Constraint#>, co4, <Bool>]
+    co5 = TyConAppCo Nominal (~#) [<Constraint#>, <Constraint#>, co4, <Bool>]
 
 
 Note [The importance of tracking UnivCo dependencies]
@@ -1638,17 +1697,22 @@ holes `HoleCo`, which get filled in later.
 
 {- **********************************************************************
 %*                                                                      *
-                Coercion holes
+                Coercion holes and CoHoleSets
 %*                                                                      *
 %********************************************************************* -}
 
 -- | A coercion to be filled in by the type-checker. See Note [Coercion holes]
 data CoercionHole
-  = CoercionHole { ch_co_var  :: CoVar
-                       -- See Note [CoercionHoles and coercion free variables]
+  = CH { ch_co_var  :: CoVar  -- See Note [Coercion holes] wrinkle (COH2)
+       , ch_ref :: IORef (Maybe CoercionPlusHoles)
+       }
 
-                 , ch_ref :: IORef (Maybe Coercion)
-                 }
+data CoercionPlusHoles
+  = CPH { cph_co    :: Coercion
+        , cph_holes :: CoHoleSet }
+   -- INVARIANT: `cph_holes` is (possibly a superset of)
+    --          the free coercion holes of `cph_co`
+   -- See (COH5) in Note [Coercion holes]
 
 coHoleCoVar :: CoercionHole -> CoVar
 coHoleCoVar = ch_co_var
@@ -1663,10 +1727,44 @@ instance Data.Data CoercionHole where
   dataTypeOf _ = mkNoRepType "CoercionHole"
 
 instance Outputable CoercionHole where
-  ppr (CoercionHole { ch_co_var = cv }) = braces (ppr cv)
+  ppr (CH { ch_co_var = cv }) = braces (ppr cv)
+
+instance Outputable CoercionPlusHoles where
+  ppr (CPH { cph_co = co, cph_holes = holes })
+     = text "CPH" <> braces (sep $ punctuate comma
+                       [ text "cph_co =" <+> ppr co
+                       , text "cph_holes =" <+> ppr holes ])
 
 instance Uniquable CoercionHole where
-  getUnique (CoercionHole { ch_co_var = cv }) = getUnique cv
+  getUnique (CH { ch_co_var = cv }) = getUnique cv
+
+
+-- | A CoHoleSet stores a set of CoercionHoles that have been used to rewrite
+-- a constraint.  See Note [Wanteds rewrite Wanteds: rewriter-sets]
+-- in GHC.Tc.Types.Constraint
+newtype CoHoleSet = CoHoleSet (UniqSet CoercionHole)
+  deriving newtype (Outputable, Semigroup, Monoid)
+
+emptyCoHoleSet :: CoHoleSet
+emptyCoHoleSet = CoHoleSet emptyUniqSet
+
+unitCoHoleSet :: CoercionHole -> CoHoleSet
+unitCoHoleSet = coerce (unitUniqSet @CoercionHole)
+
+elemCoHoleSet :: CoercionHole -> CoHoleSet -> Bool
+elemCoHoleSet = coerce (elementOfUniqSet @CoercionHole)
+
+delCoHoleSet :: CoHoleSet -> CoercionHole -> CoHoleSet
+delCoHoleSet = coerce (delOneFromUniqSet @CoercionHole)
+
+unionCoHoleSet :: CoHoleSet -> CoHoleSet -> CoHoleSet
+unionCoHoleSet = coerce (unionUniqSets @CoercionHole)
+
+isEmptyCoHoleSet :: CoHoleSet -> Bool
+isEmptyCoHoleSet = coerce (isEmptyUniqSet @CoercionHole)
+
+addRewriter :: CoHoleSet -> CoercionHole -> CoHoleSet
+addRewriter = coerce (addOneToUniqSet @CoercionHole)
 
 {- Note [Coercion holes]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1679,7 +1777,7 @@ During typechecking, constraint solving for type classes works by
     which actually binds d7 to the (Num a) evidence
 
 For equality constraints we use a different strategy.  See Note [The
-equality types story] in GHC.Builtin.Types.Prim for background on equality constraints.
+equality types story] in GHC.Builtin.WiredIn.Prim for background on equality constraints.
   - For /boxed/ equality constraints, (t1 ~N t2) and (t1 ~R t2), it's just
     like type classes above. (Indeed, boxed equality constraints *are* classes.)
   - But for /unboxed/ equality constraints (t1 ~R# t2) and (t1 ~N# t2)
@@ -1715,34 +1813,34 @@ the evidence for unboxed equalities:
     always inline types and coercions at every use site and drop the
     binding.
 
-Other notes about HoleCo:
+Other notes about CoercionHole and HoleCo:
 
- * INVARIANT: CoercionHole and HoleCo are used only during type checking,
+(COH1) INVARIANT: CoercionHole and HoleCo are used only during type checking,
    and should never appear in Core. Just like unification variables; a Type
    can contain a TcTyVar, but only during type checking. If, one day, we
    use type-level information to separate out forms that can appear during
    type-checking vs forms that can appear in core proper, holes in Core will
    be ruled out.
 
- * See Note [CoercionHoles and coercion free variables]
+(COH2)  Why does a CoercionHole contain a CoVar, as well as reference to fill in?
+  * It really helps for debug pretty-printing.
+  * It carries a type which makes `coercionKind` and `coercionRole` work
+  * It has a Unique, which gives the hole an identity; see calls to `ctEvEvId`
 
- * Coercion holes can be compared for equality like other coercions:
-   by looking at the types coerced.
+(COH3) See Note [CoercionHoles and coercion free variables] in GHC.Core.TyCo.FVs
 
+(COH4) Coercion holes can be compared for equality like other coercions:
+       by looking at the types coerced.
 
-Note [CoercionHoles and coercion free variables]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Why does a CoercionHole contain a CoVar, as well as reference to
-fill in?  Because we want to treat that CoVar as a free variable of
-the coercion.  See #14584, and Note [What prevents a
-constraint from floating] in GHC.Tc.Solver, item (4):
+(COH5) A /filled-in/ CoercionHole stores a CoercionPlusHoles, a pair that contains
+       a coercion paired with the free coercion holes of that coercion.
+       Why pair it up?  Because the coercion can be gigantic, if it was made
+       by doing lots of type-family reductions.  The rewriter, which generates
+       such coercions, is careful to collect the CoHoleSet that was used in
+       rewriting, and we are careful to preserve that info in CoercionPlusHoles.
 
-        forall k. [W] co1 :: t1 ~# t2 |> co2
-                  [W] co2 :: k ~# *
-
-Here co2 is a CoercionHole. But we /must/ know that it is free in
-co1, because that's all that stops it floating outside the
-implication.
+       See also Note [Wanteds rewrite Wanteds: rewriter-sets]
+       esp (WRW6), in GHC.Tc.Types.Constraint
 -}
 
 
@@ -1866,77 +1964,80 @@ But don't do that for two reasons (see #24591)
   `dVarSetElems` so I have used `foldr`.
 -}
 
-data TyCoFolder env a
+data TyCoFolder a
   = TyCoFolder
       { tcf_view  :: Type -> Maybe Type   -- Optional "view" function
                                           -- E.g. expand synonyms
-      , tcf_tyvar :: env -> TyVar -> a    -- Does not automatically recur
-      , tcf_covar :: env -> CoVar -> a    -- into kinds of variables
-      , tcf_hole  :: env -> CoercionHole -> a
+      , tcf_tyvar :: TyVar -> a    -- Does not automatically recur
+      , tcf_covar :: CoVar -> a    -- into kinds of variables
+      , tcf_hole  :: CoercionHole -> a
           -- ^ What to do with coercion holes.
           -- See Note [Coercion holes] in "GHC.Core.TyCo.Rep".
 
-      , tcf_tycobinder :: env -> TyCoVar -> ForAllTyFlag -> env
+      , tcf_tycobinder :: TyCoVar -> a -> a
           -- ^ The returned env is used in the extended scope
       }
 
 {-# INLINE foldTyCo  #-}  -- See Note [Specialising foldType]
-foldTyCo :: Monoid a => TyCoFolder env a -> env
+foldTyCo :: Monoid a => TyCoFolder a
          -> (Type -> a, [Type] -> a, Coercion -> a, [Coercion] -> a)
 foldTyCo (TyCoFolder { tcf_view       = view
                      , tcf_tyvar      = tyvar
                      , tcf_tycobinder = tycobinder
                      , tcf_covar      = covar
-                     , tcf_hole       = cohole }) env
-  = (go_ty env, go_tys env, go_co env, go_cos env)
+                     , tcf_hole       = cohole })
+  = (go_ty, go_tys, go_co, go_cos)
   where
-    go_ty env ty | Just ty' <- view ty = go_ty env ty'
-    go_ty env (TyVarTy tv)      = tyvar env tv
-    go_ty env (AppTy t1 t2)     = go_ty env t1 `mappend` go_ty env t2
-    go_ty _   (LitTy {})        = mempty
-    go_ty env (CastTy ty co)    = go_ty env ty `mappend` go_co env co
-    go_ty env (CoercionTy co)   = go_co env co
-    go_ty env (FunTy _ w arg res) = go_ty env w `mappend` go_ty env arg `mappend` go_ty env res
-    go_ty env (TyConApp _ tys)  = go_tys env tys
-    go_ty env (ForAllTy (Bndr tv vis) inner)
-      = let !env' = tycobinder env tv vis  -- Avoid building a thunk here
-        in go_ty env (varType tv) `mappend` go_ty env' inner
+    go_ty ty | Just ty' <- view ty = go_ty ty'
+    go_ty (TyVarTy tv)        = tyvar tv
+    go_ty (AppTy t1 t2)       = go_ty t1 `mappend` go_ty t2
+    go_ty (LitTy {})          = mempty
+    go_ty (CastTy ty co)      = go_ty ty `mappend` go_co co
+    go_ty (CoercionTy co)     = go_co co
+    go_ty (FunTy _ w arg res) = go_ty arg `mappend` go_ty w `mappend` go_ty res
+                                -- As per #23764, ordering is [arg, w, res]
+
+    go_ty (TyConApp _ tys)  = go_tys tys
+    go_ty (ForAllTy (Bndr tv _) inner)
+      = go_ty (varType tv) `mappend` tycobinder tv (go_ty inner)
 
     -- See Note [Use explicit recursion in foldTyCo]
-    go_tys _   []     = mempty
-    go_tys env (t:ts) = go_ty env t `mappend` go_tys env ts
+    go_tys []     = mempty
+    go_tys (t:ts) = go_ty t `mappend` go_tys ts
 
     -- See Note [Use explicit recursion in foldTyCo]
-    go_cos _   []     = mempty
-    go_cos env (c:cs) = go_co env c `mappend` go_cos env cs
+    go_cos []     = mempty
+    go_cos (c:cs) = go_co c `mappend` go_cos cs
 
-    go_co env (Refl ty)                = go_ty env ty
-    go_co env (GRefl _ ty MRefl)       = go_ty env ty
-    go_co env (GRefl _ ty (MCo co))    = go_ty env ty `mappend` go_co env co
-    go_co env (TyConAppCo _ _ args)    = go_cos env args
-    go_co env (AppCo c1 c2)            = go_co env c1 `mappend` go_co env c2
-    go_co env (CoVarCo cv)             = covar env cv
-    go_co env (AxiomCo _ cos)          = go_cos env cos
-    go_co env (HoleCo hole)            = cohole env hole
-    go_co env (UnivCo { uco_lty = t1, uco_rty = t2, uco_deps = deps })
-                                       = go_ty env t1 `mappend` go_ty env t2
-                                         `mappend` go_cos env deps
-    go_co env (SymCo co)               = go_co env co
-    go_co env (TransCo c1 c2)          = go_co env c1 `mappend` go_co env c2
-    go_co env (SelCo _ co)             = go_co env co
-    go_co env (LRCo _ co)              = go_co env co
-    go_co env (InstCo co arg)          = go_co env co `mappend` go_co env arg
-    go_co env (KindCo co)              = go_co env co
-    go_co env (SubCo co)               = go_co env co
+    go_co (Refl ty)                = go_ty ty
+    go_co (GRefl _ ty MRefl)       = go_ty ty
+    go_co (GRefl _ ty (MCo co))    = go_ty ty `mappend` go_co co
+    go_co (TyConAppCo _ _ args)    = go_cos args
+    go_co (AppCo c1 c2)            = go_co c1 `mappend` go_co c2
+    go_co (CoVarCo cv)             = covar cv
+    go_co (AxiomCo _ cos)          = go_cos cos
+    go_co (HoleCo hole)            = cohole hole
+    go_co (UnivCo { uco_lty = t1, uco_rty = t2, uco_deps = deps })
+                                   = go_ty t1
+                                     `mappend` go_ty t2
+                                     `mappend` go_cos deps
+    go_co (SymCo co)               = go_co co
+    go_co (TransCo c1 c2)          = go_co c1 `mappend` go_co c2
+    go_co (SelCo _ co)             = go_co co
+    go_co (LRCo _ co)              = go_co co
+    go_co (InstCo co arg)          = go_co co `mappend` go_co arg
+    go_co (KindCo co)              = go_co co
+    go_co (SubCo co)               = go_co co
 
-    go_co env (FunCo { fco_mult = cw, fco_arg = c1, fco_res = c2 })
-       = go_co env cw `mappend` go_co env c1 `mappend` go_co env c2
+    go_co (FunCo { fco_mult = cw, fco_arg = c1, fco_res = c2 })
+       = go_co cw `mappend` go_co c1 `mappend` go_co c2
 
-    go_co env (ForAllCo tv _vis1 _vis2 kind_co co)
-      = go_co env kind_co `mappend` go_ty env (varType tv)
-                          `mappend` go_co env' co
-      where
-        env' = tycobinder env tv Inferred
+    go_co (ForAllCo { fco_tcv = tcv, fco_kind = kind_co, fco_body = co })
+      = go_mco kind_co `mappend` go_ty (varType tcv)
+                       `mappend` tycobinder tcv (go_co co)
+
+    go_mco MRefl    = mempty
+    go_mco (MCo co) = go_co co
 
 -- | A view function that looks through nothing.
 noView :: Type -> Maybe Type
@@ -1978,18 +2079,19 @@ typesSize tys = foldr ((+) . typeSize) 0 tys
 
 coercionSize :: Coercion -> Int
 coercionSize (Refl ty)             = typeSize ty
-coercionSize (GRefl _ ty MRefl)    = typeSize ty
-coercionSize (GRefl _ ty (MCo co)) = 1 + typeSize ty + coercionSize co
+coercionSize (GRefl _ ty mco)      = typeSize ty + mCoercionSize mco
 coercionSize (TyConAppCo _ _ args) = 1 + sum (map coercionSize args)
 coercionSize (AppCo co arg)        = coercionSize co + coercionSize arg
 coercionSize (ForAllCo { fco_kind = h, fco_body = co })
-                                   = 1 + coercionSize co + coercionSize h
+                                   = 1 + coercionSize co + mCoercionSize h
 coercionSize (FunCo _ _ _ w c1 c2) = 1 + coercionSize c1 + coercionSize c2
                                                          + coercionSize w
 coercionSize (CoVarCo _)         = 1
 coercionSize (HoleCo _)          = 1
 coercionSize (AxiomCo _ cs)      = 1 + sum (map coercionSize cs)
-coercionSize (UnivCo { uco_lty = t1, uco_rty = t2 })  = 1 + typeSize t1 + typeSize t2
+coercionSize (UnivCo { uco_lty = t1, uco_rty = t2, uco_deps = deps })
+                                 = 1 + typeSize t1 + typeSize t2
+                                     + sum (map coercionSize deps)
 coercionSize (SymCo co)          = 1 + coercionSize co
 coercionSize (TransCo co1 co2)   = 1 + coercionSize co1 + coercionSize co2
 coercionSize (SelCo _ co)        = 1 + coercionSize co
@@ -1997,6 +2099,10 @@ coercionSize (LRCo  _ co)        = 1 + coercionSize co
 coercionSize (InstCo co arg)     = 1 + coercionSize co + coercionSize arg
 coercionSize (KindCo co)         = 1 + coercionSize co
 coercionSize (SubCo co)          = 1 + coercionSize co
+
+mCoercionSize :: MCoercion -> Int
+mCoercionSize MRefl    = 0
+mCoercionSize (MCo co) = coercionSize co
 
 {-
 ************************************************************************

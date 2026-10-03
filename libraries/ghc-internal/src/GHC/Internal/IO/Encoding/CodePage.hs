@@ -23,6 +23,9 @@ import GHC.Internal.Base
 import GHC.Internal.Show
 import GHC.Internal.Num
 import GHC.Internal.Enum
+import GHC.Internal.Prim (
+    chr#, indexInt16OffAddr#, indexWord8OffAddr#, int16ToInt#,
+  )
 import GHC.Internal.Word
 import GHC.Internal.IO (unsafePerformIO)
 import GHC.Internal.IO.Encoding.Failure

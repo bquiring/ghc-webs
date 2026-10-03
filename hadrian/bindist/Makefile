@@ -85,73 +85,38 @@ WrapperBinsDir=${bindir}
 # N.B. this is duplicated from includes/ghc.mk.
 lib/settings : config.mk
 	@rm -f $@
-	@echo '[("C compiler command", "$(SettingsCCompilerCommand)")' >> $@
-	@echo ',("C compiler flags", "$(SettingsCCompilerFlags)")' >> $@
-	@echo ',("C++ compiler command", "$(SettingsCxxCompilerCommand)")' >> $@
-	@echo ',("C++ compiler flags", "$(SettingsCxxCompilerFlags)")' >> $@
-	@echo ',("C compiler link flags", "$(SettingsCCompilerLinkFlags)")' >> $@
-	@echo ',("C compiler supports -no-pie", "$(SettingsCCompilerSupportsNoPie)")' >> $@
-	@echo ',("CPP command", "$(SettingsCPPCommand)")' >> $@
-	@echo ',("CPP flags", "$(SettingsCPPFlags)")' >> $@
-	@echo ',("Haskell CPP command", "$(SettingsHaskellCPPCommand)")' >> $@
-	@echo ',("Haskell CPP flags", "$(SettingsHaskellCPPFlags)")' >> $@
-	@echo ',("JavaScript CPP command", "$(SettingsJavaScriptCPPCommand)")' >> $@
-	@echo ',("JavaScript CPP flags", "$(SettingsJavaScriptCPPFlags)")' >> $@
-	@echo ',("C-- CPP command", "$(SettingsCmmCPPCommand)")' >> $@
-	@echo ',("C-- CPP flags", "$(SettingsCmmCPPFlags)")' >> $@
-	@echo ',("C-- CPP supports -g0", "$(SettingsCmmCPPSupportsG0)")' >> $@
-	@echo ',("ld supports compact unwind", "$(LdHasNoCompactUnwind)")' >> $@
-	@echo ',("ld supports filelist", "$(LdHasFilelist)")' >> $@
-	@echo ',("ld supports single module", "$(LdHasSingleModule)")' >> $@
-	@echo ',("ld is GNU ld", "$(LdIsGNULd)")' >> $@
-	@echo ',("Merge objects command", "$(SettingsMergeObjectsCommand)")' >> $@
-	@echo ',("Merge objects flags", "$(SettingsMergeObjectsFlags)")' >> $@
-	@echo ',("Merge objects supports response files", "$(MergeObjsSupportsResponseFiles)")' >> $@
-	@echo ',("ar command", "$(SettingsArCommand)")' >> $@
-	@echo ',("ar flags", "$(ArArgs)")' >> $@
-	@echo ',("ar supports at file", "$(ArSupportsAtFile)")' >> $@
-	@echo ',("ar supports -L", "$(ArSupportsDashL)")' >> $@
-	@echo ',("ranlib command", "$(SettingsRanlibCommand)")' >> $@
-	@echo ',("otool command", "$(SettingsOtoolCommand)")' >> $@
-	@echo ',("install_name_tool command", "$(SettingsInstallNameToolCommand)")' >> $@
-	@echo ',("windres command", "$(SettingsWindresCommand)")' >> $@
-	@echo ',("unlit command", "$$topdir/../bin/$(CrossCompilePrefix)unlit")' >> $@
-	@echo ',("cross compiling", "$(CrossCompiling)")' >> $@
-	@echo ',("target platform string", "$(TARGETPLATFORM)")' >> $@
-	@echo ',("target os", "$(HaskellTargetOs)")' >> $@
-	@echo ',("target arch", "$(HaskellTargetArch)")' >> $@
-	@echo ',("target word size", "$(TargetWordSize)")' >> $@
-	@echo ',("target word big endian", "$(TargetWordBigEndian)")' >> $@
-	@echo ',("target has GNU nonexec stack", "$(TargetHasGnuNonexecStack)")' >> $@
-	@echo ',("target has .ident directive", "$(TargetHasIdentDirective)")' >> $@
-	@echo ',("target has subsections via symbols", "$(TargetHasSubsectionsViaSymbols)")' >> $@
-	@echo ',("target has libm", "$(TargetHasLibm)")' >> $@
-	@echo ',("Unregisterised", "$(GhcUnregisterised)")' >> $@
-	@echo ',("LLVM target", "$(LLVMTarget)")' >> $@
-	@echo ',("LLVM llc command", "$(SettingsLlcCommand)")' >> $@
-	@echo ',("LLVM opt command", "$(SettingsOptCommand)")' >> $@
-	@echo ',("LLVM llvm-as command", "$(SettingsLlvmAsCommand)")' >> $@
-	@echo ',("LLVM llvm-as flags", "$(SettingsLlvmAsFlags)")' >> $@
-	@echo ',("Use inplace MinGW toolchain", "$(SettingsUseDistroMINGW)")' >> $@
-	@echo
-	@echo ',("target RTS linker only supports shared libraries", "$(TargetRTSLinkerOnlySupportsSharedLibs)")' >> $@
+	@echo '[("unlit command", "$$topdir/../bin/$(CrossCompilePrefix)unlit")' >> $@
 	@echo ',("Use interpreter", "$(GhcWithInterpreter)")' >> $@
-	@echo ',("Support SMP", "$(GhcWithSMP)")' >> $@
 	@echo ',("RTS ways", "$(GhcRTSWays)")' >> $@
-	@echo ',("Tables next to code", "$(TablesNextToCode)")' >> $@
-	@echo ',("Leading underscore", "$(LeadingUnderscore)")' >> $@
-	@echo ',("Use LibFFI", "$(UseLibffiForAdjustors)")' >> $@
-	@echo ',("RTS expects libdw", "$(GhcRtsWithLibdw)")' >> $@
 	@echo ',("Relative Global Package DB", "package.conf.d")' >> $@
 	@echo ',("base unit-id", "$(BaseUnitId)")' >> $@
 	@echo "]" >> $@
 
+lib/targets/default.target : config.mk default.target
+	@rm -f $@
+	@echo "Copying the bindist-configured default.target to lib/targets/default.target"
+	cp default.target $@
+
+# sequentially create one layer of subdirectories under DESTDIR, then
+# subsequent install_* jobs can happen concurrently without bsd
+# install race condition. required for make install -j to work on
+# macos/freebsd, see #27499.
+.PHONY: install_dirs
+install_dirs:
+	$(INSTALL_DIR) "$(DESTDIR)$(prefix)"
+	$(INSTALL_DIR) "$(DESTDIR)$(ActualBinsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(ActualLibsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(mandir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(docdir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(datadir)"
+
 # We need to install binaries relative to libraries.
 BINARIES = $(wildcard ./bin/*)
 .PHONY: install_bin_libdir
-install_bin_libdir:
+install_bin_libdir: install_dirs
 	@echo "Copying binaries to $(DESTDIR)$(ActualBinsDir)"
-	$(INSTALL_DIR) "$(DESTDIR)$(ActualBinsDir)"
+
 	for i in $(BINARIES); do \
 		if test -L "$$i"; then \
 			cp -RP "$$i" "$(DESTDIR)$(ActualBinsDir)"; \
@@ -161,15 +126,14 @@ install_bin_libdir:
 	done
 
 .PHONY: install_bin_direct
-install_bin_direct:
+install_bin_direct: install_dirs
 	@echo "Copying binaries to $(DESTDIR)$(WrapperBinsDir)"
-	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
+
 	$(INSTALL_PROGRAM) ./bin/* "$(DESTDIR)$(WrapperBinsDir)/"
 
 .PHONY: install_lib
-install_lib: lib/settings
+install_lib: install_dirs lib/settings lib/targets/default.target
 	@echo "Copying libraries to $(DESTDIR)$(ActualLibsDir)"
-	$(INSTALL_DIR) "$(DESTDIR)$(ActualLibsDir)"
 
 	@dest="$(DESTDIR)$(ActualLibsDir)"; \
 	cd ./lib; \
@@ -195,9 +159,8 @@ install_lib: lib/settings
 	done; \
 
 .PHONY: install_docs
-install_docs:
+install_docs: install_dirs
 	@echo "Copying docs to $(DESTDIR)$(docdir)"
-	$(INSTALL_DIR) "$(DESTDIR)$(docdir)"
 
 	if [ -d doc ]; then \
 		cd ./doc; $(FIND) . -type f -exec sh -c \
@@ -212,9 +175,9 @@ install_docs:
 	fi
 
 .PHONY: install_data
-install_data:
+install_data: install_dirs
 	@echo "Copying data to $(DESTDIR)share"
-	$(INSTALL_DIR) "$(DESTDIR)$(datadir)"
+
 	if [ -d share ]; then \
 		cd ./share; $(FIND) . -type f -exec sh -c \
 			'$(INSTALL_DIR) "$(DESTDIR)$(datadir)/`dirname $$1`" && \
@@ -226,18 +189,17 @@ MAN_SECTION := 1
 MAN_PAGES := manpage/ghc.1
 
 .PHONY: install_man
-install_man:
+install_man: install_dirs
 	if [ -f $(MAN_PAGES) ]; then \
-		$(INSTALL_DIR) "$(DESTDIR)$(mandir)"; \
 		$(INSTALL_DIR) "$(DESTDIR)$(mandir)/man$(MAN_SECTION)"; \
 		$(INSTALL_MAN) $(INSTALL_OPTS) $(MAN_PAGES) "$(DESTDIR)$(mandir)/man$(MAN_SECTION)"; \
 	fi
 
 export SHELL
 .PHONY: install_wrappers
-install_wrappers: install_bin_libdir install_hsc2hs_wrapper
+install_wrappers: install_dirs install_bin_libdir install_hsc2hs_wrapper
 	@echo "Installing wrapper scripts"
-	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
+
 	for p in `cd ./wrappers; $(FIND) . ! -type d`; do \
 	    mk/install_script.sh "$$p" "$(DESTDIR)/$(WrapperBinsDir)/$$p" "$(WrapperBinsDir)" "$(ActualBinsDir)" "$(ActualBinsDir)/$$p" "$(ActualLibsDir)" "$(docdir)" "$(includedir)"; \
 	done
@@ -254,7 +216,7 @@ update_package_db: install_bin install_lib
 	$(INSTALL_DATA) mk/system-cxx-std-lib-1.0.conf "$(DESTDIR)$(ActualLibsDir)/package.conf.d"
 	@echo "Updating the package DB"
 	$(foreach p, $(PKG_CONFS),\
-		$(call patchpackageconf,$(shell echo $(notdir $p) | sed 's/-[0-9.]*-[0-9a-zA-Z]*\.conf//g'),$(shell echo "$p" | sed 's:\0xxx\0:   :g'),$(docdir),$(shell mk/relpath.sh "$(ActualLibsDir)" "$(docdir)"),$(shell echo $(notdir $p) | sed 's/.conf//g')))
+		$(call patchpackageconf,$(shell echo $(notdir $p) | sed 's/-[0-9.]*-[0-9a-zA-Z]*\.conf//g'),$(shell echo "$p" | sed 's:\0xxx\0:   :g'),$(docdir),$(shell mk/relpath.sh "$(ActualLibsDir)" "$(docdir)"),$(shell echo $(notdir $p) | sed 's/-[0-9a-zA-Z]*\.conf$$//')))
 	'$(DESTDIR)$(ActualBinsDir)/$(CrossCompilePrefix)ghc-pkg' --global-package-db "$(DESTDIR)$(ActualLibsDir)/package.conf.d" recache
 
 .PHONY: install_mingw

@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -115,9 +114,12 @@ data Instr
 
         -- | X86 scalar move instruction.
         --
-        -- When used at a vector format, only moves the lower 64 bits of data;
-        -- the rest of the data in the destination may either be zeroed or
-        -- preserved, depending on the specific format and operands.
+        -- The format is the format the destination is written to. For an XMM
+        -- register, using a scalar format means that we don't care about the
+        -- upper bits, while using a vector format means that we care about the
+        -- upper bits, even though we are only writing to the lower bits.
+        --
+        -- See also Note [Allocated register formats] in GHC.CmmToAsm.Reg.Linear.
         | MOV Format Operand Operand
              -- N.B. Due to AT&T assembler quirks, when used with 'II64'
              -- 'Format' immediate source and memory target operand, the source
@@ -175,11 +177,13 @@ data Instr
         | AND         Format Operand Operand
         | OR          Format Operand Operand
         | XOR         Format Operand Operand
-        -- | AVX bitwise logical XOR operation
-        | VXOR        Format Operand Reg Reg
         | NOT         Format Operand
         | NEGI        Format Operand         -- NEG instruction (name clash with Cond)
         | BSWAP       Format Reg
+        -- Vector bitwise logical operations
+        | VAND        Format Operand Reg Reg
+        | VOR         Format Operand Reg Reg
+        | VXOR        Format Operand Reg Reg
 
         -- Shifts (amount may be immediate or %cl only)
         | SHL         Format Operand{-amount-} Operand
@@ -189,6 +193,12 @@ data Instr
         | SHLD        Format Operand{-amount-} Operand Operand
 
         | BT          Format Imm Operand
+        -- | Bit test-and-reset
+        | BTR         Format Operand{- ^ bit offset (imm/reg) -} Operand
+        -- | Bit set
+        | BTS         Format Operand{- ^ bit offset (imm/reg) -} Operand
+        -- | Bit complement
+        | BTC         Format Operand{- ^ bit offset (imm/reg) -} Operand
         | NOP
 
 
@@ -250,6 +260,7 @@ data Instr
                       [Maybe JumpDest] -- Targets of the jump table
                       Section   -- Data section jump table should be put in
                       CLabel    -- Label of jump table
+                      !(Maybe CLabel) -- Label used to compute relative offsets. Otherwise we store absolute addresses.
         -- | X86 call instruction
         | CALL        (Either Imm Reg) -- ^ Jump target
                       [RegWithFormat]  -- ^ Arguments (required for register allocation)
@@ -318,10 +329,12 @@ data Instr
 
         -- logic operations
         | PXOR        Format Operand Reg
-        | VPXOR       Format Reg Reg Reg
+        | VPXOR       Format Operand Reg Reg
         | PAND        Format Operand Reg
         | PANDN       Format Operand Reg
+        | VPAND       Format Operand Reg Reg
         | POR         Format Operand Reg
+        | VPOR        Format Operand Reg Reg
 
         -- Arithmetic
         | VADD       Format Operand Reg Reg
@@ -331,7 +344,13 @@ data Instr
         | PADD       Format Operand Reg
         | PSUB       Format Operand Reg
         | PMULL      Format Operand Reg
+        | VPMULL     Format Operand Reg Reg
         | PMULUDQ    Format Operand Reg
+
+        -- Absolute value and square root
+        | PABS       Format Operand Reg -- SSE2
+        | VPABS      Format Operand Reg -- AVX512F Int64
+        | VSQRT      Format Operand Reg -- AVX
 
         -- SIMD compare
         | PCMPGT     Format Operand Reg
@@ -374,6 +393,7 @@ data Instr
         -- Shift
         | PSLL       Format Operand Reg
         | PSLLDQ     Format Imm Reg
+        | PSRA       Format Operand Reg
         | PSRL       Format Operand Reg
         | PSRLDQ     Format Imm Reg
         | PALIGNR    Format Imm Operand Reg
@@ -406,18 +426,27 @@ data FMAPermutation = FMA132 | FMA213 | FMA231
 regUsageOfInstr :: Platform -> Instr -> RegUsage
 regUsageOfInstr platform instr
  = case instr of
-    MOV fmt src dst
+
+    -- Recall that MOV is always a scalar move instruction, but when the destination
+    -- is an XMM register, we make the distinction between:
+    --
+    --  - a scalar format, meaning that from now on we no longer care about the top bits
+    --    of the register, and
+    --  - a vector format, meaning that we still care about what's in the high bits.
+    --
+    -- See Note [Allocated register formats] in GHC.CmmToAsm.Reg.Linear.
+    MOV dst_fmt src dst
       -- MOVSS/MOVSD preserve the upper half of vector registers,
       -- but only for reg-2-reg moves
-      | VecFormat _ sFmt <- fmt
+      | VecFormat _ sFmt <- dst_fmt
       , isFloatScalarFormat sFmt
       , OpReg {} <- src
       , OpReg {} <- dst
-      -> usageRM fmt src dst
+      -> usageRM dst_fmt src dst
       -- other MOV instructions zero any remaining upper part of the destination
       -- (largely to avoid partial register stalls)
       | otherwise
-      -> usageRW fmt src dst
+      -> usageRW dst_fmt src dst
     MOVD fmt1 fmt2 src dst    ->
       -- NB: MOVD and MOVQ always zero any remaining upper part of destination,
       -- so the destination is "written" not "modified".
@@ -433,7 +462,7 @@ regUsageOfInstr platform instr
     IMUL   fmt src dst    -> usageRM fmt src dst
 
     -- Result of IMULB will be in just in %ax
-    IMUL2  II8 src       -> mkRU (mk II8 eax:use_R II8 src []) [mk II8 eax]
+    IMUL2  II8 src       -> mkRU (mk II8 eax:use_R II8 src []) [mk II16 eax]
     -- Result of IMUL for wider values, will be split between %dx/%edx/%rdx and
     -- %ax/%eax/%rax.
     IMUL2  fmt src        -> mkRU (mk fmt eax:use_R fmt src []) [mk fmt eax,mk fmt edx]
@@ -444,8 +473,14 @@ regUsageOfInstr platform instr
     IDIV   fmt op -> mkRU (mk fmt eax:mk fmt edx:use_R fmt op []) [mk fmt eax, mk fmt edx]
     ADD_CC fmt src dst    -> usageRM fmt src dst
     SUB_CC fmt src dst    -> usageRM fmt src dst
+
     AND    fmt src dst    -> usageRM fmt src dst
+    VAND   fmt src1 src2 dst
+      -> mkRU (use_R fmt src1 [mk fmt src2]) [mk fmt dst]
+
     OR     fmt src dst    -> usageRM fmt src dst
+    VOR    fmt src1 src2 dst
+      -> mkRU (use_R fmt src1 [mk fmt src2]) [mk fmt dst]
 
     XOR    fmt (OpReg src) (OpReg dst)
       | src == dst
@@ -467,6 +502,9 @@ regUsageOfInstr platform instr
     SHLD   fmt imm dst1 dst2 -> usageRMM fmt imm dst1 dst2
     SHRD   fmt imm dst1 dst2 -> usageRMM fmt imm dst1 dst2
     BT     fmt _   src    -> mkRUR (use_R fmt src [])
+    BTR    fmt off dst    -> usageRM fmt off dst
+    BTS    fmt off dst    -> usageRM fmt off dst
+    BTC    fmt off dst    -> usageRM fmt off dst
 
     PUSH   fmt op         -> mkRUR (use_R fmt op [])
     POP    fmt op         -> mkRU [] (def_W fmt op)
@@ -476,7 +514,7 @@ regUsageOfInstr platform instr
     JXX    _ _          -> mkRU [] []
     JXX_GBL _ _         -> mkRU [] []
     JMP     op regs     -> mkRU (use_R addrFmt op regs) []
-    JMP_TBL op _ _ _    -> mkRU (use_R addrFmt op []) []
+    JMP_TBL op _ _ _ _  -> mkRU (use_R addrFmt op []) []
     CALL (Left _)  params   -> mkRU params (map mkFmt $ callClobberedRegs platform)
     CALL (Right reg) params -> mkRU (mk addrFmt reg:params) (map mkFmt $ callClobberedRegs platform)
     CLTD   fmt          -> mkRU [mk fmt eax] [mk fmt edx]
@@ -500,6 +538,8 @@ regUsageOfInstr platform instr
     LOCATION{}          -> noUsage
     UNWIND{}            -> noUsage
     DELTA   _           -> noUsage
+    LDATA{}             -> noUsage
+    NEWBLOCK{}          -> noUsage
 
     POPCNT fmt src dst -> mkRU (use_R fmt src []) [mk fmt dst]
     LZCNT  fmt src dst -> mkRU (use_R fmt src []) [mk fmt dst]
@@ -525,7 +565,7 @@ regUsageOfInstr platform instr
     VPBROADCAST sFmt vFmt src dst -> mkRU (use_R sFmt src []) [mk vFmt dst]
     VEXTRACT     fmt _off src dst -> usageRW fmt (OpReg src) dst
     INSERTPS     fmt (ImmInt off) src dst
-      -> mkRU ((use_R fmt src []) ++ [mk fmt dst | not doesNotReadDst]) [mk fmt dst]
+      -> mkRU (use_R fmt src [mk fmt dst | not doesNotReadDst]) [mk fmt dst]
         where
           -- Compute whether the instruction reads the destination register or not.
           -- Immediate bits: ss_dd_zzzz s = src pos, d = dst pos, z = zeroed components.
@@ -534,7 +574,7 @@ regUsageOfInstr platform instr
             -- are being zeroed.
             where pos = ( off `shiftR` 4 ) .&. 0b11
     INSERTPS fmt _off src dst
-      -> mkRU ((use_R fmt src []) ++ [mk fmt dst]) [mk fmt dst]
+      -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
     VINSERTPS fmt _imm src2 src1 dst
       -> mkRU (use_R fmt src2 [mk fmt src1]) [mk fmt dst]
     PINSR sFmt vFmt _off src dst
@@ -550,30 +590,38 @@ regUsageOfInstr platform instr
     VMOVDQU      fmt src dst   -> usageRW fmt src dst
     VMOV_MERGE   fmt src2 src1 dst -> mkRU [mk fmt src1, mk fmt src2] [mk fmt dst]
 
-    PXOR fmt (OpReg src) dst
-      | src == dst
+    PXOR fmt src dst
+      | OpReg src_reg <- src
+      , src_reg == dst
       -> mkRU [] [mk fmt dst]
       | otherwise
-      -> mkRU [mk fmt src, mk fmt dst] [mk fmt dst]
+      -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
 
     VPXOR        fmt s1 s2 dst
-      | s1 == s2, s1 == dst
+      | OpReg s1_reg <- s1
+      , s1_reg == s2, s1_reg == dst
       -> mkRU [] [mk fmt dst]
       | otherwise
-      -> mkRU [mk fmt s1, mk fmt s2] [mk fmt dst]
+      -> mkRU (use_R fmt s1 [mk fmt s2]) [mk fmt dst]
 
     PAND         fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
     PANDN        fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
+    VPAND        fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
     POR          fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
+    VPOR         fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
 
-    VADD         fmt s1 s2 dst -> mkRU ((use_R fmt s1 []) ++ [mk fmt s2]) [mk fmt dst]
-    VSUB         fmt s1 s2 dst -> mkRU ((use_R fmt s1 []) ++ [mk fmt s2]) [mk fmt dst]
-    VMUL         fmt s1 s2 dst -> mkRU ((use_R fmt s1 []) ++ [mk fmt s2]) [mk fmt dst]
-    VDIV         fmt s1 s2 dst -> mkRU ((use_R fmt s1 []) ++ [mk fmt s2]) [mk fmt dst]
+    VADD         fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
+    VSUB         fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
+    VMUL         fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
+    VDIV         fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
     PADD         fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
     PSUB         fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
     PMULL        fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
+    VPMULL       fmt s1 s2 dst -> mkRU (use_R fmt s1  [mk fmt s2])  [mk fmt dst]
     PMULUDQ      fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
+    PABS         fmt src dst   -> mkRU (use_R fmt src []) [mk fmt dst]
+    VPABS        fmt src dst   -> mkRU (use_R fmt src []) [mk fmt dst]
+    VSQRT        fmt src dst   -> mkRU (use_R fmt src []) [mk fmt dst]
 
     PCMPGT       fmt src dst   -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
 
@@ -601,6 +649,7 @@ regUsageOfInstr platform instr
     PSLL   fmt off dst -> mkRU (use_R fmt off [mk fmt dst]) [mk fmt dst]
     PSLLDQ fmt _off dst -> mkRU [mk fmt dst] [mk fmt dst]
     PSRL   fmt off dst -> mkRU (use_R fmt off [mk fmt dst]) [mk fmt dst]
+    PSRA   fmt off dst -> mkRU (use_R fmt off [mk fmt dst]) [mk fmt dst]
     PSRLDQ fmt _off dst -> mkRU [mk fmt dst] [mk fmt dst]
     PALIGNR fmt _off src dst -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
 
@@ -651,7 +700,6 @@ regUsageOfInstr platform instr
       -> mkRU (use_R fmt src [mk fmt dst]) [mk fmt dst]
     VMINMAX _ _ fmt src1 src2 dst
       -> mkRU (use_R fmt src1 [mk fmt src2]) [mk fmt dst]
-    _other              -> panic "regUsage: unrecognised instr"
  where
 
     -- # Definitions
@@ -779,6 +827,8 @@ patchRegsOfInstr platform instr env
     AND  fmt src dst     -> patch2 (AND  fmt) src dst
     OR   fmt src dst     -> patch2 (OR   fmt) src dst
     XOR  fmt src dst     -> patch2 (XOR  fmt) src dst
+    VAND fmt src1 src2 dst -> VAND fmt (patchOp src1) (env src2) (env dst)
+    VOR fmt src1 src2 dst  -> VOR fmt (patchOp src1) (env src2) (env dst)
     VXOR fmt src1 src2 dst -> VXOR fmt (patchOp src1) (env src2) (env dst)
     NOT  fmt op          -> patch1 (NOT  fmt) op
     BSWAP fmt reg        -> BSWAP fmt (env reg)
@@ -789,13 +839,16 @@ patchRegsOfInstr platform instr env
     SHLD fmt imm dst1 dst2 -> patch2 (SHLD fmt imm) dst1 dst2
     SHRD fmt imm dst1 dst2 -> patch2 (SHRD fmt imm) dst1 dst2
     BT   fmt imm src     -> patch1 (BT  fmt imm) src
+    BTR  fmt off dst     -> patch2 (BTR fmt) off dst
+    BTS  fmt off dst     -> patch2 (BTS fmt) off dst
+    BTC  fmt off dst     -> patch2 (BTC fmt) off dst
     TEST fmt src dst     -> patch2 (TEST fmt) src dst
     CMP  fmt src dst     -> patch2 (CMP  fmt) src dst
     PUSH fmt op          -> patch1 (PUSH fmt) op
     POP  fmt op          -> patch1 (POP  fmt) op
     SETCC cond op        -> patch1 (SETCC cond) op
     JMP op regs          -> JMP (patchOp op) regs
-    JMP_TBL op ids s lbl -> JMP_TBL (patchOp op) ids s lbl
+    JMP_TBL op ids s tl jl -> JMP_TBL (patchOp op) ids s tl jl
 
     FMA3 fmt perm var x1 x2 x3 -> patch3 (FMA3 fmt perm var) x1 x2 x3
 
@@ -868,11 +921,13 @@ patchRegsOfInstr platform instr env
     VMOVDQU    fmt src dst   -> VMOVDQU fmt (patchOp src) (patchOp dst)
     VMOV_MERGE fmt src2 src1 dst -> VMOV_MERGE fmt (env src2) (env src1) (env dst)
 
-    PXOR       fmt src dst   -> PXOR fmt (patchOp src) (env dst)
-    VPXOR      fmt s1 s2 dst -> VPXOR fmt (env s1) (env s2) (env dst)
-    PAND       fmt src dst   -> PAND fmt (patchOp src) (env dst)
+    PXOR       fmt src dst   -> PXOR  fmt (patchOp src) (env dst)
+    VPXOR      fmt s1 s2 dst -> VPXOR fmt (patchOp s1) (env s2) (env dst)
+    PAND       fmt src dst   -> PAND  fmt (patchOp src) (env dst)
+    VPAND      fmt s1 s2 dst -> VPAND fmt (patchOp s1) (env s2) (env dst)
     PANDN      fmt src dst   -> PANDN fmt (patchOp src) (env dst)
-    POR        fmt src dst   -> POR fmt (patchOp src) (env dst)
+    POR        fmt src dst   -> POR   fmt (patchOp src) (env dst)
+    VPOR       fmt s1 s2 dst -> VPOR  fmt (patchOp s1) (env s2) (env dst)
 
     VADD       fmt s1 s2 dst -> VADD fmt (patchOp s1) (env s2) (env dst)
     VSUB       fmt s1 s2 dst -> VSUB fmt (patchOp s1) (env s2) (env dst)
@@ -881,7 +936,11 @@ patchRegsOfInstr platform instr env
     PADD       fmt src dst   -> PADD fmt (patchOp src) (env dst)
     PSUB       fmt src dst   -> PSUB fmt (patchOp src) (env dst)
     PMULL      fmt src dst   -> PMULL fmt (patchOp src) (env dst)
+    VPMULL     fmt s1 s2 dst -> VPMULL fmt (patchOp s1) (env s2) (env dst)
     PMULUDQ    fmt src dst   -> PMULUDQ fmt (patchOp src) (env dst)
+    PABS       fmt src dst   -> PABS fmt (patchOp src) (env dst)
+    VPABS      fmt src dst   -> VPABS fmt (patchOp src) (env dst)
+    VSQRT      fmt src dst   -> VSQRT fmt (patchOp src) (env dst)
 
     PCMPGT     fmt src dst   -> PCMPGT fmt (patchOp src) (env dst)
 
@@ -908,6 +967,8 @@ patchRegsOfInstr platform instr env
 
     PSLL         fmt off dst
       -> PSLL    fmt (patchOp off) (env dst)
+    PSRA         fmt off dst
+      -> PSRA    fmt (patchOp off) (env dst)
     PSLLDQ       fmt off dst
       -> PSLLDQ  fmt off (env dst)
     PSRL         fmt off dst
@@ -997,9 +1058,9 @@ isJumpishInstr instr
 canFallthroughTo :: Instr -> BlockId -> Bool
 canFallthroughTo insn bid
   = case insn of
-    JXX _ target          -> bid == target
-    JMP_TBL _ targets _ _ -> all isTargetBid targets
-    _                     -> False
+    JXX _ target            -> bid == target
+    JMP_TBL _ targets _ _ _ -> all isTargetBid targets
+    _                       -> False
   where
     isTargetBid target = case target of
       Nothing                      -> True
@@ -1012,9 +1073,9 @@ jumpDestsOfInstr
 
 jumpDestsOfInstr insn
   = case insn of
-        JXX _ id        -> [id]
-        JMP_TBL _ ids _ _ -> [id | Just (DestBlockId id) <- ids]
-        _               -> []
+        JXX _ id            -> [id]
+        JMP_TBL _ ids _ _ _ -> [id | Just (DestBlockId id) <- ids]
+        _                   -> []
 
 
 patchJumpInstr
@@ -1023,8 +1084,8 @@ patchJumpInstr
 patchJumpInstr insn patchF
   = case insn of
         JXX cc id       -> JXX cc (patchF id)
-        JMP_TBL op ids section lbl
-          -> JMP_TBL op (map (fmap (patchJumpDest patchF)) ids) section lbl
+        JMP_TBL op ids section table_lbl rel_lbl
+          -> JMP_TBL op (map (fmap (patchJumpDest patchF)) ids) section table_lbl rel_lbl
         _               -> insn
     where
         patchJumpDest f (DestBlockId id) = DestBlockId (f id)
@@ -1121,8 +1182,8 @@ movInstr config fmt =
       = f
 
     plat    = ncgPlatform config
-    avx     = ncgAvxEnabled config
-    avx2    = ncgAvx2Enabled config
+    avx     = ncgSseAvxVersion config >= Just AVX1
+    avx2    = ncgSseAvxVersion config >= Just AVX2
     avx512f = ncgAvx512fEnabled config
     avx_move sFmt =
       if isFloatScalarFormat sFmt
@@ -1485,14 +1546,14 @@ shortcutJump fn insn = shortcutJump' fn (setEmpty :: LabelSet) insn
             Just (DestBlockId id') -> shortcutJump' fn seen' (JXX cc id')
             Just (DestImm imm)     -> shortcutJump' fn seen' (JXX_GBL cc imm)
         where seen' = setInsert id seen
-    shortcutJump' fn _ (JMP_TBL addr blocks section tblId) =
+    shortcutJump' fn _ (JMP_TBL addr blocks section table_lbl rel_lbl) =
         let updateBlock (Just (DestBlockId bid))  =
                 case fn bid of
                     Nothing   -> Just (DestBlockId bid )
                     Just dest -> Just dest
             updateBlock dest = dest
             blocks' = map updateBlock blocks
-        in  JMP_TBL addr blocks' section tblId
+        in  JMP_TBL addr blocks' section table_lbl rel_lbl
     shortcutJump' _ _ other = other
 
 -- Here because it knows about JumpDest

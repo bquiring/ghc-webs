@@ -12,6 +12,7 @@ module GHC.Core.Opt.Simplify.Env (
 
         -- * Environments
         SimplEnv(..), pprSimplEnv,   -- Temp not abstract
+        SimplPhase(..), isActive, simplStartPhase, simplEndPhase,
         seArityOpts, seCaseCase, seCaseFolding, seCaseMerge, seCastSwizzle,
         seDoEtaReduction, seEtaExpand, seFloatEnable, seInline, seNames,
         seOptCoercionOpts, sePhase, sePlatform, sePreInline,
@@ -27,7 +28,7 @@ module GHC.Core.Opt.Simplify.Env (
         SimplEnvIS,  checkSimplEnvIS, pprBadSimplEnvIS,
 
         -- * Substitution results
-        SimplSR(..), mkContEx, substId, lookupRecBndr,
+        SimplSR(..), substId, lookupRecBndr,
 
         -- * Simplifying 'Id' binders
         simplNonRecBndr, simplNonRecJoinBndr, simplRecBndrs, simplRecJoinBndrs,
@@ -75,13 +76,14 @@ import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Id as Id
+import GHC.Types.InlinePragma ( ActivationGhc, CompilerPhase, isActiveInPhase )
 import GHC.Types.Basic
 import GHC.Types.Unique.FM      ( pprUniqFM )
 
 import GHC.Data.OrdList
 import GHC.Data.Graph.UnVar
 
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import GHC.Platform ( Platform )
 
 import GHC.Utils.Monad
@@ -145,7 +147,7 @@ here is between "freely set by the caller" and "internally managed by the pass".
 Note that it doesn't matter for the decision procedure wheter a value is altered
 throughout an iteration of the Simplify pass: The fields sm_phase, sm_inline,
 sm_rules, sm_cast_swizzle and sm_eta_expand are updated locally (See the
-definitions of `updModeForStableUnfoldings` and `updModeForRules` in
+definitions of `updModeForStableUnfoldings` and `updModeForRule{LHS,RHS}` in
 GHC.Core.Opt.Simplify.Utils) but they are still part of `SimplMode` as the
 caller of the Simplify pass needs to provide the initial values for those fields.
 
@@ -250,7 +252,7 @@ seNames env = sm_names (seMode env)
 seOptCoercionOpts :: SimplEnv -> OptCoercionOpts
 seOptCoercionOpts env = sm_co_opt_opts (seMode env)
 
-sePhase :: SimplEnv -> CompilerPhase
+sePhase :: SimplEnv -> SimplPhase
 sePhase env = sm_phase (seMode env)
 
 sePlatform :: SimplEnv -> Platform
@@ -270,7 +272,7 @@ seUnfoldingOpts env = sm_uf_opts (seMode env)
 
 -- See Note [The environments of the Simplify pass]
 data SimplMode = SimplMode -- See comments in GHC.Core.Opt.Simplify.Monad
-  { sm_phase        :: !CompilerPhase
+  { sm_phase        :: !SimplPhase    -- ^ The phase of the simplifier
   , sm_names        :: ![String]      -- ^ Name(s) of the phase
   , sm_rules        :: !Bool          -- ^ Whether RULES are enabled
   , sm_inline       :: !Bool          -- ^ Whether inlining is enabled
@@ -288,13 +290,86 @@ data SimplMode = SimplMode -- See comments in GHC.Core.Opt.Simplify.Monad
   , sm_co_opt_opts :: !OptCoercionOpts -- ^ Coercion optimiser options
   }
 
+-- | See Note [SimplPhase]
+data SimplPhase
+  -- | A simplifier phase: InitialPhase, Phase 2, Phase 1, Phase 0, FinalPhase
+  -- NB: (SimplPhase p) is equivalent to (SimplPhaseRange p p)
+  = SimplPhase CompilerPhase
+
+  -- | Simplifying the RHS of a rule or of a stable unfolding: the range of
+  -- phases of the activation of the rule/stable unfolding.
+  --
+  -- _Invariant:_ 'simplStartPhase' is not a later phase than 'simplEndPhase'.
+  -- Equivalently, 'SimplPhaseRange' is always a non-empty interval of phases.
+  --
+  -- See Note [What is active in the RHS of a RULE or unfolding?]
+  --     in GHC.Core.Opt.Simplify.Utils.
+  | SimplPhaseRange CompilerPhase CompilerPhase
+
+  deriving Eq
+
+simplStartPhase :: SimplPhase -> CompilerPhase
+simplStartPhase (SimplPhase p)        = p
+simplStartPhase (SimplPhaseRange p _) = p
+
+simplEndPhase :: SimplPhase -> CompilerPhase
+simplEndPhase (SimplPhase p)        = p
+simplEndPhase (SimplPhaseRange _ p) = p
+
+instance Outputable SimplPhase where
+  ppr (SimplPhase p) = ppr p
+  ppr (SimplPhaseRange s e) = brackets $ ppr s <> ellipsis <> ppr e
+
+-- | Is this activation active in this simplifier phase?
+--
+-- For a phase range, @isActive simpl_phase_range act@ is true if and only if
+-- @act@ is active throughout the entire range, as per
+-- Note [What is active in the RHS of a RULE or unfolding?]
+-- in GHC.Core.Opt.Simplify.Utils.
+--
+-- See Note [SimplPhase].
+isActive :: SimplPhase -> ActivationGhc -> Bool
+isActive (SimplPhase p) act
+  = isActiveInPhase p act
+isActive (SimplPhaseRange start end) act
+  = -- To check whether the activation is active throughout the whole phase range,
+    -- it's sufficient to check the endpoints of the phase range, because an
+    -- activation can never have gaps (all activations are phase intervals).
+    isActiveInPhase start act && isActiveInPhase end act
+
+{- Note [SimplPhase]
+~~~~~~~~~~~~~~~~~~~~
+In general, the simplifier is invoked in successive phases:
+
+  InitialPhase, Phase 2, Phase 1, Phase 0, FinalPhase
+
+This allows us to control which rules, specialisations and inlinings are
+active at any given point. For example,
+
+  {-# RULE "myRule" [1] lhs = rhs #-}
+
+starts being active in Phase 1, and stays active thereafter. Thus it is active
+in Phase 1, Phase 0, FinalPhase, but not active in InitialPhase or Phase 2.
+
+This simplifier phase is stored in the sm_phase field of SimplMode, usin
+the 'SimplPhase' constructor. This allows us to determine which rules/inlinings
+are active.
+
+When we invoke the simplifier on the RHS of a rule, such as 'rhs' above, instead
+of setting the simplifier mode to a single phase, we use a phase range
+corresponding to the range of phases in which the rule is active, with the
+'SimplPhaseRange' constructor. This allows us to check whether other rules or
+inlinings are active throughout the whole activation of the rule.
+See Note [What is active in the RHS of a RULE or unfolding?] in GHC.Core.Opt.Simplify.Utils.
+-}
+
 instance Outputable SimplMode where
-    ppr (SimplMode { sm_phase = p , sm_names = ss
+    ppr (SimplMode { sm_phase = phase , sm_names = ss
                    , sm_rules = r, sm_inline = i
                    , sm_cast_swizzle = cs
                    , sm_eta_expand = eta, sm_case_case = cc })
        = text "SimplMode" <+> braces (
-         sep [ text "Phase =" <+> ppr p <+>
+         sep [ text "Phase =" <+> ppr phase <+>
                brackets (text (concat $ intersperse "," ss)) <> comma
              , pp_flag i   (text "inline") <> comma
              , pp_flag r   (text "rules") <> comma
@@ -312,9 +387,8 @@ data FloatEnable  -- Controls local let-floating
   | FloatNestedOnly    -- Local let-floating for nested (NotTopLevel) bindings only
   | FloatEnabled       -- Do local let-floating on all bindings
 
-{-
-Note [Local floating]
-~~~~~~~~~~~~~~~~~~~~~
+{- Note [Local floating]
+~~~~~~~~~~~~~~~~~~~~~~~~
 The Simplifier can perform local let-floating: it floats let-bindings
 out of the RHS of let-bindings.  See
   Let-floating: moving bindings to give faster programs (ICFP'96)
@@ -368,7 +442,7 @@ instance Outputable SimplFloats where
                        , text "joins:" <+> ppr jf
                        , text "in_scope:" <+> ppr is ])
 
-emptyFloats :: SimplEnv -> SimplFloats
+emptyFloats :: SimplEnvIS -> SimplFloats
 emptyFloats env
   = SimplFloats { sfLetFloats  = emptyLetFloats
                 , sfJoinFloats = emptyJoinFloats
@@ -414,12 +488,11 @@ data SimplSR
        -- and  v is a join-point of arity a
        --      <=> x is a join-point of arity a
 
-  | ContEx TvSubstEnv                 -- A suspended substitution
-           CvSubstEnv
-           SimplIdSubst
+  | ContEx SimplEnv
            InExpr
-      -- If   x :-> ContEx tv cv id e   is in the SimplISubst
-      -- then replace occurrences of x by (subst (tv,cv,id) e)
+           MOutCoercion  -- See Note [The sc_cast field of ApplyToVal]
+      -- If   x :-> ContEx static_env e mco   is in the SimplISubst
+      -- then replace occurrences of x by (subst static_env e) |> mco
 
 instance Outputable SimplSR where
   ppr (DoneId v)    = text "DoneId" <+> ppr v
@@ -429,8 +502,8 @@ instance Outputable SimplSR where
                 NotJoinPoint -> empty
                 JoinPoint n  -> parens (int n)
 
-  ppr (ContEx _tv _cv _id e) = vcat [text "ContEx" <+> ppr e {-,
-                                ppr (filter_env tv), ppr (filter_env id) -}]
+  ppr (ContEx _env e _mco) = text "ContEx" <+> ppr e
+                             -- ppr (filter_env tv), ppr (filter_env id)
         -- where
         -- fvs = exprFreeVars e
         -- filter_env env = filterVarEnv_Directly keep env
@@ -662,9 +735,6 @@ zapSubstEnv env@(SimplEnv { seInlineDepth = n })
 setSubstEnv :: SimplEnv -> TvSubstEnv -> CvSubstEnv -> SimplIdSubst -> SimplEnv
 setSubstEnv env tvs cvs ids = env { seTvSubst = tvs, seCvSubst = cvs, seIdSubst = ids }
 
-mkContEx :: SimplEnv -> InExpr -> SimplSR
-mkContEx (SimplEnv { seTvSubst = tvs, seCvSubst = cvs, seIdSubst = ids }) e = ContEx tvs cvs ids e
-
 {-
 ************************************************************************
 *                                                                      *
@@ -741,8 +811,9 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
       && want_to_float
       && can_float
   where
-     want_to_float = isTopLevel lvl || exprIsCheap rhs || exprIsExpandable rhs
-                     -- See Note [Float when cheap or expandable]
+     want_to_float = isTopLevel lvl || exprIsExpandable rhs
+                     -- See Note [Float when expandable]
+
      can_float = case ff of
                    FltLifted  -> True
                    FltOkSpec  -> isNotTopLevel lvl && isNonRec rec
@@ -754,16 +825,29 @@ doFloatFromRhs fe lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs 
      floatEnabled lvl FloatNestedOnly = not (isTopLevel lvl)
      floatEnabled _ FloatEnabled = True
 
-{-
-Note [Float when cheap or expandable]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We want to float a let from a let if the residual RHS is
-   a) cheap, such as (\x. blah)
-   b) expandable, such as (f b) if f is CONLIKE
-But there are
-  - cheap things that are not expandable (eg \x. expensive)
-  - expandable things that are not cheap (eg (f b) where b is CONLIKE)
-so we must take the 'or' of the two.
+{- Note [Float when expandable]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We float when that would leave us with a RHS that is /expandable/ (#26854).
+The whole purpose of the local-let-floating is to end up with
+   let x = rhs
+where rhs has an expandable unfolding, so that `exprIsConApp_maybe` will look
+inside `x`.
+
+Historical aside:
+
+    In the long-distant (2011) past, we made `want_to_float` true if
+      EITHER exprIsExpandable OR exprIsCheap
+    But that seems wrong: there is no point in floating for expressions that are
+    cheap but not expandable:
+      * It costs more to test
+      * It gives no benefit
+      * Very few expressions are cheap but not expandable (e.g. error calls)
+    We justified this OR by saying that there may be:
+      - cheap things that are not expandable (eg \x. expensive)
+      - expandable things that are not cheap (eg (f b) where b is CONLIKE)
+    But that's not true: (\x.expensive) is certainly expandable.
+
+End of historial aside
 -}
 
 emptyLetFloats :: LetFloats
@@ -1280,17 +1364,15 @@ getTCvSubst (SimplEnv { seInScope = in_scope, seTvSubst = tv_env, seCvSubst = cv
 
 getFullSubst :: InScopeSet -> SimplEnv -> Subst
 getFullSubst in_scope (SimplEnv { seIdSubst = id_env, seTvSubst = tv_env, seCvSubst = cv_env })
-  = mk_full_subst in_scope tv_env cv_env id_env
-
-mk_full_subst :: InScopeSet -> TvSubstEnv -> CvSubstEnv -> SimplIdSubst -> Subst
-mk_full_subst in_scope tv_env cv_env id_env
   = mkSubst in_scope (mapVarEnv to_expr id_env) tv_env cv_env
   where
     to_expr :: SimplSR -> CoreExpr
     -- A tiresome impedence-matcher
-    to_expr (DoneEx e _)           = e
-    to_expr (DoneId v)             = Var v
-    to_expr (ContEx tvs cvs ids e) = GHC.Core.Subst.substExprSC (mk_full_subst in_scope tvs cvs ids) e
+    to_expr (DoneEx e _)       = e
+    to_expr (DoneId v)         = Var v
+    to_expr (ContEx env e mco) = mkCastMCo e' mco
+      where
+        e' = GHC.Core.Subst.substExprSC (getFullSubst in_scope env) e
 
 substTy :: HasDebugCallStack => SimplEnv -> Type -> Type
 substTy env ty = Type.substTy (getTCvSubst env) ty

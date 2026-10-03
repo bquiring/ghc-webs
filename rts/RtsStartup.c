@@ -14,6 +14,7 @@
 #include "linker/MMap.h"
 #include "RtsFlags.h"
 #include "RtsUtils.h"
+#include "BuiltinClosures.h"
 #include "Prelude.h"
 #include "Printer.h"    /* DEBUG_LoadSymbols */
 #include "Schedule.h"   /* initScheduler */
@@ -125,13 +126,7 @@ void _fpreset(void)
     x86_init_fpu();
 }
 
-#if defined(__GNUC__)
 void __attribute__((alias("_fpreset"))) fpreset(void);
-#else
-void fpreset(void) {
-    _fpreset();
-}
-#endif
 
 /* Set the console's CodePage to UTF-8 if using the new I/O manager and the CP
    is still the default one.  */
@@ -188,8 +183,8 @@ static void initBuiltinGcRoots(void)
      * these closures `Id`s of these can be safely marked as non-CAFFY
      * in the compiler.
      */
-    getStablePtr((StgPtr)runIO_closure);
-    getStablePtr((StgPtr)runNonIO_closure);
+    getStablePtr((StgPtr)ghc_hs_iface->runIO_closure);
+    getStablePtr((StgPtr)ghc_hs_iface->runNonIO_closure);
     getStablePtr((StgPtr)flushStdHandles_closure);
 
     getStablePtr((StgPtr)runFinalizerBatch_closure);
@@ -241,6 +236,8 @@ hs_init_with_rtsopts(int *argc, char **argv[])
     hs_init_ghc(argc, argv, rts_opts);
 }
 
+void init_ghc_hs_iface(void);
+
 void
 hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 {
@@ -267,6 +264,8 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 #endif
 
     setlocale(LC_CTYPE,"");
+
+    init_ghc_hs_iface();
 
     /* Initialise the stats department, phase 0 */
     initStats0();
@@ -379,6 +378,9 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     traceInitEvent(traceOSProcessInfo);
     flushTrace();
 
+    /* initialize INTLIKE and CHARLIKE closures */
+    initBuiltinClosures();
+
     /* initialize the storage manager */
     initStorage();
 
@@ -413,8 +415,8 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     traceInitEvent(dumpIPEToEventLog);
     initHeapProfiling();
 
-    /* start the virtual timer 'subsystem'. */
-    startTimer();
+    /* start the timer (after initTimer above) */
+    unpauseTimer();
 
 #if defined(RTS_USER_SIGNALS)
     if (RtsFlags.MiscFlags.install_signal_handlers) {
@@ -425,7 +427,7 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     }
 #endif
 
-    initIOManager();
+    startIOManager();
 
     x86_init_fpu();
 
@@ -510,14 +512,12 @@ hs_exit_(bool wait_foreign)
     }
 #endif
 
-    /* stop the ticker */
-    stopTimer();
-    /*
-     * it is quite important that we wait here as some timer implementations
-     * (e.g. pthread) may fire even after we exit, which may segfault as we've
-     * already freed the capabilities.
+    /* We rely on the guarantee that exitTimer stops the timer synchronously,
+     * which ensures the timer handler does not get run again after this point.
+     * We are about to start freeing resources used by the timer handler (like
+     * the capabilities, eventlog and profiling data structures).
      */
-    exitTimer(true);
+    exitTimer();
 
     /*
      * Dump the ticky counter definitions

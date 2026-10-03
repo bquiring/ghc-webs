@@ -23,7 +23,8 @@ module GHC.Internal.ConsoleHandler
         where
 
 -- See W1 of Note [Tracking dependencies on primitives] in GHC.Internal.Base
-import GHC.Internal.Types ()
+import GHC.Internal.Base as Rebindable
+
 #else /* whole file */
         ( Handler(..)
         , installHandler
@@ -42,7 +43,8 @@ Note: this #include is inside a Haskell comment
       by GHC
 -}
 
-import GHC.Internal.Base
+import GHC.Internal.Data.Maybe (Maybe(..))
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.Marshal.Alloc
 import GHC.Internal.Foreign.Ptr
@@ -50,6 +52,8 @@ import GHC.Internal.Foreign.Storable
 import GHC.Internal.Stable
 import GHC.Internal.Conc.IO
 import GHC.Internal.Control.Concurrent.MVar
+import GHC.Internal.Base as Rebindable
+import qualified GHC.Internal.Num as Rebindable
 
 data Handler
  = Default
@@ -67,9 +71,7 @@ data Handler
 -- running in a Windows console.  Certain environments that look like consoles
 -- do not support console events, these include:
 --
---  * Cygwin shells with @CYGWIN=tty@ set (if you don't set @CYGWIN=tty@,
---    then a Cygwin shell behaves like a Windows console).
---  * Cygwin xterm and rxvt windows
+--  * MSYS MinTTY shells
 --  * MSYS rxvt windows
 --
 -- In order for your application to receive console events, avoid running

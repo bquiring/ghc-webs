@@ -1,21 +1,16 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MonadComprehensions #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic TcRnMessage
-{-# LANGUAGE InstanceSigs #-}
 
 module GHC.Tc.Errors.Ppr
   ( pprTypeDoesNotHaveFixedRuntimeRep
   , pprScopeError
-  , pprErrCtxtMsg
+  , pprHsCtxt
   --
   , tidySkolemInfo
   , tidySkolemInfoAnon
@@ -37,6 +32,8 @@ module GHC.Tc.Errors.Ppr
 
 import GHC.Prelude
 
+import Language.Haskell.Syntax.Text
+
 import qualified GHC.Boot.TH.Syntax as TH
 -- In stage1: import "ghc-boot-th-next" qualified GHC.Boot.TH.Syntax as TH
 -- In stage2: import "ghc-boot-th"      qualified GHC.Boot.TH.Syntax as TH
@@ -44,8 +41,8 @@ import qualified GHC.Boot.TH.Syntax as TH
 --            import "ghc-internal"     qualified GHC.Internal.TH.Syntax as TH
 import qualified GHC.Boot.TH.Ppr as TH
 
-import GHC.Builtin.Names
-import GHC.Builtin.Types ( boxedRepDataConTyCon, tYPETyCon, pretendNameIsInScope )
+import GHC.Builtin.WiredIn.Types( boxedRepDataConTyCon, tYPETyCon, pretendNameIsInScope )
+import GHC.Builtin.KnownKeys -- A bunch of keys
 
 import GHC.Types.Name.Reader
 import GHC.Unit.Module.ModIface
@@ -63,7 +60,7 @@ import GHC.Core.InstEnv
 import GHC.Core.TyCo.Rep (Type(..))
 import GHC.Core.TyCo.Ppr (pprWithInvisibleBitsWhen, pprSourceTyCon,
                           pprTyVars, pprWithTYPE, pprTyVar, pprTidiedType, pprForAll)
-import GHC.Core.PatSyn ( patSynName, pprPatSynType )
+import GHC.Core.PatSyn ( patSynName, pprPatSynType, PatSyn )
 import GHC.Core.TyCo.Tidy
 import GHC.Core.Predicate
 import GHC.Core.Type
@@ -73,8 +70,11 @@ import GHC.CoreToIface
 import GHC.Driver.Flags
 import GHC.Driver.Backend
 import GHC.Hs hiding (HoleError)
+import GHC.Hs.Decls.Overlap
+import GHC.Hs.Syn.Type (hsLitType)
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.Errors.Types.PromotionErr (pprTermLevelUseCtxt)
 import GHC.Tc.Errors.Hole.FitTypes
 import GHC.Tc.Types.BasicTypes
 import GHC.Tc.Types.Constraint
@@ -89,7 +89,7 @@ import GHC.Types.DefaultEnv (ClassDefaults(ClassDefaults, cd_types, cd_provenanc
 import GHC.Types.Error
 import GHC.Types.Error.Codes
 import GHC.Types.Hint
-import GHC.Types.Hint.Ppr ( pprSigLike ) -- & Outputable GhcHint
+import GHC.Types.Hint.Ppr ( pprSigLike )
 import GHC.Types.Basic
 import GHC.Types.Id
 import GHC.Types.Id.Info ( RecSelParent(..) )
@@ -128,16 +128,17 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Data.BooleanFormula (pprBooleanFormulaNice)
 
+import Control.Monad (guard)
+import qualified Data.Semigroup as S
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
+import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Foldable ( fold )
 import Data.Function (on)
-import Data.List ( groupBy, sortBy, tails
-                 , partition, unfoldr )
+import Data.List ( groupBy, sortBy, sortOn, tails, partition, unfoldr )
 import Data.Ord ( comparing )
 import Data.Bifunctor
-import GHC.Tc.Errors.Types.PromotionErr (pprTermLevelUseCtxt)
 
 
 defaultTcRnMessageOpts :: TcRnMessageOpts
@@ -164,9 +165,11 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $ pprSolverReportWithCtxt msg
     TcRnSolverDepthError ty depth -> mkSimpleDecorated msg
       where
+        pp_type_or_constraint | isConstraintLikeKind (typeKind ty) = text "constraint"
+                              | otherwise                          = text "type"
         msg =
           vcat [ text "Reduction stack overflow; size =" <+> ppr depth
-               , hang (text "When simplifying the following type:")
+               , hang (text "When simplifying the following" <+> pp_type_or_constraint <> colon)
                     2 (ppr ty) ]
     TcRnRedundantConstraints redundants (info, show_info)
       -> mkSimpleDecorated $
@@ -185,21 +188,43 @@ instance Diagnostic TcRnMessage where
     TcRnTypeDoesNotHaveFixedRuntimeRep ty prov err_ctxt
       -> mkDecorated $
           (pprTypeDoesNotHaveFixedRuntimeRep ty prov)
-          : map pprErrCtxtMsg err_ctxt
+          : map pprHsCtxt err_ctxt
     TcRnImplicitLift id_or_name err_ctxt
       -> mkDecorated $
            ( text "The variable" <+> quotes (ppr id_or_name) <+>
              text "is implicitly lifted in the TH quotation"
-           ) : map pprErrCtxtMsg err_ctxt
+           ) : map pprHsCtxt err_ctxt
     TcRnUnusedPatternBinds bind
       -> mkDecorated [hang (text "This pattern-binding binds no variables:") 2 (ppr bind)]
-    TcRnDodgyImports (DodgyImportsEmptyParent gre)
-      -> mkDecorated [dodgy_msg (text "import") gre (dodgy_msg_insert gre)]
+    TcRnDodgyImports (DodgyImportsEmptyParent ie ns_spec gre)
+      -> mkDecorated [dodgy_msg (text "import") gre ie ns_spec]
     TcRnDodgyImports (DodgyImportsHiding reason)
       -> mkSimpleDecorated $
          pprImportLookup reason
-    TcRnDodgyExports gre
-      -> mkDecorated [dodgy_msg (text "export") gre (dodgy_msg_insert gre)]
+    TcRnDodgyImports (DodgyImportsWildcard mod_name ns_spec)
+      -> mkDecorated
+          [ text "The wildcard import" <+> quotes ppr_wc <+> text "does not bring any names into scope"
+          , let hdr = text "The module" <+> quotes (ppr mod_name) <+> text "does not export any"
+            in fsep $ hdr : pprNamespaceItems ns_spec
+          ]
+      where
+        ppr_wc = ppr ns_spec <+> text ".."
+
+    TcRnDodgyExports (DodgyExportsEmptyParent ie ns_spec gre)
+      -> mkDecorated [dodgy_msg (text "export") gre ie ns_spec]
+    TcRnDodgyExports (DodgyExportsNullModule mod)
+      -> mkSimpleDecorated
+       $ formatExportItemError
+           (text "module" <+> ppr mod)
+           "exports nothing"
+    TcRnDodgyExports (DodgyExportsWildcard mod ns_spec)
+      -> mkDecorated
+          [ text "The wildcard export" <+> quotes ppr_wc <+> text "does not match any names"
+          , let hdr = text "The module" <+> quotes (ppr mod) <+> text "does not define any"
+            in fsep $ hdr : pprNamespaceItems ns_spec
+          ]
+      where
+        ppr_wc = ppr ns_spec <+> text ".."
     TcRnMissingImportList ie
       -> mkDecorated [ text "The import item" <+> quotes (ppr ie) <+>
                        text "does not have an explicit import list"
@@ -233,19 +258,18 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
            vcat [text "Multiple warning declarations for" <+> quotes (ppr rdr_name),
                  text "also at " <+> ppr (getLocA d)]
-    TcRnSimplifierTooManyIterations simples limit wc
+    TcRnSimplifierTooManyIterations limit wc
       -> mkSimpleDecorated $
            hang (text "solveWanteds: too many iterations"
                    <+> parens (text "limit =" <+> ppr limit))
-                2 (vcat [ text "Unsolved:" <+> ppr wc
-                        , text "Simples:"  <+> ppr simples
-                        ])
+                2 (text "Unsolved:" <+> ppr wc)
     TcRnIllegalPatSynDecl rdrname
       -> mkSimpleDecorated $
            hang (text "Illegal pattern synonym declaration for" <+> quotes (ppr rdrname))
               2 (text "Pattern synonym declarations are only valid at top level")
     TcRnLinearPatSyn ty
       -> mkSimpleDecorated $
+           pprWithLinearTypes $
            hang (text "Pattern synonyms do not support linear fields (GHC #18806):") 2 (ppr ty)
     TcRnEmptyRecordUpdate
       -> mkSimpleDecorated $ text "Empty record update"
@@ -330,11 +354,11 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $ vcat [text "Illegal view pattern: " <+> ppr pat]
     TcRnCharLiteralOutOfRange c
       -> mkSimpleDecorated $ text "character literal out of range: '\\" <> char c  <> char '\''
-    TcRnIllegalWildcardsInConstructor con
+    TcRnIllegalWildcardsInConstructor ctx con _
       -> mkSimpleDecorated $
-           vcat [ text "Illegal `{..}' notation for constructor" <+> quotes (ppr con)
-                , nest 2 (text "Record wildcards may not be used for constructors with unlabelled fields.")
-                , nest 2 (text "Possible fix: Remove the `{..}' and add a match for each field of the constructor.")
+           vcat [ text "Invalid record" <+> pprRecordFieldPart ctx <+> quotes (ppr con <> text "{..}") <> dot
+                , text "The data constructor" <+> quotes (ppr con)
+                  <+> text "does not have named record fields."
                 ]
     TcRnIgnoringAnnotations anns
       -> mkSimpleDecorated $
@@ -454,6 +478,7 @@ instance Diagnostic TcRnMessage where
             UnboxedSumType   -> text "sum"
     TcRnLinearFuncInKind ty
       -> mkSimpleDecorated $
+           pprWithLinearTypes $
            text "Illegal linear function in a kind:" <+> pprType ty
     TcRnForAllEscapeError ty kind
       -> mkSimpleDecorated $ vcat
@@ -614,28 +639,22 @@ instance Diagnostic TcRnMessage where
     TcRnDupeModuleExport mod
       -> mkSimpleDecorated $
            hsep [ text "Duplicate"
-                , quotes (text "Module" <+> ppr mod)
+                , quotes (text "module" <+> ppr mod)
                 , text "in export list" ]
+    TcRnDupeWildcardExport mod ns
+      -> mkSimpleDecorated $
+           text "Duplicate wildcard" <+> quotes (ppr ns <+> text "..")
+           $$ text "in the export list of module" <+> quotes (ppr mod)
     TcRnExportedModNotImported mod
       -> mkSimpleDecorated
        $ formatExportItemError
            (text "module" <+> ppr mod)
            "is not imported"
-    TcRnNullExportedModule mod
-      -> mkSimpleDecorated
-       $ formatExportItemError
-           (text "module" <+> ppr mod)
-           "exports nothing"
     TcRnMissingExportList mod
       -> mkSimpleDecorated
        $ formatExportItemError
            (text "module" <+> ppr mod)
            "is missing an export list"
-    TcRnExportHiddenComponents export_item
-      -> mkSimpleDecorated
-       $ formatExportItemError
-           (ppr export_item)
-           "attempts to export constructors or class methods that are not visible here"
     TcRnExportHiddenDefault export_item
       -> mkSimpleDecorated
        $ formatExportItemError
@@ -670,6 +689,43 @@ instance Diagnostic TcRnMessage where
         what_is = pp_category ty_thing
         thing = ppr $ nameOccName child
         parents = map ppr parent_names
+    TcRnExportedSubordinateNotFound parent_gre k _ ->
+      mkSimpleDecorated $
+      case k of
+        BadExportSubordinateNotFound wname ->
+          let child_name      = lieWrappedName wname
+              child_name_fs   = occNameFS (rdrNameOcc child_name)
+              suggest_patsyn  = allow_patsyn && could_be_patsyn
+              could_be_patsyn =
+                case unLoc wname of
+                  IEName{} -> isLexCon child_name_fs
+                  IEData{} -> isLexCon child_name_fs
+                  IEPattern{} -> True
+                  IEType{}    -> False
+                  IEDefault{} -> False
+              basic_msg =
+                what_parent <+> quotes (ppr parent_name)
+                <+> "does not define a child named" <+> quotes (ppr child_name)
+              patsyn_msg =
+                text "nor is there a pattern synonym of that name in scope"
+              combined_msg
+                | suggest_patsyn = basic_msg <> comma $$ patsyn_msg <> dot
+                | otherwise      = basic_msg <> dot
+          in combined_msg
+        BadExportSubordinateNonType gre ->
+          let child_name = greName gre
+          in what_parent <+> quotes (ppr parent_name) <+> "defines a child named" <+> quotes (ppr child_name) <> comma
+             $$ text "but it is not in the type namespace."
+        BadExportSubordinateNonData gre ->
+          let child_name = greName gre
+          in what_parent <+> quotes (ppr parent_name) <+> "defines a child named" <+> quotes (ppr child_name) <> comma
+             $$ text "but it is not in the data namespace."
+      where
+        parent_name = greName parent_gre
+        (what_parent, allow_patsyn) = case greInfo parent_gre of
+          IAmTyCon ClassFlavour -> (text "The class", False)
+          IAmTyCon _            -> (text "The data type", True)
+          _                     -> (text "The item", False)
     TcRnConflictingExports occ child_gre1 ie1 child_gre2 ie2
       -> mkSimpleDecorated $
            vcat [ text "Conflicting exports for" <+> quotes (ppr occ) <> colon
@@ -790,30 +846,15 @@ instance Diagnostic TcRnMessage where
                 = note "Type-directed disambiguation is not supported for pattern synonym record fields"
                 | otherwise
                 = empty
-    TcRnStaticFormNotClosed name reason
+    TcRnStaticFormNotClosed name
       -> mkSimpleDecorated $
-           quotes (ppr name)
-             <+> text "is used in a static form but it is not closed"
-             <+> text "because it"
-             $$ sep (causes reason)
-         where
-          causes :: NotClosedReason -> [SDoc]
-          causes NotLetBoundReason = [text "is not let-bound."]
-          causes (NotTypeClosed vs) =
-            [ text "has a non-closed type because it contains the"
-            , text "type variables:" <+>
-              pprVarSet vs (hsep . punctuate comma . map (quotes . ppr))
-            ]
-          causes (NotClosed n reason) =
-            let msg = text "uses" <+> quotes (ppr n) <+> text "which"
-             in case reason of
-                  NotClosed _ _ -> msg : causes reason
-                  _   -> let (xs0, xs1) = splitAt 1 $ causes reason
-                          in fmap (msg <+>) xs0 ++ xs1
+         hang (quotes (ppr name) <+> text "is used in a static form")
+            2 (text "but it is not defined at top level")
+
     TcRnUselessTypeable
       -> mkSimpleDecorated $
-           text "Deriving" <+> quotes (ppr typeableClassName) <+>
-           text "has no effect: all types now auto-derive Typeable"
+           text "Deriving(Typeable) has no effect: all types now auto-derive Typeable"
+
     TcRnDerivingDefaults cls
       -> mkSimpleDecorated $ sep
                      [ text "Both DeriveAnyClass and"
@@ -1104,6 +1145,10 @@ instance Diagnostic TcRnMessage where
                      TermVariablePE -> text "term variables cannot be promoted"
                      TypeVariablePE -> text "type variables bound in a kind signature cannot be used in the type"
           same_rec_group_msg = text "it is defined and used in the same recursive group"
+    TcRnUnpromotableLit lit
+      -> mkSimpleDecorated $
+           vcat [ text "The literal" <+> quotes (ppr lit) <+> text "cannot be promoted."
+                , text "It is of the unpromotable type" <+> quotes (ppr (hsLitType lit)) <> dot ]
     TcRnIllegalTermLevelUse simple_msg rdr name err
       -> mkSimpleDecorated $
            if simple_msg
@@ -1251,9 +1296,8 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
         ppr feature <+> text "are not allowed in type data declarations."
 
-    TcRnIllegalNewtype con show_linear_types reason
-      -> mkSimpleDecorated $
-        vcat [msg, additional]
+    TcRnIllegalNewtype con reason
+      -> mkSimpleDecorated $ vcat [msg, additional]
         where
           (msg,additional) =
             case reason of
@@ -1263,20 +1307,21 @@ instance Diagnostic TcRnMessage where
                   nest 2 $
                     text "but" <+> quotes (ppr con) <+> text "has" <+> speakN n_flds
                 ],
-                ppr con <+> dcolon <+> ppr (dataConDisplayType show_linear_types con))
+                ppr con <+> dcolon <+> ppr (dataConWrapperType con))
               IsNonLinear ->
                 (text "A newtype constructor must be linear",
-                ppr con <+> dcolon <+> ppr (dataConDisplayType True con))
+                pprWithLinearTypes $
+                  ppr con <+> dcolon <+> ppr (dataConWrapperType con))
               IsGADT ->
                 (text "A newtype must not be a GADT",
                 ppr con <+> dcolon <+> pprWithInvisibleBitsWhen sneaky_eq_spec
-                                       (ppr $ dataConDisplayType show_linear_types con))
+                                       (ppr $ dataConWrapperType con))
               HasConstructorContext ->
                 (text "A newtype constructor must not have a context in its type",
-                ppr con <+> dcolon <+> ppr (dataConDisplayType show_linear_types con))
+                ppr con <+> dcolon <+> ppr (dataConWrapperType con))
               HasExistentialTyVar ->
                 (text "A newtype constructor must not have existential type variables",
-                ppr con <+> dcolon <+> ppr (dataConDisplayType show_linear_types con))
+                ppr con <+> dcolon <+> ppr (dataConWrapperType con))
               HasStrictnessAnnotation ->
                 (text "A newtype constructor must not have a strictness annotation", empty)
 
@@ -1339,6 +1384,21 @@ instance Diagnostic TcRnMessage where
       hang (text "Missing role annotation" <> colon)
          2 (text "type role" <+> ppr name <+> hsep (map ppr roles))
 
+    TcRnImplicitFieldStrictness _lazy_anns cons -> mkSimpleDecorated $
+      hang (text "These constructor fields lack an explicit strictness annotation" <> colon)
+         2 (vcat (map ppr_con (NE.toList cons)))
+      where
+        ppr_con (con, fields) =
+          bullet <+> text "In" <+> quotes (ppr con) <> colon <+> ppr_fields (NE.toList fields)
+        ppr_fields fields
+          | let names = [n | ImplicitStrictnessRecField n <- fields]
+          , not (null names)
+          = text "field" <> plural names <+> quotedListWithAnd (map ppr names)
+          | otherwise
+          = let poss = [i | ImplicitStrictnessPosField i <- fields]
+            in text "field" <> plural poss
+               <+> unquotedListWith (text "and") (map int poss)
+
     TcRnIllformedTypePattern p
       -> mkSimpleDecorated $
           hang (text "Ill-formed type pattern:") 2 (ppr p)
@@ -1399,7 +1459,7 @@ instance Diagnostic TcRnMessage where
         EmptyCaseForall tvb ->
           vcat [ text "Empty list of alternatives in" <+> pp_ctxt
                , hang (text "checked against a forall-type:")
-                      2 (pprForAll [tvb] <+> text "...")
+                      2 (pprForAll [tvb] <+> ellipsis)
                ]
         where
           pp_ctxt = case ctxt of
@@ -1517,9 +1577,9 @@ instance Diagnostic TcRnMessage where
       -> pprTcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt
     TcRnBadlyLevelledType name bind_lvls use_lvl
       -> mkSimpleDecorated $
-         text "Badly levelled type:" <+> ppr name <+>
-         fsep [text "is bound at" <+> pprThBindLevel bind_lvls,
-               text "but used at level" <+> ppr use_lvl]
+         fsep [ text "Level error:"
+              , ppr name <+> text "is used at level" <+> ppr use_lvl
+              , text "but is bound at" <+> ppr_th_bind_level bind_lvls]
     TcRnTyThingUsedWrong sort thing name
       -> mkSimpleDecorated $
          pprTyThingUsedWrong sort thing name
@@ -1591,7 +1651,7 @@ instance Diagnostic TcRnMessage where
               <+> text "may fail for the following constructors:")
            2
            (hsep $ punctuate comma $
-            map ppr (take maxCons cons) ++ [ text "..." | lengthExceeds cons maxCons ])
+            map ppr (take maxCons cons) ++ [ ellipsis | lengthExceeds cons maxCons ])
     TcRnBadFieldAnnotation n con reason -> mkSimpleDecorated $
       hang (pprBadFieldAnnotationReason reason)
          2 (text "on the" <+> speakNth n
@@ -1676,10 +1736,9 @@ instance Diagnostic TcRnMessage where
     TcRnGADTsDisabled tc_name -> mkSimpleDecorated $
       text "Illegal generalised algebraic data declaration for" <+> quotes (ppr tc_name)
     TcRnExistentialQuantificationDisabled con -> mkSimpleDecorated $
-      sdocOption sdocLinearTypes (\show_linear_types ->
         hang (text "Data constructor" <+> quotes (ppr con) <+>
               text "has existential type variables, a context, or a specialised result type")
-           2 (ppr con <+> dcolon <+> ppr (dataConDisplayType show_linear_types con)))
+           2 (ppr con <+> dcolon <+> ppr (dataConWrapperType con))
     TcRnGADTDataContext tc_name -> mkSimpleDecorated $
       text "A data type declared in GADT style cannot have a context:" <+> quotes (ppr tc_name)
     TcRnMultipleConForNewtype tycon n -> mkSimpleDecorated $
@@ -1737,9 +1796,6 @@ instance Diagnostic TcRnMessage where
            hang (text "Illegal type signature:" <+> quotes (ppr ty))
               2 (text "Type signatures are only allowed in patterns with ScopedTypeVariables")
 
-    TcRnIllegalKindSignature ty
-      -> mkSimpleDecorated $ text "Illegal kind signature:" <+> quotes (ppr ty)
-
     TcRnUnusedQuantifiedTypeVar doc tyVar
       -> mkSimpleDecorated $
            vcat [ text "Unused quantified type variable" <+> quotes (ppr tyVar)
@@ -1786,7 +1842,7 @@ instance Diagnostic TcRnMessage where
                nest 2 (vcat (map (ppr . hsDocString . unLoc) msg)) ]
          where
           (extra, msg) = case txt of
-            WarningTxt _ _ msg -> ("", msg)
+            WarningTxt  _ _ msg -> ("", msg)
             DeprecatedTxt _ msg -> (" is deprecated", msg)
     TcRnRedundantSourceImport mod_name
       -> mkSimpleDecorated $
@@ -1897,6 +1953,19 @@ instance Diagnostic TcRnMessage where
           = vcat [ text "Future versions of GHC will turn this warning into an error." ]
         proposal
           = vcat [ text "See GHC Proposal #330." ]
+    TcRnDefaultedCallStack ct_loc
+      -> mkSimpleDecorated $ case ctLocOrigin ct_loc of
+           -- Suggestion makes sense only for this particular case.
+           PushedCallStackOrigin{} -> vcat [ header, suggestion ]
+           _ -> header
+      where
+        header, suggestion :: SDoc
+        header
+          = vcat [ text "Defaulting to the empty call stack"
+                 , nest 2 $ pprCtOrigin (ctLocOrigin ct_loc) <> text "." ]
+        suggestion
+          = text "Add a" <+> quotes (text "HasCallStack") <+>
+            text "constraint to the enclosing definition to extend the call stack."
     TcRnImplicitImportOfPrelude
       -> mkSimpleDecorated $
          text "Module" <+> quotes (text "Prelude") <+> text "implicitly imported."
@@ -1979,8 +2048,8 @@ instance Diagnostic TcRnMessage where
             | otherwise
             = text "they are not unfilled metavariables"
 
-    TcRnNamespacedWarningPragmaWithoutFlag warning@(Warning (kw, _) _ txt) -> mkSimpleDecorated $
-      vcat [ text "Illegal use of the" <+> quotes (ppr kw) <+> text "keyword:"
+    TcRnNamespacedWarningPragmaWithoutFlag warning@(Warning _ ns_spec _ txt) -> mkSimpleDecorated $
+      vcat [ text "Illegal use of the" <+> quotes (ppr ns_spec) <+> text "keyword:"
            , nest 2 (ppr warning)
            , text "in a" <+> pragma_type <+> text "pragma"
            ]
@@ -1998,7 +2067,7 @@ instance Diagnostic TcRnMessage where
                InvisPatMisplaced -> text "An invisible type pattern must occur in an argument position."
            ]
 
-    TcRnNamespacedFixitySigWithoutFlag sig@(FixitySig kw _ _) -> mkSimpleDecorated $
+    TcRnNamespacedFixitySigWithoutFlag sig@(FixitySig _ kw _ _) -> mkSimpleDecorated $
       vcat [ text "Illegal use of the" <+> quotes (ppr kw) <+> text "keyword:"
            , nest 2 (ppr sig)
            , text "in a fixity signature"
@@ -2018,6 +2087,15 @@ instance Diagnostic TcRnMessage where
 
     TcRnUnexpectedTypeSyntaxInTerms syntax -> mkSimpleDecorated $
       text "Unexpected" <+> pprTypeSyntaxName syntax
+
+    TcRnUnrecognisedModifier mod _ -> mkSimpleDecorated $
+      text "Unrecognised modifier" <+> pprHsModifier mod
+
+    TcRnUnknownModifierKind mod _ -> mkSimpleDecorated $
+      text "Modifier" <+> pprHsModifier mod <+> "has unknown kind"
+
+    TcRnTooManyMultiplicities -> mkSimpleDecorated $
+      text "Too many Multiplicity modifiers"
 
   diagnosticReason :: TcRnMessage -> DiagnosticReason
   diagnosticReason = \case
@@ -2184,14 +2262,12 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnDupeModuleExport{}
       -> WarningWithFlag Opt_WarnDuplicateExports
+    TcRnDupeWildcardExport{}
+      -> WarningWithFlag Opt_WarnDuplicateExports
     TcRnExportedModNotImported{}
       -> ErrorWithoutFlag
-    TcRnNullExportedModule{}
-      -> WarningWithFlag Opt_WarnDodgyExports
     TcRnMissingExportList{}
       -> WarningWithFlag Opt_WarnMissingExportList
-    TcRnExportHiddenComponents{}
-      -> ErrorWithoutFlag
     TcRnExportHiddenDefault{}
       -> ErrorWithoutFlag
     TcRnDuplicateExport{}
@@ -2199,6 +2275,8 @@ instance Diagnostic TcRnMessage where
     TcRnDuplicateNamedDefaultExport{}
       -> WarningWithFlag Opt_WarnDuplicateExports
     TcRnExportedParentChildMismatch{}
+      -> ErrorWithoutFlag
+    TcRnExportedSubordinateNotFound{}
       -> ErrorWithoutFlag
     TcRnConflictingExports{}
       -> ErrorWithoutFlag
@@ -2334,6 +2412,8 @@ instance Diagnostic TcRnMessage where
     TcRnClassKindNotConstraint{}
       -> ErrorWithoutFlag
     TcRnUnpromotableThing{}
+      -> ErrorWithoutFlag
+    TcRnUnpromotableLit{}
       -> ErrorWithoutFlag
     TcRnIllegalTermLevelUse{}
       -> ErrorWithoutFlag
@@ -2551,8 +2631,6 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnUnexpectedPatSigType{}
       -> ErrorWithoutFlag
-    TcRnIllegalKindSignature{}
-      -> ErrorWithoutFlag
     TcRnUnusedQuantifiedTypeVar{}
       -> WarningWithFlag Opt_WarnUnusedForalls
     TcRnDataKindsError{}
@@ -2618,6 +2696,8 @@ instance Diagnostic TcRnMessage where
       -> WarningWithFlag Opt_WarnNonCanonicalMonadInstances
     TcRnDefaultedExceptionContext{}
       -> WarningWithFlag Opt_WarnDefaultedExceptionContext
+    TcRnDefaultedCallStack{}
+      -> WarningWithFlag Opt_WarnDefaultedCallStack
     TcRnImplicitImportOfPrelude {}
       -> WarningWithFlag Opt_WarnImplicitPrelude
     TcRnMissingMain {}
@@ -2628,6 +2708,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnMissingRoleAnnotation{}
       -> WarningWithFlag Opt_WarnMissingRoleAnnotations
+    TcRnImplicitFieldStrictness{}
+      -> WarningWithFlag Opt_WarnImplicitFieldStrictness
     TcRnIllegalInvisTyVarBndr{}
       -> ErrorWithoutFlag
     TcRnIllegalWildcardTyVarBndr{}
@@ -2659,6 +2741,12 @@ instance Diagnostic TcRnMessage where
     TcRnOutOfArityTyVar{}
       -> ErrorWithoutFlag
     TcRnUnexpectedTypeSyntaxInTerms{}
+      -> ErrorWithoutFlag
+    TcRnUnrecognisedModifier{}
+      -> WarningWithFlag Opt_WarnUnrecognisedModifiers
+    TcRnUnknownModifierKind{}
+      -> ErrorWithoutFlag
+    TcRnTooManyMultiplicities{}
       -> ErrorWithoutFlag
 
   diagnosticHints = \case
@@ -2732,8 +2820,12 @@ instance Diagnostic TcRnMessage where
       -> [suggestExtension LangExt.ViewPatterns]
     TcRnCharLiteralOutOfRange{}
       -> noHints
-    TcRnIllegalWildcardsInConstructor{}
-      -> noHints
+    TcRnIllegalWildcardsInConstructor ctx con arity
+      -> case ctx of
+           RecordFieldPattern{} -> [ SuggestEmptyRecordBraces con
+                                   , SuggestExplicitConstructorArguments con arity
+                                   ]
+           _                    -> [SuggestExplicitConstructorArguments con arity]
     TcRnIgnoringAnnotations{}
       -> noHints
     TcRnAnnotationInSafeHaskell
@@ -2855,13 +2947,11 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnDupeModuleExport{}
       -> noHints
+    TcRnDupeWildcardExport{}
+      -> noHints
     TcRnExportedModNotImported{}
       -> noHints
-    TcRnNullExportedModule{}
-      -> noHints
     TcRnMissingExportList{}
-      -> noHints
-    TcRnExportHiddenComponents{}
       -> noHints
     TcRnExportHiddenDefault{}
       -> noHints
@@ -2871,6 +2961,13 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnExportedParentChildMismatch{}
       -> noHints
+    TcRnExportedSubordinateNotFound _ k similar_names
+      -> ns_spec_hints ++ similar_names
+      where
+        ns_spec_hints = case k of
+          BadExportSubordinateNotFound{} -> noHints
+          BadExportSubordinateNonType{}  -> [SuggestChangeExportItem ExportItemRemoveSubordinateType]
+          BadExportSubordinateNonData{}  -> [SuggestChangeExportItem ExportItemRemoveSubordinateData]
     TcRnConflictingExports{}
       -> noHints
     TcRnDuplicateFieldExport {}
@@ -2996,6 +3093,8 @@ instance Diagnostic TcRnMessage where
     TcRnClassKindNotConstraint{}
       -> noHints
     TcRnUnpromotableThing{}
+      -> noHints
+    TcRnUnpromotableLit{}
       -> noHints
     TcRnIllegalTermLevelUse {}
       -> noHints
@@ -3168,7 +3267,7 @@ instance Diagnostic TcRnMessage where
     TcRnHasFieldResolvedIncomplete{}
       -> noHints
     TcRnBadFieldAnnotation _ _ LazyFieldsDisabled
-      -> [suggestExtension LangExt.StrictData]
+      -> [suggestExtension LangExt.LazyFieldAnnotations]
     TcRnBadFieldAnnotation{}
       -> noHints
     TcRnSuperclassCycle{}
@@ -3231,8 +3330,6 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnUnexpectedPatSigType{}
       -> [suggestExtension LangExt.ScopedTypeVariables]
-    TcRnIllegalKindSignature{}
-      -> [suggestExtension LangExt.KindSignatures]
     TcRnUnusedQuantifiedTypeVar{}
       -> noHints
     TcRnDataKindsError{}
@@ -3336,6 +3433,8 @@ instance Diagnostic TcRnMessage where
       -> suggestNonCanonicalDefinition reason
     TcRnDefaultedExceptionContext _
       -> noHints
+    TcRnDefaultedCallStack{}
+      -> noHints
     TcRnImplicitImportOfPrelude {}
       -> noHints
     TcRnMissingMain {}
@@ -3346,6 +3445,12 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnMissingRoleAnnotation{}
       -> noHints
+    TcRnImplicitFieldStrictness lazy_anns _
+      -> SuggestExplicitFieldStrictness
+         : [ useExtensionInOrderTo
+               (text "to allow" <+> quotes (char '~') <+> text "annotations")
+               LangExt.LazyFieldAnnotations
+           | not lazy_anns ]
     TcRnIllegalInvisTyVarBndr{}
       -> [suggestExtension LangExt.TypeAbstractions]
     TcRnIllegalWildcardTyVarBndr{}
@@ -3381,25 +3486,44 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnUnexpectedTypeSyntaxInTerms syntax
       -> [suggestExtension (typeSyntaxExtension syntax)]
+    TcRnUnrecognisedModifier _ sl
+      -> case sl of
+           SuggestLinear -> [suggestExtension LangExt.LinearTypes]
+           DontSuggestLinear -> noHints
+    TcRnUnknownModifierKind mod@(HsModifier _ ty) mName
+      -> case (mName, hsTyKindSig ty) of
+           (Just name, Nothing) -> [SuggestModifierSignature mod name]
+           _ -> noHints
+    TcRnTooManyMultiplicities{}
+      -> noHints
 
   diagnosticCode = constructorCode @GHC
 
 pprTcRnBadlyLevelled :: LevelCheckReason -> Set.Set ThLevelIndex -> ThLevelIndex -> Maybe ErrorItem -> DecoratedSDoc
 pprTcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt = mkDecorated $
-         [ fsep [ text "Level error:", pprLevelCheckReason reason
-                , text "is bound at" <+> pprThBindLevel bind_lvls
-                , text "but used at level" <+> ppr use_lvl]
+         [ fsep [ text "Level error:"
+                , hang (fsep [what <+> text "is used at level" <+> ppr use_lvl, "but it is bound at" <+> ppr_th_bind_level bind_lvls]) 2
+                  if | LevelCheckSplice (unwrapUserRdr -> gre) <- reason
+                     , imps <- gre_imp gre
+                     , not (isEmptyBag imps) -> ppr_imports imps
+                     | otherwise -> empty
+
+                ]
          ] ++
          [hang (text "Could not be resolved by implicit lifting due to the following error:") 2
           (text "No instance for:" <+> quotes (ppr (errorItemPred item)))
-         | Just item <- [lift_attempt]
-         ] ++
-         [ vcat (text "Available from the imports:" : ppr_imports (gre_imp gre))
-         | LevelCheckSplice _ (Just gre) <- [reason]
-         , not (isEmptyBag (gre_imp gre)) ]
+         | Just item <- [lift_attempt] ]
   where
-    ppr_imports :: Bag ImportSpec -> [SDoc]
-    ppr_imports = map ((bullet <+>) . ppr ) . bagToList
+    what = case reason of
+      LevelCheckInstance _ t -> text "instance for" <+> quotes (ppr t)
+      LevelCheckSplice n -> quotes $ ppr $ userRdrName n
+
+    ppr_imports :: Bag ImportSpec -> SDoc
+    ppr_imports bag = vcat $ map ((bullet <+>) .  ppr) impspecs
+      where impspecs = bagToList bag
+
+ppr_th_bind_level :: Set.Set ThLevelIndex -> SDoc
+ppr_th_bind_level levels_set = text "level" <> pluralSet levels_set <+> pprUnquotedSet levels_set
 
 note :: SDoc -> SDoc
 note note = "Note" <> colon <+> note <> dot
@@ -3541,7 +3665,7 @@ pprHoleFit :: HoleFitDispConfig -> HoleFit -> SDoc
 pprHoleFit _ (RawHoleFit sd) = sd
 pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
  hang display 2 provenance
- where tyApp = sep $ zipWithEqual pprArg vars hfWrap
+ where tyApp = sep $ zipWith pprArg vars hfWrap
          where pprArg b arg = case binderFlag b of
                                 Specified -> text "@" <> pprParendType arg
                                   -- Do not print type application for inferred
@@ -3550,20 +3674,9 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
                                 Required  -> pprPanic "pprHoleFit: bad Required"
                                                          (ppr b <+> ppr arg)
        tyAppVars = sep $ punctuate comma $
-           zipWithEqual (\v t -> ppr (binderVar v) <+> text "~" <+> pprParendType t)
+           zipWith (\v t -> ppr (binderVar v) <+> text "~" <+> pprParendType t)
            vars hfWrap
-
-       vars = unwrapTypeVars hfType
-         where
-           -- Attempts to get all the quantified type variables in a type,
-           -- e.g.
-           -- return :: forall (m :: * -> *) Monad m => (forall a . a -> m a)
-           -- into [m, a]
-           unwrapTypeVars :: Type -> [ForAllTyBinder]
-           unwrapTypeVars t = vars ++ case splitFunTy_maybe unforalled of
-                               Just (_, _, _, unfunned) -> unwrapTypeVars unfunned
-                               _ -> []
-             where (vars, unforalled) = splitForAllForAllTyBinders t
+       vars = deepInvisTvBinders hfType
        holeVs = sep $ map (parens . (text "_" <+> dcolon <+>) . ppr) hfMatches
        holeDisp = if sMs then holeVs
                   else sep $ replicate (length hfMatches) $ text "_"
@@ -3590,6 +3703,18 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
                  NameHFCand name -> text "bound at" <+> ppr (getSrcLoc name)
                  IdHFCand id_ -> text "bound at" <+> ppr (getSrcLoc id_)
 
+-- | Similar to 'tcDeepSplitSigmaTy_maybe', but just cares about the binders.
+deepInvisTvBinders :: TcSigmaType -> [ForAllTyBinder]
+deepInvisTvBinders = go
+  where
+    go ty | Just (_arg_ty, res_ty) <- tcSplitFunTy_maybe ty
+          = go res_ty
+          | (tvs, body) <- splitForAllForAllTyBinders ty
+          , not (null tvs)
+          = tvs ++ go body
+          | otherwise
+          = []
+
 -- | Add a "Constraints include..." message.
 --
 -- See Note [Constraints include ...]
@@ -3610,7 +3735,7 @@ messageWithInfoDiagnosticMessage :: UnitState
                                  -> DecoratedSDoc
 messageWithInfoDiagnosticMessage unit_state (ErrInfo {..}) show_ctxt important =
   let ctxt = pprWithUnitState unit_state
-           $ vcat $ map pprErrCtxtMsg  [ ctx | ctx <- errInfoContext, show_ctxt ]
+           $ vcat $ map pprHsCtxt  [ ctx | ctx <- errInfoContext, show_ctxt ]
 
       supp = case errInfoSupplementary of
         Nothing -> empty
@@ -3631,27 +3756,43 @@ messageWithHsDocContext opts ctxt main_msg = do
 
 --------------------------------------------------------------------------------
 
-dodgy_msg :: Outputable ie => SDoc -> GlobalRdrElt -> ie -> SDoc
-dodgy_msg kind tc ie
+dodgy_msg :: Outputable ie => SDoc -> GlobalRdrElt -> ie -> NamespaceSpecifier (GhcPass p) -> SDoc
+dodgy_msg kind tc ie ns_spec
   = vcat [ text "The" <+> kind <+> text "item" <+> quotes (ppr ie) <+> text "suggests that"
-         , quotes (ppr $ greName tc) <+> text "has" <+> sep rest ]
+         , quotes (ppr $ greName tc) <+> text "has" <+> fst rest, snd rest ]
   where
-    rest :: [SDoc]
+    rest :: (SDoc, SDoc)
     rest =
       case greInfo tc of
         IAmTyCon ClassFlavour
-          -> [ text "(in-scope) class methods or associated types" <> comma
-             , text "but it has none" ]
+          -> let items = case ns_spec of
+                   NoNamespaceSpecifier{}   -> text "class methods or associated types"
+                   DataNamespaceSpecifier{} -> text "class methods"
+                   TypeNamespaceSpecifier{} -> text "associated types"
+             in ( text "(in-scope)" <+> items <> comma
+                , text "but it has none" )
         IAmTyCon _
-          -> [ text "(in-scope) constructors or record fields" <> comma
-             , text "but it has none" ]
-        _ -> [ text "children" <> comma
-             , text "but it is not a type constructor or a class" ]
+          -> let data_msg = ( text "(in-scope) constructors or record fields" <> comma
+                            , text "but it has none" )
+                 type_msg = ( text "associated types" <> comma
+                            , text "but it is not a class" )
+             in case ns_spec of
+                  NoNamespaceSpecifier{}   -> data_msg
+                  DataNamespaceSpecifier{} -> data_msg
+                  TypeNamespaceSpecifier{} -> type_msg
+        _ -> ( text "children" <> comma
+             , text "but it is not a type constructor or a class" )
 
-dodgy_msg_insert :: GlobalRdrElt -> IE GhcRn
-dodgy_msg_insert tc_gre = IEThingAll (Nothing, noAnn) ii Nothing
-  where
-    ii = noLocA (IEName noExtField $ noLocA $ greName tc_gre)
+pprNamespaceItems :: NamespaceSpecifier (GhcPass p) -> [SDoc]
+pprNamespaceItems ns_spec = case ns_spec of
+  NoNamespaceSpecifier{} -> [text "names"]
+  TypeNamespaceSpecifier{} ->
+    [text "types,", text "classes,",
+     text "or other names", text "in the type namespace"]
+  DataNamespaceSpecifier{} ->
+    [text "data constructors,", text "functions,", text "constants,",
+     text "field selectors,", text "pattern synonyms,",
+     text "or other names", text "in the data namespace"]
 
 pprTypeDoesNotHaveFixedRuntimeRep :: Type -> FixedRuntimeRepProvenance -> SDoc
 pprTypeDoesNotHaveFixedRuntimeRep ty prov =
@@ -3759,7 +3900,7 @@ derivErrDiagnosticMessage cls cls_tys mb_strat newtype_deriving pprHerald = \cas
   DerivErrNotWellKinded tc cls_kind _
     -> sep [ hang (text "Cannot derive well-kinded instance of form"
                          <+> quotes (pprClassPred cls cls_tys
-                                       <+> parens (ppr tc <+> text "...")))
+                                       <+> parens (ppr tc <+> ellipsis)))
                   2 empty
            , nest 2 (text "Class" <+> quotes (ppr cls)
                          <+> text "expects an argument of kind"
@@ -3985,18 +4126,25 @@ pprTcSolverReportMsg ctxt
   (CannotUnifyVariable
     { mismatchMsg         = msg
     , cannotUnifyReason   = reason })
-  =  pprMismatchMsg ctxt msg
-  $$ pprCannotUnifyVariableReason ctxt reason
+  =  let invis_bits = mismatchInvisibleBits msg
+         mismatch_msg = pprMismatchMsg ctxt msg
+     in pprWithInvisibleBits invis_bits $
+           mismatch_msg $$ pprCannotUnifyVariableReason ctxt reason
 pprTcSolverReportMsg ctxt
   (Mismatch
      { mismatchMsg           = mismatch_msg
      , mismatchTyVarInfo     = tv_info
      , mismatchAmbiguityInfo = ambig_infos
-     , mismatchCoercibleInfo = coercible_info })
-  = vcat ([ pprMismatchMsg ctxt mismatch_msg
-          , maybe empty (pprTyVarInfo ctxt) tv_info
-          , maybe empty pprCoercibleMsg coercible_info ]
-          ++ (map pprAmbiguityInfo ambig_infos))
+     , mismatchCoercibleInfo = coercible_msgs })
+  = let invis_bits = mismatchInvisibleBits mismatch_msg
+        ppr_mismatch = pprMismatchMsg ctxt mismatch_msg
+    in pprWithInvisibleBits invis_bits $
+          vcat
+            ( ppr_mismatch
+            : maybe empty (pprTyVarInfo ctxt) tv_info
+            : pprCoercibleMsgs coercible_msgs
+            : map pprAmbiguityInfo ambig_infos
+            )
 pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
   vcat (map make_msg frr_origs)
   where
@@ -4100,12 +4248,23 @@ pprTcSolverReportMsg _ (ExpectingMoreArguments n thing) =
      | n == 1    = text "more argument to"
      | otherwise = text "more arguments to" -- n > 1
 pprTcSolverReportMsg ctxt (UnboundImplicitParams (item :| items)) =
-  let givens = getUserGivens ctxt
+  let givens = getUsefulGivens ctxt item
   in if null givens
      then addArising (errorItemCtLoc item) $
             sep [ text "Unbound implicit parameter" <> plural preds
                 , nest 2 (pprParendTheta preds) ]
-     else pprMismatchMsg ctxt (CouldNotDeduce givens (item :| items) Nothing)
+     else
+        let mismatch =
+              CouldNotDeduce
+                { cnd_user_givens   = givens
+                , cnd_wanted        = item :| items
+                , cnd_ea            = Nothing
+                , cnd_noBuiltin_msg = Nothing
+                }
+            invis_bits = mismatchInvisibleBits mismatch
+            ppr_msg = pprMismatchMsg ctxt mismatch
+        in
+          pprWithInvisibleBits invis_bits ppr_msg
   where
     preds = map errorItemPred (item : items)
 pprTcSolverReportMsg _ (AmbiguityPreventsSolvingCt item ambigs) =
@@ -4113,12 +4272,12 @@ pprTcSolverReportMsg _ (AmbiguityPreventsSolvingCt item ambigs) =
   pprArising (errorItemCtLoc item) $$
   text "prevents the constraint" <+> quotes (pprParendType $ errorItemPred item)
   <+> text "from being solved."
-pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
-  (CannotResolveInstance item unifiers candidates rel_binds)
-  =
+pprTcSolverReportMsg ctxt
+  (CannotResolveInstance item unifiers candidates rel_binds mb_HasField_msg)
+  = pprWithInvisibleBits invis_bits $
     vcat
       [ no_inst_msg
-      , nest 2 extra_note
+      , extra_note
       , mb_patsyn_prov `orElse` empty
       , ppWhen (has_ambigs && not (null unifiers && null useful_givens))
         (vcat [ ppUnless lead_with_ambig $
@@ -4130,8 +4289,7 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
       , ppWhen (isNothing mb_patsyn_prov) $
             -- Don't suggest fixes for the provided context of a pattern
             -- synonym; the right fix is to bind more in the pattern
-        show_fixes (ctxtFixes has_ambigs pred implics
-                    ++ drv_fixes ++ naked_sc_fixes)
+        show_fixes (ctxt_fixes ++ drv_fixes ++ naked_sc_fixes)
       , ppWhen (not (null candidates))
         (hang (text "There are instances for similar types:")
             2 (vcat (map ppr candidates)))
@@ -4145,7 +4303,7 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
     (ambig_kvs, ambig_tvs) = ambigTkvsOfTy pred
     ambigs = ambig_kvs ++ ambig_tvs
     has_ambigs = not (null ambigs)
-    useful_givens = discardProvCtxtGivens orig (getUserGivensFromImplics implics)
+    useful_givens = getUsefulGivens ctxt item
          -- useful_givens are the enclosing implications with non-empty givens,
          -- modulo the horrid discardProvCtxtGivens
     lead_with_ambig = not (null ambigs)
@@ -4153,12 +4311,17 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
                    && not (null unifiers)
                    && null useful_givens
 
+    invis_bits :: InvisibleBits
     no_inst_msg :: SDoc
-    no_inst_msg
+    (invis_bits, no_inst_msg)
       | lead_with_ambig
-      = pprTcSolverReportMsg ctxt $ AmbiguityPreventsSolvingCt item (ambig_kvs, ambig_tvs)
+      = (Set.empty, pprTcSolverReportMsg ctxt $ AmbiguityPreventsSolvingCt item (ambig_kvs, ambig_tvs))
       | otherwise
-      = pprMismatchMsg ctxt $ CouldNotDeduce useful_givens (item :| []) Nothing
+      = let mismatch = CouldNotDeduce useful_givens (item :| []) Nothing mb_HasField_msg
+        in
+          ( mismatchInvisibleBits mismatch
+          , pprMismatchMsg ctxt mismatch
+          )
 
     -- Report "potential instances" only when the constraint arises
     -- directly from the user's use of an overloaded function
@@ -4184,17 +4347,19 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
                    , text "does not provide the constraint" <+> pprParendType pred ])
       | otherwise = Nothing
 
-    extra_note | any isFunTy (filterOutInvisibleTypes (classTyCon clas) tys)
-               = text "(maybe you haven't applied a function to enough arguments?)"
-               | className clas == typeableClassName  -- Avoid mysterious "No instance for (Typeable T)
-               , [_,ty] <- tys                        -- Look for (Typeable (k->*) (T k))
-               , Just (tc,_) <- tcSplitTyConApp_maybe ty
-               , not (isTypeFamilyTyCon tc)
-               = hang (text "GHC can't yet do polykinded")
-                    2 (text "Typeable" <+>
-                       parens (ppr ty <+> dcolon <+> ppr (typeKind ty)))
-               | otherwise
-               = empty
+    extra_note
+      | Just {} <- mb_HasField_msg
+      = empty
+
+      -- Flag up partially applied uses of (->)
+      | any isFunTy (filterOutInvisibleTypes (classTyCon clas) tys)
+      = text "(maybe you haven't applied a function to enough arguments?)"
+
+      | otherwise
+      = empty
+
+    ----------- Possible fixes ----------------
+    ctxt_fixes = ctxtFixes ctxt has_ambigs pred
 
     drv_fixes = case orig of
                    DerivOrigin standalone             -> [drv_fix standalone]
@@ -4213,9 +4378,9 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
     -- superclass constraints caught by the subtleties described by
     -- Note [Recursive superclasses] in GHC.TyCl.Instance
     naked_sc_fixes
-      | ScOrigin _ NakedSc <- orig  -- A superclass wanted with no instance decls used yet
-      , any non_tyvar_preds useful_givens  -- Some non-tyvar givens
-      = [vcat [ text "If the constraint looks soluble from a superclass of the instance context,"
+      | ScOrigin IsClsInst NakedSc <- orig  -- A superclass wanted with no instance decls used yet
+      , any non_tyvar_preds useful_givens   -- Some non-tyvar givens
+      = [vcat [ text "if the constraint looks soluble from a superclass of the instance context,"
               , text "read 'Undecidable instances and loopy superclasses' in the user manual" ]]
       | otherwise = []
 
@@ -4228,7 +4393,7 @@ pprTcSolverReportMsg ctxt@(CEC {cec_encl = implics})
                              Just (_, tys) -> not (all isTyVarTy tys)
                              Nothing       -> False
 
-pprTcSolverReportMsg (CEC {cec_encl = implics}) (OverlappingInstances item matches unifiers) =
+pprTcSolverReportMsg ctxt (OverlappingInstances item matches unifiers) =
   vcat
     [ addArising ct_loc $
         (text "Overlapping instances for"
@@ -4246,7 +4411,7 @@ pprTcSolverReportMsg (CEC {cec_encl = implics}) (OverlappingInstances item match
        -- simply report back the whole given
        -- context. Accelerate Smart.hs showed this problem.
          sep [ text "There exists a (perhaps superclass) match:"
-             , nest 2 (vcat (pp_givens useful_givens))]
+             , nest 2 (vcat (pp_from_givens useful_givens))]
 
     ,  ppWhen (null $ NE.tail matches) $
        parens (vcat [ ppUnless (null tyCoVars) $
@@ -4266,12 +4431,11 @@ pprTcSolverReportMsg (CEC {cec_encl = implics}) (OverlappingInstances item match
                ])]
   where
     ct_loc          = errorItemCtLoc item
-    orig            = ctLocOrigin ct_loc
     pred            = errorItemPred item
     (clas, tys)     = getClassPredTys pred
     tyCoVars        = tyCoVarsOfTypesList tys
     famTyCons       = filter isFamilyTyCon $ concatMap (nonDetEltsUniqSet . tyConsOfType) tys
-    useful_givens   = discardProvCtxtGivens orig (getUserGivensFromImplics implics)
+    useful_givens   = getUsefulGivens ctxt item
     matching_givens = mapMaybe matchable useful_givens
     matchable implic@(Implic { ic_given = evvars, ic_info = skol_info })
       = case ev_vars_matching of
@@ -4355,11 +4519,8 @@ pprCannotUnifyVariableReason ctxt
       vcat (map (tyvar_binding . tidyTyCoVarOcc (cec_tidy ctxt))
                 (tv:tvs))
     tyvar_binding tyvar = ppr tyvar <+> dcolon <+> ppr (tyVarKind tyvar)
-pprCannotUnifyVariableReason ctxt (DifferentTyVars tv_info)
-  = pprTyVarInfo ctxt tv_info
-pprCannotUnifyVariableReason ctxt (RepresentationalEq tv_info mb_coercible_msg)
-  = pprTyVarInfo ctxt tv_info
-  $$ maybe empty pprCoercibleMsg mb_coercible_msg
+pprCannotUnifyVariableReason ctxt (DifferentTyVars tv_info coercible_msgs)
+  = pprTyVarInfo ctxt tv_info $$ pprCoercibleMsgs coercible_msgs
 
 pprUntouchableVariable :: TcTyVar -> Implication -> SDoc
 pprUntouchableVariable tv (Implic { ic_given = given, ic_info = skol_info, ic_env = env })
@@ -4368,6 +4529,44 @@ pprUntouchableVariable tv (Implic { ic_given = given, ic_info = skol_info, ic_en
         , nest 2 $ text "bound by" <+> ppr skol_info
         , nest 2 $ text "at" <+> ppr (getCtLocEnvLoc env) ]
 
+-- | Which invisible bits of types should be displayed to the user when
+-- rendering a 'MismatchMsg'?
+--
+-- See Note [Showing invisible bits of types in error messages] in GHC.Tc.Errors.Ppr.
+mismatchInvisibleBits :: MismatchMsg -> InvisibleBits
+mismatchInvisibleBits
+  (BasicMismatch { mismatch_item = item
+                 , mismatch_ty1  = ty1
+                 , mismatch_ty2  = ty2
+                 , mismatch_whenMatching = mb_match_txt })
+   = invis_bits1 S.<> invis_bits2
+   where
+      orig   = errorItemOrigin item
+      invis_bits1 = shouldPprWithInvisibleBits ty1 ty2 orig
+      invis_bits2 =
+        case mb_match_txt of
+        Nothing -> Set.empty
+        Just (WhenMatching cty1 cty2 sub_o _) ->
+          shouldPprWithInvisibleBits cty1 cty2 sub_o
+mismatchInvisibleBits
+  (TypeEqMismatch { teq_mismatch_item     = item
+                  , teq_mismatch_ty1      = ty1
+                  , teq_mismatch_ty2      = ty2 })
+  = shouldPprWithInvisibleBits ty1 ty2 (errorItemOrigin item)
+mismatchInvisibleBits (CouldNotDeduce { cnd_ea = mb_ea })
+  = case mb_ea of
+      Nothing -> Set.empty
+      Just (CND_ExpectedActual _ ty1 ty2) ->
+        mayLookIdentical ty1 ty2
+
+-- | Turn a 'MismatchMsg' into an 'SDoc'.
+--
+-- Use 'mismatchInvisibleBits' to compute which invisible bits should be
+-- displayed to the user when rendering this 'SDoc'.
+--
+-- (NB: this function doesn't directly update the 'SDocContext' because the
+-- returned 'SDoc' might only be part of a larger 'SDoc', and we likely want the
+-- entire larger message to have an updated 'SDocContext'.)
 pprMismatchMsg :: SolverReportErrCtxt -> MismatchMsg -> SDoc
 pprMismatchMsg ctxt
   (BasicMismatch { mismatch_ea   = ea
@@ -4377,9 +4576,11 @@ pprMismatchMsg ctxt
                  , mismatch_whenMatching = mb_match_txt
                  , mismatch_mb_same_occ  = same_occ_info })
   =  vcat [ addArising (errorItemCtLoc item) msg
+          , pprQCOriginExtra item
           , ea_extra
           , maybe empty (pprWhenMatching ctxt) mb_match_txt
-          , maybe empty pprSameOccInfo same_occ_info ]
+          , maybe empty pprSameOccInfo same_occ_info
+          ]
   where
     msg
       | (isLiftedRuntimeRep ty1 && isUnliftedRuntimeRep ty2) ||
@@ -4414,7 +4615,7 @@ pprMismatchMsg ctxt
       = case ea of
          NoEA        -> (False, empty)
          EA mb_extra -> (True , maybe empty (pprExpectedActualInfo ctxt) mb_extra)
-    is_repr = case errorItemEqRel item of { ReprEq -> True; NomEq -> False }
+    is_repr = errorItemEqRel item == ReprEq
 
     what = levelString (ctLocTypeOrKind_maybe (errorItemCtLoc item) `orElse` TypeLevel)
 
@@ -4429,9 +4630,11 @@ pprMismatchMsg ctxt
                   , teq_mismatch_actual   = act   --   the mis-match
                   , teq_mismatch_what     = mb_thing
                   , teq_mb_same_occ       = mb_same_occ })
-  = addArising ct_loc $
-    pprWithInvisibleBitsWhen ppr_invis_bits msg
-    $$ maybe empty pprSameOccInfo mb_same_occ
+  = vcat [ addArising ct_loc $
+             vcat [ msg
+                  , maybe empty pprSameOccInfo mb_same_occ
+                  ]
+         , pprQCOriginExtra item ]
   where
 
     msg | Just (torc, rep) <- sORTKind_maybe exp
@@ -4451,12 +4654,14 @@ pprMismatchMsg ctxt
       -- bale_out_msg: the mismatched types are /inside/ exp and act
     bale_out_msg = vcat errs
       where
-        errs = case mk_ea_msg ctxt Nothing level orig of
-                  Left ea_info -> pprMismatchMsg ctxt mismatch_err
-                                : map (pprExpectedActualInfo ctxt) ea_info
-                  Right ea_err -> [ pprMismatchMsg ctxt mismatch_err
-                                  , ea_err ]
         mismatch_err = mkBasicMismatchMsg NoEA item ty1 ty2
+        ppr_mismatch_err = pprMismatchMsg ctxt mismatch_err
+        errs =
+          case mk_ea_msg ctxt Nothing level orig of
+            Left ea_info -> ppr_mismatch_err
+                          : map (pprExpectedActualInfo ctxt) ea_info
+            Right ea_err -> [ ppr_mismatch_err
+                            , ea_err ]
 
       -- 'expected' is (TYPE rep) or (CONSTRAINT rep)
     msg_for_exp_sort exp_torc exp_rep
@@ -4496,7 +4701,6 @@ pprMismatchMsg ctxt
     ct_loc = errorItemCtLoc item
     orig   = errorItemOrigin item
     level  = ctLocTypeOrKind_maybe ct_loc `orElse` TypeLevel
-    ppr_invis_bits = shouldPprWithInvisibleBits ty1 ty2 orig
 
     num_args_msg = case level of
       KindLevel
@@ -4545,47 +4749,69 @@ pprMismatchMsg ctxt
 
     starts_with_vowel (c:_) = c `elem` ("AEIOU" :: String)
     starts_with_vowel []    = False
-
-pprMismatchMsg ctxt (CouldNotDeduce useful_givens (item :| others) mb_extra)
-  = main_msg $$
-     case supplementary of
-      Left infos
-        -> vcat (map (pprExpectedActualInfo ctxt) infos)
-      Right other_msg
-        -> other_msg
+pprMismatchMsg ctxt
+  (CouldNotDeduce { cnd_user_givens = useful_givens
+                  , cnd_wanted = item :| others
+                  , cnd_ea = mb_ea
+                  , cnd_noBuiltin_msg = mb_NoBuiltin_msg
+                  })
+  = vcat [ main_msg
+         , maybe empty pprNoBuiltinInstanceMsg mb_NoBuiltin_msg
+         , pprQCOriginExtra item
+         , ea_supplementary ]
   where
     main_msg
-      | null useful_givens
-      = addArising ct_loc (no_instance_msg <+> missing)
-      | otherwise
-      = vcat (addArising ct_loc (no_deduce_msg <+> missing)
-              : pp_givens useful_givens)
+      | null useful_givens = addArising ct_loc no_instance_msg
+      | otherwise          = vcat ( addArising ct_loc no_deduce_msg
+                                  : pp_from_givens useful_givens)
 
-    supplementary = case mb_extra of
-      Nothing
-        -> Left []
-      Just (CND_Extra level ty1 ty2)
-        -> mk_supplementary_ea_msg ctxt level ty1 ty2 orig
+    ea_supplementary
+      | Just (CND_ExpectedActual level ty1 ty2) <- mb_ea
+      = mk_supplementary_ea_msg ctxt level ty1 ty2 orig
+      | Just (InsolubleFunDepReason is_top) <- ei_m_reason item
+      = case is_top of
+          True  -> text "Insoluble functional dependencies wrt top-level instances"
+          False -> text "Insoluble functional dependencies wrt other constraints"
+      | otherwise
+      = empty
+
     ct_loc = errorItemCtLoc item
     orig   = ctLocOrigin ct_loc
     wanteds = map errorItemPred (item:others)
 
     no_instance_msg =
       case wanteds of
-        [wanted] | Just (tc, _) <- splitTyConApp_maybe wanted
-                 -- Don't say "no instance" for a constraint such as "c" for a type variable c.
-                 , isClassTyCon tc -> text "No instance for"
-        _ -> text "Could not solve:"
+        [wanted] | -- Guard: don't say "no instance" for a constraint
+                   -- such as "c" for a type variable c.
+                   Just (tc, _) <- splitTyConApp_maybe wanted
+                 , isClassTyCon tc
+                 -> text "No instance for" <+> quotes (ppr wanted)
+        _        -> text "Could not solve:" <+> pprTheta wanteds
 
     no_deduce_msg =
       case wanteds of
-        [_wanted] -> text "Could not deduce"
-        _         -> text "Could not deduce:"
+        [wanted] -> text "Could not deduce" <+> quotes (ppr wanted)
+        _        -> text "Could not deduce:" <+> pprTheta wanteds
 
-    missing =
-      case wanteds of
-        [wanted] -> quotes (ppr wanted)
-        _        -> pprTheta wanteds
+pprQCOriginExtra :: ErrorItem -> SDoc
+-- When we were originally trying to solve a quantified constraint like
+--    (forall a. Eq a => Eq (c a))
+-- add a note to say so, so the overall error looks like
+--    Cannot deduce Eq (c a)
+--       from (Eq a)
+--    when trying to solve (forall a. Eq a => Eq (c a))
+-- Without this, the error is very inscrutable
+-- See (WFA3) in Note [Solving a Wanted forall-constraint],
+--            in GHC.Tc.Solver.Solve
+pprQCOriginExtra item
+  | ScOrigin (IsQC pred orig) _ <- orig
+  = hang (text "When trying to solve the quantified constraint")
+       2 (vcat [ ppr pred
+               , text "arising from" <+> pprCtOriginBriefly orig ])
+  | otherwise
+  = empty
+  where
+    orig = ctLocOrigin (errorItemCtLoc item)
 
 pprKindMismatchMsg :: TypedThing -> Type -> Type -> SDoc
 pprKindMismatchMsg thing exp act
@@ -4610,49 +4836,118 @@ pprKindMismatchMsg thing exp act
 -- a visible equality, check the expected/actual types to see if the types
 -- have equal visible components. If the 'CtOrigin' is
 -- not a 'TypeEqOrigin', fall back on the actual mismatched types themselves.
-shouldPprWithInvisibleBits :: Type -> Type -> CtOrigin -> Bool
-shouldPprWithInvisibleBits _ty1 _ty2 (TypeEqOrigin { uo_actual = act
-                                                   , uo_expected = exp
-                                                   , uo_visible = vis })
-  | not vis   = True                  -- See tests T15870, T16204c
-  | otherwise = mayLookIdentical act exp   -- See tests T9171, T9144.
+shouldPprWithInvisibleBits :: Type -> Type -> CtOrigin -> Set InvisibleBit
+shouldPprWithInvisibleBits ty1 ty2
+  eq@(TypeEqOrigin { uo_actual = act, uo_expected = exp })
+  = mconcat
+      [ maybe Set.empty Set.singleton $ invisibleOrigin_maybe eq
+        -- Heuristic: if 'ty1 ~ ty2' arose from an invisible kind argument, e.g.
+        -- 'T @{ty1} a ~ T @{ty2} b', then pretty-print the expected/actual types
+        -- with explicit kinds.
+        --
+        -- This is helpful in some cases, see e.g. tests T15870, T16204c.
+        --
+        -- TODO: remove this logic after tackling #26468.
+
+      , mayLookIdentical act exp
+        -- See tests T9171, T9144.
+
+      , mayLookIdentical ty1 ty2
+      ]
+shouldPprWithInvisibleBits ty1 ty2
+  eq@(KindEqOrigin act exp orig _)
+  = mconcat
+      [ maybe Set.empty Set.singleton $ invisibleOrigin_maybe eq
+      , mayLookIdentical act exp
+      , shouldPprWithInvisibleBits ty1 ty2 orig
+      ]
 shouldPprWithInvisibleBits ty1 ty2 _ct
   = mayLookIdentical ty1 ty2
 
+pprWithLinearTypes :: SDoc -> SDoc
+pprWithLinearTypes =
+  updSDocContext $ \ctx -> ctx { sdocLinearTypes = True }
+
 {- Note [Showing invisible bits of types in error messages]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-It can be terribly confusing to get an error message like (#9171)
+When we display a type, we usually suppress some parts of the type to avoid
+unnecessary clutter:
 
-    Couldn't match expected type ‘GetParam Base (GetParam Base Int)’
-                with actual type ‘GetParam Base (GetParam Base Int)’
+  - Kinds. Controlled by -fprint-explicit-kinds.
 
-The reason may be that the kinds don't match up.  Typically you'll get
-more useful information, but not when it's as a result of ambiguity.
+      Unless -fprint-explicit-kinds is enabled, we avoid printing
+      invisible type applications. For example, rather than:
 
-To mitigate this, when we find a type or kind mis-match:
+        (:) @Type Int tys
+        Proxy @{Nat} 3
 
-* See if normally-visible parts of the type would make the two types
-  look different.  This check is made by
-  `GHC.Core.TyCo.Compare.mayLookIdentical`
+      we display
 
-* If not, display the types with their normally-visible parts made visible,
-  by setting flags in the `SDocContext":
-  Specifically:
-    - Display kind arguments: sdocPrintExplicitKinds
-    - Don't default away runtime-reps: sdocPrintExplicitRuntimeReps,
-           which controls `GHC.Iface.Type.hideNonStandardTypes`
-  (NB: foralls are always printed by pprType, it turns out.)
+        (:) Int tys
+        Proxy 3
 
-As a result the above error message would instead be displayed as:
+  - RuntimeReps. Controlled by -fprint-explicit-runtime-reps.
 
-    Couldn't match expected type
-                  ‘GetParam @* @k2 @* Base (GetParam @* @* @k2 Base Int)’
-                with actual type
-                  ‘GetParam @* @k20 @* Base (GetParam @* @* @k20 Base Int)’
+      Unless -fprint-explicit-runtime-reps is enabled, rather than:
 
-Which makes it clearer that the culprit is the mismatch between `k2` and `k20`.
+        (#,#) :: forall {r1} {r2}. TYPE r1 -> TYPE r2 -> TYPE (TupleRep '[r1, r2])
+        ($) :: forall {r} a (b :: TYPE r). (a -> b) -> a -> b
 
-Another example of what goes wrong without this: #24553.
+      we display
+
+        (#,#) :: Type -> Type -> TYPE (TupleRep '[LiftedRep, LiftedRep])
+        ($) :: forall a b. (a -> b) -> a -> b
+
+  - Multiplicities. Controlled by -XLinearTypes.
+
+      Unless -XLinearTypes is enabled, rather than:
+
+        (a %1 -> b)
+        forall (m :: Multiplicity). a %m -> b
+
+      we display
+
+        (a -> b)
+
+To achieve this, each of these user-facing flags controls a field of
+'SDocContext', respectively:
+
+    * sdocPrintExplicitKinds
+    * sdocPrintExplicitRuntimeReps
+    * sdocLinearTypes
+
+The pretty-printer in GHC.Iface.Type then consults these when deciding how much
+to show.
+
+However, we don't want to rely on the user turning these flags on manually,
+as this can cause deeply confusing error messages. Examples:
+
+  #9171
+
+      Expected type: ‘F @k    a’
+        Actual type: ‘F @Type a’
+
+    If we hide the kinds, we get the horrible error message
+
+      Couldn't match expected type ‘F a’
+                  with actual type ‘F a’
+
+  #24553 and #26340
+
+      Expected type: ‘TYPE r’
+        Actual type: ‘Type’
+
+    If we hide RuntimeReps, we get the error message:
+
+      Couldn't match expected type ‘Type’
+                  with actual type ‘Type’
+
+To avoid these deeply confusing error messages, when we pretty-print a type
+mismatch (e.g. in 'pprTcSolverReportMsg'), we first call 'mayLookIdentical',
+which computes which normally-invisible parts of the types should be displayed
+in order to make the types visibly distinct (if any). Then 'pprWithInvisibleBits'
+updates the SDocContext to ensure that those invisible bits are shown to the user,
+even when the user hasn't manually set e.g. -fprint-explicit-kinds.
 -}
 
 {- *********************************************************************
@@ -4745,7 +5040,7 @@ potentials_msg_with_options
 
     name_in_scope name
       | pretendNameIsInScope name
-      = True -- E.g. (->); see Note [pretendNameIsInScope] in GHC.Builtin.Names
+      = True -- E.g. (->); see Note [pretendNameIsInScope] in GHC.Builtin.KnownKeys
       | Just mod <- nameModule_maybe name
       = qual_in_scope (qualName sty mod Nothing (nameOccName name))
       | otherwise
@@ -4864,22 +5159,184 @@ pprExpectedActualInfo _
       , text "Expected type:" <+> ppr exp
       , text "  Actual type:" <+> ppr act ]
 
+pprCoercibleMsgs :: [CoercibleMsg] -> SDoc
+pprCoercibleMsgs = \case
+  [] -> empty
+  [msg] -> bullet <+> (note $ pprCoercibleMsg msg)
+  msgs ->
+    let sorted_msgs = sortOn msg_prio msgs
+    in
+      bullet <+> text "Note:" $$
+      nest 2 (vcat $ map ((<> dot) . (bullet <+>) . pprCoercibleMsg) sorted_msgs)
+  where
+    -- Print the messages with a given priority order
+    msg_prio :: CoercibleMsg -> Int
+    msg_prio = \case
+      OutOfScopeNewtypeConstructor {} -> 0 -- highest priority; print first
+      TyConIsAbstract {} -> 1
+      UnknownRoles {} -> 2
+      StuckDataFamApps {} -> 3
+      TyConHasRoleInArgs {} -> 4           -- lowest priority; print last
+
+
 pprCoercibleMsg :: CoercibleMsg -> SDoc
 pprCoercibleMsg (UnknownRoles ty) =
-  note $ "We cannot know what roles the parameters to" <+> quotes (ppr ty) <+> "have;" $$
-           "we must assume that the role is nominal"
+  "We cannot know what roles the parameters to" <+> quotes (ppr ty) <+> "have;" $$
+    "we must assume that the role is nominal"
+pprCoercibleMsg (TyConHasRoleInArgs role tc args)
+  = vcat [ role_msg, oversat_msg ]
+  where
+    (oversat_args, normal_args) = partition (> tyConArity tc) $ NE.toList args
+    role_msg = case NE.nonEmpty normal_args of
+      Nothing -> empty
+      Just neArgs ->
+        "The type constructor" <+> quotes (pprSourceTyCon tc)
+        <+> "has" <+> ppr role <+> "role in its" <+> ppr_args neArgs
+    oversat_msg = case NE.nonEmpty oversat_args of
+      Nothing -> empty
+      Just neArgs ->
+        "The type constructor" <+> quotes (pprSourceTyCon tc) <+> "is oversaturated;" $$
+        "we must assume that the" <+> ppr_args neArgs
+          <+> hasOrHave (NE.toList neArgs) <+> "nominal role."
+    ppr_args neArgs =
+      fsep (punctuateFinal comma (text " and") (map speakNth (NE.init neArgs)))
+        <+> speakNth (NE.last neArgs)
+        <+> "argument" <> plural (NE.toList neArgs)
 pprCoercibleMsg (TyConIsAbstract tc) =
-  note $ "The type constructor" <+> quotes (pprSourceTyCon tc) <+> "is abstract"
-pprCoercibleMsg (OutOfScopeNewtypeConstructor tc dc) =
-  hang (text "The data constructor" <+> quotes (ppr $ dataConName dc))
-    2 (sep [ text "of newtype" <+> quotes (pprSourceTyCon tc)
-           , text "is not in scope" ])
+  "The type constructor" <+> quotes (pprSourceTyCon tc) <+> "is abstract"
+pprCoercibleMsg (StuckDataFamApps tc tyss) =
+  "The data family application" <> plural (NE.toList tyss)
+        <+> fsep (punctuateFinal comma (text " and") (map ppr_one (NE.init tyss)))
+        <+> ppr_one (NE.last tyss)
+    <+> doOrDoes (NE.toList tyss) <+> "not reduce"
+  where
+    ppr_one tys = quotes (ppr (mkTyConApp tc tys))
+pprCoercibleMsg (OutOfScopeNewtypeConstructor dc import_suggs) =
+  -- If we don't have any suggestions for bringing the newtype constructor
+  -- into scope, perhaps it is a deliberately opaque newtype (#25949),
+  -- so give a slightly different error message to reflect that.
+  --
+  -- NB: the hints get displayed separately, using coercibleMsgHints,
+  -- so don't display them here.
+  if null import_suggs
+  then
+    text "The type" <+> quotes (pprSourceTyCon tc)
+      <+> text "is an opaque newtype, whose constructor is hidden"
+  else
+    hang (text "The data constructor" <+> quotes (ppr dc))
+      2 (sep [ text "of newtype" <+> quotes (pprSourceTyCon tc)
+             , text "is not in scope" ])
+  where
+    tc = dataConTyCon dc
+
+pprNoBuiltinInstanceMsg :: NoBuiltinInstanceMsg -> SDoc
+pprNoBuiltinInstanceMsg = \case
+  NoBuiltinHasFieldMsg msg -> pprHasFieldMsg msg
+  NoBuiltinTypeableMsg msg -> pprTypeableMsg msg
+
+pprHasFieldMsg :: HasFieldMsg -> SDoc
+pprHasFieldMsg = \case
+  NotALiteralFieldName ty ->
+    text "NB:" <+> quotes (ppr ty) <+> what
+      where
+        what
+          | Just {} <- getCastedTyVar_maybe ty
+          = text "is a type variable, not a string literal."
+          | otherwise
+          = text "is not a string literal."
+  NotARecordType ty ->
+    text "NB:" <+> quotes (ppr ty) <+> text "is not a record type."
+  OutOfScopeField tc fld _import_suggs ->
+    text "NB: the record field" <+> quotes (ppr fld) <+> text "of" <+> quotes (ppr tc) <+> text "is out of scope."
+  FieldTooFancy tc fld rea ->
+    case rea of
+      FieldHasExistential ->
+        text "NB: the record field" <+> quotes (ppr fld) <+> text "of" <+> quotes (ppr tc) <+> text "contains existential variables."
+      FieldHasForAlls ->
+        text "NB: the field type of the record field" <+> quotes (ppr fld) <+> text "of" <+> quotes (ppr tc) <+> text "is not a mono-type."
+  CustomHasField custom_hasField ->
+    text "NB:" <+> quotes (ppr custom_hasField) <+> text "is not the built-in"
+      <+> quotes (text "HasField") <+> text "class."
+  SuggestSimilarFields (Just (tc, rep_tc)) fld suggs pat_syns _imp_suggs ->
+    vcat
+      [   text "NB:" <+> quotes (ppr tc)
+      <+> text "does not have a record field named"
+      <+> quotes (ppr fld) <> dot
+      , pprHasFieldPatSynMsg fld pat_syns
+      , pprSameNameOtherTyCons (mapMaybe same_name_diff_tc suggs)
+        -- NB: The actual suggestions are dealt with by
+        -- GHC.Tc.Errors.hasFieldMsgHints. The logic here just covers
+        -- information for which there is no actionable hint.
+      ]
+    where
+      same_name_diff_tc (rep_tc', fld') = do
+        let occ = case fld' of
+                     SimilarName n -> getOccString n
+                     SimilarRdrName n _ _ -> occNameString $ rdrNameOcc n
+        guard $
+          rep_tc' /= rep_tc
+            &&
+          (fld == FieldLabelString (packHText occ))
+        return rep_tc'
+  SuggestSimilarFields Nothing fld _suggs pat_syns _imp_suggs ->
+    pprHasFieldPatSynMsg fld pat_syns
+    -- Most of the error message only makes sense when we know the TyCon.
+    -- In this "unknown TyCon" case, we only have:
+    --   - the "PatSyns don't give HasField instances" message
+    --   - the hints, which are handled separately (see 'hasFieldMsgHints').
+
+pprSameNameOtherTyCons :: [TyCon] -> SDoc
+pprSameNameOtherTyCons [] = empty
+pprSameNameOtherTyCons tcs =
+  other_types_have <+> text "a field of this name:"
+    <+> pprWithCommas (quotes . ppr) tcs <> dot
+  where
+    other_types_have :: SDoc
+    other_types_have = case tcs of
+      _:_:_ -> "Other types have"
+      _     -> "Another type has"
+
+pprHasFieldPatSynMsg :: FieldLabelString -> [(PatSyn, SimilarName)] -> SDoc
+pprHasFieldPatSynMsg fld pat_syns =
+  if any same_name pat_syns
+  then
+    text "Pattern synonym record fields do not contribute"
+      <+> quotes (text "HasField") <+> text "instances."
+  else empty
+  where
+    same_name (_,nm) =
+      let occ = case nm of
+                  SimilarName n -> getOccString n
+                  SimilarRdrName n _ _ -> occNameString $ rdrNameOcc n
+      in
+        packHText occ == field_label fld
+
+pprTypeableMsg :: TypeableMsg -> SDoc
+pprTypeableMsg = \case
+    NoTypeableForPolytype ty ->
+      ppr_is ty "a polymorphic type"
+    NoTypeableForQualifiedType ty ->
+      ppr_is ty "a qualified type"
+    NoTypeableForUnboxedSumType ty ->
+      ppr_is ty "an unboxed sum type"
+    NoTypeableForUnreducedTypeFamilyApplication ty ->
+      ppr_is ty "an unreduced type family application"
+    NoTypeableForTyConWithNonTypeableKind ty k ->
+      vcat
+        [ text "NB:" <+> "The kind of" <+> quotes (ppr ty)
+        , nest 2 (quotes (ppr k)) <+> "contains foralls,"
+        , "for which the built-in"
+          <+> quotes (text "Typeable") <+> text "solver cannot produce evidence." ]
+  where
+    ppr_is ty reason =
+      text "NB:" <+> quotes (ppr ty) <+> text "is" <+> text reason
+        $$ "for which the built-in"
+        <+> quotes (text "Typeable") <+> text "solver cannot produce evidence."
 
 pprWhenMatching :: SolverReportErrCtxt -> WhenMatching -> SDoc
 pprWhenMatching ctxt (WhenMatching cty1 cty2 sub_o mb_sub_t_or_k) =
   sdocOption sdocPrintExplicitCoercions $ \printExplicitCoercions ->
-    if printExplicitCoercions
-       || not (cty1 `pickyEqType` cty2)
+    if printExplicitCoercions || not (cty1 `pickyEqType` cty2)
       then vcat [ hang (text "When matching" <+> sub_whats)
                       2 (vcat [ ppr cty1 <+> dcolon <+>
                                ppr (typeKind cty1)
@@ -4890,10 +5347,7 @@ pprWhenMatching ctxt (WhenMatching cty1 cty2 sub_o mb_sub_t_or_k) =
   where
     sub_t_or_k = mb_sub_t_or_k `orElse` TypeLevel
     sub_whats  = text (levelString sub_t_or_k) <> char 's'
-    supplementary =
-      case mk_supplementary_ea_msg ctxt sub_t_or_k cty1 cty2 sub_o of
-        Left infos -> vcat $ map (pprExpectedActualInfo ctxt) infos
-        Right msg  -> msg
+    supplementary = mk_supplementary_ea_msg ctxt sub_t_or_k cty1 cty2 sub_o
 
 pprTyVarInfo :: SolverReportErrCtxt -> TyVarInfo -> SDoc
 pprTyVarInfo ctxt (TyVarInfo { thisTyVar = tv1, otherTy = mb_tv2, thisTyVarIsUntouchable = mb_implic })
@@ -5094,8 +5548,9 @@ tcSolverReportMsgHints ctxt = \case
     -> noHints
   CannotUnifyVariable mismatch_msg rea
     -> mismatchMsgHints ctxt mismatch_msg ++ cannotUnifyVariableHints rea
-  Mismatch { mismatchMsg = mismatch_msg }
+  Mismatch { mismatchMsg = mismatch_msg, mismatchCoercibleInfo = coercible_msgs }
     -> mismatchMsgHints ctxt mismatch_msg
+    ++ concatMap coercibleMsgHints coercible_msgs
   FixedRuntimeRepError {}
     -> noHints
   ExpectingMoreArguments {}
@@ -5104,8 +5559,8 @@ tcSolverReportMsgHints ctxt = \case
     -> noHints
   AmbiguityPreventsSolvingCt {}
     -> noHints
-  CannotResolveInstance {}
-    -> noHints
+  CannotResolveInstance { cannotResolve_noBuiltinMsg = mb_noBuiltin }
+    -> maybe noHints noBuiltinInstanceHints mb_noBuiltin
   OverlappingInstances {}
     -> noHints
   UnsafeOverlap {}
@@ -5113,10 +5568,56 @@ tcSolverReportMsgHints ctxt = \case
   MultiplicityCoercionsNotSupported {}
    -> noHints
 
+noBuiltinInstanceHints :: NoBuiltinInstanceMsg -> [GhcHint]
+noBuiltinInstanceHints = \case
+  NoBuiltinHasFieldMsg noHasFieldMsg -> hasFieldMsgHints noHasFieldMsg
+  NoBuiltinTypeableMsg _             -> noHints
+
+hasFieldMsgHints :: HasFieldMsg -> [GhcHint]
+hasFieldMsgHints = \case
+  NotALiteralFieldName {} -> noHints
+  NotARecordType {}       -> noHints
+  FieldTooFancy {}        -> noHints
+  SuggestSimilarFields mb_orig_tc orig_fld suggs _patsyns imp_suggs ->
+    map (ImportSuggestion fld_occ) imp_suggs ++ similar_suggs
+    where
+      fld_occ = mkVarOccFS $ mkFastStringShortText $ field_label orig_fld
+      similar_suggs =
+        case NE.nonEmpty $ filter different_name suggs of
+          Nothing -> noHints
+          Just neSuggs ->
+            case mb_orig_tc of
+              Just (orig_tc, orig_rep_tc) ->
+                -- We know the parent TyCon
+                [SuggestSimilarSelectors orig_tc orig_rep_tc orig_fld neSuggs]
+              Nothing ->
+                -- We don't know the parent TyCon
+                [ SuggestSimilarNames
+                    (mkRdrUnqual fld_occ)
+                    (fmap snd neSuggs)
+                ]
+      different_name ( _, nm ) =
+        let occ = case nm of
+                    SimilarName n -> getOccString n
+                    SimilarRdrName n _ _ -> occNameString $ rdrNameOcc n
+        in
+          orig_fld /= FieldLabelString (packHText occ)
+  OutOfScopeField _tc fld import_suggs ->
+    map (ImportSuggestion (nameOccName $ flSelector fld)) import_suggs
+  CustomHasField {} -> noHints
+
 mismatchMsgHints :: SolverReportErrCtxt -> MismatchMsg -> [GhcHint]
 mismatchMsgHints ctxt msg =
+  mismatchMsgHasFieldHints msg ++
   maybeToList [ hint | (exp,act) <- mismatchMsg_ExpectedActuals msg
                      , hint <- suggestAddSig ctxt exp act ]
+
+mismatchMsgHasFieldHints :: MismatchMsg -> [GhcHint]
+mismatchMsgHasFieldHints
+  (CouldNotDeduce { cnd_noBuiltin_msg = mb_noBuiltin }) =
+    maybe noHints noBuiltinInstanceHints mb_noBuiltin
+mismatchMsgHasFieldHints (BasicMismatch{}) = []
+mismatchMsgHasFieldHints (TypeEqMismatch{}) = []
 
 mismatchMsg_ExpectedActuals :: MismatchMsg -> Maybe (Type, Type)
 mismatchMsg_ExpectedActuals = \case
@@ -5124,11 +5625,10 @@ mismatchMsg_ExpectedActuals = \case
     Just (exp, act)
   TypeEqMismatch { teq_mismatch_expected = exp, teq_mismatch_actual = act } ->
     Just (exp,act)
-  CouldNotDeduce { cnd_extra = cnd_extra }
-    | Just (CND_Extra _ exp act) <- cnd_extra
-    -> Just (exp, act)
-    | otherwise
-    -> Nothing
+  CouldNotDeduce { cnd_ea = mb_ea } ->
+    case mb_ea of
+      Just (CND_ExpectedActual _ exp act) -> Just (exp, act)
+      Nothing -> Nothing
 
 cannotUnifyVariableHints :: CannotUnifyVariableReason -> [GhcHint]
 cannotUnifyVariableHints = \case
@@ -5138,10 +5638,17 @@ cannotUnifyVariableHints = \case
     -> noHints
   SkolemEscape {}
     -> noHints
-  DifferentTyVars {}
-    -> noHints
-  RepresentationalEq {}
-    -> noHints
+  DifferentTyVars _ coercible_msgs
+    -> concatMap coercibleMsgHints coercible_msgs
+
+coercibleMsgHints :: CoercibleMsg -> [GhcHint]
+coercibleMsgHints = \case
+  UnknownRoles {} -> []
+  TyConIsAbstract {} -> []
+  TyConHasRoleInArgs {} -> []
+  StuckDataFamApps {} -> []
+  OutOfScopeNewtypeConstructor dc import_suggs ->
+    map (ImportSuggestion (getOccName dc)) import_suggs
 
 suggestAddSig :: SolverReportErrCtxt -> TcType -> TcType -> Maybe GhcHint
 -- See Note [Suggest adding a type signature]
@@ -5230,8 +5737,8 @@ show_fixes []     = empty
 show_fixes (f:fs) = sep [ text "Possible fix:"
                         , nest 2 (vcat (f : map (text "or" <+>) fs))]
 
-ctxtFixes :: Bool -> PredType -> [Implication] -> [SDoc]
-ctxtFixes has_ambig_tvs pred implics
+ctxtFixes :: SolverReportErrCtxt -> Bool -> PredType -> [SDoc]
+ctxtFixes (CEC {cec_encl = implics}) has_ambig_tvs pred
   | not has_ambig_tvs
   , isTyVarClassPred pred   -- Don't suggest adding (Eq T) to the context, say
   , (skol:skols) <- usefulContext implics pred
@@ -5258,10 +5765,14 @@ usefulContext implics pred
   = go implics
   where
     pred_tvs = tyCoVarsOfType pred
+    go :: [Implication] -> [SkolemInfoAnon]
     go [] = []
     go (ic : ics)
-       | implausible ic = rest
-       | otherwise      = ic_info ic : rest
+       | isStaticSkolInfo (ic_info ic) = []
+         -- Stop at a static form, because all outer Givens are irrelevant
+         -- See (SF3) in Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
+       | implausible ic               = rest
+       | otherwise                    = ic_info ic : rest
        where
           -- Stop when the context binds a variable free in the predicate
           rest | any (`elemVarSet` pred_tvs) (ic_skols ic) = []
@@ -5276,8 +5787,8 @@ usefulContext implics pred
     implausible_info _                             = False
     -- Do not suggest adding constraints to an *inferred* type signature
 
-pp_givens :: [Implication] -> [SDoc]
-pp_givens givens
+pp_from_givens :: [Implication] -> [SDoc]
+pp_from_givens givens
    = case givens of
          []     -> []
          (g:gs) ->      ppr_given (text "from the context:") g
@@ -5304,12 +5815,10 @@ pprArising :: CtLoc -> SDoc
 -- Used for the main, top-level error message
 -- We've done special processing for TypeEq, KindEq, givens
 pprArising ct_loc
-  | in_generated_code = empty  -- See Note ["Arising from" messages in generated code]
   | suppress_origin   = empty
   | otherwise         = pprCtOrigin orig
   where
     orig = ctLocOrigin ct_loc
-    in_generated_code = ctLocEnvInGeneratedCode (ctLocEnv ct_loc)
     suppress_origin
       | isGivenOrigin orig = True
       | otherwise          = case orig of
@@ -5447,13 +5956,15 @@ skolsSpan skol_tvs = foldr1WithDefault noSrcSpan combineSrcSpans (map getSrcSpan
 **********************************************************************-}
 
 mk_supplementary_ea_msg :: SolverReportErrCtxt -> TypeOrKind
-                        -> Type -> Type -> CtOrigin -> Either [ExpectedActualInfo] SDoc
+                        -> Type -> Type -> CtOrigin -> SDoc
 mk_supplementary_ea_msg ctxt level ty1 ty2 orig
   | TypeEqOrigin { uo_expected = exp, uo_actual = act } <- orig
   , not (ea_looks_same ty1 ty2 exp act)
-  = mk_ea_msg ctxt Nothing level orig
+  = case mk_ea_msg ctxt Nothing level orig of
+      Left infos -> vcat $ map (pprExpectedActualInfo ctxt) infos
+      Right msg  -> msg
   | otherwise
-  = Left []
+  = empty
 
 ea_looks_same :: Type -> Type -> Type -> Type -> Bool
 -- True if the faulting types (ty1, ty2) look the same as
@@ -5482,7 +5993,9 @@ mk_ea_msg ctxt at_top level
   | Just item <- at_top
   , let  ea = EA $ if expanded_syns then Just ea_expanded else Nothing
          mismatch = mkBasicMismatchMsg ea item exp act
-  = Right (pprMismatchMsg ctxt mismatch)
+         invis_bits = mismatchInvisibleBits mismatch
+         ppr_mismatch = pprMismatchMsg ctxt mismatch
+  = Right $ pprWithInvisibleBits invis_bits ppr_mismatch
   | otherwise
   = Left $
     if expanded_syns
@@ -5759,7 +6272,7 @@ pprConversionFailReason = \case
   ImplicitParamsWithOtherBinds ->
     text "Implicit parameters mixed with other bindings"
   InvalidCCallImpent from ->
-    text (show from) <+> text "is not a valid ccall impent"
+    text (show from) <+> text "is not a valid ccall import entity"
   RecGadtNoCons ->
     quotes (text "RecGadtC") <+> text "must have at least one constructor name"
   GadtNoCons ->
@@ -5800,13 +6313,6 @@ pprWrongThingSort =
     WrongThingClass -> "class"
     WrongThingTyCon -> "type constructor"
     WrongThingAxiom -> "axiom"
-
-pprLevelCheckReason :: LevelCheckReason -> SDoc
-pprLevelCheckReason = \case
-  LevelCheckInstance _ t ->
-    text "instance for" <+> quotes (ppr t)
-  LevelCheckSplice t _ ->
-    quotes (ppr t)
 
 pprUninferrableTyVarCtx :: UninferrableTyVarCtx -> SDoc
 pprUninferrableTyVarCtx = \case
@@ -5973,9 +6479,6 @@ pprImportLookup = \case
        2 (ppr rdr)
   ImportLookupIllegal ->
     text "Illegal import item"
-  ImportLookupAmbiguous rdr gres ->
-    hang (text "Ambiguous name" <+> quotes (ppr rdr) <+> text "in import item. It could refer to:")
-       2 (vcat (map (ppr . greOccName) gres))
 
 pprUnusedImport :: ImportDecl GhcRn -> UnusedImportReason -> SDoc
 pprUnusedImport decl = \case
@@ -6001,6 +6504,8 @@ pprUnusedImport decl = \case
         case par of
           ParentIs p -> pprNameUnqualified p <> parens (ppr fld_occ)
           NoParent   -> ppr fld_occ
+      UnusedImportWildcard ns_spec ->
+        ppr ns_spec <+> text ".."
 
 pprUnusedName :: OccName -> UnusedNameProv -> SDoc
 pprUnusedName name reason =
@@ -6134,16 +6639,16 @@ suggestNonCanonicalDefinition reason =
   where
     action = case reason of
       NonCanonicalMonoid sub -> case sub of
-        NonCanonical_Sappend -> move sappendName mappendName
-        NonCanonical_Mappend -> remove mappendName sappendName
-      NonCanonicalMonad sub -> case sub of
-        NonCanonical_Pure -> move pureAName returnMName
-        NonCanonical_ThenA -> move thenAName thenMName
-        NonCanonical_Return -> remove returnMName pureAName
-        NonCanonical_ThenM -> remove thenMName thenAName
+        NonCanonical_Sappend -> move sappendClassOpOcc mappendClassOpOcc
+        NonCanonical_Mappend -> remove mappendClassOpOcc sappendClassOpOcc
+      NonCanonicalMonad sub  -> case sub of
+        NonCanonical_Pure    -> move   pureAClassOpOcc   returnMClassOpOcc
+        NonCanonical_ThenA   -> move   thenAClassOpOcc   thenMClassOpOcc
+        NonCanonical_Return  -> remove returnMClassOpOcc pureAClassOpOcc
+        NonCanonical_ThenM   -> remove thenMClassOpOcc   thenAClassOpOcc
 
-    move = SuggestMoveNonCanonicalDefinition
-    remove = SuggestRemoveNonCanonicalDefinition
+    move lhs_occ rhs_occ   = SuggestMoveNonCanonicalDefinition   lhs_occ rhs_occ
+    remove lhs_occ rhs_occ = SuggestRemoveNonCanonicalDefinition lhs_occ rhs_occ
 
     doc = case reason of
       NonCanonicalMonoid _ -> doc_monoid
@@ -6800,7 +7305,7 @@ pprInvalidAssocDefault = \case
       ppr_eqn :: SDoc
       ppr_eqn =
         quotes (text "type" <+> ppr (mkTyConApp fam_tc pat_tys)
-                <+> equals <+> text "...")
+                <+> equals <+> ellipsis)
 
       suggestion :: SDoc
       suggestion = text "The arguments to" <+> quotes (ppr fam_tc)
@@ -6967,14 +7472,15 @@ pprTHReifyError = \case
        text "No roles associated with" <+> (ppr thing)
   CannotRepresentType sort ty
     -> mkSimpleDecorated $
+       (if show_linear then pprWithLinearTypes else id) $
        hang (text "Can't represent" <+> sort_doc <+> text "in Template Haskell:")
           2 (ppr ty)
      where
-       sort_doc = text $
+       (show_linear, sort_doc) =
          case sort of
-           LinearInvisibleArgument -> "linear invisible argument"
-           CoercionsInTypes -> "coercions in types"
-           DataConVisibleForall -> "visible forall in the type of a data constructor"
+           LinearInvisibleArgument -> (True , text "linear invisible argument")
+           CoercionsInTypes        -> (False, text "coercions in types")
+           DataConVisibleForall    -> (False, text "visible forall in the type of a data constructor")
 
 pprTypedTHError :: TypedTHError -> DecoratedSDoc
 pprTypedTHError = \case
@@ -7225,9 +7731,10 @@ pprTypeSyntaxName TypeKeywordSyntax     = "keyword" <+> quotes "type"
 pprTypeSyntaxName ForallTelescopeSyntax = "forall telescope"
 pprTypeSyntaxName ContextArrowSyntax    = "context arrow (=>)"
 pprTypeSyntaxName FunctionArrowSyntax   = "function type arrow (->)"
+pprTypeSyntaxName StarKindSyntax        = "kind" <+> quotes starLit
 
 --------------------------------------------------------------------------------
--- ErrCtxt
+-- HsCtxt
 
 pprTyConInstFlavour :: TyConInstFlavour -> SDoc
 pprTyConInstFlavour
@@ -7237,10 +7744,10 @@ pprTyConInstFlavour
       }
   ) = (if is_dflt then text "default" else empty) <+> ppr flav <+> text "instance"
 
-pprErrCtxtMsg :: ErrCtxtMsg -> SDoc
-pprErrCtxtMsg = \case
-  ExprCtxt expr ->
-    hang (text "In the expression:")
+pprHsCtxt :: HsCtxt -> SDoc
+pprHsCtxt = \case
+  ExprCtxt expr
+    -> hang (text "In the expression:")
        2 (ppr (stripParensHsExpr expr))
   ThetaCtxt ctxt theta ->
     vcat [ text "In the context:" <+> pprTheta theta
@@ -7282,11 +7789,13 @@ pprErrCtxtMsg = \case
      make_lines_msg [last]  = ppr last <> dot
      make_lines_msg [l1,l2] = l1 $$ text "and" <+> l2 <> dot
      make_lines_msg (l:ls)  = l <> comma $$ make_lines_msg ls
+
   PatSigErrCtxt sig_ty res_ty ->
     vcat [ hang (text "When checking that the pattern signature:")
               4 (ppr sig_ty)
          , nest 2 (hang (text "fits the type of its context:")
-                      2 (ppr res_ty)) ]
+                      2 (ppr (getCheckExpType res_ty))) ]
+
   PatCtxt pat ->
     hang (text "In the pattern:") 2 (ppr pat)
   PatSynDeclCtxt name ->
@@ -7347,7 +7856,7 @@ pprErrCtxtMsg = \case
       full_herald = pprExpectedFunTyHerald herald
                 <+> speakNOf n_vis_args_in_call (text "visible argument")
                  -- What are "visible" arguments? See Note [Visibility and arity] in GHC.Types.Basic
-  FunResCtxt fun n_val_args res_fun res_env n_fun n_env
+  FunResCtxt fun n_val_args fun_res_ty env_ty
     | -- Check for too few args
       --  fun_tau = a -> b, res_tau = Int
       n_fun > n_env
@@ -7369,7 +7878,20 @@ pprErrCtxtMsg = \case
 
     | otherwise
     -> empty
+      -- text "Debug" <+> vcat [ppr fun, ppr n_val_args, ppr res_fun, ppr res_env, ppr n_fun, ppr n_env]
     where
+      -- See Note [Splitting nested sigma types in mismatched
+      --           function types]
+      -- env_ty is an ExpRhoTy, but with simple subsumption it
+      -- is not /deeply/ skolemised, so still use tcSplitNestedSigmaTys
+
+      (_,_,fun_tau)   = tcSplitNestedSigmaTys fun_res_ty
+      (_, _, env_tau) = tcSplitNestedSigmaTys (getCheckExpType env_ty)
+      (args_fun, res_fun) = tcSplitFunTys fun_tau
+      (args_env, res_env) = tcSplitFunTys env_tau
+      n_fun = length args_fun
+      n_env = length args_env
+
       not_fun ty   -- ty is definitely not an arrow type,
                    -- and cannot conceivably become one
         = case tcSplitTyConApp_maybe ty of
@@ -7438,17 +7960,14 @@ pprErrCtxtMsg = \case
 
   StmtErrCtxt ctxt stmt
     -- For [ e | .. ], do not mutter about "stmts"
-    | LastStmt _ e _ _ <- stmt
+    | (L _ (LastStmt _ e _ _)) <- stmt
     , isComprehensionContext ctxt
     -> hang (text "In the expression:") 2 (ppr e)
     | otherwise
     -> hang (text "In a stmt of" <+> pprAStmtContext ctxt <> colon)
-       2 (ppr_stmt stmt)
-    where
-      -- For Group and Transform Stmts, don't print the nested stmts!
-      ppr_stmt (TransStmt { trS_by = by, trS_using = using
-                          , trS_form = form }) = pprTransStmt by using form
-      ppr_stmt stmt = pprStmt stmt
+       2 (ppr_stmt (unLoc stmt))
+
+  StmtErrCtxtPat{} -> empty
 
   DerivInstCtxt pred ->
     text "When deriving the instance for" <+> parens (ppr pred)
@@ -7526,7 +8045,9 @@ pprErrCtxtMsg = \case
       text "implements signature" <+> quotes (ppr req_mod_name) <+>
       text "in" <+> quotes (ppr req_uid) <> dot
 
---------------------------------------------------------------------------------
 
-pprThBindLevel :: Set.Set ThLevelIndex -> SDoc
-pprThBindLevel levels_set = text "level" <> pluralSet levels_set <+> pprUnquotedSet levels_set
+  where
+    -- For Group and Transform Stmts, don't print the nested stmts!
+    ppr_stmt (TransStmt { trS_by = by, trS_using = using
+                        , trS_form = form }) = pprTransStmt by using form
+    ppr_stmt stmt = pprStmt stmt

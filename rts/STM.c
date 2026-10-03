@@ -134,7 +134,8 @@ static int shake(void) {
   StgTRecHeader *__t = (_t);                                                    \
   StgTRecChunk *__c = __t -> current_chunk;                                     \
   StgWord __limit = __c -> next_entry_idx;                                      \
-  TRACE("%p : FOR_EACH_ENTRY, current_chunk=%p limit=%ld", __t, __c, __limit);  \
+  TRACE("%p : FOR_EACH_ENTRY, current_chunk=%p limit=%" FMT_Word,               \
+              __t, __c, __limit);                                               \
   while (__c != END_STM_CHUNK_LIST) {                                           \
     StgWord __i;                                                                \
     for (__i = 0; __i < __limit; __i ++) {                                      \
@@ -264,7 +265,7 @@ static StgBool cond_lock_tvar(Capability *cap,
 
 static void park_tso(StgTSO *tso) {
   ASSERT(tso -> why_blocked == NotBlocked);
-  tso -> block_info.closure = (StgClosure *) END_TSO_QUEUE;
+  tso->block_info.unused = END_TSO_QUEUE;
   RELEASE_STORE(&tso -> why_blocked, BlockedOnSTM);
   TRACE("park_tso on tso=%p", tso);
 }
@@ -780,7 +781,7 @@ static StgBool validate_and_acquire_ownership (Capability *cap,
             result = false;
             BREAK_FOR_EACH;
           } else {
-            TRACE("%p : need to check version %ld", trec, e -> num_updates);
+            TRACE("%p : need to check version %" FMT_Int, trec, e->num_updates);
           }
         });
       }
@@ -815,7 +816,8 @@ static StgBool check_read_only(StgTRecHeader *trec STG_UNUSED) {
       StgTVar *s;
       s = e -> tvar;
       if (entry_is_read_only(e)) {
-        TRACE("%p : check_read_only for TVar %p, saw %ld", trec, s, e -> num_updates);
+        TRACE("%p : check_read_only for TVar %p, saw %" FMT_Int,
+              trec, s, e->num_updates);
 
         // We must first load current_value then num_updates; this is inverse of
         // the order of the stores in stmCommitTransaction.
@@ -959,6 +961,46 @@ void stmFreeAbortedTRec(Capability *cap,
   free_stg_trec_header(cap, trec);
 
   TRACE("%p : stmFreeAbortedTRec done", trec);
+}
+
+/*
+Note [catchRetry# implementation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+catchRetry# creates a nested transaction for its lhs:
+- if the lhs transaction succeeds:
+    - the lhs transaction is committed
+    - its read-variables are merged with those of the parent transaction
+    - the rhs code is ignored
+- if the lhs transaction retries:
+    - the lhs transaction is aborted
+    - its read-variables are merged with those of the parent transaction
+    - the rhs code is executed directly in the parent transaction (see #26028).
+
+So note that:
+- lhs code uses a nested transaction
+- rhs code doesn't use a nested transaction
+
+We have to take which case we're in into account (using the running_alt_code
+field of the catchRetry frame) in catchRetry's entry code, in retry#
+implementation, and also when an async exception is received (to cleanup the
+right number of transactions).
+*/
+
+/* Called when unwinding past a CATCH_RETRY_FRAME.
+ * Only aborts the transaction if we're executing the lhs (running_alt_code=0),
+ * because rhs code uses the parent transaction directly with no nested trec.
+ * See Note [catchRetry# implementation].
+ */
+void stmAbortNestedCatchRetryTransaction(Capability *cap,
+                                         StgTSO *tso,
+                                         StgCatchRetryFrame *frame) {
+  if (!frame->running_alt_code) {
+    StgTRecHeader *trec = tso->trec;
+    StgTRecHeader *outer = trec->enclosing_trec;
+    stmAbortTransaction(cap, trec);
+    stmFreeAbortedTRec(cap, trec);
+    tso->trec = outer;
+  }
 }
 
 /*......................................................................*/
@@ -1159,7 +1201,7 @@ of these false-positives causing actual issues.
 StgBool stmValidateNestOfTransactions(Capability *cap, StgTRecHeader *trec, StgBool optimistically) {
   StgTRecHeader *t;
 
-  TRACE("%p : stmValidateNestOfTransactions, %b", trec, optimistically);
+  TRACE("%p : stmValidateNestOfTransactions, %d", trec, optimistically);
   ASSERT(trec != NO_TREC);
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_WAITING) ||
@@ -1505,30 +1547,3 @@ void stmWriteTVar(Capability *cap,
 }
 
 /*......................................................................*/
-
-
-
-/*
-
-Note [catchRetry# implementation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-catchRetry# creates a nested transaction for its lhs:
-- if the lhs transaction succeeds:
-    - the lhs transaction is committed
-    - its read-variables are merged with those of the parent transaction
-    - the rhs code is ignored
-- if the lhs transaction retries:
-    - the lhs transaction is aborted
-    - its read-variables are merged with those of the parent transaction
-    - the rhs code is executed directly in the parent transaction (see #26028).
-
-So note that:
-- lhs code uses a nested transaction
-- rhs code doesn't use a nested transaction
-
-We have to take which case we're in into account (using the running_alt_code
-field of the catchRetry frame) in catchRetry's entry code, in retry#
-implementation, and also when an async exception is received (to cleanup the
-right number of transactions).
-
-*/

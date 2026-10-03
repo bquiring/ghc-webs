@@ -12,6 +12,8 @@ Target
 , tgtUnregisterised = @UnregisterisedBool@
 , tgtTablesNextToCode = @TablesNextToCodeBool@
 , tgtUseLibffiForAdjustors = @UseLibffiForAdjustorsBool@
+, tgtHasLibm = @TargetHasLibmBool@
+, tgtRTSWithLibdw = @UseLibdwMaybeLibrary@
 , tgtCCompiler = Cc {ccProgram = Program {prgPath = "@CC@", prgFlags = @CONF_CC_OPTS_STAGE2List@}}
 , tgtCxxCompiler = Cxx {cxxProgram = Program {prgPath = "@CXX@", prgFlags = @CONF_CXX_OPTS_STAGE2List@}}
 , tgtCPreprocessor = Cpp {cppProgram = Program {prgPath = "@CPPCmd@", prgFlags = @CONF_CPP_OPTS_STAGE2List@}}
@@ -25,6 +27,7 @@ Target
 , ccLinkSupportsFilelist = @LdHasFilelistBool@
 , ccLinkSupportsSingleModule = @LdHasSingleModuleBool@
 , ccLinkIsGnu = @LdIsGNULdBool@
+, ccLinkSupportsVerbatimNamespace = @LdSupportsVerbatimNamespaceBool@
 }
 
 , tgtAr = Ar
@@ -42,6 +45,7 @@ Target
 , tgtOpt = @OptCmdMaybeProg@
 , tgtLlvmAs = @LlvmAsCmdMaybeProg@
 , tgtWindres = @WindresCmdMaybeProg@
+, tgtDlltool = @DlltoolCmdMaybeProg@
 , tgtOtool = @OtoolCmdMaybeProg@
 , tgtInstallNameTool = @InstallNameToolCmdMaybeProg@
 }

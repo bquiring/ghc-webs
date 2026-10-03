@@ -5,7 +5,6 @@
 -}
 
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
 
 module GHC.Builtin.PrimOps (
         PrimOp(..), PrimOpVecCat(..), allThePrimOps,
@@ -18,7 +17,7 @@ module GHC.Builtin.PrimOps (
 
         primOpOutOfLine, primOpCodeSize,
         primOpOkForSpeculation, primOpOkToDiscard,
-        primOpIsWorkFree, primOpIsCheap, primOpFixity, primOpDocs, primOpDeprecations,
+        primOpIsWorkFree, primOpIsCheap, primOpFixity, primOpDocs, PrimOpDoc(..), primOpDeprecations,
         primOpIsDiv, primOpIsReallyInline,
 
         PrimOpEffect(..), primOpEffect,
@@ -30,10 +29,10 @@ module GHC.Builtin.PrimOps (
 
 import GHC.Prelude
 
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Types
 import GHC.Builtin.Uniques (mkPrimOpIdUnique, mkPrimOpWrapperUnique )
-import GHC.Builtin.Names ( gHC_PRIMOPWRAPPERS )
+import GHC.Builtin.Modules ( gHC_PRIMOPWRAPPERS )
 
 import GHC.Core.TyCon    ( isPrimTyCon, isUnboxedTupleTyCon, PrimRep(..) )
 import GHC.Core.Type
@@ -53,10 +52,12 @@ import GHC.Types.Unique  ( Unique )
 
 import GHC.Unit.Types    ( Unit )
 
+import GHC.Utils.Binary
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.Data.FastString
+import GHC.Data.SmallArray
 
 {-
 ************************************************************************
@@ -162,10 +163,16 @@ primOpFixity :: PrimOp -> Maybe Fixity
 *                                                                      *
 ************************************************************************
 
-See Note [GHC.Prim Docs] in GHC.Builtin.Utils
+See Note [GHC.Prim Docs] in GHC.Builtin
 -}
 
-primOpDocs :: [(FastString, String)]
+data PrimOpDoc
+  = -- | Section header with title and description
+    PrimOpSection String String
+  | -- | Documentation for a named declaration
+    PrimOpDecl FastString String
+
+primOpDocs :: [PrimOpDoc]
 #include "primop-docs.hs-incl"
 
 primOpDeprecations :: [(OccName, FastString)]
@@ -800,15 +807,22 @@ the former has an additional type binder. Hmmm....
 
 Note [Eta expanding primops]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 STG requires that primop applications be saturated. This makes code generation
 significantly simpler since otherwise we would need to define a calling
 convention for curried applications that can accommodate representation
 polymorphism.
 
-To ensure saturation, CorePrep eta expands all primop applications as
-described in Note [Eta expansion of hasNoBinding things in CorePrep] in
+To ensure saturation, CorePrep eta expands all primop applications
+as described in Note [Eta expansion of unsaturated calls] in
 GHC.Core.Prep.
+
+Side note: this decision is somewhat in flux: see comments with `hasNoBinding`.
+The question is: do we generate a trivial wrapper for each primop
+   (+#) x y = (+#) x y
+and now we can call that wrapper unsaturated.  But in practice we
+might never call it because in practice Prep eta-expands all partial
+applications!
+
 
 Historical Note:
 
@@ -929,3 +943,12 @@ primOpIsReallyInline = \case
   DataToTagSmallOp -> False
   DataToTagLargeOp -> False
   p                -> not (primOpOutOfLine p)
+
+instance Binary PrimOp where
+  get bh = (allThePrimOpsArr `indexSmallArray`) <$> get bh
+
+  put_ bh = put_ bh . primOpTag
+
+allThePrimOpsArr :: SmallArray PrimOp
+{-# NOINLINE allThePrimOpsArr #-}
+allThePrimOpsArr = listToArray (maxPrimOpTag + 1) primOpTag id allThePrimOps

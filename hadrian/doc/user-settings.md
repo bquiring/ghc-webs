@@ -19,14 +19,16 @@ A build _flavour_ is a collection of build settings that fully define a GHC buil
 data Flavour = Flavour {
     -- | Flavour name, to select this flavour from command line.
     name :: String,
-    -- | Use these command line arguments.
-    args :: Args,
+    -- | Use these extra command line arguments.
+    -- This can't depend on the result of configuring a package (ie, using readContextData)
+    extraArgs :: Args,
     -- | Build these packages.
     packages :: Stage -> Action [Package],
-    -- | Bignum backend: 'native', 'gmp', 'ffi', etc.
+    -- | Bignum backend: 'native', 'gmp', etc.
     bignumBackend :: String,
-    -- | Check selected bignum backend against native backend
-    bignumCheck :: Bool,
+    -- | Build the @text@ package with @simdutf@ support. Disabled by
+    -- default due to packaging difficulties described in #20724.
+    textWithSIMDUTF :: Bool,
     -- | Build libraries these ways.
     libraryWays :: Ways,
     -- | Build RTS these ways.
@@ -45,11 +47,18 @@ data Flavour = Flavour {
     -- | Build the GHC executable against the threaded runtime system.
     ghcThreaded :: Stage -- ^ stage of the /built/ compiler
                 -> Bool,
+
+    ghcSplitSections :: Bool, -- ^ Whether to enable split sections
     -- | Whether to build docs and which ones
     --   (haddocks, user manual, haddock manual)
     ghcDocs :: Action DocTargets,
+
+    -- | Whether to uses hashes or inplace for unit ids
+    hashUnitIds :: Bool,
+
     -- | Whether to generate .hie files
     ghcHieFiles :: Stage -> Bool
+
     }
 ```
 Hadrian provides several built-in flavours (`default`, `quick`, and a few
@@ -238,7 +247,7 @@ quickDebug = quickFlavour { name = "dbg", ghcDebugged = const True }
 ```
 
 Running `build --flavour=dbg` will build a `quick`-flavoured GHC and link
-GHC, iserv, iserv-proxy and remote-iserv against the debugged RTS, by passing
+GHC, iserv-proxy and remote-iserv against the debugged RTS, by passing
 `-debug` to the commands that link those executables.
 
 More generally, a predicate on `Stage` can be provided to specify which stages should be built debugged. For example, setting `ghcDebugged = (>= Stage2)` will build a debugged compiler at stage 2 or higher, but not stage 1.

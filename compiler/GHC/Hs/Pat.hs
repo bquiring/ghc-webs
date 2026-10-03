@@ -1,15 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
 
@@ -74,7 +65,7 @@ import GHC.Types.Basic
 import GHC.Types.SourceText
 -- others:
 import GHC.Core.Ppr ( {- instance OutputableBndr TyVar -} )
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import GHC.Types.Var
 import GHC.Types.Name.Reader
 import GHC.Core.ConLike
@@ -89,6 +80,7 @@ import Data.Data
 import qualified Data.List( map )
 
 import qualified Data.List.NonEmpty as NE
+import Language.Haskell.Syntax.Type (XPrefixCon, XInfixCon)
 
 type instance XWildPat GhcPs = NoExtField
 type instance XWildPat GhcRn = NoExtField
@@ -112,7 +104,7 @@ type instance XBangPat GhcPs = EpToken "!"
 type instance XBangPat GhcRn = NoExtField
 type instance XBangPat GhcTc = NoExtField
 
-type instance XListPat GhcPs = AnnList ()
+type instance XListPat GhcPs = (EpToken "[", EpToken "]")
   -- After parsing, ListPat can refer to a built-in Haskell list pattern
   -- or an overloaded list pattern.
 type instance XListPat GhcRn = NoExtField
@@ -122,7 +114,7 @@ type instance XListPat GhcRn = NoExtField
 type instance XListPat GhcTc = Type
   -- List element type, for use in hsPatType.
 
-type instance XTuplePat GhcPs = (EpaLocation, EpaLocation)
+type instance XTuplePat GhcPs = AnnParen
 type instance XTuplePat GhcRn = NoExtField
 type instance XTuplePat GhcTc = [Type]
 
@@ -134,7 +126,7 @@ type instance XSumPat GhcPs = EpAnnSumPat
 type instance XSumPat GhcRn = NoExtField
 type instance XSumPat GhcTc = [Type]
 
-type instance XConPat GhcPs = (Maybe (EpToken "{"), Maybe (EpToken "}"))
+type instance XConPat GhcPs = NoExtField
 type instance XConPat GhcRn = NoExtField
 type instance XConPat GhcTc = ConPatTc
 
@@ -152,7 +144,8 @@ type instance XSplicePat GhcPs = NoExtField
 type instance XSplicePat GhcRn = HsUntypedSpliceResult (Pat GhcRn) -- See Note [Lifecycle of a splice] in GHC.Hs.Expr
 type instance XSplicePat GhcTc = DataConCantHappen
 
-type instance XLitPat    (GhcPass _) = NoExtField
+type instance XLitPat     (GhcPass _) = NoExtField
+type instance XQualLitPat (GhcPass _) = NoExtField
 
 type instance XNPat GhcPs = EpToken "-"
 type instance XNPat GhcRn = EpToken "-"
@@ -183,9 +176,7 @@ type instance ConLikeP GhcPs = RdrName          -- IdOccP GhcPs
 type instance ConLikeP GhcRn = WithUserRdr Name -- IdOccP GhcRn
 type instance ConLikeP GhcTc = ConLike
 
-type instance XHsRecFields GhcPs = NoExtField
-type instance XHsRecFields GhcRn = NoExtField
-type instance XHsRecFields GhcTc = NoExtField
+type instance XHsRecFields (GhcPass p) = (EpToken "{", EpToken  "}")
 
 type instance XHsFieldBind _ = Maybe (EpToken "=")
 
@@ -196,6 +187,12 @@ type instance XInvisPat GhcPs = (EpToken "@", Specificity)
 type instance XInvisPat GhcRn = Specificity
 type instance XInvisPat GhcTc = Type
 
+type instance XModifiedPat GhcPs = NoExtField
+type instance XModifiedPat GhcRn = NoExtField
+type instance XModifiedPat GhcTc = NoExtField
+
+type instance XPrefixCon (LocatedA (Pat (GhcPass p))) = NoExtField
+type instance XInfixCon  (LocatedA (Pat (GhcPass p))) = NoExtField
 
 {- Note [Invisible binders in functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -268,13 +265,13 @@ discarded inside tcMatchPats, where we know if visible pattern retained or erase
 -- API Annotations types
 
 data EpAnnSumPat = EpAnnSumPat
-      { sumPatParens      :: (EpaLocation, EpaLocation)
+      { sumPatParens      :: AnnParen
       , sumPatVbarsBefore :: [EpToken "|"]
       , sumPatVbarsAfter  :: [EpToken "|"]
       } deriving Data
 
 instance NoAnn EpAnnSumPat where
-  noAnn = EpAnnSumPat (noAnn, noAnn) [] []
+  noAnn = EpAnnSumPat noAnn [] []
 
 -- ---------------------------------------------------------------------
 
@@ -356,7 +353,7 @@ hsRecFieldId = hsRecFieldSel
 ************************************************************************
 -}
 
-instance (Outputable arg, Outputable (XRec p (HsRecField p arg)), XRec p RecFieldsDotDot ~ LocatedE RecFieldsDotDot)
+instance (Outputable arg, Outputable (XRec p (HsRecField p arg)), XRec p RecFieldsDotDot ~ LocatedA RecFieldsDotDot)
       => Outputable (HsRecFields p arg) where
   ppr (HsRecFields { rec_flds = flds, rec_dotdot = Nothing })
         = braces (fsep (punctuate comma (map ppr flds)))
@@ -424,6 +421,7 @@ pprPat (AsPat _ name pat)       = hcat [pprPrefixOcc (unLoc name), char '@',
 pprPat (ViewPat _ expr pat)     = hcat [pprLExpr expr, text " -> ", ppr pat]
 pprPat (ParPat _ pat)           = parens (ppr pat)
 pprPat (LitPat _ s)             = ppr s
+pprPat (QualLitPat _ lit)       = ppr lit
 pprPat (NPat _ l Nothing  _)    = ppr l
 pprPat (NPat _ l (Just _) _)    = char '-' <> ppr l
 pprPat (NPlusKPat _ n k _ _ _)  = hcat [ppr_n, char '+', ppr k]
@@ -445,7 +443,7 @@ pprPat (TuplePat _ pats bx)
     -- `MkSolo x`, not `(x)`
   | [pat] <- pats
   , Boxed <- bx
-  = hcat [text (mkTupleStr Boxed dataName 1), pprParendLPat appPrec pat]
+  = hsep [text (mkTupleStr Boxed dataName 1), pprParendLPat appPrec pat]
   | otherwise
   = tupleParens (boxityTupleSort bx) (pprWithCommas ppr pats)
 pprPat (SumPat _ pat alt arity) = sumParens (pprAlternative ppr pat alt arity)
@@ -482,6 +480,7 @@ pprPat (InvisPat x tp) = char '@' <> delimit (ppr tp)
       GhcRn -> x == InferredSpec
       GhcTc -> False
     needs_parens = hsTypeNeedsParens appPrec $ unLoc $ hstp_body tp
+pprPat (ModifiedPat _ mods pat) = pprLHsModifiers mods <+> ppr pat
 
 pprPat (XPat ext) = case ghcPass @p of
   GhcRn -> case ext of
@@ -497,16 +496,16 @@ pprPat (XPat ext) = case ghcPass @p of
 pprUserCon :: (OutputableBndr con, OutputableBndrId p,
                      Outputable (Anno (IdGhcP p)))
            => con -> HsConPatDetails (GhcPass p) -> SDoc
-pprUserCon c (InfixCon p1 p2) = ppr p1 <+> pprInfixOcc c <+> ppr p2
-pprUserCon c details          = pprPrefixOcc c <+> pprConArgs details
+pprUserCon c (InfixCon _ p1 p2) = ppr p1 <+> pprInfixOcc c <+> ppr p2
+pprUserCon c details            = pprPrefixOcc c <+> pprConArgs details
 
 pprConArgs :: (OutputableBndrId p,
                      Outputable (Anno (IdGhcP p)))
            => HsConPatDetails (GhcPass p) -> SDoc
-pprConArgs (PrefixCon pats)    = fsep (map (pprParendLPat appPrec) pats)
-pprConArgs (InfixCon p1 p2)    = sep [ pprParendLPat appPrec p1
-                                     , pprParendLPat appPrec p2 ]
-pprConArgs (RecCon rpats)      = ppr rpats
+pprConArgs (PrefixCon _ pats)    = fsep (map (pprParendLPat appPrec) pats)
+pprConArgs (InfixCon _ p1 p2)    = sep [ pprParendLPat appPrec p1
+                                       , pprParendLPat appPrec p2 ]
+pprConArgs (RecCon _ rpats)      = ppr rpats
 
 {-
 ************************************************************************
@@ -518,10 +517,10 @@ pprConArgs (RecCon rpats)      = ppr rpats
 
 mkPrefixConPat :: DataCon ->
                   [LPat GhcTc] -> [Type] -> LPat GhcTc
--- Make a vanilla Prefix constructor pattern
+-- ^ Make a vanilla Prefix constructor pattern.
 mkPrefixConPat dc pats tys
   = noLocA $ ConPat { pat_con = noLocA (RealDataCon dc)
-                    , pat_args = PrefixCon pats
+                    , pat_args = PrefixCon noExtField pats
                     , pat_con_ext = ConPatTc
                       { cpt_tvs = []
                       , cpt_dicts = []
@@ -678,8 +677,10 @@ isIrrefutableHsPat is_strict irref_conLike pat = go (unLoc pat)
                            =  irref_conLike con
                            && all goL (hsConPatArgs details)
     go (LitPat {})         = False
+    go (QualLitPat {})     = False
     go (NPat {})           = False
     go (NPlusKPat {})      = False
+    go (ModifiedPat _ _ pat) = goL pat
 
     -- We conservatively assume that no TH splices are irrefutable
     -- since we cannot know until the splice is evaluated.
@@ -753,11 +754,13 @@ isBoringHsPat = goL
               -> False
       OrPat _ pats  -> all goL pats
       LitPat {}     -> True
+      QualLitPat {} -> True
       NPat {}       -> True
       NPlusKPat {}  -> True
       SplicePat {}  -> False
       EmbTyPat {}   -> True
       InvisPat {}   -> True
+      ModifiedPat _ _ pat -> goL pat
       XPat ext ->
         case ghcPass @p of
          GhcRn -> case ext of
@@ -1084,23 +1087,25 @@ patNeedsParens p = go @p
     go (AsPat {})        = False
     -- Special-case unary boxed tuple applications so that they are
     -- parenthesized as `Identity (Solo x)`, not `Identity Solo x` (#18612)
-    -- See Note [One-tuples] in GHC.Builtin.Types
+    -- See Note [One-tuples] in GHC.Builtin.WiredIn.Types
     go (TuplePat _ [_] Boxed)
                          = p >= appPrec
     go (TuplePat{})      = False
     go (SumPat {})       = False
     go (ListPat {})      = False
     go (LitPat _ l)      = hsLitNeedsParens p l
+    go (QualLitPat _ _)  = False
     go (NPat _ lol _ _)  = hsOverLitNeedsParens p (unLoc lol)
+    go (ModifiedPat {})  = p > sigPrec
 
 -- | @'conPatNeedsParens' p cp@ returns 'True' if the constructor patterns @cp@
 -- needs parentheses under precedence @p@.
-conPatNeedsParens :: PprPrec -> HsConDetails a b -> Bool
+conPatNeedsParens :: PprPrec -> HsConDetails (GhcPass p) a b -> Bool
 conPatNeedsParens p = go
   where
-    go (PrefixCon args) = p >= appPrec && not (null args)
-    go (InfixCon {})    = p >= opPrec -- type args should be empty in this case
-    go (RecCon {})      = False
+    go (PrefixCon _ args) = p >= appPrec && not (null args)
+    go (InfixCon {})      = p >= opPrec -- type args should be empty in this case
+    go (RecCon {})        = False
 
 
 -- | Parenthesize a pattern without token information
@@ -1173,4 +1178,4 @@ type instance Anno (Pat (GhcPass p)) = SrcSpanAnnA
 type instance Anno (HsOverLit (GhcPass p)) = EpAnnCO
 type instance Anno ConLike = SrcSpanAnnN
 type instance Anno (HsFieldBind lhs rhs) = SrcSpanAnnA
-type instance Anno RecFieldsDotDot = EpaLocation
+type instance Anno RecFieldsDotDot = SrcSpanAnnA

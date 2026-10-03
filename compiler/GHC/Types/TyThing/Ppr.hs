@@ -95,7 +95,7 @@ Consequences:
 
 - In a few places we have info that is used only for pretty-printing,
   and is totally ignored when turning Iface syntax back into Core
-  (in GHC.IfaceToCore). For example, IfaceClosedSynFamilyTyCon
+  (in GHC.IfaceToCore). For example, IfaceClosedTyFamTyCon
   stores a [IfaceAxBranch] that is used only for pretty-printing.
 
 - See Note [Free TyVars and CoVars in IfaceType] in GHC.Iface.Type
@@ -175,8 +175,7 @@ pprTyThing :: ShowSub -> TyThing -> SDoc
 -- We pretty-print 'TyThing' via 'IfaceDecl'
 -- See Note [Pretty printing via Iface syntax]
 pprTyThing ss ty_thing
-  = sdocOption sdocLinearTypes $ \show_linear_types ->
-      pprIfaceDecl ss' (tyThingToIfaceDecl show_linear_types ty_thing)
+  = pprIfaceDecl ss' (tyThingToIfaceDecl ty_thing)
   where
     ss' = case ss_how_much ss of
       ShowHeader (AltPpr Nothing)    -> ss { ss_how_much = ShowHeader ppr' }

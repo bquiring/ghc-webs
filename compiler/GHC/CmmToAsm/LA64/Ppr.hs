@@ -20,6 +20,7 @@ import GHC.Types.Unique ( pprUniqueAlways, getUnique )
 import GHC.Utils.Outputable
 import GHC.Types.Basic (Alignment, alignmentBytes, mkAlignment)
 import GHC.Utils.Panic
+import GHC.Types.Literal.Floating
 
 pprNatCmmDecl :: forall doc. (IsDoc doc) => NCGConfig -> NatCmmDecl RawCmmStatics Instr -> doc
 
@@ -108,8 +109,6 @@ pprAlignForSection _seg = pprAlign . mkAlignment $ 8
 --     .balign 8
 --
 pprSectionAlign :: IsDoc doc => NCGConfig -> Section -> doc
-pprSectionAlign _config (Section (OtherSection _) _) =
-  panic "LA64.Ppr.pprSectionAlign: unknown section"
 pprSectionAlign config sec@(Section seg _) =
     line (pprSectionHeader config sec)
     $$ pprAlignForSection seg
@@ -236,11 +235,11 @@ pprDataItem config lit
         ppr_item II64 _ = [text "\t.quad\t"  <> pprDataImm platform imm]
 
         ppr_item FF32  (CmmFloat r _)
-           = let bs = floatToBytes (fromRational r)
+           = let bs = floatToBytes (litFloatingToHostFloat r)
              in  map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
 
         ppr_item FF64 (CmmFloat r _)
-           = let bs = doubleToBytes (fromRational r)
+           = let bs = doubleToBytes (litFloatingToHostDouble r)
              in  map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
 
         ppr_item _ _ = pprPanic "pprDataItem:ppr_item" (text $ show lit)
@@ -254,8 +253,8 @@ pprDataImm _ (ImmInteger i) = integer i
 pprDataImm p (ImmCLbl l)    = pprAsmLabel p l
 pprDataImm p (ImmIndex l i) = pprAsmLabel p l <> char '+' <> int i
 pprDataImm _ (ImmLit s)     = ftext s
-pprDataImm _ (ImmFloat f) = float (fromRational f)
-pprDataImm _ (ImmDouble d) = double (fromRational d)
+pprDataImm _ (ImmFloat f)   = float f
+pprDataImm _ (ImmDouble d)  = double d
 
 pprDataImm p (ImmConstantSum a b) = pprDataImm p a <> char '+' <> pprDataImm p b
 pprDataImm p (ImmConstantDiff a b) = pprDataImm p a <> char '-'
@@ -276,8 +275,8 @@ pprOpImm platform imm = case imm of
   ImmInt i -> int i
   ImmInteger i -> integer i
   ImmCLbl l -> char '=' <> pprAsmLabel platform l
-  ImmFloat f -> float (fromRational f)
-  ImmDouble d -> double (fromRational d)
+  ImmFloat f -> float f
+  ImmDouble d -> double d
   _ -> pprPanic "LA64.Ppr.pprOpImm" (text "Unsupported immediate for instruction operands:" <+> (text . show) imm)
 
 negOp :: Operand -> Operand
@@ -802,8 +801,9 @@ pprInstr platform instr = case instr of
     -- BITREV.{W/D}
   BITREV4B o1 o2 -> op2 (text "\tbitrev.4b") o1 o2
   BITREV8B o1 o2 -> op2 (text "\tbitrev.8b") o1 o2
-  BITREVW o1 o2 -> op2 (text "\tbitrev.w") o1 o2
-  BITREVD o1 o2 -> op2 (text "\tbitrev.d") o1 o2
+  BITREV o1 o2
+    | OpReg W32 _ <- o2 -> op2 (text "\tbitrev.w") o1 o2
+    | OpReg W64 _ <- o2 -> op2 (text "\tbitrev.d") o1 o2
     -- BSTRINS.{W/D}
   BSTRINS II64 o1 o2 o3 o4 -> op4 (text "\tbstrins.d") o1 o2 o3 o4
   BSTRINS II32 o1 o2 o3 o4 -> op4 (text "\tbstrins.w") o1 o2 o3 o4
@@ -852,6 +852,7 @@ pprInstr platform instr = case instr of
       line $ text "\tbgeu" <+> pprOp platform d <> comma <+> pprOp platform j <> comma <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
     UGT ->
       line $ text "\tbltu" <+> pprOp platform d <> comma <+> pprOp platform j <> comma <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
+
     _ -> line $ text "\t" <> pprBcond c <+> pprOp platform j <> comma <+> pprOp platform d <> comma <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
 
   BCOND1 _ _ _ (TLabel _) -> panic "LA64.ppr: BCOND1: No conditional branching to TLabel!"
@@ -916,17 +917,18 @@ pprInstr platform instr = case instr of
 
   BCOND _ _ _ (TReg _) -> panic "LA64.ppr: BCOND: No conditional branching to registers!"
 
+  BEQZ1 o1 o2 | isImmOp o2 -> op2 (text "\tbeqz") o1 o2
   BEQZ j (TBlock bid) ->
     line $ text "\tbeqz" <+> pprOp platform j <> comma <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
   BEQZ j (TLabel lbl) ->
     line $ text "\tbeqz" <+> pprOp platform j <> comma <+> pprAsmLabel platform lbl
-  BEQZ _ (TReg _)     -> panic "LA64.ppr: BEQZ: No conditional branching to registers!"
+  BEQZ _ (TReg _) -> panic "LA64.ppr: BEQZ: No conditional branching to registers!"
 
   BNEZ j (TBlock bid) ->
     line $ text "\tbnez" <+> pprOp platform j <> comma <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
   BNEZ j (TLabel lbl) ->
     line $ text "\tbnez" <+> pprOp platform j <> comma <+> pprAsmLabel platform lbl
-  BNEZ _ (TReg _)     -> panic "LA64.ppr: BNEZ: No conditional branching to registers!"
+  BNEZ _ (TReg _) -> panic "LA64.ppr: BNEZ: No conditional branching to registers!"
 
   -- 5. Common Memory Access Instructions --------------------------------------
     -- LD.{B[U]/H[U]/W[U]/D}, ST.{B/H/W/D}: AddrRegImm
@@ -1020,8 +1022,29 @@ pprInstr platform instr = case instr of
   AMSWAPDB II32 o1 o2 o3 -> op3 (text "\tamswap_db.w") o1 o2 o3
   AMSWAPDB II64 o1 o2 o3 -> op3 (text "\tamswap_db.d") o1 o2 o3
     -- AM.{SWAP/ADD}[_DB].{B/H}
+  AMADDDB II8  o1 o2 o3 -> op3 (text "\tamadd_db.b") o1 o2 o3
+  AMADDDB II16 o1 o2 o3 -> op3 (text "\tamadd_db.h") o1 o2 o3
+  AMADDDB II32 o1 o2 o3 -> op3 (text "\tamadd_db.w") o1 o2 o3
+  AMADDDB II64 o1 o2 o3 -> op3 (text "\tamadd_db.d") o1 o2 o3
+
+  AMANDDB II32 o1 o2 o3 -> op3 (text "\tamand_db.w") o1 o2 o3
+  AMANDDB II64 o1 o2 o3 -> op3 (text "\tamand_db.d") o1 o2 o3
+
+  AMORDB II32 o1 o2 o3 -> op3 (text "\tamor_db.w") o1 o2 o3
+  AMORDB II64 o1 o2 o3 -> op3 (text "\tamor_db.d") o1 o2 o3
+
+  AMXORDB II32 o1 o2 o3 -> op3 (text "\tamxor_db.w") o1 o2 o3
+  AMXORDB II64 o1 o2 o3 -> op3 (text "\tamxor_db.d") o1 o2 o3
     -- AMCAS[_DB].{B/H/W/D}
+  AMCASDB II8  o1 o2 o3 -> op3 (text "\tamcas_db.b") o1 o2 o3
+  AMCASDB II16 o1 o2 o3 -> op3 (text "\tamcas_db.h") o1 o2 o3
+  AMCASDB II32 o1 o2 o3 -> op3 (text "\tamcas_db.w") o1 o2 o3
+  AMCASDB II64 o1 o2 o3 -> op3 (text "\tamcas_db.d") o1 o2 o3
     -- LL.{W/D}, SC.{W/D}
+  LL II32 o1 o2 o3 -> op3 (text "\tll.w") o1 o2 o3
+  SC II32 o1 o2 o3 -> op3 (text "\tsc.w") o1 o2 o3
+  LL II64 o1 o2 o3 -> op3 (text "\tll.d") o1 o2 o3
+  SC II64 o1 o2 o3 -> op3 (text "\tsc.d") o1 o2 o3
     -- SC.Q
     -- LL.ACQ.{W/D}, SC.REL.{W/D}
   -- 8. Barrier Instructions ---------------------------------------------------

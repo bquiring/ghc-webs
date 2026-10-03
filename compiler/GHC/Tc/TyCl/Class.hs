@@ -38,6 +38,7 @@ import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Instantiate( newFamInst, tcSuperSkolTyVars )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.TcMType
+import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
@@ -189,8 +190,9 @@ tcClassSigs clas sigs def_methods
 tcClassDecl2 :: LTyClDecl GhcRn          -- The class declaration
              -> TcM (LHsBinds GhcTc)
 
-tcClassDecl2 (L _ (ClassDecl {tcdLName = class_name, tcdSigs = sigs,
-                                tcdMeths = default_binds}))
+tcClassDecl2 (L _ (ClassDecl {tcdLName = class_name,
+                              tcdCExt =
+                               (HsNestedGroup { ng_sigs = sigs, ng_meths = default_binds }, _)}))
   = recoverM (return emptyLHsBinds) $
     setSrcSpan (getLocA class_name) $
     do  { clas <- tcLookupLocatedClass (la2la class_name)
@@ -343,7 +345,7 @@ tcClassMinimalDef _clas sigs op_info
   where
     -- By default require all methods without a default implementation
     defMindef :: ClassMinimalDef
-    defMindef = mkAnd [ noLocA (mkVar (noLocA name))
+    defMindef = mkAnd [ noLocA (mkVar NoExtField (noLocA name))
                       | (name, _, Nothing) <- op_info ]
 
 instantiateMethod :: Class -> TcId -> [TcType] -> TcType
@@ -463,17 +465,17 @@ badDmPrag :: TcId -> Sig GhcRn -> TcM ()
 badDmPrag sel_id prag
   = addErrTc (TcRnDefaultMethodForPragmaLacksBinding sel_id prag)
 
-instDeclCtxt1 :: LHsSigType GhcRn -> ErrCtxtMsg
+instDeclCtxt1 :: LHsSigType GhcRn -> HsCtxt
 instDeclCtxt1 hs_inst_ty
   = InstDeclErrCtxt (Left $ getLHsInstDeclHead hs_inst_ty)
 
-instDeclCtxt2 :: Type -> ErrCtxtMsg
+instDeclCtxt2 :: Type -> HsCtxt
 instDeclCtxt2 dfun_ty
   = instDeclCtxt3 cls tys
   where
     (_,_,cls,tys) = tcSplitDFunTy dfun_ty
 
-instDeclCtxt3 :: Class -> [Type] -> ErrCtxtMsg
+instDeclCtxt3 :: Class -> [Type] -> HsCtxt
 instDeclCtxt3 cls cls_tys
   = InstDeclErrCtxt (Right $ mkClassPred cls cls_tys)
 

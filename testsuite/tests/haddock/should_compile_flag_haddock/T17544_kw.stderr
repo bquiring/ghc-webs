@@ -8,178 +8,156 @@
    (EpAnn
     (EpaSpan { T17544_kw.hs:1:1 })
     (AnnsModule
-     (NoEpTok)
      (EpTok
-      (EpaSpan { T17544_kw.hs:8:1-6 }))
+      (EpaSpan { <no location info> }))
      (EpTok
-      (EpaSpan { T17544_kw.hs:13:12-16 }))
+      (EpaSpan { T17544_kw.hs:6:1-6 }))
+     (EpTok
+      (EpaSpan { T17544_kw.hs:11:12-16 }))
+     ((,,)
+      (EpTok (EpaSpan { T17544_kw.hs:8:13 }))
+      (EpTok (EpaSpan { T17544_kw.hs:11:10 }))
+      [])
      []
      []
      (Just
       ((,)
-       { T17544_kw.hs:25:1 }
-       { T17544_kw.hs:24:18 })))
+       { T17544_kw.hs:23:1 }
+       { T17544_kw.hs:22:18 })))
     (EpaCommentsBalanced
      []
      []))
    (EpVirtualBraces
-    (1))
+    (EpaSpan { T17544_kw.hs:13:1 }))
    (Nothing)
    (Nothing))
   (Just
    (L
     (EpAnn
-     (EpaSpan { T17544_kw.hs:10:3-11 })
-     (AnnListItem
-      [])
+     (EpaSpan { T17544_kw.hs:8:3-11 })
+     []
      (EpaComments
       []))
     {ModuleName: T17544_kw}))
   (Just
-   (L
-    (EpAnn
-     (EpaSpan { T17544_kw.hs:(10,13)-(13,10) })
-     (AnnList
-      (Nothing)
-      (ListParens
+   [(L
+     (EpAnn
+      (EpaSpan { T17544_kw.hs:9:3-9 })
+      [(AddCommaAnn
+        (EpTok
+         (EpaSpan { T17544_kw.hs:9:10 })))]
+      (EpaComments
+       []))
+     (IEThingAll
+      (IEThingAllExt
+       (Nothing)
+       (EpTok (EpaSpan { T17544_kw.hs:9:6 }))
        (EpTok
-        (EpaSpan { T17544_kw.hs:10:13 }))
+        (EpaSpan { T17544_kw.hs:9:7-8 }))
+       (EpTok (EpaSpan { T17544_kw.hs:9:9 })))
+      (NoNamespaceSpecifier
+       (NoExtField))
+      (L
+       (EpAnn
+        (EpaSpan { T17544_kw.hs:9:3-5 })
+        []
+        (EpaComments
+         []))
+       (IEName
+        (NoExtField)
+        (L
+         (EpAnn
+          (EpaSpan { T17544_kw.hs:9:3-5 })
+          (NameAnnTrailing
+           [])
+          (EpaComments
+           []))
+         (Unqual
+          {OccName: Foo}))))
+      (Nothing)))
+   ,(L
+     (EpAnn
+      (EpaSpan { T17544_kw.hs:10:3-9 })
+      [(AddCommaAnn
+        (EpTok
+         (EpaSpan { T17544_kw.hs:10:10 })))]
+      (EpaComments
+       []))
+     (IEThingAll
+      (IEThingAllExt
+       (Nothing)
+       (EpTok (EpaSpan { T17544_kw.hs:10:6 }))
        (EpTok
-        (EpaSpan { T17544_kw.hs:13:10 })))
+        (EpaSpan { T17544_kw.hs:10:7-8 }))
+       (EpTok (EpaSpan { T17544_kw.hs:10:9 })))
+      (NoNamespaceSpecifier
+       (NoExtField))
+      (L
+       (EpAnn
+        (EpaSpan { T17544_kw.hs:10:3-5 })
+        []
+        (EpaComments
+         []))
+       (IEName
+        (NoExtField)
+        (L
+         (EpAnn
+          (EpaSpan { T17544_kw.hs:10:3-5 })
+          (NameAnnTrailing
+           [])
+          (EpaComments
+           []))
+         (Unqual
+          {OccName: Bar}))))
+      (Nothing)))
+   ,(L
+     (EpAnn
+      (EpaSpan { T17544_kw.hs:11:3-9 })
       []
-      ((,)
-       (NoEpTok)
-       [])
-      [])
-     (EpaComments
-      []))
-    [(L
-      (EpAnn
-       (EpaSpan { T17544_kw.hs:11:3-9 })
-       (AnnListItem
-        [(AddCommaAnn
-          (EpTok
-           (EpaSpan { T17544_kw.hs:11:10 })))])
-       (EpaComments
-        []))
-      (IEThingAll
-       ((,)
-        (Nothing)
-        ((,,)
-         (EpTok
-          (EpaSpan { T17544_kw.hs:11:6 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:11:7-8 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:11:9 }))))
-       (L
-        (EpAnn
-         (EpaSpan { T17544_kw.hs:11:3-5 })
-         (AnnListItem
-          [])
-         (EpaComments
-          []))
-        (IEName
-         (NoExtField)
-         (L
-          (EpAnn
-           (EpaSpan { T17544_kw.hs:11:3-5 })
-           (NameAnnTrailing
-            [])
-           (EpaComments
-            []))
-          (Unqual
-           {OccName: Foo}))))
-       (Nothing)))
-    ,(L
-      (EpAnn
-       (EpaSpan { T17544_kw.hs:12:3-9 })
-       (AnnListItem
-        [(AddCommaAnn
-          (EpTok
-           (EpaSpan { T17544_kw.hs:12:10 })))])
-       (EpaComments
-        []))
-      (IEThingAll
-       ((,)
-        (Nothing)
-        ((,,)
-         (EpTok
-          (EpaSpan { T17544_kw.hs:12:6 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:12:7-8 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:12:9 }))))
-       (L
-        (EpAnn
-         (EpaSpan { T17544_kw.hs:12:3-5 })
-         (AnnListItem
-          [])
-         (EpaComments
-          []))
-        (IEName
-         (NoExtField)
-         (L
-          (EpAnn
-           (EpaSpan { T17544_kw.hs:12:3-5 })
-           (NameAnnTrailing
-            [])
-           (EpaComments
-            []))
-          (Unqual
-           {OccName: Bar}))))
-       (Nothing)))
-    ,(L
-      (EpAnn
-       (EpaSpan { T17544_kw.hs:13:3-9 })
-       (AnnListItem
-        [])
-       (EpaComments
-        []))
-      (IEThingAll
-       ((,)
-        (Nothing)
-        ((,,)
-         (EpTok
-          (EpaSpan { T17544_kw.hs:13:6 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:13:7-8 }))
-         (EpTok
-          (EpaSpan { T17544_kw.hs:13:9 }))))
-       (L
-        (EpAnn
-         (EpaSpan { T17544_kw.hs:13:3-5 })
-         (AnnListItem
-          [])
-         (EpaComments
-          []))
-        (IEName
-         (NoExtField)
-         (L
-          (EpAnn
-           (EpaSpan { T17544_kw.hs:13:3-5 })
-           (NameAnnTrailing
-            [])
-           (EpaComments
-            []))
-          (Unqual
-           {OccName: Cls}))))
-       (Nothing)))]))
+      (EpaComments
+       []))
+     (IEThingAll
+      (IEThingAllExt
+       (Nothing)
+       (EpTok (EpaSpan { T17544_kw.hs:11:6 }))
+       (EpTok
+        (EpaSpan { T17544_kw.hs:11:7-8 }))
+       (EpTok (EpaSpan { T17544_kw.hs:11:9 })))
+      (NoNamespaceSpecifier
+       (NoExtField))
+      (L
+       (EpAnn
+        (EpaSpan { T17544_kw.hs:11:3-5 })
+        []
+        (EpaComments
+         []))
+       (IEName
+        (NoExtField)
+        (L
+         (EpAnn
+          (EpaSpan { T17544_kw.hs:11:3-5 })
+          (NameAnnTrailing
+           [])
+          (EpaComments
+           []))
+         (Unqual
+          {OccName: Cls}))))
+      (Nothing)))])
   []
   [(L
     (EpAnn
-     (EpaSpan { T17544_kw.hs:(15,1)-(16,20) })
-     (AnnListItem
-      [])
+     (EpaSpan { T17544_kw.hs:(13,1)-(14,20) })
+     []
      (EpaComments
       []))
     (TyClD
      (NoExtField)
      (DataDecl
       (NoExtField)
+      []
       (L
        (EpAnn
-        (EpaSpan { T17544_kw.hs:15:6-8 })
+        (EpaSpan { T17544_kw.hs:13:6-8 })
         (NameAnnTrailing
          [])
         (EpaComments
@@ -194,17 +172,22 @@
        (AnnDataDefn
         []
         []
-        (NoEpTok)
-        (NoEpTok)
         (EpTok
-         (EpaSpan { T17544_kw.hs:15:1-4 }))
-        (NoEpTok)
-        (NoEpUniTok)
+         (EpaSpan { <no location info> }))
         (EpTok
-         (EpaSpan { T17544_kw.hs:16:3-7 }))
-        (NoEpTok)
-        (NoEpTok)
-        (NoEpTok))
+         (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { T17544_kw.hs:13:1-4 }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpUniTok
+         (EpaSpan { <no location info> })
+         (NormalSyntax))
+        (EpTok
+         (EpaSpan { T17544_kw.hs:14:3-7 }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { <no location info> })))
        (Nothing)
        (Nothing)
        (Nothing)
@@ -212,9 +195,8 @@
         (False)
         [(L
           (EpAnn
-           (EpaSpan { T17544_kw.hs:16:9-20 })
-           (AnnListItem
-            [])
+           (EpaSpan { T17544_kw.hs:14:9-20 })
+           []
            (EpaComments
             []))
           (ConDeclGADT
@@ -222,12 +204,13 @@
             []
             []
             (EpUniTok
-             (EpaSpan { T17544_kw.hs:16:15-16 })
+             (EpaSpan { T17544_kw.hs:14:15-16 })
              (NormalSyntax)))
+           []
            (:|
             (L
              (EpAnn
-              (EpaSpan { T17544_kw.hs:16:9-13 })
+              (EpaSpan { T17544_kw.hs:14:9-13 })
               (NameAnnTrailing
                [])
               (EpaComments
@@ -237,9 +220,8 @@
             [])
            (L
             (EpAnn
-             (EpaSpan { T17544_kw.hs:16:18-20 })
-             (AnnListItem
-              [])
+             (EpaSpan { T17544_kw.hs:14:18-20 })
+             []
              (EpaComments
               []))
             (HsOuterImplicit
@@ -251,17 +233,17 @@
             [])
            (L
             (EpAnn
-             (EpaSpan { T17544_kw.hs:16:18-20 })
-             (AnnListItem
-              [])
+             (EpaSpan { T17544_kw.hs:14:18-20 })
+             []
              (EpaComments
               []))
             (HsTyVar
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              (NotPromoted)
              (L
               (EpAnn
-               (EpaSpan { T17544_kw.hs:16:18-20 })
+               (EpaSpan { T17544_kw.hs:14:18-20 })
                (NameAnnTrailing
                 [])
                (EpaComments
@@ -272,18 +254,18 @@
        []))))
   ,(L
     (EpAnn
-     (EpaSpan { T17544_kw.hs:(18,1)-(19,26) })
-     (AnnListItem
-      [])
+     (EpaSpan { T17544_kw.hs:(16,1)-(17,26) })
+     []
      (EpaComments
       []))
     (TyClD
      (NoExtField)
      (DataDecl
       (NoExtField)
+      []
       (L
        (EpAnn
-        (EpaSpan { T17544_kw.hs:18:9-11 })
+        (EpaSpan { T17544_kw.hs:16:9-11 })
         (NameAnnTrailing
          [])
         (EpaComments
@@ -298,26 +280,30 @@
        (AnnDataDefn
         []
         []
-        (NoEpTok)
         (EpTok
-         (EpaSpan { T17544_kw.hs:18:1-7 }))
-        (NoEpTok)
-        (NoEpTok)
-        (NoEpUniTok)
+         (EpaSpan { <no location info> }))
         (EpTok
-         (EpaSpan { T17544_kw.hs:19:3-7 }))
-        (NoEpTok)
-        (NoEpTok)
-        (NoEpTok))
+         (EpaSpan { T17544_kw.hs:16:1-7 }))
+        (EpTok
+         (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpUniTok
+         (EpaSpan { <no location info> })
+         (NormalSyntax))
+        (EpTok
+         (EpaSpan { T17544_kw.hs:17:3-7 }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { <no location info> })))
        (Nothing)
        (Nothing)
        (Nothing)
        (NewTypeCon
         (L
          (EpAnn
-          (EpaSpan { T17544_kw.hs:19:9-26 })
-          (AnnListItem
-           [])
+          (EpaSpan { T17544_kw.hs:17:9-26 })
+          []
           (EpaComments
            []))
          (ConDeclGADT
@@ -325,12 +311,13 @@
            []
            []
            (EpUniTok
-            (EpaSpan { T17544_kw.hs:19:15-16 })
+            (EpaSpan { T17544_kw.hs:17:15-16 })
             (NormalSyntax)))
+          []
           (:|
            (L
             (EpAnn
-             (EpaSpan { T17544_kw.hs:19:9-13 })
+             (EpaSpan { T17544_kw.hs:17:9-13 })
              (NameAnnTrailing
               [])
              (EpaComments
@@ -340,9 +327,8 @@
            [])
           (L
            (EpAnn
-            (EpaSpan { T17544_kw.hs:19:18-26 })
-            (AnnListItem
-             [])
+            (EpaSpan { T17544_kw.hs:17:18-26 })
+            []
             (EpaComments
              []))
            (HsOuterImplicit
@@ -355,45 +341,46 @@
              ((,)
               ((,,)
                (EpaDelta { <no location info> } (SameLine 0) [])
-               (NoEpTok)
+               (EpTok
+                (EpaSpan { <no location info> }))
                (EpaDelta { <no location info> } (SameLine 0) []))
               (NoSourceText))
              (NoSrcUnpack)
              (NoSrcStrict)
-             (HsUnannotated
-              (EpArrow
-               (EpUniTok
-                (EpaSpan { T17544_kw.hs:19:21-22 })
-                (NormalSyntax))))
+             (HsModifiedFunArr
+              (NoExtField)
+              []
+              (HsStandardArr
+               (EpArrow
+                (EpUniTok
+                 (EpaSpan { T17544_kw.hs:17:21-22 })
+                 (NormalSyntax)))))
              (L
               (EpAnn
-               (EpaSpan { T17544_kw.hs:19:18-19 })
-               (AnnListItem
-                [])
+               (EpaSpan { T17544_kw.hs:17:18-19 })
+               []
                (EpaComments
                 []))
               (HsTupleTy
                (AnnParens
-                (EpTok
-                 (EpaSpan { T17544_kw.hs:19:18 }))
-                (EpTok
-                 (EpaSpan { T17544_kw.hs:19:19 })))
+                (EpTok (EpaSpan { T17544_kw.hs:17:18 }))
+                (EpTok (EpaSpan { T17544_kw.hs:17:19 })))
                (HsBoxedOrConstraintTuple)
                []))
              (Nothing))])
           (L
            (EpAnn
-            (EpaSpan { T17544_kw.hs:19:24-26 })
-            (AnnListItem
-             [])
+            (EpaSpan { T17544_kw.hs:17:24-26 })
+            []
             (EpaComments
              []))
            (HsTyVar
-            (NoEpTok)
+            (EpTok
+             (EpaSpan { <no location info> }))
             (NotPromoted)
             (L
              (EpAnn
-              (EpaSpan { T17544_kw.hs:19:24-26 })
+              (EpaSpan { T17544_kw.hs:17:24-26 })
               (NameAnnTrailing
                [])
               (EpaComments
@@ -404,33 +391,33 @@
        []))))
   ,(L
     (EpAnn
-     (EpaSpan { T17544_kw.hs:(21,1)-(24,18) })
-     (AnnListItem
-      [])
+     (EpaSpan { T17544_kw.hs:(19,1)-(22,18) })
+     []
      (EpaComments
       []))
     (TyClD
      (NoExtField)
      (ClassDecl
-      ((,,)
+      ((,)
        (AnnClassDecl
         (EpTok
-         (EpaSpan { T17544_kw.hs:21:1-5 }))
+         (EpaSpan { T17544_kw.hs:19:1-5 }))
         []
         []
-        (NoEpTok)
         (EpTok
-         (EpaSpan { T17544_kw.hs:23:3-7 }))
-        (NoEpTok)
-        (NoEpTok)
+         (EpaSpan { <no location info> }))
+        (EpTok
+         (EpaSpan { T17544_kw.hs:21:3-7 }))
+        (EpTok (EpaSpan { <no location info> }))
+        (EpTok (EpaSpan { <no location info> }))
         [])
        (EpVirtualBraces
-        (5))
-       (NoAnnSortKey))
+        (EpaSpan { T17544_kw.hs:22:5 })))
+      []
       (Nothing)
       (L
        (EpAnn
-        (EpaSpan { T17544_kw.hs:21:7-9 })
+        (EpaSpan { T17544_kw.hs:19:7-9 })
         (NameAnnTrailing
          [])
         (EpaComments
@@ -441,24 +428,26 @@
        (NoExtField)
        [(L
          (EpAnn
-          (EpaSpan { T17544_kw.hs:21:11 })
-          (AnnListItem
-           [])
+          (EpaSpan { T17544_kw.hs:19:11 })
+          []
           (EpaComments
            []))
          (HsTvb
           (AnnTyVarBndr
            []
            []
-           (NoEpTok)
-           (NoEpUniTok))
+           (EpTok
+            (EpaSpan { <no location info> }))
+           (EpUniTok
+            (EpaSpan { <no location info> })
+            (NormalSyntax)))
           (HsBndrRequired
            (NoExtField))
           (HsBndrVar
            (NoExtField)
            (L
             (EpAnn
-             (EpaSpan { T17544_kw.hs:21:11 })
+             (EpaSpan { T17544_kw.hs:19:11 })
              (NameAnnTrailing
               [])
              (EpaComments
@@ -471,73 +460,69 @@
       []
       [(L
         (EpAnn
-         (EpaSpan { T17544_kw.hs:24:5-18 })
-         (AnnListItem
-          [])
+         (EpaSpan { T17544_kw.hs:22:5-18 })
+         []
          (EpaComments
           []))
-        (ClassOpSig
-         (AnnSig
-          (EpUniTok
-           (EpaSpan { T17544_kw.hs:24:15-16 })
-           (NormalSyntax))
-          (Nothing)
-          (Nothing))
-         (False)
-         [(L
-           (EpAnn
-            (EpaSpan { T17544_kw.hs:24:5-13 })
-            (NameAnnTrailing
-             [])
-            (EpaComments
-             []))
-           (Unqual
-            {OccName: clsmethod}))]
-         (L
-          (EpAnn
-           (EpaSpan { T17544_kw.hs:24:18 })
-           (AnnListItem
-            [])
-           (EpaComments
-            []))
-          (HsSig
-           (NoExtField)
-           (HsOuterImplicit
-            (NoExtField))
-           (L
+        (SigD
+         (NoExtField)
+         (ClassOpSig
+          (AnnSig
+           (EpUniTok
+            (EpaSpan { T17544_kw.hs:22:15-16 })
+            (NormalSyntax))
+           (Nothing)
+           (Nothing))
+          (False)
+          [(L
             (EpAnn
-             (EpaSpan { T17544_kw.hs:24:18 })
-             (AnnListItem
+             (EpaSpan { T17544_kw.hs:22:5-13 })
+             (NameAnnTrailing
               [])
              (EpaComments
               []))
-            (HsTyVar
-             (NoEpTok)
-             (NotPromoted)
-             (L
-              (EpAnn
-               (EpaSpan { T17544_kw.hs:24:18 })
-               (NameAnnTrailing
-                [])
-               (EpaComments
-                []))
-              (Unqual
-               {OccName: a}))))))))]
-      []
-      []
-      []
-      [])))]))
+            (Unqual
+             {OccName: clsmethod}))]
+          (L
+           (EpAnn
+            (EpaSpan { T17544_kw.hs:22:18 })
+            []
+            (EpaComments
+             []))
+           (HsSig
+            (NoExtField)
+            (HsOuterImplicit
+             (NoExtField))
+            (L
+             (EpAnn
+              (EpaSpan { T17544_kw.hs:22:18 })
+              []
+              (EpaComments
+               []))
+             (HsTyVar
+              (EpTok
+               (EpaSpan { <no location info> }))
+              (NotPromoted)
+              (L
+               (EpAnn
+                (EpaSpan { T17544_kw.hs:22:18 })
+                (NameAnnTrailing
+                 [])
+                (EpaComments
+                 []))
+               (Unqual
+                {OccName: a})))))))))])))]))
 
 
-T17544_kw.hs:9:3: warning: [GHC-94458] [-Winvalid-haddock]
+T17544_kw.hs:7:3: warning: [GHC-94458] [-Winvalid-haddock]
     A Haddock comment cannot appear in this position and will be ignored.
 
-T17544_kw.hs:15:10: warning: [GHC-94458] [-Winvalid-haddock]
+T17544_kw.hs:13:10: warning: [GHC-94458] [-Winvalid-haddock]
     A Haddock comment cannot appear in this position and will be ignored.
 
-T17544_kw.hs:18:13: warning: [GHC-94458] [-Winvalid-haddock]
+T17544_kw.hs:16:13: warning: [GHC-94458] [-Winvalid-haddock]
     A Haddock comment cannot appear in this position and will be ignored.
 
-T17544_kw.hs:22:5: warning: [GHC-94458] [-Winvalid-haddock]
+T17544_kw.hs:20:5: warning: [GHC-94458] [-Winvalid-haddock]
     A Haddock comment cannot appear in this position and will be ignored.
 

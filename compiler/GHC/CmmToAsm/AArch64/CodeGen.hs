@@ -56,6 +56,7 @@ import GHC.Float
 
 import GHC.Types.Basic
 import GHC.Types.ForeignCall
+import GHC.Types.Literal.Floating
 import GHC.Data.FastString
 import GHC.Utils.Misc
 import GHC.Utils.Panic
@@ -169,6 +170,8 @@ mkBlocks :: Instr
           -> ([Instr], [GenBasicBlock Instr], [GenCmmDecl RawCmmStatics h g])
 mkBlocks (NEWBLOCK id) (instrs,blocks,statics)
   = ([], BasicBlock id instrs : blocks, statics)
+mkBlocks (LDATA sec dat) (instrs,blocks,statics)
+  = (instrs, blocks, CmmData sec dat:statics)
 mkBlocks instr (instrs,blocks,statics)
   = (instr:instrs, blocks, statics)
 -- -----------------------------------------------------------------------------
@@ -235,11 +238,11 @@ genSwitch config expr targets = do
               -- index to offset into the table (relative to tableReg)
               annExpr expr (LSL (OpReg (formatToWidth fmt1) reg) (OpReg (formatToWidth fmt1) reg) (OpImm (ImmInt 3))),
               -- calculate table entry address
-              ADD (OpReg W64 targetReg) (OpReg (formatToWidth fmt1) reg) (OpReg (formatToWidth fmt2) tableReg),
+              ADD II64 (OpReg W64 targetReg) (OpReg (formatToWidth fmt1) reg) (OpReg (formatToWidth fmt2) tableReg),
               -- load table entry (relative offset from tableReg (first entry) to target label)
               LDR II64 (OpReg W64 targetReg) (OpAddr (AddrRegImm targetReg (ImmInt 0))),
               -- calculate absolute address of the target label
-              ADD (OpReg W64 targetReg) (OpReg W64 targetReg) (OpReg W64 tableReg),
+              ADD II64 (OpReg W64 targetReg) (OpReg W64 targetReg) (OpReg W64 tableReg),
               -- prepare jump to target label
               J_TBL ids (Just lbl) targetReg
             ]
@@ -317,15 +320,9 @@ stmtToInstrs stmt = do
       CmmComment s   -> return (unitOL (COMMENT (ftext s)))
       CmmTick {}     -> return nilOL
 
-      CmmAssign reg src
-        | isFloatType ty         -> assignReg_FltCode format reg src
-        | otherwise              -> assignReg_IntCode format reg src
-          where ty = cmmRegType reg
-                format = cmmTypeFormat ty
+      CmmAssign reg src -> assignReg reg src
 
-      CmmStore addr src _alignment
-        | isFloatType ty         -> assignMem_FltCode format addr src
-        | otherwise              -> assignMem_IntCode format addr src
+      CmmStore addr src _alignment -> assignMem format addr src
           where ty = cmmExprType platform src
                 format = cmmTypeFormat ty
 
@@ -359,13 +356,10 @@ type InstrBlock
 --
 data Register
         = Fixed Format Reg InstrBlock
+        -- ^ It can be unsafe to clobber the result reg, as it might map to a
+        -- local variable.
         | Any   Format (Reg -> InstrBlock)
-
--- | Sometimes we need to change the Format of a register. Primarily during
--- conversion.
-swizzleRegisterRep :: Format -> Register -> Register
-swizzleRegisterRep format (Fixed _ reg code) = Fixed format reg code
-swizzleRegisterRep format (Any _ codefn)     = Any   format codefn
+        -- ^ A destination the caller decides, prevents redundant moves
 
 -- | Grab the Reg for a CmmReg
 getRegisterReg :: Platform -> CmmReg -> Reg
@@ -373,8 +367,9 @@ getRegisterReg :: Platform -> CmmReg -> Reg
 getRegisterReg _ (CmmLocal (LocalReg u pk))
   = RegVirtual $ mkVirtualReg u (cmmTypeFormat pk)
 
-getRegisterReg platform (CmmGlobal reg@(GlobalRegUse mid _))
-  = case globalRegMaybe platform mid of
+getRegisterReg platform (CmmGlobal reg@(GlobalRegUse mid ty))
+  = assert (formatInBytes (cmmTypeFormat ty) >= 4) $
+    case globalRegMaybe platform mid of
         Just reg -> RegReal reg
         Nothing  -> pprPanic "getRegisterReg-memory" (ppr $ CmmGlobal reg)
         -- By this stage, the only MagicIds remaining should be the
@@ -385,11 +380,19 @@ getRegisterReg platform (CmmGlobal reg@(GlobalRegUse mid _))
 -- -----------------------------------------------------------------------------
 -- General things for putting together code sequences
 
--- | The dual to getAnyReg: compute an expression into a register, but
---      we don't mind which one it is.
+-- | Computes the `Register` value into a concrete register, but we can't pick which one.
+-- This means the register might be mapped to a global or local variable and
+-- we can only mutate the result reg in place if we know the Cmm expression can't
+-- refer to local or global variables.
+-- Subword results will be truncated as described by the subword invariant.
+-- See Note [Subword operations on AArch64].
 getSomeReg :: CmmExpr -> NatM (Reg, Format, InstrBlock)
 getSomeReg expr = do
   r <- getRegister expr
+  someReg r
+
+someReg :: Register -> NatM (Reg, Format, InstrBlock)
+someReg r =
   case r of
     Any rep code -> do
         tmp <- getNewRegNat rep
@@ -502,7 +505,110 @@ isOffsetImm off w
   where
     byte_width = widthInBytes w
 
+-- | Check if a floating-point constant can be embedded in FMOV (immediate).
+--
+-- FMOV (immediate) can embed an 8-bit floating-point number:
+--   x = (-1)^s * m/16 * 2^e, where 16 <= m <= 31, -3 <= e <= 4
+--
+-- Additionally, +0.0 can be represented by a move from the zero register.
+isFmovImm :: RealFloat a => a -> Bool
+isFmovImm x
+  | x == 0.0 = not (isNegativeZero x)
+  | isNaN x || isInfinite x = False
+  | otherwise =
+    let (m, n) = decodeFloat x
+        e = n + floatDigits x -- exponent x
+        m_mask = bit (floatDigits x - 5) - 1
+    in -2 <= e && e <= 5 && m .&. m_mask == 0
+{-# INLINE [0] isFmovImm #-}
+{-# RULES
+"isFmovImm/Float" isFmovImm = isFmovImmFloat
+"isFmovImm/Double" isFmovImm = isFmovImmDouble
+  #-}
 
+isFmovImmFloat :: Float -> Bool
+isFmovImmFloat x = w == 0 || (0x3E00_0000 <= e && e <= 0x4180_0000 && w .&. 0x0007_FFFF == 0)
+  where w = castFloatToWord32 x
+        e = w .&. 0x7F80_0000
+
+isFmovImmDouble :: Double -> Bool
+isFmovImmDouble x = w == 0 || (0x3FC0_0000_0000_0000 <= e && e <= 0x4030_0000_0000_0000 && w .&. 0x0000_FFFF_FFFF_FFFF == 0)
+  where w = castDoubleToWord64 x
+        e = w .&. 0x7FF0_0000_0000_0000
+
+-- | MOVI/MVNI (16-bit)
+--
+-- MOVI.8H can embed integer constants of one of the following forms:
+--
+--   * 0x00HH
+--   * 0xHH00
+--
+-- MVNI.{8H,4S} can embed integer constants of one of the following forms:
+--
+--   * 0xFFHH
+--   * 0xHHFF
+getMoviImm16 :: Word16 -> Maybe (Operand -> Operand -> Instr, Operand)
+getMoviImm16 w
+  | w .&. 0xFF00 == 0 = Just (MOVI fmt16, OpImm (ImmInt $ fromIntegral w))
+  | w .&. 0x00FF == 0 = Just (MOVI fmt16, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 8) SLSL 8)
+  | w .&. 0xFF00 == 0xFF00 = Just (MVNI fmt16, OpImm (ImmInt $ fromIntegral $ complement w .&. 0xFF))
+  | w .&. 0x00FF == 0x00FF = Just (MVNI fmt16, OpImmShift (ImmInt $ fromIntegral $ complement w `shiftR` 8) SLSL 8)
+  | (w `xor` (w `shiftR` 8)) .&. 0xFF == 0 = Just (MOVI fmt8, OpImm (ImmInt $ fromIntegral $ w .&. 0xFF))
+  | otherwise = Nothing
+  where fmt16 = VecFormat 8 FmtInt16
+        fmt8 = VecFormat 16 FmtInt8
+
+-- | MOVI/MVNI (32-bit)
+--
+-- MOVI.4S can embed integer constants of one of the following forms:
+--
+--   * 0x0000_00HH
+--   * 0x0000_HH00
+--   * 0x00HH_0000
+--   * 0xHH00_0000
+--   * 0x0000_HHFF
+--   * 0x00HH_FFFF
+--
+-- MVNI.4S can embed integer constants of one of the following forms:
+--
+--   * 0xFFFF_FFHH
+--   * 0xFFFF_HHFF
+--   * 0xFFHH_FFFF
+--   * 0xHHFF_FFFF
+--   * 0xFFFF_HH00
+--   * 0xFFHH_0000
+getMoviImm32 :: Word32 -> Maybe (Operand -> Operand -> Instr, Operand)
+getMoviImm32 w
+  | w .&. 0xFFFFFF00 == 0 = Just (MOVI fmt32, OpImm (ImmInt $ fromIntegral w))
+  | w .&. 0xFFFF00FF == 0 = Just (MOVI fmt32, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 8) SLSL 8)
+  | w .&. 0xFF00FFFF == 0 = Just (MOVI fmt32, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 16) SLSL 16)
+  | w .&. 0x00FFFFFF == 0 = Just (MOVI fmt32, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 24) SLSL 24)
+  | w .&. 0xFFFF00FF == 0x000000FF = Just (MOVI fmt32, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 8) SMSL 8)
+  | w .&. 0xFF00FFFF == 0x0000FFFF = Just (MOVI fmt32, OpImmShift (ImmInt $ fromIntegral $ w `shiftR` 16) SMSL 16)
+  | w .&. 0xFFFFFF00 == 0xFFFFFF00 = Just (MVNI fmt32, OpImm (ImmInt $ fromIntegral $ complement w))
+  | w .&. 0xFFFF00FF == 0xFFFF00FF = Just (MVNI fmt32, OpImmShift (ImmInt $ fromIntegral $ complement w `shiftR` 8) SLSL 8)
+  | w .&. 0xFF00FFFF == 0xFF00FFFF = Just (MVNI fmt32, OpImmShift (ImmInt $ fromIntegral $ complement w `shiftR` 16) SLSL 16)
+  | w .&. 0x00FFFFFF == 0x00FFFFFF = Just (MVNI fmt32, OpImmShift (ImmInt $ fromIntegral $ complement w `shiftR` 24) SLSL 24)
+  | w .&. 0xFFFF00FF == 0xFFFF0000 = Just (MVNI fmt32, OpImmShift (ImmInt $ fromIntegral $ (complement w `shiftR` 8) .&. 0xFF) SMSL 8)
+  | w .&. 0xFF00FFFF == 0xFF000000 = Just (MVNI fmt32, OpImmShift (ImmInt $ fromIntegral $ (complement w `shiftR` 16) .&. 0xFF) SMSL 16)
+  -- A repetition of 16-bit pattern
+  | (w `xor` (w `shiftR` 16)) .&. 0x0000FFFF == 0 = getMoviImm16 (fromIntegral w)
+  | otherwise = Nothing
+  where fmt32 = VecFormat 4 FmtInt32
+
+-- | MOVI (64-bit)
+--
+-- MOVI.64 can embed integer constants of one of the following forms:
+--
+--   * 0xHHIIJJKK_LLMMNNOO, where HH,II,JJ,KK,LL,MM,NN,OO `elem` [0,0xFF]
+getMoviImm64 :: Word64 -> Maybe (Operand -> Operand -> Instr, Operand)
+getMoviImm64 w
+  -- For w=0b{a63}...{a7}{a6}{a5}{a4}{a3}{a2}{a1}{a0}: Test if a[i] == a[i+1] for 8*n <= i <= 8*n+6
+  | (w `xor` (w `shiftR` 1)) .&. 0x7F7F7F7F_7F7F7F7F == 0 = Just (MOVI fmt64, OpImm $ ImmInteger $ toInteger w)
+  -- A repetition of 32-bit pattern
+  | (w `xor` (w `shiftR` 32)) .&. 0xFFFFFFFF == 0 = getMoviImm32 (fromIntegral w)
+  | otherwise = Nothing
+  where fmt64 = VecFormat 2 FmtInt64
 
 
 -- TODO OPT: we might be able give getRegister
@@ -533,6 +639,8 @@ getFloatReg expr = do
 litToImm' :: CmmLit -> NatM (Operand, InstrBlock)
 litToImm' lit = return (OpImm (litToImm lit), nilOL)
 
+-- | Return a computation/block of instructions that corresponds to the expressions
+-- value. Values are already truncated if needed. See Note [Subword operations on AArch64].
 getRegister :: CmmExpr -> NatM Register
 getRegister e = do
   config <- getConfig
@@ -547,19 +655,38 @@ opRegWidth W16 = W32  -- w
 opRegWidth W8  = W32  -- w
 opRegWidth w   = pprPanic "opRegWidth" (text "Unsupported width" <+> ppr w)
 
--- Note [Signed arithmetic on AArch64]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- Handling signed arithmetic on sub-word-size values on AArch64 is a bit
--- tricky as Cmm's type system does not capture signedness. While 32-bit values
--- are fairly easy to handle due to AArch64's 32-bit instruction variants
--- (denoted by use of %wN registers), 16- and 8-bit values require quite some
--- care.
+-- Note [Subword operations on AArch64]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Handling subword operations on AArch64 is a bit tricky. 32-bit values are fairly
+-- easy to handle due to AArch64's 32-bit instruction variants. 16- and 8-bit
+-- values require quite some care. The platform doesn't provide operations at
+-- widths below 32bit. Which means we have to simulate them using wider operations.
+-- Signed arithmetic on sub-word-size values on AArch64 is a bit tricky as Cmm's
+-- type system does not capture signedness. If we have a 8 bit value the high
+-- bits could be sign or zero extended with no easy way to tell.
 --
--- We handle 16-and 8-bit values by using the 32-bit operations and
+-- To work around this handle 16-and 8-bit values by using the 32-bit operations and
 -- sign-/zero-extending operands and truncate results as necessary. For
 -- simplicity we maintain the invariant that a register containing a
 -- sub-word-size value always contains the zero-extended form of that value
 -- in between operations.
+--
+-- Concretely we establish this invariant on every input into the function for which
+-- we generate code for in the NCG. This means:
+-- * Global STG register access
+-- * memory reads
+-- * function arguments
+-- * ffi results
+-- * function call results
+-- * results from any subexpression. (Including results produced by getRegister/getSomeReg)
+--
+-- This means we can assume the invariant when generated code for expression trees
+-- or machops reading local variables, avoiding (some) redundant extensions. But
+-- we have to take great care to uphold the invariant when computing new values.
+--
+-- We used to do the inverse. Re-establish the invariant for any operation that
+-- is sensitive to values in the high bits. But that turned out to produce worse
+-- code and wasn't any less likely to result in new bugs in practice.
 --
 -- For instance, consider the program,
 --
@@ -580,6 +707,9 @@ opRegWidth w   = pprPanic "opRegWidth" (text "Unsupported width" <+> ppr w)
 -- we must still truncate the result back down to 8-bits. Finally the `%shrl`
 -- requires no extension and no truncate since we can assume that
 -- `c` is zero-extended.
+--
+-- Down the line I think the right way to approach this is to operate more over
+-- the `Register` type and store sign extension information inside it.
 --
 -- TODO:
 --   Don't use Width in Operands
@@ -688,38 +818,86 @@ getRegister' config plat expr
           return (Any (intFormat rep) (\dst -> imm_code `snocOL` annExpr expr (MOV (OpReg rep dst) op)))
 
         -- floatToBytes (fromRational f)
-        CmmFloat 0 w   -> do
-          (op, imm_code) <- litToImm' lit
-          return (Any (floatFormat w) (\dst -> imm_code `snocOL` annExpr expr (MOV (OpReg w dst) op)))
+        CmmFloat f LitFloat -> do
+          let f' = litFloatingToHostFloat f
+          if isFmovImm f'
+            then return $ Any FF32 $ \dst -> unitOL (annExpr expr $ FMOV FF32 (OpReg W32 dst) (OpImm $ ImmFloat f'))
+            else do
+              let word = castFloatToWord32 f' :: Word32
+                  half0 = fromIntegral (fromIntegral word :: Word16)
+                  half1 = fromIntegral (fromIntegral (word `shiftR` 16) :: Word16)
+              tmp <- getNewRegNat (intFormat W32)
+              return (Any (floatFormat W32) (\dst -> toOL [ annExpr expr
+                                                          $ MOV (OpReg W32 tmp) (OpImm (ImmInt half0))
+                                                          , MOVK (OpReg W32 tmp) (OpImmShift (ImmInt half1) SLSL 16)
+                                                          , MOV (OpReg W32 dst) (OpReg W32 tmp)
+                                                          ]))
+        CmmFloat f LitDouble -> do
+          let f' = litFloatingToHostDouble f
+          if isFmovImm f'
+            then return $ Any FF64 $ \dst -> unitOL (annExpr expr $ FMOV FF64 (OpReg W64 dst) (OpImm $ ImmDouble f'))
+            else do
+              let word = castDoubleToWord64 f' :: Word64
+                  half0 = fromIntegral (fromIntegral word :: Word16)
+                  half1 = fromIntegral (fromIntegral (word `shiftR` 16) :: Word16)
+                  half2 = fromIntegral (fromIntegral (word `shiftR` 32) :: Word16)
+                  half3 = fromIntegral (fromIntegral (word `shiftR` 48) :: Word16)
+              tmp <- getNewRegNat (intFormat W64)
+              return (Any (floatFormat W64) (\dst -> toOL [ annExpr expr
+                                                          $ MOV (OpReg W64 tmp) (OpImm (ImmInt half0))
+                                                          , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half1) SLSL 16)
+                                                          , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half2) SLSL 32)
+                                                          , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half3) SLSL 48)
+                                                          , MOV (OpReg W64 dst) (OpReg W64 tmp)
+                                                          ]))
 
-        CmmFloat _f W8  -> pprPanic "getRegister' (CmmLit:CmmFloat), no support for bytes" (pdoc plat expr)
-        CmmFloat _f W16 -> pprPanic "getRegister' (CmmLit:CmmFloat), no support for halfs" (pdoc plat expr)
-        CmmFloat f W32 -> do
-          let word = castFloatToWord32 (fromRational f) :: Word32
-              half0 = fromIntegral (fromIntegral word :: Word16)
-              half1 = fromIntegral (fromIntegral (word `shiftR` 16) :: Word16)
-          tmp <- getNewRegNat (intFormat W32)
-          return (Any (floatFormat W32) (\dst -> toOL [ annExpr expr
-                                                      $ MOV (OpReg W32 tmp) (OpImm (ImmInt half0))
-                                                      , MOVK (OpReg W32 tmp) (OpImmShift (ImmInt half1) SLSL 16)
-                                                      , MOV (OpReg W32 dst) (OpReg W32 tmp)
-                                                      ]))
-        CmmFloat f W64 -> do
-          let word = castDoubleToWord64 (fromRational f) :: Word64
-              half0 = fromIntegral (fromIntegral word :: Word16)
-              half1 = fromIntegral (fromIntegral (word `shiftR` 16) :: Word16)
-              half2 = fromIntegral (fromIntegral (word `shiftR` 32) :: Word16)
-              half3 = fromIntegral (fromIntegral (word `shiftR` 48) :: Word16)
-          tmp <- getNewRegNat (intFormat W64)
-          return (Any (floatFormat W64) (\dst -> toOL [ annExpr expr
-                                                      $ MOV (OpReg W64 tmp) (OpImm (ImmInt half0))
-                                                      , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half1) SLSL 16)
-                                                      , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half2) SLSL 32)
-                                                      , MOVK (OpReg W64 tmp) (OpImmShift (ImmInt half3) SLSL 48)
-                                                      , MOV (OpReg W64 dst) (OpReg W64 tmp)
-                                                      ]))
-        CmmFloat _f _w -> pprPanic "getRegister' (CmmLit:CmmFloat), unsupported float lit" (pdoc plat expr)
-        CmmVec _ -> pprPanic "getRegister' (CmmLit:CmmVec): " (pdoc plat expr)
+        CmmVec lits -> do
+          let rep = cmmLitType plat lit
+              format = cmmTypeFormat rep
+          let broadcast = case lits of
+                l0:ls | all (== l0) ls -> Just l0
+                _ -> Nothing
+          case broadcast of
+            Just (CmmFloat f LitFloat) | let v = litFloatingToHostFloat f, isFmovImm v ->
+              let imm = OpImm (ImmFloat v)
+                  code dst = unitOL $ annExpr expr $
+                    if v == 0.0
+                    then DUP format (OpReg W128 dst) imm -- pprIm prints 0.0 as wzr
+                    else FMOV format (OpReg W128 dst) imm
+              in return $ Any format code
+            Just (CmmFloat f LitDouble) | let v = litFloatingToHostDouble f, isFmovImm v ->
+              let imm = OpImm (ImmDouble v)
+                  code dst = unitOL $ annExpr expr $
+                    if v == 0.0
+                    then DUP format (OpReg W128 dst) imm -- pprIm prints 0.0 as xzr
+                    else FMOV format (OpReg W128 dst) imm
+              in return $ Any format code
+            Just (CmmInt x W8) ->
+              let imm = OpImm $ ImmInt $ fromIntegral (fromInteger x :: Word8)
+                  code dst = unitOL $ annExpr expr $ MOVI format (OpReg W128 dst) imm
+              in return $ Any format code
+            Just (CmmInt x W16) | Just (mvi, imm) <- getMoviImm16 (fromInteger x) ->
+              let code dst = unitOL $ annExpr expr $ mvi (OpReg W128 dst) imm
+              in return $ Any format code
+            Just (CmmInt x W32) | Just (mvi, imm) <- getMoviImm32 (fromInteger x) ->
+              let code dst = unitOL $ annExpr expr $ mvi (OpReg W128 dst) imm
+              in return $ Any format code
+            Just (CmmInt x W64) | Just (mvi, imm) <- getMoviImm64 (fromInteger x) ->
+              let code dst = unitOL $ annExpr expr $ mvi (OpReg W128 dst) imm
+              in return $ Any format code
+            _ -> do
+              lbl <- getNewLabelNat
+              let sectionType = case platformOS (ncgPlatform config) of
+                    -- AArch64 Windows platform requires LLVM 20 to support .rodata
+                    OSMinGW32 -> Text
+                    _         -> ReadOnlyData
+              Amode addr addr_code <- getAmode plat W128 (CmmLit (CmmLabel lbl))
+              return $ Any format $ \dst -> addr_code `appOL` toOL
+                [ LDATA (Section sectionType lbl)
+                        (CmmStaticsRaw lbl [CmmStaticLit lit])
+                , LDR format (OpReg W128 dst) (OpAddr addr)
+                ]
+
         CmmLabel _lbl -> do
           (op, imm_code) <- litToImm' lit
           let rep = cmmLitType plat lit
@@ -738,7 +916,7 @@ getRegister' config plat expr
               format = cmmTypeFormat rep
               width = typeWidth rep
           (off_r, _off_format, off_code) <- getSomeReg $ CmmLit (CmmInt (fromIntegral off) width)
-          return (Any format (\dst -> imm_code `appOL` off_code `snocOL` LDR format (OpReg (formatToWidth format) dst) op `snocOL` ADD (OpReg width dst) (OpReg width dst) (OpReg width off_r)))
+          return (Any format (\dst -> imm_code `appOL` off_code `snocOL` LDR format (OpReg (formatToWidth format) dst) op `snocOL` ADD format (OpReg width dst) (OpReg width dst) (OpReg width off_r)))
 
         CmmLabelDiffOff _ _ _ _ -> pprPanic "getRegister' (CmmLit:CmmLabelOff): " (pdoc plat expr)
         CmmBlock _ -> pprPanic "getRegister' (CmmLit:CmmLabelOff): " (pdoc plat expr)
@@ -768,19 +946,36 @@ getRegister' config plat expr
       getRegister (CmmLoad e (cmmBits w) NaturallyAligned)
 
     CmmMachOp op [e] -> do
-      (reg, _format, code) <- getSomeReg e
+      register <- getRegister e
+      (reg, _format, code) <- someReg register
       case op of
-        MO_Not w -> return $ Any (intFormat w) $ \dst ->
+        -- XX Conversion
+        -- truncateSubwordRegister: See Note [Subword operations on AArch64].
+        MO_XX_Conv from to
+          | to >= from -> pure $ swizzleRegisterRep register (intFormat to)
+          | otherwise -> pure $ truncateSubwordRegister to register
+
+        -- truncateSubwordRegister: See Note [Subword operations on AArch64].
+        MO_Not w -> return $ truncateSubwordRegister w $ Any (intFormat w) $ \dst ->
             let w' = opRegWidth w
              in code `snocOL`
-                MVN (OpReg w' dst) (OpReg w' reg) `appOL`
-                truncateReg w' w dst -- See Note [Signed arithmetic on AArch64]
+                MVN (OpReg w' dst) (OpReg w' reg)
 
-        MO_S_Neg w -> negate code w reg
-        MO_F_Neg w -> return $ Any (floatFormat w) (\dst -> code `snocOL` NEG (OpReg w dst) (OpReg w reg))
+        -- truncateSubwordRegister: See Note [Subword operations on AArch64].
+        MO_S_Neg w -> truncateSubwordRegister w <$> do
+          let op_w = opRegWidth w
+          (src, _fmt, reg_code) <- someReg $ signExtendRegister w op_w register
+          pure $ Any (intFormat w) $ \dst -> reg_code `snocOL` (NEG (intFormat w) (OpReg op_w dst) (OpReg op_w src))
 
-        MO_SF_Round    from to -> return $ Any (floatFormat to) (\dst -> code `snocOL` SCVTF (OpReg to dst) (OpReg from reg))  -- (Signed ConVerT Float)
-        MO_FS_Truncate from to -> return $ Any (intFormat to) (\dst -> code `snocOL` FCVTZS (OpReg to dst) (OpReg from reg)) -- (float convert (-> zero) signed)
+        MO_F_Neg w -> return $ Any fmt (\dst -> code `snocOL` NEG fmt (OpReg w dst) (OpReg w reg))
+          where fmt = floatFormat w
+
+        MO_SF_Round    from to ->
+          massert (from >= W32) >>
+          return $ Any (floatFormat to) (\dst -> code `snocOL` SCVTF (OpReg to dst) (OpReg from reg))  -- (Signed ConVerT Float)
+        MO_FS_Truncate from to ->
+          massert (to >= W32) >>
+          return $ Any (intFormat to) (\dst -> code `snocOL` FCVTZS (OpReg to dst) (OpReg from reg)) -- (float convert (-> zero) signed)
 
         -- TODO this is very hacky
         -- Note, UBFM and SBFM expect source and target register to be of the same size, so we'll use @max from to@
@@ -788,11 +983,34 @@ getRegister' config plat expr
         MO_UU_Conv from to -> return $ Any (intFormat to) (\dst -> code `snocOL` UBFM (OpReg (max from to) dst) (OpReg (max from to) reg) (OpImm (ImmInt 0)) (toImm (min from to)))
         MO_SS_Conv from to -> ss_conv from to reg code
         MO_FF_Conv from to -> return $ Any (floatFormat to) (\dst -> code `snocOL` FCVT (OpReg to dst) (OpReg from reg))
-        MO_WF_Bitcast w    -> return $ Any (floatFormat w)  (\dst -> code `snocOL` FMOV (OpReg w dst) (OpReg w reg))
-        MO_FW_Bitcast w    -> return $ Any (intFormat w)    (\dst -> code `snocOL` FMOV (OpReg w dst) (OpReg w reg))
+        MO_WF_Bitcast w    -> return $ Any fmt (\dst -> code `snocOL` FMOV fmt (OpReg w dst) (OpReg w reg))
+          where fmt = floatFormat w
+        MO_FW_Bitcast w    -> return $ Any fmt (\dst -> code `snocOL` FMOV fmt (OpReg w dst) (OpReg w reg))
+          where fmt = intFormat w
 
-        -- Conversions
-        MO_XX_Conv _from to -> swizzleRegisterRep (intFormat to) <$> getRegister e
+        -- Vector
+        MO_V_Broadcast l w -> return $ Any fmt (\dst -> code `snocOL` DUP fmt (OpReg vw dst) (OpReg w reg))
+          where fmt = VecFormat l (intScalarFormat w)
+                vw = formatToWidth fmt
+        MO_VF_Broadcast l w -> return $ Any fmt (\dst -> code `snocOL` DUP fmt (OpReg vw dst) (OpScalarAsVec w reg))
+          where fmt = VecFormat l (floatScalarFormat w)
+                vw = formatToWidth fmt
+        MO_VS_Neg l sw -> return $ Any fmt (\dst -> code `snocOL` NEG fmt (OpReg vw dst) (OpReg vw reg))
+          where fmt = VecFormat l (intScalarFormat sw)
+                vw = formatToWidth fmt
+        MO_VF_Neg l sw -> return $ Any fmt (\dst -> code `snocOL` NEG fmt (OpReg vw dst) (OpReg vw reg))
+          -- The NEG here will be printed as FNEG
+          where fmt = VecFormat l (floatScalarFormat sw)
+                vw = formatToWidth fmt
+        MO_VS_Abs l sw -> return $ Any fmt (\dst -> code `snocOL` ABS fmt (OpReg vw dst) (OpReg vw reg))
+          where fmt = VecFormat l (intScalarFormat sw)
+                vw = formatToWidth fmt
+        MO_VF_Abs l sw -> return $ Any fmt (\dst -> code `snocOL` FABS fmt (OpReg vw dst) (OpReg vw reg))
+          where fmt = VecFormat l (floatScalarFormat sw)
+                vw = formatToWidth fmt
+        MO_VF_Sqrt l sw -> return $ Any fmt (\dst -> code `snocOL` FSQRT fmt (OpReg vw dst) (OpReg vw reg))
+          where fmt = VecFormat l (floatScalarFormat sw)
+                vw = formatToWidth fmt
 
         MO_Eq {} -> notUnary
         MO_Ne {} -> notUnary
@@ -832,7 +1050,9 @@ getRegister' config plat expr
         MO_V_Add {} -> notUnary
         MO_V_Sub {} -> notUnary
         MO_V_Mul {} -> notUnary
-        MO_VS_Neg {} -> notUnary
+        MO_V_And {} -> notUnary
+        MO_V_Or {} -> notUnary
+        MO_V_Xor {} -> notUnary
         MO_V_Shuffle {} -> notUnary
         MO_VF_Shuffle  {} -> notUnary
         MO_VF_Insert {} -> notUnary
@@ -841,6 +1061,9 @@ getRegister' config plat expr
         MO_VF_Sub {} -> notUnary
         MO_VF_Mul {} -> notUnary
         MO_VF_Quot {} -> notUnary
+        MO_VF_And {} -> notUnary
+        MO_VF_Or {} -> notUnary
+        MO_VF_Xor {} -> notUnary
         MO_Add {} -> notUnary
         MO_Sub {} -> notUnary
 
@@ -855,14 +1078,8 @@ getRegister' config plat expr
 
         MO_AlignmentCheck {} ->
           pprPanic "getRegister' (monadic CmmMachOp):" (pdoc plat expr)
-
-        MO_V_Broadcast {} -> vectorsNeedLlvm
-        MO_VF_Broadcast {} -> vectorsNeedLlvm
-        MO_VF_Neg {} -> vectorsNeedLlvm
       where
         notUnary = pprPanic "getRegister' (non-unary CmmMachOp with 1 argument):" (pdoc plat expr)
-        vectorsNeedLlvm =
-            sorry "SIMD operations on AArch64 currently require the LLVM backend"
         toImm W8 =  (OpImm (ImmInt 7))
         toImm W16 = (OpImm (ImmInt 15))
         toImm W32 = (OpImm (ImmInt 31))
@@ -871,25 +1088,13 @@ getRegister' config plat expr
         toImm W256 = (OpImm (ImmInt 255))
         toImm W512 = (OpImm (ImmInt 511))
 
-        -- In the case of 16- or 8-bit values we need to sign-extend to 32-bits
-        -- See Note [Signed arithmetic on AArch64].
-        negate code w reg = do
-            let w' = opRegWidth w
-            (reg', code_sx) <- signExtendReg w w' reg
-            return $ Any (intFormat w) $ \dst ->
-                code `appOL`
-                code_sx `snocOL`
-                NEG (OpReg w' dst) (OpReg w' reg') `appOL`
-                truncateReg w' w dst
-
         ss_conv from to reg code =
             let w' = opRegWidth (max from to)
-            in return $ Any (intFormat to) $ \dst ->
-                code `snocOL`
-                SBFM (OpReg w' dst) (OpReg w' reg) (OpImm (ImmInt 0)) (toImm (min from to)) `appOL`
-                -- At this point an 8- or 16-bit value would be sign-extended
+            in return $ truncateSubwordRegister to $ Any (intFormat to) $ \dst ->
+                  code `snocOL`
+                  SBFM (OpReg w' dst) (OpReg w' reg) (OpImm (ImmInt 0)) (toImm (min from to))
+                -- At this point an 8- or 16-bit value is sign-extended
                 -- to 32-bits. Truncate back down the final width.
-                truncateReg w' to dst
 
     -- Dyadic machops:
     --
@@ -906,20 +1111,21 @@ getRegister' config plat expr
     CmmMachOp (MO_Sub _) [expr'@(CmmReg (CmmGlobal _r)), CmmLit (CmmInt 0 _)] -> getRegister' config plat expr'
     -- Immediates are handled via `getArithImm` in the generic code path.
 
-    CmmMachOp (MO_U_Quot w) [x, y] | w == W8 -> do
+    CmmMachOp (MO_U_Quot w) [x, y] | w == W8 || w == W16-> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (UXTB (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                        (UXTB (OpReg w reg_y) (OpReg w reg_y)) `snocOL`
-                                                                        (UDIV (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
-    CmmMachOp (MO_U_Quot w) [x, y] | w == W16 -> do
-      (reg_x, _format_x, code_x) <- getSomeReg x
-      (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (UXTH (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                        (UXTH (OpReg w reg_y) (OpReg w reg_y)) `snocOL`
-                                                                        (UDIV (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
+      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (UDIV (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
 
     -- 2. Shifts. x << n, x >> n.
+    -- Sub-word left shifts by a constant: use UBFM (UBFIZ alias) to shift
+    -- and mask in a single instruction.  See Note [Subword operations on AArch64].
+    CmmMachOp (MO_Shl w) [x, (CmmLit (CmmInt n _))] | w == W8, 0 <= n, n < 8 -> do
+      (reg_x, _format_x, code_x) <- getSomeReg x
+      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (UBFM (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger ((32 - n) `mod` 32))) (OpImm (ImmInteger (7 - n)))))
+    CmmMachOp (MO_Shl w) [x, (CmmLit (CmmInt n _))] | w == W16, 0 <= n, n < 16 -> do
+      (reg_x, _format_x, code_x) <- getSomeReg x
+      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (UBFM (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger ((32 - n) `mod` 32))) (OpImm (ImmInteger (15 - n)))))
+
     CmmMachOp (MO_Shl w) [x, (CmmLit (CmmInt n _))]
       | w == W32 || w == W64
       , 0 <= n, n < fromIntegral (widthInBits w) -> do
@@ -929,24 +1135,30 @@ getRegister' config plat expr
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))] | w == W8, 0 <= n, n < 8 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (8-n))))
-                                                 `snocOL` (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
+                                                 `snocOL` (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Subword operations on AArch64]
     CmmMachOp (MO_S_Shr w) [x, y] | w == W8 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTB (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)) `snocOL`
-                                                                         (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
+      -- Use a temporary register to avoid sign-extending reg_x in-place,
+      -- as other operations may use reg_x.
+      tmp <- getNewRegNat (intFormat w)
+      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTB (OpReg w tmp) (OpReg w reg_x)) `snocOL`
+                                                                         (ASR (OpReg w dst) (OpReg w tmp) (OpReg w reg_y)) `snocOL`
+                                                                         (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Subword operations on AArch64]
 
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))] | w == W16, 0 <= n, n < 16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (16-n))))
-                                                 `snocOL` (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
+                                                 `snocOL` (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Subword operations on AArch64]
     CmmMachOp (MO_S_Shr w) [x, y] | w == W16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTH (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)) `snocOL`
-                                                                         (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
+      -- Use a temporary register to avoid sign-extending reg_x in-place,
+      -- as other operations may use reg_x.
+      tmp <- getNewRegNat (intFormat w)
+      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTH (OpReg w tmp) (OpReg w reg_x)) `snocOL`
+                                                                         (ASR (OpReg w dst) (OpReg w tmp) (OpReg w reg_y)) `snocOL`
+                                                                         (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Subword operations on AArch64]
 
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))]
       | w == W32 || w == W64
@@ -960,8 +1172,8 @@ getRegister' config plat expr
     CmmMachOp (MO_U_Shr w) [x, y] | w == W8 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (UXTB (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                        (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
+      tmp <- getNewRegNat (intFormat w)
+      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` UXTB (OpReg w tmp) (OpReg w reg_x) `snocOL` annExpr expr (LSR (OpReg w dst) (OpReg w tmp) (OpReg w reg_y)))
 
     CmmMachOp (MO_U_Shr w) [x, (CmmLit (CmmInt n _))] | w == W16, 0 <= n, n < 16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
@@ -969,8 +1181,8 @@ getRegister' config plat expr
     CmmMachOp (MO_U_Shr w) [x, y] | w == W16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
-      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (UXTH (OpReg w reg_x) (OpReg w reg_x))
-                                                                `snocOL` (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
+      tmp <- getNewRegNat (intFormat w)
+      return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` UXTH (OpReg w tmp) (OpReg w reg_x) `snocOL` annExpr expr (LSR (OpReg w dst) (OpReg w tmp) (OpReg w reg_y)))
 
     CmmMachOp (MO_U_Shr w) [x, (CmmLit (CmmInt n _))]
       | w == W32 || w == W64
@@ -979,14 +1191,16 @@ getRegister' config plat expr
       return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (LSR (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n))))
 
     -- 3. Logic &&, ||
-    CmmMachOp (MO_And w) [(CmmReg reg), CmmLit (CmmInt n _)] | isAArch64Bitmask (opRegWidth w') (fromIntegral n) ->
-      return $ Any (intFormat w) (\d -> unitOL $ annExpr expr (AND (OpReg w d) (OpReg w' r') (OpImm (ImmInteger n))))
-      where w' = formatToWidth (cmmTypeFormat (cmmRegType reg))
+    CmmMachOp (MO_And w) [(CmmReg reg), CmmLit (CmmInt n _)] | Just op_bitmask <- getBitmaskImm n w ->
+      return $ Any fmt (\d -> unitOL $ annExpr expr (AND fmt (OpReg w d) (OpReg w' r') op_bitmask))
+      where fmt = intFormat w
+            w' = formatToWidth (cmmTypeFormat (cmmRegType reg))
             r' = getRegisterReg plat reg
 
-    CmmMachOp (MO_Or w) [(CmmReg reg), CmmLit (CmmInt n _)] | isAArch64Bitmask (opRegWidth w') (fromIntegral n) ->
-      return $ Any (intFormat w) (\d -> unitOL $ annExpr expr (ORR (OpReg w d) (OpReg w' r') (OpImm (ImmInteger n))))
-      where w' = formatToWidth (cmmTypeFormat (cmmRegType reg))
+    CmmMachOp (MO_Or w) [(CmmReg reg), CmmLit (CmmInt n _)] | Just op_bitmask <- getBitmaskImm n w ->
+      return $ Any fmt (\d -> unitOL $ annExpr expr (ORR fmt (OpReg w d) (OpReg w' r') op_bitmask))
+      where fmt = intFormat w
+            w' = formatToWidth (cmmTypeFormat (cmmRegType reg))
             r' = getRegisterReg plat reg
 
     -- Generic binary case.
@@ -1015,16 +1229,17 @@ getRegister' config plat expr
                 code_y `appOL`
                 op (OpReg w dst) (OpReg w reg_x) op_y)
 
-          -- A (potentially signed) integer operation.
+          -- A (potentially signed) integer operation that can have immediate arguments.
           -- In the case of 8- and 16-bit signed arithmetic we must first
           -- sign-extend both arguments to 32-bits.
-          -- See Note [Signed arithmetic on AArch64].
-          intOpImm :: Bool -> Width -> (Operand -> Operand -> Operand -> OrdList Instr) -> (Integer -> Width -> Maybe Operand) -> NatM (Register)
-          intOpImm {- is signed -} True  w op _encode_imm = intOp True w op
-          intOpImm                 False w op  encode_imm = do
+          -- See Note [Subword operations on AArch64].
+          intOpImm :: Bool -> SetsHighBits -> Width -> (Operand -> Operand -> Operand -> OrdList Instr) -> (Integer -> Width -> Maybe Operand) -> NatM (Register)
+          intOpImm {- is signed -} True  trunc w op _encode_imm = intOp True trunc w op
+          intOpImm                 False trunc w op  encode_imm = maintainHighBits trunc w <$> do
               -- compute x<m> <- x
               -- compute x<o> <- y
               -- <OP> x<n>, x<m>, x<o>
+              let w' = opRegWidth w
               (reg_x, format_x, code_x) <- getSomeReg x
               (op_y, format_y, code_y) <- case y of
                 CmmLit (CmmInt n w)
@@ -1036,46 +1251,57 @@ getRegister' config plat expr
               massertPpr (isIntFormat format_x && isIntFormat format_y) $ text "intOp: non-int"
               -- This is the width of the registers on which the operation
               -- should be performed.
-              let w' = opRegWidth w
               return $ Any (intFormat w) $ \dst ->
                   code_x `appOL`
                   code_y `appOL`
-                  op (OpReg w' dst) (OpReg w' reg_x) (op_y) `appOL`
-                  truncateReg w' w dst -- truncate back to the operand's original width
+                  op (OpReg w' dst) (OpReg w' reg_x) (op_y)
 
           -- A (potentially signed) integer operation.
           -- In the case of 8- and 16-bit signed arithmetic we must first
           -- sign-extend both arguments to 32-bits.
-          -- See Note [Signed arithmetic on AArch64].
-          intOp is_signed w op = do
+          -- See Note [Subword operations on AArch64].
+          intOp is_signed clean_highbits w op = maintainHighBits clean_highbits w <$> do
               -- compute x<m> <- x
               -- compute x<o> <- y
               -- <OP> x<n>, x<m>, x<o>
-              (reg_x, format_x, code_x) <- getSomeReg x
-              (reg_y, format_y, code_y) <- getSomeReg y
+              let op_w = opRegWidth w
+              let setHighBits = if is_signed then signExtendRegister w (opRegWidth w) else id
+              (reg_x_sx, format_x, code_x) <- someReg =<< setHighBits <$> getRegister x
+              (reg_y_sx, format_y, code_y) <- someReg =<< setHighBits <$> getRegister y
               massertPpr (isIntFormat format_x && isIntFormat format_y) $ text "intOp: non-int"
-              -- This is the width of the registers on which the operation
-              -- should be performed.
-              let w' = opRegWidth w
-                  signExt r
-                    | not is_signed  = return (r, nilOL)
-                    | otherwise      = signExtendReg w w' r
-              (reg_x_sx, code_x_sx) <- signExt reg_x
-              (reg_y_sx, code_y_sx) <- signExt reg_y
+
               return $ Any (intFormat w) $ \dst ->
                   code_x `appOL`
                   code_y `appOL`
-                  -- sign-extend both operands
-                  code_x_sx `appOL`
-                  code_y_sx `appOL`
-                  op (OpReg w' dst) (OpReg w' reg_x_sx) (OpReg w' reg_y_sx) `appOL`
-                  truncateReg w' w dst -- truncate back to the operand's original width
+                  op (OpReg op_w dst) (OpReg op_w reg_x_sx) (OpReg op_w reg_y_sx)
 
           floatOp w op = do
             (reg_fx, format_x, code_fx) <- getFloatReg x
             (reg_fy, format_y, code_fy) <- getFloatReg y
             massertPpr (isFloatFormat format_x && isFloatFormat format_y) $ text "floatOp: non-float"
             return $ Any (floatFormat w) (\dst -> code_fx `appOL` code_fy `appOL` op (OpReg w dst) (OpReg w reg_fx) (OpReg w reg_fy))
+
+          intVecOp l scalarWidth op = do
+            (reg_x, format_x, code_x) <- getSomeReg x
+            (reg_y, format_y, code_y) <- getSomeReg y
+            massertPpr (isVecFormat format_x && isVecFormat format_y) $ text "intVecOp: non-vector"
+            let format = case (l, scalarWidth) of
+                  (16, W8) -> VecFormat 16 FmtInt8
+                  (8, W16) -> VecFormat 8 FmtInt16
+                  (4, W32) -> VecFormat 4 FmtInt32
+                  (2, W64) -> VecFormat 2 FmtInt64
+                  _ -> pprPanic "intVecOp: invalid vector format" (ppr l <+> ppr scalarWidth)
+            return $ Any format (\dst -> code_x `appOL` code_y `appOL` op format (OpReg W128 dst) (OpReg W128 reg_x) (OpReg W128 reg_y))
+
+          floatVecOp l scalarWidth op = do
+            (reg_x, format_x, code_x) <- getSomeReg x
+            (reg_y, format_y, code_y) <- getSomeReg y
+            massertPpr (isVecFormat format_x && isVecFormat format_y) $ text "floatVecOp: non-vector"
+            let format = case (l, scalarWidth) of
+                  (4, W32) -> VecFormat 4 FmtFloat
+                  (2, W64) -> VecFormat 2 FmtDouble
+                  _ -> pprPanic "floatVecOp: invalid vector format" (ppr l <+> ppr scalarWidth)
+            return $ Any format (\dst -> code_x `appOL` code_y `appOL` op format (OpReg W128 dst) (OpReg W128 reg_x) (OpReg W128 reg_y))
 
           -- need a special one for conditionals, as they return ints
           floatCond w op = do
@@ -1084,12 +1310,163 @@ getRegister' config plat expr
             massertPpr (isFloatFormat format_x && isFloatFormat format_y) $ text "floatCond: non-float"
             return $ Any (intFormat w) (\dst -> code_fx `appOL` code_fy `appOL` op (OpReg w dst) (OpReg w reg_fx) (OpReg w reg_fy))
 
+          intVecMinMax l scalarWidth gt max = do
+            (reg_x, format_x, code_x) <- getSomeReg x
+            (reg_y, format_y, code_y) <- getSomeReg y
+            massertPpr (isVecFormat format_x && isVecFormat format_y) $ text "intVecOp: non-vector"
+            let format = case (l, scalarWidth) of
+                  (16, W8) -> VecFormat 16 FmtInt8
+                  (8, W16) -> VecFormat 8 FmtInt16
+                  (4, W32) -> VecFormat 4 FmtInt32
+                  (2, W64) -> VecFormat 2 FmtInt64
+                  _ -> pprPanic "intVecOp: invalid vector format" (ppr l <+> ppr scalarWidth)
+            tmp <- getNewRegNat format
+            let op dst x y = toOL [gt format dst x y -- CMGT or CMHI
+                                  ,if max then BSL dst x y else BSL dst y x
+                                  ]
+            return $ Any format $ \dst ->
+              code_x `appOL` code_y `appOL`
+              if dst == reg_x || dst == reg_y
+                then op (OpReg W128 tmp) (OpReg W128 reg_x) (OpReg W128 reg_y) `snocOL`
+                     MOV (OpReg W128 dst) (OpReg W128 tmp)
+                else op (OpReg W128 dst) (OpReg W128 reg_x) (OpReg W128 reg_y)
+
+          -- The shuffle function serves as an entry point to many instructions.
+          -- In the case of ASIMD, possible targets include INS, DUP, EXT,
+          -- REV{16,32,64}, ZIP{1,2}, UZP{1,2}, and TRN{1,2}.
+          shuffleOp l scalarWidth is@(i0:_)
+            | length is == l, all (\i -> 0 <= i && i < 2 * l) is = do
+              (reg_x, format_x, code_x) <- getSomeReg x
+              (reg_y, format_y, code_y) <- getSomeReg y
+              massertPpr (isVecFormat format_x && isVecFormat format_y) $ text "shuffleOp: non-vector"
+              let format = case (l, scalarWidth) of
+                    (16, W8) -> VecFormat 16 FmtInt8
+                    (8, W16) -> VecFormat 8 FmtInt16
+                    (4, W32) -> VecFormat 4 FmtInt32
+                    (2, W64) -> VecFormat 2 FmtInt64
+                    _ -> pprPanic "shuffleOp: invalid vector format" (ppr l <+> ppr scalarWidth)
+
+              let -- All elements are from one source:
+                  -- Returns `Left (\dst src -> insn)` if the operation can be done by one instruction.
+                  -- Returns `Right (\dst src -> insns)` if the operation needs multiple instrucitons,
+                  -- requesting the caller to use a temporary register if necessary.
+                  singleSource :: [Int] -> Either (Reg -> Reg -> Instr) (Reg -> Reg -> OrdList Instr)
+                  singleSource is@(i0:iss)
+                    | is == [0..l-1] = Left $ \dst src1 -> MOV (OpReg W128 dst) (OpReg W128 src1)
+
+                    -- REV64.16B: 7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8
+                    | scalarWidth == W8, and $ zipWith (\i j -> i == j + 7 - 2 * (j `rem` 8)) is [0..] =
+                      Left $ \dst src1 -> REV64 (VecFormat 16 FmtInt8) (OpReg W128 dst) (OpReg W128 src1) -- REV64.16B
+
+                    -- REV32.16B: 3,2,1,0,7,6,5,4,...
+                    -- REV64.8H: 3,2,1,0,7,6,5,4
+                    | scalarWidth <= W16, and $ zipWith (\i j -> i == j + 3 - 2 * (j `rem` 4)) is [0..] =
+                      case scalarWidth of
+                        W8 -> Left $ \dst src1 -> REV32 (VecFormat 16 FmtInt8) (OpReg W128 dst) (OpReg W128 src1) -- REV32.16B
+                        W16 -> Left $ \dst src1 -> REV64 (VecFormat 8 FmtInt16) (OpReg W128 dst) (OpReg W128 src1) -- REV64.8H
+                        _ -> panic "cannot occur"
+
+                    -- REV16.16B: 1,0,3,2,5,4,...
+                    -- REV32.8H: 1,0,3,2,5,4,7,6
+                    -- REV64.4S: 1,0,3,2
+                    | scalarWidth <= W32, and $ zipWith (\i j -> i == j + 1 - 2 * (j `rem` 2)) is [0..] =
+                      case scalarWidth of
+                        W8 -> Left $ \dst src1 -> REV16 (VecFormat 16 FmtInt8) (OpReg W128 dst) (OpReg W128 src1) -- REV16.16B
+                        W16 -> Left $ \dst src1 -> REV32 (VecFormat 8 FmtInt16) (OpReg W128 dst) (OpReg W128 src1) -- REV32.8H
+                        W32 -> Left $ \dst src1 -> REV64 (VecFormat 4 FmtInt32) (OpReg W128 dst) (OpReg W128 src1) -- REV64.4S
+                        _ -> panic "cannot occur"
+
+                    -- Handled by the general case:
+                    -- all (== i0) iss = Left $ \dst src1 -> DUP format (OpReg W128 dst) (OpVecLane scalarWidth reg1 i0)
+
+                    -- general case
+                    | otherwise = Right $ \dst src1 ->
+                      DUP format (OpReg W128 dst) (OpVecLane scalarWidth src1 i0) `consOL`
+                      toOL [ INS format (OpVecLane scalarWidth dst j) (OpVecLane scalarWidth src1 i) | (j, i) <- zip [1..] iss, i /= i0 ]
+
+                  singleSource [] = panic "cannot occur"
+
+                  -- Assumption: i0 < l (symmetry)
+                  -- Returns `Left (\dst src1 src2 -> insn)` if the operation can be done by one instruction.
+                  -- Returns `Right (\dst src1 src2 -> insns)` if the operation needs multiple instrucitons,
+                  -- requesting the caller to use a temporary register if necessary.
+                  twoSources :: [Int] -> Either (Reg -> Reg -> Reg -> Instr) (Reg -> Reg -> Reg -> OrdList Instr)
+                  twoSources is@(i0:iss)
+                    -- EXT: k,k+1,..,l-1,l,l+1,..,k+l-1
+                    | is == [i0..i0+l-1] = Left $ \dst src1 src2 ->
+                      EXT (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2) (widthInBytes scalarWidth * i0)
+
+                    -- ZIP1: 0,l,1,l+1,..,l/2-1,l+l/2-1
+                    | is == map (\j -> case j `quotRem` 2 of (q,r) -> q + r * l) [0..l-1] =
+                      Left $ \dst src1 src2 -> ZIP1 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- ZIP2: l/2,l+l/2,l/2+1,l+l/2+1,..,l-1,2*l-1
+                    | is == map (\j -> case j `quotRem` 2 of (q,r) -> l `quot` 2 + q + r * l) [0..l-1] =
+                      Left $ \dst src1 src2 -> ZIP2 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- UZP1: 0,2,4,6,..,2*l-2
+                    | is == [0,2..2*l-2] = Left $ \dst src1 src2 -> UZP1 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- UZP2: 1,3,5,7,..,2*l-1
+                    | is == [1,3..2*l-1] = Left $ \dst src1 src2 -> UZP2 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- TRN1: 0,l,2,l+2,..
+                    | is == map (\j -> j + (j `rem` 2) * (l - 1)) [0..l-1] =
+                      Left $ \dst src1 src2 -> TRN1 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- TRN2: 1,l+1,3,l+3,..
+                    | is == map (\j -> j + (j `rem` 2) * (l - 1) + 1) [0..l-1] =
+                      Left $ \dst src1 src2 -> TRN2 format (OpReg W128 dst) (OpReg W128 src1) (OpReg W128 src2)
+
+                    -- general case
+                    | otherwise = Right $ \dst src1 src2 ->
+                      let getLane i | i < l = OpVecLane scalarWidth src1 i
+                                    | otherwise = OpVecLane scalarWidth src2 (i - l)
+                      in DUP format (OpReg W128 dst) (getLane i0) `consOL`
+                         toOL [ INS format (OpVecLane scalarWidth dst j) (getLane i) | (j, i) <- zip [1..] iss, i /= i0 ]
+
+                  twoSources [] = panic "cannot occur"
+
+              tmp <- getNewRegNat format
+              let code dst
+                    | all (< l) is = code_x `appOL`
+                      case singleSource is of
+                        Left insn -> unitOL $ insn dst reg_x -- single instruction
+                        Right insns -- multiple instructions; may need to use temporary
+                          | dst == reg_x -> insns tmp reg_x `snocOL` MOV (OpReg W128 dst) (OpReg W128 tmp)
+                          | otherwise -> insns dst reg_x
+
+                    | all (>= l) is = code_y `appOL`
+                      case singleSource [i - l | i <- is] of
+                        Left insn -> unitOL $ insn dst reg_y
+                        Right insns
+                          | dst == reg_y -> insns tmp reg_y `snocOL` MOV (OpReg W128 dst) (OpReg W128 tmp)
+                          | otherwise -> insns dst reg_y
+
+                    | i0 < l = code_x `appOL` code_y `appOL`
+                      case twoSources is of
+                        Left insn -> unitOL $ insn dst reg_x reg_y
+                        Right insns
+                          | dst == reg_x || dst == reg_y -> insns tmp reg_x reg_y `snocOL` MOV (OpReg W128 dst) (OpReg W128 tmp)
+                          | otherwise -> insns dst reg_x reg_y
+
+                    | otherwise = code_x `appOL` code_y `appOL`
+                      case twoSources [if i < l then i + l else i - l | i <- is] of
+                        Left insn -> unitOL $ insn dst reg_y reg_x
+                        Right insns
+                          | dst == reg_x || dst == reg_y -> insns tmp reg_y reg_x `snocOL` MOV (OpReg W128 dst) (OpReg W128 tmp)
+                          | otherwise -> insns dst reg_y reg_x
+
+              return $ Any format code
+
+          shuffleOp _ _ is = pprPanic "shuffleOp: wrong indices" (ppr is)
+
       case op of
         -- Integer operations
         -- Add/Sub should only be Integer Options.
-        MO_Add w -> intOpImm False w (\d x y -> unitOL $ annExpr expr (ADD d x y)) getArithImm
+        MO_Add w -> intOpImm False UnknownHighBits w (\d x y -> unitOL $ annExpr expr (ADD (intFormat w) d x y)) getArithImm
         -- TODO: Handle sub-word case
-        MO_Sub w -> intOpImm False w (\d x y -> unitOL $ annExpr expr (SUB d x y)) getArithImm
+        MO_Sub w -> intOpImm False UnknownHighBits w (\d x y -> unitOL $ annExpr expr (SUB (intFormat w) d x y)) getArithImm
 
         -- Note [CSET]
         -- ~~~~~~~~~~~
@@ -1135,9 +1512,9 @@ getRegister' config plat expr
         MO_Ne w     -> bitOpImm w (\d x y -> toOL [ CMP x y, CSET d NE ]) getArithImm
 
         -- Signed multiply/divide
-        MO_Mul w          -> intOp True w (\d x y -> unitOL $ MUL d x y)
+        MO_Mul w          -> intOp True UnknownHighBits w (\d x y -> unitOL $ MUL (intFormat w) d x y)
         MO_S_MulMayOflo w -> do_mul_may_oflo w x y
-        MO_S_Quot w       -> intOp True w (\d x y -> unitOL $ SDIV d x y)
+        MO_S_Quot w       -> intOp True UnknownHighBits w (\d x y -> unitOL $ SDIV (intFormat w) d x y)
 
         -- No native rem instruction. So we'll compute the following
         -- Rd  <- Rx / Ry             | 2 <- 7 / 3      -- SDIV Rd Rx Ry
@@ -1147,32 +1524,32 @@ getRegister' config plat expr
         --        '--------------------------'
         -- Note the swap in Rx and Ry.
         MO_S_Rem w -> withTempIntReg w $ \t ->
-                      intOp True w (\d x y -> toOL [ SDIV t x y, MSUB d t y x ])
+                      intOp True UnknownHighBits w (\d x y -> toOL [ SDIV (intFormat w) t x y, MSUB d t y x ])
 
         -- Unsigned multiply/divide
-        MO_U_Quot w -> intOp False w (\d x y -> unitOL $ UDIV d x y)
+        MO_U_Quot w -> intOp False CleanHighBits w (\d x y -> unitOL $ UDIV d x y)
         MO_U_Rem w  -> withTempIntReg w $ \t ->
-                       intOp False w (\d x y -> toOL [ UDIV t x y, MSUB d t y x ])
+                       intOp False CleanHighBits w (\d x y -> toOL [ UDIV t x y, MSUB d t y x ])
 
         -- Signed comparisons -- see Note [CSET]
-        MO_S_Ge w     -> intOp True  w (\d x y -> toOL [ CMP x y, CSET d SGE ])
-        MO_S_Le w     -> intOp True  w (\d x y -> toOL [ CMP x y, CSET d SLE ])
-        MO_S_Gt w     -> intOp True  w (\d x y -> toOL [ CMP x y, CSET d SGT ])
-        MO_S_Lt w     -> intOp True  w (\d x y -> toOL [ CMP x y, CSET d SLT ])
+        MO_S_Ge w     -> intOp True CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d SGE ])
+        MO_S_Le w     -> intOp True CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d SLE ])
+        MO_S_Gt w     -> intOp True CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d SGT ])
+        MO_S_Lt w     -> intOp True CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d SLT ])
 
         -- Unsigned comparisons
-        MO_U_Ge w     -> intOpImm False w (\d x y -> toOL [ CMP x y, CSET d UGE ]) getArithImm
-        MO_U_Le w     -> intOpImm False w (\d x y -> toOL [ CMP x y, CSET d ULE ]) getArithImm
-        MO_U_Gt w     -> intOpImm False w (\d x y -> toOL [ CMP x y, CSET d UGT ]) getArithImm
-        MO_U_Lt w     -> intOpImm False w (\d x y -> toOL [ CMP x y, CSET d ULT ]) getArithImm
+        MO_U_Ge w     -> intOpImm False CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d UGE ]) getArithImm
+        MO_U_Le w     -> intOpImm False CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d ULE ]) getArithImm
+        MO_U_Gt w     -> intOpImm False CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d UGT ]) getArithImm
+        MO_U_Lt w     -> intOpImm False CleanHighBits w (\d x y -> toOL [ CMP x y, CSET d ULT ]) getArithImm
 
         -- Floating point arithmetic
-        MO_F_Add w   -> floatOp w (\d x y -> unitOL $ ADD d x y)
-        MO_F_Sub w   -> floatOp w (\d x y -> unitOL $ SUB d x y)
-        MO_F_Mul w   -> floatOp w (\d x y -> unitOL $ MUL d x y)
-        MO_F_Quot w  -> floatOp w (\d x y -> unitOL $ SDIV d x y)
-        MO_F_Min w   -> floatOp w (\d x y -> unitOL $ FMIN d x y)
-        MO_F_Max w   -> floatOp w (\d x y -> unitOL $ FMAX d x y)
+        MO_F_Add w   -> floatOp w (\d x y -> unitOL $ ADD (floatFormat w) d x y)
+        MO_F_Sub w   -> floatOp w (\d x y -> unitOL $ SUB (floatFormat w) d x y)
+        MO_F_Mul w   -> floatOp w (\d x y -> unitOL $ MUL (floatFormat w) d x y)
+        MO_F_Quot w  -> floatOp w (\d x y -> unitOL $ SDIV (floatFormat w) d x y)
+        MO_F_Min w   -> floatOp w (\d x y -> unitOL $ FMIN (floatFormat w) d x y)
+        MO_F_Max w   -> floatOp w (\d x y -> unitOL $ FMAX (floatFormat w) d x y)
 
         -- Floating point comparison
         MO_F_Eq w    -> floatCond w (\d x y -> toOL [ CMP x y, CSET d EQ ])
@@ -1189,16 +1566,90 @@ getRegister' config plat expr
         MO_F_Lt w    -> floatCond w (\d x y -> toOL [ CMP x y, CSET d OLT ]) -- x < y <=> y >= x
 
         -- Bitwise operations
-        MO_And   w -> bitOpImm w (\d x y -> unitOL $ AND d x y) getBitmaskImm
-        MO_Or    w -> bitOpImm w (\d x y -> unitOL $ ORR d x y) getBitmaskImm
-        MO_Xor   w -> bitOpImm w (\d x y -> unitOL $ EOR d x y) getBitmaskImm
-        MO_Shl   w -> intOp False w (\d x y -> unitOL $ LSL d x y)
-        MO_U_Shr w -> intOp False w (\d x y -> unitOL $ LSR d x y)
-        MO_S_Shr w -> intOp True  w (\d x y -> unitOL $ ASR d x y)
+        MO_And   w -> bitOpImm w (\d x y -> unitOL $ AND (intFormat w) d x y) getBitmaskImm
+        MO_Or    w -> bitOpImm w (\d x y -> unitOL $ ORR (intFormat w) d x y) getBitmaskImm
+        MO_Xor   w -> bitOpImm w (\d x y -> unitOL $ EOR (intFormat w) d x y) getBitmaskImm
+        MO_Shl   w -> intOp False UnknownHighBits w (\d x y -> unitOL $ LSL d x y)
+        MO_U_Shr w -> intOp False CleanHighBits w (\d x y -> unitOL $ LSR d x y)
+        MO_S_Shr w -> intOp True  UnknownHighBits w (\d x y -> unitOL $ ASR d x y)
+
+        -- Vector operations
+        MO_V_Add l w      -> intVecOp l w (\fmt d x y -> unitOL $ ADD fmt d x y)
+        MO_V_Sub l w      -> intVecOp l w (\fmt d x y -> unitOL $ SUB fmt d x y)
+        MO_V_Mul 2 W64 -> do
+          -- There is no vector multiplication for int64x2.
+          -- Use scalar fallback.
+          (reg_x, format_x, code_x) <- getSomeReg x
+          (reg_y, format_y, code_y) <- getSomeReg y
+          massertPpr (isVecFormat format_x && isVecFormat format_y) $ text "intVecOp: non-vector"
+          x_lo <- getNewRegNat II64
+          x_hi <- getNewRegNat II64
+          y_lo <- getNewRegNat II64
+          y_hi <- getNewRegNat II64
+          return $ Any (VecFormat 2 FmtInt64) $ \dst ->
+            code_x `appOL` code_y `appOL` toOL
+              [ MOV (OpReg W64 x_lo) (OpVecLane W64 reg_x 0)
+              , MOV (OpReg W64 x_hi) (OpVecLane W64 reg_x 1)
+              , MOV (OpReg W64 y_lo) (OpVecLane W64 reg_y 0)
+              , MOV (OpReg W64 y_hi) (OpVecLane W64 reg_y 1)
+              , MUL II64 (OpReg W64 x_lo) (OpReg W64 x_lo) (OpReg W64 y_lo)
+              , MUL II64 (OpReg W64 x_hi) (OpReg W64 x_hi) (OpReg W64 y_hi)
+              , DUP (VecFormat 2 FmtInt64) (OpReg W128 dst) (OpReg W64 x_lo)
+              , INS (VecFormat 2 FmtInt64) (OpVecLane W64 dst 1) (OpReg W64 x_hi)
+              ]
+        MO_V_Mul l w      -> intVecOp l w (\fmt d x y -> unitOL $ MUL fmt d x y)
+        MO_V_And l w      -> intVecOp l w (\_ d x y -> unitOL $ AND (VecFormat 16 FmtInt8) d x y)
+        MO_V_Or l w       -> intVecOp l w (\_ d x y -> unitOL $ ORR (VecFormat 16 FmtInt8) d x y)
+        MO_V_Xor l w      -> intVecOp l w (\_ d x y -> unitOL $ EOR (VecFormat 16 FmtInt8) d x y)
+        MO_VF_And l w     -> floatVecOp l w (\_ d x y -> unitOL $ AND (VecFormat 16 FmtInt8) d x y)
+        MO_VF_Or l w      -> floatVecOp l w (\_ d x y -> unitOL $ ORR (VecFormat 16 FmtInt8) d x y)
+        MO_VF_Xor l w     -> floatVecOp l w (\_ d x y -> unitOL $ EOR (VecFormat 16 FmtInt8) d x y)
+        MO_VF_Add l w     -> floatVecOp l w (\fmt d x y -> unitOL $ ADD fmt d x y)
+        MO_VF_Sub l w     -> floatVecOp l w (\fmt d x y -> unitOL $ SUB fmt d x y)
+        MO_VF_Mul l w     -> floatVecOp l w (\fmt d x y -> unitOL $ MUL fmt d x y)
+        MO_VF_Quot l w    -> floatVecOp l w (\fmt d x y -> unitOL $ SDIV fmt d x y)
+        MO_V_Shuffle l w is -> shuffleOp l w is
+        MO_VF_Shuffle l w is -> shuffleOp l w is
+        MO_VU_Min l@2 w@W64 -> intVecMinMax l w CMHI False
+        MO_VU_Min l w       -> intVecOp l w (\fmt d x y -> unitOL $ UMIN fmt d x y)
+        MO_VU_Max l@2 w@W64 -> intVecMinMax l w CMHI True
+        MO_VU_Max l w       -> intVecOp l w (\fmt d x y -> unitOL $ UMAX fmt d x y)
+        MO_VS_Min l@2 w@W64 -> intVecMinMax l w CMGT False
+        MO_VS_Min l w       -> intVecOp l w (\fmt d x y -> unitOL $ SMIN fmt d x y)
+        MO_VS_Max l@2 w@W64 -> intVecMinMax l w CMGT True
+        MO_VS_Max l w       -> intVecOp l w (\fmt d x y -> unitOL $ SMAX fmt d x y)
+        MO_VF_Min l w       -> floatVecOp l w (\fmt d x y -> unitOL $ FMIN fmt d x y)
+        MO_VF_Max l w       -> floatVecOp l w (\fmt d x y -> unitOL $ FMAX fmt d x y)
+
+        MO_V_Extract l w -> do
+          platform <- getPlatform
+          let format = intFormat w
+              index = case y of
+                CmmLit (CmmInt i _) | 0 <= i, i < toInteger l -> fromInteger i
+                _ -> pprPanic "Unsupported offset" (pdoc platform y)
+          (reg_x, format_x, code_x) <- getSomeReg x
+          massertPpr (isVecFormat format_x) $ text "MO_V_Extract: non-vector"
+          -- Always use UMOV. See Note [Subword operations on AArch64]
+          return $ Any format (\dst -> code_x `snocOL` UMOV (OpReg w dst) (OpVecLane w reg_x index))
+
+        MO_VF_Extract l w -> do
+          platform <- getPlatform
+          let format = floatFormat w
+              index = case y of
+                CmmLit (CmmInt i _) | 0 <= i, i < toInteger l -> fromInteger i
+                _ -> pprPanic "Unsupported offset" (pdoc platform y)
+          (reg_x, format_x, code_x) <- getSomeReg x
+          massertPpr (isVecFormat format_x) $ text "MO_VF_Extract: non-vector"
+          return $ Any format (\dst -> code_x `snocOL` DUP format_x (OpReg w dst) (OpVecLane w reg_x index))
 
         -- Non-dyadic MachOp with 2 arguments
         MO_S_Neg {} -> notDyadic
         MO_F_Neg {} -> notDyadic
+        MO_VS_Neg {} -> notDyadic
+        MO_VF_Neg {} -> notDyadic
+        MO_VF_Abs {} -> notDyadic
+        MO_VS_Abs {} -> notDyadic
+        MO_VF_Sqrt {} -> notDyadic
         MO_FMA {} -> notDyadic
         MO_Not {} -> notDyadic
         MO_SF_Round {} -> notDyadic
@@ -1215,33 +1666,10 @@ getRegister' config plat expr
         MO_VF_Insert {} -> notDyadic
         MO_AlignmentCheck {} -> notDyadic
         MO_RelaxedRead {} -> notDyadic
-
-        -- Vector operations: currently unsupported in the AArch64 NCG.
-        MO_V_Extract {} -> vectorsNeedLlvm
-        MO_V_Add {} -> vectorsNeedLlvm
-        MO_V_Sub {} -> vectorsNeedLlvm
-        MO_V_Mul {} -> vectorsNeedLlvm
-        MO_VS_Neg {} -> vectorsNeedLlvm
-        MO_VF_Extract {} -> vectorsNeedLlvm
-        MO_VF_Add {} -> vectorsNeedLlvm
-        MO_VF_Sub {} -> vectorsNeedLlvm
-        MO_VF_Neg {} -> vectorsNeedLlvm
-        MO_VF_Mul {} -> vectorsNeedLlvm
-        MO_VF_Quot {} -> vectorsNeedLlvm
-        MO_V_Shuffle {} -> vectorsNeedLlvm
-        MO_VF_Shuffle {} -> vectorsNeedLlvm
-        MO_VU_Min {} -> vectorsNeedLlvm
-        MO_VU_Max {} -> vectorsNeedLlvm
-        MO_VS_Min {} -> vectorsNeedLlvm
-        MO_VS_Max {} -> vectorsNeedLlvm
-        MO_VF_Min {} -> vectorsNeedLlvm
-        MO_VF_Max {} -> vectorsNeedLlvm
         where
           notDyadic =
             pprPanic "getRegister' (non-dyadic CmmMachOp with 2 arguments): " $
               (pprMachOp op) <+> text "in" <+> (pdoc plat expr)
-          vectorsNeedLlvm =
-            sorry "SIMD operations on AArch64 currently require the LLVM backend"
 
     -- Generic ternary case.
     CmmMachOp op [x, y, z] ->
@@ -1263,17 +1691,86 @@ getRegister' config plat expr
             FNMAdd -> float3Op w (\d n m a -> unitOL $ FMA FMSub  d n m a)
             FNMSub -> float3Op w (\d n m a -> unitOL $ FMA FNMAdd d n m a)
           | otherwise
-          -> vectorsNeedLlvm
+          -> do
+            (reg_x, format_x, code_x) <- getSomeReg x
+            (reg_y, format_y, code_y) <- getSomeReg y
+            (reg_z, format_z, code_z) <- getSomeReg z
+            massertPpr (isVecFormat format_x && isVecFormat format_y && isVecFormat format_z) $
+              text "MO_FMA: non-vector"
+            let format = case (l, w) of
+                  (4, W32) -> VecFormat 4 FmtFloat
+                  (2, W64) -> VecFormat 2 FmtDouble
+                  _ -> pprPanic "MO_FMA: invalid vector format" (ppr l <+> ppr w)
+            tmp <- getNewRegNat format
+            -- FMLA vd, vn, vm: vd := vd + vn * vm
+            -- FMLS vd, vn, vm: vd := vd - vn * vm
+            let op d n m a = case var of
+                  FMAdd | d == a -> unitOL $ FMLA format d n m
+                        | otherwise -> toOL [MOV d a, FMLA format d n m]
+                  FNMAdd | d == a -> unitOL $ FMLS format d n m
+                         | otherwise -> toOL [MOV d a, FMLS format d n m]
+                  FMSub ->
+                    toOL [NEG format d a, FMLA format d n m]
+                  FNMSub ->
+                    toOL [NEG format d a, FMLS format d n m]
+            return $ Any format $ \ dst ->
+              code_x `appOL`
+              code_y `appOL`
+              code_z `appOL`
+              if dst == reg_x || dst == reg_y
+                then op (OpReg W128 tmp) (OpReg W128 reg_x) (OpReg W128 reg_y) (OpReg W128 reg_z) `snocOL`
+                     MOV (OpReg W128 dst) (OpReg W128 tmp)
+                else op (OpReg W128 dst) (OpReg W128 reg_x) (OpReg W128 reg_y) (OpReg W128 reg_z)
 
-        MO_V_Insert {} -> vectorsNeedLlvm
-        MO_VF_Insert {} -> vectorsNeedLlvm
+        MO_V_Insert l w -> do
+          platform <- getPlatform
+          let format = case (l, w) of
+                (16, W8) -> VecFormat 16 FmtInt8
+                (8, W16) -> VecFormat 8 FmtInt16
+                (4, W32) -> VecFormat 4 FmtInt32
+                (2, W64) -> VecFormat 2 FmtInt64
+                _ -> pprPanic "MO_V_Insert: invalid vector format" (ppr l <+> ppr w)
+              index = case z of
+                CmmLit (CmmInt i _) | 0 <= i, i < toInteger l -> fromInteger i
+                _ -> pprPanic "Unsupported offset" (pdoc platform z)
+          (reg_x, format_x, code_x) <- getSomeReg x
+          (reg_y, format_y, code_y) <- getSomeReg y
+          massertPpr (isVecFormat format_x) $ text "MO_V_Insert: non-vector"
+          massertPpr (isIntFormat format_y) $ text "MO_V_Insert: non-integer"
+          return $ Any format $ \dst ->
+            code_x `appOL` code_y `snocOL`
+            MOV (OpReg W128 dst) (OpReg W128 reg_x) `snocOL`
+            INS format (OpVecLane w dst index) (OpReg w reg_y)
+
+        MO_VF_Insert l w -> do
+          platform <- getPlatform
+          let format = case (l, w) of
+                (4, W32) -> VecFormat 4 FmtFloat
+                (2, W64) -> VecFormat 2 FmtDouble
+                _ -> pprPanic "MO_VF_Insert: invalid vector format" (ppr l <+> ppr w)
+              index = case z of
+                CmmLit (CmmInt i _) | 0 <= i, i < toInteger l -> fromInteger i
+                _ -> pprPanic "Unsupported offset" (pdoc platform z)
+          (reg_x, format_x, code_x) <- getSomeReg x
+          (reg_y, format_y, code_y) <- getSomeReg y
+          massertPpr (isVecFormat format_x) $ text "MO_VF_Insert: non-vector"
+          massertPpr (isFloatFormat format_y) $ text "MO_VF_Insert: non-float"
+          tmp <- getNewRegNat format
+          return $ Any format $ \dst ->
+            code_x `appOL` code_y `appOL`
+            if dst == reg_y --unlike MO_V_Insert here y/dst can overlap.
+            then toOL [ MOV (OpReg W128 tmp) (OpReg W128 reg_x)
+                      , INS format (OpVecLane w tmp index) (OpScalarAsVec w reg_y)
+                      , MOV (OpReg W128 dst) (OpReg W128 tmp)
+                      ]
+            else toOL [ MOV (OpReg W128 dst) (OpReg W128 reg_x)
+                      , INS format (OpVecLane w dst index) (OpScalarAsVec w reg_y)
+                      ]
 
         _ -> pprPanic "getRegister' (unhandled ternary CmmMachOp): " $
                 (pprMachOp op) <+> text "in" <+> (pdoc plat expr)
 
       where
-          vectorsNeedLlvm =
-            sorry "SIMD operations on AArch64 currently require the LLVM backend"
           float3Op w op = do
             (reg_fx, format_x, code_fx) <- getFloatReg x
             (reg_fy, format_y, code_fy) <- getFloatReg y
@@ -1305,7 +1802,7 @@ getRegister' config plat expr
         return $ Any (intFormat w) (\dst ->
             code_x `appOL`
             code_y `snocOL`
-            MUL (OpReg w lo) (OpReg w reg_x) (OpReg w reg_y) `snocOL`
+            MUL II64 (OpReg w lo) (OpReg w reg_x) (OpReg w reg_y) `snocOL`
             SMULH (OpReg w hi) (OpReg w reg_x) (OpReg w reg_y) `snocOL`
             CMP (OpReg w hi) (OpRegShift w lo SASR 63) `snocOL`
             CSET (OpReg w dst) NE)
@@ -1346,7 +1843,7 @@ getRegister' config plat expr
             code_y `snocOL`
             extend tmp1 reg_x `snocOL`
             extend tmp2 reg_y `snocOL`
-            MUL (OpReg W32 tmp1) (OpReg W32 tmp1) (OpReg W32 tmp2) `snocOL`
+            MUL II32 (OpReg W32 tmp1) (OpReg W32 tmp1) (OpReg W32 tmp2) `snocOL`
             SBFX (OpReg W64 tmp2) (OpReg W64 tmp1) (opInt $ width - 1) (opInt 1) `snocOL`
             UBFX (OpReg W32 tmp1) (OpReg W32 tmp1) (opInt width) (opInt width) `snocOL`
             CMP (OpReg W32 tmp1) (OpRegExt W32 tmp2 cmp_ext_mode 0) `snocOL`
@@ -1388,36 +1885,87 @@ isAArch64Bitmask width n =
     hasOneRun m =
         64 == popCount m + countLeadingZeros m + countTrailingZeros m
 
+--------------------------------------------------------------------------------
+-- Helpers to help enforcing Note [Subword operations on AArch64]
+--------------------------------------------------------------------------------
+
 -- | Instructions to sign-extend the value in the given register from width @w@
 -- up to width @w'@.
-signExtendReg :: Width -> Width -> Reg -> NatM (Reg, OrdList Instr)
-signExtendReg w w' r =
-    case w of
-      W64 -> noop
-      W32
-        | w' == W32 -> noop
-        | otherwise -> extend SXTH
-      W16           -> extend SXTH
-      W8            -> extend SXTB
-      _             -> panic "intOp"
+signExtendInstr :: Width -> Width -> Reg -> Maybe (Reg -> Instr)
+signExtendInstr w w' r =
+    case (w,w') of
+      (W64,_) -> Nothing
+      (W32,W32) -> Nothing
+      (W32,_) -> extend SXTW
+      (W16,_) -> extend SXTH
+      (W8 ,_) -> extend SXTB
+      _             -> panic "signExtendInstr:unexpectedWidth"
   where
-    noop = return (r, nilOL)
-    extend instr = do
-        r' <- getNewRegNat II64
-        return (r', unitOL $ instr (OpReg w' r') (OpReg w' r))
+    extend instr = Just $ \r' -> instr (OpReg w' r') (OpReg w r)
 
--- | Instructions to truncate the value in the given register from width @w@
--- down to width @w'@.
-truncateReg :: Width -> Width -> Reg -> OrdList Instr
-truncateReg w w' r =
-    case w of
+-- | Sign extend the register if needed, otherwise use register as-is
+signExtendRegister :: Width -> Width -> Register -> Register
+signExtendRegister w w' register = case register of
+  Fixed _fmt reg code ->
+    maybe register
+      (\instr_ext -> Any (intFormat w') (\dst -> code `snocOL` instr_ext dst) )
+      (signExtendInstr w w' reg)
+  Any _fmt code ->
+    Any (intFormat w') $ \dst ->
+      maybe (code dst)
+        (\instr_ext -> code dst `snocOL` instr_ext dst)
+        (signExtendInstr w w' dst)
+
+truncSubwordRegInstr :: Width -> Reg -> Maybe (Reg -> Instr)
+truncSubwordRegInstr w_to r =
+    case w_to of
+      -- Asserted false, but be defensive for non-debug builds.
+      W64 -> Nothing
+      W32 -> Nothing
+
+      -- Actual truncation
+      W16 -> trunc W32 UXTH
+      W8  -> trunc W32 UXTB
+      _   -> panic "truncateSubwordReg:unexpectedWidth"
+  where
+    trunc w instr = do
+        Just $ \r' -> instr (OpReg w r') (OpReg w r)
+
+-- | Like @truncateSubwordRegister@, but modifes the given argument register in place if we
+-- need to truncate.
+truncateSubwordRegInplace :: Width -> Reg -> OrdList Instr
+truncateSubwordRegInplace w_to r = do
+    case w_to of
       W64 -> nilOL
-      W32
-        | w' == W32 -> nilOL
-      _   -> unitOL $ UBFM (OpReg w r)
-                           (OpReg w r)
-                           (OpImm (ImmInt 0))
-                           (OpImm $ ImmInt $ widthInBits w' - 1)
+      W32 -> nilOL
+      W16 -> trunc UXTH
+      W8  -> trunc UXTB
+      _   -> panic "truncateSubwordRegInplace:unexpectedWidth"
+  where
+    trunc instr = do
+        unitOL $ instr (OpReg W32 r) (OpReg W32 r)
+
+-- | Zeros the high words of the value represented by Register if needed according to
+-- Note [Subword operations on AArch64]
+truncateSubwordRegister :: Width -> Register -> Register
+truncateSubwordRegister w register = case register of
+  Fixed _fmt reg code ->
+    maybe (swizzleRegisterRep register (intFormat w))
+      (\r_instr -> Any (intFormat w) (\dst -> code `snocOL` r_instr dst))
+      (truncSubwordRegInstr w reg)
+  Any _fmt code -> Any (intFormat w) $ \dst ->
+    maybe (code dst) (\r_inst -> code dst `snocOL` r_inst dst) (truncSubwordRegInstr w dst)
+
+data SetsHighBits = UnknownHighBits | CleanHighBits
+
+maintainHighBits :: SetsHighBits -> Width -> Register -> Register
+maintainHighBits CleanHighBits _w x = x
+maintainHighBits UnknownHighBits w x = truncateSubwordRegister w x
+
+-- Reinterpret the value in the register as different format.
+swizzleRegisterRep :: Register -> Format -> Register
+swizzleRegisterRep (Fixed _ reg code) format = Fixed format reg code
+swizzleRegisterRep (Any _ codefn)     format = Any   format codefn
 
 -- -----------------------------------------------------------------------------
 --  The 'Amode' type: Memory addressing modes passed up the tree.
@@ -1468,13 +2016,8 @@ getAmode _platform _ expr
 -- fails when the right hand side is forced into a fixed register
 -- (e.g. the result of a call).
 
-assignMem_IntCode :: Format -> CmmExpr -> CmmExpr -> NatM InstrBlock
-assignReg_IntCode :: Format -> CmmReg  -> CmmExpr -> NatM InstrBlock
-
-assignMem_FltCode :: Format -> CmmExpr -> CmmExpr -> NatM InstrBlock
-assignReg_FltCode :: Format -> CmmReg  -> CmmExpr -> NatM InstrBlock
-
-assignMem_IntCode rep addrE srcE
+assignMem :: Format -> CmmExpr -> CmmExpr -> NatM InstrBlock
+assignMem rep addrE srcE
   = do
     (src_reg, _format, code) <- getSomeReg srcE
     platform <- getPlatform
@@ -1485,19 +2028,17 @@ assignMem_IntCode rep addrE srcE
             `appOL` addr_code
             `snocOL` STR rep (OpReg w src_reg) (OpAddr addr))
 
-assignReg_IntCode _ reg src
+assignReg :: CmmReg  -> CmmExpr -> NatM InstrBlock
+assignReg reg src
   = do
     platform <- getPlatform
     let dst = getRegisterReg platform reg
     r <- getRegister src
     return $ case r of
-      Any _ code              -> COMMENT (text "CmmAssign" <+> parens (text (show reg)) <+> parens (text (show src))) `consOL` code dst
-      Fixed format freg fcode -> COMMENT (text "CmmAssign" <+> parens (text (show reg)) <+> parens (text (show src))) `consOL` (fcode `snocOL` MOV (OpReg (formatToWidth format) dst) (OpReg (formatToWidth format) freg))
-
--- Let's treat Floating point stuff
--- as integer code for now. Opaque.
-assignMem_FltCode = assignMem_IntCode
-assignReg_FltCode = assignReg_IntCode
+      Any _ code              -> COMMENT (text "CmmAssign" <+> parens (text (show reg)) <+> parens (text (show src)))
+                                `consOL` code dst
+      Fixed format freg fcode -> COMMENT (text "CmmAssign" <+> parens (text (show reg)) <+> parens (text (show src)))
+                                `consOL` (fcode `snocOL` MOV (OpReg (formatToWidth format) dst) (OpReg (formatToWidth format) freg))
 
 -- -----------------------------------------------------------------------------
 -- Jumps
@@ -1547,27 +2088,24 @@ genCondJump bid expr = do
       -- Generic case.
       CmmMachOp mop [x, y] -> do
 
-        let ubcond w cmp = do
-                -- compute both sides.
-                (reg_x, _format_x, code_x) <- getSomeReg x
-                (reg_y, _format_y, code_y) <- getSomeReg y
-                let x' = OpReg w reg_x
-                    y' = OpReg w reg_y
-                return $ case w of
-                  W8  -> code_x `appOL` code_y `appOL` toOL [ UXTB x' x', UXTB y' y', CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
-                  W16 -> code_x `appOL` code_y `appOL` toOL [ UXTH x' x', UXTH y' y', CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
-                  _   -> code_x `appOL` code_y `appOL` toOL [                         CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
+        let icond is_signed w cmp = do
+                -- zero or sign extend the argument register(s)
+                let extend reg =
+                      if is_signed
+                        then someReg $ signExtendRegister w (opRegWidth w) reg
+                        else someReg reg
 
-            sbcond w cmp = do
-                -- compute both sides.
-                (reg_x, _format_x, code_x) <- getSomeReg x
-                (reg_y, _format_y, code_y) <- getSomeReg y
+                (reg_x, _format_x, code_x) <- extend =<< getRegister x
+                (reg_y, _format_y, code_y) <- extend =<< getRegister y
+
                 let x' = OpReg w reg_x
                     y' = OpReg w reg_y
-                return $ case w of
-                  W8  -> code_x `appOL` code_y `appOL` toOL [ SXTB x' x', SXTB y' y', CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
-                  W16 -> code_x `appOL` code_y `appOL` toOL [ SXTH x' x', SXTH y' y', CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
-                  _   -> code_x `appOL` code_y `appOL` toOL [                         CMP x' y', (annExpr expr (BCOND cmp (TBlock bid))) ]
+
+                return $ concatOL [code_x, code_y,
+                                   toOL [CMP x' y', (annExpr expr (BCOND cmp (TBlock bid)))]]
+
+        let ubcond w cmp = icond False w cmp
+            sbcond w cmp = icond True  w cmp
 
             fbcond w cmp = do
               -- ensure we get float regs
@@ -1758,12 +2296,12 @@ genCCall target dest_regs arg_regs = do
                                  , DELTA (-16) ]
           moveStackDown i | odd i = moveStackDown (i + 1)
           moveStackDown i = toOL [ PUSH_STACK_FRAME
-                                 , SUB (OpReg W64 (regSingle 31)) (OpReg W64 (regSingle 31)) (OpImm (ImmInt (8 * i)))
+                                 , SUB II64 (OpReg W64 (regSingle 31)) (OpReg W64 (regSingle 31)) (OpImm (ImmInt (8 * i)))
                                  , DELTA (-8 * i - 16) ]
           moveStackUp 0 = toOL [ POP_STACK_FRAME
                                , DELTA 0 ]
           moveStackUp i | odd i = moveStackUp (i + 1)
-          moveStackUp i = toOL [ ADD (OpReg W64 (regSingle 31)) (OpReg W64 (regSingle 31)) (OpImm (ImmInt (8 * i)))
+          moveStackUp i = toOL [ ADD II64 (OpReg W64 (regSingle 31)) (OpReg W64 (regSingle 31)) (OpImm (ImmInt (8 * i)))
                                , POP_STACK_FRAME
                                , DELTA 0 ]
 
@@ -1777,19 +2315,19 @@ genCCall target dest_regs arg_regs = do
 
     PrimTarget MO_F32_Fabs
       | [arg_reg] <- arg_regs, [dest_reg] <- dest_regs ->
-        unaryFloatOp W32 (\d x -> unitOL $ FABS d x) arg_reg dest_reg
+        unaryFloatOp W32 (\d x -> unitOL $ FABS FF32 d x) arg_reg dest_reg
       | otherwise -> panic "mal-formed MO_F32_Fabs"
     PrimTarget MO_F64_Fabs
       | [arg_reg] <- arg_regs, [dest_reg] <- dest_regs ->
-        unaryFloatOp W64 (\d x -> unitOL $ FABS d x) arg_reg dest_reg
+        unaryFloatOp W64 (\d x -> unitOL $ FABS FF64 d x) arg_reg dest_reg
       | otherwise -> panic "mal-formed MO_F64_Fabs"
     PrimTarget MO_F32_Sqrt
       | [arg_reg] <- arg_regs, [dest_reg] <- dest_regs ->
-        unaryFloatOp W32 (\d x -> unitOL $ FSQRT d x) arg_reg dest_reg
+        unaryFloatOp W32 (\d x -> unitOL $ FSQRT FF32 d x) arg_reg dest_reg
       | otherwise -> panic "mal-formed MO_F32_Sqrt"
     PrimTarget MO_F64_Sqrt
       | [arg_reg] <- arg_regs, [dest_reg] <- dest_regs ->
-        unaryFloatOp W64 (\d x -> unitOL $ FSQRT d x) arg_reg dest_reg
+        unaryFloatOp W64 (\d x -> unitOL $ FSQRT FF64 d x) arg_reg dest_reg
       | otherwise -> panic "mal-formed MO_F64_Sqrt"
 
 
@@ -1809,11 +2347,19 @@ genCCall target dest_regs arg_regs = do
               let lo = getRegisterReg platform (CmmLocal dst_lo)
                   hi = getRegisterReg platform (CmmLocal dst_hi)
                   nd = getRegisterReg platform (CmmLocal dst_needed)
+
+              -- Generate a fresh virtual register for the low word computation.
+              -- This avoids clobbering reg_a or reg_b in the first MUL instruction,
+              -- which could for example happen if 'lo' and 'reg_a' are the same
+              -- virtual register.
+              tmp_lo <- getNewRegNat II64
+
               return $
                   code_x `appOL`
                   code_y `snocOL`
-                  MUL   (OpReg W64 lo) (OpReg W64 reg_a) (OpReg W64 reg_b) `snocOL`
+                  MUL   II64 (OpReg W64 tmp_lo) (OpReg W64 reg_a) (OpReg W64 reg_b) `snocOL`
                   SMULH (OpReg W64 hi) (OpReg W64 reg_a) (OpReg W64 reg_b) `snocOL`
+                  MOV   (OpReg W64 lo) (OpReg W64 tmp_lo) `snocOL`
                   -- Are all high bits equal to the sign bit of the low word?
                   -- nd = (hi == ASR(lo,width-1)) ? 1 : 0
                   CMP   (OpReg W64 hi) (OpRegShift W64 lo SASR (widthInBits w - 1)) `snocOL`
@@ -1828,48 +2374,37 @@ genCCall target dest_regs arg_regs = do
           , [src_a, src_b] <- arg_regs
           , [dst_needed, dst_hi, dst_lo] <- dest_regs
             ->  do
-              (reg_a', _format_x, code_a) <- getSomeReg src_a
-              (reg_b', _format_y, code_b) <- getSomeReg src_b
+              -- Sign-extend inputs to W32 for SMULL (Xd = Wn * Wm).
+              -- sign extension always allocates a fresh temp for w < W32,
+              -- and is a noop for W32 (safe: SMULL reads both sources
+              -- atomically before writing the destination).
+              (reg_a, _format_x, code_a) <- someReg =<< signExtendRegister w W32 <$> getRegister src_a
+              (reg_b, _format_y, code_b) <- someReg =<< signExtendRegister w W32 <$> getRegister src_b
 
               let lo = getRegisterReg platform (CmmLocal dst_lo)
                   hi = getRegisterReg platform (CmmLocal dst_hi)
                   nd = getRegisterReg platform (CmmLocal dst_needed)
-                  -- Do everything in a full 64 bit registers
                   w' = platformWordWidth platform
-
-              (reg_a, code_a') <- signExtendReg w w' reg_a'
-              (reg_b, code_b') <- signExtendReg w w' reg_b'
 
               return $
                   code_a  `appOL`
-                  code_b  `appOL`
-                  code_a' `appOL`
-                  code_b' `snocOL`
-                  -- the low 2w' of lo contains the full multiplication;
-                  -- eg: int8 * int8 -> int16 result
-                  -- so lo is in the last w of the register, and hi is in the second w.
-                  SMULL (OpReg w' lo) (OpReg w' reg_a) (OpReg w' reg_b) `snocOL`
-                  -- Make sure we hold onto the sign bits for dst_needed
-                  ASR (OpReg w' hi) (OpReg w' lo)    (OpImm (ImmInt $ widthInBits w)) `appOL`
-                  -- lo can now be truncated so we can get at it's top bit easily.
-                  truncateReg w' w lo `snocOL`
-                  -- Note the use of CMN (compare negative), not CMP: we want to
-                  -- test if the top half is negative one and the top
-                  -- bit of the bottom half is positive one. eg:
-                  -- hi = 0b1111_1111  (actually 64 bits)
-                  -- lo = 0b1010_1111  (-81, so the result didn't need the top half)
-                  -- lo' = ASR(lo,7)   (second reg of SMN)
-                  --     = 0b0000_0001 (theeshift gives us 1 for negative,
-                  --                    and 0 for positive)
-                  -- hi == -lo'?
-                  -- 0b1111_1111 == 0b1111_1111 (yes, top half is just overflow)
-                  -- Another way to think of this is if hi + lo' == 0, which is what
-                  -- CMN really is under the hood.
+                  code_b  `snocOL`
+                  -- SMULL Xd, Wn, Wm: multiply two W32 values producing a
+                  -- 64-bit result. The low w bits of lo contain the truncated
+                  -- product, and hi gets the overflow (sign extension bits).
+                  SMULL (OpReg w' lo) (OpReg W32 reg_a) (OpReg W32 reg_b) `snocOL`
+                  ASR (OpReg w' hi) (OpReg w' lo) (OpImm (ImmInt $ widthInBits w)) `appOL`
+                  truncateSubwordRegInplace w lo `snocOL`
+                  -- CMN (compare negative) tests hi + lo' == 0, i.e. hi == -lo'.
+                  -- lo' = LSR(lo, w-1) gives 1 if lo is negative, 0 if positive.
+                  -- No overflow iff hi is the sign extension of lo:
+                  --   lo positive (bit w-1 = 0) => lo' = 0, need hi == 0
+                  --   lo negative (bit w-1 = 1) => lo' = 1, need hi == -1
+                  -- CMN sets Z when hi + lo' == 0 (no overflow), so we use
+                  -- NE to set nd = 1 when overflow occurred.
                   CMN   (OpReg w' hi) (OpRegShift w' lo SLSR (widthInBits w - 1)) `snocOL`
-                  -- Set dst_needed to 1 if hi and lo' were (negatively) equal
-                  CSET  (OpReg w' nd) EQ `appOL`
-                  -- Finally truncate hi to drop any extraneous sign bits.
-                  truncateReg w' w hi
+                  CSET  (OpReg w' nd) NE `appOL`
+                  truncateSubwordRegInplace w hi
           -- Can't handle > 64 bit operands
           | otherwise -> unsupported (MO_S_Mul2 w)
     PrimTarget (MO_U_Mul2  w)
@@ -1887,12 +2422,12 @@ genCCall target dest_regs arg_regs = do
               return (
                   code_x `appOL`
                   code_y `snocOL`
-                  MUL   (OpReg W64 lo) (OpReg W64 reg_a) (OpReg W64 reg_b) `snocOL`
+                  MUL   II64 (OpReg W64 lo) (OpReg W64 reg_a) (OpReg W64 reg_b) `snocOL`
                   UMULH (OpReg W64 hi) (OpReg W64 reg_a) (OpReg W64 reg_b)
                   )
             -- For sizes < platform width, we can just perform a multiply and shift
             -- Need to be careful to truncate the low half, but the upper half should be
-            -- be ok if the invariant in [Signed arithmetic on AArch64] is maintained.
+            -- be ok if the invariant in Note [Subword operations on AArch64] is maintained.
             -- Currently this case can't be produced by the compiler since
             -- timesWord2# :: Word# -> Word# -> (# Word#, Word# #)
             -- TODO: Remove? Or would the extra primop be useful for avoiding the extra
@@ -1919,7 +2454,7 @@ genCCall target dest_regs arg_regs = do
                       (OpImm (ImmInt $ widthInBits w)) -- lsb
                       (OpImm (ImmInt $ widthInBits w)) -- width to extract
                       `appOL`
-                  truncateReg W64 w lo
+                  truncateSubwordRegInplace w lo
                   )
           | otherwise -> unsupported (MO_U_Mul2  w)
     PrimTarget (MO_Clz  w)
@@ -1945,7 +2480,7 @@ genCCall target dest_regs arg_regs = do
               return (
                   code_x `appOL` toOL
                     [ LSL (r dst') (r reg_a) (imm 16)
-                    , ORR (r dst') (r dst')  (imm 0x00008000)
+                    , ORR II32 (r dst') (r dst')  (imm 0x00008000)
                     , CLZ (r dst') (r dst')
                     ]
                   )
@@ -1961,7 +2496,7 @@ genCCall target dest_regs arg_regs = do
               return $
                   code_x `appOL` toOL
                     [ LSL (r dst') (r reg_a) (imm 24)
-                    , ORR (r dst') (r dst')  (imm 0x00800000)
+                    , ORR II32 (r dst') (r dst')  (imm 0x00800000)
                     , CLZ (r dst') (r dst')
                     ]
             | otherwise -> unsupported (MO_Clz  w)
@@ -1988,7 +2523,7 @@ genCCall target dest_regs arg_regs = do
               return $
                   code_x `appOL` toOL
                     [ RBIT (r dst') (r reg_a)
-                    , ORR  (r dst') (r dst') (imm 0x00008000)
+                    , ORR  II32 (r dst') (r dst') (imm 0x00008000)
                     , CLZ  (r dst') (r dst')
                     ]
           | w == W8
@@ -2003,7 +2538,7 @@ genCCall target dest_regs arg_regs = do
               return $
                   code_x `appOL` toOL
                     [ RBIT (r dst') (r reg_a)
-                    , ORR (r dst')  (r dst') (imm 0x00800000)
+                    , ORR II32 (r dst') (r dst') (imm 0x00800000)
                     , CLZ  (r dst')  (r dst')
                     ]
             | otherwise -> unsupported (MO_Ctz  w)
@@ -2063,7 +2598,7 @@ genCCall target dest_regs arg_regs = do
                   r n = OpReg W32 n
               -- Swaps the bytes in each 16bit word
               -- TODO: Expose the 32 & 64 bit version of this?
-              return $ code_x `snocOL` REV16 (r dst') (r reg_a)
+              return $ code_x `snocOL` REV16 II32 (r dst') (r reg_a)
           | otherwise -> unsupported (MO_BSwap w)
 
     -- or a possibly side-effecting machine operation
@@ -2161,10 +2696,27 @@ genCCall target dest_regs arg_regs = do
         MO_SubIntC    _w -> unsupported mop
 
         -- Vector
-        MO_VS_Quot {} -> unsupported mop
-        MO_VS_Rem {} -> unsupported mop
-        MO_VU_Quot {} -> unsupported mop
-        MO_VU_Rem {} -> unsupported mop
+        MO_VS_Quot 16 W8    -> mkCCall "hs_quotInt8X16"
+        MO_VS_Quot 8 W16    -> mkCCall "hs_quotInt16X8"
+        MO_VS_Quot 4 W32    -> mkCCall "hs_quotInt32X4"
+        MO_VS_Quot 2 W64    -> mkCCall "hs_quotInt64X2"
+        MO_VS_Quot {}       -> unsupported mop
+        MO_VS_Rem 16 W8     -> mkCCall "hs_remInt8X16"
+        MO_VS_Rem 8 W16     -> mkCCall "hs_remInt16X8"
+        MO_VS_Rem 4 W32     -> mkCCall "hs_remInt32X4"
+        MO_VS_Rem 2 W64     -> mkCCall "hs_remInt64X2"
+        MO_VS_Rem {}        -> unsupported mop
+        MO_VU_Quot 16 W8    -> mkCCall "hs_quotWord8X16"
+        MO_VU_Quot 8 W16    -> mkCCall "hs_quotWord16X8"
+        MO_VU_Quot 4 W32    -> mkCCall "hs_quotWord32X4"
+        MO_VU_Quot 2 W64    -> mkCCall "hs_quotWord64X2"
+        MO_VU_Quot {}       -> unsupported mop
+        MO_VU_Rem 16 W8     -> mkCCall "hs_remWord8X16"
+        MO_VU_Rem 8 W16     -> mkCCall "hs_remWord16X8"
+        MO_VU_Rem 4 W32     -> mkCCall "hs_remWord32X4"
+        MO_VU_Rem 2 W64     -> mkCCall "hs_remWord64X2"
+        MO_VU_Rem {}        -> unsupported mop
+
         MO_I64X2_Min -> unsupported mop
         MO_I64X2_Max -> unsupported mop
         MO_W64X2_Min -> unsupported mop
@@ -2220,6 +2772,7 @@ genCCall target dest_regs arg_regs = do
           | [p_reg, val_reg] <- arg_regs -> do
               (p, _fmt_p, code_p) <- getSomeReg p_reg
               (val, fmt_val, code_val) <- getSomeReg val_reg
+              massert (fmt_val == intFormat w)
               let instr = case ord of
                       MemOrderRelaxed -> STR
                       _               -> STLR
@@ -2335,6 +2888,7 @@ genCCall target dest_regs arg_regs = do
                 W16 -> SXTH (OpReg W64 gpReg) (OpReg w r)
                 _   -> panic "impossible"
             | otherwise
+            -- Relies on Note [Subword operations on AArch64]
             = MOV (OpReg w gpReg) (OpReg w r)
           accumCode' = accumCode `appOL`
                        code_r `snocOL`
@@ -2342,7 +2896,7 @@ genCCall target dest_regs arg_regs = do
       passArguments pack gpRegs fpRegs args stackSpace (gpReg:accumRegs) accumCode'
 
     -- Still have FP regs, and we want to pass an FP argument.
-    passArguments pack gpRegs (fpReg:fpRegs) ((r, format, _hint, code_r):args) stackSpace accumRegs accumCode | isFloatFormat format = do
+    passArguments pack gpRegs (fpReg:fpRegs) ((r, format, _hint, code_r):args) stackSpace accumRegs accumCode | isFloatFormat format || isVecFormat format = do
       let w = formatToWidth format
           mov = MOV (OpReg w fpReg) (OpReg w r)
           accumCode' = accumCode `appOL`
@@ -2375,7 +2929,7 @@ genCCall target dest_regs arg_regs = do
       passArguments pack [] fpRegs args (stackSpace'+space) accumRegs (stackCode `appOL` accumCode)
 
     -- Still have gpRegs left, but want to pass a FP argument. Must be passed on the stack then.
-    passArguments pack gpRegs [] ((r, format, _hint, code_r):args) stackSpace accumRegs accumCode | isFloatFormat format = do
+    passArguments pack gpRegs [] ((r, format, _hint, code_r):args) stackSpace accumRegs accumCode | isFloatFormat format || isVecFormat format = do
       let w = formatToWidth format
           bytes = widthInBits w `div` 8
           space = if pack then bytes else 8
@@ -2388,6 +2942,7 @@ genCCall target dest_regs arg_regs = do
 
     passArguments _ _ _ _ _ _ _ = pprPanic "passArguments" (text "invalid state")
 
+    -- readResults gpArgs fpArgs dest_regs reg_acc code_acc
     readResults :: [Reg] -> [Reg] -> [LocalReg] -> [Reg]-> InstrBlock -> NatM (InstrBlock)
     readResults _ _ [] _ accumCode = return accumCode
     readResults [] _ _ _ _ = do
@@ -2403,9 +2958,16 @@ genCCall target dest_regs arg_regs = do
           format = cmmTypeFormat rep
           w   = cmmRegWidth (CmmLocal dst)
           r_dst = getRegisterReg platform (CmmLocal dst)
-      if isFloatFormat format
+      if isFloatFormat format || isVecFormat format
         then readResults (gpReg:gpRegs) fpRegs dsts (fpReg:accumRegs) (accumCode `snocOL` MOV (OpReg w r_dst) (OpReg w fpReg))
-        else readResults gpRegs (fpReg:fpRegs) dsts (gpReg:accumRegs) (accumCode `snocOL` MOV (OpReg w r_dst) (OpReg w gpReg))
+        else do
+          -- Needed, ffi calls can return garbage in high bits.
+          -- See Note [Subword operations on AArch64]
+          let !mov_instr = case w of
+                W8  -> UXTB
+                W16 -> UXTH
+                _   -> MOV
+          readResults gpRegs (fpReg:fpRegs) dsts (gpReg:accumRegs) (accumCode `snocOL` mov_instr (OpReg w r_dst) (OpReg w gpReg))
 
     unaryFloatOp w op arg_reg dest_reg = do
       platform <- getPlatform

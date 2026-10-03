@@ -1,8 +1,6 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE TupleSections #-}
-{-# OPTIONS -fno-warn-incomplete-patterns -optc-DNON_POSIX_SOURCE #-}
+{-# OPTIONS_GHC -Wno-x-partial -Wno-incomplete-patterns -optc-DNON_POSIX_SOURCE #-}
 
 -----------------------------------------------------------------------------
 --
@@ -21,6 +19,7 @@ import GHC              (parseTargetFiles,  Ghc, GhcMonad(..),
 
 import GHC.Driver.Backend
 import GHC.Driver.CmdLine
+import GHC.Driver.DynFlags (ExecutableLinkMode(..))
 import GHC.Driver.Env
 import GHC.Driver.Errors
 import GHC.Driver.Errors.Types
@@ -37,8 +36,8 @@ import GHC.Driver.Config.Diagnostic
 import GHC.Platform
 import GHC.Platform.Host
 
-#if defined(HAVE_INTERNAL_INTERPRETER)
-import GHCi.UI              ( interactiveUI, ghciWelcomeMsg, defaultGhciSettings )
+#if defined(HAVE_INTERPRETER)
+import GHCi.UI              ( interactiveUI, ghciWelcomeMsg, defaultGhciSettings, languageEditionMsg )
 #endif
 
 import GHC.Runtime.Loader   ( loadFrontendPlugin, initializeSessionPlugins )
@@ -73,6 +72,8 @@ import GHC.SysTools.BaseDir
 
 import GHC.Iface.Load
 import GHC.Iface.Recomp.Binary ( fingerprintBinMem )
+
+import GHC.ByteCode.Show ( showByteCode )
 
 import GHC.Tc.Utils.Monad      ( initIfaceCheck )
 import GHC.Iface.Errors.Ppr
@@ -169,14 +170,14 @@ main' postLoadMode units dflags0 args flagWarnings = do
   let dflt_backend = backend dflags0
       (mode, bcknd, link)
          = case postLoadMode of
-               DoInteractive   -> (CompManager, interpreterBackend,  LinkInMemory)
-               DoEval _        -> (CompManager, interpreterBackend,  LinkInMemory)
-               DoRun           -> (CompManager, interpreterBackend,  LinkInMemory)
-               DoMake          -> (CompManager, dflt_backend, LinkBinary)
-               DoBackpack      -> (CompManager, dflt_backend, LinkBinary)
-               DoMkDependHS    -> (MkDepend,    dflt_backend, LinkBinary)
-               DoAbiHash       -> (OneShot,     dflt_backend, LinkBinary)
-               _               -> (OneShot,     dflt_backend, LinkBinary)
+               DoInteractive   -> (CompManager, bytecodeBackend,  LinkInMemory)
+               DoEval _        -> (CompManager, bytecodeBackend,  LinkInMemory)
+               DoRun           -> (CompManager, bytecodeBackend,  LinkInMemory)
+               DoMake          -> (CompManager, dflt_backend, LinkExecutable Dynamic)
+               DoBackpack      -> (CompManager, dflt_backend, LinkExecutable Dynamic)
+               DoMkDependHS    -> (MkDepend,    dflt_backend, LinkExecutable Dynamic)
+               DoAbiHash       -> (OneShot,     dflt_backend, LinkExecutable Dynamic)
+               _               -> (OneShot,     dflt_backend, LinkExecutable Dynamic)
 
   let dflags1 = dflags0{ ghcMode   = mode,
                          backend   = bcknd,
@@ -200,6 +201,7 @@ main' postLoadMode units dflags0 args flagWarnings = do
                | DoRun         <- postLoadMode = def_ghci_flags
                | otherwise                     = dflags1
         where def_ghci_flags = dflags1 `gopt_set` Opt_ImplicitImportQualified
+                                       `gopt_set` Opt_InteractiveErrorHints
                                        `gopt_set` Opt_IgnoreOptimChanges
                                        `gopt_set` Opt_IgnoreHpcChanges
                                        -- Setting this by default has the nice effect that
@@ -267,6 +269,7 @@ main' postLoadMode units dflags0 args flagWarnings = do
                                                     (hsc_units  hsc_env)
                                                     (hsc_NC     hsc_env)
                                                     f
+       ShowByteCode f         -> liftIO $ showByteCode logger hsc_env f
        DoMake                 -> doMake units srcs
        DoMkDependHS           -> doMkDependHS (map fst srcs)
        StopBefore p           -> liftIO (oneShot hsc_env p srcs)
@@ -289,11 +292,14 @@ doRun units srcs args = do
     args' = drop 1 $ dropWhile (/= "--") $ map unLoc args
 
 ghciUI :: [String] -> [(FilePath, Maybe Phase)] -> Maybe [String] -> Ghc ()
-#if !defined(HAVE_INTERNAL_INTERPRETER)
+#if !defined(HAVE_INTERPRETER)
 ghciUI _ _ _ =
   throwGhcException (CmdLineError "not built for interactive use")
 #else
 ghciUI units srcs maybe_expr = do
+  -- The base 'DynFlags' are the initial flags
+  -- that the ghci prompt is using.
+  baseDFlags <- getDynFlags
   hs_srcs <- case NE.nonEmpty units of
     Just ne_units -> do
       initMulti ne_units (checkOptions DoMake)
@@ -304,7 +310,7 @@ ghciUI units srcs maybe_expr = do
           s <- initMake srcs
           dflags <- getDynFlags
           return $ map (uncurry (,Just $ homeUnitId_ dflags,)) s
-  interactiveUI defaultGhciSettings hs_srcs maybe_expr
+  interactiveUI defaultGhciSettings baseDFlags hs_srcs maybe_expr
 #endif
 
 -- ----------------------------------------------------------------------------
@@ -333,9 +339,11 @@ showBanner :: PostLoadMode -> DynFlags -> IO ()
 showBanner _postLoadMode dflags = do
    let verb = verbosity dflags
 
-#if defined(HAVE_INTERNAL_INTERPRETER)
+#if defined(HAVE_INTERPRETER)
    -- Show the GHCi banner
-   when (isInteractiveMode _postLoadMode && verb >= 1) $ putStrLn ghciWelcomeMsg
+   when (isInteractiveMode _postLoadMode && verb >= 1) $
+    do putStrLn ghciWelcomeMsg
+       putStrLn $ languageEditionMsg (language dflags)
 #endif
 
    -- Display details of the configuration in verbose mode
@@ -487,7 +495,7 @@ abiHash strs = do
 
   let find_it str = do
          let modname = mkModuleName str
-         r <- findImportedModule hsc_env modname NoPkgQual
+         r <- findImportedModule hsc_env LookupUser modname NoPkgQual
          case r of
            Found _ m -> return m
            _error    ->

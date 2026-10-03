@@ -1,7 +1,7 @@
 {-# LANGUAGE ApplicativeDo       #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
 {-# LANGUAGE MultiWayIf          #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 -- | Domain types used in "GHC.HsToCore.Pmc.Solver".
 -- The ultimate goal is to define 'Nabla', which models normalised refinement
@@ -32,7 +32,7 @@ module GHC.HsToCore.Pmc.Solver.Types (
         PmEquality(..), eqPmAltCon,
 
         -- *** Operations on 'PmLit'
-        literalToPmLit, negatePmLit, overloadPmLit,
+        literalToPmLit, negatePmLit,
         pmLitAsStringLit, coreExprAsPmLit
 
     ) where
@@ -51,33 +51,32 @@ import GHC.Core.ConLike
 import GHC.Utils.Outputable
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc (lastMaybe)
-import GHC.Data.List.SetOps (unionLists)
 import GHC.Data.Maybe
 import GHC.Core.Type
-import GHC.Core.TyCon
 import GHC.Types.Literal
+import GHC.Types.Literal.Floating
 import GHC.Core
-import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCo.Compare( eqType, nonDetCmpType )
 import GHC.Core.Map.Expr
 import GHC.Core.Utils (exprType)
-import GHC.Builtin.Names
-import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Prim
 import GHC.Tc.Solver.InertSet (InertSet, emptyInertSet)
 import GHC.Tc.Utils.TcType (isStringTy, topTcLevel)
 import GHC.Types.CompleteMatch
-import GHC.Types.SourceText (SourceText(..), mkFractionalLit, FractionalLit
-                            , fractionalLitFromRational
-                            , FractionalExponentBase(..))
+import GHC.Types.SourceText
+import GHC.Hs.Extension (GhcTc)
+import GHC.Hs.Lit
+
 import Numeric (fromRat)
-import Data.Foldable (find)
 import Data.Ratio
+import Data.List( find )
+import qualified Data.Set as Set
 import GHC.Real (Ratio(..))
-import qualified Data.Semigroup as Semi
+import qualified Data.Semigroup as S
 
--- import GHC.Driver.Ppr
-
---
 -- * Normalised refinement types
 --
 
@@ -358,6 +357,13 @@ lookupSolution nabla x = case vi_pos (lookupVarInfo (nabla_tm_st nabla) x) of
     | Just sol <- find isDataConSolution pos -> Just sol
     | otherwise                              -> Just x
 
+
+{- *********************************************************************
+*                                                                      *
+                 PmLit and PmLitValue
+*                                                                      *
+********************************************************************* -}
+
 --------------------------------------------------------------------------------
 -- The rest is just providing an IR for (overloaded!) literals and AltCons that
 -- sits between Hs and Core. We need a reliable way to detect and determine
@@ -376,12 +382,63 @@ data PmLitValue
   = PmLitInt Integer
   | PmLitRat Rational
   | PmLitChar Char
-  -- We won't actually see PmLitString in the oracle since we desugar strings to
-  -- lists
   | PmLitString FastString
+       -- We won't actually see PmLitString in the oracle
+       -- since we desugar strings to lists
+
+  -- Overloaded literals
   | PmLitOverInt Int {- How often Negated? -} Integer
-  | PmLitOverRat Int {- How often Negated? -} FractionalLit
+  | PmLitOverRat Int {- How often Negated? -} (FractionalLit GhcTc)
   | PmLitOverString FastString
+
+-- | Syntactic equality.
+-- We want (Ord PmLit) so that we can use (Set PmLit) in `PmAltConSet`
+instance Eq PmLit where
+  a == b = (a `compare` b) == EQ
+instance Ord PmLit where
+  compare = cmpPmLit
+
+cmpPmLit :: PmLit -> PmLit -> Ordering
+-- This function does "syntactic comparison":
+--   For overloaded literals, compare the type and value
+--   For non-overloaded literals, just compare the values
+-- But it treats (say)
+--    (PmLit Bool (PmLitOverInt 1))
+--    (PmLit Bool (PmLitOverInt 2))
+-- as un-equal, even through (fromInteger @Bool 1)
+-- could be the same as (fromInteger @Bool 2)
+cmpPmLit (PmLit { pm_lit_ty = t1, pm_lit_val = val1 })
+         (PmLit { pm_lit_ty = t2, pm_lit_val = val2 })
+  = case (val1,val2) of
+      (PmLitInt i1, PmLitInt i2) -> i1 `compare` i2
+      (PmLitRat r1, PmLitRat r2) -> r1 `compare` r2
+      (PmLitChar c1, PmLitChar c2) -> c1 `compare` c2
+      (PmLitString s1, PmLitString s2) -> s1 `uniqCompareFS` s2
+      (PmLitOverInt n1 i1, PmLitOverInt n2 i2) -> (n1 `compare` n2) S.<>
+                                                  (i1 `compare` i2) S.<>
+                                                  (t1 `nonDetCmpType` t2)
+      (PmLitOverRat n1 r1, PmLitOverRat n2 r2) -> (n1 `compare` n2) S.<>
+                                                  (r1 `compare` r2) S.<>
+                                                  (t1 `nonDetCmpType` t2)
+      (PmLitOverString s1, PmLitOverString s2) -> (s1 `uniqCompareFS` s2) S.<>
+                                                  (t1 `nonDetCmpType` t2)
+      (PmLitInt {},    _) -> LT
+      (PmLitRat {},    PmLitInt {})  -> GT
+      (PmLitRat {},    _)            -> LT
+      (PmLitChar {},   PmLitInt {})  -> GT
+      (PmLitChar {},   PmLitRat {})  -> GT
+      (PmLitChar {},   _)            -> LT
+      (PmLitString {}, PmLitInt {})  -> GT
+      (PmLitString {}, PmLitRat {})  -> GT
+      (PmLitString {}, PmLitChar {}) -> GT
+      (PmLitString {}, _)            -> LT
+
+      (PmLitOverString {}, _)                 -> GT
+      (PmLitOverRat {},    PmLitOverString{}) -> LT
+      (PmLitOverRat {},    _)                 -> GT
+      (PmLitOverInt {},    PmLitOverString{}) -> LT
+      (PmLitOverInt {},    PmLitOverRat{})    -> LT
+      (PmLitOverInt {},    _)                 -> GT
 
 -- | Undecidable semantic equality result.
 -- See Note [Undecidable Equality for PmAltCons]
@@ -406,7 +463,10 @@ eqPmLit :: PmLit -> PmLit -> PmEquality
 eqPmLit (PmLit t1 v1) (PmLit t2 v2)
   -- no haddock | pprTrace "eqPmLit" (ppr t1 <+> ppr v1 $$ ppr t2 <+> ppr v2) False = undefined
   | not (t1 `eqType` t2) = Disjoint
-  | otherwise            = go v1 v2
+  | otherwise            = eqPmLitValue v1 v2
+
+eqPmLitValue :: PmLitValue -> PmLitValue -> PmEquality
+eqPmLitValue v1 v2 = go v1 v2
   where
     go (PmLitInt i1)        (PmLitInt i2)        = decEquality (i1 == i2)
     go (PmLitRat r1)        (PmLitRat r2)        = decEquality (r1 == r2)
@@ -419,10 +479,6 @@ eqPmLit (PmLit t1 v1) (PmLit t2 v2)
     go (PmLitOverString s1) (PmLitOverString s2)
       | s1 == s2                                 = Equal
     go _                    _                    = PossiblyOverlap
-
--- | Syntactic equality.
-instance Eq PmLit where
-  a == b = eqPmLit a b == Equal
 
 -- | Type of a 'PmLit'
 pmLitType :: PmLit -> Type
@@ -445,34 +501,47 @@ eqConLike (PatSynCon psc1)  (PatSynCon psc2)
   = Equal
 eqConLike _                 _                 = PossiblyOverlap
 
+
+{- *********************************************************************
+*                                                                      *
+                 PmAltCon and PmAltConSet
+*                                                                      *
+********************************************************************* -}
+
 -- | Represents the head of a match against a 'ConLike' or literal.
 -- Really similar to 'GHC.Core.AltCon'.
 data PmAltCon = PmAltConLike ConLike
               | PmAltLit     PmLit
 
-data PmAltConSet = PACS !(UniqDSet ConLike) ![PmLit]
+data PmAltConSet = PACS !(UniqDSet ConLike)
+                        !(Set.Set PmLit)
+-- We use a (Data.Set.Set PmLit) here, at the cost of requiring an Ord
+-- instance for PmLit, because in extreme cases the set of PmLits can be
+-- very large.  See #26514.
 
 emptyPmAltConSet :: PmAltConSet
-emptyPmAltConSet = PACS emptyUniqDSet []
+emptyPmAltConSet = PACS emptyUniqDSet Set.empty
 
 isEmptyPmAltConSet :: PmAltConSet -> Bool
-isEmptyPmAltConSet (PACS cls lits) = isEmptyUniqDSet cls && null lits
+isEmptyPmAltConSet (PACS cls lits)
+  = isEmptyUniqDSet cls && Set.null lits
 
 -- | Whether there is a 'PmAltCon' in the 'PmAltConSet' that compares 'Equal' to
 -- the given 'PmAltCon' according to 'eqPmAltCon'.
 elemPmAltConSet :: PmAltCon -> PmAltConSet -> Bool
 elemPmAltConSet (PmAltConLike cl) (PACS cls _   ) = elementOfUniqDSet cl cls
-elemPmAltConSet (PmAltLit lit)    (PACS _   lits) = elem lit lits
+elemPmAltConSet (PmAltLit lit)    (PACS _   lits) = Set.member lit lits
 
 extendPmAltConSet :: PmAltConSet -> PmAltCon -> PmAltConSet
 extendPmAltConSet (PACS cls lits) (PmAltConLike cl)
   = PACS (addOneToUniqDSet cls cl) lits
 extendPmAltConSet (PACS cls lits) (PmAltLit lit)
-  = PACS cls (unionLists lits [lit])
+  = PACS cls (Set.insert lit lits)
 
 pmAltConSetElems :: PmAltConSet -> [PmAltCon]
 pmAltConSetElems (PACS cls lits)
-  = map PmAltConLike (uniqDSetToList cls) ++ map PmAltLit lits
+  = map PmAltConLike (uniqDSetToList cls) ++
+    map PmAltLit (Set.toList lits)
 
 instance Outputable PmAltConSet where
   ppr = ppr . pmAltConSetElems
@@ -591,8 +660,10 @@ literalToPmLit :: Type -> Literal -> Maybe PmLit
 literalToPmLit ty l = PmLit ty <$> go l
   where
     go (LitChar c)       = Just (PmLitChar c)
-    go (LitFloat r)      = Just (PmLitRat r)
-    go (LitDouble r)     = Just (PmLitRat r)
+    go (LitFloating _ f) = Just (PmLitRat (unsafeLitFloatingToRational f))
+      -- 'unsafeLitFloatingToRational' is OK here because there is no
+      -- way to write NaN/Infinity as patterns, and we are OK with
+      -- equating -0.0 with +0.0.
     go (LitString s)     = Just (PmLitString (mkFastStringByteString s))
     go (LitNumber _ i)   = Just (PmLitInt i)
     go _                 = Nothing
@@ -610,7 +681,7 @@ overloadPmLit :: Type -> PmLit -> Maybe PmLit
 overloadPmLit ty (PmLit _ v) = PmLit ty <$> go v
   where
     go (PmLitInt i)          = Just (PmLitOverInt 0 i)
-    go (PmLitRat r)          = Just $! PmLitOverRat 0 $! fractionalLitFromRational r
+    go (PmLitRat r)          = Just $! PmLitOverRat 0 $! mkFractionalLitFromRational r
     go (PmLitString s)
       | ty `eqType` stringTy = Just v
       | otherwise            = Just (PmLitOverString s)
@@ -626,6 +697,15 @@ coreExprAsPmLit :: CoreExpr -> Maybe PmLit
 coreExprAsPmLit (Tick _t e) = coreExprAsPmLit e
 coreExprAsPmLit (Lit l) = literalToPmLit (literalType l) l
 coreExprAsPmLit e = case collectArgs e of
+
+  -- Look through nospec, noinline and lazy, which are only eliminated by Core Prep.
+  -- See Note [coreExprAsPmLit and nospec]
+  (Var x, Type _ : inner : rest_args)
+    | x `hasKey` nospecIdKey
+   || x `hasKey` noinlineIdKey
+   || x `hasKey` lazyIdKey
+    -> coreExprAsPmLit (mkApps inner rest_args)
+
   (Var x, [Lit l])
     | Just dc <- isDataConWorkId_maybe x
     , dc `elem` [intDataCon, wordDataCon, charDataCon, floatDataCon, doubleDataCon]
@@ -635,23 +715,21 @@ coreExprAsPmLit e = case collectArgs e of
     -> Just (PmLit ty (PmLitInt l))
   (Var x, [_ty, n_arg, d_arg])
     | Just dc <- isDataConWorkId_maybe x
-    , dataConName dc == ratioDataConName
+    , dc `hasKnownKey` ratioDataConKey
     , Just (PmLit _ (PmLitInt n)) <- coreExprAsPmLit n_arg
     , Just (PmLit _ (PmLitInt d)) <- coreExprAsPmLit d_arg
-    -- HACK: just assume we have a literal double. This case only occurs for
-    --       overloaded lits anyway, so we immediately override type information
-    -> literalToPmLit (exprType e) (mkLitDouble (n % d))
+    -> Just (PmLit (exprType e) (PmLitRat (n % d)))
 
   (Var x, args)
     -- See Note [Detecting overloaded literals with -XRebindableSyntax]
-    | is_rebound_name x fromIntegerName
+    | is_rebound_name x fromIntegerClassOpOcc
     , Just arg <- lastMaybe args
     , Just (_ty,l) <- bignum_conapp_maybe arg
     -> Just (PmLit integerTy (PmLitInt l)) >>= overloadPmLit (exprType e)
   (Var x, args)
     -- See Note [Detecting overloaded literals with -XRebindableSyntax]
     -- fromRational <expr>
-    | is_rebound_name x fromRationalName
+    | is_rebound_name x fromRationalClassOpOcc
     , [r] <- dropWhile (not . is_ratio) args
     -> coreExprAsPmLit r >>= overloadPmLit (exprType e)
 
@@ -664,7 +742,7 @@ coreExprAsPmLit e = case collectArgs e of
     , [r, exp] <- dropWhile (not . is_ratio) args
     , (Var x, [_ty, n_arg, d_arg]) <- collectArgs r
     , Just dc <- isDataConWorkId_maybe x
-    , dataConName dc == ratioDataConName
+    , dc `hasKnownKey` ratioDataConKey
     , Just (PmLit _ (PmLitInt n)) <- coreExprAsPmLit n_arg
     , Just (PmLit _ (PmLitInt d)) <- coreExprAsPmLit d_arg
     , Just (_exp_ty,exp') <- bignum_conapp_maybe exp
@@ -675,7 +753,7 @@ coreExprAsPmLit e = case collectArgs e of
       Just $ PmLit (exprType e) (PmLitOverRat neg frac)
 
   (Var x, args)
-    | is_rebound_name x fromStringName
+    | is_rebound_name x fromStringClassOpOcc
     -- See Note [Detecting overloaded literals with -XRebindableSyntax]
     , s:_ <- filter (isStringTy . exprType) $ filter isValArg args
     -- NB: Calls coreExprAsPmLit and then overloadPmLit, so that we return PmLitOverStrings
@@ -687,7 +765,7 @@ coreExprAsPmLit e = case collectArgs e of
     , ty `eqType` charTy
     -> literalToPmLit stringTy (mkLitString "")
   (Var x, [Lit l])
-    | idName x `elem` [unpackCStringName, unpackCStringUtf8Name]
+    | idUnique x `elem` [unpackCStringIdKey, unpackCStringUtf8IdKey]
     -> literalToPmLit stringTy l
 
   _ -> Nothing
@@ -709,21 +787,20 @@ coreExprAsPmLit e = case collectArgs e of
     is_ratio (Type _) = False
     is_ratio r
       | Just (tc, _) <- splitTyConApp_maybe (exprType r)
-      = tyConName tc == ratioTyConName
+      = tc `hasKnownKey` ratioTyConKey
       | otherwise
       = False
     is_larg_exp_ratio x
-      | is_rebound_name x mkRationalBase10Name
+      | is_rebound_name x mkRationalBase10IdOcc
       = Just Base10
-      | is_rebound_name x mkRationalBase2Name
+      | is_rebound_name x mkRationalBase2IdOcc
       = Just Base2
       | otherwise
       = Nothing
 
-
     -- See Note [Detecting overloaded literals with -XRebindableSyntax]
-    is_rebound_name :: Id -> Name -> Bool
-    is_rebound_name x n = getOccFS (idName x) == getOccFS n
+    is_rebound_name :: Id -> KnownOcc -> Bool
+    is_rebound_name x ko = getOccFS (idName x) == occNameFS ko
 
 {- Note [Detecting overloaded literals with -XRebindableSyntax]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -768,16 +845,44 @@ with large exponents case. This will return a `PmLitOverRat` literal.
 Which is then passed to overloadPmLit which simply returns it as-is since
 it's already overloaded.
 
+Note [coreExprAsPmLit and nospec]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For coverage checking, we need to analyse overloaded literal patterns to figure
+out which literals they correspond to; this is what 'coreExprAsPmLit' does.
+For example, the literal pattern "fromString" (with -XOverloadedStrings)
+will turn into an equality check against the **expression**
+
+  fromString @T $dFromString "hello"#
+
+and 'coreExprAsPmLit' recovers the string by taking apart this application.
+
+However, when $dFromString is non-canonical (e.g. when an INCOHERENT
+instance was discarded during resolution of the typeclass constraint, or when
+the dictionary comes from 'withDict'), the desugarer wraps 'fromString' in
+'nospec' (as per Note [nospecId magic] in GHC.Types.Id.Make and
+Note [Desugaring non-canonical evidence] in GHC.HsToCore.Expr):
+
+  nospec @(IsString a => String -> Maybe a) fromString @T $dFromString "hello"#
+
+(For a full example, see test case T27124a.)
+
+The 'nospec' mechanism only exists for the specialiser; it should be transparent
+to everything else. 'coreExprAsPmLit' must thus look through the 'nospec'
+application in order obtain the string "hello". If it doesn't, we can't do
+pattern match checking (in fact GHC.HsToCore.Pmc.Desugar.desugarPat is liable
+to crash!).
+
+The same reasoning applies to `noinline` and `lazy`.
 -}
 
 instance Outputable PmLitValue where
   ppr (PmLitInt i)        = ppr i
   ppr (PmLitRat r)        = double (fromRat r) -- good enough
   ppr (PmLitChar c)       = pprHsChar c
-  ppr (PmLitString s)     = pprHsString s
+  ppr (PmLitString s)     = pprHsString (unpackFS s)
   ppr (PmLitOverInt n i)  = minuses n (ppr i)
   ppr (PmLitOverRat n r)  = minuses n (ppr r)
-  ppr (PmLitOverString s) = pprHsString s
+  ppr (PmLitOverString s) = pprHsString (unpackFS s)
 
 -- Take care of negated literals
 minuses :: Int -> SDoc -> SDoc

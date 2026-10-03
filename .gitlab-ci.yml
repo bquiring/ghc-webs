@@ -1,18 +1,31 @@
+spec:
+  inputs:
+    release:
+      default: "no"
+      description: Release pipeline
+      options: [ "yes", "no" ]
+
+---
+
 variables:
   GIT_SSL_NO_VERIFY: "1"
 
   # Commit of ghc/ci-images repository from which to pull Docker images
-  DOCKER_REV: 6e9f8f17086e56e83adae4a8a9d63e2fec3cb6c7
+  DOCKER_REV: 5df428b97c501f61f57587048d4bd15eba53e364
 
   # Sequential version number of all cached things.
   # Bump to invalidate GitLab CI cache.
-  CACHE_REV: 11
+  CACHE_REV: 12
 
   # Disable shallow clones; they break our linting rules
   GIT_DEPTH: 0
 
   # Always start with a fresh clone to avoid non-hermetic builds
   GIT_STRATEGY: clone
+
+  # Shallow submodule clones. Overridden by individual jobs that need deeper
+  # submodule history.
+  GIT_SUBMODULE_DEPTH: 1
 
   # Overridden by individual jobs
   CONFIGURE_ARGS: ""
@@ -27,6 +40,8 @@ variables:
 
   # Makes ci.sh isolate CABAL_DIR
   HERMETIC: "YES"
+
+  RELEASE_JOB: $[[ inputs.release ]]
 
   # Reduce XZ compression level for regular jobs (it is bumped to 9 for releases
   # and nightly jobs). In my experiments I've got the following bindist size in
@@ -104,10 +119,13 @@ workflow:
 # which versions of GHC to allow bootstrap with
 .bootstrap_matrix : &bootstrap_matrix
   matrix:
-    - GHC_VERSION: 9.8.1
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12-ghc9_8:$DOCKER_REV"
-    - GHC_VERSION: 9.10.1
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12-ghc9_10:$DOCKER_REV"
+    # If you update this version, be sure to also update 'MinBootGhcVersion' in configure.ac
+    - GHC_VERSION: 9.10.3
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13-ghc9_10:$DOCKER_REV"
+    - GHC_VERSION: 9.12.2
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13-ghc9_12:$DOCKER_REV"
+    - GHC_VERSION: 9.14.1
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13-ghc9_14:$DOCKER_REV"
 
 # Allow linters to fail on draft MRs.
 # This must be explicitly transcluded in lint jobs which
@@ -120,6 +138,10 @@ workflow:
   stage: tool-lint
   tags:
     - lint
+  before_script:
+    # Allow Git to read from the runner-owned checkout. This is needed
+    # for example by the lint-author job.
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
   rules:
     - *drafts-can-fail-lint
     - when: always
@@ -180,8 +202,9 @@ workflow:
 # https://gitlab.com/gitlab-org/gitlab/-/issues/32837). This leads to the
 # hack in this MR where by default all jobs are `interruptible: True`, but
 # for pipelines we definitely want to run, there is a dummy job which
-# happens first, which is `interreuptible: False`. This has the effect of
-# dirtying the whole pipeline and
+# happens first, which is `interruptible: False`. This has the effect of
+# dirtying the whole pipeline and preventing another push to master from
+# cancelling it.
 #
 # For now, this patch solves the immediate problem of making sure nightly
 # jobs are not cancelled.
@@ -194,7 +217,7 @@ not-interruptible:
   stage: not-interruptible
   script: "true"
   interruptible: false
-  image: "debian:10"
+  image: "debian:13"
   variables:
     GIT_STRATEGY: none
   tags:
@@ -219,7 +242,7 @@ include: '.gitlab/jobs.yaml'
 
 ghc-linters:
   stage: tool-lint
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   extends: .lint-params
   variables:
     BUILD_FLAVOUR: default
@@ -231,18 +254,53 @@ ghc-linters:
     - if: $CI_MERGE_REQUEST_ID
     - *drafts-can-fail-lint
 
+# Check that MRs include a changelog entry in changelog.d/.
+# Skipped if the MR has the ~"no-changelog" label.
+lint-changelog:
+  stage: tool-lint
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
+  extends: .lint
+  variables:
+    CHANGELOG_EXPECT_MR: "$CI_MERGE_REQUEST_IID"
+    GIT_DEPTH: 1
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - export PATH="/opt/toolchain/bin:$PATH"
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
+  script:
+    - .gitlab/ci.sh lint_changelog
+  dependencies: []
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*marge_bot_batch_merge_job.*/'
+      when: never
+    - if: $CI_MERGE_REQUEST_ID
+    - *drafts-can-fail-lint
+
 # Run mypy Python typechecker on linter scripts.
 lint-linters:
   image: "registry.gitlab.haskell.org/ghc/ci-images/linters:$DOCKER_REV"
   extends: .lint
+  variables:
+    GIT_DEPTH: 1
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
   script:
     - mypy testsuite/tests/linters/regex-linters/*.py
   dependencies: []
 
 # Check that .T files all parse by listing broken tests.
 lint-testsuite:
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   extends: .lint
+  variables:
+    GIT_DEPTH: 1
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
   script:
     - make -Ctestsuite list_broken TEST_HC=$GHC
   dependencies: []
@@ -251,6 +309,12 @@ lint-testsuite:
 typecheck-testsuite:
   image: "registry.gitlab.haskell.org/ghc/ci-images/linters:$DOCKER_REV"
   extends: .lint
+  variables:
+    GIT_DEPTH: 1
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
   script:
     - mypy testsuite/driver/runtests.py
   dependencies: []
@@ -259,10 +323,11 @@ typecheck-testsuite:
 # accommodate, e.g., haddock changes not yet upstream) but not on `master` or
 # Marge jobs.
 .lint-submods:
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   extends: .lint-params
   variables:
     BUILD_FLAVOUR: default
+    GIT_SUBMODULE_DEPTH: 0 # full history
   script:
     - .gitlab/ci.sh configure
     - .gitlab/ci.sh run_hadrian stage0:exe:lint-submodule-refs
@@ -273,14 +338,16 @@ typecheck-testsuite:
     - _build/stageBoot/bin/lint-submodule-refs . $(git rev-list $base..$CI_COMMIT_SHA)
   dependencies: []
 
-# We allow the submodule checker to fail when run on merge requests (to
-# accommodate, e.g., haddock changes not yet upstream) but not on `master` or
-# Marge jobs.
+# Check that commits in an MR were not authored with the identity that CI uses
+# when it needs to create commits itself. This only needs Git history.
 lint-author:
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
-  extends: .lint-params
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
+  extends: .lint
   variables:
-    BUILD_FLAVOUR: default
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
   script:
     - git fetch "$CI_MERGE_REQUEST_PROJECT_URL" $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
     - base="$(git merge-base FETCH_HEAD $CI_COMMIT_SHA)"
@@ -358,7 +425,7 @@ lint-submods-branch:
 
 .lint-params:
   needs: []
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   extends: .lint
   before_script:
     - export PATH="/opt/toolchain/bin:$PATH"
@@ -375,20 +442,6 @@ lint-submods-branch:
     paths:
       - cabal-cache
 
-# Disabled due to #22830
-.hlint-ghc-and-base:
-  extends: .lint-params
-  image: "registry.gitlab.haskell.org/ghc/ci-images/linters:$DOCKER_REV"
-  variables:
-    BUILD_FLAVOUR: default
-  script:
-    - .gitlab/ci.sh setup
-    - .gitlab/ci.sh configure
-    - .gitlab/ci.sh run_hadrian lint:ghc-internal
-    - .gitlab/ci.sh run_hadrian lint:ghc-experimental
-    - .gitlab/ci.sh run_hadrian lint:base
-    - .gitlab/ci.sh run_hadrian lint:compiler
-
 ############################################################
 # GHC-in-GHCi (Hadrian)
 ############################################################
@@ -399,12 +452,12 @@ hadrian-ghc-in-ghci:
     - job: lint-linters
     - job: lint-submods
       optional: true
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   before_script:
     # workaround for docker permissions
     - sudo chown ghc:ghc -R .
   variables:
-    GHC_FLAGS: -Werror
+    GHC_FLAGS: -Werror -Wwarn=unused-imports
   tags:
     - x86_64-linux
   script:
@@ -416,7 +469,7 @@ hadrian-ghc-in-ghci:
     - "echo '  ghc-options: -Werror'  >> hadrian/cabal.project.local"
     # Load ghc-in-ghci then immediately exit and check the modules loaded
     - export CORES="$(mk/detect-cpu-count.sh)"
-    - echo ":q" | HADRIAN_ARGS=-j$CORES hadrian/ghci -j$CORES | tail -n2 | grep "Ok,"
+    - echo ":q" | HADRIAN_ARGS=-j$CORES hadrian/ghci-multi -j$CORES | tail -n2 | grep "Ok,"
   after_script:
     - .gitlab/ci.sh save_cache
     - cat ci_timings.txt
@@ -432,24 +485,19 @@ hadrian-ghc-in-ghci:
 hadrian-multi:
   stage: testing
   needs:
-    - job: x86_64-linux-fedora33-release
+    - job: x86_64-linux-deb13-validate
       optional: true
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-deb13-validate
       optional: true
-    - job: release-x86_64-linux-fedora33-release
+    - job: release-x86_64-linux-deb13-release
       optional: true
   dependencies: null
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   before_script:
     # workaround for docker permissions
     - sudo chown ghc:ghc -R .
   variables:
-    GHC_FLAGS: "-Werror=-Wno-error=incomplete-record-selectors -Wwarn=deprecations -Wwarn=unused-imports"
-       # -Wno-error=incomplete-record-selectors is present because -Wall now
-       # includes -Wincomplete-record-selectors, and hadrian-multi has many, many
-       # warnings about incomplete record selectors.  A better fix would be to
-       # remove the use of incomplete record selectors, since each of them represents
-       # a potential crash.
+    GHC_FLAGS: "-Wwarn=deprecations -Wwarn=unused-imports"
     CONFIGURE_ARGS: --enable-bootstrap-with-devel-snapshot
   tags:
     - x86_64-linux
@@ -459,10 +507,11 @@ hadrian-multi:
     - ls
     - |
       mkdir tmp
-      tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      tar -xf ghc-x86_64-linux-deb13-validate.tar.xz -C tmp \
+        || tar -xf ghc-x86_64-linux-deb13-release.tar.xz -C tmp
       pushd tmp/ghc-*/
       ./configure --prefix=$root
-      make install
+      make install -j$CPUS
       popd
       rm -Rf tmp
     - export HC=$root/bin/ghc
@@ -498,20 +547,23 @@ stack-hadrian-build:
     - . .gitlab/ci.sh setup
     - . .gitlab/ci.sh configure
     - hadrian/build-stack --version
+  rules:
+    - *full-ci
 
 ####################################
 # Testing reinstallable ghc codepath
 ####################################
 
-test-cabal-reinstall-x86_64-linux-deb10:
-  extends: nightly-x86_64-linux-deb10-validate
+test-cabal-reinstall-x86_64-linux-deb13:
+  extends: nightly-x86_64-linux-deb13-validate
   stage: full-build
   variables:
     REINSTALL_GHC: "yes"
     BUILD_FLAVOUR: validate
-    TEST_ENV: "x86_64-linux-deb10-cabal-install"
+    TEST_ENV: "x86_64-linux-deb13-cabal-install"
   rules:
     - if: $NIGHTLY
+      allow_failure: true
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-reinstall.*/'
 
 ########################################
@@ -521,17 +573,17 @@ test-cabal-reinstall-x86_64-linux-deb10:
 abi-test-nightly:
   stage: full-build
   needs:
-    - job: nightly-x86_64-linux-fedora33-release-hackage
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-fedora43-release-hackage
+    - job: nightly-x86_64-linux-fedora43-release
   tags:
     - x86_64-linux
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora43:$DOCKER_REV"
   dependencies: null
   before_script:
     - mkdir -p normal
     - mkdir -p hackage
-    - tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C normal/
-    - tar -xf ghc-x86_64-linux-fedora33-release-hackage_docs.tar.xz -C hackage/
+    - tar -xf ghc-x86_64-linux-fedora43-release.tar.xz -C normal/
+    - tar -xf ghc-x86_64-linux-fedora43-release-hackage_docs.tar.xz -C hackage/
   script:
     - .gitlab/ci.sh compare_interfaces_of "normal/ghc-*" "hackage/ghc-*"
   artifacts:
@@ -550,11 +602,11 @@ abi-test-nightly:
 doc-tarball:
   stage: packaging
   needs:
-    - job: x86_64-linux-deb12-numa-slow-validate
+    - job: x86_64-linux-deb13-numa-slow-validate
       optional: true
-    - job: nightly-x86_64-linux-deb12-validate
+    - job: nightly-x86_64-linux-deb13-validate
       optional: true
-    - job: release-x86_64-linux-deb12-release
+    - job: release-x86_64-linux-deb13-release
       optional: true
 
     - job: x86_64-windows-validate
@@ -566,10 +618,10 @@ doc-tarball:
 
   tags:
     - x86_64-linux
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   dependencies: null
   variables:
-    LINUX_BINDIST: "ghc-x86_64-linux-deb12.tar.xz"
+    LINUX_BINDIST: "ghc-x86_64-linux-deb13.tar.xz"
     WINDOWS_BINDIST: "ghc-x86_64-windows.tar.xz"
   artifacts:
     expose_as: "Documentation Preview"
@@ -585,15 +637,15 @@ doc-tarball:
       - users_guide.pdf
   script:
     - |
-      mv "ghc-x86_64-linux-deb12-numa-slow-validate.tar.xz" "$LINUX_BINDIST" \
-        || mv "ghc-x86_64-linux-deb12-validate.tar.xz" "$LINUX_BINDIST" \
-        || mv "ghc-x86_64-linux-deb12-release.tar.xz" "$LINUX_BINDIST" \
+      mv "ghc-x86_64-linux-deb13-numa-slow-validate.tar.xz" "$LINUX_BINDIST" \
+        || mv "ghc-x86_64-linux-deb13-validate.tar.xz" "$LINUX_BINDIST" \
+        || mv "ghc-x86_64-linux-deb13-release.tar.xz" "$LINUX_BINDIST" \
         || true
       mv "ghc-x86_64-windows-validate.tar.xz" "$WINDOWS_BINDIST" \
         || mv "ghc-x86_64-windows-release.tar.xz" "$WINDOWS_BINDIST" \
         || true
       if [ ! -f "$LINUX_BINDIST" ]; then
-        echo "Error: $LINUX_BINDIST does not exist. Did the Debian 9 job fail?"
+        echo "Error: $LINUX_BINDIST does not exist. Did the Debian job fail?"
         exit 1
       fi
       if [ ! -f "$WINDOWS_BINDIST" ]; then
@@ -608,14 +660,14 @@ doc-tarball:
 hackage-doc-tarball:
   stage: packaging
   needs:
-    - job: nightly-x86_64-linux-fedora33-release-hackage
+    - job: nightly-x86_64-linux-fedora43-release-hackage
       optional: true
-    - job: release-x86_64-linux-fedora33-release-hackage
+    - job: release-x86_64-linux-fedora43-release-hackage
       optional: true
     - job: source-tarball
   tags:
     - x86_64-linux
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   dependencies: null
   variables:
     # Don't clone the git repo..
@@ -627,7 +679,7 @@ hackage-doc-tarball:
       - hackage_docs
   before_script:
     - tar -xf ghc-*[0-9]-src.tar.xz
-    - tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C ghc*/
+    - tar -xf ghc-x86_64-linux-fedora43-release.tar.xz -C ghc*/
   script:
     - cd ghc*/
     - mv .gitlab/rel_eng/upload_ghc_libs.py .
@@ -645,7 +697,7 @@ source-tarball:
     - hadrian-ghc-in-ghci
   tags:
     - x86_64-linux
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   dependencies: []
   artifacts:
     paths:
@@ -689,7 +741,7 @@ package-hadrian-bootstrap-sources:
   tags:
     - x86_64-linux
   needs: ["generate-hadrian-bootstrap-sources"]
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   artifacts:
     paths:
       - hadrian-bootstrap-sources-all.tar.gz
@@ -733,7 +785,7 @@ test-bootstrap:
   variables:
     # Don't record performance benchmarks
     TEST_ENV: ""
-    BIN_DIST_NAME: "ghc-x86_64-deb12-linux"
+    BIN_DIST_NAME: "ghc-x86_64-deb13-linux"
     BUILD_FLAVOUR: "validate"
     NO_BOOT: "1"
   rules:
@@ -753,7 +805,7 @@ test-bootstrap:
 # Triggering jobs in the ghc/head.hackage project requires that we have a job
 # token for that repository. Furthermore the head.hackage CI job must have
 # access to an unprivileged access token with the ability to query the ghc/ghc
-# project such that it can find the job ID of the fedora33 job for the current
+# project such that it can find the job ID of the fedora43 job for the current
 # pipeline.
 #
 # hackage-lint: Can be triggered on any MR, normal validate pipeline or nightly build.
@@ -782,16 +834,16 @@ test-bootstrap:
 
 hackage-lint:
   needs:
-    - job: x86_64-linux-deb12-numa-slow-validate
+    - job: x86_64-linux-deb13-numa-slow-validate
       optional: true
       artifacts: false
-    - job: nightly-x86_64-linux-deb12-numa-slow-validate
+    - job: nightly-x86_64-linux-deb13-numa-slow-validate
       optional: true
       artifacts: false
-    - job: nightly-aarch64-linux-deb12-validate
+    - job: nightly-aarch64-linux-deb13-validate
       optional: true
       artifacts: false
-    - job: aarch64-linux-deb12-validate
+    - job: aarch64-linux-deb13-validate
       optional: true
       artifacts: false
   extends: .hackage
@@ -806,10 +858,10 @@ hackage-lint:
 
 hackage-label-lint:
   needs:
-    - job: x86_64-linux-deb12-numa-slow-validate
+    - job: x86_64-linux-deb13-numa-slow-validate
       optional: true
       artifacts: false
-    - job: aarch64-linux-deb12-validate
+    - job: aarch64-linux-deb13-validate
       optional: true
       artifacts: false
   extends: .hackage
@@ -823,10 +875,10 @@ hackage-label-lint:
 # affects the total allocation numbers for the simplifier portion significantly.
 nightly-hackage-lint:
   needs:
-    - job: nightly-x86_64-linux-deb12-numa-slow-validate
+    - job: nightly-x86_64-linux-deb13-numa-slow-validate
       optional: true
       artifacts: false
-    - job: nightly-aarch64-linux-deb12-validate
+    - job: nightly-aarch64-linux-deb13-validate
       optional: true
       artifacts: false
   rules:
@@ -840,10 +892,10 @@ nightly-hackage-lint:
 
 nightly-hackage-perf:
   needs:
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-fedora43-release
       optional: true
       artifacts: false
-    - job: nightly-aarch64-linux-deb12-validate
+    - job: nightly-aarch64-linux-deb13-validate
       optional: true
       artifacts: false
   rules:
@@ -859,10 +911,10 @@ nightly-hackage-perf:
 
 release-hackage-lint:
   needs:
-    - job: release-x86_64-linux-fedora33-release
+    - job: release-x86_64-linux-fedora43-release
       optional: true
       artifacts: false
-    - job: release-aarch64-linux-deb12-release+no_split_sections
+    - job: release-aarch64-linux-deb13-release+no_split_sections
       optional: true
       artifacts: false
   rules:
@@ -895,9 +947,9 @@ release-hackage-lint:
 
 .test-primops-validate-template:
   needs:
-    - job: x86_64-linux-deb12-validate
+    - job: x86_64-linux-deb13-validate
       artifacts: false
-    - job: aarch64-linux-deb12-validate
+    - job: aarch64-linux-deb13-validate
       artifacts: false
     - job: aarch64-darwin-validate
       artifacts: false
@@ -917,9 +969,9 @@ test-primops-label:
 test-primops-nightly:
   extends: .test-primops
   needs:
-    - job: nightly-x86_64-linux-deb12-validate
+    - job: nightly-x86_64-linux-deb13-validate
       artifacts: false
-    - job: nightly-aarch64-linux-deb12-validate
+    - job: nightly-aarch64-linux-deb13-validate
       artifacts: false
     - job: nightly-aarch64-darwin-validate
       artifacts: false
@@ -945,13 +997,13 @@ perf-nofib:
   allow_failure: true
   stage: testing
   needs:
-    - job: x86_64-linux-fedora33-release
+    - job: x86_64-linux-fedora43-release
       optional: true
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-fedora43-release
       optional: true
-    - job: release-x86_64-linux-fedora33-release
+    - job: release-x86_64-linux-fedora43-release
       optional: true
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora43:$DOCKER_REV"
   rules:
     - when: never
     - *full-ci
@@ -964,10 +1016,10 @@ perf-nofib:
     - root=$(pwd)/ghc
     - |
       mkdir tmp
-      tar -xf ../ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      tar -xf ../ghc-x86_64-linux-fedora43-release.tar.xz -C tmp
       pushd tmp/ghc-*/
       ./configure --prefix=$root
-      make install
+      make install -j$CPUS
       popd
       rm -Rf tmp
     - export PATH=$root/bin:$PATH
@@ -988,24 +1040,28 @@ perf-nofib:
 perf:
   stage: testing
   needs:
-    - job: x86_64-linux-fedora33-release
+    - job: x86_64-linux-deb13-validate
       optional: true
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-deb13-validate
       optional: true
-    - job: release-x86_64-linux-fedora33-release
+    - job: release-x86_64-linux-deb13-release
       optional: true
   dependencies: null
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   tags:
     - x86_64-linux-perf
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
   script:
     - root=$(pwd)/ghc
     - |
       mkdir tmp
-      tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      tar -xf ghc-x86_64-linux-deb13-validate.tar.xz -C tmp \
+        || tar -xf ghc-x86_64-linux-deb13-release.tar.xz -C tmp
       pushd tmp/ghc-*/
       ./configure --prefix=$root
-      make install
+      make install -j$CPUS
       popd
       rm -Rf tmp
     - export BOOT_HC=$(which ghc)
@@ -1026,28 +1082,26 @@ perf:
 abi-test:
   stage: testing
   needs:
-    - job: x86_64-linux-fedora33-release
+    - job: x86_64-linux-deb13-validate
       optional: true
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-deb13-validate
       optional: true
-    - job: release-x86_64-linux-fedora33-release
+    - job: release-x86_64-linux-deb13-release
       optional: true
   dependencies: null
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
-  rules:
-    - if: $CI_MERGE_REQUEST_ID
-    - if: '$CI_COMMIT_BRANCH == "master"'
-    - if: '$CI_COMMIT_BRANCH =~ /ghc-[0.9]+\.[0-9]+/'
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   tags:
     - x86_64-linux
   script:
+    - sudo chown ghc:ghc -R .
     - root=$(pwd)/ghc
     - |
       mkdir tmp
-      tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      tar -xf ghc-x86_64-linux-deb13-validate.tar.xz -C tmp \
+        || tar -xf ghc-x86_64-linux-deb13-release.tar.xz -C tmp
       pushd tmp/ghc-*/
       ./configure --prefix=$root
-      make install
+      make install -j$CPUS
       popd
       rm -Rf tmp
     - export BOOT_HC=$(which ghc)
@@ -1079,29 +1133,29 @@ abi-test:
 ghc-wasm-meta-gmp:
   extends: .ghc-wasm-meta
   needs:
-    - job: x86_64-linux-alpine3_20-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    - job: x86_64-linux-alpine3_23-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
       artifacts: false
   variables:
     UPSTREAM_GHC_FLAVOUR: gmp
-    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_20-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_23-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
 
 ghc-wasm-meta-native:
   extends: .ghc-wasm-meta
   needs:
-    - job: x86_64-linux-alpine3_20-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    - job: x86_64-linux-alpine3_23-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
       artifacts: false
   variables:
     UPSTREAM_GHC_FLAVOUR: native
-    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_20-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_23-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
 
 ghc-wasm-meta-unreg:
   extends: .ghc-wasm-meta
   needs:
-    - job: x86_64-linux-alpine3_20-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    - job: x86_64-linux-alpine3_23-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
       artifacts: false
   variables:
     UPSTREAM_GHC_FLAVOUR: unreg
-    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_20-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_23-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
 
 ############################################################
 # Documentation deployment via GitLab Pages
@@ -1111,7 +1165,7 @@ pages:
   stage: deploy
   needs: [doc-tarball]
   dependencies: null
-  image: ghcci/x86_64-linux-deb9:0.2
+  image: "debian:13"
   # See #18973
   allow_failure: true
   tags:
@@ -1146,7 +1200,7 @@ pages:
 
 project-version:
   stage: packaging
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb13:$DOCKER_REV"
   tags:
     - x86_64-linux
   variables:
@@ -1169,6 +1223,10 @@ project-version:
   image: nixos/nix:2.25.2
   dependencies: null
   tags:
+    # N.B. we use the OpenCape runners here since this job involves a significant
+    # amount of artifact fetching. This is much more efficient on these runners
+    # as they are near the GitLab box.
+    - opencape
     - x86_64-linux
   variables:
     BUILD_FLAVOUR: default
@@ -1199,15 +1257,11 @@ ghcup-metadata-nightly:
   extends: .ghcup-metadata
   # Explicit needs for validate pipeline because we only need certain bindists
   needs:
-    - job: nightly-x86_64-linux-fedora33-release
+    - job: nightly-x86_64-linux-fedora43-release
       artifacts: false
     - job: nightly-x86_64-linux-ubuntu24_04-validate
       artifacts: false
     - job: nightly-x86_64-linux-ubuntu22_04-validate
-      artifacts: false
-    - job: nightly-x86_64-linux-ubuntu20_04-validate
-      artifacts: false
-    - job: nightly-x86_64-linux-ubuntu18_04-validate
       artifacts: false
     - job: nightly-x86_64-linux-rocky8-validate
       artifacts: false
@@ -1217,40 +1271,38 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: nightly-x86_64-windows-validate
       artifacts: false
-    - job: nightly-x86_64-linux-alpine3_12-validate
+    - job: nightly-x86_64-linux-alpine3_23-validate
       artifacts: false
-    - job: nightly-x86_64-linux-alpine3_20-validate
+    - job: nightly-i386-linux-deb11-validate
       artifacts: false
-    - job: nightly-x86_64-linux-deb9-validate
+    - job: nightly-i386-linux-deb13-validate
       artifacts: false
-    - job: nightly-i386-linux-deb10-validate
+    - job: nightly-i386-linux-alpine3_23-validate
       artifacts: false
-    - job: nightly-i386-linux-deb12-validate
-      artifacts: false
-    - job: nightly-x86_64-linux-deb10-validate
-      artifacts: false
-    - job: nightly-aarch64-linux-deb10-validate
+    - job: nightly-aarch64-linux-deb11-validate
       artifacts: false
     - job: nightly-x86_64-linux-deb11-validate
       artifacts: false
+    - job: nightly-x86_64-linux-deb13-validate
+      artifacts: false
+    - job: nightly-aarch64-linux-deb13-validate
+      artifacts: false
     - job: nightly-x86_64-linux-deb12-validate
       artifacts: false
-    - job: nightly-aarch64-linux-deb12-validate
-      artifacts: false
-    - job: nightly-aarch64-linux-alpine3_18-validate
+    - job: nightly-aarch64-linux-alpine3_23-validate
       artifacts: false
     - job: source-tarball
       artifacts: false
     - job: project-version
   script:
-    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" metadata_test.yaml
   rules:
     - if: $NIGHTLY
 
 # Update the ghcup metadata with information about this nightly pipeline
 ghcup-metadata-nightly-push:
   stage: deploy
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora43:$DOCKER_REV"
   dependencies: null
   tags:
     - x86_64-linux
@@ -1270,7 +1322,8 @@ ghcup-metadata-nightly-push:
     - git config user.name "GHC GitLab CI"
     - git remote add gitlab_origin https://oauth2:$PROJECT_PUSH_TOKEN@gitlab.haskell.org/ghc/ghcup-metadata.git
     - git add .
-    - git commit -m "Update metadata"
+    # a metadata nightly run may result in no changes. We reflect that in the commit message.
+    - git diff --cached --quiet && git commit --allow-empty -m "Updated metadata - no changes" || git commit -m "Update metadata"
     - git push gitlab_origin HEAD:updates
   rules:
     # Only run the update on scheduled nightly pipelines, ie once a day

@@ -30,6 +30,8 @@ module GHC.Internal.System.Environment
       getEnvironment,
   ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Data.Maybe (maybe)
 import GHC.Internal.Ptr
 import GHC.Internal.Foreign.C.Types
@@ -45,9 +47,11 @@ import GHC.Internal.System.IO.Error (mkIOError)
 import GHC.Internal.Control.Exception.Base (bracket_, throwIO)
 #if defined(mingw32_HOST_OS)
 import GHC.Internal.Control.Exception.Base (bracket)
+import GHC.Internal.Err (undefined)
+#else
 #endif
-import GHC.Internal.Base
 import GHC.Internal.List (null, elem, takeWhile, break)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num
 import GHC.Internal.Real (fromIntegral)
 import GHC.Internal.IO (FilePath)

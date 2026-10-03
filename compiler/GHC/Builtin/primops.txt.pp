@@ -46,7 +46,7 @@
 -- * The primitives are listed in this file, primops.txt.pp.
 --   It goes through CPP, which creates primops.txt.
 --   It is then consumed by the utility program genprimopcode, which produces
---   the following three types of files.
+--   the following types of files.
 --
 --   1. The files with extension .hs-incl.
 --      They can be found by grepping for hs-incl.
@@ -71,12 +71,7 @@
 --      Additionally, we pattern match on PrimOp when generating Cmm in
 --      GHC/StgToCmm/Prim.hs.
 --
---   2. The dummy Prim.hs file, which is used for Haddock and
---      contains descriptions taken from primops.txt.pp.
---      All definitions are replaced by placeholders.
---      See Note [GHC.Prim Docs] in GHC.Builtin.Utils.
---
---   3. The module PrimopWrappers.hs, which wraps every call for GHCi;
+--   2. The module PrimopWrappers.hs, which wraps every call for GHCi;
 --      see Note [Primop wrappers] in GHC.Builtin.Primops for details.
 --
 -- * This file does not list internal-only equality types
@@ -148,6 +143,8 @@ defaults
    vector           = []
    deprecated_msg   = {}      -- A non-empty message indicates deprecation
    div_like         = False   -- Second argument expected to be non zero - used for tests
+   shift_like       = False   -- Second argument expected to be atmost first argument's word size -1 - used for tests
+   defined_bits     = Nothing -- The number of bits the operation is defined for (if not all bits)
 
 -- Note [When do out-of-line primops go in primops.txt.pp]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -311,8 +308,16 @@ primop Int8QuotRemOp "quotRemInt8#" GenPrimOp Int8# -> Int8# -> (# Int8#, Int8# 
     div_like = True
 
 primop Int8SllOp "uncheckedShiftLInt8#"  GenPrimOp Int8# -> Int# -> Int8#
+  with
+    shift_like = True
+
 primop Int8SraOp "uncheckedShiftRAInt8#" GenPrimOp Int8# -> Int# -> Int8#
+  with
+    shift_like = True
+
 primop Int8SrlOp "uncheckedShiftRLInt8#" GenPrimOp Int8# -> Int# -> Int8#
+  with
+    shift_like = True
 
 primop Int8ToWord8Op "int8ToWord8#" GenPrimOp Int8# -> Word8#
    with code_size = 0
@@ -371,7 +376,12 @@ primop Word8XorOp "xorWord8#" GenPrimOp Word8# -> Word8# -> Word8#
 primop Word8NotOp "notWord8#" GenPrimOp Word8# -> Word8#
 
 primop Word8SllOp "uncheckedShiftLWord8#"  GenPrimOp Word8# -> Int# -> Word8#
+  with
+    shift_like = True
+
 primop Word8SrlOp "uncheckedShiftRLWord8#" GenPrimOp Word8# -> Int# -> Word8#
+  with
+    shift_like = True
 
 primop Word8ToInt8Op "word8ToInt8#" GenPrimOp Word8# -> Int8#
    with code_size = 0
@@ -421,8 +431,16 @@ primop Int16QuotRemOp "quotRemInt16#" GenPrimOp Int16# -> Int16# -> (# Int16#, I
     div_like = True
 
 primop Int16SllOp "uncheckedShiftLInt16#"  GenPrimOp Int16# -> Int# -> Int16#
+  with
+    shift_like = True
+
 primop Int16SraOp "uncheckedShiftRAInt16#" GenPrimOp Int16# -> Int# -> Int16#
+  with
+    shift_like = True
+
 primop Int16SrlOp "uncheckedShiftRLInt16#" GenPrimOp Int16# -> Int# -> Int16#
+  with
+    shift_like = True
 
 primop Int16ToWord16Op "int16ToWord16#" GenPrimOp Int16# -> Word16#
    with code_size = 0
@@ -481,7 +499,12 @@ primop Word16XorOp "xorWord16#" GenPrimOp Word16# -> Word16# -> Word16#
 primop Word16NotOp "notWord16#" GenPrimOp Word16# -> Word16#
 
 primop Word16SllOp "uncheckedShiftLWord16#"  GenPrimOp Word16# -> Int# -> Word16#
+  with
+    shift_like = True
+
 primop Word16SrlOp "uncheckedShiftRLWord16#" GenPrimOp Word16# -> Int# -> Word16#
+  with
+    shift_like = True
 
 primop Word16ToInt16Op "word16ToInt16#" GenPrimOp Word16# -> Int16#
    with code_size = 0
@@ -531,8 +554,16 @@ primop Int32QuotRemOp "quotRemInt32#" GenPrimOp Int32# -> Int32# -> (# Int32#, I
     div_like = True
 
 primop Int32SllOp "uncheckedShiftLInt32#"  GenPrimOp Int32# -> Int# -> Int32#
+  with
+    shift_like = True
+
 primop Int32SraOp "uncheckedShiftRAInt32#" GenPrimOp Int32# -> Int# -> Int32#
+  with
+    shift_like = True
+
 primop Int32SrlOp "uncheckedShiftRLInt32#" GenPrimOp Int32# -> Int# -> Int32#
+  with
+    shift_like = True
 
 primop Int32ToWord32Op "int32ToWord32#" GenPrimOp Int32# -> Word32#
    with code_size = 0
@@ -591,7 +622,12 @@ primop Word32XorOp "xorWord32#" GenPrimOp Word32# -> Word32# -> Word32#
 primop Word32NotOp "notWord32#" GenPrimOp Word32# -> Word32#
 
 primop Word32SllOp "uncheckedShiftLWord32#"  GenPrimOp Word32# -> Int# -> Word32#
+  with
+    shift_like = True
+
 primop Word32SrlOp "uncheckedShiftRLWord32#" GenPrimOp Word32# -> Int# -> Word32#
+  with
+    shift_like = True
 
 primop Word32ToInt32Op "word32ToInt32#" GenPrimOp Word32# -> Int32#
    with code_size = 0
@@ -636,8 +672,16 @@ primop Int64RemOp "remInt64#" GenPrimOp Int64# -> Int64# -> Int64#
     div_like = True
 
 primop Int64SllOp "uncheckedIShiftL64#"  GenPrimOp Int64# -> Int# -> Int64#
+  with
+    shift_like = True
+
 primop Int64SraOp "uncheckedIShiftRA64#" GenPrimOp Int64# -> Int# -> Int64#
+  with
+    shift_like = True
+
 primop Int64SrlOp "uncheckedIShiftRL64#" GenPrimOp Int64# -> Int# -> Int64#
+  with
+    shift_like = True
 
 primop Int64ToWord64Op "int64ToWord64#" GenPrimOp Int64# -> Word64#
    with code_size = 0
@@ -691,7 +735,12 @@ primop Word64XorOp "xor64#" GenPrimOp Word64# -> Word64# -> Word64#
 primop Word64NotOp "not64#" GenPrimOp Word64# -> Word64#
 
 primop Word64SllOp "uncheckedShiftL64#"  GenPrimOp Word64# -> Int# -> Word64#
+  with
+    shift_like = True
+
 primop Word64SrlOp "uncheckedShiftRL64#" GenPrimOp Word64# -> Int# -> Word64#
+  with
+    shift_like = True
 
 primop Word64ToInt64Op "word64ToInt64#" GenPrimOp Word64# -> Int64#
    with code_size = 0
@@ -864,12 +913,20 @@ primop   WordToDoubleOp   "word2Double#"          GenPrimOp  Word# -> Double#
 primop   IntSllOp   "uncheckedIShiftL#" GenPrimOp  Int# -> Int# -> Int#
          {Shift left.  Result undefined if shift amount is not
           in the range 0 to word size - 1 inclusive.}
+  with
+    shift_like = True
+
 primop   IntSraOp   "uncheckedIShiftRA#" GenPrimOp Int# -> Int# -> Int#
          {Shift right arithmetic.  Result undefined if shift amount is not
           in the range 0 to word size - 1 inclusive.}
+  with
+    shift_like = True
+
 primop   IntSrlOp   "uncheckedIShiftRL#" GenPrimOp Int# -> Int# -> Int#
          {Shift right logical.  Result undefined if shift amount is not
           in the range 0 to word size - 1 inclusive.}
+  with
+    shift_like = True
 
 ------------------------------------------------------------------------
 section "Word#"
@@ -945,9 +1002,14 @@ primop   WordNotOp   "not#"   GenPrimOp   Word# -> Word#
 primop   WordSllOp   "uncheckedShiftL#"   GenPrimOp   Word# -> Int# -> Word#
          {Shift left logical.   Result undefined if shift amount is not
           in the range 0 to word size - 1 inclusive.}
+  with
+    shift_like = True
+
 primop   WordSrlOp   "uncheckedShiftRL#"   GenPrimOp   Word# -> Int# -> Word#
          {Shift right logical.   Result undefined if shift  amount is not
           in the range 0 to word size - 1 inclusive.}
+  with
+    shift_like = True
 
 primop   WordToIntOp   "word2Int#"   GenPrimOp   Word# -> Int#
    with code_size = 0
@@ -1065,8 +1127,10 @@ primop   CtzOp     "ctz#"   GenPrimOp   Word# -> Word#
 
 primop   BSwap16Op   "byteSwap16#"   GenPrimOp   Word# -> Word#
     {Swap bytes in the lower 16 bits of a word. The higher bytes are undefined. }
+    with defined_bits = 16
 primop   BSwap32Op   "byteSwap32#"   GenPrimOp   Word# -> Word#
     {Swap bytes in the lower 32 bits of a word. The higher bytes are undefined. }
+    with defined_bits = 32
 primop   BSwap64Op   "byteSwap64#"   GenPrimOp   Word64# -> Word64#
     {Swap bytes in a 64 bits of a word.}
 primop   BSwapOp     "byteSwap#"     GenPrimOp   Word# -> Word#
@@ -1074,10 +1138,13 @@ primop   BSwapOp     "byteSwap#"     GenPrimOp   Word# -> Word#
 
 primop   BRev8Op    "bitReverse8#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 8-bit word.}
+    with defined_bits = 8
 primop   BRev16Op   "bitReverse16#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 16-bit word.}
+    with defined_bits = 16
 primop   BRev32Op   "bitReverse32#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 32-bit word.}
+    with defined_bits = 32
 primop   BRev64Op   "bitReverse64#"   GenPrimOp   Word64# -> Word64#
     {Reverse the order of the bits in a 64-bit word.}
 primop   BRevOp     "bitReverse#"     GenPrimOp   Word# -> Word#
@@ -2082,7 +2149,7 @@ primop  SizeofMutableByteArrayOp "sizeofMutableByteArray#" GenPrimOp
 
 primop  GetSizeofMutableByteArrayOp "getSizeofMutableByteArray#" GenPrimOp
    MutableByteArray# s -> State# s -> (# State# s, Int# #)
-   {Return the number of elements in the array, correctly accounting for
+   {Return the number of bytes in the array, correctly accounting for
    the effect of 'shrinkMutableByteArray#' and 'resizeMutableByteArray#'.
 
    @since 0.5.0.0}
@@ -3233,63 +3300,33 @@ primop  IsEmptyMVarOp "isEmptyMVar#" GenPrimOp
 
 
 ------------------------------------------------------------------------
-section "Synchronized I/O Ports"
-        {Operations on 'IOPort#'s. }
-------------------------------------------------------------------------
-
-primtype IOPort# s a
-        { A shared I/O port is almost the same as an 'MVar#'.
-        The main difference is that IOPort has no deadlock detection or
-        deadlock breaking code that forcibly releases the lock. }
-
-primop  NewIOPortOp "newIOPort#"  GenPrimOp
-   State# s -> (# State# s, IOPort# s a_levpoly #)
-   {Create new 'IOPort#'; initially empty.}
-   with
-   out_of_line = True
-   effect = ReadWriteEffect
-
-primop  ReadIOPortOp "readIOPort#" GenPrimOp
-   IOPort# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
-   {If 'IOPort#' is empty, block until it becomes full.
-   Then remove and return its contents, and set it empty.
-   Throws an 'IOPortException' if another thread is already
-   waiting to read this 'IOPort#'.}
-   with
-   out_of_line      = True
-   effect = ReadWriteEffect
-
-primop  WriteIOPortOp "writeIOPort#" GenPrimOp
-   IOPort# s a_levpoly -> a_levpoly -> State# s -> (# State# s, Int# #)
-   {If 'IOPort#' is full, immediately return with integer 0,
-    throwing an 'IOPortException'.
-    Otherwise, store value arg as 'IOPort#''s new contents,
-    and return with integer 1. }
-   with
-   out_of_line      = True
-   effect = ReadWriteEffect
-
-------------------------------------------------------------------------
 section "Delay/wait operations"
 ------------------------------------------------------------------------
 
 primop  DelayOp "delay#" GenPrimOp
    Int# -> State# s -> State# s
-   {Sleep specified number of microseconds.}
+   {Suspend the calling thread for a specified number of microseconds. This
+    operation is /interruptible/ by async exceptions.}
    with
    effect = ReadWriteEffect
    out_of_line      = True
 
 primop  WaitReadOp "waitRead#" GenPrimOp
    Int# -> State# s -> State# s
-   {Block until input is available on specified file descriptor.}
+   {Suspend the calling thread until input is available (or an I/O error
+    occurs) on the given file descriptor. This operation can throw exceptions
+    of type 'IOException'. The operation is also /interruptible/ by async
+    exceptions.}
    with
    effect = ReadWriteEffect
    out_of_line      = True
 
 primop  WaitWriteOp "waitWrite#" GenPrimOp
    Int# -> State# s -> State# s
-   {Block until output is possible on specified file descriptor.}
+   {Suspend the calling thread until output is possible (or an I/O error
+    occurs) on the given file descriptor. This operation can throw exceptions
+    of type 'IOException'. The operation is also /interruptible/ by async
+    exceptions.}
    with
    effect = ReadWriteEffect
    out_of_line      = True
@@ -3713,7 +3750,6 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 --   sameMutVar# :: MutVar# s a -> MutVar# s a -> Int#
 --   sameTVar# :: TVar# s a -> TVar# s a -> Int#
 --   sameMVar# :: MVar# s a -> MVar# s a -> Int#
---   sameIOPort# :: IOPort# s a -> IOPort# s a -> Int#
 --   eqStableName# :: StableName# a -> StableName# b -> Int#
 --
 -- These operations are all specialisations of unsafePtrEquality#.
@@ -3913,6 +3949,18 @@ primop  NewBCOOp "newBCO#" GenPrimOp
    effect = ReadWriteEffect
    out_of_line      = True
 
+primop  NewConAppObjOp "newConAppObj#" GenPrimOp
+   Addr# -> ByteArray# -> Array# a_levpoly -> Word# -> State# s -> (# State# s, b_levpoly #)
+   { @'newConAppObj#' datacon_itbl lits ptrs arity@ creates a new constructor
+     application object on the heap from the info table pointer of the data
+     constructor and the data arguments given in @ptrs@ and @lits@. The
+     resulting object is a heap closure for the constructor application. It is
+     evaluated and properly tagged. The given @arity@ gives the total size of
+     pointers and literals in number of words. }
+   with
+   effect = ReadWriteEffect
+   out_of_line      = True
+
 primop  UnpackClosureOp "unpackClosure#" GenPrimOp
    a -> (# Addr#, ByteArray#, Array# b #)
    { @'unpackClosure#' closure@ copies the closure and pointers in the
@@ -3955,6 +4003,16 @@ primop  ClearCCSOp "clearCCS#" GenPrimOp
    { Run the supplied IO action with an empty CCS.  For example, this
      is used by the interpreter to run an interpreted computation
      without the call stack showing that it was invoked from GHC. }
+   with
+   out_of_line = True
+
+------------------------------------------------------------------------
+section "Annotating call stacks"
+------------------------------------------------------------------------
+
+primop AnnotateStackOp "annotateStack#" GenPrimOp
+   b -> (State# s -> (# State# s, a_reppoly #)) -> State# s -> (# State# s, a_reppoly #)
+   { Pushes an annotation frame to the stack which can be reported by backtraces. }
    with
    out_of_line = True
 
@@ -4224,6 +4282,16 @@ primop VecNegOp "negate#" GenPrimOp
    { Negate element-wise. }
    with vector = SIGNED_VECTOR_TYPES
 
+primop VecAbsOp "abs#" GenPrimOp
+   VECTOR -> VECTOR
+   { Element-wise absolute value. }
+   with vector = SIGNED_VECTOR_TYPES
+
+primop VecSqrtOp "sqrt#" GenPrimOp
+   VECTOR -> VECTOR
+   { Element-wise square root. }
+   with vector = FLOAT_VECTOR_TYPES
+
 primop VecIndexByteArrayOp "indexArray#" GenPrimOp
    ByteArray# -> Int# -> VECTOR
    { Read a vector from the specified index of an immutable array.
@@ -4344,6 +4412,24 @@ primop VecMinOp "min#" GenPrimOp
 primop VecMaxOp "max#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
    {Component-wise maximum of two vectors.}
+   with
+      vector = ALL_VECTOR_TYPES
+
+primop VecAndOp "and#" GenPrimOp
+   VECTOR -> VECTOR -> VECTOR
+   {Bit-wise AND of two vectors.}
+   with
+      vector = ALL_VECTOR_TYPES
+
+primop VecOrOp "or#" GenPrimOp
+   VECTOR -> VECTOR -> VECTOR
+   {Bit-wise OR of two vectors.}
+   with
+      vector = ALL_VECTOR_TYPES
+
+primop VecXorOp "xor#" GenPrimOp
+   VECTOR -> VECTOR -> VECTOR
+   {Bit-wise XOR of two vectors.}
    with
       vector = ALL_VECTOR_TYPES
 

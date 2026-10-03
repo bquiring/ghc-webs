@@ -8,6 +8,7 @@ test('ghcirun002', just_ghci, compile_and_run, [''])
 test('ghcirun003', just_ghci, compile_and_run, [''])
 test('T2589',      just_ghci, compile_and_run, [''])
 test('T2881',      just_ghci, compile_and_run, [''])
+test('T27287', [just_ghci, combined_output], makefile_test, [])
 
 test('T3171',
      [when(opsys('mingw32'),skip),
@@ -22,9 +23,9 @@ test('T9914',      just_ghci, ghci_script, ['T9914.script'])
 test('T9915',      just_ghci, ghci_script, ['T9915.script'])
 test('T10145',     just_ghci, ghci_script, ['T10145.script'])
 test('T7253',      just_ghci, ghci_script, ['T7253.script'])
-test('T10857a',    just_ghci, ghci_script, ['T10857a.script'])
+test('T10857a',    [extra_hc_opts("-XGHC2021"), just_ghci], ghci_script, ['T10857a.script'])
 test('T10857b',
-      [extra_hc_opts("-XMonomorphismRestriction -XNoExtendedDefaultRules")],
+      [extra_hc_opts("-XMonomorphismRestriction -XNoExtendedDefaultRules -XGHC2021")],
                    ghci_script, ['T10857b.script'])
 test('T11328',     just_ghci, ghci_script, ['T11328.script'])
 test('T11825',     just_ghci, ghci_script, ['T11825.script'])
@@ -91,10 +92,17 @@ test('T22958a', just_ghci, compile_and_run, [''])
 test('T22958b', just_ghci, compile_and_run, [''])
 test('T22958c', just_ghci, compile_and_run, [''])
 test('GhciMainIs', just_ghci, compile_and_run, ['-main-is otherMain'])
-test('LargeBCO', [extra_files(['LargeBCO_A.hs']), req_interp, extra_hc_opts("-O -fbyte-code-and-object-code -fprefer-byte-code")], compile_and_run, [''])
+test('LargeBCO', [extra_files(['LargeBCO_A.hs']), req_th, extra_hc_opts("-O -fbyte-code-and-object-code -fprefer-byte-code")], compile_and_run, [''])
 
 test('T24115', just_ghci + [extra_run_opts("-e ':add T24115.hs'")], ghci_script, ['T24115.script'])
 
 test('T10920', [only_ways(ghci_ways), extra_files(['LocalPrelude/Prelude.hs'])], ghci_script, ['T10920.script'])
 test('TopEnvIface', [only_ways(ghci_ways)], makefile_test, [])
 test('T25790', [only_ways(ghci_ways), extra_ways(["ghci-opt"])], ghci_script, ['T25790.script'])
+test('T25636f',
+     just_ghci + [
+      extra_hc_opts("-package ghci -package ghc-heap"),
+      when(arch('wasm32'), skip)
+     ],
+     compile_and_run,
+     [''])

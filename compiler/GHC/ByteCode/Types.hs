@@ -1,11 +1,12 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE MagicHash                  #-}
 {-# LANGUAGE UnliftedNewtypes           #-}
 --
 --  (c) The University of Glasgow 2002-2006
 --
+
+#include "Bytecodes.h"
 
 -- | Bytecode assembler types
 module GHC.ByteCode.Types
@@ -14,6 +15,7 @@ module GHC.ByteCode.Types
   , FFIInfo(..)
   , RegBitmap(..)
   , NativeCallType(..), NativeCallInfo(..), voidTupleReturnInfo, voidPrimCallInfo
+  , mAX_SMALL_TUPLE_CTOI
   , ByteOff(..), WordOff(..), HalfWord(..)
   , UnlinkedBCO(..), BCOPtr(..), BCONPtr(..)
   , ItblEnv, ItblPtr(..)
@@ -23,6 +25,9 @@ module GHC.ByteCode.Types
   -- * Mod Breaks
   , ModBreaks (..), BreakpointId(..), BreakTickIndex
 
+  -- * Hpc Info
+  , ByteCodeHpcInfo(..)
+
   -- * Internal Mod Breaks
   , InternalModBreaks(..), CgBreakInfo(..), seqInternalModBreaks
   -- ** Internal breakpoint identifier
@@ -30,15 +35,18 @@ module GHC.ByteCode.Types
   ) where
 
 import GHC.Prelude
+import qualified Data.ByteString.Char8 as BS8
 
 import GHC.Data.FastString
 import GHC.Data.FlatBag
+import qualified GHC.Data.Strict as Strict
 import GHC.Types.Name
 import GHC.Types.Name.Env
+import GHC.Utils.Binary
 import GHC.Utils.Outputable
 import GHC.Builtin.PrimOps
 import GHC.Types.SptEntry
-import GHC.HsToCore.Breakpoints
+import GHC.HsToCore.Breakpoints.Types
 import GHC.ByteCode.Breakpoints
 import GHCi.Message
 import GHCi.RemoteTypes
@@ -48,6 +56,7 @@ import GHCi.ResolvedBCO ( BCOByteArray(..), mkBCOByteArray )
 
 import Foreign
 import Data.ByteString (ByteString)
+import Data.ByteString.Short (ShortByteString)
 import qualified GHC.Exts.Heap as Heap
 import GHC.Cmm.Expr ( GlobalRegSet, emptyRegSet, regSetToList )
 import GHC.Unit.Module
@@ -76,6 +85,28 @@ data CompiledByteCode = CompiledByteCode
     -- ^ Static pointer table entries which should be loaded along with the
     -- BCOs. See Note [Grand plan for static forms] in
     -- "GHC.Iface.Tidy.StaticPtrTable".
+
+  , bc_hpc_info :: !(Strict.Maybe ByteCodeHpcInfo)
+    -- ^ 'ByteCodeHpcInfo' that should be added to the run-time system when this 'CompiledByteCode'
+    -- object is loaded.
+    --
+    -- It is safe to load the same 'ByteCodeHpcInfo' multiple times.
+  }
+
+-- | ByteCode specific HPC information.
+--
+-- All fields are strict to avoid retaining references to bigger structures,
+-- for example the 'CgInteractiveGuts' from which 'ByteCodeHpcInfo' can be
+-- derived from
+data ByteCodeHpcInfo = ByteCodeHpcInfo
+  { bchi_module_name :: !ShortByteString
+  -- ^ Name of the module.
+  , bchi_tickbox_name :: !ShortByteString
+  -- ^ Name of the tick box that has been added via 'CStub'.
+  , bchi_tick_count :: {-# UNPACK #-} !Int
+  -- ^ Number of ticks.
+  , bchi_hash :: {-# UNPACK #-} !Int
+  -- ^ mix-file hash.
   }
 
 -- | A libffi ffi_cif function prototype.
@@ -159,6 +190,12 @@ voidTupleReturnInfo = NativeCallInfo NativeTupleReturn 0 emptyRegSet 0
 
 voidPrimCallInfo :: NativeCallInfo
 voidPrimCallInfo = NativeCallInfo NativePrimCall 0 emptyRegSet 0
+
+-- | Maximum nativeCallStackSpillSize for which we use a small
+-- stg_ctoi_tN frame (no old_spill slot, no TSO access) instead of
+-- the generic stg_ctoi_t frame.
+mAX_SMALL_TUPLE_CTOI :: WordOff
+mAX_SMALL_TUPLE_CTOI = MAX_SMALL_TUPLE_CTOI
 
 type ItblEnv = NameEnv (Name, ItblPtr)
 type AddrEnv = NameEnv (Name, AddrPtr)
@@ -248,16 +285,33 @@ data UnlinkedBCO
    = UnlinkedBCO {
         unlinkedBCOName   :: !Name,
         unlinkedBCOArity  :: {-# UNPACK #-} !Int,
-        unlinkedBCOInstrs :: !(BCOByteArray Word16),      -- insns
-        unlinkedBCOBitmap :: !(BCOByteArray Word),      -- bitmap
-        unlinkedBCOLits   :: !(FlatBag BCONPtr),       -- non-ptrs
-        unlinkedBCOPtrs   :: !(FlatBag BCOPtr)         -- ptrs
+        unlinkedBCOInstrs :: !(BCOByteArray Word16),  -- insns
+        unlinkedBCOBitmap :: !(BCOByteArray Word),    -- bitmap
+        unlinkedBCOLits   :: !(FlatBag BCONPtr),      -- non-ptrs
+        unlinkedBCOPtrs   :: !(FlatBag BCOPtr)        -- ptrs
+   }
+   -- | An unlinked top-level static constructor
+   -- See Note [Static constructors in Bytecode]
+   | UnlinkedStaticCon {
+        unlinkedStaticConName :: !Name,
+        -- ^ The name to which this static constructor is bound, not to be
+        -- confused with the name of the static constructor itself
+        -- ('unlinkedStaticConDataConName')
+        unlinkedStaticConDataConName :: !Name,
+        unlinkedStaticConLits :: !(FlatBag BCONPtr),
+        -- ^ non-ptrs full words, where sub-word literals have already been
+        -- packed into full words as needed
+        unlinkedStaticConPtrs :: !(FlatBag BCOPtr),  -- ptrs
+        unlinkedStaticConIsUnlifted :: !Bool
    }
 
 instance NFData UnlinkedBCO where
   rnf UnlinkedBCO{..} =
     rnf unlinkedBCOLits `seq`
     rnf unlinkedBCOPtrs
+  rnf UnlinkedStaticCon{..} =
+    rnf unlinkedStaticConLits `seq`
+    rnf unlinkedStaticConPtrs
 
 data BCOPtr
   = BCOPtrName   !Name
@@ -269,6 +323,12 @@ data BCOPtr
 instance NFData BCOPtr where
   rnf (BCOPtrBCO bco) = rnf bco
   rnf x = x `seq` ()
+
+instance Outputable BCOPtr where
+  ppr (BCOPtrName nm)        = text "BCOPtrName" <+> ppr nm
+  ppr (BCOPtrPrimOp op)      = text "BCOPtrPrimOp" <+> ppr op
+  ppr (BCOPtrBCO bco)        = text "BCOPtrBCO" <+> ppr bco
+  ppr (BCOPtrBreakArray mod) = text "<break array for" <+> ppr mod <> char '>'
 
 data BCONPtr
   = BCONPtrWord  {-# UNPACK #-} !Word
@@ -287,6 +347,16 @@ data BCONPtr
   -- | A 'CostCentre' remote pointer array's respective 'BreakpointId'
   | BCONPtrCostCentre !InternalBreakpointId
 
+instance Outputable BCONPtr where
+  ppr (BCONPtrWord w)         = integer (fromIntegral w)
+  ppr (BCONPtrLbl lbl)        = text "<label:" <> ftext lbl <> char '>'
+  ppr (BCONPtrItbl nm)        = text "<itbl:" <+> ppr nm <> char '>'
+  ppr (BCONPtrAddr nm)        = text "<addr:" <+> ppr nm <> char '>'
+  ppr (BCONPtrStr bs)         = text "<string literal: " <+> text (BS8.unpack bs) <> char '>'
+  ppr (BCONPtrFS fs)          = text "<fast string literal:" <+> ftext fs <> char '>'
+  ppr (BCONPtrFFIInfo _)      = text "<FFIInfo>"
+  ppr (BCONPtrCostCentre bid) = text "<CostCentre for BreakpointId:" <+> ppr bid <> char '>'
+
 instance NFData BCONPtr where
   rnf x = x `seq` ()
 
@@ -295,4 +365,14 @@ instance Outputable UnlinkedBCO where
       = sep [text "BCO", ppr nm, text "with",
              ppr (sizeFlatBag lits), text "lits",
              ppr (sizeFlatBag ptrs), text "ptrs" ]
+   ppr (UnlinkedStaticCon nm dc_nm lits ptrs unl)
+      = sep [text "StaticCon", ppr nm, text "for",
+             if unl then text "unlifted" else text "lifted",
+             ppr dc_nm, text "with",
+             ppr (sizeFlatBag lits), text "lits", parens (text "(packed) full words"),
+             ppr (sizeFlatBag ptrs), text "ptrs" ]
 
+instance Binary FFIInfo where
+  get bh = FFIInfo <$> get bh <*> get bh
+
+  put_ bh FFIInfo {..} = put_ bh ffiInfoArgs *> put_ bh ffiInfoRet

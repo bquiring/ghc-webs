@@ -13,11 +13,13 @@ module GHC.Internal.Event.KQueue
     , available
     ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import qualified GHC.Internal.Event.Internal as E
 
 #include "EventConfig.h"
 #if !defined(HAVE_KQUEUE)
-import GHC.Internal.Base
+import GHC.Internal.Err (errorWithoutStackTrace)
 
 new :: IO E.Backend
 new = errorWithoutStackTrace "KQueue back end not implemented for this platform"
@@ -28,8 +30,9 @@ available = False
 #else
 
 import GHC.Internal.Data.Bits (Bits(..), FiniteBits(..))
+import GHC.Internal.Err (errorWithoutStackTrace, undefined)
 import GHC.Internal.Int
-import GHC.Internal.Data.Maybe ( catMaybes )
+import GHC.Internal.Data.Maybe (Maybe(..), catMaybes)
 import GHC.Internal.Word (Word16, Word32)
 import GHC.Internal.Foreign.C.Error (throwErrnoIfMinus1, eINTR, eINVAL,
                         eNOTSUP, getErrno, throwErrno)
@@ -38,11 +41,10 @@ import GHC.Internal.Foreign.Marshal.Alloc (alloca)
 import GHC.Internal.Foreign.Marshal.Array (withArrayLen)
 import GHC.Internal.Foreign.Ptr (Ptr, nullPtr)
 import GHC.Internal.Foreign.Storable (Storable(..))
-import GHC.Internal.Base
 import GHC.Internal.Enum (toEnum)
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Real (quotRem, fromIntegral)
-import GHC.Internal.Show (Show(show))
+import GHC.Internal.Show
 import GHC.Internal.Event.Internal (Timeout(..))
 import GHC.Internal.System.Posix.Internals (c_close,c_getpid)
 import GHC.Internal.System.Posix.Types (Fd(..), CPid)

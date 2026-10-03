@@ -7,8 +7,6 @@ module GHC.HsToCore.Usage (
 
 import GHC.Prelude
 
-import GHC.Driver.Env
-
 import GHC.Tc.Types
 
 import GHC.Iface.Load
@@ -27,7 +25,6 @@ import GHC.Types.Unique.Set
 
 import GHC.Unit
 import GHC.Unit.Env
-import GHC.Unit.External
 import GHC.Unit.Module.Imported
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.Deps
@@ -35,18 +32,18 @@ import GHC.Unit.Module.Deps
 import GHC.Data.Maybe
 import GHC.Data.FastString
 
-import Data.IORef
+import Data.Containers.ListUtils (nubOrdOn)
 import Data.List (sortBy)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.List.NonEmpty as NE
 
 import GHC.Linker.Types
 import GHC.Unit.Finder
 import GHC.Types.Unique.DFM
 import GHC.Driver.Plugins
 import qualified GHC.Unit.Home.Graph as HUG
+import qualified Data.List.NonEmpty as NE
 
 {- Note [Module self-dependency]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -73,37 +70,42 @@ data UsageConfig = UsageConfig
   { uc_safe_implicit_imps_req :: !Bool -- ^ Are all implicit imports required to be safe for this Safe Haskell mode?
   }
 
+-- | Build the list of 'Usage's that drive recompilation checking.
+-- The resulting list is deterministically sorted.
 mkUsageInfo :: UsageConfig -> Plugins -> FinderCache -> UnitEnv
             -> Module -> ImportedMods -> [ImportUserSpec] -> NameSet
-            -> [FilePath] -> [(Module, Fingerprint)] -> [Linkable] -> PkgsLoaded
+            -> [FilePath] -> [FilePath] -> [(Module, Fingerprint)] -> [LinkableUsage] -> PkgsLoaded
             -> IfG [Usage]
 mkUsageInfo uc plugins fc unit_env
   this_mod dir_imp_mods imp_decls used_names
-  dependent_files merged needed_links needed_pkgs
+  dependent_files dependent_dirs merged needed_links needed_pkgs
   = do
-    eps <- liftIO $ readIORef (euc_eps (ue_eps unit_env))
-    hashes <- liftIO $ mapM getFileHash dependent_files
+    file_hashes <- liftIO $ mapM getFileHash dependent_files
+    dirs_hashes <- liftIO $ mapM getDirHash dependent_dirs
     let hu = ue_unsafeHomeUnit unit_env
-        hug = ue_home_unit_graph unit_env
     -- Dependencies on object files due to TH and plugins
-    object_usages <- liftIO $ mkObjectUsage (eps_PIT eps) plugins fc hug needed_links needed_pkgs
+    object_usages <- liftIO $ mkObjectUsage plugins fc needed_links needed_pkgs
     let all_home_ids = HUG.allUnits (ue_home_unit_graph unit_env)
     mod_usages <- mk_mod_usage_info uc hu all_home_ids this_mod
                                        dir_imp_mods imp_decls used_names
     let usages = mod_usages ++ [ UsageFile { usg_file_path = mkFastString f
                                            , usg_file_hash = hash
                                            , usg_file_label = Nothing }
-                               | (f, hash) <- zip dependent_files hashes ]
+                               | (f, hash) <- zip dependent_files file_hashes ]
+                            ++ [ UsageDirectory { usg_dir_path = mkFastString d
+                                                , usg_dir_hash = hash
+                                                , usg_dir_label = Nothing }
+                               | (d, hash) <- zip dependent_dirs dirs_hashes]
                             ++ [ UsageMergedRequirement
                                     { usg_mod = mod,
                                       usg_mod_hash = hash
                                     }
                                | (mod, hash) <- merged ]
                             ++ object_usages
-    usages `seqList` return usages
-    -- seq the list of Usages returned: occasionally these
-    -- don't get evaluated for a while and we can end up hanging on to
-    -- the entire collection of Ifaces.
+    usages `seqList` return (sortBy stableUsageCmp usages)
+    -- The use of 'seqList' is important because occasionally the returned list
+    -- is not evaluated for a while, so that with too much laziness here we
+    -- could end up hanging on to the entire collection of 'Iface's.
 
 {- Note [Plugin dependencies]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -162,34 +164,48 @@ the hashes of object files that the TH code is required to load. These are
 calculated by the loader in `getLinkDeps` and are accumulated in each individual
 `TcGblEnv`, in `tcg_th_needed_deps`. We read this just before compute the UsageInfo
 to inject the appropriate dependencies.
+
+Note [Recompilation avoidance with bytecode objects]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For bytecode objects there are also two forms of dependencies.
+
+1. The existence of the .gbc file for the module you are currently compiling.
+2. The usage of bytecode to evaluate TH splices (similar to Note [Object File Dependencies])
+
+In both cases, we record the hash of the 'CompiledByteCode' which was used when evaluating
+the TH splice.
 -}
+
+
 
 -- | Find object files corresponding to the transitive closure of given home
 -- modules and direct object files for pkg dependencies
-mkObjectUsage :: PackageIfaceTable -> Plugins -> FinderCache -> HomeUnitGraph-> [Linkable] -> PkgsLoaded -> IO [Usage]
-mkObjectUsage pit plugins fc hug th_links_needed th_pkgs_needed = do
-      let ls = ordNubOn linkableModule (th_links_needed ++ plugins_links_needed)
+mkObjectUsage :: Plugins -> FinderCache -> [LinkableUsage] -> PkgsLoaded -> IO [Usage]
+mkObjectUsage plugins fc th_links_needed th_pkgs_needed = do
+      let ls = nubOrdOn linkableModule (th_links_needed ++ plugins_links_needed)
           ds = concatMap loaded_pkg_hs_objs $ eltsUDFM (plusUDFM th_pkgs_needed plugin_pkgs_needed) -- TODO possibly record loaded_pkg_non_hs_objs as well
           (plugins_links_needed, plugin_pkgs_needed) = loadedPluginDeps plugins
       concat <$> sequence (map linkableToUsage ls ++ map librarySpecToUsage ds)
   where
-    linkableToUsage (Linkable _ m uls) = mapM (partToUsage m) (NE.toList uls)
+    linkableToUsage (Linkable _ _m parts) = traverse partToUsage (NE.toList parts)
 
     msg m = moduleNameString (moduleName m) ++ "[TH] changed"
 
-    fing mmsg fn = UsageFile (mkFastString fn) <$> lookupFileCache fc fn <*> pure mmsg
+    partToUsage link_usage =
+      case link_usage of
+        FileLinkablePartUsage{flu_file, flu_module} -> do
+          fing (Just $ msg flu_module) flu_file
 
-    partToUsage m part =
-      case linkablePartPath part of
-        Just fn -> fing (Just (msg m)) fn
-        Nothing ->  do
-          -- This should only happen for home package things but oneshot puts
-          -- home package ifaces in the PIT.
-          miface <- lookupIfaceByModule hug pit m
-          case miface of
-            Nothing -> pprPanic "mkObjectUsage" (ppr m)
-            Just iface ->
-              return $ UsageHomeModuleInterface (moduleName m) (toUnitId $ moduleUnit m) (mi_iface_hash iface)
+        ByteCodeLinkablePartUsage{bclu_module, bclu_hash} ->
+          pure $
+            UsageHomeModuleBytecode
+              { usg_mod_name = moduleName bclu_module
+              , usg_unit_id = toUnitId $ moduleUnit bclu_module
+              , usg_bytecode_hash = bclu_hash
+              }
+
+    fing mmsg fn = UsageFile (mkFastString fn) <$> lookupFileCache fc fn <*> pure mmsg
 
     librarySpecToUsage :: LibrarySpec -> IO [Usage]
     librarySpecToUsage (Objects os) = traverse (fing Nothing) os
@@ -210,11 +226,14 @@ mk_mod_usage_info uc home_unit home_unit_ids this_mod direct_imports imp_decls u
   where
     safe_implicit_imps_req = uc_safe_implicit_imps_req uc
 
-    used_mods    = moduleEnvKeys ent_map
-    dir_imp_mods = Map.keys direct_imports
-    all_mods     = used_mods ++ filter (`notElem` used_mods) dir_imp_mods
-    usage_mods   = sortBy stableModuleCmp all_mods
-                        -- canonical order is imported, to avoid interface-file
+    used_mods     = nonDetModuleEnvKeys ent_map
+                      -- nonDetModuleEnvKeys is OK here, because the
+                      -- resulting usage_mods are sorted explicitly.
+    is_used_mod m = m `elemModuleEnv` ent_map
+    dir_imp_mods  = Map.keys direct_imports
+    all_mods      = filter (not . is_used_mod) dir_imp_mods ++ used_mods
+    usage_mods    = sortBy stableModuleCmp all_mods
+                        -- canonical order is important, to avoid interface-file
                         -- wobblage.
 
     -- ent_map groups together all the things imported and used
@@ -363,7 +382,11 @@ moduleImportedAvails mod vis_exp_hash = go [] emptyNameSet
           ImpUserExplicit avails parents_of_implicits
             -> go (avails ++ avails_acc) (parents_acc `unionNameSet` parents_of_implicits)
                   imp_decls
-          _ -> HMIA_Implicit vis_exp_hash
+          -- Any import that is not an explicit import list makes us depend on
+          -- the whole export list of the imported module.
+          ImpUserAll             -> HMIA_Implicit vis_exp_hash
+          ImpUserEverythingBut{} -> HMIA_Implicit vis_exp_hash
+          ImpUserDependOnly      -> HMIA_Implicit vis_exp_hash
       | otherwise
       = go avails_acc parents_acc imp_decls
 

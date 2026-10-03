@@ -4,7 +4,6 @@
 -}
 
 
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards  #-}
 
 -- | Module finder
@@ -15,7 +14,8 @@ module GHC.Unit.Finder (
     FinderCache(..),
     initFinderCache,
     findImportedModule,
-    findImportedModuleWithIsBoot,
+    resolveImport,
+    ModuleLookupScope(..),
     findPluginModule,
     findExactModule,
     findHomeModule,
@@ -31,6 +31,9 @@ module GHC.Unit.Finder (
 
     findObjectLinkableMaybe,
     findObjectLinkable,
+
+    -- important that GHC.HsToCore.Usage uses the same hashing method for usage dirs as is used here.
+    getDirHash,
   ) where
 
 import GHC.Prelude
@@ -42,6 +45,11 @@ import GHC.Data.OsPath
 import GHC.Unit.Env
 import GHC.Unit.Types
 import GHC.Unit.Module
+import GHC.Unit.Module.Graph
+       (
+           HomeModuleNameProvidersMap,
+           mgHomeModuleNameProvidersMap
+       )
 import GHC.Unit.Home
 import GHC.Unit.Home.Graph (UnitEnvGraph)
 import qualified GHC.Unit.Home.Graph as HUG
@@ -55,20 +63,26 @@ import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
 import GHC.Linker.Types
+import GHC.Types.UnresolvedImport
 import GHC.Types.PkgQual
 import GHC.Types.SourceFile
+import GHC.Types.SrcLoc ( unLoc )
 
 import GHC.Fingerprint
 import Data.IORef
-import System.Directory.OsPath
 import Control.Applicative ((<|>))
 import Control.Monad
 import Data.Time
 import qualified Data.Map as M
+import GHC.Types.Unique.Map
 import GHC.Driver.Env
 import GHC.Driver.Config.Finder
-import qualified Data.Set as Set
+import GHC.Types.Unique.Set
+import qualified Data.List as L(sort)
 import Data.List.NonEmpty ( NonEmpty (..) )
+import Data.Set (Set)
+import qualified Data.Set as Set (empty, intersection, difference, null, toList)
+import qualified System.Directory as SD
 import qualified System.OsPath as OsPath
 import qualified Data.List.NonEmpty as NE
 
@@ -107,10 +121,12 @@ initFinderCache :: IO FinderCache
 initFinderCache = do
   mod_cache <- newIORef emptyInstalledModuleEnv
   file_cache <- newIORef M.empty
+  dir_cache <- newIORef M.empty
   let flushFinderCaches :: UnitEnv -> IO ()
       flushFinderCaches ue = do
         atomicModifyIORef' mod_cache $ \fm -> (filterInstalledModuleEnv is_ext fm, ())
         atomicModifyIORef' file_cache $ \_ -> (M.empty, ())
+        atomicModifyIORef' dir_cache  $ \_ -> (M.empty, ())
        where
         is_ext mod _ = not (isUnitEnvInstalledModule ue mod)
 
@@ -137,113 +153,302 @@ initFinderCache = do
              atomicModifyIORef' file_cache $ \c -> (M.insert key hash c, ())
              return hash
            Just fp -> return fp
+      lookupDirCache :: FilePath -> IO Fingerprint
+      lookupDirCache key = do
+         c <- readIORef dir_cache
+         case M.lookup key c of
+           Nothing -> do
+             hash <- getDirHash key
+             atomicModifyIORef' dir_cache $ \c -> (M.insert key hash c, ())
+             return hash
+           Just fp -> return fp
   return FinderCache{..}
 
+-- | This function computes a shallow hash of a directory, so really just what files and directories are directly inside it.
+-- It does not look at the contents of the files, or the contents of the directories it contains.
+getDirHash :: FilePath -> IO Fingerprint
+getDirHash dir = do
+  contents <- SD.listDirectory dir
+  let hashes  = fingerprintString <$> contents
+  let s_hashes = L.sort hashes
+  let hash    = fingerprintFingerprints s_hashes
+  return hash
+
 -- -----------------------------------------------------------------------------
--- The three external entry points
+--External entry points
 
+-- | Resolve an import to its corresponding 'Module'.
+--
+-- Handles user-written module imports, @SOURCE@ imports, plugin module imports,
+-- system imports, etc.
+resolveImport :: HscEnv -> UnresolvedImport PkgQual -> IO FindResult
+resolveImport hsc_env imp =
+  case ui_origin imp of
+    FromPlugin      -> findPluginModule hsc_env mod_name
+    FromDecl {}     -> find_normal
+    FromBackpackSig -> find_normal
+    FromSelfBoot    -> find_normal
+    FromTarget      -> find_normal
+  where
+    scope = unresolvedImportLookupScope (ui_origin imp)
+    mod_name = unLoc (ui_mod_name imp)
+    find_normal = do
+      res <- findImportedModule hsc_env scope mod_name (ui_pkg_qual imp)
+      case (res, ui_boot imp) of
+        (Found loc mod, IsBoot) -> return (Found (addBootSuffixLocn loc) mod)
+        _ -> return res
 
--- | Locate a module that was imported by the user.  We have the
--- module's name, and possibly a package name.  Without a package
--- name, this function will use the search path and the known exposed
--- packages to find the module, if a package is specified then only
--- that package is searched for the module.
-
-findImportedModule :: HscEnv -> ModuleName -> PkgQual -> IO FindResult
-findImportedModule hsc_env mod pkg_qual =
-  let fc        = hsc_FC hsc_env
-      mhome_unit = hsc_home_unit_maybe hsc_env
-      dflags    = hsc_dflags hsc_env
-      fopts     = initFinderOpts dflags
-  in do
-    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) mhome_unit mod pkg_qual
-
-findImportedModuleWithIsBoot :: HscEnv -> ModuleName -> IsBootInterface -> PkgQual -> IO FindResult
-findImportedModuleWithIsBoot hsc_env mod is_boot pkg_qual = do
-  res <- findImportedModule hsc_env mod pkg_qual
-  case (res, is_boot) of
-    (Found loc mod, IsBoot) -> return (Found (addBootSuffixLocn loc) mod)
-    _ -> return res
+-- | Resolve a 'ModuleName' into a 'Module'.
+findImportedModule
+  :: HscEnv
+  -> ModuleLookupScope
+     -- ^ Is this a user import or a system import?
+  -> ModuleName
+     -- ^ The module name to look up
+  -> PkgQual
+     -- ^ Optional PackageImports package name
+  -> IO FindResult
+findImportedModule hsc_env scope mod pkg_qual =
+  let fc           = hsc_FC hsc_env
+      mb_home_unit = hsc_home_unit_maybe hsc_env
+      dflags       = hsc_dflags hsc_env
+      fopts        = initFinderOpts dflags
+      providers    = mgHomeModuleNameProvidersMap (hsc_mod_graph hsc_env)
+  in
+    findImportedModuleNoHsc
+      fc
+      fopts
+      (hsc_unit_env hsc_env)
+      providers
+      mb_home_unit
+      scope
+      mod
+      pkg_qual
 
 findImportedModuleNoHsc
   :: FinderCache
   -> FinderOpts
   -> UnitEnv
+  -> HomeModuleNameProvidersMap
   -> Maybe HomeUnit
+  -> ModuleLookupScope
   -> ModuleName
   -> PkgQual
   -> IO FindResult
-findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
+findImportedModuleNoHsc fc fopts ue home_module_name_providers_map mb_home_unit scope mod_name mb_pkg =
   case mb_pkg of
     NoPkgQual  -> unqual_import
-    ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
+    ThisPkg uid | (homeUnitId <$> mb_home_unit) == Just uid -> home_import
                 | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
-                | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
+                | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mb_home_unit) $$ ppr uid $$ ppr (map fst all_opts))
     OtherPkg _ -> pkg_import
   where
-    all_opts = case mhome_unit of
-                Nothing -> other_fopts
-                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts
 
+    mb_home_unit_id :: Maybe UnitId
+    mb_home_unit_id = homeUnitId <$> mb_home_unit
 
-    home_import = case mhome_unit of
-                   Just home_unit -> findHomeModule fc fopts home_unit mod_name
-                   Nothing -> pure $ NoPackage (panic "findImportedModule: no home-unit")
+    all_opts :: [(UnitId, FinderOpts)]
+    all_opts = case mb_home_unit_id of
+        Nothing           -> other_fopts
+        Just home_unit_id -> (home_unit_id, fopts) : other_fopts
 
+    home_import :: IO FindResult
+    home_import = case mb_home_unit of
+        Just home_unit -> findHomeModule fc fopts home_unit mod_name
+        Nothing        -> pure $
+                          NoPackage (panic "findImportedModule: no home-unit")
 
-    home_pkg_import (uid, opts)
-      -- If the module is reexported, then look for it as if it was from the perspective
-      -- of that package which reexports it.
-      | Just real_mod_name <- mod_name `M.lookup` finder_reexportedModules opts =
-        findImportedModuleNoHsc fc opts ue (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
-      | mod_name `Set.member` finder_hiddenModules opts =
-        return (mkHomeHidden uid)
-      | otherwise =
-        findHomePackageModule fc opts uid mod_name
+    home_pkg_import :: (UnitId, FinderOpts) -> IO FindResult
+    home_pkg_import = findHomeUnitDepModule fc ue home_module_name_providers_map scope mod_name
 
-    -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
-    -- that is not the same!! home_import is first because we need to look within ourselves
-    -- first before looking at the packages in order.
-    any_home_import = foldr1 orIfNotFound (home_import:| map home_pkg_import other_fopts)
+    pkg_import :: IO FindResult
+    pkg_import = findExposedPackageModule fc fopts unit_state scope mod_name mb_pkg
 
-    pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
+    unqual_import :: IO FindResult
+    unqual_import = findHomeOrRegularPackageModule fc fopts ue
+                        home_module_name_providers_map mb_home_unit scope mod_name
 
-    unqual_import = any_home_import
-                    `orIfNotFound`
-                    findExposedPackageModule fc fopts units mod_name NoPkgQual
+    unit_state :: UnitState
+    unit_state = case mb_home_unit_id of
+        Nothing           -> ue_homeUnitState ue
+        Just home_unit_id -> HUG.homeUnitEnv_units $
+                             ue_findHomeUnitEnv home_unit_id ue
 
-    units     = case mhome_unit of
-                  Nothing -> ue_homeUnitState ue
-                  Just home_unit -> HUG.homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
-    hpt_deps :: [UnitId]
-    hpt_deps  = homeUnitDepends units
-    other_fopts  = map (\uid -> (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))) hpt_deps
+    other_fopts :: [(UnitId, FinderOpts)]
+    other_fopts = homeUnitDepsFinderOpts ue home_module_name_providers_map
+                                         unit_state mod_name
 
 -- | Locate a plugin module requested by the user, for a compiler
 -- plugin.  This consults the same set of exposed packages as
 -- 'findImportedModule', unless @-hide-all-plugin-packages@ or
 -- @-plugin-package@ are specified.
-findPluginModuleNoHsc :: FinderCache -> FinderOpts -> UnitState -> Maybe HomeUnit -> ModuleName -> IO FindResult
-findPluginModuleNoHsc fc fopts units (Just home_unit) mod_name =
-  findHomeModule fc fopts home_unit mod_name
-  `orIfNotFound`
-  findExposedPluginPackageModule fc fopts units mod_name
-findPluginModuleNoHsc fc fopts units Nothing mod_name =
-  findExposedPluginPackageModule fc fopts units mod_name
+findPluginModuleNoHsc
+  :: FinderCache
+  -> FinderOpts
+  -> UnitEnv
+  -> HomeModuleNameProvidersMap
+  -> Maybe HomeUnit
+  -> ModuleName
+  -> IO FindResult
+findPluginModuleNoHsc fc fopts ue home_module_name_providers_map mb_home_unit@(Just home_unit) mod_name =
+    findHomeModuleAmongDeps fc fopts ue home_module_name_providers_map
+                            mb_home_unit LookupUser mod_name
+    `orIfNotFound`
+    findExposedPluginPackageModule fc fopts unit_state mod_name
+  where
+    unit_state = HUG.homeUnitEnv_units $
+                 ue_findHomeUnitEnv (homeUnitId home_unit) ue
+findPluginModuleNoHsc fc fopts ue _ Nothing mod_name =
+  findExposedPluginPackageModule fc fopts (ue_homeUnitState ue) mod_name
 
 findPluginModule :: HscEnv -> ModuleName -> IO FindResult
 findPluginModule hsc_env mod_name = do
-  let fc = hsc_FC hsc_env
-  let units = hsc_units hsc_env
-  let mhome_unit = hsc_home_unit_maybe hsc_env
-  findPluginModuleNoHsc fc (initFinderOpts (hsc_dflags hsc_env)) units mhome_unit mod_name
+  let fc           = hsc_FC hsc_env
+      mb_home_unit = hsc_home_unit_maybe hsc_env
+      home_module_name_providers_map =
+        mgHomeModuleNameProvidersMap (hsc_mod_graph hsc_env)
+  findPluginModuleNoHsc fc (initFinderOpts (hsc_dflags hsc_env))
+    (hsc_unit_env hsc_env) home_module_name_providers_map mb_home_unit mod_name
+
+-- -----------------------------------------------------------------------------
+-- Home Module Finder Helpers
+
+-- | Yields the unit IDs from the given set as a list with those that refer to
+-- providers of the given home module name coming first. This is to prioritize
+-- such providers during module finding.
+rankedHomeUnitDeps :: HomeModuleNameProvidersMap
+                   -> ModuleName
+                   -> Set UnitId
+                   -> [UnitId]
+rankedHomeUnitDeps _ _ home_unit_deps | Set.null home_unit_deps
+    = []
+-- The special handling of the situation where the dependency set is empty does
+-- not change the result, but it avoids triggering evaluation of the module
+-- graph. This is particularly important in one-shot mode, where the module
+-- graph is not needed. Computing it nevertheless would result in a, possibly
+-- dramatic, increase of memory usage. Worse, GHC would erroneously look for the
+-- sources of modules, which would, for example, cause test `boot1` to fail with
+-- the following error message:
+--
+--     B.hs:3:1: error: [GHC-87110]
+--         Could not find module ‘A’.
+--         Use -v to see a list of the files searched for.
+--       |
+--     3 | import {-# source #-} A
+--       | ^^^^^^^^^^^^^^^^^^^^^^^
+rankedHomeUnitDeps home_module_name_providers_map mod_name home_unit_deps
+    = Set.toList cached_deps ++ Set.toList uncached_deps
+    where
+
+    cached_providers :: Set UnitId
+    cached_providers = lookupWithDefaultUniqMap home_module_name_providers_map
+                                                Set.empty
+                                                mod_name
+
+    cached_deps :: Set UnitId
+    cached_deps = Set.intersection home_unit_deps cached_providers
+
+    uncached_deps :: Set UnitId
+    uncached_deps = Set.difference home_unit_deps cached_providers
+
+-- | The 'FinderOpts' of the home units that should be searched, sorted by
+-- priority order specified by 'rankedHomeUnitDeps'.
+homeUnitDepsFinderOpts
+  :: UnitEnv
+  -> HomeModuleNameProvidersMap
+  -> UnitState  -- ^ unit state of the requesting home unit
+  -> ModuleName
+  -> [(UnitId, FinderOpts)]
+homeUnitDepsFinderOpts ue home_module_name_providers_map unit_state mod_name =
+    [ (uid, initFinderOpts (ue_unitFlags uid ue))
+    | uid <- rankedHomeUnitDeps home_module_name_providers_map mod_name
+                                (homeUnitDepends unit_state)
+    ]
+
+-- | Search for @mod_name@ in the given home unit.
+findHomeUnitDepModule
+  :: FinderCache
+  -> UnitEnv
+  -> HomeModuleNameProvidersMap
+  -> ModuleLookupScope
+  -> ModuleName
+  -> (UnitId, FinderOpts)
+  -> IO FindResult
+findHomeUnitDepModule fc ue home_module_name_providers_map scope mod_name (uid, opts)
+    -- If the module is reexported, then look for it as if it was from the
+    -- perspective of the package which reexports it.
+    | Just real_mod_name
+          <- lookupUniqMap (finder_reexportedModules opts) mod_name
+        = findHomeOrRegularPackageModule fc opts ue home_module_name_providers_map
+              (Just $ DefiniteHomeUnit uid Nothing)
+              scope real_mod_name
+    | elementOfUniqSet mod_name (finder_hiddenModules opts)
+    , LookupUser <- scope -- A system lookup is allowed to find hidden modules.
+        = return (mkHomeHidden uid)
+    | otherwise
+        = findHomePackageModule fc opts uid mod_name
+
+-- | Search for @mod_name@ among the home units: first the current home unit,
+-- then the home units it depends on, in priority order, following module
+-- reexports along the way (see 'findHomeUnitDepModule'). Yields the first
+-- successful result.
+findHomeModuleAmongDeps
+  :: FinderCache
+  -> FinderOpts
+  -> UnitEnv
+  -> HomeModuleNameProvidersMap
+  -> Maybe HomeUnit
+  -> ModuleLookupScope
+  -> ModuleName
+  -> IO FindResult
+findHomeModuleAmongDeps fc fopts ue home_module_name_providers_map mb_home_unit scope mod_name =
+    foldr1 orIfNotFound (home_import :| map home_pkg_import other_fopts)
+    -- Do not try to be smart and change this to `foldr orIfNotFound home_import
+    -- (map home_pkg_import other_fopts)`, as that would not be the same.
+    -- `home_import` is first because we need to first look within the current
+    -- unit before looking at the other units in order.
+  where
+    home_import = case mb_home_unit of
+        Just home_unit -> findHomeModule fc fopts home_unit mod_name
+        Nothing        -> pure $
+                          NoPackage (panic "findHomeModuleAmongDeps: no home-unit")
+    home_pkg_import = findHomeUnitDepModule fc ue home_module_name_providers_map scope mod_name
+
+    unit_state = case homeUnitId <$> mb_home_unit of
+        Nothing           -> ue_homeUnitState ue
+        Just home_unit_id -> HUG.homeUnitEnv_units $
+                             ue_findHomeUnitEnv home_unit_id ue
+    other_fopts = homeUnitDepsFinderOpts ue home_module_name_providers_map
+                                         unit_state mod_name
+
+-- | Search the home-unit graph and otherwise the regular exposed package
+-- database.
+findHomeOrRegularPackageModule
+  :: FinderCache
+  -> FinderOpts
+  -> UnitEnv
+  -> HomeModuleNameProvidersMap
+  -> Maybe HomeUnit
+  -> ModuleLookupScope
+  -> ModuleName
+  -> IO FindResult
+findHomeOrRegularPackageModule fc fopts ue home_module_name_providers_map mb_home_unit scope mod_name =
+    findHomeModuleAmongDeps fc fopts ue home_module_name_providers_map
+                            mb_home_unit scope mod_name
+    `orIfNotFound`
+    findExposedPackageModule fc fopts unit_state scope mod_name NoPkgQual
+  where
+    unit_state = case homeUnitId <$> mb_home_unit of
+        Nothing           -> ue_homeUnitState ue
+        Just home_unit_id -> HUG.homeUnitEnv_units $
+                             ue_findHomeUnitEnv home_unit_id ue
 
 
 -- | A version of findExactModule which takes the exact parts of the HscEnv it needs
 -- directly.
 findExactModuleNoHsc :: FinderCache -> FinderOpts -> UnitEnvGraph FinderOpts -> UnitState -> Maybe HomeUnit -> InstalledModule -> IsBootInterface -> IO InstalledFindResult
-findExactModuleNoHsc fc fopts other_fopts unit_state mhome_unit mod is_boot = do
-  res <- case mhome_unit of
+findExactModuleNoHsc fc fopts other_fopts unit_state mb_home_unit mod is_boot = do
+  res <- case mb_home_unit of
     Just home_unit
      | isHomeInstalledModule home_unit mod
         -> findInstalledHomeModule fc fopts (homeUnitId home_unit) (moduleName mod)
@@ -308,15 +513,15 @@ homeSearchCache fc home_unit mod_name do_this = do
   let mod = mkModule home_unit mod_name
   modLocationCache fc mod do_this
 
-findExposedPackageModule :: FinderCache -> FinderOpts -> UnitState -> ModuleName -> PkgQual -> IO FindResult
-findExposedPackageModule fc fopts units mod_name mb_pkg =
+findExposedPackageModule :: FinderCache -> FinderOpts -> UnitState -> ModuleLookupScope -> ModuleName -> PkgQual -> IO FindResult
+findExposedPackageModule fc fopts units scope mod_name mb_pkg =
   findLookupResult fc fopts
-    $ lookupModuleWithSuggestions units mod_name mb_pkg
+    $ lookupModuleWithSuggestions units scope mod_name mb_pkg
 
 findExposedPluginPackageModule :: FinderCache -> FinderOpts -> UnitState -> ModuleName -> IO FindResult
 findExposedPluginPackageModule fc fopts units mod_name =
   findLookupResult fc fopts
-    $ lookupPluginModuleWithSuggestions units mod_name NoPkgQual
+    $ lookupPluginModuleWithSuggestions units LookupUser mod_name NoPkgQual
 
 findLookupResult :: FinderCache -> FinderOpts -> LookupResult -> IO FindResult
 findLookupResult fc fopts r = case r of
@@ -337,10 +542,10 @@ findLookupResult fc fopts r = case r of
                                          , fr_suggestions = []})
      LookupMultiple rs ->
        return (FoundMultiple rs)
-     LookupHidden pkg_hiddens mod_hiddens ->
+     LookupHidden fr_pkgs_hidden mod_hiddens ->
        return (NotFound{ fr_paths = [], fr_pkg = Nothing
-                       , fr_pkgs_hidden = map (moduleUnit.fst) pkg_hiddens
-                       , fr_mods_hidden = map (moduleUnit.fst) mod_hiddens
+                       , fr_pkgs_hidden
+                       , fr_mods_hidden = [ (moduleUnit m, hmu) | (m, hmu) <- mod_hiddens ]
                        , fr_unusables = []
                        , fr_suggestions = [] })
      LookupUnusable unusable ->
@@ -410,7 +615,7 @@ mkHomeHidden :: UnitId -> FindResult
 mkHomeHidden uid =
   NotFound { fr_paths = []
            , fr_pkg = Just (RealUnit (Definite uid))
-           , fr_mods_hidden = [RealUnit (Definite uid)]
+           , fr_mods_hidden = [(RealUnit (Definite uid), HiddenModInVisibleUnit)]
            , fr_pkgs_hidden = []
            , fr_unusables = []
            , fr_suggestions = []}
@@ -630,13 +835,15 @@ mkHomeModLocation2 fopts mod src_basename ext =
        hi_fn  = mkHiPath   fopts src_basename mod_basename
        dyn_hi_fn  = mkDynHiPath   fopts src_basename mod_basename
        hie_fn = mkHiePath  fopts src_basename mod_basename
+       bytecode_fn = mkBytecodePath fopts src_basename mod_basename
 
    in (OsPathModLocation{ ml_hs_file_ospath   = Just (src_basename <.> ext),
                           ml_hi_file_ospath   = hi_fn,
                           ml_dyn_hi_file_ospath = dyn_hi_fn,
                           ml_obj_file_ospath  = obj_fn,
                           ml_dyn_obj_file_ospath = dyn_obj_fn,
-                          ml_hie_file_ospath  = hie_fn })
+                          ml_hie_file_ospath  = hie_fn,
+                          ml_bytecode_file_ospath = bytecode_fn })
 
 mkHomeModHiOnlyLocation :: FinderOpts
                         -> ModuleName
@@ -656,6 +863,7 @@ mkHiOnlyModLocation fopts hisuf dynhisuf path basename
        obj_fn = mkObjPath fopts full_basename basename
        dyn_obj_fn = mkDynObjPath fopts full_basename basename
        hie_fn = mkHiePath fopts full_basename basename
+       bytecode_fn = mkBytecodePath fopts full_basename basename
    in OsPathModLocation{  ml_hs_file_ospath   = Nothing,
                           ml_hi_file_ospath   = full_basename <.> hisuf,
                               -- Remove the .hi-boot suffix from
@@ -666,7 +874,8 @@ mkHiOnlyModLocation fopts hisuf dynhisuf path basename
                           -- MP: TODO
                           ml_dyn_hi_file_ospath  = full_basename <.> dynhisuf,
                           ml_obj_file_ospath  = obj_fn,
-                          ml_hie_file_ospath  = hie_fn
+                          ml_hie_file_ospath  = hie_fn,
+                          ml_bytecode_file_ospath = bytecode_fn
                   }
 
 -- | Constructs the filename of a .o file for a given source file.
@@ -745,7 +954,20 @@ mkHiePath fopts basename mod_basename = hie_basename <.> hiesuf
                 hie_basename | Just dir <- hiedir = dir </> mod_basename
                              | otherwise          = basename
 
-
+-- | Constructs the filename of a .gbc file for a given source file.
+-- Does /not/ check whether the .gbc file exists
+mkBytecodePath
+  :: FinderOpts
+  -> OsPath             -- the filename of the source file, minus the extension
+  -> OsPath             -- the module name with dots replaced by slashes
+  -> OsPath
+mkBytecodePath fopts basename mod_basename = bytecode_basename <.> bytecodesuf
+ where
+                bytecodedir = finder_bytecodeDir fopts
+                bytecodesuf = finder_bytecodeSuf fopts
+                bytecode_basename
+                             | Just dir <- bytecodedir = dir </> mod_basename
+                             | otherwise          = basename
 
 -- -----------------------------------------------------------------------------
 -- Filenames of the stub files
@@ -782,7 +1004,7 @@ mkStubPaths fopts mod location = do
 findObjectLinkableMaybe :: Module -> ModLocation -> IO (Maybe Linkable)
 findObjectLinkableMaybe mod locn
    = do let obj_fn = ml_obj_file locn
-        maybe_obj_time <- modificationTimeIfExists obj_fn
+        maybe_obj_time <- modificationTimeIfExists (ml_obj_file_ospath locn)
         case maybe_obj_time of
           Nothing -> return Nothing
           Just obj_time -> liftM Just (findObjectLinkable mod obj_fn obj_time)
@@ -794,4 +1016,3 @@ findObjectLinkable mod obj_fn obj_time =
   pure (Linkable obj_time mod (NE.singleton (DotO obj_fn ModuleObject)))
   -- We used to look for _stub.o files here, but that was a bug (#706)
   -- Now GHC merges the stub.o into the main .o (#3687)
-

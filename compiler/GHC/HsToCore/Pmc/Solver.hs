@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
 
 {-
@@ -77,8 +75,8 @@ import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Core.TyCon
 import GHC.Core.TyCon.RecWalk
-import GHC.Builtin.Names
-import GHC.Builtin.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Types
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Subst (elemSubst)
 import GHC.Core.Type
@@ -363,7 +361,7 @@ pmTopNormaliseType (TySt _ inert) typ = {-# SCC "pmTopNormaliseType" #-} do
     eq_src_ty ty tys = maybe ty id (find is_closed_or_data_family tys)
 
     is_closed_or_data_family :: Type -> Bool
-    is_closed_or_data_family ty = pmIsClosedType ty || isDataFamilyAppType ty
+    is_closed_or_data_family ty = pmIsClosedType ty || isDataFamilyApp ty
 
     -- For efficiency, represent both lists as difference lists.
     -- comb performs the concatenation, for both lists.
@@ -373,7 +371,7 @@ pmTopNormaliseType (TySt _ inert) typ = {-# SCC "pmTopNormaliseType" #-} do
 
     -- A 'NormaliseStepper' that unwraps newtypes, careful not to fall into
     -- a loop. If it would fall into a loop, it produces 'NS_Abort'.
-    newTypeStepper :: NormaliseStepper ([Type] -> [Type],[(Type, DataCon, Type)] -> [(Type, DataCon, Type)])
+    newTypeStepper :: NormaliseStepper ([Type] -> [Type], [(Type, DataCon, Type)] -> [(Type, DataCon, Type)])
     newTypeStepper rec_nts tc tys
       | Just (ty', _co) <- instNewTyCon_maybe tc tys
       , let orig_ty = TyConApp tc tys
@@ -642,11 +640,11 @@ tyOracle ty_st@(TySt n inert) cts
          -- return the new inert set and increment the sequence number n
        ; return (TySt (n+1) <$> mb_new_inert) }
 
--- | Allocates a fresh 'EvVar' name for 'PredTy's.
+-- | Allocates a fresh 'EvVar' name for 'PredTy's
 nameTyCt :: PredType -> DsM EvVar
 nameTyCt pred_ty = do
   unique <- getUniqueM
-  let occname = mkVarOccFS (fsLit ("pm_"++show unique))
+  let occname = mkVarOccFS $ fsLit "pm"
   return (mkUserLocalOrCoVar occname unique ManyTy pred_ty noSrcSpan)
 
 -----------------------------
@@ -845,6 +843,7 @@ addVarCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts = env } } x y =
 --   * Finally, if we have @let x = e@ and we already have seen @let y = e@, we
 --     want to record @x ~ y@.
 addCoreCt :: Nabla -> Id -> CoreExpr -> MaybeT DsM Nabla
+-- See Note [Desugaring HsExpr during pattern-match checking]
 addCoreCt nabla x e = do
   simpl_opts <- initSimpleOpts <$> getDynFlags
   let e' = simpleOptExpr simpl_opts e
@@ -872,8 +871,9 @@ addCoreCt nabla x e = do
           s' -> core_expr x (mkListExpr charTy (map mkCharExpr s'))
       | Just lit <- coreExprAsPmLit e
       = pm_lit x lit
-      | Just (in_scope, _empty_floats@[], dc, _arg_tys, args)
+      | Just (in_scope, empty_floats, dc, _arg_tys, args)
             <- exprIsConApp_maybe in_scope_env e
+      , isEmptyFloatBinds empty_floats
       = data_con_app x in_scope dc args
       -- See Note [Detecting pattern synonym applications in expressions]
       | Var y <- e, Nothing <- isDataConId_maybe x
@@ -1000,8 +1000,9 @@ makeDictsCoherent (Case scrut bndr ty alts)
       , let expr' = makeDictsCoherent expr ]
 makeDictsCoherent (Cast expr co)
   = Cast (makeDictsCoherent expr) co
-makeDictsCoherent (Tick tick expr)
-  = Tick tick (makeDictsCoherent expr)
+makeDictsCoherent (Tick _tick expr)
+  -- See Wrinkle (UD1) in Note [Unique dictionaries in the TmOracle CoreMap]
+  = makeDictsCoherent expr
 makeDictsCoherent ty@(Type {})
   = ty
 makeDictsCoherent co@(Coercion {})
@@ -1061,6 +1062,25 @@ In the end, replacing dictionaries with an error value in the pattern-match
 checker was the most self-contained, although we might want to revisit once
 we implement a more robust approach to computing equality in the pattern-match
 checker (see #19272).
+
+Wrinkle (UD1): ticks
+--------------------
+'makeDictsCoherent' also drops all ticks. The CoreMap key represents
+value-level equality, which ticks never affect.
+
+Example (#27314): with -finfo-table-map every record-selector use site is
+wrapped in a 'SourceNote' carrying that site's span (see
+Note [Record-selector ticks] in GHC.HsToCore.Ticks). Given
+
+    data Box = Box { unBox :: Maybe Int }
+    f b = case unBox b of
+      Nothing -> 0
+      Just _  -> let Just x = unBox b in x
+
+the two `unBox b`s carry different SourceNote spans. Without tick stripping
+the CoreMap treats them as distinct expressions. Long-distance information
+from the outer `Just _` branch therefore never reaches the let-pattern, and
+`Just x = unBox b` is wrongly reported as non-exhaustive.
 -}
 
 {- Note [The Pos/Neg invariant]

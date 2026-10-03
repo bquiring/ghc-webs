@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE StandaloneDeriving #-}
+
 {-# OPTIONS_GHC -Wno-inline-rule-shadowing #-}
     -- The RULES for the methods of class Arrow may never fire
     -- e.g. compose/arr;  see #10528
@@ -45,16 +46,14 @@ module GHC.Internal.Control.Arrow (
     ArrowChoice(..),
     -- * Arrow application
     ArrowApply(..), ArrowMonad(..), leftApp,
-    -- * Feedback
-    ArrowLoop(..)
     ) where
 
-import GHC.Internal.Data.Tuple ( fst, snd, uncurry )
+import GHC.Internal.Base hiding( id, (.) )
+import GHC.Internal.Data.Tuple ( uncurry )
 import GHC.Internal.Data.Either
-import GHC.Internal.Control.Monad.Fix
 import GHC.Internal.Control.Category
-import GHC.Internal.Base hiding ( (.), id )
 import GHC.Internal.Generics (Generic, Generic1)
+import qualified GHC.Internal.Generics as Rebindable
 
 infixr 5 <+>
 infixr 3 ***
@@ -419,55 +418,3 @@ leftApp :: ArrowApply a => a b c -> a (Either b d) (Either c d)
 leftApp f = arr ((\b -> (arr (\() -> b) >>> f >>> arr Left, ())) |||
              (\d -> (arr (\() -> d) >>> arr Right, ()))) >>> app
 
--- | The 'loop' operator expresses computations in which an output value
--- is fed back as input, although the computation occurs only once.
--- It underlies the @rec@ value recursion construct in arrow notation.
--- 'loop' should satisfy the following laws:
---
--- [/extension/]
---      @'loop' ('arr' f) = 'arr' (\\ b -> 'fst' ('fix' (\\ (c,d) -> f (b,d))))@
---
--- [/left tightening/]
---      @'loop' ('first' h >>> f) = h >>> 'loop' f@
---
--- [/right tightening/]
---      @'loop' (f >>> 'first' h) = 'loop' f >>> h@
---
--- [/sliding/]
---      @'loop' (f >>> 'arr' ('id' *** k)) = 'loop' ('arr' ('id' *** k) >>> f)@
---
--- [/vanishing/]
---      @'loop' ('loop' f) = 'loop' ('arr' unassoc >>> f >>> 'arr' assoc)@
---
--- [/superposing/]
---      @'second' ('loop' f) = 'loop' ('arr' assoc >>> 'second' f >>> 'arr' unassoc)@
---
--- where
---
--- > assoc ((a,b),c) = (a,(b,c))
--- > unassoc (a,(b,c)) = ((a,b),c)
---
-class Arrow a => ArrowLoop a where
-    -- |
-    --
-    -- >     ╭──────────────╮
-    -- >   b │     ╭───╮    │ c
-    -- > >───┼─────┤   ├────┼───>
-    -- >     │   ┌─┤   ├─┐  │
-    -- >     │ d │ ╰───╯ │  │
-    -- >     │   └───<───┘  │
-    -- >     ╰──────────────╯
-    loop :: a (b,d) (c,d) -> a b c
-
--- | @since base-2.01
-instance ArrowLoop (->) where
-    loop f b = let (c,d) = f (b,d) in c
-
--- | Beware that for many monads (those for which the '>>=' operation
--- is strict) this instance will /not/ satisfy the right-tightening law
--- required by the 'ArrowLoop' class.
---
--- @since base-2.01
-instance MonadFix m => ArrowLoop (Kleisli m) where
-    loop (Kleisli f) = Kleisli (liftM fst . mfix . f')
-      where f' x y = f (x, snd y)

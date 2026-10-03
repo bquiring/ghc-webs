@@ -423,6 +423,25 @@ Redirecting the compilation output(s)
     Finally, the option ``-hcsuf`` ⟨suffix⟩ will change the ``.hc`` file
     suffix for compiler-generated intermediate C files.
 
+.. ghc-flag:: -gbcsuf ⟨suffix⟩
+    :shortdesc: set the suffix to use for bytecode files
+    :type: dynamic
+    :category:
+
+    The option ``-gbcsuf`` ⟨suffix⟩ will change the ``.gbc`` file
+    suffix for bytecode files to whatever you specify. This is useful
+    when you want to avoid conflicts between different bytecode versions
+    or when building with different flags.
+
+.. ghc-flag:: -gbcdir ⟨dir⟩
+    :shortdesc: set the directory for bytecode files
+    :type: dynamic
+    :category:
+
+    The option ``-gbcdir`` ⟨dir⟩ will change the directory where
+    bytecode files (``.gbc``) are placed. By default, bytecode files
+    are placed in the same directory as the source files.
+
 .. _keeping-intermediates:
 
 Keeping Intermediate Files
@@ -594,8 +613,9 @@ Other options related to interface files
     :type: mode
     :category: interface-files
 
-    where ⟨file⟩ is the name of an interface file, dumps the contents of
-    that interface in a human-readable format. See :ref:`modes`.
+    where ⟨file⟩ is the name of an interface file, dumps relevant parts
+    of this file’s contents in a human-readable format. See
+    :ref:`modes`.
 
 .. _hie-options:
 
@@ -710,7 +730,7 @@ beautiful sight!
 You can read about :ghc-wiki:`how all this works <commentary/compiler/recompilation-avoidance>` in the GHC commentary.
 
 Recompilation for Template Haskell and Plugins
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Recompilation checking gets a bit more complicated when using Template Haskell or
 plugins. Both these features execute code at compile time and so if any of the
@@ -726,6 +746,19 @@ dependencies are created on the object file dependencies of the expression. For 
 if ``foo`` is from module ``A`` and ``bar`` is from module ``B``, the module will
 now depend on ``A.o`` and ``B.o``, if either of these change then the module will
 be recompiled.
+
+``addDependentFile`` and ``addDependentDirectory``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When using Template Haskell or plugins, you can use the functions
+``addDependentFile`` and ``addDependentDirectory`` to add additional
+dependencies to the module being compiled.
+
+- When adding a file, this means that the contents of the file changing between
+  compilations will trigger a recompilation of the module.
+- When adding a directory, this means that any file or subdirectory *added* to or
+  *removed* from the directory will trigger recompilation of the module, so
+  it is not a recursive dependency.
 
 .. _mutual-recursion:
 
@@ -1182,7 +1215,7 @@ to ``hs-boot`` files, but with some slight changes:
   abstract data declaration can be anything (in which case it probably
   will be implemented using a type synonym.)  This can be used
   to allow compile-time representation polymorphism (as opposed to
-  `run-time representation polymorphism <#runtime-rep>`__),
+  :ref:`run-time representation polymorphism <runtime-rep>`),
   as in this example::
 
         signature Number where
@@ -1609,3 +1642,54 @@ using the :ghc-flag:`--show-iface ⟨file⟩` :ref:`mode <modes>`. If there is a
 
 .. [1]
    This is a change in behaviour relative to 6.2 and earlier.
+
+
+.. _known-key-names
+
+Known-key names
+----------------------------------------
+
+(This section is relevant only if you are a GHC developer, or you are
+modifying the ``base`` package.)
+
+GHC relies on a few hundred entities (types, classes, and functions)
+defined in the libraries ``ghc-internal`` or ``base``.  These include the classes
+``Num``, ``Show``, etc, the types ``Rational``, ``Ratio`` etc, and much
+more.  These entities are so-called "known entities" with "known names".
+
+You can read ``Note [Overview of known entities]`` in GHC's source code
+to understand more.  The behaviour of known-key names is controlled by three
+flags:
+
+.. ghc-flag:: -frebindable-known-names
+    :shortdesc: Find known-key and known-occ names in the current top-level scope
+    :type: dynamic
+    :category:
+
+    This flag is off by default. It tells GHC to look for a known entity in
+    the current top-level scope. When the flag is off, GHC looks for known
+    entities in the exports of module ``GHC.Essentials``.
+
+    It is typically set when compiling modules in ``ghc-internal`` or ``base``,
+    since ``GHC.Essentials`` does not yet exist when compiling those packages.
+
+    GHC must assume ``GHC.Essentials`` is an implicit module dependency when
+    and only when ``-fno-rebindable-known-names``.
+
+.. ghc-flag:: -fdefines-known-key-names
+    :shortdesc: This module defines a known name
+    :type: dynamic
+    :category:
+
+    This flag is off by default.  It should be set when compiling a module
+    that *defines* a known entity.  That is how GHC knows that the entity
+    called "Rational" in this module is *the* known ``Rational`` and not
+    some other random type or class that happens to be called "Rational".
+
+.. ghc-flag:: -fexclude-known-key-define=(name)
+    :shortdesc: Do not treat a definition of (name) as a definition of a known entity
+    :type: dynamic
+    :category:
+
+    You can use this flag multiple times to excludes several names.
+

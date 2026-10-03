@@ -1,6 +1,3 @@
-
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultiWayIf #-}
 
 -- | PrimOp's Ids
@@ -21,14 +18,14 @@ import GHC.Core.FVs (mkRuleInfo)
 
 import GHC.Builtin.PrimOps
 import GHC.Builtin.Uniques
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.Modules( gHC_PRIM )
+import GHC.Builtin.WiredIn.Prim
 
-import GHC.Types.Basic
 import GHC.Types.Cpr
 import GHC.Types.Demand
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma
 import GHC.Types.TyThing
 import GHC.Types.Name
 import GHC.Types.Name.Env
@@ -99,7 +96,7 @@ computePrimOpConcTyVarsFromType nm tyvars arg_tys _res_ty = mkNameEnv concs
       | tv `elem` [ runtimeRep1TyVar, runtimeRep2TyVar, runtimeRep3TyVar
                   , levity1TyVar, levity2TyVar ]
       = listToMaybe $
-          mapMaybe (\ (i,arg) -> Argument i <$> positiveKindPos_maybe tv arg)
+          mapMaybe (\ (i,arg) -> mkArgPos i <$> positiveKindPos_maybe tv arg)
             (zip [1..] arg_tys)
       | otherwise
       = Nothing
@@ -124,7 +121,7 @@ negativeKindPos_maybe tv ty
       )
   where
     recur (pos, scaled_ty)
-      = Argument pos <$> positiveKindPos_maybe tv (scaledThing scaled_ty)
+      = mkArgPos pos <$> positiveKindPos_maybe tv (scaledThing scaled_ty)
     -- (assumes we don't have any function types nested inside other types)
 
 -- | Does this type variable appear in a kind in a positive position in the
@@ -145,7 +142,7 @@ positiveKindPos_maybe tv ty
       )
   where
     recur (pos, scaled_ty)
-      = Argument pos <$> negativeKindPos_maybe tv (scaledThing scaled_ty)
+      = mkArgPos pos <$> negativeKindPos_maybe tv (scaledThing scaled_ty)
     -- (assumes we don't have any function types nested inside other types)
     finish ty
       | tv `elemVarSet` tyCoVarsOfType (typeKind ty)

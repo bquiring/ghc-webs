@@ -1,5 +1,5 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE NoImplicitPrelude, PatternSynonyms, ExplicitNamespaces #-}
+{-# LANGUAGE NoImplicitPrelude, PatternSynonyms, ExplicitNamespaces, MagicHash #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Tuple
@@ -27,12 +27,11 @@ module GHC.Internal.Tuple (
   Tuple40(..), Tuple41(..), Tuple42(..), Tuple43(..), Tuple44(..), Tuple45(..), Tuple46(..), Tuple47(..), Tuple48(..), Tuple49(..),
   Tuple50(..), Tuple51(..), Tuple52(..), Tuple53(..), Tuple54(..), Tuple55(..), Tuple56(..), Tuple57(..), Tuple58(..), Tuple59(..),
   Tuple60(..), Tuple61(..), Tuple62(..), Tuple63(..), Tuple64(..),
+  maxTupleSize,
 ) where
 
 -- See W1 of Note [Tracking dependencies on primitives] in GHC.Internal.Base
-import GHC.Internal.Types ()
-
-default () -- Double and Integer aren't available yet
+import GHC.Internal.Types
 
 -- | The unit datatype @Unit@ has one non-undefined member, the nullary
 -- constructor @()@.
@@ -43,7 +42,7 @@ data Unit = ()
 
 -- The desugarer uses 1-tuples,
 -- but "Unit" is already used up for 0-tuples
--- See Note [One-tuples] in GHC.Builtin.Types
+-- See Note [One-tuples] in GHC.Builtin.WiredIn.Types
 
 -- | @Solo@ is the canonical lifted 1-tuple, just like 'Tuple2' is the canonical
 -- lifted 2-tuple (pair) and 'Tuple3' is the canonical lifted 3-tuple (triple).
@@ -598,3 +597,9 @@ data Tuple64 a b c d e f g h i j k l m n o p q r s t u v w x y z a1 b1 c1 d1 e1 
       r1 s1 t1 u1 v1 w1 x1 y1 z1 a2 b2 c2 d2 e2 f2 g2 h2 i2 j2 k2 l2
   = (a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,a1,b1,c1,d1,e1,f1,g1,h1,i1,j1,k1,l1,m1,n1,o1,p1,q1,
      r1,s1,t1,u1,v1,w1,x1,y1,z1,a2,b2,c2,d2,e2,f2,g2,h2,i2,j2,k2,l2)
+
+maxTupleSize :: Int
+maxTupleSize = I# 64#
+  -- Tricky: avoid using plain "64" because that's an overloaded literal,
+  -- and so desugars into (fromInteger (64::Integer)); but `fromInteger`
+  -- has not not yet been defined.

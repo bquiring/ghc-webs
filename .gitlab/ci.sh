@@ -8,7 +8,7 @@ set -Eeuo pipefail
 
 # Configuration:
 # N.B. You may want to also update the index-state in hadrian/cabal.project.
-HACKAGE_INDEX_STATE="2025-01-27T17:45:32Z"
+HACKAGE_INDEX_STATE="2026-03-10T17:36:36Z"
 MIN_HAPPY_VERSION="1.20"
 MIN_ALEX_VERSION="3.2.6"
 
@@ -55,16 +55,19 @@ Common Modes:
   shell             Run an interactive shell with a configured build environment.
   save_test_output  Generate unexpected-test-output.tar.gz
   save_cache        Preserve the cabal cache
+  build_hadrian     Build GHC via the Hadrian build system
+  test_hadrian      Test GHC via the Hadrian build system
+  lint_changelog    Check that an MR adds a valid changelog entry
 
-Hadrian build system
-  build_hadrian Build GHC via the Hadrian build system
-  test_hadrian  Test GHC via the Hadrian build system
-
-Environment variables affecting both build systems:
+Environment variables affecting the build:
 
   CROSS_TARGET      Triple of cross-compilation target.
+  CROSS_STAGE       The stage of the cross-compiler to build either
+                      * 2: Build a normal cross-compiler bindist
+                      * 3: Build a target executable bindist (with the stage2 cross-compiler)
   VERBOSE           Set to non-empty for verbose build output
   RUNTEST_ARGS      Arguments passed to runtest.py
+  TEST_WAYS         Testsuite ways to run
   MSYSTEM           (Windows-only) Which platform to build from (CLANG64).
   IGNORE_PERF_FAILURES
                     Whether to ignore perf failures (one of "increases",
@@ -79,9 +82,6 @@ Environment variables affecting both build systems:
   NIX_SYSTEM        On Darwin, the target platform of the desired toolchain
                     (either "x86-64-darwin" or "aarch-darwin")
   NO_BOOT           Whether to run ./boot or not, used when testing the source dist
-
-Environment variables determining build configuration of Hadrian system:
-
   BUILD_FLAVOUR     Which flavour to build.
   REINSTALL_GHC     Build and test a reinstalled "stage3" ghc built using cabal-install
                     This tests the "reinstall" configuration
@@ -96,7 +96,9 @@ Environment variables determining bootstrap toolchain (Linux):
 
 Environment variables determining bootstrap toolchain (non-Linux):
 
-  GHC_VERSION   Which GHC version to fetch for bootstrapping.
+  FETCH_GHC_VERSION   Which GHC version to fetch for bootstrapping.
+                      This should not be set if GHC is already provisioned, i.e. in the
+                      docker image for linux platforms and via nix for darwin platforms
   CABAL_INSTALL_VERSION
                 Cabal-install version to fetch for bootstrapping.
 EOF
@@ -167,6 +169,8 @@ PATH="$toolchain/bin:$PATH"
 
 export METRICS_FILE="$TOP/performance-metrics.tsv"
 
+TEST_WAYS=( ${TEST_WAYS:-} )
+
 cores="$(mk/detect-cpu-count.sh)"
 
 # Use a local temporary directory to ensure that concurrent builds don't
@@ -197,9 +201,6 @@ function set_toolchain_paths() {
       CABAL="$toolchain/bin/cabal$exe"
       HAPPY="$toolchain/bin/happy$exe"
       ALEX="$toolchain/bin/alex$exe"
-      if [ "$(uname)" = "FreeBSD" ]; then
-        GHC=/usr/local/bin/ghc
-      fi
       ;;
     nix)
       if [[ ! -f toolchain.sh ]]; then
@@ -260,6 +261,21 @@ function setup() {
   git config user.email "ghc-ci@gitlab-haskell.org"
   git config user.name "GHC GitLab CI"
 
+  # Disable auto gc. Useless in a temporary checkout, and
+  # non-deterministic "Auto packing the repository in background for
+  # optimum performance." message could pop up that confuses the
+  # testsuite driver!
+  git config gc.auto 0
+
+  # Some runners still choke at the perf note fetch step, which has to
+  # do with slow internet connection, see
+  # https://docs.gitlab.com/topics/git/troubleshooting_git/#error-stream-0-was-not-closed-cleanly
+  # for the http.postBuffer mitigation. It might seem
+  # counter-intuitive that "post buffer" helps with fetching, but git
+  # indeed issues post requests when fetching over https, it's a
+  # bidirectional negotiation with the remote.
+  git config http.postBuffer 52428800
+
   info "====================================================="
   info "Toolchain versions"
   info "====================================================="
@@ -275,40 +291,79 @@ function setup() {
 }
 
 function fetch_ghc() {
+  local should_fetch=false
+
   if [ ! -e "$GHC" ]; then
-      local v="$GHC_VERSION"
-      if [[ -z "$v" ]]; then
-          fail "neither GHC nor GHC_VERSION are not set"
+    if [ -z "${FETCH_GHC_VERSION:-}" ]; then
+      fail "GHC not found at '$GHC' and FETCH_GHC_VERSION is not set"
+    fi
+    should_fetch=true
+  fi
+
+  if  [ -e "$GHC" ] && [ -n "${FETCH_GHC_VERSION:-}" ]; then
+    local current_version
+    if current_version=$($GHC --numeric-version 2>/dev/null); then
+      if [ "$current_version" != "$FETCH_GHC_VERSION" ]; then
+        info "GHC version mismatch: found $current_version, expected $FETCH_GHC_VERSION"
+        should_fetch=true
       fi
+    fi
+  fi
+
+  if [ "$should_fetch" = true ]; then
+      local v="$FETCH_GHC_VERSION"
 
       start_section fetch-ghc "Fetch GHC"
-      url="https://downloads.haskell.org/~ghc/${GHC_VERSION}/ghc-${GHC_VERSION}-${boot_triple}.tar.xz"
+      case "$(uname)" in
+        FreeBSD)
+          url="https://downloads.haskell.org/ghcup/unofficial-bindists/ghc/${FETCH_GHC_VERSION}/ghc-${FETCH_GHC_VERSION}-${boot_triple}.tar.xz"
+          ;;
+        *)
+          url="https://downloads.haskell.org/~ghc/${FETCH_GHC_VERSION}/ghc-${FETCH_GHC_VERSION}-${boot_triple}.tar.xz"
+          ;;
+      esac
       info "Fetching GHC binary distribution from $url..."
       curl "$url" > ghc.tar.xz || fail "failed to fetch GHC binary distribution"
       $TAR -xJf ghc.tar.xz || fail "failed to extract GHC binary distribution"
       case "$(uname)" in
         MSYS_*|MINGW*)
-          cp -r ghc-${GHC_VERSION}*/* "$toolchain"
+          cp -r ghc-${FETCH_GHC_VERSION}*/* "$toolchain"
           ;;
         *)
-          pushd ghc-${GHC_VERSION}*
+          pushd ghc-${FETCH_GHC_VERSION}*
           ./configure --prefix="$toolchain"
           "$MAKE" install
           popd
           ;;
       esac
-      rm -Rf "ghc-${GHC_VERSION}" ghc.tar.xz
+      rm -Rf "ghc-${FETCH_GHC_VERSION}" ghc.tar.xz
       end_section fetch-ghc
   fi
 
 }
 
 function fetch_cabal() {
+  local should_fetch=false
+
   if [ ! -e "$CABAL" ]; then
-      local v="$CABAL_INSTALL_VERSION"
-      if [[ -z "$v" ]]; then
-          fail "neither CABAL nor CABAL_INSTALL_VERSION are not set"
+    if [ -z "${CABAL_INSTALL_VERSION:-}" ]; then
+      fail "cabal not found at '$CABAL' and CABAL_INSTALL_VERSION is not set"
+    fi
+    should_fetch=true
+  fi
+
+  if  [ -e "$CABAL" ] && [ -n "${CABAL_INSTALL_VERSION:-}" ]; then
+    local current_version
+    if current_version=$($CABAL --numeric-version 2>/dev/null); then
+      if [ "$current_version" != "$CABAL_INSTALL_VERSION" ]; then
+        info "cabal version mismatch: found $current_version, expected $CABAL_INSTALL_VERSION"
+        should_fetch=true
       fi
+    fi
+  fi
+
+  if [ "$should_fetch" = true ]; then
+      local v="$CABAL_INSTALL_VERSION"
 
       start_section fetch-cabal "Fetch Cabal"
       case "$(uname)" in
@@ -318,7 +373,7 @@ function fetch_cabal() {
             CLANG64) cabal_arch="x86_64" ;;
             *) fail "unknown MSYSTEM $MSYSTEM" ;;
           esac
-          url="https://downloads.haskell.org/~cabal/cabal-install-$v/cabal-install-$v-$cabal_arch-windows.zip"
+          local url="https://downloads.haskell.org/~cabal/cabal-install-$v/cabal-install-$v-$cabal_arch-windows.zip"
           info "Fetching cabal binary distribution from $url..."
           curl "$url" > "$TMP/cabal.zip"
           unzip "$TMP/cabal.zip"
@@ -328,19 +383,21 @@ function fetch_cabal() {
           local base_url="https://downloads.haskell.org/~cabal/cabal-install-$v/"
           case "$(uname)" in
             Darwin) cabal_url="$base_url/cabal-install-$v-x86_64-apple-darwin17.7.0.tar.xz" ;;
-            FreeBSD) cabal_url="$base_url/cabal-install-$v-x86_64-freebsd14.tar.xz" ;;
+            FreeBSD) cabal_url="https://downloads.haskell.org/ghcup/unofficial-bindists/cabal/$v/cabal-install-$v-x86_64-portbld-freebsd.tar.xz" ;;
             *) fail "don't know where to fetch cabal-install for $(uname)"
           esac
           echo "Fetching cabal-install from $cabal_url"
           curl "$cabal_url" > cabal.tar.xz
-          tmp="$(tar -tJf cabal.tar.xz | head -n1)"
-          $TAR -xJf cabal.tar.xz
+          local path="$(tar -tJf cabal.tar.xz | head -n1)"
+          local tmp_dir=$(mktemp -d XXXX-cabal)
+          $TAR -xJf cabal.tar.xz -C "${tmp_dir}"
           # Check if the bindist has directory structure
-          if [[ "$tmp" = "cabal" ]]; then
-              mv cabal "$toolchain/bin"
+          if [[ "$path" = "cabal" ]]; then
+              mv "${tmp_dir}"/cabal "$toolchain/bin"
           else
-              mv "$tmp/cabal" "$toolchain/bin"
+              mv "${tmp_dir}/$path/cabal" "$toolchain/bin"
           fi
+          rmdir "${tmp_dir}"
           ;;
       esac
       end_section fetch-cabal
@@ -386,7 +443,7 @@ function cleanup_submodules() {
     # is not valid. Avoid failing in this case with the following insanity.
     git submodule sync || git submodule deinit --force --all
     git submodule update --init
-    git submodule foreach git clean -xdf
+    git submodule --quiet foreach git clean -xdfq
   else
     info "Not cleaning submodules, not in a git repo"
   fi;
@@ -438,6 +495,11 @@ function fetch_perf_notes() {
 }
 
 function push_perf_notes() {
+  if [[ "${CI_COMMIT_BRANCH:-}" != "master" ]] && [[ ! "${CI_COMMIT_BRANCH:-}" =~ ghc-[0-9]+\.[0-9]+ ]]; then
+    info "Perf notes are only pushed on master/release branches"
+    return
+  fi
+
   if [[ -z "${TEST_ENV:-}" ]]; then
     return
   fi
@@ -511,6 +573,12 @@ function build_hadrian() {
     export XZ_OPT="${XZ_OPT:-} -T$cores"
   fi
 
+  case "${CROSS_STAGE:-2}" in
+    2) BINDIST_TARGET="binary-dist";;
+    3) BINDIST_TARGET="binary-dist-stage3";;
+    *) fail "Unknown CROSS_STAGE, must be 2 or 3";;
+  esac
+
   if [[ -n "${REINSTALL_GHC:-}" ]]; then
     run_hadrian build-cabal -V
   else
@@ -520,7 +588,7 @@ function build_hadrian() {
           mv _build/reloc-bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
           ;;
         *)
-          run_hadrian test:all_deps binary-dist -V
+          run_hadrian test:all_deps $BINDIST_TARGET
           mv _build/bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
           ;;
     esac
@@ -538,7 +606,7 @@ function make_install_destdir() {
 
   mkdir -p "$destdir"
   mkdir -p "$instdir"
-  run "$MAKE" DESTDIR="$destdir" install || fail "make install failed"
+  run "$MAKE" DESTDIR="$destdir" install -j"$cores" || fail "make install failed"
   # check for empty dir portably
   # https://superuser.com/a/667100
   if find "$instdir" -mindepth 1 -maxdepth 1 | read; then
@@ -568,20 +636,6 @@ function install_bindist() {
     *)
       read -r -a args <<< "${INSTALL_CONFIGURE_ARGS:-}"
 
-      if [[ "${CROSS_TARGET:-no_cross_target}" =~ "mingw" ]]; then
-          # We suppose that host target = build target.
-          # By the fact above it is clearly turning out which host value is
-          # for currently built compiler.
-          # The fix for #21970 will probably remove this if-branch.
-          local -r CROSS_HOST_GUESS=$($SHELL ./config.guess)
-          args+=( "--target=$CROSS_TARGET" "--host=$CROSS_HOST_GUESS" )
-
-      # FIXME: The bindist configure script shouldn't need to be reminded of
-      # the target platform. See #21970.
-      elif [ -n "${CROSS_TARGET:-}" ]; then
-          args+=( "--target=$CROSS_TARGET" "--host=$CROSS_TARGET" )
-      fi
-
       run ${CONFIGURE_WRAPPER:-} ./configure \
           --prefix="$instdir" \
           "${args[@]+"${args[@]}"}" || fail "bindist configure failed"
@@ -595,9 +649,12 @@ function install_bindist() {
 }
 
 function test_hadrian() {
-  start_section test-hadrian "Test via Hadrian"
   check_msys2_deps _build/stage1/bin/ghc --version
   check_release_build
+
+  # GitLab's log viewer renders ANSI colors, but stdout here is not a tty,
+  # so the driver must be told to emit them.
+  RUNTEST_ARGS="${RUNTEST_ARGS:-} --force-colors"
 
   # Ensure that statically-linked builds are actually static
   if [[ "${BUILD_FLAVOUR}" = *static* ]]; then
@@ -619,28 +676,8 @@ function test_hadrian() {
   if [[ "${CROSS_EMULATOR:-}" == "NOT_SET" ]]; then
     info "Cannot test cross-compiled build without CROSS_EMULATOR being set."
     return
-    # special case for JS backend
-  elif [ -n "${CROSS_TARGET:-}" ] && [ "${CROSS_EMULATOR:-}" == "js-emulator" ]; then
-    # The JS backend doesn't support CROSS_EMULATOR logic yet
-    unset CROSS_EMULATOR
-    # run "hadrian test" directly, not using the bindist, even though it did get installed.
-    # This is a temporary solution, See !9515 for the status of hadrian support.
-    run_hadrian \
-      test \
-      --summary-junit=./junit.xml \
-      --test-have-intree-files    \
-      --docs=none                 \
-      "runtest.opts+=${RUNTEST_ARGS:-}" \
-      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
-      || fail "cross-compiled hadrian main testsuite"
-  elif [[ -n "${CROSS_TARGET:-}" ]] && [[ "${CROSS_TARGET:-}" == *"wasm"* ]]; then
-    run_hadrian \
-      test \
-      --summary-junit=./junit.xml \
-      "runtest.opts+=${RUNTEST_ARGS:-}" \
-      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
-      || fail "hadrian main testsuite targetting $CROSS_TARGET"
-  elif [ -n "${CROSS_TARGET:-}" ]; then
+  # If we have set CROSS_EMULATOR, then can't test using normal testsuite.
+  elif [ -n "${CROSS_EMULATOR:-}" ] && [[ "${CROSS_TARGET:-}" != *"wasm"* ]]; then
     local instdir="$TOP/_build/install"
     local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
     install_bindist _build/bindist/ghc-*/ "$instdir"
@@ -670,6 +707,7 @@ function test_hadrian() {
       --test-compiler=stage-cabal \
       --test-root-dirs=testsuite/tests/perf \
       --test-root-dirs=testsuite/tests/typecheck \
+      ${TEST_WAYS[@]/#/--test-way=} \
       "runtest.opts+=${RUNTEST_ARGS:-}" \
       "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
       || fail "hadrian cabal-install test"
@@ -678,12 +716,13 @@ function test_hadrian() {
     local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
     install_bindist _build/bindist/ghc-*/ "$instdir"
 
-    if [[ "${WINDOWS_HOST}" == "no" ]] && [ -z "${CROSS_TARGET:-}" ]
+    if [[ "${CI_JOB_NAME}" != *"windows"* ]] && [ -z "${CROSS_TARGET:-}" ]
     then
       run_hadrian \
         test \
         --test-root-dirs=testsuite/tests/stage1 \
         --test-compiler=stage1 \
+        ${TEST_WAYS[@]/#/--test-way=} \
         "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian stage1 test"
       info "STAGE1_TEST=$?"
     fi
@@ -710,6 +749,7 @@ function test_hadrian() {
       --summary-junit=./junit.xml \
       --test-have-intree-files \
       --test-compiler="${test_compiler}" \
+      ${TEST_WAYS[@]/#/--test-way=} \
       "runtest.opts+=${RUNTEST_ARGS:-}" \
       "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
       || fail "hadrian main testsuite"
@@ -717,7 +757,6 @@ function test_hadrian() {
     info "STAGE2_TEST=$?"
 
   fi
-  end_section test-hadrian
 }
 
 function summarise_hi_files() {
@@ -756,7 +795,7 @@ function cabal_abi_test() {
   mkdir -p "$OUT"
   "$HC" \
     -hidir tmp -odir tmp -fforce-recomp -haddock \
-    -iCabal/Cabal/src -XNoPolyKinds Distribution.Simple -j"$cores" \
+    -iCabal/Cabal/src -XHaskell2010 -XNoPolyKinds Distribution.Simple -j"$cores" \
     -fobject-determinism \
     "$@" 2>&1 | sed '1d' | tee $OUT/log
   summarise_hi_files
@@ -775,8 +814,9 @@ function cabal_test() {
   run "$HC" \
     -hidir tmp -odir tmp -fforce-recomp \
     -dumpdir "$OUT/dumps" -ddump-timings \
+    -j"$cores" \
     +RTS --machine-readable "-t$OUT/rts.log" -RTS \
-    -ilibraries/Cabal/Cabal/src -XNoPolyKinds Distribution.Simple \
+    -ilibraries/Cabal/Cabal/src -XHaskell2010 -XNoPolyKinds Distribution.Simple \
     "$@" 2>&1 | tee $OUT/log
   rm -Rf tmp
   end_section cabal-test
@@ -861,12 +901,41 @@ function save_test_output() {
 function save_cache () {
   info "Storing cabal cache from $CABAL_DIR to $CABAL_CACHE..."
   rm -Rf "$CABAL_CACHE"
-  cp -Rf "$CABAL_DIR" "$CABAL_CACHE"
+  if [[ "${CI_JOB_NAME}" == *"darwin"* ]]; then
+    # -a makes APFS behave like a COW file system
+    # From man CP(1)
+    # copy files using clonefile(2).
+    # Note that if clonefile(2) is not supported for the target filesystem,
+    # then cp will fallback to using copyfile(2) instead to ensure the copy still succeeds.
+    cp -Rcf "$CABAL_DIR" "$CABAL_CACHE"
+  else
+    cp -Rf "$CABAL_DIR" "$CABAL_CACHE"
+  fi
 }
 
 function clean() {
-  rm -R tmp
-  run rm -Rf _build
+  # When CI_DISPOSABLE_ENVIRONMENT is not true (e.g. using shell
+  # executor on windows/macos), the project directory is not removed
+  # by gitlab runner automatically after each job. To mitigate the
+  # space leak, other than periodic cleaning on the runner host, we
+  # also must aggressively cleanup build products, otherwise we run
+  # into out of space errors too frequently.
+  #
+  # When CI_DISPOSABLE_ENVIRONMENT is true (using docker executor on
+  # linux), the runner will do proper cleanup, so no need to do
+  # anything here.
+  #
+  # The exclude list are the artifacts that we do expect to be
+  # uploaded. Keep in sync with `jobArtifacts` in
+  # `.gitlab/generate-ci/gen_ci.hs`!
+  if [[ "${CI_DISPOSABLE_ENVIRONMENT:-}" != true ]]; then
+    git submodule --quiet foreach --recursive git clean -xdfq
+    git clean -xdfq \
+      --exclude=ci_timings.txt \
+      --exclude=ghc-*.tar.xz \
+      --exclude=junit.xml \
+      --exclude=unexpected-test-output.tar.gz
+  fi
 }
 
 function run_hadrian() {
@@ -907,6 +976,50 @@ function lint_author(){
   done
 }
 
+function lint_changelog() {
+  # Cancel the job if there is a no-changelog label.
+  if [[ ",${CI_MERGE_REQUEST_LABELS:-}," == *",no-changelog,"* ]]; then
+    exit 0
+  fi
+
+  # Check that the MR adds or modifies at least one changelog entry.
+  git fetch --depth=1 \
+    "$CI_MERGE_REQUEST_PROJECT_URL" \
+    "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+
+  local entries
+  entries=$(git diff --name-only --diff-filter=AM \
+    "$CI_MERGE_REQUEST_DIFF_BASE_SHA..$CI_COMMIT_SHA" -- \
+    'changelog.d/' | grep -v '^changelog.d/config$' || true)
+
+  if [ -z "$entries" ]; then
+    error "No changelog entry found in changelog.d/"
+    echo "Please add a changelog entry file describing your user-facing changes,"
+    echo "or add this MR to the 'mrs' field of an existing entry."
+    echo "If this MR does not need a changelog entry, apply the 'no-changelog' label."
+    exit 1
+  fi
+  echo "Found changelog entries: $entries"
+
+  # Build changelog-d with the bootstrap compiler and validate all entries
+  # (checks required fields, section names, and the MR number).
+  local changelog_build_dir
+  changelog_build_dir="$(mktemp -d)"
+  "$GHC" -Werror \
+    -package base \
+    -package bytestring \
+    -package Cabal-syntax \
+    -package containers \
+    -package directory \
+    -package filepath \
+    -package pretty \
+    -outputdir "$changelog_build_dir" \
+    -o "$changelog_build_dir/changelog-d" \
+    utils/changelog-d/ChangelogD.hs
+  "$changelog_build_dir/changelog-d" \
+    changelog.d/ --validate --expect-mr "$CHANGELOG_EXPECT_MR"
+}
+
 function abi_of(){
   DIR=$(realpath $1)
   mkdir -p "$OUT"
@@ -945,11 +1058,12 @@ case "$(uname)" in
     exe=".exe"
     # N.B. cabal-install expects CABAL_DIR to be a Windows path
     CABAL_DIR="$(cygpath -w "$CABAL_DIR")"
-    WINDOWS_HOST="yes"
+    ;;
+  Darwin*)
+    exe=""
     ;;
   *)
     exe=""
-    WINDOWS_HOST="no"
     ;;
 esac
 
@@ -993,7 +1107,7 @@ if [ "${CI_COMMIT_BRANCH:-}" == "master" ] &&  [ "${CI_PROJECT_PATH:-}" == "ghc/
   fi
 fi
 if [ -n "${IGNORE_PERF_FAILURES:-}" ]; then
-  RUNTEST_ARGS=( "${RUNTEST_ARGS[@]:-}" "--ignore-perf-failures=$IGNORE_PERF_FAILURES" )
+  RUNTEST_ARGS="${RUNTEST_ARGS:-} --ignore-perf-failures=$IGNORE_PERF_FAILURES"
 fi
 
 if [[ -z ${BIGNUM_BACKEND:-} ]]; then BIGNUM_BACKEND=gmp; fi
@@ -1007,9 +1121,10 @@ case ${1:-help} in
   setup) setup && cleanup_submodules ;;
   configure) time_it "configure" configure ;;
   build_hadrian) time_it "build" build_hadrian ;;
-  # N.B. Always push notes, even if the build fails. This is okay to do as the
-  # testsuite driver doesn't record notes for tests that fail due to
-  # correctness.
+  # N.B. Always push notes, even if the build fails. Metrics from runs failing
+  # a perf stat check are deliberately recorded too — discarding them would
+  # bias the baseline towards whichever sample came first. Only correctness
+  # failures record nothing.
   test_hadrian)
     fetch_perf_notes
     res=0
@@ -1020,6 +1135,7 @@ case ${1:-help} in
   perf_test) run_perf_test ;;
   abi_test) abi_test ;;
   cabal_test) cabal_test ;;
+  lint_changelog) lint_changelog ;;
   lint_author) shift; lint_author "$@" ;;
   compare_interfaces_of) shift; compare_interfaces_of "$@" ;;
   clean) clean ;;

@@ -1,6 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 --
 --  (c) The University of Glasgow 2002-2006
@@ -17,7 +15,9 @@ import GHC.ByteCode.Types
 import GHC.Cmm.Type (Width)
 import GHC.StgToCmm.Layout     ( ArgRep(..) )
 import GHC.Utils.Outputable
+import GHC.Data.FastString     ( FastString )
 import GHC.Types.Name
+import GHC.Types.Id
 import GHC.Types.Literal
 import GHC.Types.Unique
 import GHC.Core.DataCon
@@ -37,17 +37,79 @@ import GHC.Stg.Syntax
 -- ----------------------------------------------------------------------------
 -- Bytecode instructions
 
-data ProtoBCO a
+data ProtoBCO
    = ProtoBCO {
-        protoBCOName       :: a,          -- name, in some sense
+        protoBCOName       :: Name,       -- name, in some sense
         protoBCOInstrs     :: [BCInstr],  -- instrs
         -- arity and GC info
         protoBCOBitmap     :: [StgWord],
         protoBCOBitmapSize :: Word,
         protoBCOArity      :: Int,
-        -- what the BCO came from, for debugging only
+        -- | What the BCO came from, for debugging only
         protoBCOExpr       :: Either [CgStgAlt] CgStgRhs
    }
+   -- | A top-level static constructor application object
+   -- See Note [Static constructors in Bytecode]
+   | ProtoStaticCon {
+        protoStaticConName :: Name,
+        -- ^ The name to which this static constructor is bound,
+        -- not to be confused with the DataCon itself.
+        protoStaticCon     :: DataCon,
+        -- ^ The DataCon being constructed.
+        -- We use this to construct the right info table.
+        protoStaticConData :: [Either Literal Id],
+        -- ^ The static constructor pointer and non-pointer arguments, sorted
+        -- in the order they should appear at runtime (see
+        -- 'mkVirtHeapOffsetsWithPadding' in 'schemeTopBind').
+        --
+        -- The non-pointer arguments are meant to be laid contiguously in
+        -- memory using the width of each literal individually. The padding is
+        -- given as Literals of value 0 with the appropriate width.
+        protoStaticConNonPtrsSize :: Int,
+        -- ^ How many words needed to store the non-pointer arguments.
+        -- Note that this may be smaller than the number of non-pointer
+        -- arguments, since subword arguments need to be packed.
+        protoStaticConExpr :: CgStgRhs
+        -- ^ What the static con came from, for debugging only
+   }
+
+{-
+Note [Static constructors in Bytecode]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In bytecode, top-level 'StgRhsCon's are lowered to 'ProtoStaticCon' rather than
+'ProtoBCO'. A 'ProtoStaticCon' represents directly a heap allocated data
+constructor application. We can do this only for top-level 'StgRhsCon's, where
+all the data arguments to the constructor are statically known.
+
+'StgRhsCon's which have free variables are compiled down to BCOs which push the
+arguments and then 'PACK' the constructor, just like 'StgConApp's.
+
+Example:
+
+  Haskell:
+
+    data X = X Char# Char
+    x = X 'a'# 'b'
+
+  Stg:
+
+    x1  = GHC.Types.C#! ['b'#];
+    X.x = X.X! ['a#' x2];
+
+    X.X = \r [arg1 arg2] X.X [arg1 arg2];
+
+  ByteCode:
+    ProtoStaticCon x1:
+      C# [Left 'b'#]
+    ProtoStaticCon X.x:
+      X.X [Left 'a'#, Right x1]
+
+    ProtoBCO X.X:
+     PUSH_LL  0 1
+     PACK     X.X 2
+     SLIDE    1 2
+     RETURN   P
+-}
 
 -- | A local block label (e.g. identifying a case alternative).
 newtype LocalLabel = LocalLabel { getLocalLabel :: Word32 }
@@ -89,13 +151,13 @@ data BCInstr
    -- Push a (heap) ptr  (these all map to PUSH_G really)
    | PUSH_G       Name
    | PUSH_PRIMOP  PrimOp
-   | PUSH_BCO     (ProtoBCO Name)
+   | PUSH_BCO     ProtoBCO
 
    -- Push an alt continuation
-   | PUSH_ALTS          (ProtoBCO Name) ArgRep
-   | PUSH_ALTS_TUPLE    (ProtoBCO Name) -- continuation
+   | PUSH_ALTS          ProtoBCO ArgRep
+   | PUSH_ALTS_TUPLE    ProtoBCO -- continuation
                         !NativeCallInfo
-                        (ProtoBCO Name) -- tuple return BCO
+                        ProtoBCO -- tuple return BCO
 
    -- Pushing 8, 16 and 32 bits of padding (for constructors).
    | PUSH_PAD8
@@ -260,9 +322,9 @@ data BCInstr
    -- Breakpoints
    | BRK_FUN          !InternalBreakpointId
 
-   -- An internal breakpoint for triggering a break on any case alternative
-   -- See Note [Debugger: BRK_ALTS]
-   | BRK_ALTS         !Bool {- enabled? -}
+   -- | HPC tick instruction
+   | HPC_TICK         !FastString -- ^ Name of the tickbox array
+                      !Word32     -- ^ Index into the tickbox array
 
 #if MIN_VERSION_rts(1,0,3)
    -- | A "meta"-instruction for recording the name of a BCO for debugging purposes.
@@ -283,7 +345,13 @@ data BCInstr
 -- -----------------------------------------------------------------------------
 -- Printing bytecode instructions
 
-instance Outputable a => Outputable (ProtoBCO a) where
+instance Outputable ProtoBCO where
+   ppr (ProtoStaticCon nm con args nonPtrsSize origin)
+      = text "ProtoStaticCon" <+> ppr nm <> colon
+        $$ nest 3 (pprStgRhsShort shortStgPprOpts origin)
+        $$ nest 3 (text "constructor: "  <+> ppr con)
+        $$ nest 3 (text "sorted args: "  <+> ppr args)
+        $$ nest 3 (text "non-ptrs (packed) size: " <+> int (fromIntegral nonPtrsSize) <+> text "words")
    ppr (ProtoBCO { protoBCOName       = name
                  , protoBCOInstrs     = instrs
                  , protoBCOBitmap     = bitmap
@@ -458,7 +526,7 @@ instance Outputable BCInstr where
                              = text "BRK_FUN" <+> text "<breakarray>"
                                <+> ppr info_mod <+> ppr infox
                                <+> text "<cc>"
-   ppr (BRK_ALTS active)     = text "BRK_ALTS" <+> ppr active
+   ppr (HPC_TICK lbl ix)     = text "HPC_TICK" <+> ppr lbl <+> ppr ix
 #if MIN_VERSION_rts(1,0,3)
    ppr (BCO_NAME nm)         = text "BCO_NAME" <+> text (show nm)
 #endif
@@ -475,8 +543,9 @@ instance Outputable BCInstr where
 -- This could all be made more accurate by keeping track of a proper
 -- stack high water mark, but it doesn't seem worth the hassle.
 
-protoBCOStackUse :: ProtoBCO a -> Word
-protoBCOStackUse bco = sum (map bciStackUse (protoBCOInstrs bco))
+protoBCOStackUse :: ProtoBCO -> Word
+protoBCOStackUse ProtoBCO{protoBCOInstrs} = sum (map bciStackUse protoBCOInstrs)
+protoBCOStackUse ProtoStaticCon{} = 0
 
 bciStackUse :: BCInstr -> Word
 bciStackUse STKCHECK{}            = 0
@@ -495,11 +564,12 @@ bciStackUse PUSH_BCO{}            = 1
 bciStackUse (PUSH_ALTS bco _)     = 2 {- profiling only, restore CCCS -} +
                                     3 + protoBCOStackUse bco
 bciStackUse (PUSH_ALTS_TUPLE bco info _) =
-   -- (tuple_bco, call_info word, cont_bco, stg_ctoi_t)
-   -- tuple
-   -- (call_info, tuple_bco, stg_ret_t)
+   -- ctoi frame: small (4 words) or generic (5 words, with old_spill)
+   -- + tuple data + ret_t frame (3 words)
    1 {- profiling only -} +
-   7 + fromIntegral (nativeCallSize info) + protoBCOStackUse bco
+   ctoi_frame + 3 + fromIntegral (nativeCallSize info) + protoBCOStackUse bco
+   where ctoi_frame | nativeCallStackSpillSize info <= mAX_SMALL_TUPLE_CTOI = 4
+                    | otherwise                                             = 5
 bciStackUse (PUSH_PAD8)           = 1  -- overapproximation
 bciStackUse (PUSH_PAD16)          = 1  -- overapproximation
 bciStackUse (PUSH_PAD32)          = 1  -- overapproximation on 64bit arch
@@ -584,7 +654,7 @@ bciStackUse OP_INDEX_ADDR{}         = 0
 
 bciStackUse SWIZZLE{}             = 0
 bciStackUse BRK_FUN{}             = 0
-bciStackUse BRK_ALTS{}            = 0
+bciStackUse HPC_TICK{}            = 0
 
 -- These insns actually reduce stack use, but we need the high-tide level,
 -- so can't use this info.  Not that it matters much.

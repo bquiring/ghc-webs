@@ -8,6 +8,7 @@
 --
 -- Derived from @primitive@ package.
 
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -20,6 +21,10 @@ module Data.Array.Byte (
   MutableByteArray(..),
 ) where
 
+import Prelude
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Essentials as Rebindable
+#endif
 import GHC.Internal.Data.Bits ((.&.), unsafeShiftR)
 import GHC.Internal.Data.Data (mkNoRepType, Data(..))
 import GHC.Internal.Data.Typeable (Typeable)
@@ -27,14 +32,16 @@ import qualified GHC.Internal.Data.Foldable as F
 import GHC.Internal.Data.Maybe (fromMaybe)
 import Data.Semigroup
 import GHC.Internal.Exts
-import GHC.Num.Integer (Integer(..))
+import GHC.Internal.Bignum.Integer (Integer(..))
 import GHC.Internal.Show (intToDigit)
 import GHC.Internal.ST (ST(..), runST)
 import GHC.Internal.Word (Word8(..))
 import GHC.Internal.TH.Syntax
+#if __GLASGOW_HASKELL__ >= 1000
+import GHC.Internal.TH.Monad (unsafeCodeCoerce)
+#endif
 import GHC.Internal.TH.Lift
 import GHC.Internal.ForeignPtr
-import Prelude
 
 -- | Lifted wrapper for 'ByteArray#'.
 --

@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.15], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [10.1], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
     # Version on master must be X.Y (not X.Y.Z) for ProjectVersionMunged variable
     # to be useful (cf #19058). However, the version must have three components
     # (X.Y.Z) on stable branches (e.g. ghc-9.2) to ensure that pre-releases are
@@ -43,12 +43,6 @@ dnl interprets build/host/target and how this interacts with $CC tests
 test -n "$target_alias" && ac_tool_prefix=$target_alias-
 
 dnl ----------------------------------------------------------
-dnl ** Store USER specified environment variables to pass them on to
-dnl ** ghc-toolchain (in m4/ghc-toolchain.m4)
-USER_CFLAGS="$CFLAGS"
-USER_LDFLAGS="$LDFLAGS"
-USER_LIBS="$LIBS"
-USER_CXXFLAGS="$CXXFLAGS"
 dnl The lower-level/not user-facing environment variables that may still be set
 dnl by developers such as in ghc-wasm-meta
 USER_CONF_CC_OPTS_STAGE2="$CONF_CC_OPTS_STAGE2"
@@ -63,13 +57,9 @@ dnl ** which are needed by FP_SETUP_PROJECT_VERSION
 
 dnl ** Find find command (for Win32's benefit)
 FP_PROG_FIND
-FP_PROG_SORT
 
 dnl ----------------------------------------------------------
 FP_SETUP_PROJECT_VERSION
-
-# Hmmm, we fix the RPM release number to 1 here... Is this convenient?
-AC_SUBST([release], [1])
 
 dnl * We require autoconf version 2.69 due to
 dnl   https://bugs.ruby-lang.org/issues/8179. Also see #14910.
@@ -132,6 +122,7 @@ AC_ARG_ENABLE(distro-toolchain,
   [FP_CAPITALIZE_YES_NO(["$enableval"], [EnableDistroToolchain])],
   [EnableDistroToolchain=NO]
 )
+AC_SUBST([EnableDistroToolchain])
 
 if test "$EnableDistroToolchain" = "YES"; then
   TarballsAutodownload=NO
@@ -200,6 +191,13 @@ if test "$WithGhc" != ""; then
   BOOTSTRAPPING_GHC_INFO_FIELD([SUPPORT_SMP_STAGE0],[Support SMP])
   BOOTSTRAPPING_GHC_INFO_FIELD([RTS_WAYS_STAGE0],[RTS ways])
 
+
+  BOOTSTRAPPING_GHC_INFO_FIELD([LdHasNoCompactUnwind_STAGE0],[ld supports compact unwind])
+  BOOTSTRAPPING_GHC_INFO_FIELD([LdIsGNULd_STAGE0],[ld is GNU ld])
+  BOOTSTRAPPING_GHC_INFO_FIELD([LdHasFilelist_STAGE0],[ld supports filelist])
+
+  BOOTSTRAPPING_GHC_INFO_FIELD([CONF_GCC_SUPPORTS_NO_PIE_STAGE0],[C compiler supports -no-pie])
+
   dnl Check whether or not the bootstrapping GHC has a threaded RTS. This
   dnl determines whether or not we can have a threaded stage 1.
   dnl See Note [Linking ghc-bin against threaded stage0 RTS] in
@@ -219,7 +217,7 @@ if test "$WithGhc" = ""
 then
     AC_MSG_ERROR([GHC is required.])
 fi
-MinBootGhcVersion="9.6"
+MinBootGhcVersion="9.10"
 FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[$MinBootGhcVersion],
     [AC_MSG_ERROR([GHC version $MinBootGhcVersion or later is required to compile GHC.])])
 
@@ -240,22 +238,13 @@ if test "${WithGhc}" != ""
 then
     ghc_host_os=`"${WithGhc}" +RTS --info | grep 'Host OS' | sed -e 's/.*, "//' -e 's/")//'`
 
+    dnl NB: can't use FP_CANONICALISE_WIN_PATH here, as $windows is not yet set.
     if test "$ghc_host_os" = "mingw32"
     then
-        if test "${OSTYPE}" = "msys"
-        then
-            WithGhc=`echo "${WithGhc}" | sed "s#^/\([a-zA-Z]\)/#\1:/#"`
-        else
-            # Canonicalise to <drive>:/path/to/ghc
-            WithGhc=`cygpath -m "${WithGhc}"`
-        fi
-        echo "GHC path canonicalised to: ${WithGhc}"
+        WithGhc=`cygpath -m "${WithGhc}"`
     fi
 fi
 AC_SUBST([WithGhc])
-
-dnl ** Without optimization some INLINE trickery fails for GHCi
-SRC_CC_OPTS="-O"
 
 dnl--------------------------------------------------------------------
 dnl * Choose host(/target/build) platform
@@ -267,6 +256,7 @@ if test "${WithGhc}" != ""
 then
         bootstrap_host=`"${WithGhc}" --info | grep '^ ,("Host platform"' | sed -e 's/.*,"//' -e 's/")//' | tr -d '\r'`
         bootstrap_target=`"${WithGhc}" --info | grep '^ ,("Target platform"' | sed -e 's/.*,"//' -e 's/")//' | tr -d '\r'`
+	      bootstrap_build="$bootstrap_host"
         if test "$bootstrap_host" != "$bootstrap_target"
         then
                 echo "Bootstrapping GHC is a cross compiler. This probably isn't going to work"
@@ -325,17 +315,19 @@ else
     AC_CHECK_TOOL([RANLIB],[ranlib])
     AC_CHECK_TOOL([OBJDUMP],[objdump])
     AC_CHECK_TOOL([WindresCmd],[windres])
+    AC_CHECK_TOOL([DlltoolCmd],[llvm-dlltool])
     AC_CHECK_TOOL([Genlib],[genlib])
 
     if test "$HostOS" = "mingw32"; then
         AC_CHECK_TARGET_TOOL([WindresCmd],[windres])
+        AC_CHECK_TARGET_TOOL([DlltoolCmd],[llvm-dlltool])
         AC_CHECK_TARGET_TOOL([OBJDUMP],[objdump])
 
-        WindresCmd="$(cygpath -m $WindresCmd)"
+        FP_CANONICALISE_WIN_PATH([WindresCmd])
+        FP_CANONICALISE_WIN_PATH([DlltoolCmd])
 
-        if test "$Genlib" != ""; then
-            GenlibCmd="$(cygpath -m $Genlib)"
-        fi
+        GenlibCmd="$Genlib"
+        FP_CANONICALISE_WIN_PATH([GenlibCmd])
     fi
 fi
 
@@ -406,8 +398,33 @@ then
 else
   TargetPlatformFull="${target_alias}"
 fi
+
+if test -z "${build_alias}"
+then
+  # --target wasn't given; use result from AC_CANONICAL_TARGET
+  BuildPlatformFull="${build}"
+else
+  BuildPlatformFull="${build_alias}"
+fi
+if test -z "${host_alias}"
+then
+  # --target wasn't given; use result from AC_CANONICAL_TARGET
+  HostPlatformFull="${host}"
+else
+  HostPlatformFull="${host_alias}"
+fi
+if test "$CrossCompiling" = "YES"
+then
+  # Use value passed by user from --target=
+  CrossCompilePrefix="${TargetPlatformFull}-"
+else
+  CrossCompilePrefix=""
+fi
+
 AC_SUBST(CrossCompiling)
 AC_SUBST(TargetPlatformFull)
+AC_SUBST(BuildPlatformFull)
+AC_SUBST(HostPlatformFull)
 
 dnl ** Which gcc to use?
 dnl --------------------------------------------------------------
@@ -423,7 +440,7 @@ AC_ARG_WITH([clang],
 dnl detect compiler (prefer gcc over clang) and set $CC (unless CC already set),
 dnl later CC is copied to CC_STAGE{1,2,3}
 AC_PROG_CC([cc gcc clang])
-AC_PROG_CXX([g++ clang++ c++])
+AC_PROG_CXX([c++ g++ clang++])
 # Work around #24324
 MOVE_TO_FLAGS([CC],[CFLAGS])
 MOVE_TO_FLAGS([CXX],[CXXFLAGS])
@@ -453,11 +470,6 @@ AC_SUBST([CmmCPPCmd])
 AC_SUBST([CmmCPPArgs])
 AC_SUBST([CmmCPPSupportsG0])
 
-FP_SET_CFLAGS_C99([CC],[CFLAGS],[CPPFLAGS])
-FP_SET_CFLAGS_C99([CC_STAGE0],[CONF_CC_OPTS_STAGE0],[CONF_CPP_OPTS_STAGE0])
-FP_SET_CFLAGS_C99([CC],[CONF_CC_OPTS_STAGE1],[CONF_CPP_OPTS_STAGE1])
-FP_SET_CFLAGS_C99([CC],[CONF_CC_OPTS_STAGE2],[CONF_CPP_OPTS_STAGE2])
-
 dnl ** Do we have a compatible emsdk version?
 dnl --------------------------------------------------------------
 EMSDK_VERSION("3.1.20", "", "")
@@ -486,17 +498,13 @@ dnl --------------------------------------------------------------
 dnl Note: we may not have objdump on OS X, and we only need it on
 dnl Windows (for DLL checks), OpenBSD, and AIX
 case $HostOS_CPP in
-  cygwin32|mingw32|openbsd|aix)
+  mingw32|openbsd|aix)
     AC_CHECK_TARGET_TOOL([OBJDUMP], [objdump])
     ;;
 esac
 
-if test "$HostOS" = "mingw32"
-then
-  ObjdumpCmd=$(cygpath -m "$OBJDUMP")
-else
-  ObjdumpCmd="$OBJDUMP"
-fi
+ObjdumpCmd="$OBJDUMP"
+FP_CANONICALISE_WIN_PATH([ObjdumpCmd])
 AC_SUBST([ObjdumpCmd])
 
 dnl ** Which ranlib to use?
@@ -505,13 +513,11 @@ AC_PROG_RANLIB
 if test "$RANLIB" = ":"; then
     AC_MSG_ERROR([cannot find ranlib in your PATH])
 fi
-if test "$HostOS" = "mingw32"
-then
-  RanlibCmd=$(cygpath -m "$RANLIB")
-else
-  RanlibCmd="$RANLIB"
-fi
+RanlibCmd="$RANLIB"
+FP_CANONICALISE_WIN_PATH([RanlibCmd])
 AC_SUBST([RanlibCmd])
+
+LINKER_SUPPORTS_VERBATIM_LINKING
 
 dnl ** which strip to use?
 dnl --------------------------------------------------------------
@@ -536,7 +542,7 @@ AC_SUBST(InstallNameToolCmd)
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
 LlvmMinVersion=13  # inclusive
-LlvmMaxVersion=20  # not inclusive
+LlvmMaxVersion=24  # not inclusive
 AC_SUBST([LlvmMinVersion])
 AC_SUBST([LlvmMaxVersion])
 
@@ -557,9 +563,22 @@ FIND_LLVM_PROG([OPT], [opt], [$LlvmMinVersion], [$LlvmMaxVersion])
 OptCmd="$OPT"
 AC_SUBST([OptCmd])
 
+dnl ** Which LLVM llvm-dlltool to use?
+dnl --------------------------------------------------------------
+AC_ARG_VAR(DlltoolCmd,[Use as the path to LLVM's llvm-dlltool [default=autodetect]])
+FIND_LLVM_PROG([DlltoolCmd], [llvm-dlltool], [$LlvmMinVersion], [$LlvmMaxVersion])
+
+dnl ** look to see if we have a C compiler using an llvm back end.
+dnl
+FP_CC_LLVM_BACKEND
+AC_SUBST(CcLlvmBackend)
+
 dnl ** Which LLVM assembler to use?
 dnl --------------------------------------------------------------
 AC_ARG_VAR(LLVMAS,[Use as the path to LLVM's assembler (typically clang) [default=autodetect]])
+if test "x$CcLlvmBackend" = "xYES" && test -z "$LLVMAS"; then
+    LLVMAS="$CC"
+fi
 FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
 LlvmAsCmd="$LLVMAS"
 AC_SUBST([LlvmAsCmd])
@@ -637,11 +656,6 @@ else
     AC_SUBST([NeedLibatomic],[NO])
 fi
 
-dnl ** look to see if we have a C compiler using an llvm back end.
-dnl
-FP_CC_LLVM_BACKEND
-AC_SUBST(CcLlvmBackend)
-
 FPTOOLS_SET_C_LD_FLAGS([target],[CFLAGS],[LDFLAGS],[IGNORE_LINKER_LD_FLAGS],[CPPFLAGS])
 FPTOOLS_SET_C_LD_FLAGS([build],[CONF_CC_OPTS_STAGE0],[CONF_GCC_LINKER_OPTS_STAGE0],[CONF_LD_LINKER_OPTS_STAGE0],[CONF_CPP_OPTS_STAGE0])
 FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE1],[CONF_GCC_LINKER_OPTS_STAGE1],[CONF_LD_LINKER_OPTS_STAGE1],[CONF_CPP_OPTS_STAGE1])
@@ -686,8 +700,8 @@ FP_CC_IGNORE_UNUSED_ARGS([$CC], [CONF_CC_OPTS_STAGE2])
 
 # CPP, CPPFLAGS
 # --with-cpp/-with-cpp-flags
-dnl Note that we must do this after setting and using the C99 CPPFLAGS, or
-dnl otherwise risk trying to configure the C99 and LD flags using -E as a CPPFLAG
+dnl Note that we must do this after setting and using the C11 CPPFLAGS, or
+dnl otherwise risk trying to configure the C11 and LD flags using -E as a CPPFLAG
 FP_CPP_CMD_WITH_ARGS([$CC_STAGE0],[CPPCmd_STAGE0],[CONF_CPP_OPTS_STAGE0])
 FP_CPP_CMD_WITH_ARGS([$CC],[CPPCmd],[CONF_CPP_OPTS_STAGE1])
 FP_CPP_CMD_WITH_ARGS([$CC],[CPPCmd],[CONF_CPP_OPTS_STAGE2])
@@ -760,21 +774,18 @@ FP_PROG_AR_NEEDS_RANLIB
 dnl ** Check to see whether ln -s works
 AC_PROG_LN_S
 
-FP_SETTINGS
-
 dnl ** Find the path to sed
 AC_PATH_PROGS(SedCmd,gsed sed,sed)
-
-
-dnl ** check for time command
-AC_PATH_PROG(TimeCmd,time)
+FP_CANONICALISE_WIN_PATH([SedCmd])
 
 dnl ** check for tar
 dnl   if GNU tar is named gtar, look for it first.
 AC_PATH_PROGS(TarCmd,gnutar gtar tar,tar)
+FP_CANONICALISE_WIN_PATH([TarCmd])
 
 dnl ** check for autoreconf
 AC_PATH_PROG(AutoreconfCmd, autoreconf, autoreconf)
+FP_CANONICALISE_WIN_PATH([AutoreconfCmd])
 
 dnl ** check for dtrace (currently only implemented for Mac OS X)
 AC_ARG_ENABLE(dtrace,
@@ -799,17 +810,11 @@ fi
 AC_SUBST(HaveDtrace)
 
 AC_PATH_PROG(HSCOLOUR,HsColour)
-# HsColour is passed to Cabal, so we need a native path
-if test "$HostOS"      = "mingw32" && \
-   test "${OSTYPE}"   != "msys"    && \
-   test "${HSCOLOUR}" != ""
-then
-    # Canonicalise to <drive>:/path/to/gcc
-    HSCOLOUR=`cygpath -m ${HSCOLOUR}`
-fi
+FP_CANONICALISE_WIN_PATH([HSCOLOUR])
 
 dnl ** check for Sphinx toolchain
 AC_PATH_PROG(SPHINXBUILD,sphinx-build)
+FP_CANONICALISE_WIN_PATH([SPHINXBUILD])
 AC_CACHE_CHECK([for version of sphinx-build], fp_cv_sphinx_version,
 changequote(, )dnl
 [if test -n "$SPHINXBUILD"; then
@@ -828,14 +833,19 @@ fi
 
 dnl ** check for xelatex
 AC_PATH_PROG(XELATEX,xelatex)
+FP_CANONICALISE_WIN_PATH([XELATEX])
 AC_PATH_PROG(MAKEINDEX,makeindex)
+FP_CANONICALISE_WIN_PATH([MAKEINDEX])
 AC_PATH_PROG(GIT,git)
+FP_CANONICALISE_WIN_PATH([GIT])
 
 dnl ** check for makeinfo
 AC_PATH_PROG(MAKEINFO,makeinfo)
+FP_CANONICALISE_WIN_PATH([MAKEINFO])
 
 dnl ** check for cabal
 AC_PATH_PROG(CABAL,cabal)
+FP_CANONICALISE_WIN_PATH([CABAL])
 
 
 dnl ** check for Python for testsuite driver
@@ -871,10 +881,7 @@ dnl    Keep that check as early as possible.
 dnl    as we need to know whether we need libm
 dnl    for math functions or not
 dnl    (see https://gitlab.haskell.org/ghc/ghc/issues/3730)
-AC_CHECK_LIB(m, atan, UseLibm=YES, UseLibm=NO)
-AC_SUBST([UseLibm])
-TargetHasLibm=$UseLibm
-AC_SUBST(TargetHasLibm)
+AC_CHECK_LIB(m, atan, TargetHasLibm=YES, TargetHasLibm=NO)
 
 FP_BFD_FLAG
 AC_SUBST([UseLibbfd])
@@ -888,10 +895,6 @@ AC_SUBST(UseSystemLibFFI)
 AC_SUBST(FFILibDir)
 AC_SUBST(FFIIncludeDir)
 
-dnl ** check whether we need -ldl to get dlopen()
-AC_CHECK_LIB([dl], [dlopen], UseLibdl=YES, UseLibdl=NO)
-AC_SUBST([UseLibdl])
-
 dnl ** check for leading underscores in symbol names
 FP_LEADING_UNDERSCORE
 AC_SUBST([LeadingUnderscore], [`echo $fptools_cv_leading_underscore | sed 'y/yesno/YESNO/'`])
@@ -899,9 +902,6 @@ AC_SUBST([LeadingUnderscore], [`echo $fptools_cv_leading_underscore | sed 'y/yes
 dnl ** check for librt
 AC_CHECK_LIB([rt], [clock_gettime], UseLibrt=YES, UseLibrt=NO)
 AC_SUBST([UseLibrt])
-
-FP_CHECK_PTHREAD_LIB
-AC_SUBST([UseLibpthread])
 
 GHC_ADJUSTORS_METHOD([Target])
 AC_SUBST([UseLibffiForAdjustors])
@@ -985,6 +985,8 @@ FIND_GHC_TOOLCHAIN([hadrian/cfg])
 
 AC_CONFIG_FILES(
 [ hadrian/cfg/system.config
+  hadrian/cfg/system.config.host
+  hadrian/cfg/system.config.target
   hadrian/ghci-cabal
   hadrian/ghci-multi-cabal
   hadrian/ghci-stack
@@ -1072,9 +1074,10 @@ echo "\
       libdw   : $UseLibdw
 
    Using LLVM tools
-      llc   : $LlcCmd
-      opt   : $OptCmd
-      llvm-as : $LlvmAsCmd"
+      llc          : $LlcCmd
+      opt          : $OptCmd
+      llvm-as      : $LlvmAsCmd
+      llvm-dlltool : $DlltoolCmd"
 
 if test "$HSCOLOUR" = ""; then
 echo "

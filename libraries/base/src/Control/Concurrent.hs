@@ -82,6 +82,9 @@ module Control.Concurrent (
         -- * Weak references to ThreadIds
         mkWeakThreadId,
 
+        -- * Thread debugging
+        labelThread,
+
         -- * GHC's implementation of concurrency
 
         -- |This section describes features specific to GHC's
@@ -117,9 +120,14 @@ import GHC.Internal.System.Posix.Types ( Fd )
 #if defined(mingw32_HOST_OS)
 import GHC.Internal.Foreign.C.Error
 import GHC.Internal.Foreign.C.Types
-import GHC.Internal.System.IO
+import System.IO
 import GHC.Internal.Data.Functor ( void )
 import GHC.Internal.Int ( Int64 )
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Internal.Stack.Types as Rebindable
+  ( SrcLoc(..), pushCallStack, emptyCallStack )
+import qualified GHC.Internal.Types as Rebindable
+#endif
 #else
 import qualified GHC.Internal.Conc.IO as Conc
 #endif

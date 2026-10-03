@@ -32,7 +32,6 @@ module Haddock.Backends.Xhtml.Names
 
 import Data.List (stripPrefix)
 import GHC hiding (LexicalFixity (..))
-import GHC.Data.FastString (unpackFS)
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import Text.XHtml hiding (name, p, quote)
@@ -41,6 +40,8 @@ import Haddock.Backends.Xhtml.Utils
 import Haddock.GhcUtils
 import Haddock.Types
 import Haddock.Utils
+import qualified Data.Text as T
+import qualified Data.Text.Lazy as LText
 
 -- | Indicator of how to render a 'DocName' into 'Html'
 data Notation
@@ -53,19 +54,19 @@ data Notation
   deriving (Eq, Show)
 
 ppOccName :: OccName -> Html
-ppOccName = toHtml . occNameString
+ppOccName = toHtml . occNameFS
 
 ppRdrName :: RdrName -> Html
 ppRdrName = ppOccName . rdrNameOcc
 
 ppIPName :: HsIPName -> Html
-ppIPName = toHtml . ('?' :) . unpackFS . hsIPNameFS
+ppIPName = toHtml . ("?" <>) . fastStringToText . hsIPNameFS
 
 ppUncheckedLink :: Qualification -> Wrap (ModuleName, OccName) -> Html
 ppUncheckedLink _ x = linkIdOcc' mdl (Just occ) << occHtml
   where
     (mdl, occ) = unwrap x
-    occHtml = toHtml (showWrapped (occNameString . snd) x) -- TODO: apply ppQualifyName
+    occHtml = toHtml (showWrapped (T.pack . occNameString . snd) x) -- TODO: apply ppQualifyName
 
 -- The Bool indicates if it is to be rendered in infix notation
 ppLDocName :: Qualification -> Notation -> GenLocated l DocName -> Html
@@ -123,10 +124,10 @@ ppFullQualName notation mdl name = wrapInfix notation (getOccName name) qname
 ppName :: Notation -> Name -> Html
 ppName notation name =
   case m_pun of
-    Just str -> toHtml (unpackFS str) -- use the punned form
+    Just str -> toHtml str -- use the punned form
     Nothing ->
       wrapInfix notation (getOccName name) $
-        toHtml (getOccString name) -- use the original identifier
+        toHtml (getOccFS name) -- use the original identifier
   where
     m_pun = case notation of
       Raw -> namePun_maybe name
@@ -171,7 +172,7 @@ linkIdOcc mdl mbName insertAnchors =
     then anchor ! [href url, title ttl]
     else id
   where
-    ttl = moduleNameString (moduleName mdl)
+    ttl = LText.pack (moduleNameString (moduleName mdl))
     url = case mbName of
       Nothing -> moduleUrl mdl
       Just name -> moduleNameUrl mdl name
@@ -179,9 +180,9 @@ linkIdOcc mdl mbName insertAnchors =
 linkIdOcc' :: ModuleName -> Maybe OccName -> Html -> Html
 linkIdOcc' mdl mbName = anchor ! [href url, title ttl]
   where
-    ttl = moduleNameString mdl
+    ttl = LText.pack (moduleNameString mdl)
     url = case mbName of
-      Nothing -> moduleHtmlFile' mdl
+      Nothing -> LText.pack (moduleHtmlFile' mdl)
       Just name -> moduleNameUrl' mdl name
 
 ppModule :: Module -> Html
@@ -190,14 +191,14 @@ ppModule mdl =
     ! [href (moduleUrl mdl)]
     << toHtml (moduleString mdl)
 
-ppModuleRef :: Maybe Html -> ModuleName -> String -> Html
+ppModuleRef :: Maybe Html -> ModuleName -> LText -> Html
 ppModuleRef Nothing mdl ref =
   anchor
-    ! [href (moduleHtmlFile' mdl ++ ref)]
+    ! [href (LText.pack (moduleHtmlFile' mdl) <> ref)]
     << toHtml (moduleNameString mdl)
 ppModuleRef (Just lbl) mdl ref =
   anchor
-    ! [href (moduleHtmlFile' mdl ++ ref)]
+    ! [href (LText.pack (moduleHtmlFile' mdl) <> ref)]
     << lbl
 
 -- NB: The ref parameter already includes the '#'.

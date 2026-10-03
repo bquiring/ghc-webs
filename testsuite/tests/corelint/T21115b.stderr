@@ -6,14 +6,8 @@ T21115b.hs:9:1: warning:
     In the body of lambda with binder ds :: Double#
     In the body of a let with binder fail :: (# #) -> Int#
     In the body of a let with binder fail :: (# #) -> Int#
-    Substitution: <InScope = {}
-                   IdSubst   = []
-                   TvSubst   = []
-                   CvSubst   = []>
 *** Offending Program ***
 Rec {
-$trModule = Module (TrNameS "main"#) (TrNameS "T21115b"#)
-
 foo
   = \ ds ->
       let {
@@ -21,7 +15,7 @@ foo
           = \ ds ->
               case patError "T21115b.hs:(10,4)-(15,4)|\\case"# of {} } in
       let { fail = \ ds -> 5# } in
-      case ds of ds {
+      case ds of wild {
         __DEFAULT -> fail (##);
         0.0## -> 2#;
         2.0## -> 3#

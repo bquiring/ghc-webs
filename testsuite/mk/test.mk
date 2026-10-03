@@ -44,6 +44,7 @@ TEST_HC_OPTS = -dcore-lint -dstg-lint -dcmm-lint -fno-dump-with-ways \
 # we want tests to produce the same output for all test ways.
 TEST_HC_OPTS += -fno-warn-missed-specialisations
 TEST_HC_OPTS += -fshow-warning-groups
+TEST_HC_OPTS += -fno-hide-source-paths
 
 # Turn off any VT800 codes in the output or they wreak havoc on the
 # testsuite output.
@@ -60,18 +61,18 @@ TEST_HC_OPTS += -Werror=compat
 # removing this line.
 TEST_HC_OPTS += -dno-debug-output
 
-TEST_HC_OPTS_INTERACTIVE = $(TEST_HC_OPTS) --interactive -v0 -ignore-dot-ghci -fno-ghci-history
+TEST_HC_OPTS_INTERACTIVE = -v0 $(TEST_HC_OPTS) --interactive -ignore-dot-ghci -fno-ghci-history
 
 
 RUNTEST_OPTS =
 
-ifeq "$(filter $(TargetOS_CPP), cygwin32 mingw32)" ""
+ifeq "$(filter $(TargetOS_CPP), mingw32)" ""
 exeext =
 else
 exeext = .exe
 endif
 
-ifneq "$(filter $(TargetOS_CPP),cygwin32 mingw32)" ""
+ifneq "$(filter $(TargetOS_CPP),mingw32)" ""
 dllext = .dll
 else ifeq "$(TargetOS_CPP)" "darwin"
 dllext = .dylib
@@ -108,9 +109,11 @@ endif
 HAVE_GDB := $(shell if gdb --version > /dev/null 2> /dev/null; then echo YES; else echo NO; fi)
 HAVE_READELF := $(shell if readelf --version > /dev/null 2> /dev/null; then echo YES; else echo NO; fi)
 
-# we need a better way to find which backend is selected and if --check flag is
-# used
-BIGNUM_GMP := $(shell "$(GHC_PKG)" field ghc-bignum exposed-modules | grep GMP)
+# Detect whether the fast (GMP) bignum backend is in use. The GMP backend module
+# in ghc-internal is hidden, so we look instead for the gmp library it links
+# against: GMP_LIBS adds gmp to ghc-internal's extra-libraries only on a GMP
+# build.
+BIGNUM_GMP := $(shell "$(GHC_PKG)" field ghc-internal extra-libraries 2>/dev/null | grep gmp)
 
 ifeq "$(filter thr, $(GhcRTSWays))" "thr"
 RUNTEST_OPTS += -e config.ghc_with_threaded_rts=True
@@ -123,6 +126,13 @@ RUNTEST_OPTS += -e ghc_with_dynamic_rts=True
 else
 RUNTEST_OPTS += -e ghc_with_dynamic_rts=False
 endif
+
+ifeq "$(filter debug, $(GhcRTSWays))" "debug"
+RUNTEST_OPTS += -e config.debug_rts=True
+else
+RUNTEST_OPTS += -e config.debug_rts=False
+endif
+
 
 ifeq "$(GhcWithInterpreter)" "NO"
 RUNTEST_OPTS += -e config.have_interp=False

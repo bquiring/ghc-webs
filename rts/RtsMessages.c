@@ -9,6 +9,7 @@
 #include "rts/PosixSource.h"
 #include "Rts.h"
 #include "RtsUtils.h"
+#include "ghcversion.h"
 
 #include "eventlog/EventLog.h"
 
@@ -55,6 +56,24 @@ vbarf(const char*s, va_list ap)
 {
   (*fatalInternalErrorFn)(s,ap);
   stg_exit(EXIT_INTERNAL_ERROR); // just in case fatalInternalErrorFn() returns
+}
+
+void
+sbarf(const char*s)
+{
+  barf("%s", s);
+}
+
+void
+pbarf(const char*fmt, void *p)
+{
+  barf(fmt, p);
+}
+
+void
+ssbarf(const char *fmt, const char *s)
+{
+  barf(fmt, s);
 }
 
 void
@@ -177,7 +196,7 @@ rtsFatalInternalErrorFn(const char *s, va_list ap)
      libdwFree(session);
 #endif
      fprintf(stderr, "\n");
-     fprintf(stderr, "    (GHC version %s for %s)\n", ProjectVersion, xstr(HostPlatform_TYPE));
+     fprintf(stderr, "    (GHC version %s for %s)\n", __GLASGOW_HASKELL_FULL_VERSION__, xstr(HostPlatform_TYPE));
      fprintf(stderr, "    Please report this as a GHC bug:  https://www.haskell.org/ghc/reportabug\n");
      fflush(stderr);
   }

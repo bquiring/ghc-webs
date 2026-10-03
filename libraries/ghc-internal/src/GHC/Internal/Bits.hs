@@ -62,10 +62,18 @@ module GHC.Internal.Bits (
 
 #include "MachDeps.h"
 
-import GHC.Internal.Data.Maybe
-import GHC.Internal.Num
 import GHC.Internal.Base
+import GHC.Internal.Data.Maybe
+import GHC.Internal.Err (error, errorWithoutStackTrace)
+import GHC.Internal.Num
+import GHC.Internal.Prim (
+    and#, andI#, clz#, ctz#, int2Word#, negateInt#, not#, notI#, or#, orI#,
+    popCnt#, uncheckedIShiftL#, uncheckedIShiftRA#, uncheckedIShiftRL#,
+    uncheckedShiftL#, uncheckedShiftRL#, word2Int#, xor#, xorI#,
+    (-#), (==#), (>=#)
+  )
 import GHC.Internal.Real
+import GHC.Internal.Stack.Types as Rebindable
 
 infixl 8 `shift`, `rotate`, `shiftL`, `shiftR`, `rotateL`, `rotateR`
 infixl 7 .&.
@@ -82,7 +90,7 @@ class Eq a => Bits a where
     {-# MINIMAL (.&.), (.|.), xor, complement,
                 (shift | (shiftL, shiftR)),
                 (rotate | (rotateL, rotateR)),
-                bitSize, bitSizeMaybe, isSigned, testBit, bit, popCount #-}
+                bitSizeMaybe, isSigned, testBit, bit, popCount #-}
 
     -- | Bitwise \"and\"
     (.&.) :: a -> a -> a
@@ -553,6 +561,15 @@ instance Bits Integer where
              | otherwise = integerShiftR x (fromIntegral (negate i))
    testBit x i = integerTestBit x (fromIntegral i)
    zeroBits    = integerZero
+   -- INLINE on setBit/clearBit/complementBit preserves constant folding;
+   -- see Note [INLINE for constant folding of bit operations] in
+   -- GHC.Internal.Bignum.Integer.
+   setBit x i = integerSetBit x (fromIntegral i)
+   {-# INLINE setBit #-}
+   clearBit x i = integerClearBit x (fromIntegral i)
+   {-# INLINE clearBit #-}
+   complementBit x i = integerComplementBit x (fromIntegral i)
+   {-# INLINE complementBit #-}
 
    bit (I# i)  = integerBit# (int2Word# i)
    popCount x  = I# (integerPopCount# x)

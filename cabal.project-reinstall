@@ -52,13 +52,13 @@ packages: ./compiler
           ./utils/hsc2hs
           ./utils/runghc
           ./utils/unlit
-          ./utils/iserv
           ./linters/**/*.cabal
 
 constraints: ghc +internal-interpreter +dynamic-system-linke,
              ghc-bin +internal-interpreter +threaded,
              ghci +internal-interpreter,
              haddock +in-ghc-tree,
+             haddock-api +in-ghc-tree,
              any.array installed,
              any.base installed,
              any.deepseq installed,
@@ -68,6 +68,8 @@ constraints: ghc +internal-interpreter +dynamic-system-linke,
              any.pretty installed,
              any.template-haskell installed
 
+package *
+    happy-options: --strict
 
 benchmarks: False
 tests: False

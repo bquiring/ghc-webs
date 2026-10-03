@@ -1,6 +1,3 @@
-
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies        #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -42,18 +39,17 @@ import GHC.Unit.Module ( moduleName, moduleUnit
 
 import GHC.Iface.Env    ( newGlobalBinder )
 
+import GHC.Types.InlinePragma ( CompilerPhase(Phase), activeAfter
+                              , alwaysInlinePragma, setInlinePragmaActivation )
 import GHC.Types.Name hiding ( varName )
 import GHC.Types.Name.Reader
-import GHC.Types.SourceText
-import GHC.Types.Fixity
-import GHC.Types.Basic
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set (elemVarSet)
 
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
-import GHC.Builtin.Names
+import GHC.Builtin.KnownOccs
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Types
 
 import GHC.Utils.Error( Validity'(..), andValid )
 import GHC.Utils.Outputable
@@ -62,8 +58,6 @@ import GHC.Utils.Misc
 
 import GHC.Driver.DynFlags
 import GHC.Data.FastString
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Control.Monad (mplus)
 import Data.List (zip4, partition)
@@ -188,7 +182,7 @@ canDoGenerics dit@(DerivInstTys{dit_rep_tc = tc})
   where
     -- The tc can be a representation tycon. When we want to display it to the
     -- user (in an error message) we should print its parent
-    tc_name = case tyConFamInst_maybe tc of
+    tc_name = case tyConDataFamInst_maybe tc of
         Just (ptc, _) -> ptc
         _             -> tc
 
@@ -357,14 +351,14 @@ gk2gkDC Gen1 dc tc_args = Gen1_DC $ assert (isTyVarTy last_dc_inst_univ)
 mkBindsRep :: DynFlags -> GenericKind -> SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, [LSig GhcPs])
 mkBindsRep dflags gk loc dit@(DerivInstTys{dit_rep_tc = tycon}) = (binds, sigs)
       where
-        binds = [mkRdrFunBind (L loc' from01_RDR) [from_eqn]]
+        binds = [mkRdrFunBind from01_bndr [from_eqn]]
               ++
-                [mkRdrFunBind (L loc' to01_RDR) [to_eqn]]
+                [mkRdrFunBind to01_bndr [to_eqn]]
 
         -- See Note [Generics performance tricks]
         sigs = if     gopt Opt_InlineGenericsAggressively dflags
                   || (gopt Opt_InlineGenerics dflags && inlining_useful)
-               then [inline1 from01_RDR, inline1 to01_RDR]
+               then [inline1 from01_bndr, inline1 to01_bndr]
                else []
          where
            inlining_useful
@@ -378,8 +372,8 @@ mkBindsRep dflags gk loc dit@(DerivInstTys{dit_rep_tc = tycon}) = (binds, sigs)
                cons       = length datacons
                max_fields = maximum $ 0 :| map dataConSourceArity datacons
 
-           inline1 f = L loc'' . InlineSig noAnn (L loc' f)
-                     $ alwaysInlinePragma { inl_act = ActiveAfter NoSourceText 1 }
+           inline1 f = L loc'' . InlineSig noAnn f
+                     $ alwaysInlinePragma `setInlinePragmaActivation` activeAfter (Phase 1)
 
         -- The topmost M1 (the datatype metadata) has the exact same type
         -- across all cases of a from/to definition, and can be factored out
@@ -391,10 +385,11 @@ mkBindsRep dflags gk loc dit@(DerivInstTys{dit_rep_tc = tycon}) = (binds, sigs)
 
         from_matches  = [mkHsCaseAlt pat rhs | (pat,rhs) <- from_alts]
         to_matches    = [mkHsCaseAlt pat rhs | (pat,rhs) <- to_alts  ]
-        loc'          = noAnnSrcSpan loc
         loc''         = noAnnSrcSpan loc
         datacons      = tyConDataCons tycon
 
+        from01_bndr = mkMethBinder loc from01_RDR
+        to01_bndr   = mkMethBinder loc to01_RDR
         (from01_RDR, to01_RDR) = case gk of
                                    Gen0 -> (from_RDR,  to_RDR)
                                    Gen1 -> (from1_RDR, to1_RDR)
@@ -425,8 +420,8 @@ gen_Generic_fam_inst gk get_fixity loc
        --                               ; data instance D Int a b = D_ a }
   do { -- `rep` = GHC.Generics.Rep or GHC.Generics.Rep1 (type family)
        fam_tc <- case gk of
-         Gen0 -> tcLookupTyCon repTyConName
-         Gen1 -> tcLookupTyCon rep1TyConName
+         Gen0 -> tcLookupKnownOccTyCon repTyConOcc
+         Gen1 -> tcLookupKnownOccTyCon rep1TyConOcc
 
      ; let -- If the derived instance is
            --   instance Generic (Foo x)
@@ -451,7 +446,7 @@ gen_Generic_fam_inst gk get_fixity loc
      ; mod <- getModule
      ; let tc_occ  = nameOccName (tyConName tycon)
            rep_occ = case gk of Gen0 -> mkGenR tc_occ; Gen1 -> mkGen1R tc_occ
-     ; rep_name <- newGlobalBinder mod rep_occ loc
+     ; rep_name <- newGlobalBinder mod rep_occ Nothing loc
 
      ; let tcv      = tyCoVarsOfTypeList inst_ty
            (tv, cv) = partition isTyVar tcv
@@ -545,43 +540,43 @@ tc_mkRepTy ::  -- Gen0 or Gen1, for Rep or Rep1
 tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
                                           , dit_rep_tc_args = tycon_args }) k =
   do
-    d1      <- tcLookupTyCon d1TyConName
-    c1      <- tcLookupTyCon c1TyConName
-    s1      <- tcLookupTyCon s1TyConName
-    rec0    <- tcLookupTyCon rec0TyConName
-    rec1    <- tcLookupTyCon rec1TyConName
-    par1    <- tcLookupTyCon par1TyConName
-    u1      <- tcLookupTyCon u1TyConName
-    v1      <- tcLookupTyCon v1TyConName
-    plus    <- tcLookupTyCon sumTyConName
-    times   <- tcLookupTyCon prodTyConName
-    comp    <- tcLookupTyCon compTyConName
-    uAddr   <- tcLookupTyCon uAddrTyConName
-    uChar   <- tcLookupTyCon uCharTyConName
-    uDouble <- tcLookupTyCon uDoubleTyConName
-    uFloat  <- tcLookupTyCon uFloatTyConName
-    uInt    <- tcLookupTyCon uIntTyConName
-    uWord   <- tcLookupTyCon uWordTyConName
+    d1      <- tcLookupKnownOccTyCon d1TyConOcc
+    c1      <- tcLookupKnownOccTyCon c1TyConOcc
+    s1      <- tcLookupKnownOccTyCon s1TyConOcc
+    rec0    <- tcLookupKnownOccTyCon rec0TyConOcc
+    rec1    <- tcLookupKnownOccTyCon rec1TyConOcc
+    par1    <- tcLookupKnownOccTyCon par1TyConOcc
+    u1      <- tcLookupKnownOccTyCon u1TyConOcc
+    v1      <- tcLookupKnownOccTyCon v1TyConOcc
+    plus    <- tcLookupKnownOccTyCon sumTyConOcc
+    times   <- tcLookupKnownOccTyCon prodTyConOcc
+    comp    <- tcLookupKnownOccTyCon compTyConOcc
+    uAddr   <- tcLookupKnownOccTyCon uAddrTyConOcc
+    uChar   <- tcLookupKnownOccTyCon uCharTyConOcc
+    uDouble <- tcLookupKnownOccTyCon uDoubleTyConOcc
+    uFloat  <- tcLookupKnownOccTyCon uFloatTyConOcc
+    uInt    <- tcLookupKnownOccTyCon uIntTyConOcc
+    uWord   <- tcLookupKnownOccTyCon uWordTyConOcc
 
-    let tcLookupPromDataCon = fmap promoteDataCon . tcLookupDataCon
+    let tcLookupPromDataCon = fmap promoteDataCon . tcLookupKnownOccDataCon
 
-    md         <- tcLookupPromDataCon metaDataDataConName
-    mc         <- tcLookupPromDataCon metaConsDataConName
-    ms         <- tcLookupPromDataCon metaSelDataConName
-    pPrefix    <- tcLookupPromDataCon prefixIDataConName
-    pInfix     <- tcLookupPromDataCon infixIDataConName
-    pLA        <- tcLookupPromDataCon leftAssociativeDataConName
-    pRA        <- tcLookupPromDataCon rightAssociativeDataConName
-    pNA        <- tcLookupPromDataCon notAssociativeDataConName
-    pSUpk      <- tcLookupPromDataCon sourceUnpackDataConName
-    pSNUpk     <- tcLookupPromDataCon sourceNoUnpackDataConName
-    pNSUpkness <- tcLookupPromDataCon noSourceUnpackednessDataConName
-    pSLzy      <- tcLookupPromDataCon sourceLazyDataConName
-    pSStr      <- tcLookupPromDataCon sourceStrictDataConName
-    pNSStrness <- tcLookupPromDataCon noSourceStrictnessDataConName
-    pDLzy      <- tcLookupPromDataCon decidedLazyDataConName
-    pDStr      <- tcLookupPromDataCon decidedStrictDataConName
-    pDUpk      <- tcLookupPromDataCon decidedUnpackDataConName
+    md         <- tcLookupPromDataCon metaDataDataConOcc
+    mc         <- tcLookupPromDataCon metaConsDataConOcc
+    ms         <- tcLookupPromDataCon metaSelDataConOcc
+    pPrefix    <- tcLookupPromDataCon prefixIDataConOcc
+    pInfix     <- tcLookupPromDataCon infixIDataConOcc
+    pLA        <- tcLookupPromDataCon leftAssociativeDataConOcc
+    pRA        <- tcLookupPromDataCon rightAssociativeDataConOcc
+    pNA        <- tcLookupPromDataCon notAssociativeDataConOcc
+    pSUpk      <- tcLookupPromDataCon sourceUnpackDataConOcc
+    pSNUpk     <- tcLookupPromDataCon sourceNoUnpackDataConOcc
+    pNSUpkness <- tcLookupPromDataCon noSourceUnpackednessDataConOcc
+    pSLzy      <- tcLookupPromDataCon sourceLazyDataConOcc
+    pSStr      <- tcLookupPromDataCon sourceStrictDataConOcc
+    pNSStrness <- tcLookupPromDataCon noSourceStrictnessDataConOcc
+    pDLzy      <- tcLookupPromDataCon decidedLazyDataConOcc
+    pDStr      <- tcLookupPromDataCon decidedStrictDataConOcc
+    pDUpk      <- tcLookupPromDataCon decidedUnpackDataConOcc
 
     let mkSum' a b = mkTyConApp plus  [k,a,b]
         mkProd a b = mkTyConApp times [k,a,b]
@@ -634,7 +629,7 @@ tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
               {ata_rec0 = mkRec0, ata_par1 = mkPar1,
                ata_rec1 = mkRec1, ata_comp = mkComp comp k})
 
-        tyConName_user = case tyConFamInst_maybe tycon of
+        tyConName_user = case tyConDataFamInst_maybe tycon of
                            Just (ptycon, _) -> tyConName ptycon
                            Nothing          -> tyConName tycon
 
@@ -662,7 +657,7 @@ tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
                               then promotedTrueDataCon
                               else promotedFalseDataCon
 
-        selName = mkStrLitTy . field_label . flLabel
+        selName = mkStrLitTy . mkFastStringShortText . field_label . flLabel
 
         mbSel Nothing  = mkTyConApp promotedNothingDataCon [typeSymbolKind]
         mbSel (Just s) = mkTyConApp promotedJustDataCon
@@ -895,9 +890,6 @@ mkM1_E e = nlHsVar m1DataCon_RDR `nlHsApp` e
 mkM1_P :: LPat GhcPs -> LPat GhcPs
 mkM1_P p = nlParPat $ m1DataCon_RDR `nlConPat` [p]
 
-nlHsCompose :: LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs
-nlHsCompose x y = compose_RDR `nlHsApps` [x, y]
-
 -- | Variant of foldr for producing balanced lists
 foldBal :: (a -> a -> a) -> a -> [a] -> a
 {-# INLINE foldBal #-} -- inlined to produce specialised code for each op
@@ -1113,3 +1105,4 @@ If one uses threshold values higher what is found in
 pragmas tends to be at best useless and at worst lead to code size blowup
 without runtime performance improvements.
 -}
+

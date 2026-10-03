@@ -1,4 +1,3 @@
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UnliftedFFITypes #-}
@@ -59,6 +58,7 @@ module GHC.Data.FastString
 
         -- * ShortText
         fastStringToShortText,
+        mkFastStringShortText,
 
         -- * FastZString
         FastZString,
@@ -140,6 +140,7 @@ import Foreign.C
 import System.IO
 import Data.Data
 import Data.IORef
+import qualified Data.List.NonEmpty as NE
 import Data.Semigroup as Semi
 
 import Foreign
@@ -233,6 +234,7 @@ instance IsString FastString where
 
 instance Semi.Semigroup FastString where
     (<>) = appendFS
+    sconcat = concatFS . NE.toList
 
 instance Monoid FastString where
     mempty = nilFS
@@ -318,7 +320,7 @@ data FastStringTable = FastStringTable
   -- ^ Number of computed z-encodings for all buckets.
   --
   -- We mark this as 'NOUNPACK' as this 'FastMutInt' is retained by a thunk
-  -- in 'mkFastStringWith' and needs to be boxed any way.
+  -- in 'internSB' and needs to be boxed any way.
   -- If this is unpacked, then we box this single 'FastMutInt' once for each
   -- allocated FastString.
   (Array# (IORef FastStringTableSegment)) -- ^  concurrent segments
@@ -472,9 +474,10 @@ The procedure goes like this:
    * Otherwise, insert and return the string we created.
 -}
 
-mkFastStringWith
-    :: (Int -> FastMutInt-> IO FastString) -> ShortByteString -> IO FastString
-mkFastStringWith mk_fs sbs = do
+-- | Return the interned 'FastString' for the given bytes, creating and
+-- inserting one on a table miss.
+internSB :: ShortByteString -> IO FastString
+internSB sbs = do
   FastStringTableSegment lock _ buckets# <- readIORef segmentRef
   let idx# = hashToIndex# buckets# hash#
   bucket <- IO $ readArray# buckets# idx#
@@ -485,7 +488,7 @@ mkFastStringWith mk_fs sbs = do
       -- only run partially and putMVar is not called after takeMVar.
       noDuplicate
       n <- get_uid
-      new_fs <- mk_fs n n_zencs
+      new_fs <- mkNewFastStringShortByteString sbs n n_zencs
       withMVar lock $ \_ -> insert new_fs
   where
     !(FastStringTable uid n_zencs segments#) = stringTable
@@ -521,11 +524,11 @@ bucket_match fs sbs = go fs
 
 mkFastStringBytes :: Ptr Word8 -> Int -> FastString
 mkFastStringBytes !ptr !len =
-    -- NB: Might as well use unsafeDupablePerformIO, since mkFastStringWith is
+    -- NB: Might as well use unsafeDupablePerformIO, since internSB is
     -- idempotent.
     unsafeDupablePerformIO $ do
         sbs <- newSBSFromPtr ptr len
-        mkFastStringWith (mkNewFastStringShortByteString sbs) sbs
+        internSB sbs
 
 newSBSFromPtr :: Ptr a -> Int -> IO ShortByteString
 newSBSFromPtr (Ptr src#) (I# len#) =
@@ -539,14 +542,17 @@ newSBSFromPtr (Ptr src#) (I# len#) =
 mkFastStringByteString :: ByteString -> FastString
 mkFastStringByteString bs =
   let sbs = SBS.toShort bs in
-  inlinePerformIO $
-      mkFastStringWith (mkNewFastStringShortByteString sbs) sbs
+  inlinePerformIO $ internSB sbs
 
 -- | Create a 'FastString' from an existing 'ShortByteString' without
 -- copying.
 mkFastStringShortByteString :: ShortByteString -> FastString
 mkFastStringShortByteString sbs =
-  inlinePerformIO $ mkFastStringWith (mkNewFastStringShortByteString sbs) sbs
+  inlinePerformIO $ internSB sbs
+
+-- | Create a 'FastString' from an 'HText'
+mkFastStringShortText :: ShortText -> FastString
+mkFastStringShortText = mkFastStringShortByteString . contents
 
 -- | Creates a UTF-8 encoded 'FastString' from a 'String'
 mkFastString :: String -> FastString
@@ -554,7 +560,7 @@ mkFastString :: String -> FastString
 mkFastString str =
   inlinePerformIO $ do
     let !sbs = utf8EncodeShortByteString str
-    mkFastStringWith (mkNewFastStringShortByteString sbs) sbs
+    internSB sbs
 
 -- The following rule is used to avoid polluting the non-reclaimable FastString
 -- table with transient strings when we only want their encoding.
@@ -620,6 +626,42 @@ unpackFS fs = utf8DecodeShortByteString $ fs_sbs fs
 zEncodeFS :: FastString -> FastZString
 zEncodeFS fs = fs_zenc fs
 
+-- Sometimes an `appendFS` operand is temporarily constructed, and we
+-- should avoid retaining the unused `FastString` operand in the
+-- table. The RULES below mitigate the issue by concatenating the
+-- `ShortByteString`s instead when an operand is `fsLit` or
+-- `mkFastString`, which cover most such `appendFS` use cases. See
+-- #27205.
+
+{-# RULES
+"appendFS/fsLit y" forall x y.
+  appendFS x (fsLit y) =
+    mkFastStringShortByteString $
+      fs_sbs x Semi.<> utf8EncodeShortByteString y
+  #-}
+
+{-# RULES
+"appendFS/fsLit x" forall x y.
+  appendFS (fsLit x) y =
+    mkFastStringShortByteString $
+      utf8EncodeShortByteString x Semi.<> fs_sbs y
+  #-}
+
+{-# RULES
+"appendFS/mkFastString y" forall x y.
+  appendFS x (mkFastString y) =
+    mkFastStringShortByteString $
+      fs_sbs x Semi.<> utf8EncodeShortByteString y
+  #-}
+
+{-# RULES
+"appendFS/mkFastString x" forall x y.
+  appendFS (mkFastString x) y =
+    mkFastStringShortByteString $
+      utf8EncodeShortByteString x Semi.<> fs_sbs y
+  #-}
+
+{-# INLINE[1] appendFS #-}
 appendFS :: FastString -> FastString -> FastString
 appendFS fs1 fs2 = mkFastStringShortByteString
                  $ (Semi.<>) (fs_sbs fs1) (fs_sbs fs2)

@@ -19,9 +19,10 @@ module GHC.Internal.InfoProv.Types
 
 import GHC.Internal.Base
 import GHC.Internal.Enum
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Real (fromIntegral)
 import GHC.Internal.Word (Word32)
-import GHC.Internal.Show (Show)
+import GHC.Internal.Show
 import GHC.Internal.Ptr (Ptr(..), plusPtr)
 import GHC.Internal.Foreign.C.String.Encoding (CString, peekCString)
 import GHC.Internal.Foreign.C.Types (CBool(..))
@@ -30,6 +31,7 @@ import GHC.Internal.IO.Encoding (utf8)
 import GHC.Internal.Foreign.Storable (peekByteOff)
 import GHC.Internal.ClosureTypes
 import GHC.Internal.Prim (whereFrom##)
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 data InfoProv = InfoProv {
   ipName :: String,

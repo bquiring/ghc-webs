@@ -2,6 +2,7 @@
 
 module GHC.HsToCore.Foreign.Utils
   ( Binding
+  , ExportLinking(..)
   , getPrimTyOf
   , primTyDescChar
   , ppPrimTyConStgType
@@ -22,8 +23,8 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Id
 import GHC.Types.RepType
 
-import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Prim
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -102,3 +103,8 @@ ppPrimTyConStgType tc =
      | tc == smallArrayPrimTyCon -> Just "const StgAddr"
      | tc == smallMutableArrayPrimTyCon -> Just "StgAddr"
      | otherwise -> Nothing
+
+-- | Whether the foreign function export linking should be dynamic or static.
+data ExportLinking
+  = ExportIsDynamic
+  | ExportIsStatic

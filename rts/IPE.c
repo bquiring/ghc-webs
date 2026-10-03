@@ -62,12 +62,35 @@ entry's containing IpeBufferListNode and its index in that node.
 When the user looks up an IPE entry, we convert it to the user-facing
 InfoProvEnt representation.
 
+Note [Stable identifiers for IPE entries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each IPE entry is given a stable identifier which remains the same across
+different runs of the executable (unlike the address of the info table).
+
+The identifier is a 64-bit word which consists of two parts.
+
+* The high 32-bits are a per-node identifier.
+* The low 32-bits are the index of the entry in the node.
+
+When a node is queued in the pending list by `registerInfoProvList` it is
+given a unique identifier from an incrementing global variable.
+
+The unique key can be computed by using the `IPE_ENTRY_KEY` macro.
+
 */
 
 typedef struct {
     IpeBufferListNode *node;
     uint32_t idx;
 } IpeMapEntry;
+
+// See Note [Stable identifiers for IPE entries]
+#define IPE_ENTRY_KEY(entry) \
+    MAKE_IPE_KEY((entry).node->node_id, (entry).idx)
+
+#define MAKE_IPE_KEY(module_id, idx) \
+    ((((uint64_t)(module_id)) << 32) | ((uint64_t)(idx)))
 
 #if defined(THREADED_RTS)
 static Mutex ipeMapLock;
@@ -78,8 +101,21 @@ static HashTable *ipeMap = NULL;
 // Accessed atomically
 static IpeBufferListNode *ipeBufferList = NULL;
 
+// A global counter which is used to give an IPE entry a unique value across runs.
+static StgWord next_module_id = 1; // Start at 1 to reserve 0 as "invalid"
+
 static void decompressIPEBufferListNodeIfCompressed(IpeBufferListNode*);
 static void updateIpeMap(void);
+
+// Check whether the IpeBufferListNode has the relevant magic words.
+// See Note [IPE Stripping and magic words]
+static inline bool ipe_node_valid(const IpeBufferListNode *node) {
+    return node &&
+           node->entries_block &&
+           node->string_table_block &&
+           node->entries_block->magic == IPE_MAGIC_WORD &&
+           node->string_table_block->magic == IPE_MAGIC_WORD;
+}
 
 #if defined(THREADED_RTS)
 
@@ -99,11 +135,12 @@ static InfoProvEnt ipeBufferEntryToIpe(const IpeBufferListNode *node, uint32_t i
 {
     CHECK(idx < node->count);
     CHECK(!node->compressed);
-    const char *strings = node->string_table;
-    const IpeBufferEntry *ent = &node->entries[idx];
+    const char *strings = node->string_table_block->string_table;
+    const IpeBufferEntry *ent = &node->entries_block->entries[idx];
     return (InfoProvEnt) {
             .info = node->tables[idx],
             .prov = {
+                .info_prov_id  = MAKE_IPE_KEY(node->node_id, idx),
                 .table_name = &strings[ent->table_name],
                 .closure_desc = ent->closure_desc,
                 .ty_desc = &strings[ent->ty_desc],
@@ -121,29 +158,53 @@ static InfoProvEnt ipeBufferEntryToIpe(const IpeBufferListNode *node, uint32_t i
 static void traceIPEFromHashTable(void *data STG_UNUSED, StgWord key STG_UNUSED,
                                   const void *value) {
     const IpeMapEntry *map_ent = (const IpeMapEntry *)value;
-    const InfoProvEnt ipe = ipeBufferEntryToIpe(map_ent->node, map_ent->idx);
-    traceIPE(&ipe);
+    if (ipe_node_valid(map_ent->node)){
+      const InfoProvEnt ipe = ipeBufferEntryToIpe(map_ent->node, map_ent->idx);
+      traceIPE(&ipe);
+    }
 }
 
 void dumpIPEToEventLog(void) {
-    // Dump pending entries
-    IpeBufferListNode *node = RELAXED_LOAD(&ipeBufferList);
-    while (node != NULL) {
-        decompressIPEBufferListNodeIfCompressed(node);
+    /*
+    Usually, traceX functions are defined as a pair of a traceX_ function that
+    traces unconditionally and a traceX functional macro that performs the test
+    for the relevant TRACE_x flag.
 
-        for (uint32_t i = 0; i < node->count; i++) {
-            const InfoProvEnt ent = ipeBufferEntryToIpe(node, i);
-            traceIPE(&ent);
+    This function is the only function that calls traceIPE, but it takes a lot
+    of work just to prepare the IPE information. If traceIPE does not trace that
+    IPE information, all that work is wasted. Hence, the test of TRACE_ipe is
+    performed in this function instead.
+
+    This function is called via traceInitEvent in RtsStartup.c, which registers
+    it as an init event handler. It is important that this happens regardless
+    of whether or not IPE tracing is enabled at startup, since IPE tracing can
+    be started/stopped at runtime using the dynamic trace flags API.
+
+    IPE tracing is enabled whenever IPE debug printing is enabled via -DI, so
+    this test does not prevent IPE debug printing.
+    */
+    if (RTS_UNLIKELY(TRACE_ipe)) {
+        // Dump pending entries
+        IpeBufferListNode *node = RELAXED_LOAD(&ipeBufferList);
+        while (node != NULL) {
+            if (ipe_node_valid(node)){
+              decompressIPEBufferListNodeIfCompressed(node);
+
+              for (uint32_t i = 0; i < node->count; i++) {
+                  const InfoProvEnt ent = ipeBufferEntryToIpe(node, i);
+                  traceIPE(&ent);
+              }
+            }
+            node = node->next;
         }
-        node = node->next;
-    }
 
-    // Dump entries already in hashmap
-    ACQUIRE_LOCK(&ipeMapLock);
-    if (ipeMap != NULL) {
-        mapHashTable(ipeMap, NULL, &traceIPEFromHashTable);
+        // Dump entries already in hashmap
+        ACQUIRE_LOCK(&ipeMapLock);
+        if (ipeMap != NULL) {
+            mapHashTable(ipeMap, NULL, &traceIPEFromHashTable);
+        }
+        RELEASE_LOCK(&ipeMapLock);
     }
-    RELEASE_LOCK(&ipeMapLock);
 }
 
 
@@ -165,11 +226,30 @@ ipeMapLock; we instead use atomic CAS operations to add to the list.
 
 A performance test for IPE registration and lookup can be found here:
 https://gitlab.haskell.org/ghc/ghc/-/merge_requests/5724#note_370806
+
+Note that IPEs are still regiestered even if the .ipe section is stripped. That's
+because you may still want to query what the unique identifier for an info table is
+so it can be reconciled with previously extracted metadata information. For example,
+when `-hi` profiling or using `whereFrom`.
+
 */
 void registerInfoProvList(IpeBufferListNode *node) {
+
+        // Grab a fresh module_id
+    uint32_t module_id;
+    StgWord temp_module_id;
+    while (true) {
+        temp_module_id = next_module_id;
+        if (cas(&next_module_id, temp_module_id, temp_module_id+1) == temp_module_id) {
+            module_id = (uint32_t) temp_module_id;
+            break;
+        }
+
+    }
     while (true) {
         IpeBufferListNode *old = RELAXED_LOAD(&ipeBufferList);
         node->next = old;
+        node->node_id = module_id;
         if (cas_ptr((volatile void **) &ipeBufferList, old, node) == (void *) old) {
             return;
         }
@@ -183,11 +263,23 @@ void formatClosureDescIpe(const InfoProvEnt *ipe_buf, char *str_buf) {
 bool lookupIPE(const StgInfoTable *info, InfoProvEnt *out) {
     updateIpeMap();
     IpeMapEntry *map_ent = (IpeMapEntry *) lookupHashTable(ipeMap, (StgWord)info);
-    if (map_ent) {
+    if (map_ent && ipe_node_valid(map_ent->node)) {
         *out = ipeBufferEntryToIpe(map_ent->node, map_ent->idx);
         return true;
     } else {
         return false;
+    }
+}
+
+// Returns 0 when the info table is not present in the info table map.
+// See Note [Stable identifiers for IPE entries]
+uint64_t lookupIPEId(const StgInfoTable *info) {
+    updateIpeMap();
+    IpeMapEntry *map_ent = (IpeMapEntry *) lookupHashTable(ipeMap, (StgWord)(info));
+    if (map_ent){
+        return IPE_ENTRY_KEY(*map_ent);
+    } else {
+        return 0;
     }
 }
 
@@ -241,38 +333,41 @@ void decompressIPEBufferListNodeIfCompressed(IpeBufferListNode *node) {
         barf("An IPE buffer list node has been compressed, but the "
              "decompression library (zstd) is not available.");
 #else
+        // Decompress string table
         size_t compressed_sz = ZSTD_findFrameCompressedSize(
-            node->string_table,
+            node->string_table_block->string_table,
             node->string_table_size
         );
-        char *decompressed_strings = stgMallocBytes(
-            node->string_table_size,
+        IpeStringTableBlock *decompressed_strings = stgMallocBytes(
+            sizeof(IpeStringTableBlock) + node->string_table_size,
             "updateIpeMap: decompressed_strings"
         );
+        decompressed_strings->magic = IPE_MAGIC_WORD;
         ZSTD_decompress(
-            decompressed_strings,
+            decompressed_strings->string_table,
             node->string_table_size,
-            node->string_table,
+            node->string_table_block->string_table,
             compressed_sz
         );
-        node->string_table = (const char *) decompressed_strings;
+        node->string_table_block = decompressed_strings;
 
         // Decompress the IPE data
         compressed_sz = ZSTD_findFrameCompressedSize(
-            node->entries,
+            node->entries_block->entries,
             node->entries_size
         );
-        void *decompressed_entries = stgMallocBytes(
-            node->entries_size,
+        IpeBufferEntryBlock *decompressed_entries = stgMallocBytes(
+            sizeof(IpeBufferEntryBlock) + node->entries_size,
             "updateIpeMap: decompressed_entries"
         );
+        decompressed_entries->magic = IPE_MAGIC_WORD;
         ZSTD_decompress(
-            decompressed_entries,
+            decompressed_entries->entries,
             node->entries_size,
-            node->entries,
+            node->entries_block->entries,
             compressed_sz
         );
-        node->entries = decompressed_entries;
+        node->entries_block = decompressed_entries;
 #endif // HAVE_LIBZSTD == 0
 
     }

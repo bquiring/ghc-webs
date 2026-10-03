@@ -9,9 +9,6 @@ which is declared in the various \tr{Hs*} modules.  This module,
 therefore, is almost nothing but re-exporting.
 -}
 
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-} -- For deriving instance Data
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -19,6 +16,7 @@ therefore, is almost nothing but re-exporting.
 module Language.Haskell.Syntax (
         module Language.Haskell.Syntax.Binds,
         module Language.Haskell.Syntax.Decls,
+        module Language.Haskell.Syntax.Doc,
         module Language.Haskell.Syntax.Expr,
         module Language.Haskell.Syntax.ImpExp,
         module Language.Haskell.Syntax.Lit,
@@ -31,6 +29,7 @@ module Language.Haskell.Syntax (
 
 import Language.Haskell.Syntax.Decls
 import Language.Haskell.Syntax.Binds
+import Language.Haskell.Syntax.Doc
 import Language.Haskell.Syntax.Expr
 import Language.Haskell.Syntax.ImpExp
 import Language.Haskell.Syntax.Module.Name
@@ -72,7 +71,7 @@ data HsModule p
       hsmodName :: Maybe (XRec p ModuleName),
         -- ^ @Nothing@: \"module X where\" is omitted (in which case the next
         --     field is Nothing too)
-      hsmodExports :: Maybe (XRec p [LIE p]),
+      hsmodExports :: Maybe [LIE p],
         -- ^ Export list
         --
         --  - @Nothing@: export list omitted, so export everything

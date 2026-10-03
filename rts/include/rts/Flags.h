@@ -45,7 +45,7 @@ typedef struct _GC_FLAGS {
     uint32_t     maxHeapSize;        /* in *blocks* */
     uint32_t     minAllocAreaSize;   /* in *blocks* */
     uint32_t     largeAllocLim;      /* in *blocks* */
-    uint32_t     nurseryChunkSize;   /* in *blocks* */
+    int32_t      nurseryChunkSize;   /* in *blocks*, int to distinguish default off, vs explicit off */
     uint32_t     minOldGenSize;      /* in *blocks* */
     uint32_t     heapSizeSuggestion; /* in *blocks* */
     bool heapSizeSuggestionAuto;
@@ -80,7 +80,7 @@ typedef struct _GC_FLAGS {
                                  * to handle the exception before we
                                  * raise it again.
                                  */
-    StgWord heapLimitGrace;     /* units: *blocks*
+    StgWord heapLimitGrace;     /* units: *bytes*
                                  * After a HeapOverflow exception has
                                  * been raised, how much extra space is
                                  * given to the thread to handle the
@@ -118,6 +118,7 @@ typedef struct _DEBUG_FLAGS {
     bool compact;        /* 'C' */
     bool continuation;   /* 'k' */
     bool iomanager;      /* 'o' */
+    bool ipe;            /* 'I' */
 } DEBUG_FLAGS;
 
 /* See Note [Synchronization of flags and base APIs] */
@@ -170,6 +171,8 @@ typedef struct _PROFILING_FLAGS {
     const char*         retainerSelector;
     StgWord             eraSelector;
     const char*         bioSelector;
+    const char*         closureTypeSelector;
+    const char*         infoTableSelector;
 
 } PROFILING_FLAGS;
 
@@ -188,6 +191,7 @@ typedef struct _TRACE_FLAGS {
     bool sparks_full;    /* trace spark events 100% accurately */
     bool ticky;          /* trace ticky-ticky samples */
     bool user;           /* trace user events (emitted from Haskell code) */
+    bool ipe;            /* trace IPE events */
 #if defined(THREADED_RTS)
     /* Time between force eventlog flushes (or 0 if disabled) */
     Time eventlogFlushTime;
@@ -237,7 +241,12 @@ typedef struct _CONCURRENT_FLAGS {
 #define DEFAULT_LINKER_ALWAYS_PIC false
 #endif
 
-/* Which I/O Manager to use in the target program. */
+/* Which I/O Manager to use in the target program.
+ *
+ * If you modify this enum, you must update the corresponding IoManagerFlag
+ * type and Enum instance in GHC.Internal.RTS.Flags and GHC.RTS.Flags (but be
+ * aware that the latter is a public API).
+ */
 typedef enum _IO_MANAGER_FLAG {
 
     /* Select an I/O manager automatically. This will pick the one determined
@@ -249,6 +258,8 @@ typedef enum _IO_MANAGER_FLAG {
 
     /* All other choices pick only the requested one, with no fallback. */
     IO_MNGR_FLAG_SELECT,          /* Unix only,    non-threaded RTS only */
+    IO_MNGR_FLAG_SELECTBIS,       /* Unix only,    non-threaded RTS only */
+    IO_MNGR_FLAG_POLL,            /* Unix only,    non-threaded RTS only */
     IO_MNGR_FLAG_MIO,             /* cross-platform,   threaded RTS only */
     IO_MNGR_FLAG_WINIO,           /* Windows only                        */
     IO_MNGR_FLAG_WIN32_LEGACY,    /* Windows only, non-threaded RTS only */
@@ -352,7 +363,7 @@ typedef struct _RTS_FLAGS {
 } RTS_FLAGS;
 
 #if defined(COMPILING_RTS_MAIN)
-extern DLLIMPORT RTS_FLAGS RtsFlags;
+extern RTS_FLAGS RtsFlags;
 #elif IN_STG_CODE
 /* Note [RtsFlags is a pointer in STG code]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

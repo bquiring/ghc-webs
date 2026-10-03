@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 
 module GHC.Driver.Config.StgToCmm
@@ -82,13 +81,13 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
 
   , stgToCmmAllowIntMul2Instr         = (ncg && (x86ish || aarch64)) || llvm
   , stgToCmmAllowWordMul2Instr        = (ncg && (x86ish || ppc || aarch64)) || llvm
-  , stgToCmmAllowIntWord64X2MinMax    = (ncg && x86ish && isSse4_2Enabled dflags) || llvm
+  , stgToCmmAllowIntWord64X2MinMax    = (ncg && ((x86ish && isSse4_2Enabled dflags) || aarch64)) || llvm
   -- SIMD flags
   , stgToCmmVecInstrsErr  = vec_err
   , stgToCmmAvx           = isAvxEnabled                   dflags
   , stgToCmmAvx2          = isAvx2Enabled                  dflags
   , stgToCmmAvx512f       = isAvx512fEnabled               dflags
-  , stgToCmmTickyAP       = gopt Opt_Ticky_AP dflags
+  , stgToCmmUseStdApThunk = not $ gopt Opt_Ticky_AP dflags
   -- See Note [Saving foreign call target to local]
   , stgToCmmSaveFCallTargetToLocal = any (callerSaves platform) $ activeStgRegs platform
   } where profile  = targetProfile dflags

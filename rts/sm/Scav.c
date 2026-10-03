@@ -138,29 +138,16 @@ scavengeTSO (StgTSO *tso)
         evacuate((StgClosure **)&tso->label);
     }
 
-    switch (ACQUIRE_LOAD(&tso->why_blocked)) {
-    case BlockedOnMVar:
-    case BlockedOnMVarRead:
-    case BlockedOnBlackHole:
-    case BlockedOnMsgThrowTo:
-    case NotBlocked:
+    if (IsBlockInfoClosure(ACQUIRE_LOAD(&tso->why_blocked))) {
         evacuate(&tso->block_info.closure);
-        break;
-    case BlockedOnRead:
-    case BlockedOnWrite:
-    case BlockedOnDelay:
-    case BlockedOnDoProc:
-        scavengeTSOIOManager(tso);
-        break;
-    default:
+    } else {
 #if defined(THREADED_RTS)
     // in the THREADED_RTS, block_info.closure must always point to a
     // valid closure, because we assume this in throwTo().  In the
     // non-threaded RTS it might be a FD (for
     // BlockedOnRead/BlockedOnWrite) or a time value (BlockedOnDelay)
-        tso->block_info.closure = (StgClosure *)END_TSO_QUEUE;
+        ASSERT(tso->block_info.unused == END_TSO_QUEUE);
 #endif
-        break;
     }
 
     tso->dirty = gct->failed_to_evac;
@@ -1276,6 +1263,7 @@ scavenge_one(StgPtr p)
     bool no_luck;
     bool saved_eager_promotion;
 
+try_again:
     saved_eager_promotion = gct->eager_promotion;
 
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(p));
@@ -1616,6 +1604,13 @@ scavenge_one(StgPtr p)
     case CONTINUATION:
         scavenge_continuation((StgContinuation *)p);
         break;
+
+    case WHITEHOLE:
+        // This may happen when the nonmoving GC is in use via two paths:
+        //   1. when an MVAR is being marked concurrently
+        //   2. when the object belongs to a chain of selectors being short-cutted.
+        while (get_itbl((StgClosure*) p) == &stg_WHITEHOLE_info);
+        goto try_again;
 
     default:
         barf("scavenge_one: strange object %d", (int)(info->type));
@@ -1983,6 +1978,7 @@ scavenge_stack(StgPtr p, StgPtr stack_end)
     case STOP_FRAME:
     case CATCH_FRAME:
     case RET_SMALL:
+    case ANN_FRAME:
         bitmap = BITMAP_BITS(info->i.layout.bitmap);
         size   = BITMAP_SIZE(info->i.layout.bitmap);
         // NOTE: the payload starts immediately after the info-ptr, we

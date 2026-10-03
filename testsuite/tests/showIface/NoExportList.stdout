@@ -6,18 +6,18 @@ docs:
        export docs:
          []
        declaration docs:
-         [fα -> [text:
+         [$fEqR -> [text:
+                      -- | A very lazy Eq instance
+                    identifiers:],
+          fα -> [text:
                    -- ^ Documentation for 'R'\'s 'fα' field.
                  identifiers:
-                   {NoExportList.hs:13:38}
+                   {EpAnn EpaSpan NoExportList.hs:14:38 NameAnnTrailing [] EpaComments []}
                    R
-                   {NoExportList.hs:13:38}
+                   {EpAnn EpaSpan NoExportList.hs:14:38 NameAnnTrailing [] EpaComments []}
                    R
-                   {NoExportList.hs:13:45-46}
-                   fα],
-          $fEqR -> [text:
-                      -- | A very lazy Eq instance
-                    identifiers:]]
+                   {EpAnn EpaSpan NoExportList.hs:14:45-46 NameAnnTrailing [] EpaComments []}
+                   fα]]
        arg docs:
          []
        documentation structure:
@@ -48,7 +48,7 @@ docs:
        named chunks:
        haddock options:
        language:
-         Nothing
+         Just GHC2021
        language extensions:
          MonomorphismRestriction
          RelaxedPolyRec

@@ -1,5 +1,4 @@
-
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module GHC.Types.RepType
   (
@@ -33,10 +32,11 @@ import GHC.Types.Basic (Arity, RepArity)
 import GHC.Core.DataCon
 import GHC.Core.Coercion
 import GHC.Core.TyCon
+import GHC.Core.TyCon.Set
 import GHC.Core.TyCon.RecWalk
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
-import {-# SOURCE #-} GHC.Builtin.Types ( anyTypeOfKind
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types ( anyTypeOfKind
   , vecRepDataConTyCon
   , liftedRepTy, unliftedRepTy
   , intRepDataConTy
@@ -102,12 +102,13 @@ unwrapType ty
     go (CastTy t _)              = go t
     go t                         = t
 
-     -- cf. Coercion.unwrapNewTypeStepper
+    -- cf. GHC.Core.Coercion.unwrapNewTypeStepper
+    stepper :: RecTcChecker -> TyCon -> [Type] -> NormaliseStepResult ()
     stepper rec_nts tc tys
       | Just (ty', _) <- instNewTyCon_maybe tc tys
       = case checkRecTc rec_nts tc of
           Just rec_nts' -> NS_Step rec_nts' (go ty') ()
-          Nothing       -> NS_Abort   -- infinite newtypes
+          Nothing       -> NS_Abort  -- infinite newtypes
       | otherwise
       = NS_Done
 
@@ -197,12 +198,12 @@ type SortedSlotTys = [SlotTy]
 -- of the list we have the slot for the tag.
 ubxSumRepType :: [[PrimRep]] -> NonEmpty SlotTy
 ubxSumRepType constrs0
-  -- These first two cases never classify an actual unboxed sum, which always
+  -- This first case never classifies an actual unboxed sum, which always
   -- has at least two disjuncts. But it could happen if a user writes, e.g.,
   -- forall (a :: TYPE (SumRep [IntRep])). ...
   -- which could never be instantiated. We still don't want to panic.
   | constrs0 `lengthLessThan` 2
-  = WordSlot :| []
+  = Word8Slot :| []
 
   | otherwise
   = let
@@ -230,8 +231,17 @@ ubxSumRepType constrs0
       rep :: [PrimRep] -> SortedSlotTys
       rep ty = sort (map primRepSlot ty)
 
-      sumRep = WordSlot :| combine_alts (map rep constrs0)
-               -- WordSlot: for the tag of the sum
+      -- constructors are 1-based, pick an appropriate slot size for the tag
+      tag_slot | length constrs0 < 256        = Word8Slot
+               | length constrs0 < 65536      = Word16Slot
+               -- we use 2147483647 instead of 4294967296 to avoid
+               -- overflow when building a 32 bit GHC. Please fix the
+               -- overflow if you encounter a type with more than 2147483646
+               -- constructors and need the tag to be 32 bits.
+               | length constrs0 < 2147483647 = Word32Slot
+               | otherwise                    = WordSlot
+
+      sumRep = tag_slot :| combine_alts (map rep constrs0)
     in
       sumRep
 
@@ -275,22 +285,32 @@ layoutUbxSum sum_slots0 arg_slots0 =
 --   - Float slots: Shared between floating point types.
 --
 --   - Void slots: Shared between void types. Not used in sums.
---
--- TODO(michalt): We should probably introduce `SlotTy`s for 8-/16-/32-bit
--- values, so that we can pack things more tightly.
-data SlotTy = PtrLiftedSlot | PtrUnliftedSlot | WordSlot | Word64Slot | FloatSlot | DoubleSlot | VecSlot Int PrimElemRep
+
+data SlotTy = PtrLiftedSlot
+            | PtrUnliftedSlot
+            | Word8Slot
+            | Word16Slot
+            | Word32Slot
+            | WordSlot
+            | Word64Slot
+            | FloatSlot
+            | DoubleSlot
+            | VecSlot Int PrimElemRep
   deriving (Eq, Ord)
     -- Constructor order is important! If slot A could fit into slot B
     -- then slot A must occur first.  E.g.  FloatSlot before DoubleSlot
     --
-    -- We are assuming that WordSlot is smaller than or equal to Word64Slot
-    -- (would not be true on a 128-bit machine)
+    -- We are assuming that Word32Slot <= WordSlot <= Word64Slot
+    -- (would not be true on a 16-bit or 128-bit machine)
 
 instance Outputable SlotTy where
   ppr PtrLiftedSlot   = text "PtrLiftedSlot"
   ppr PtrUnliftedSlot = text "PtrUnliftedSlot"
   ppr Word64Slot      = text "Word64Slot"
   ppr WordSlot        = text "WordSlot"
+  ppr Word32Slot      = text "Word32Slot"
+  ppr Word16Slot      = text "Word16Slot"
+  ppr Word8Slot       = text "Word8Slot"
   ppr DoubleSlot      = text "DoubleSlot"
   ppr FloatSlot       = text "FloatSlot"
   ppr (VecSlot n e)   = text "VecSlot" <+> ppr n <+> ppr e
@@ -307,14 +327,14 @@ primRepSlot (BoxedRep mlev) = case mlev of
   Just Lifted   -> PtrLiftedSlot
   Just Unlifted -> PtrUnliftedSlot
 primRepSlot IntRep      = WordSlot
-primRepSlot Int8Rep     = WordSlot
-primRepSlot Int16Rep    = WordSlot
-primRepSlot Int32Rep    = WordSlot
+primRepSlot Int8Rep     = Word8Slot
+primRepSlot Int16Rep    = Word16Slot
+primRepSlot Int32Rep    = Word32Slot
 primRepSlot Int64Rep    = Word64Slot
 primRepSlot WordRep     = WordSlot
-primRepSlot Word8Rep    = WordSlot
-primRepSlot Word16Rep   = WordSlot
-primRepSlot Word32Rep   = WordSlot
+primRepSlot Word8Rep    = Word8Slot
+primRepSlot Word16Rep   = Word16Slot
+primRepSlot Word32Rep   = Word32Slot
 primRepSlot Word64Rep   = Word64Slot
 primRepSlot AddrRep     = WordSlot
 primRepSlot FloatRep    = FloatSlot
@@ -325,6 +345,9 @@ slotPrimRep :: SlotTy -> PrimRep
 slotPrimRep PtrLiftedSlot   = BoxedRep (Just Lifted)
 slotPrimRep PtrUnliftedSlot = BoxedRep (Just Unlifted)
 slotPrimRep Word64Slot      = Word64Rep
+slotPrimRep Word32Slot      = Word32Rep
+slotPrimRep Word16Slot      = Word16Rep
+slotPrimRep Word8Slot       = Word8Rep
 slotPrimRep WordSlot        = WordRep
 slotPrimRep DoubleSlot      = DoubleRep
 slotPrimRep FloatSlot       = FloatRep
@@ -349,10 +372,11 @@ fitsIn ty1 ty2
   -- See Note [Casting slot arguments]
   where
     isWordSlot Word64Slot = True
+    isWordSlot Word32Slot = True
+    isWordSlot Word16Slot = True
+    isWordSlot Word8Slot  = True
     isWordSlot WordSlot   = True
     isWordSlot _          = False
-
-
 
 {- **********************************************************************
 *                                                                       *
@@ -417,7 +441,7 @@ data Levity     = Lifted
 It's all in 1-1 correspondence with PrimRep except for TupleRep and SumRep,
 which describe unboxed products and sums respectively. RuntimeRep is defined
 in the library ghc-prim:GHC.Types. It is also "wired-in" to GHC: see
-GHC.Builtin.Types.runtimeRepTyCon. The unarisation pass, in GHC.Stg.Unarise, transforms the
+GHC.Builtin.WiredIn.Types.runtimeRepTyCon. The unarisation pass, in GHC.Stg.Unarise, transforms the
 program, so that every variable has a type that has a PrimRep. For
 example, unarisation transforms our utup function above, to take two Int
 arguments instead of one (# Int, Int #) argument.
@@ -503,13 +527,13 @@ should be passed the TyCon produced by promoting one of the constructors
 of RuntimeRep into type-level data. The RuntimeRep promoted datacons are
 associated with a RuntimeRepInfo (stored directly in the PromotedDataCon
 constructor of TyCon, field promDcRepInfo).
-This pairing happens in GHC.Builtin.Types. A RuntimeRepInfo
+This pairing happens in GHC.Builtin.WiredIn.Types. A RuntimeRepInfo
 usually(*) contains a function from [Type] to [PrimRep]: the [Type] are
 the arguments to the promoted datacon. These arguments are necessary
 for the TupleRep and SumRep constructors, so that this process can recur,
 producing a flattened list of PrimReps. Calling this extracted function
 happens in runtimeRepPrimRep; the functions themselves are defined in
-tupleRepDataCon and sumRepDataCon, both in GHC.Builtin.Types.
+tupleRepDataCon and sumRepDataCon, both in GHC.Builtin.WiredIn.Types.
 
 The (*) above is to support vector representations. RuntimeRep refers
 to VecCount and VecElem, whose promoted datacons have nuggets of information
@@ -532,9 +556,9 @@ runtimeRepPrimRep calls tyConRuntimeRepInfo on (PromotedDataCon "IntRep"), resp.
 (PromotedDataCon "TupleRep"), extracting a function that will produce the PrimReps.
 In example 1, this function is passed an empty list (the empty list of args to IntRep)
 and returns the PrimRep IntRep. (See the definition of runtimeRepSimpleDataCons in
-GHC.Builtin.Types and its helper function mk_runtime_rep_dc.) Example 2 passes the promoted
+GHC.Builtin.WiredIn.Types and its helper function mk_runtime_rep_dc.) Example 2 passes the promoted
 list as the one argument to the extracted function. The extracted function is defined
-as prim_rep_fun within tupleRepDataCon in GHC.Builtin.Types. It takes one argument, decomposes
+as prim_rep_fun within tupleRepDataCon in GHC.Builtin.WiredIn.Types. It takes one argument, decomposes
 the promoted list (with extractPromotedList), and then recurses back to runtimeRepPrimRep
 to process the LiftedRep and WordRep, concatenating the results.
 
@@ -686,19 +710,50 @@ primRepToType = anyTypeOfKind . mkTYPEapp . primRepToRuntimeRep
 
 --------------
 mightBeFunTy :: Type -> Bool
--- Return False only if we are *sure* it's a data type
--- Look through newtypes etc as much as possible. Used to
--- decide if we need to enter a closure via a slow call.
+-- ^ Might this type be a function type, including after looking through
+-- newtypes and reducing type family applications?
 --
--- AK: It would be nice to figure out and document the difference
--- between this and isFunTy at some point.
+-- In particular, returns @True@ for @IO a@: after unwrapping the newtype,
+-- we get @State# RealWorld -> (# State# RealWorld, a #)@, which is indeed a
+-- function type.
+--
+-- This function is conservative: it returns @False@ only if the type is
+-- **definitely not** a function type. It returns @True@ when it's not sure,
+-- e.g. for a type family application.
+--
+-- This function is generally used when we can perform certain optimisations
+-- when we are sure a type is not a function type (i.e. operationally does not
+-- take a value argument at runtime).
+--
+-- This is different from 'isFunTy', which only returns @True@ when the type
+-- is a function arrow on-the-nose (without looking through newtypes).
+-- In particular, 'isFunTy' returns @False@ for @IO ()@ as well as for all
+-- type family applications.
 mightBeFunTy ty
-  -- Currently ghc has no unlifted functions.
+  -- GHC (currently) has no unlifted functions, so an unlifted type is
+  -- definitely not a function type.
   | definitelyUnliftedType ty
   = False
-  | [BoxedRep _] <- typePrimRep ty
-  , Just tc <- tyConAppTyCon_maybe (unwrapType ty)
-  , isDataTyCon tc
-  = False
+  | Just tc <- tyConAppTyCon_maybe (unwrap_type ty)
+  -- A proper datatype (such as 'Int' or 'Maybe Bool') is definitely not
+  -- a function type. (This does not include newtypes nor type families.)
+  = not $ isBoxedDataTyCon tc
   | otherwise
   = True
+
+  where
+    -- Use 'unwrapType' to look through casts, newtypes and foralls.
+    -- Separately, look through unary classes (supposed to be transparent as per
+    -- Note [Unary class magic] in GHC.Core.TyCon). We don't try to reduce type
+    -- family applications, as we don't have a FamInstEnv to hand.
+    unwrap_type = go emptyTyConSet
+      where
+        go seen_tcs ty
+          | Just (tc, tys) <- splitTyConApp_maybe (unwrapType ty)
+          , Just (_cls, unary_dc) <- isUnaryClassTyCon_maybe tc
+          , [inst_meth_ty] <- map scaledThing (dataConInstArgTys unary_dc tys)
+          = if tc `elemTyConSet` seen_tcs
+            then ty -- cycle detected: bail out
+            else go (seen_tcs `extendTyConSet` tc) inst_meth_ty
+          | otherwise
+          = ty

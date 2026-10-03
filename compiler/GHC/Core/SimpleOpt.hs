@@ -27,10 +27,10 @@ import GHC.Core.Utils
 import GHC.Core.FVs
 import GHC.Core.Unfold
 import GHC.Core.Unfold.Make
-import GHC.Core.Make ( FloatBind(..), mkWildValBinder )
-import GHC.Core.Opt.OccurAnal( occurAnalyseExpr, occurAnalysePgm, zapLambdaBndrs )
+import GHC.Core.Make
+import GHC.Core.Opt.OccurAnal( OccurAnalOpts(..), occurAnalyseExpr, occurAnalysePgm, zapLambdaBndrs )
 import GHC.Core.DataCon
-import GHC.Core.Coercion.Opt ( optCoercion, OptCoercionOpts (..) )
+import GHC.Core.Coercion.Opt ( optCoercion, optTransCo, OptCoercionOpts (..) )
 import GHC.Core.Type hiding ( substTy, extendTvSubst, extendCvSubst, extendTvSubstList
                             , isInScope, substTyVarBndr, cloneTyVarBndr )
 import GHC.Core.Predicate( isCoVarType )
@@ -39,6 +39,7 @@ import GHC.Core.Coercion hiding ( substCo, substCoVarBndr )
 import GHC.Types.Literal
 import GHC.Types.Id
 import GHC.Types.Id.Info  ( realUnfoldingInfo, setUnfoldingInfo, setRuleInfo, IdInfo (..) )
+import GHC.Types.InlinePragma ( isAlwaysActive )
 import GHC.Types.Var      ( isNonCoVarId )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -46,8 +47,8 @@ import GHC.Types.Demand( etaConvertDmdSig, topSubDmd )
 import GHC.Types.Tickish
 import GHC.Types.Basic
 
-import GHC.Builtin.Types
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
 
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Encoding
@@ -56,6 +57,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Misc
 
 import GHC.Data.Maybe       ( orElse )
+import GHC.Data.OrdList
 import GHC.Data.Graph.UnVar
 import Data.List (mapAccumL)
 import qualified Data.ByteString as BS
@@ -107,6 +109,93 @@ unfolding-info to the scrutinee's Id.)
 * Bad bad bad: then the x in  case x of ... may be replaced with a version that has an unfolding.
 
 See ticket #25790
+
+Note [Controlling inlining in the simple optimiser]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Sometimes, plugins that analyse Core programs may want to prevent the
+inlining of certain bindings. While they could avoid running the simple
+optimiser at all, that would leave plenty of generated bindings that do not
+have a direct correspondence to the source code.
+
+For example, consider the following Haskell code:
+
+    foo = z
+      where
+        z  = z1 + z2
+        z1 = 42
+        z2 = 1
+
+Before the simple optimizer runs, the Core programs is roughly:
+
+    foo =
+      let
+        foo_aIb =
+          let
+            z2
+              = let
+                  z2_aHG = 1
+                 in
+                  z2_aHG
+           in
+            let
+              z1 =
+                let
+                  z1_aHR = 42
+                 in
+                  z1_aHR
+             in
+              let
+                z =
+                  let
+                    z_aI5 = z1 + z2
+                   in
+                    z_aI5
+               in
+                z
+      in
+        foo_aIb
+
+After the simple optimizer runs, the Core program is:
+
+    foo = 42 + 1
+
+And the bindings for `z`, `z1`, and `z2` are all gone. If a plugin wanted to
+analyse those bindings, it would have to deal with the unsimplified Core, but
+cope with the generated bindings `z2_aHG`, `z1_aHR`, `z_aI5`, and `foo_aIb`,
+all of which have no direct correspondence to the source code.
+
+Fortunately, a plugin can still improve the output by using the `so_inline`
+field of `SimpleOpts`. The `so_inline` field is a /function/ of type
+`(Id -> Bool)` that tells the simple optimiser whether or not to inline the `Id`.
+The client of the GHC can thereby control precisely which bindings are inlined
+and which are not. For instance,
+
+    simplOptPgm
+      (defaultSimpleOpts { so_inline = (`notElem` ["z", "z1", "z2"]) })
+      ...
+
+produces the following Core program:
+
+    foo =
+      let
+        z2 = 1
+       in
+        let
+          z1 = 42
+         in
+          let
+            z = z1 + z2
+           in
+            z
+
+which contains the bindings of interest and little else.
+
+For the specifics of how this affects a concrete plugin (Liquid Haskell), see
+the discussion in https://gitlab.haskell.org/ghc/ghc/-/issues/24386
+
+In addition to supporting clients of the GHC API, there is another use of
+`so_inline` mentioned in 'simpleOptExprNoInline'.
+
 -}
 
 -- | Simple optimiser options
@@ -114,8 +203,13 @@ data SimpleOpts = SimpleOpts
    { so_uf_opts :: !UnfoldingOpts   -- ^ Unfolding options
    , so_co_opts :: !OptCoercionOpts -- ^ Coercion optimiser options
    , so_eta_red :: !Bool            -- ^ Eta reduction on?
-   , so_inline :: !Bool             -- ^ False <=> do no inlining whatsoever,
-                                    --    even for trivial or used-once things
+   , so_inline :: !(Var -> Bool)    -- ^ False <=> do no inline the given
+                                    --   binding whatsoever, even for trivial or
+                                    --   used-once things
+                                    --
+                                    --   See Note [Controlling inlining in the simple optimiser]
+   , so_can_drop :: !(Var -> Bool)  -- ^ True <=> can drop the given binding if it is dead
+                                    -- See 'oa_can_drop' in 'OccurAnalOpts'.
    }
 
 -- | Default options for the Simple optimiser.
@@ -124,7 +218,8 @@ defaultSimpleOpts = SimpleOpts
    { so_uf_opts = defaultUnfoldingOpts
    , so_co_opts = OptCoercionOpts { optCoercionEnabled = False }
    , so_eta_red = False
-   , so_inline  = True
+   , so_inline  = const True
+   , so_can_drop = const True
    }
 
 simpleOptExpr :: HasDebugCallStack => SimpleOpts -> CoreExpr -> CoreExpr
@@ -169,7 +264,7 @@ simpleOptExprNoInline :: HasDebugCallStack => SimpleOpts -> CoreExpr -> CoreExpr
 simpleOptExprNoInline opts expr
   = simple_opt_expr init_env expr
   where
-    init_opts  = opts { so_inline = False }
+    init_opts  = opts { so_inline = const False }
     init_env   = (emptyEnv init_opts) { soe_subst = init_subst }
     init_subst = mkEmptySubst (mkInScopeSet (exprFreeVars expr))
 
@@ -190,10 +285,15 @@ simpleOptPgm :: SimpleOpts
 simpleOptPgm opts this_mod binds rules =
     (reverse binds', rules', occ_anald_binds)
   where
-    occ_anald_binds  = occurAnalysePgm this_mod
-                          (\_ -> True)  {- All unfoldings active -}
-                          (\_ -> False) {- No rules active -}
-                          rules binds
+    occ_anald_binds  = occurAnalysePgm
+                         this_mod
+                         OccurAnalOpts
+                           { oa_active_unf = \_ -> True  {- All unfoldings active -}
+                           , oa_active_rule = \_ -> False {- No rules active -}
+                           , oa_can_drop = so_can_drop opts
+                           }
+                         rules
+                         binds
 
     (final_env, binds') = foldl' do_one (emptyEnv opts, []) occ_anald_binds
     final_subst = soe_subst final_env
@@ -211,6 +311,12 @@ simpleOptPgm opts this_mod binds rules =
 
 ----------------------
 type SimpleClo = (SimpleOptEnv, InExpr)
+
+data SimpleContItem = ApplyToArg SimpleClo | CastIt OutCoercion
+
+instance Outputable SimpleContItem where
+  ppr (ApplyToArg (_, arg)) = text "ARG" <+> ppr arg
+  ppr (CastIt co) = text "CAST" <+> ppr co
 
 data SimpleOptEnv
   = SOE { soe_opts :: {-# UNPACK #-} !SimpleOpts
@@ -268,35 +374,30 @@ simple_opt_clo in_scope (e_env, e)
   = simple_opt_expr (soeSetInScope in_scope e_env) e
 
 simple_opt_expr :: HasDebugCallStack => SimpleOptEnv -> InExpr -> OutExpr
-simple_opt_expr env expr
-  = go expr
+simple_opt_expr env expr = go expr
   where
-    rec_ids      = soe_rec_ids env
     subst        = soe_subst env
     in_scope     = substInScopeSet subst
     in_scope_env = ISE in_scope alwaysActiveUnfoldingFun
 
     ---------------
-    go (Var v)
-       | Just clo <- lookupVarEnv (soe_inl env) v
-       = simple_opt_clo in_scope clo
-       | otherwise
-       = lookupIdSubst (soe_subst env) v
+    go e@(App {})  = simple_app env e []
+    go e@(Var {})  = simple_app env e []
+    go e@(Cast {}) = simple_app env e []
+    go e@(Lam {})  = simple_app env e []
 
-    go (App e1 e2)      = simple_app env e1 [(env,e2)]
     go (Type ty)        = Type     (substTyUnchecked subst ty)
     go (Coercion co)    = Coercion (go_co co)
     go (Lit lit)        = Lit lit
     go (Tick tickish e) = mkTick (substTickish subst tickish) (go e)
-    go (Cast e co)      = mk_cast (go e) (go_co co)
     go (Let bind body)  = case simple_opt_bind env bind NotTopLevel of
                              (env', Nothing)   -> simple_opt_expr env' body
                              (env', Just bind) -> Let bind (simple_opt_expr env' body)
 
-    go lam@(Lam {})     = go_lam env [] lam
     go (Case e b ty as)
       | isDeadBinder b
-      , Just (_, [], con, _tys, es) <- exprIsConApp_maybe in_scope_env e'
+      , Just (_, floats, con, _tys, es) <- exprIsConApp_maybe in_scope_env e'
+      , isEmptyFloatBinds floats
         -- We don't need to be concerned about floats when looking for coerce.
       , Just (Alt altcon bs rhs) <- findAlt (DataAlt con) as
       = case altcon of
@@ -331,6 +432,80 @@ simple_opt_expr env expr
       where
         (env', bndrs') = subst_opt_bndrs env bndrs
 
+----------------------
+-- simple_app collects arguments for beta reduction
+simple_app :: HasDebugCallStack => SimpleOptEnv -> InExpr -> [SimpleContItem] -> CoreExpr
+
+simple_app env (Var v) as
+  | Just (env', e) <- lookupVarEnv (soe_inl env) v
+  = simple_app (soeSetInScope (soeInScope env) env') e as
+
+  | let unf = idUnfolding v
+  , isCompulsoryUnfolding unf
+  , isAlwaysActive (idInlineActivation v)
+    -- Make sure to inline Ids with compulsory unfoldings.
+    -- See Note [Unfold compulsory unfoldings in RULE LHSs]
+    --
+    -- NB: this is also necessary for the plan described in
+    -- Note [Desugaring unlifted newtypes]. Test cases: T17021, T21650_{a,b}.
+  , Just rhs <- maybeUnfoldingTemplate unf -- Always succeeds if isCompulsoryUnfolding does
+  = simple_app (soeZapSubst env) rhs as
+
+simple_app env (Var v) []
+  = lookupIdSubst (soe_subst env) v
+
+simple_app env (App e1 e2) as
+  = simple_app env e1 (ApplyToArg (env, e2) : as)
+
+simple_app env e0@(Lam {}) as0@(_:_)
+  = do_beta env (zapLambdaBndrs e0 n_args) as0
+    -- Be careful to zap the lambda binders if necessary
+    -- c.f. the Lam case of simplExprF1 in GHC.Core.Opt.Simplify
+    -- Lacking this zap caused #19347, when we had a redex
+    --   (\ a b. K a b) e1 e2
+  where
+    n_args = count (\case {ApplyToArg {} -> True; CastIt {} -> False}) as0
+
+    do_beta :: SimpleOptEnv -> InExpr -> [SimpleContItem] -> OutExpr
+    do_beta env (Lam b body) (ApplyToArg a:as)
+      | -- simpl binder before looking at its type
+        -- See Note [Dark corner with representation polymorphism]
+        needsCaseBinding (idType b') (snd a)
+        -- This arg must not be inlined (side-effects) and cannot be let-bound,
+        -- due to the let-can-float invariant. So simply case-bind it here.
+      , let a' = simple_opt_clo (soeInScope env) a
+      = mkDefaultCase a' b' $ do_beta env' body as
+
+      | (env'', mb_pr) <- simple_bind_pair env' b (Just b') a NotTopLevel
+      = wrapLet mb_pr $ do_beta env'' body as
+      where (env', b') = subst_opt_bndr env b
+
+    -- See Note [Eliminate casts in function position]
+    do_beta env e@(Lam b _) as@(CastIt out_co:rest)
+      | isNonCoVarId b
+      -- Optimise the inner lambda to make it an 'OutExpr', which makes it
+      -- possible to call 'pushCoercionIntoLambda' with the 'OutCoercion' 'co'.
+      -- This is kind of horrible, as for nested casted lambdas with a big body,
+      -- we will repeatedly optimise the body (once for each binder). However,
+      -- we need to do this to avoid mixing 'InExpr' and 'OutExpr', or two
+      -- 'InExpr' with different environments (getting this wrong caused #26588 & #26589.)
+      , Lam out_b out_body <- simple_app env e []
+      , Just (b', body') <- pushCoercionIntoLambda (soeInScope env) out_b out_body out_co
+      = do_beta (soeZapSubst env) (Lam b' body') rest
+        -- soeZapSubst: we've already optimised everything (the lambda and 'rest') by now.
+      | otherwise
+      = rebuild_app env (simple_opt_expr env e) as
+
+    do_beta env (Cast e co) as =
+      do_beta env e (add_cast env co as)
+
+    do_beta env body as
+      = simple_app env body as
+
+simple_app env e@(Lam {}) []
+  = go_lam env [] e
+  where
+    rec_ids      = soe_rec_ids env
     ----------------------
     -- go_lam tries eta reduction
     -- It is quite important that it does so. I tried removing this code and
@@ -348,69 +523,9 @@ simple_opt_expr env expr
          bs = reverse bs'
          e' = simple_opt_expr env e
 
-mk_cast :: CoreExpr -> CoercionR -> CoreExpr
--- Like GHC.Core.Utils.mkCast, but does a full reflexivity check.
--- mkCast doesn't do that because the Simplifier does (in simplCast)
--- But in SimpleOpt it's nice to kill those nested casts (#18112)
-mk_cast (Cast e co1) co2        = mk_cast e (co1 `mkTransCo` co2)
-mk_cast (Tick t e)   co         = Tick t (mk_cast e co)
-mk_cast e co | isReflexiveCo co = e
-             | otherwise        = Cast e co
-
-----------------------
--- simple_app collects arguments for beta reduction
-simple_app :: HasDebugCallStack => SimpleOptEnv -> InExpr -> [SimpleClo] -> CoreExpr
-
-simple_app env (Var v) as
-  | Just (env', e) <- lookupVarEnv (soe_inl env) v
-  = simple_app (soeSetInScope (soeInScope env) env') e as
-
-  | let unf = idUnfolding v
-  , isCompulsoryUnfolding unf
-  , isAlwaysActive (idInlineActivation v)
-    -- See Note [Unfold compulsory unfoldings in RULE LHSs]
-  , Just rhs <- maybeUnfoldingTemplate unf
-    -- Always succeeds if isCompulsoryUnfolding does
-  = simple_app (soeZapSubst env) rhs as
-
-  | otherwise
-  , let out_fn = lookupIdSubst (soe_subst env) v
-  = finish_app env out_fn as
-
-simple_app env (App e1 e2) as
-  = simple_app env e1 ((env, e2) : as)
-
-simple_app env e@(Lam {}) as@(_:_)
-  = do_beta env (zapLambdaBndrs e n_args) as
-    -- Be careful to zap the lambda binders if necessary
-    -- c.f. the Lam case of simplExprF1 in GHC.Core.Opt.Simplify
-    -- Lacking this zap caused #19347, when we had a redex
-    --   (\ a b. K a b) e1 e2
-    -- where (as it happens) the eta-expanded K is produced by
-    -- Note [Typechecking data constructors] in GHC.Tc.Gen.Head
-  where
-    n_args = length as
-
-    do_beta env (Lam b body) (a:as)
-      | -- simpl binder before looking at its type
-        -- See Note [Dark corner with representation polymorphism]
-        needsCaseBinding (idType b') (snd a)
-        -- This arg must not be inlined (side-effects) and cannot be let-bound,
-        -- due to the let-can-float invariant. So simply case-bind it here.
-      , let a' = simple_opt_clo (soeInScope env) a
-      = mkDefaultCase a' b' $ do_beta env' body as
-
-      | (env'', mb_pr) <- simple_bind_pair env' b (Just b') a NotTopLevel
-      = wrapLet mb_pr $ do_beta env'' body as
-
-      where (env', b') = subst_opt_bndr env b
-
-    do_beta env body as
-      = simple_app env body as
-
 simple_app env (Tick t e) as
   -- Okay to do "(Tick t e) x ==> Tick t (e x)"?
-  | t `tickishScopesLike` SoftScope
+  | tickishHasSoftScope t
   = mkTick t $ simple_app env e as
 
 -- (let x = e in b) a1 .. an  =>  let x = e in (b a1 .. an)
@@ -424,28 +539,126 @@ simple_app env (Let bind body) args
   = case simple_opt_bind env bind NotTopLevel of
       (env', Nothing)   -> simple_app env' body args
       (env', Just bind')
-        | isJoinBind bind' -> finish_app env expr' args
+        | isJoinBind bind' -> rebuild_app env expr' args
         | otherwise        -> Let bind' (simple_app env' body args)
         where
           expr' = Let bind' (simple_opt_expr env' body)
 
+simple_app env (Cast e co) as
+  = simple_app env e (add_cast env co as)
+
 simple_app env e as
-  = finish_app env (simple_opt_expr env e) as
+  = rebuild_app env (simple_opt_expr env e) as
 
-finish_app :: HasDebugCallStack
-           => SimpleOptEnv -> OutExpr -> [SimpleClo] -> OutExpr
--- See Note [Eliminate casts in function position]
-finish_app env (Cast (Lam x e) co) as@(_:_)
-  | not (isTyVar x) && not (isCoVar x)
-  , assert (not $ x `elemVarSet` tyCoVarsOfCo co) True
-  , Just (x',e') <- pushCoercionIntoLambda (soeInScope env) x e co
-  = simple_app (soeZapSubst env) (Lam x' e') as
+add_cast :: SimpleOptEnv -> InCoercion -> [SimpleContItem] -> [SimpleContItem]
+add_cast env co1 as
+  | isReflCo co1
+  = as
+  | otherwise
+  = case as of
+      CastIt co2:rest -> CastIt (optTransCo opts in_scope opt_co1 co2):rest
+      _               -> CastIt opt_co1:as
+  where
+    opts     = so_co_opts (soe_opts env)
+    in_scope = soeInScope env
+    opt_co1  = optCoercion opts (soe_subst env) co1
 
-finish_app env fun args
-  = foldl mk_app fun args
+rebuild_app :: HasDebugCallStack
+            => SimpleOptEnv -> OutExpr -> [SimpleContItem] -> OutExpr
+rebuild_app env fun args = foldl mk_app fun args
   where
     in_scope = soeInScope env
-    mk_app fun arg = App fun (simple_opt_clo in_scope arg)
+    mk_app out_fun = \case
+      ApplyToArg arg -> App out_fun (simple_opt_clo in_scope arg)
+      CastIt co      -> mk_cast out_fun co
+
+mk_cast :: CoreExpr -> CoercionR -> CoreExpr
+-- Does a full reflexivity check, unlike GHC.Core.Utils.mkCast,
+-- which does the cheaper isReflCo only.
+-- But in SimpleOpt it's nice to kill those nested casts (#18112)
+mk_cast e co
+  | isReflexiveCo co = e
+  | otherwise        = Cast e co
+
+{- Note [Desugaring unlifted newtypes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We must take special care to desugar applications of unlifted newtypes. For
+example, if we have (see tests T17021 and T21650_{a,b}):
+
+  {-# LANGUAGE UnliftedNewtypes #-}
+
+  type family Id a where Id a = a
+
+  type N :: forall (r :: RuntimeRep). TYPE (Id r) -> TYPE (Id r)
+  newtype N a = MkN a
+    -- so that MkN :: forall (r :: RuntimeRep) (a :: TYPE (Id r)). a -> N @r a
+
+Now, a saturated application of `MkN` such as `MkN 3#` will contain a cast
+"in between" `MkN` and its argument, thus:
+   ((MkN @IntRep @(Int# |> kco)) |> co) 3#
+where
+   kco :: TYPE IntRep ~ TYPE (Id IntRep)
+   co  :: (Int# |> kco) -> N @IntRep (Int# |> kco)  ~   Int# -> N @IntRep Int#
+The cast `co` ensures that the value application to 3# is at a known, concrete
+`RuntimeRep`, here `IntRep`. See Note [Representation polymorphism invariants] in GHC.Core.
+
+Now imagine inlining `MkN`.  We get:
+  ( (\ @r @(a :: TYPE (Id r)) (x :: a) -> x |> some_co ) @IntRep @(Int# |> kco) )
+    |> co ) arg
+
+All by itself that term doesn't satisfy Note [Representation polymorphism invariants],
+/but/ it does after beta-reduction. The difficulty is that `|> co` gets in the
+way of beta reduction. What we really must do here is push the coercion **into**
+the lambda, using 'pushCoercionIntoLambda'.
+
+TL;DR: To avoid the rest of the compiler pipeline seeing these bad lambas, we
+rely on the simple optimiser to both inline the newtype unfolding and
+subsequently deal with the resulting lambdas (either beta-reducing them
+altogether or pushing coercions into them so that they satisfy the
+representation-polymorphism invariants). See Note [Eliminate casts in function position].
+
+[Alternative approach] (GHC ticket #26608)
+
+  We could instead, in the typechecker, emit a special form (a new constructor
+  of XXExprGhcTc) for instantiations of representation-polymorphic unlifted
+  newtypes (whether applied to a value argument or not):
+
+    UnliftedNT :: DataCon -> [Type] -> Coercion -> XXExprGhcTc
+
+  where "UnliftedNT nt_con [ty1, ...] co" represents the expression:
+
+    ( nt_con @ty1 ... ) |> co
+
+  The desugarer would then turn these AST nodes into appropriate Core, doing
+  what the simple optimiser does today:
+    - inline the compulsory unfolding of the newtype constructor
+    - apply it to its type arguments and beta reduce
+    - push the coercion into the resulting lambda
+
+  This would have several advantages:
+    - the desugarer would never produce "invalid" Core that needs to be
+      tidied up by the simple optimiser,
+    - the ugly and inefficient implementation described in
+      Note [Eliminate casts in function position] could be removed.
+
+Wrinkle [Unlifted newtypes with wrappers]
+
+  Usually, newtype constructors don't have wrappers; they only have a worker.
+  However, newtype family instances and newtypes with a stupid theta have a
+  wrapper in addition to a worker.
+
+  To avoid running into the above issue with **both** the wrapper and the worker,
+  we make sure that the wrapper unfolding does not have such bad lambdas, by
+  simply omitting the (last) value argument. That is, instead of:
+
+    $WMkN = \ @r @a x -> $wMkN @r @a x
+
+  we set the unfolding to be:
+
+    $WMkN = \ @r @a -> $wMkN @r @a
+
+  This is done in GHC.Types.Id.Make.mkDataConRep.
+-}
 
 ----------------------
 simple_opt_bind :: SimpleOptEnv -> InBind -> TopLevelFlag
@@ -524,12 +737,12 @@ simple_bind_pair env@(SOE { soe_inl = inl_env, soe_subst = subst, soe_opts = opt
 
     pre_inline_unconditionally :: Bool
     pre_inline_unconditionally
-       | not (so_inline opts)     = False    -- Not if so_inline is False
-       | isExportedId in_bndr     = False
-       | stable_unf               = False
-       | not active               = False    -- Note [Inline prag in simplOpt]
-       | not (safe_to_inline occ) = False
-       | otherwise                = True
+       | not (so_inline opts in_bndr) = False    -- Not if so_inline is False
+       | isExportedId in_bndr         = False
+       | stable_unf                   = False
+       | not active                   = False    -- Note [Inline prag in simplOpt]
+       | not (safe_to_inline occ)     = False
+       | otherwise                    = True
 
         -- Unconditionally safe to inline
 safe_to_inline :: OccInfo -> Bool
@@ -596,15 +809,15 @@ simple_out_bind_pair env@(SOE { soe_subst = subst, soe_opts = opts })
 
     post_inline_unconditionally :: Bool
     post_inline_unconditionally
-       | not (so_inline opts)  = False -- Not if so_inline is False
-       | isExportedId in_bndr  = False -- Note [Exported Ids and trivial RHSs]
-       | stable_unf            = False -- Note [Stable unfoldings and postInlineUnconditionally]
-       | not active            = False --     in GHC.Core.Opt.Simplify.Utils
-       | is_loop_breaker       = False -- If it's a loop-breaker of any kind, don't inline
-                                       -- because it might be referred to "earlier"
-       | exprIsTrivial out_rhs = True
-       | coercible_hack        = True
-       | otherwise             = False
+       | not (so_inline opts in_bndr) = False -- Not if so_inline is False
+       | isExportedId in_bndr         = False -- Note [Exported Ids and trivial RHSs]
+       | stable_unf                   = False -- Note [Stable unfoldings and postInlineUnconditionally]
+       | not active                   = False --     in GHC.Core.Opt.Simplify.Utils
+       | is_loop_breaker              = False -- If it's a loop-breaker of any kind, don't inline
+                                              -- because it might be referred to "earlier"
+       | exprIsTrivial out_rhs        = True
+       | coercible_hack               = True
+       | otherwise                    = False
 
     is_loop_breaker = isWeakLoopBreaker occ_info
 
@@ -632,50 +845,49 @@ rhss here.
 
 Note [Eliminate casts in function position]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider the following program:
+Due to the current implementation strategy for representation-polymorphic
+unlifted newtypes, as described in Note [Desugaring unlifted newtypes], we rely
+on the simple optimiser to push coercions into lambdas, such as in the following
+example:
 
   type R :: Type -> RuntimeRep
-  type family R a where { R Float = FloatRep; R Double = DoubleRep }
-  type F :: forall (a :: Type) -> TYPE (R a)
-  type family F a where { F Float = Float#  ; F Double = Double# }
+  type family R a where { R Int = IntRep }
+  type F :: forall a -> TYPE (R a)
+  type family F a where { F Int = Int# }
 
-  type N :: forall (a :: Type) -> TYPE (R a)
   newtype N a = MkN (F a)
 
-As MkN is a newtype, its unfolding is a lambda which wraps its argument
-in a cast:
+Now, an instantiated occurrence of 'MkN', such as 'MkN @Int' (whether applied
+to a value argument or not) will lead, after inlining the compulsory unfolding
+of 'MkN', to a lambda fo the form:
 
-  MkN :: forall (a :: Type). F a -> N a
-  MkN = /\a \(x::F a). x |> co_ax
-    -- recall that F a :: TYPE (R a)
+  ( \ ( x :: F Int ) -> body ) |> co
 
-This is a representation-polymorphic lambda, in which the binder has an unknown
-representation (R a). We can't compile such a lambda on its own, but we can
-compile instantiations, such as `MkN @Float` or `MkN @Double`.
+    where
+      co :: ( F Int -> res ) ~# ( Int# -> res )
 
-Our strategy to avoid running afoul of the representation-polymorphism
-invariants of Note [Representation polymorphism invariants] in GHC.Core is thus:
+The problem is that we now have a lambda abstraction whose binder does not have a
+fixed RuntimeRep in the sense of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
 
-  1. Give the newtype a compulsory unfolding (it has no binding, as we can't
-     define lambdas with representation-polymorphic value binders in source Haskell).
-  2. Rely on the optimiser to beta-reduce away any representation-polymorphic
-     value binders.
+However, if we use 'pushCoercionIntoLambda', we end up with:
 
-For example, consider the application
+  ( \ ( x' :: Int# ) -> body' )
 
-    MkN @Float 34.0#
+which satisfies the representation-polymorphism invariants of
+Note [Representation polymorphism invariants] in GHC.Core.
 
-After inlining MkN we'll get
+In conclusion:
 
-   ((/\a \(x:F a). x |> co_ax) @Float) |> co 34#
+  1. The simple optimiser must push casts into lambdas.
+  2. It must also deal with a situation such as (MkN @Int) |> co, where we first
+     inline the compulsory unfolding of N. This means the simple optimiser must
+     "peel off" the casts and optimise the inner expression first, to determine
+     whether it is a lambda abstraction or not.
 
-where co :: (F Float -> N Float) ~ (Float# ~ N Float)
-
-But to actually beta-reduce that lambda, we need to push the 'co'
-inside the `\x` with pushCoecionIntoLambda.  Hence the extra
-equation for Cast-of-Lam in finish_app.
-
-This is regrettably delicate.
+This is regrettably delicate. If we could make sure the typechecker/desugarer
+did not produce these bad lambdas in the first place (as described in
+[Alternative approach] in Note [Desugaring unlifted newtypes]), we could
+get rid of this ugly logic.
 
 Note [Preserve join-binding arity]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -945,23 +1157,33 @@ and again its arity increases (#15517)
 -}
 
 
--- | Returns Just (bndr,rhs) if the binding is a join point:
--- If it's a JoinId, just return it
--- If it's not yet a JoinId but is always tail-called,
---    make it into a JoinId and return it.
--- In the latter case, eta-expand the RHS if necessary, to make the
--- lambdas explicit, as is required for join points
+-- | Returns @Just (bndr, rhs)@ if the binding is a join point, or can be made
+-- into a join poin. Returns @Nothing@ otherwise.
 --
--- Precondition: the InBndr has been occurrence-analysed,
---               so its OccInfo is valid
+--   - If the input binder is a 'JoinId', just return it;
+--   - if it's not yet a 'JoinId' but is always tail-called,
+--     make it into a 'JoinId' and return that.
+--
+-- In the latter case, eta-expand the RHS if necessary, to make the
+-- lambdas explicit, as is required for join points.
+--
+-- Precondition: the 'TailCallInfo' of the 'InBndr' is conservative:
+--
+--  - if it says 'AlwaysTailCalled', it is definitely always tail called,
+--  - if it says 'NoTailCallInfo', then we're not sure.
+--
+-- See Note [JoinId vs TailCallInfo].
 joinPointBinding_maybe :: InBndr -> InExpr -> Maybe (InBndr, InExpr)
 joinPointBinding_maybe bndr rhs
   | not (isId bndr)
   = Nothing
 
+  -- Being a JoinId is robust: preserve that. See Note [JoinId vs TailCallInfo].
   | isJoinId bndr
   = Just (bndr, rhs)
 
+  -- If the 'TailCallInfo' of 'bndr' says 'AlwaysTailCalled', then we know for
+  -- sure that it can be made into a join point.
   | AlwaysTailCalled join_arity <- tailCallInfo (idOccInfo bndr)
   , (bndrs, body) <- etaExpandToJoinPoint join_arity rhs
   , let str_sig   = idDmdSig bndr
@@ -977,6 +1199,48 @@ joinPointBindings_maybe :: [(InBndr, InExpr)] -> Maybe [(InBndr, InExpr)]
 joinPointBindings_maybe bndrs
   = mapM (uncurry joinPointBinding_maybe) bndrs
 
+{- Note [JoinId vs TailCallInfo]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* Occurrence information is /fundamentally fragile/; that is, it may
+  be invalidated by the Simplifier.
+  Example 1:
+      \y -> let x = y in ...x..x...
+    Here `y` is marked "occurs exactly once" but, after inlining `x`,
+    `y` now occurs many times.
+  Example 2:
+     f (let h x = ... in case y of { True -> h 1; False -> h 2 })
+  Here `h` is tail-called; but if `f` is strict we could transform to
+     let h x = ... in
+     case y of { True -> f (h 1); False -> f (h 2) }
+  Now `h` is not tail called any more.
+
+  Exception: Dead things (with no occurrences) usually stay dead.
+  There are exceptions e.g.
+      case x of y { (a,b) -> case y of (p,q) -> p }
+  Here `a` and `b` look dead, but we may well transform to
+      case x of y { (a,b) -> a }
+
+  Because occurrence info is fragile, we recompute occurrence info
+  (including tail call info) before each run of the Simplifier.
+
+  Whenever the simplifier performs a transformation that **might** invalidate
+  occurrence information, it calls 'zapFragileIdInfo'. This sets the
+  'TailCallInfo' to 'NoTailCallInfo' (among other things).
+
+* Being a JoinId is /robust/, and is rigorously maintained by the
+  Simplifier.  In Example 2 above, if `h` was marked as a JoinId,
+  that transformation would not have happened.  Instead we'd have
+  transformed to
+     let h x = f (...) in
+     case y of { True -> h 1; False -> h 2 }
+
+  The Simplifier takes an Id whose occurrences are marked as
+  `AlwaysTailCalled` and turns it into robust `JoinId`. This is
+  done by `joinPointBinding_maybe`.
+
+  There is one exception: float-out, the only caller of 'zapJoinId'.
+  See Note [Zapping JoinId when floating].
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -1180,7 +1444,7 @@ Note [Don't float join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 exprIsConApp_maybe should succeed on
    let v = e in Just v
-returning [x=e] as one of the [FloatBind].  But it must
+returning [x=e] as one of the FloatBinds.  But it must
 NOT succeed on
    join j x = rhs in Just v
 because join-points can't be gaily floated.  Consider
@@ -1273,21 +1537,21 @@ data ConCont = CC [CoreExpr] MCoercion
 -- in "GHC.Types.Id.Make".
 --
 -- We also return the incoming InScopeSet, augmented with
--- the binders from any [FloatBind] that we return
+-- the binders from any FloatBinds that we return
 exprIsConApp_maybe :: HasDebugCallStack
                    => InScopeEnv -> CoreExpr
-                   -> Maybe (InScopeSet, [FloatBind], DataCon, [Type], [CoreExpr])
+                   -> Maybe (InScopeSet, FloatBinds, DataCon, [Type], [CoreExpr])
 exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
-  = go (Left in_scope) [] expr (CC [] MRefl)
+  = go (Left in_scope) emptyFloatBinds expr (CC [] MRefl)
   where
     go :: Either InScopeSet Subst
              -- Left in-scope  means "empty substitution"
              -- Right subst    means "apply this substitution to the CoreExpr"
              -- NB: in the call (go subst floats expr cont)
              --     the substitution applies to 'expr', but /not/ to 'floats' or 'cont'
-       -> [FloatBind] -> CoreExpr -> ConCont
+       -> FloatBinds -> CoreExpr -> ConCont
              -- Notice that the floats here are in reverse order
-       -> Maybe (InScopeSet, [FloatBind], DataCon, [Type], [CoreExpr])
+       -> Maybe (InScopeSet, FloatBinds, DataCon, [Type], [CoreExpr])
     go subst floats (Tick t expr) cont
        | not (tickishIsCode t) = go subst floats expr cont
 
@@ -1316,7 +1580,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
        -- Good: returning (Mk#, [x]) with a float of  case exp of x { DEFAULT -> [] }
        --       simplifier produces case exp of a { DEFAULT -> exp[x/a] }
        , (subst', float, bndr) <- case_bind subst arg arg_type
-       = go subst' (float:floats) fun (CC (Var bndr : args) mco)
+       = go subst' (floats `snocOL` float) fun (CC (Var bndr : args) mco)
        | otherwise
        = go subst floats fun (CC (subst_expr subst arg : args) mco)
 
@@ -1326,7 +1590,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
        | otherwise
        = let (subst', bndr') = subst_bndr subst bndr
              float           = FloatLet (NonRec bndr' arg)
-         in go subst' (float:floats) body (CC args mco)
+         in go subst' (floats `snocOL` float) body (CC args mco)
 
     go subst floats (Let (NonRec bndr rhs) expr) cont
        | not (isJoinId bndr)
@@ -1334,7 +1598,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
        = let rhs'            = subst_expr subst rhs
              (subst', bndr') = subst_bndr subst bndr
              float           = FloatLet (NonRec bndr' rhs')
-         in go subst' (float:floats) expr cont
+         in go subst' (floats `snocOL` float) expr cont
 
     go subst floats (Case scrut b _ [Alt con vars expr]) cont
        | do_case_elim scrut' b vars  -- See Note [Case elim in exprIsConApp_maybe]
@@ -1345,7 +1609,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
           (subst'', vars') = subst_bndrs subst' vars
           float            = FloatCase scrut' b' con vars'
          in
-           go subst'' (float:floats) expr cont
+           go subst'' (floats `snocOL` float) expr cont
        where
           scrut'           = subst_expr subst scrut
 
@@ -1361,7 +1625,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
         , count isValArg args == idArity fun
         , (in_scope', seq_floats, args') <- mkFieldSeqFloats in_scope con args
           -- mkFieldSeqFloats: See (SFC2) in Note [Strict fields in Core]
-        = succeedWith in_scope' (seq_floats ++ floats) $
+        = succeedWith in_scope' (floats `appOL` seq_floats) $
           pushCoDataCon con args' mco
 
         -- Look through data constructor wrappers: they inline late (See Note
@@ -1410,12 +1674,11 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
 
     go _ _ _ _ = Nothing
 
-    succeedWith :: InScopeSet -> [FloatBind]
+    succeedWith :: InScopeSet -> FloatBinds
                 -> Maybe (DataCon, [Type], [CoreExpr])
-                -> Maybe (InScopeSet, [FloatBind], DataCon, [Type], [CoreExpr])
-    succeedWith in_scope rev_floats x
+                -> Maybe (InScopeSet, FloatBinds, DataCon, [Type], [CoreExpr])
+    succeedWith in_scope floats x
       = do { (con, tys, args) <- x
-           ; let floats = reverse rev_floats
            ; return (in_scope, floats, con, tys, args) }
 
     ----------------------------
@@ -1447,7 +1710,8 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
     extend (Left in_scope) v e = Right (extendSubst (mkEmptySubst in_scope) v e)
     extend (Right s)       v e = Right (extendSubst s v e)
 
-    case_bind :: Either InScopeSet Subst -> CoreExpr -> Type -> (Either InScopeSet Subst, FloatBind, Id)
+    case_bind :: Either InScopeSet Subst -> CoreExpr -> Type
+              -> (Either InScopeSet Subst, FloatBind, Id)
     case_bind subst expr expr_ty = (subst', float, bndr)
       where
         bndr   = setCaseBndrEvald MarkedStrict $
@@ -1457,22 +1721,23 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
         expr'  = subst_expr subst expr
         float  = FloatCase expr' bndr DEFAULT []
 
-    mkFieldSeqFloats :: InScopeSet -> DataCon -> [CoreExpr] -> (InScopeSet, [FloatBind], [CoreExpr])
+    mkFieldSeqFloats :: InScopeSet -> DataCon -> [CoreExpr] -> (InScopeSet, FloatBinds, [CoreExpr])
     -- See Note [Strict fields in Core] for what a field seq is and (SFC2) for
     -- why we insert them
     mkFieldSeqFloats in_scope dc args
       | isLazyDataConRep dc
-      = (in_scope, [], args)
+      = (in_scope, nilOL, args)
       | otherwise
       = (in_scope', floats', ty_args ++ val_args')
       where
         (ty_args, val_args) = splitAtList (dataConUnivAndExTyCoVars dc) args
-        (in_scope', floats', val_args') = foldr do_one (in_scope, [], []) $ zipEqual str_marks val_args
+        (in_scope', floats', val_args') = foldr do_one (in_scope, nilOL, []) $
+                                          zipEqual str_marks val_args
         str_marks = dataConRepStrictness dc
         do_one (str, arg) (in_scope,floats,args)
           | NotMarkedStrict <- str   = no_seq
           | exprIsHNF arg            = no_seq
-          | otherwise                = (in_scope', float:floats, Var bndr:args)
+          | otherwise                = (in_scope', float `consOL` floats, Var bndr:args)
           where
             no_seq = (in_scope, floats, arg:args)
             (in_scope', float, bndr) =

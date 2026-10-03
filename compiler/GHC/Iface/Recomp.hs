@@ -1,7 +1,4 @@
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE LambdaCase #-}
 
 -- | Module for detecting if recompilation is required
 module GHC.Iface.Recomp
@@ -56,6 +53,7 @@ import GHC.Utils.Constants (debugIsOn)
 import GHC.Types.Annotations
 import GHC.Types.Avail
 import GHC.Types.Basic ( ImportLevel(..) )
+import GHC.Types.UnresolvedImport
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
@@ -91,6 +89,10 @@ import GHC.Iface.Errors.Ppr
 import Data.Functor
 import Data.Bifunctor (first)
 import GHC.Types.PkgQual
+import GHC.ByteCode.Serialize (ModuleByteCode, gbc_hash)
+import GHC.Unit.Home.Graph (lookupHugByModule)
+import GHC.Unit.Home.ModInfo (HomeModLinkable(..), HomeModInfo (..))
+import GHC.Linker.Types (linkableParts)
 
 {-
   -----------------------------------------------
@@ -193,7 +195,9 @@ data RecompReason
   | ModuleAdded (ImportLevel, UnitId, ModuleName)
   | ModuleChangedRaw ModuleName
   | ModuleChangedIface ModuleName
+  | ModuleChangedBytecode ModuleName
   | FileChanged FilePath
+  | DirChanged FilePath
   | CustomReason String
   | FlagsChanged
   | LinkFlagsChanged
@@ -206,7 +210,6 @@ data RecompReason
   | MismatchedDynHiFile
   | ObjectsChanged
   | LibraryChanged
-  | THWithJS
   deriving (Eq)
 
 
@@ -227,9 +230,11 @@ instance Outputable RecompReason where
     ModuleChanged m          -> ppr m <+> text "changed"
     ModuleChangedRaw m       -> ppr m <+> text "changed (raw)"
     ModuleChangedIface m     -> ppr m <+> text "changed (interface)"
+    ModuleChangedBytecode m     -> ppr m <+> text "changed (bytecode)"
     ModuleRemoved (_st, _uid, m)   -> ppr m <+> text "removed"
     ModuleAdded (_st, _uid, m)     -> ppr m <+> text "added"
     FileChanged fp           -> text fp <+> text "changed"
+    DirChanged dp            -> text "Contents of" <+> text dp <+> text "changed"
     CustomReason s           -> text s
     FlagsChanged             -> text "Flags changed"
     LinkFlagsChanged         -> text "Flags changed"
@@ -242,7 +247,6 @@ instance Outputable RecompReason where
     MismatchedDynHiFile     -> text "Mismatched dynamic interface file"
     ObjectsChanged          -> text "Objects changed"
     LibraryChanged          -> text "Library changed"
-    THWithJS                -> text "JS backend always recompiles modules using Template Haskell for now (#23013)"
 
 recompileRequired :: RecompileRequired -> Bool
 recompileRequired UpToDate = False
@@ -304,7 +308,7 @@ check_old_iface hsc_env mod_summary maybe_iface
 
         loadIface read_dflags iface_path = do
              let ncu        = hsc_NC hsc_env
-             read_result <- readIface logger read_dflags ncu (ms_mod mod_summary) iface_path
+             read_result <- readIface (hsc_hooks hsc_env) logger read_dflags ncu (ms_mod mod_summary) iface_path
              case read_result of
                  Failed err -> do
                      let msg = readInterfaceErrorDiagnostic err
@@ -617,7 +621,7 @@ checkMergedSignatures hsc_env mod_summary self_recomp = do
         new_merged = case lookupUniqMap (requirementContext unit_state)
                           (ms_mod_name mod_summary) of
                         Nothing -> []
-                        Just r -> sort $ map (instModuleToModule unit_state) r
+                        Just r -> sort $ map instModuleToModule r
     if old_merged == new_merged
         then up_to_date logger (text "signatures to merge in unchanged" $$ ppr new_merged)
         else return $ needsRecompileBecause SigsMergeChanged
@@ -635,13 +639,8 @@ checkMergedSignatures hsc_env mod_summary self_recomp = do
 checkDependencies :: HscEnv -> ModSummary -> ModIface -> IfG RecompileRequired
 checkDependencies hsc_env summary iface
  = do
-    res_normal <- classify_import (findImportedModule hsc_env)
-                                  ([(st, p, m) | (st, p, m) <- (ms_textual_imps summary)]
-                                  ++
-                                  [(NormalLevel, NoPkgQual, m) | m <- ms_srcimps summary ])
-    res_plugin <- classify_import (\mod _ -> findPluginModule hsc_env mod)
-                    [(st, p, m) | (st, p, m) <- (ms_plugin_imps summary) ]
-    case sequence (res_normal ++ res_plugin) of
+    res <- classify_imports (ms_imps summary)
+    case sequence res of
       Left recomp -> return $ NeedsRecompile recomp
       Right es -> do
         let (hs, ps) = partitionEithers es
@@ -652,16 +651,16 @@ checkDependencies hsc_env summary iface
             in check_packages allPkgDeps prev_dep_pkgs
  where
 
-   classify_import :: (ModuleName -> t -> IO FindResult)
-                      -> [(ImportLevel, t, GenLocated l ModuleName)]
+   classify_imports :: [UnresolvedImport PkgQual]
                     -> IfG
                        [Either
                           CompileReason (Either (ImportLevel, UnitId, ModuleName) (FastString, (ImportLevel, UnitId)))]
-   classify_import find_import imports =
-    liftIO $ traverse (\(st, mb_pkg, L _ mod) ->
-           let reason = ModuleChanged mod
-           in classify st reason <$> find_import mod mb_pkg)
+   classify_imports imports =
+    liftIO $ traverse (\e ->
+           let reason = ModuleChanged (unLoc (ui_mod_name e))
+           in classify (ui_level e) reason <$> resolveImport hsc_env e)
            imports
+
    logger        = hsc_logger hsc_env
    all_home_units = hsc_all_home_unit_ids hsc_env
    prev_dep_mods = map (\(IfaceImportLevel s,u, a) -> (s, u, gwib_mod a)) $ Set.toAscList $ dep_direct_mods (mi_deps iface)
@@ -719,6 +718,15 @@ needInterface mod continue
         Nothing -> return $ NeedsRecompile MustCompile
         Just iface -> liftIO $ continue iface
 
+needBytecode :: Module -> (ModuleByteCode -> IO RecompileRequired)
+             -> IfG RecompileRequired
+needBytecode mod continue
+  = do
+      mb_recomp <- tryGetBytecode mod
+      case mb_recomp of
+        Nothing -> return $ NeedsRecompile MustCompile
+        Just mbc -> liftIO $ continue mbc
+
 tryGetModIface :: String -> Module -> IfG (Maybe ModIface)
 tryGetModIface doc_msg mod
   = do  -- Load the imported interface if possible
@@ -739,6 +747,27 @@ tryGetModIface doc_msg mod
                   -- just be that the current module doesn't need that
                   -- import and it's been deleted
       Succeeded iface -> pure $ Just iface
+
+tryGetBytecode :: Module -> IfG (Maybe ModuleByteCode)
+tryGetBytecode mod
+  = do  -- Load the imported bytecode if possible
+    logger <- getLogger
+    liftIO $ trace_hi_diffs logger (text "Checking bytecode hash for module" <+> ppr mod <+> ppr (moduleUnit mod))
+
+    mb_module_bytecode <- do
+      env <- getTopEnv
+      liftIO (lookupHugByModule mod (hsc_HUG env)) >>= \ case
+        Nothing -> pure Nothing
+        Just hmi ->
+          case homeMod_bytecode (hm_linkable hmi) of
+            Nothing -> pure Nothing
+            Just gbc_linkable -> pure $ Just $ linkableParts gbc_linkable
+
+    case mb_module_bytecode of
+      Nothing -> do
+        liftIO $ trace_hi_diffs logger (sep [text "Couldn't find bytecode for module", ppr mod])
+        return Nothing
+      Just module_bytecode -> pure $ Just module_bytecode
 
 -- | Given the usage information extracted from the old
 -- M.hi file for the module being compiled, figure out
@@ -761,14 +790,14 @@ checkModUsage _ UsageMergedRequirement{ usg_mod = mod, usg_mod_hash = old_mod_ha
   needInterface mod $ \iface -> do
     let reason = ModuleChangedRaw (moduleName mod)
     checkModuleFingerprint logger reason old_mod_hash (mi_mod_hash iface)
-checkModUsage _  UsageHomeModuleInterface{ usg_mod_name = mod_name
+checkModUsage _  UsageHomeModuleBytecode{ usg_mod_name = mod_name
                                                  , usg_unit_id = uid
-                                                 , usg_iface_hash = old_mod_hash } = do
+                                                 , usg_bytecode_hash = old_bytecode_hash } = do
   let mod = mkModule (RealUnit (Definite uid)) mod_name
   logger <- getLogger
-  needInterface mod $ \iface -> do
-    let reason = ModuleChangedIface mod_name
-    checkIfaceFingerprint logger reason old_mod_hash (mi_iface_hash iface)
+  needBytecode mod $ \cbc -> do
+    let reason = ModuleChangedBytecode mod_name
+    checkBytecodeFingerprint logger reason old_bytecode_hash (gbc_hash cbc)
 
 checkModUsage _ UsageHomeModule{
                                 usg_mod_name = mod_name,
@@ -814,6 +843,22 @@ checkModUsage fc UsageFile{ usg_file_path = file,
    handler = if debugIsOn
       then \e -> pprTrace "UsageFile" (text (show e)) $ return recomp
       else \_ -> return recomp -- if we can't find the file, just recompile, don't fail
+
+checkModUsage fc UsageDirectory{ usg_dir_path = dir,
+                                 usg_dir_hash = old_hash,
+                                 usg_dir_label = mlabel } =
+  liftIO $
+    handleIO handler $ do
+      new_hash <- lookupDirCache fc $ unpackFS dir
+      if (old_hash /= new_hash)
+         then return recomp
+         else return UpToDate
+ where
+   reason  = DirChanged $ unpackFS dir
+   recomp  = needsRecompileBecause $ fromMaybe reason $ fmap CustomReason mlabel
+   handler = if debugIsOn
+      then \e -> pprTrace "UsageDirectory" (text (show e)) $ return recomp
+      else \_ -> return recomp -- if we can't find the dir, just recompile, don't fail
 
 -- | We are importing a module whose exports have changed.
 -- Does this require recompilation?
@@ -1017,19 +1062,18 @@ checkModuleFingerprint logger reason old_mod_hash new_mod_hash
   = out_of_date_hash logger reason (text "  Module fingerprint has changed")
                      old_mod_hash new_mod_hash
 
-checkIfaceFingerprint
+checkBytecodeFingerprint
   :: Logger
   -> RecompReason
   -> Fingerprint
   -> Fingerprint
   -> IO RecompileRequired
-checkIfaceFingerprint logger reason old_mod_hash new_mod_hash
-  | new_mod_hash == old_mod_hash
-  = up_to_date logger (text "Iface fingerprint unchanged")
-
+checkBytecodeFingerprint logger reason old_bytecode_hash new_bytecode_hash
+  | old_bytecode_hash == new_bytecode_hash
+  = up_to_date logger (text "Bytecode fingerprint unchanged")
   | otherwise
-  = out_of_date_hash logger reason (text "  Iface fingerprint has changed")
-                     old_mod_hash new_mod_hash
+  = out_of_date_hash logger reason (text "  Bytecode fingerprint has changed")
+                     old_bytecode_hash new_bytecode_hash
 
 ------------------------
 checkEntityUsage :: Logger
@@ -1208,7 +1252,7 @@ addFingerprints hsc_env iface0 = do
 
       sorted_extra_decls :: Maybe IfaceSimplifiedCore
       sorted_extra_decls = mi_simplified_core iface0 <&> \simpl_core ->
-         IfaceSimplifiedCore (sortOn binding_key (mi_sc_extra_decls simpl_core)) (mi_sc_foreign simpl_core)
+         IfaceSimplifiedCore (sortOn binding_key (mi_sc_extra_decls simpl_core)) (mi_sc_modBreaks simpl_core) (mi_sc_foreign simpl_core)
 
   -- The interface hash depends on:
   --   - the ABI hash, plus
@@ -1767,10 +1811,12 @@ declExtras fix_fn ann_fn rule_env inst_env fi_env dm_env complete_env decl
       IfaceClass{ifBody = IfConcreteClass { ifSigs=sigs, ifATs=ats }} ->
                      IfaceClassExtras (fix_fn n) insts (ann_fn (AnnOccName n)) meths defms
           where
-            insts = (map ifDFun $ (concatMap at_extras ats)
-                                    ++ lookupOccEnvL inst_env n)
-                           -- Include instances of the associated types
-                           -- as well as instances of the class (#5147)
+            insts =
+              let (atFamInsts, atClsInsts) = foldMap at_extras ats
+              in (ifFamInstAxiom <$> atFamInsts) ++ (ifDFun <$> atClsInsts)
+                 ++ (ifDFun <$> lookupOccEnvL inst_env n)
+                           -- Include instances and axioms of the associated types
+                           -- as well as instances of the class (#5147) (#26183)
             meths = [id_extras (getOccName op) | IfaceClassOp op _ _ <- sigs]
             -- Names of all the default methods (see Note [default method Name])
             defms = [ dmName
@@ -1780,14 +1826,19 @@ declExtras fix_fn ann_fn rule_env inst_env fi_env dm_env complete_env decl
       IfaceSynonym{} -> IfaceSynonymExtras (fix_fn n)
                                            (ann_fn (AnnOccName n))
       IfaceFamily{} -> IfaceFamilyExtras (fix_fn n)
-                        (map ifFamInstAxiom (lookupOccEnvL fi_env n))
+                        (map ifFamInstAxiom (lookupOccEnvL fi_env n)
+                        ++ map ifDFun (lookupOccEnvL inst_env n)
+                        )
                         (ann_fn (AnnOccName n))
       IfacePatSyn{} -> IfacePatSynExtras (fix_fn n) (lookup_complete_match n)
       _other -> IfaceOtherDeclExtras
   where
         n = getOccName decl
         id_extras occ = IdExtras (fix_fn occ) (lookupOccEnvL rule_env occ) (ann_fn (AnnOccName occ)) (lookup_complete_match occ)
-        at_extras (IfaceAT decl _) = lookupOccEnvL inst_env (getOccName decl)
+        at_extras (IfaceAT decl _) =
+          ( lookupOccEnvL fi_env (getOccName decl) -- Axioms
+          , lookupOccEnvL inst_env (getOccName decl) -- Class instances
+          )
 
         lookup_complete_match occ = lookupOccEnvL complete_env occ
 

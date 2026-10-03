@@ -37,6 +37,7 @@ module GHC.Internal.IO.SubSystem (
 import GHC.Internal.Base
 import GHC.Internal.Show
 import GHC.Internal.Enum
+import GHC.Internal.Num
 
 #if defined(mingw32_HOST_OS)
 import GHC.Internal.IO.Unsafe

@@ -35,7 +35,8 @@ import GHC.Cmm.Graph
 import GHC.Cmm.BlockId
 import GHC.Cmm hiding ( succ )
 import GHC.Cmm.Info
-import GHC.Cmm.Utils ( cmmTagMask, mkWordCLit, mAX_PTR_TAG )
+import GHC.Cmm.Utils ( cmmTagMask, mkWordCLit )
+import GHC.Platform.Tag ( mAX_PTR_TAG )
 import GHC.Core
 import GHC.Core.DataCon
 import GHC.Types.ForeignCall
@@ -728,15 +729,13 @@ cgAlts gc_plan bndr (PrimAlt _) alts
         ; tagged_cmms <- cgAltRhss gc_plan bndr alts
 
         ; let bndr_reg = CmmLocal (idToReg platform bndr)
-              deflt = case tagged_cmms of
-                  (DEFAULT,deflt):_ -> deflt
-                  _ -> panic "cgAlts PrimAlt"
-                -- PrimAlts always have a DEFAULT case
-                -- and it always comes first
+              mdeflt = case tagged_cmms of
+                  (DEFAULT,deflt):_ -> Just deflt
+                  _ -> Nothing
 
               tagged_cmms' = [(lit,code)
                              | (LitAlt lit, code) <- tagged_cmms]
-        ; emitCmmLitSwitch (CmmReg bndr_reg) tagged_cmms' deflt
+        ; emitCmmLitSwitch (CmmReg bndr_reg) tagged_cmms' mdeflt
         ; return AssignedDirectly }
 
 cgAlts gc_plan bndr (AlgAlt tycon) alts
@@ -749,7 +748,10 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
               !ptag_expr = cmmConstrTag1 platform (CmmReg bndr_reg)
               !branches' = first succ <$> branches
               !maxpt = mAX_PTR_TAG platform
-              (!via_ptr, !via_info) = partition ((< maxpt) . fst) branches'
+              -- 'maxpt' is a 'DynTag'; branch tables use host-side 'ConTagZ'
+              -- (= 'Int'), so convert via 'fromDynTag'.
+              !maxpt_i = fromDynTag maxpt :: ConTagZ
+              (!via_ptr, !via_info) = partition ((< maxpt_i) . fst) branches'
               !small = isSmallFamily platform fam_sz
 
                 -- Is the constructor tag in the node reg?
@@ -757,7 +759,7 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
         ; if small || null via_info
            then -- Yes, bndr_reg has constructor tag in ls bits
                emitSwitch ptag_expr branches' mb_deflt 1
-                 (if small then fam_sz else maxpt)
+                 (if small then fam_sz else maxpt_i)
 
            else -- No, the get exact tag from info table when mAX_PTR_TAG
                 -- See Note [Double switching for big families]
@@ -773,7 +775,7 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
                   infos_lbl <- newBlockId
                   infos_scp <- getTickScope
 
-                  let spillover = (maxpt, (mkBranch infos_lbl, infos_scp))
+                  let spillover = (maxpt_i, (mkBranch infos_lbl, infos_scp))
 
                   (mb_shared_deflt, mb_shared_branch) <- case mb_deflt of
                       (Just (stmts, scp)) ->
@@ -782,13 +784,13 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
                                     , Just (mkBranch lbl, scp))
                       _ -> return (Nothing, Nothing)
                   -- Switch on pointer tag
-                  emitSwitch ptag_expr (spillover : via_ptr) mb_shared_deflt 1 maxpt
+                  emitSwitch ptag_expr (spillover : via_ptr) mb_shared_deflt 1 maxpt_i
                   join_lbl <- newBlockId
                   emit (mkBranch join_lbl)
                   -- Switch on info table tag
                   emitLabel infos_lbl
                   emitSwitch itag_expr info0 mb_shared_branch
-                    (maxpt - 1) (fam_sz - 1)
+                    (maxpt_i - 1) (fam_sz - 1)
                   emitLabel join_lbl
 
         ; return AssignedDirectly }
@@ -1053,6 +1055,7 @@ cgIdApp fun_id args = do
           | otherwise                -> emitReturn [fun]
 
         -- A value infered to be in WHNF, so we can just return it.
+        -- See (EPT-codegen) in Note [EPT enforcement] in GHC.Stg.EnforceEpt
         InferedReturnIt
           | isZeroBitTy (idType fun_id) -> trace >> emitReturn []
           | otherwise                   -> trace >> assertTag >>
@@ -1272,5 +1275,5 @@ cgTick tick
            ProfNote   cc t p -> emitSetCCC cc t p
            HpcTick    m n    -> emit (mkTickBox platform m n)
            SourceNote s n    -> emitTick $ SourceNote s n
-           _other            -> return () -- ignore
+           Breakpoint {}     -> return () -- ignore
        }

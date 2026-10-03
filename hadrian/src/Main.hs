@@ -16,6 +16,7 @@ import qualified CommandLine
 import qualified Environment
 import qualified Rules
 import qualified Rules.Codes
+import qualified Rules.Changelog
 import qualified Rules.Clean
 import qualified Rules.Docspec
 import qualified Rules.Documentation
@@ -34,6 +35,13 @@ main = do
     -- Provide access to command line arguments and some user settings through
     -- Shake's type-indexed map 'shakeExtra'.
     argsMap <- CommandLine.cmdLineArgsMap
+    case CommandLine.lookupBignum argsMap of
+      Just _ -> hPutStrLn stderr $ unlines
+        [ "Warning: --bignum is deprecated."
+        , "  Use the '+native_bignum' flavour transformer instead (e.g. --flavour=default+native_bignum)."
+        , "  When building for the JavaScript target, native bignum is now enabled automatically."
+        ]
+      Nothing -> return ()
     let extra = insertExtra UserSettings.buildProgressColour
               $ insertExtra UserSettings.successColour
               $ argsMap
@@ -55,7 +63,13 @@ main = do
     shakeColor <- shouldUseColor
     let options :: ShakeOptions
         options = shakeOptions
-            { shakeChange   = ChangeModtimeAndDigest
+            { -- Bump shakeVersion whenever a type stored in the Shake oracle
+              -- changes its Binary representation (e.g. fields added/removed
+              -- from PackageData or other oracle value types). This forces
+              -- Shake to wipe the stale database instead of crashing on
+              -- deserialisation.
+              shakeVersion  = "3"
+            , shakeChange   = ChangeModtimeAndDigest
             , shakeFiles    = buildRoot -/- Base.shakeFilesDir
             , shakeProgress = Progress.hadrianProgress cwd
             , shakeRebuild  = rebuild
@@ -108,6 +122,7 @@ main = do
 #if HADRIAN_ENABLE_SELFTEST
             Rules.Selftest.selftestRules
 #endif
+            Rules.Changelog.changelogRules
             Rules.SourceDist.sourceDistRules
             Rules.Test.testRules
             Rules.topLevelTargets

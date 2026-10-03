@@ -37,7 +37,11 @@ import GHCi.ResolvedBCO
 
 import GHC.LanguageExtensions
 import GHC.InfoProv
+#if MIN_VERSION_ghc_internal(9,1500,0)
 import qualified GHC.Exts.Heap as Heap
+#else
+import qualified GHC.Exts.Heap as Heap
+#endif
 import GHC.ForeignSrcLang
 import GHC.Fingerprint
 import GHC.Conc (pseq, par)
@@ -63,6 +67,7 @@ import Foreign
 import GHC.Generics
 import GHC.Stack.CCS
 import qualified GHC.Boot.TH.Syntax        as TH
+import qualified GHC.Boot.TH.Monad         as TH
 import System.Exit
 import System.IO
 import System.IO.Error
@@ -81,10 +86,10 @@ data Message a where
 
   -- These all invoke the corresponding functions in the RTS Linker API.
   InitLinker :: Message ()
-  LookupSymbol :: String -> Message (Maybe (RemotePtr ()))
-  LookupSymbolInDLL :: RemotePtr LoadedDLL -> String -> Message (Maybe (RemotePtr ()))
-  LookupClosure :: String -> Message (Maybe HValueRef)
-  LoadDLL :: String -> Message (Either String (RemotePtr LoadedDLL))
+  LookupSymbol :: !BS.ShortByteString -> Message (Maybe (RemotePtr ()))
+  LookupSymbolInDLL :: !(RemotePtr LoadedDLL) -> !BS.ShortByteString -> Message (Maybe (RemotePtr ()))
+  LookupClosure :: !BS.ShortByteString -> Message (Maybe HValueRef)
+  LoadDLLs :: [String] -> Message (Either String [RemotePtr LoadedDLL])
   LoadArchive :: String -> Message () -- error?
   LoadObj :: String -> Message () -- error?
   UnloadObj :: String -> Message () -- error?
@@ -106,6 +111,8 @@ data Message a where
 
   -- | Add entries to the Static Pointer Table
   AddSptEntry :: Fingerprint -> HValueRef -> Message ()
+  -- | Add module to hpc
+  AddHpcModule :: BS.ShortByteString -> Int -> Int -> BS.ShortByteString -> Message ()
 
   -- | Malloc some data and return a 'RemotePtr' to it
   MallocData :: ByteString -> Message (RemotePtr ())
@@ -157,8 +164,8 @@ data Message a where
 
   -- | Create a set of CostCentres with the same module name
   MkCostCentres
-   :: String     -- module, RemotePtr so it can be shared
-   -> [(String,String)] -- (name, SrcSpan)
+   :: !(RemotePtr ())                             -- ModuleName
+   -> ![(BS.ShortByteString, BS.ShortByteString)] -- (name, SrcSpan)
    -> Message [RemotePtr CostCentre]
 
   -- | Show a 'CostCentreStack' as a @[String]@
@@ -218,7 +225,7 @@ data Message a where
                    -> [RemoteRef (TH.Q ())]
                    -> Message (QResult ())
 
-  -- | Remote interface to GHC.Exts.Heap.getClosureData. This is used by
+  -- | Remote interface to GHC.Internal.Heap.getClosureData. This is used by
   -- the GHCi debugger to inspect values in the heap for :print and
   -- type reconstruction.
   GetClosure
@@ -240,6 +247,11 @@ data Message a where
   ResumeSeq
     :: RemoteRef (ResumeContext ())
     -> Message (EvalStatus ())
+
+  -- | User-defined request encoded as a tag/payload pair.  This is left
+  -- uninterpreted by GHC and is meant for GHC API applications to be able to supply
+  -- their own interpreter which understands additional commands.
+  CustomMessage :: Word8 -> ByteString -> Message ByteString
 
 deriving instance Show (Message a)
 
@@ -291,6 +303,7 @@ data THMessage a where
 
   GetPackageRoot :: THMessage (THResult FilePath)
   AddDependentFile :: FilePath -> THMessage (THResult ())
+  AddDependentDirectory :: FilePath -> THMessage (THResult ())
   AddTempFile :: String -> THMessage (THResult FilePath)
   AddModFinalizer :: RemoteRef (TH.Q ()) -> THMessage (THResult ())
   AddCorePlugin :: String -> THMessage (THResult ())
@@ -343,6 +356,7 @@ getTHMessage = do
     23 -> THMsg <$> (PutDoc <$> get <*> get)
     24 -> THMsg <$> GetDoc <$> get
     25 -> THMsg <$> return GetPackageRoot
+    26 -> THMsg <$> AddDependentDirectory <$> get
     n -> error ("getTHMessage: unknown message " ++ show n)
 
 putTHMessage :: THMessage a -> Put
@@ -373,7 +387,7 @@ putTHMessage m = case m of
   PutDoc l s                  -> putWord8 23 >> put l >> put s
   GetDoc l                    -> putWord8 24 >> put l
   GetPackageRoot              -> putWord8 25
-
+  AddDependentDirectory a     -> putWord8 26 >> put a
 
 data EvalOpts = EvalOpts
   { useSandboxThread :: Bool
@@ -418,7 +432,7 @@ data EvalStatus_ a b
 instance Binary a => Binary (EvalStatus_ a b)
 
 data EvalBreakpoint = EvalBreakpoint
-  { eb_info_mod      :: String -- ^ Breakpoint info module
+  { eb_info_mod      :: !BS.ShortByteString -- ^ Breakpoint info module
   , eb_info_mod_unit :: BS.ShortByteString -- ^ Breakpoint tick module unit id
   , eb_info_index    :: Int    -- ^ Breakpoint info index
   }
@@ -441,7 +455,7 @@ data BreakModule
 -- that type isn't available here.
 data BreakUnitId
 
--- | A dummy type that tags pointers returned by 'LoadDLL'.
+-- | A dummy type that tags pointers returned by 'LoadDLLs'.
 data LoadedDLL
 
 -- SomeException can't be serialized because it contains dynamic
@@ -518,9 +532,11 @@ instance Binary (FunPtr a) where
   put = put . castFunPtrToPtr
   get = castPtrToFunPtr <$> get
 
+#if MIN_VERSION_GLASGOW_HASKELL(9,12,2,20250919)
 instance Binary Heap.HalfWord where
   put x = put (fromIntegral x :: Word32)
   get = fromIntegral <$> (get :: Get Word32)
+#endif
 
 -- Binary instances to support the GetClosure message
 instance Binary Heap.StgTSOProfInfo
@@ -555,7 +571,7 @@ getMessage = do
       1  -> Msg <$> return InitLinker
       2  -> Msg <$> LookupSymbol <$> get
       3  -> Msg <$> LookupClosure <$> get
-      4  -> Msg <$> LoadDLL <$> get
+      4  -> Msg <$> LoadDLLs <$> get
       5  -> Msg <$> LoadArchive <$> get
       6  -> Msg <$> LoadObj <$> get
       7  -> Msg <$> UnloadObj <$> get
@@ -593,6 +609,8 @@ getMessage = do
       38 -> Msg <$> (ResumeSeq <$> get)
       39 -> Msg <$> (LookupSymbolInDLL <$> get <*> get)
       40 -> Msg <$> (WhereFrom <$> get)
+      41 -> Msg <$> (AddHpcModule <$> get <*> get <*> get <*> get)
+      42 -> Msg <$> (CustomMessage <$> get <*> get)
       _  -> error $ "Unknown Message code " ++ (show b)
 
 putMessage :: Message a -> Put
@@ -601,7 +619,7 @@ putMessage m = case m of
   InitLinker                  -> putWord8 1
   LookupSymbol str            -> putWord8 2  >> put str
   LookupClosure str           -> putWord8 3  >> put str
-  LoadDLL str                 -> putWord8 4  >> put str
+  LoadDLLs strs               -> putWord8 4  >> put strs
   LoadArchive str             -> putWord8 5  >> put str
   LoadObj str                 -> putWord8 6  >> put str
   UnloadObj str               -> putWord8 7  >> put str
@@ -639,6 +657,8 @@ putMessage m = case m of
   ResumeSeq a                 -> putWord8 38 >> put a
   LookupSymbolInDLL dll str   -> putWord8 39 >> put dll >> put str
   WhereFrom a                 -> putWord8 40 >> put a
+  AddHpcModule m n h ticks    -> putWord8 41 >> put m >> put n >> put h >> put ticks
+  CustomMessage tag payload   -> putWord8 42 >> put tag >> put payload
 
 {-
 Note [Parallelize CreateBCOs serialization]

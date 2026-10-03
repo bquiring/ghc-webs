@@ -22,9 +22,12 @@ import GHC.Core.SimpleOpt
 
 import GHC.Data.FastString
 
+import GHC.Hs.Extension (GhcPass, GhcTc)
+
 import GHC.Types.Var
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma
 import GHC.Types.Unique.Supply
 import GHC.Types.Basic
 import GHC.Types.Demand
@@ -176,8 +179,9 @@ several liked-named Ids bouncing around at the same time---absolute
 mischief.)
 
 Notice that we refrain from w/w'ing an INLINE function even if it is
-in a recursive group.  It might not be the loop breaker.  (We could
-test for loop-breaker-hood, but I'm not sure that ever matters.)
+in a recursive group.  It might not be the loop breaker.  (We used to
+test for loop-breaker-hood, but see (CWW4) in Note [Cast worker/wrapper]
+in GHC.Core.Opt.Simplify.Iteration.)
 
 Note [Worker/wrapper for INLINABLE functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -476,15 +480,16 @@ When should the wrapper inlining be active?
            f n x = f (n+n) (x-1)
 
            g :: Int -> Int
-           g x = f x x            -- Provokes a specialisation for f
-
+           g x = f x x    -- Provokes a specialisation for f
+                          -- but not for $wf because w/w happens
+                          -- after specialisation
          module Bar where
            import Foo
 
            h :: Int -> Int
            h x = f 3 x
 
-   In module Bar we want to give specialisations a chance to fire
+   In module Bar we want to give f's specialisation a chance to fire
    before inlining f's wrapper.
 
    (Historical note: At one stage I tried making the wrapper inlining
@@ -495,7 +500,7 @@ When should the wrapper inlining be active?
       {-# SPECIALISE foo :: (Int,Int) -> Bool -> Int #-}
       {-# NOINLINE [n] foo #-}
     then specialisation will generate a SPEC rule active from Phase n.
-    See Note [Auto-specialisation and RULES] in GHC.Core.Opt.Specialise
+    See Note [Specialise: rule activation] in GHC.Core.Opt.Specialise
     This SPEC specialisation rule will compete with inlining, but we don't
     mind that, because if inlining succeeds, it should be better.
 
@@ -549,7 +554,7 @@ tryWW ww_opts is_rec fn_id rhs
   -- See Note [Drop absent bindings]
   | isAbsDmd (demandInfo fn_info)
   , not (isJoinId fn_id)
-  , Just filler <- mkAbsentFiller ww_opts fn_id NotMarkedStrict
+  , Just filler <- mkAbsentFiller (wo_module ww_opts) fn_id NotMarkedStrict
   = return [(new_fn_id, filler)]
 
   -- See Note [Don't w/w INLINE things]
@@ -827,12 +832,12 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
 
     work_rhs = work_fn (mkLams fn_args fn_body)
     work_act = case fn_inline_spec of  -- See Note [Worker activation]
-                   NoInline _  -> inl_act fn_inl_prag
-                   _           -> inl_act wrap_prag
+                   NoInline -> inl_act fn_inl_prag
+                   _        -> inl_act wrap_prag
 
-    work_prag = InlinePragma { inl_src = SourceText $ fsLit "{-# INLINE"
+    srcTxt = SourceText $ fsLit "{-# INLINE"
+    work_prag = InlinePragma { inl_ext = XInlinePragmaGhc srcTxt AnySaturation
                              , inl_inline = fn_inline_spec
-                             , inl_sat    = Nothing
                              , inl_act    = work_act
                              , inl_rule   = FunLike }
       -- inl_inline: copy from fn_id; see Note [Worker/wrapper for INLINABLE functions]
@@ -844,7 +849,7 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
       -- worker is join point iff wrapper is join point
       -- (see Note [Don't w/w join points for CPR])
 
-    work_id  = asWorkerLikeId $
+    work_id  = setCbvCandidate $
                mkWorkerId work_uniq fn_id (exprType work_rhs)
                 `setIdOccInfo` occInfo fn_info
                         -- Copy over occurrence info from parent
@@ -894,12 +899,11 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
     fn_unfolding    = realUnfoldingInfo fn_info
     fn_rules        = ruleInfoRules (ruleInfo fn_info)
 
-mkStrWrapperInlinePrag :: InlinePragma -> [CoreRule] -> InlinePragma
+mkStrWrapperInlinePrag :: InlinePragma (GhcPass p) -> [CoreRule] -> InlinePragma GhcTc
 mkStrWrapperInlinePrag (InlinePragma { inl_inline = fn_inl
                                      , inl_act    = fn_act
                                      , inl_rule   = rule_info }) rules
-  = InlinePragma { inl_src    = SourceText $ fsLit "{-# INLINE"
-                 , inl_sat    = Nothing
+  = InlinePragma { inl_ext    = XInlinePragmaGhc srcTxt AnySaturation
 
                  , inl_inline = fn_inl
                       -- See Note [Worker/wrapper for INLINABLE functions]
@@ -909,10 +913,11 @@ mkStrWrapperInlinePrag (InlinePragma { inl_inline = fn_inl
 
                  , inl_rule   = rule_info }  -- RuleMatchInfo is (and must be) unaffected
   where
+    srcTxt = SourceText $ fsLit "{-# INLINE"
     -- See Note [Wrapper activation]
-    wrapper_phase = foldr (laterPhase . get_rule_phase) earliest_inline_phase rules
-    earliest_inline_phase = beginPhase fn_act `laterPhase` nextPhase InitialPhase
-          -- laterPhase (nextPhase InitialPhase) is a temporary hack
+    wrapper_phase = foldr (latestPhase . get_rule_phase) earliest_inline_phase rules
+    earliest_inline_phase = beginPhase fn_act `latestPhase` nextPhase InitialPhase
+          -- latestPhase (nextPhase InitialPhase) is a temporary hack
           -- to inline no earlier than phase 2.  I got regressions in
           -- 'mate', due to changes in full laziness due to Note [Case
           -- MFEs], when I did earlier inlining.
@@ -921,10 +926,8 @@ mkStrWrapperInlinePrag (InlinePragma { inl_inline = fn_inl
     -- The phase /after/ the rule is first active
     get_rule_phase rule = nextPhase (beginPhase (ruleActivation rule))
 
-{-
-Note [Demand on the worker]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+{- Note [Demand on the worker]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If the original function is called once, according to its demand info, then
 so is the worker. This is important so that the occurrence analyser can
 attach OneShot annotations to the worker’s lambda binders.

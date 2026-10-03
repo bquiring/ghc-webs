@@ -54,39 +54,19 @@ extern "C" {
 #include "rts/Types.h"
 #include "rts/Time.h"
 
-#if __GNUC__ >= 3
 #define ATTRIBUTE_ALIGNED(n) __attribute__((aligned(n)))
-#else
-#define ATTRIBUTE_ALIGNED(n) /*nothing*/
-#endif
 
 // Symbols that are extern, but private to the RTS, are declared
 // with visibility "hidden" to hide them outside the RTS shared
 // library.
-#if defined(HAS_VISIBILITY_HIDDEN)
 #define RTS_PRIVATE  GNUC3_ATTRIBUTE(visibility("hidden"))
-#else
-#define RTS_PRIVATE  /* disabled: RTS_PRIVATE */
-#endif
 
-#if __GNUC__ >= 4
 #define RTS_UNLIKELY(p) __builtin_expect((p),0)
-#else
-#define RTS_UNLIKELY(p) (p)
-#endif
 
-#if __GNUC__ >= 4
 #define RTS_LIKELY(p) __builtin_expect(!!(p), 1)
-#else
-#define RTS_LIKELY(p) (p)
-#endif
 
 /* __builtin_unreachable is supported since GNU C 4.5 */
-#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5)
 #define RTS_UNREACHABLE __builtin_unreachable()
-#else
-#define RTS_UNREACHABLE abort()
-#endif
 
 /* Prefetch primitives */
 #define prefetchForRead(ptr) __builtin_prefetch(ptr, 0)
@@ -211,6 +191,13 @@ void _warnFail(const char *filename, unsigned int linenum);
 #define FMT_HexSizeT "zx"
 
 /* -----------------------------------------------------------------------------
+   Useful macros and inline functions
+   -------------------------------------------------------------------------- */
+
+#define stg_min(a,b) ({__typeof__(a) _a = (a), _b = (b); _a <= _b ? _a : _b; })
+#define stg_max(a,b) ({__typeof__(a) _a = (a), _b = (b); _a <= _b ? _b : _a; })
+
+/* -----------------------------------------------------------------------------
    Include everything STG-ish
    -------------------------------------------------------------------------- */
 
@@ -249,6 +236,7 @@ void _warnFail(const char *filename, unsigned int linenum);
 #include "rts/storage/ClosureTypes.h"
 #include "rts/storage/TSO.h"
 #include "stg/MiscClosures.h" /* InfoTables, closures etc. defined in the RTS */
+
 #include "rts/storage/Block.h"
 #include "rts/storage/ClosureMacros.h"
 #include "rts/storage/MBlock.h"
@@ -285,9 +273,9 @@ void _warnFail(const char *filename, unsigned int linenum);
 #include "rts/LibdwPool.h"
 
 /* Misc stuff without a home */
-DLL_IMPORT_RTS extern char **prog_argv; /* so we can get at these from Haskell */
-DLL_IMPORT_RTS extern int    prog_argc;
-DLL_IMPORT_RTS extern char  *prog_name;
+extern char **prog_argv; /* so we can get at these from Haskell */
+extern int    prog_argc;
+extern char  *prog_name;
 
 void reportStackOverflow(StgTSO* tso);
 void reportHeapOverflow(void);
@@ -373,22 +361,6 @@ TICK_VAR(2)
 #else
 #define DEBUG_IS_ON   0
 #endif /* DEBUG */
-
-/* -----------------------------------------------------------------------------
-   Useful macros and inline functions
-   -------------------------------------------------------------------------- */
-
-#if defined(__GNUC__)
-#define SUPPORTS_TYPEOF
-#endif
-
-#if defined(SUPPORTS_TYPEOF)
-#define stg_min(a,b) ({typeof(a) _a = (a), _b = (b); _a <= _b ? _a : _b; })
-#define stg_max(a,b) ({typeof(a) _a = (a), _b = (b); _a <= _b ? _b : _a; })
-#else
-#define stg_min(a,b) ((a) <= (b) ? (a) : (b))
-#define stg_max(a,b) ((a) <= (b) ? (b) : (a))
-#endif
 
 /* -------------------------------------------------------------------------- */
 

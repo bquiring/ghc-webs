@@ -3,6 +3,7 @@
 {-# LANGUAGE StandaloneKindSignatures #-}
 {-# LANGUAGE Trustworthy #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Foreign.C.ConstPtr
@@ -25,6 +26,7 @@ module GHC.Internal.Foreign.C.ConstPtr (
 import GHC.Internal.Base
 import GHC.Internal.Ptr
 import GHC.Internal.Show
+import GHC.Internal.Num as Rebindable( fromInteger )   -- For known-key names
 
 -- | A pointer with the C @const@ qualifier. For instance, an argument of type
 -- @ConstPtr CInt@ would be marshalled as @const int*@.

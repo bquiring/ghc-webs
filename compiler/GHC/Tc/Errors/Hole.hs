@@ -1,7 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE ExistentialQuantification #-}
 
 module GHC.Tc.Errors.Hole
    ( findValidHoleFits
@@ -37,20 +36,25 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcMType
+import GHC.Tc.TyCl.PatSyn (patSynBuilderOcc)
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 import GHC.Core.TyCon( TyCon, isGenerativeTyCon )
 import GHC.Core.TyCo.Rep( Type(..) )
+import GHC.Core.Type (funTyFlagTyCon)
 import GHC.Core.DataCon
+import GHC.Core.PatSyn (patSynName)
 import GHC.Core.Predicate( Pred(..), classifyPredType, eqRelRole )
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Reader
-import GHC.Builtin.Names ( gHC_INTERNAL_ERR, gHC_INTERNAL_UNSAFE_COERCE )
-import GHC.Builtin.Types ( tupleDataConName, unboxedSumDataConName )
+import GHC.Builtin.Modules ( gHC_INTERNAL_ERR, gHC_INTERNAL_UNSAFE_COERCE )
+import GHC.Builtin.WiredIn.Types ( tupleDataConName, unboxedSumDataConName )
 import GHC.Types.Id
+import GHC.Types.Name.Set (extendNameSet, NameSet, emptyNameSet)
+import GHC.Types.Var (isVisibleFunArg)
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.TyThing
@@ -61,7 +65,6 @@ import GHC.Tc.Utils.Env (tcLookup)
 import GHC.Utils.Outputable
 import GHC.Driver.DynFlags
 import GHC.Data.Maybe
-import GHC.Utils.FV ( fvVarList, fvVarSet, unionFV, mkFVs, FV )
 
 import Control.Arrow ( (&&&) )
 
@@ -72,14 +75,17 @@ import Data.Graph       ( graphFromEdges, topSort )
 
 import GHC.Tc.Solver    ( simplifyTopWanteds )
 import GHC.Tc.Solver.Monad ( runTcSEarlyAbort )
-import GHC.Tc.Utils.Unify ( tcSubTypeSigma )
+import GHC.Tc.Utils.Unify
+  ( DeepSubsumptionFlag(..), DeepSubsumptionDepth(..)
+  , tcSubTypeHoleFit
+  )
 
 import GHC.HsToCore.Docs ( extractDocs )
 import GHC.Hs.Doc
 import GHC.Unit.Module.ModIface ( mi_docs )
 import GHC.Iface.Load  ( loadInterfaceForName )
 
-import GHC.Builtin.Utils (knownKeyNames)
+import GHC.Builtin (wiredInNames)
 
 import GHC.Tc.Errors.Hole.FitTypes
 import GHC.Tc.Errors.Hole.Plugin
@@ -91,7 +97,6 @@ import GHC.Types.Unique.Map
 import GHC.Data.EnumSet (EnumSet)
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.LanguageExtensions as LangExt
-
 
 {-
 Note [Valid hole fits include ...]
@@ -245,6 +250,23 @@ that any changes to the ev binds during a check remains localised to that check.
 In addition, we call withoutUnification to reset any unified metavariables; this
 call is actually done outside tcCheckHoleFit so that the results can be formatted
 for the user before resetting variables.
+
+Note [Deep subsumption in tcCheckHoleFit]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To check that a candidate fits in a hole, we perform a subsumption check, as
+detailed in Note [Checking hole fits]. However, should we also perform deep
+subsumption? Well, certainly if the user has enabled deep subsumption, and also
+in cases where deep subsumption is required such as to perform eta-expansion
+of data constructors, e.g.
+
+  data T = MkT Int Bool -- so that MkT :: Int %1 -> Bool %1 -> T
+
+  foo :: Int %1 -> Bool -> T
+  foo = _
+
+We should suggest MkT as a valid hole fit, because deep subsumption will
+eta expand to make the multiplicities line up, as per
+Note [Typechecking data constructors] in GHC.Tc.Gen.Head.
 
 Note [Valid refinement hole fits include ...]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -406,24 +428,61 @@ is discarded.
 
 Note [Speeding up valid hole-fits]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-To fix #16875 we noted that a lot of time was being spent on unnecessary work.
+When computing valid hole fits, we want to quickly rule out identifiers that
+clearly don't fit the type of the hole, without doing too much work.
+This is important for the performance of the "valid hole fits" feature,
+which is known to be slow in some cases (#16875).
 
-When we'd call `tcCheckHoleFit hole hole_ty ty`, we would end up by generating
-a constraint to show that `hole_ty ~ ty`, including any constraints in `ty`. For
-example, if `hole_ty = Int` and `ty = Foldable t => (a -> Bool) -> t a -> Bool`,
-we'd have `(a_a1pa[sk:1] -> Bool) -> t_t2jk[sk:1] a_a1pa[sk:1] -> Bool ~# Int`
-from the coercion, as well as `Foldable t_t2jk[sk:1]`. By adding a flag to
-`TcSEnv` and adding a `runTcSEarlyAbort`, we can fail as soon as we hit
-an insoluble constraint. Since we don't need the result in the case that it
-fails, a boolean `False` (i.e. "it didn't work" from `runTcSEarlyAbort`)
-is sufficient.
+The valid hole fits machinery is given the type of the hole and a possible
+candidate identifier, and it computes whether the identifier can be used by
+performing a subtype check
 
-We also check whether the type of the hole is an immutable type variable (i.e.
-a skolem). In that case, the only possible fits are fits of exactly that type,
-which can only come from the locals. This speeds things up quite a bit when we
-don't know anything about the type of the hole. This also helps with degenerate
-fits like (`id (_ :: a)` and `head (_ :: [a])`) when looking for fits of type
-`a`, where `a` is a skolem.
+  tcSubTypeHoleFit .. cand_ty hole_ty
+
+which checks that the type of the candidate identifier is more general than
+the type of the hole.
+
+We currently use the following shortcuts.
+
+  1. When computing a set of candidate identifiers for a hole:
+
+    (FastHoles1)
+      If 'hole_ty' is an immutable type variable (i.e. a skolem type variable),
+      then the only possible (useful) fits are fits of exactly that type, which
+      can only come from locally bound variables for which that skolem is in scope.
+      In that case, only include local identifiers in the list of candidate Ids.
+
+      This speeds things up quite a bit when we don't know anything about the type
+      of the hole, and helps with degenerate fits like (`id (_ :: a)` and `head (_ :: [a])`)
+      when looking for fits of type `a`, where `a` is a skolem.
+
+  2. When checking whether a particular candidate 'cand_ty :: cand_ty' fits 'hole_ty':
+
+    (FastHoles2)
+      Abort early if 'cand_ty' is obviously not a subtype of 'hole_ty',
+      according to a cheap test. The current cheap test is in 'definitelyNotSubType',
+      which detects the following cases:
+
+        1. 'cand_ty' and 'hole_ty' have a different TyCon at the head, after
+           looking through foralls and (=>) arrows, e.g.:
+              hole_ty = Int     -- headed by Int
+              cand_ty = Maybe a -- headed by Maybe
+           or
+              hole_ty = forall a b. a -> b               -- headed by (->)
+              cand_ty = forall x y. Num x => Either x y  -- headed by Either
+        2. 'hole_ty' is polymorphic but 'cand_ty' has no polymorphism, e.g.
+              hole_ty = forall a. a -> a
+              cand_ty = Int -> Int
+
+    (FastHoles3)
+      After calling 'tcSubTypeHoleFit' but before running the solver on the
+      constraints that it generated, do a quick check to see if any constraint
+      is obviously insoluble. See Note [tcCheckHoleFit: fast insolubility check].
+
+    (FastHoles4)
+      When running the solver on the constraints generated by 'tcSubTypeHoleFit',
+      do it in a special mode that stops immediately as soon as it spots an
+      insoluble constraint, using 'runTcSEarlyAbort'.
 -}
 
 -- We read the various -no-show-*-of-hole-fits flags
@@ -483,7 +542,7 @@ addHoleFitDocs fits =
             { Nothing -> return (Set.insert (nameOrigin name) mods_without_docs, TcHoleFit fit)
             ; Just docs -> do
                 { let doc = lookupUniqMap (docs_decls docs) name
-                ; return $ (mods_without_docs, TcHoleFit (fit {hfDoc = map hsDocString <$> doc})) }}}
+                ; return $ (mods_without_docs, TcHoleFit (fit {hfDoc = map (tcHsDocString . hsDocString) <$> doc})) }}}
    upd _ mods_without_docs fit@(RawHoleFit {}) = pure (mods_without_docs, fit)
    nameOrigin name = case nameModule_maybe name of
      Just m  -> Right m
@@ -518,8 +577,6 @@ getLocalBindings tidy_orig ct_loc
         discard_it = go env sofar tc_bndrs
         keep_it id = go env (id:sofar) tc_bndrs
 
-
-
 -- See Note [Valid hole fits include ...]
 findValidHoleFits :: TidyEnv        -- ^ The tidy_env for zonking
                   -> [Implication]  -- ^ Enclosing implications for givens
@@ -537,7 +594,9 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; sortingAlg <- getHoleFitSortingAlg
      ; dflags <- getDynFlags
      ; let exts = extensionFlags dflags
-     ; hfPlugs <- tcg_hf_plugins <$> getGblEnv
+     ; tcg_env <- getGblEnv
+     ; plugins <- readTcRef (tcg_plugins tcg_env)
+     ; let hfPlugs = holeFitTcMPlugins plugins
      ; let findVLimit = if sortingAlg > HFSNoSorting then Nothing else maxVSubs
            refLevel = refLevelHoleFits dflags
            hole = TypedHole { th_relevant_cts =
@@ -559,8 +618,10 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
                       map IdHFCand lclBinds ++ map GreHFCand lcl
            globals = map GreHFCand gbl
            syntax = map NameHFCand (builtIns exts)
-           -- If the hole is a rigid type-variable, then we only check the
+
+           -- If the hole is a rigid type variable, then we only check the
            -- locals, since only they can match the type (in a meaningful way).
+           -- See (FastHoles1) in Note [Speeding up valid hole-fits].
            only_locals = any isImmutableTyVar $ getTyVar_maybe hole_ty
            to_check = if only_locals then locals
                       else locals ++ syntax ++ globals
@@ -621,10 +682,10 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
 
     -- BuiltInSyntax names like (:) and []
     builtIns :: EnumSet LangExt.Extension -> [Name]
-    builtIns exts = filter isBuiltInSyntax (knownKeyNames ++ infFamNames)
+    builtIns exts = filter isBuiltInSyntax (wiredInNames ++ infFamNames)
       where
         -- Tuples and sums of are not included in knownKeyName as there are infinitely many of them.
-        -- See Note [Infinite families of known-key names] in GHC.Builtin.Names.
+        -- See Note [Infinite families of known-key names] in GHC.Builtin.KnownKeys.
         infFamNames =
              [tupleDataConName Boxed   n | n <- [0..max_tup]]
           ++ [tupleDataConName Unboxed n | unboxedTuples, n <- [0..max_tup]]
@@ -680,24 +741,22 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
     possiblyDiscard (Just max) fits = (fits `lengthExceeds` max, take max fits)
     possiblyDiscard Nothing fits = (False, fits)
 
-
 -- We don't (as of yet) handle holes in types, only in expressions.
 findValidHoleFits env _ _ _ = return (env, noValidHoleFits)
 
 -- See Note [Relevant constraints]
 relevantCtEvidence :: Type -> [CtEvidence] -> [CtEvidence]
 relevantCtEvidence hole_ty simples
-  = if isEmptyVarSet (fvVarSet hole_fvs)
+  = if isEmptyVarSet hole_fvs
     then []
     else filter isRelevant simples
-  where hole_fvs = tyCoFVsOfType hole_ty
-        hole_fv_set = fvVarSet hole_fvs
+  where hole_fvs = tyCoVarsOfType hole_ty
         -- We filter out those constraints that have no variables (since
         -- they won't be solved by finding a type for the type variable
         -- representing the hole) and also other holes, since we're not
         -- trying to find hole fits for many holes at once.
         isRelevant ctev = not (isEmptyVarSet fvs) &&
-                          (fvs `intersectsVarSet` hole_fv_set)
+                          (fvs `intersectsVarSet` hole_fvs)
           where fvs = tyCoVarsOfCtEv ctev
 
 -- We zonk the hole fits so that the output aligns with the rest
@@ -733,13 +792,14 @@ sortHoleFitsBySize = return . sortOn sizeOfFit
 -- '-fno-sort-valid-hole-fits'.
 sortHoleFitsByGraph :: [TcHoleFit] -> TcM [TcHoleFit]
 sortHoleFitsByGraph fits = go [] fits
-  where tcSubsumesWCloning :: TcType -> TcType -> TcM Bool
-        tcSubsumesWCloning ht ty = withoutUnification fvs (tcSubsumes ht ty)
-          where fvs = tyCoFVsOfTypes [ht,ty]
+  where tcSubsumesWCloning :: TcSigmaType -> TcSigmaType -> TcM Bool
+        tcSubsumesWCloning fit_ty cand_ty =
+          withoutUnification (tyCoVarsOfTypes [fit_ty, cand_ty]) $
+            tcSubsumes fit_ty cand_ty
         go :: [(TcHoleFit, [TcHoleFit])] -> [TcHoleFit] -> TcM [TcHoleFit]
         go sofar [] = do { traceTc "subsumptionGraph was" $ ppr sofar
                          ; return $ uncurry (++) $ partition hfIsLcl topSorted }
-          where toV (hf, adjs) = (hf, hfId hf, map hfId adjs)
+          where toV (hf, adjs) = (hf, hfName hf, map hfName adjs)
                 (graph, fromV, _) = graphFromEdges $ map toV sofar
                 topSorted = map ((\(h,_,_) -> h) . fromV) $ topSort graph
         go sofar (hf:hfs) =
@@ -764,17 +824,18 @@ tcFilterHoleFits :: Maybe Int
 tcFilterHoleFits (Just 0) _ _ _ = return (False, []) -- Stop right away on 0
 tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
   do { traceTc "checkingFitsFor {" $ ppr hole_ty
-     ; (discards, subs) <- go [] emptyVarSet limit ht candidates
+     ; (discards, subs) <- go [] emptyNameSet limit ht candidates
      ; traceTc "checkingFitsFor }" empty
      ; return (discards, subs) }
   where
-    hole_fvs :: FV
-    hole_fvs = tyCoFVsOfType hole_ty
+    hole_fvs :: VarSet
+    hole_fvs = tyCoVarsOfType hole_ty
+
     -- Kickoff the checking of the elements.
     -- We iterate over the elements, checking each one in turn for whether
     -- it fits, and adding it to the results if it does.
-    go :: [TcHoleFit]           -- What we've found so far.
-       -> VarSet              -- Ids we've already checked
+    go :: [TcHoleFit]         -- What we've found so far.
+       -> NameSet             -- Names of identifiers we have already checked
        -> Maybe Int           -- How many we're allowed to find, if limited
        -> (TcType, [TcTyVar]) -- The type, and its refinement variables.
        -> [HoleFitCandidate]  -- The elements we've yet to check.
@@ -787,46 +848,66 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
         do { traceTc "lookingUp" $ ppr el
            ; maybeThing <- lookup el
            ; case maybeThing of
-               Just (id, id_ty) | not_trivial id ->
-                       do { fits <- fitsHole ty id_ty
+               Just cand@(_, is_dc, cand_ty) ->
+                       do { fits <- fitsHole ty cand_ty is_dc
                           ; case fits of
-                              Just (wrp, matches) -> keep_it id id_ty wrp matches
+                              Just (wrp, matches) -> keep_it cand wrp matches
                               _ -> discard_it }
                _ -> discard_it }
         where
-          -- We want to filter out undefined and the likes from GHC.Err (#17940)
-          not_trivial id = nameModule_maybe (idName id) `notElem` [Just gHC_INTERNAL_ERR, Just gHC_INTERNAL_UNSAFE_COERCE]
+          mk_id i
+            -- Filter out undefined and the likes from GHC.Err (#17940).
+            --
+            -- TODO: we might want to filter out more, e.g. if the user defines
+            --
+            --   todo :: forall a. a
+            --   todo = undefined
+            --
+            -- we probably don't want to suggest 'todo' as a hole fit either.
+            | let nm = idName i
+            , nameModule_maybe nm `notElem` [Just gHC_INTERNAL_ERR, Just gHC_INTERNAL_UNSAFE_COERCE]
+            = Just (nm, False, idType i)
+            | otherwise
+            = Nothing
 
-          lookup :: HoleFitCandidate -> TcM (Maybe (Id, Type))
-          lookup (IdHFCand id) = return (Just (id, idType id))
-          lookup hfc = do { thing <- tcLookup name
-                          ; return $ case thing of
-                                       ATcId {tct_id = id} -> Just (id, idType id)
-                                       AGlobal (AnId id)   -> Just (id, idType id)
-                                       AGlobal (AConLike (RealDataCon con)) ->
-                                           Just (dataConWrapId con, dataConNonlinearType con)
-                                       _ -> Nothing }
-            where name = case hfc of
-                           GreHFCand gre   -> greName gre
-                           NameHFCand name -> name
+          lookup :: HoleFitCandidate -> TcM (Maybe (Name, Bool, Type))
+          lookup (IdHFCand id) = return $ mk_id id
+          lookup hfc =
+            do { thing <- tcLookup name
+               ; return $
+                   case thing of
+                     ATcId {tct_id = id} -> mk_id id
+                     AGlobal (AnId id)   -> mk_id id
+                     AGlobal (AConLike (RealDataCon con)) ->
+                         Just (dataConName con, True, dataConWrapperType con)
+                     AGlobal (AConLike (PatSynCon ps))
+                       | Just (_,t) <- patSynBuilderOcc ps
+                       -> -- If we ever get a 'Todo' pattern synonym,
+                          -- we should filter it out here.
+                         Just (patSynName ps, False, t)
+                     _ -> Nothing }
+
+            where
+              name = case hfc of
+                        GreHFCand gre   -> greName gre
+                        NameHFCand name -> name
+
           discard_it = go subs seen maxleft ty elts
-          keep_it eid eid_ty wrp ms = go (fit:subs) (extendVarSet seen eid)
+          keep_it (enm, _, ety) wrp ms = go (fit:subs) (extendNameSet seen enm)
                                  ((\n -> n - 1) <$> maxleft) ty elts
             where
-              fit = HoleFit { hfId = eid, hfCand = el, hfType = eid_ty
+              fit = HoleFit { hfName = enm, hfCand = el, hfType = ety
                             , hfRefLvl = length (snd ty)
                             , hfWrap = wrp, hfMatches = ms
                             , hfDoc = Nothing }
 
-
-
-
     unfoldWrapper :: HsWrapper -> [Type]
     unfoldWrapper = reverse . unfWrp'
-      where unfWrp' (WpTyApp ty) = [ty]
-            unfWrp' (WpCompose w1 w2) = unfWrp' w1 ++ unfWrp' w2
-            unfWrp' _ = []
-
+      where
+        unfWrp' (WpTyApp ty)      = [ty]
+        unfWrp' (WpSubType w)     = unfWrp' w
+        unfWrp' (WpCompose w1 w2) = unfWrp' w1 ++ unfWrp' w2
+        unfWrp' _                  = []
 
     -- The real work happens here, where we invoke the type checker using
     -- tcCheckHoleFit to see whether the given type fits the hole.
@@ -844,27 +925,36 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                                     -- In the base case with no additional
                                     -- holes, h_ty will just be t and ref_vars
                                     -- will be [].
-             -> TcType -- The type we're checking to whether it can be
-                       -- instantiated to the type h_ty.
+             -> TcType -- The type of the hole fit candidate
+             -> Bool   -- Is the hole fit candidate a data constructor?
              -> TcM (Maybe ([TcType], [TcType])) -- If it is not a match, we
                                                  -- return Nothing. Otherwise,
                                                  -- we Just return the list of
                                                  -- types that quantified type
-                                                 -- variables in ty would take
+                                                 -- variables in cand_ty would take
                                                  -- if used in place of h_ty,
                                                  -- and the list types of any
                                                  -- additional holes simulated
                                                  -- with the refinement
                                                  -- variables in ref_vars.
-    fitsHole (h_ty, ref_vars) ty =
+    fitsHole (h_ty, ref_vars) cand_ty cand_is_datacon =
     -- We wrap this with the withoutUnification to avoid having side-effects
     -- beyond the check, but we rely on the side-effects when looking for
     -- refinement hole fits, so we can't wrap the side-effects deeper than this.
       withoutUnification fvs $
-      do { traceTc "checkingFitOf {" $ ppr ty
-         ; (fits, wrp) <- tcCheckHoleFit hole h_ty ty
-         ; traceTc "Did it fit?" $ ppr fits
-         ; traceTc "wrap is: " $ ppr wrp
+      do { traceTc "checkingFitOf {" $ ppr cand_ty
+
+           -- Compute 'ds_flag' with the same logic as 'getDeepSubsumptionFlag_DataConHead'.
+         ; user_ds <- xoptM LangExt.DeepSubsumption
+         ; let ds_flag
+                 | user_ds
+                 = Deep DeepSub
+                 | cand_is_datacon
+                 = Deep TopSub
+                 | otherwise
+                 = Shallow
+         ; mbWrap <- tcCheckHoleFit ds_flag hole h_ty cand_ty
+         ; traceTc "Did it fit?" $ ppr mbWrap
          ; traceTc "checkingFitOf }" empty
          -- We'd like to avoid refinement suggestions like `id _ _` or
          -- `head _ _`, and only suggest refinements where our all phantom
@@ -874,17 +964,17 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
          -- variables, i.e. zonk them to read their final value to check for
          -- abstract refinements, and to report what the type of the simulated
          -- holes must be for this to be a match.
-         ; if fits then do {
+         ; case mbWrap of
+            { Just wrp -> do {
               -- Zonking is expensive, so we only do it if required.
               z_wrp_tys <- liftZonkM $ zonkTcTypes (unfoldWrapper wrp)
             ; if null ref_vars
               then return (Just (z_wrp_tys, []))
               else do { let -- To be concrete matches, matches have to
                             -- be more than just an invented type variable.
-                            fvSet = fvVarSet fvs
                             notAbstract :: TcType -> Bool
                             notAbstract t = case getTyVar_maybe t of
-                                              Just tv -> tv `elemVarSet` fvSet
+                                              Just tv -> tv `elemVarSet` fvs
                                               _ -> True
                             allConcrete = all notAbstract z_wrp_tys
                       ; z_vars  <- liftZonkM $ zonkTcTyVars ref_vars
@@ -894,11 +984,10 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                       ; if allowAbstract || (allFilled && allConcrete )
                         then return $ Just (z_wrp_tys, z_vars)
                         else return Nothing }}
-           else return Nothing }
-     where fvs = mkFVs ref_vars `unionFV` hole_fvs `unionFV` tyCoFVsOfType ty
-           hole = typed_hole { th_hole = Nothing }
-
-
+           ; Nothing -> return Nothing } }
+     where
+       fvs = mkVarSet ref_vars `unionVarSet` hole_fvs `unionVarSet` tyCoVarsOfType cand_ty
+       hole = typed_hole { th_hole = Nothing }
 
 -- | Checks whether a MetaTyVar is flexible or not.
 isFlexiTyVar :: TcTyVar -> TcM Bool
@@ -907,22 +996,25 @@ isFlexiTyVar _ = return False
 
 -- | Takes a list of free variables and restores any Flexi type variables in
 -- free_vars after the action is run.
-withoutUnification :: FV -> TcM a -> TcM a
+withoutUnification :: TyCoVarSet -> TcM a -> TcM a
 withoutUnification free_vars action =
-  do { flexis <- filterM isFlexiTyVar fuvs
+  do { flexis <- filterM isFlexiTyVar (nonDetVarSetElems free_vars)
+                 -- nonDetEltsUFM: order of restoration does not matter
+
      ; result <- action
-          -- Reset any mutated free variables
+
+       -- Reset any mutated free variables
      ; mapM_ restore flexis
      ; return result }
-  where restore tv = do { traceTc "withoutUnification: restore flexi" (ppr tv)
-                        ; writeTcRef (metaTyVarRef tv) Flexi }
-        fuvs = fvVarList free_vars
+  where
+    restore tv = do { traceTc "withoutUnification: restore flexi" (ppr tv)
+                    ; writeTcRef (metaTyVarRef tv) Flexi }
 
 -- | Reports whether first type (ty_a) subsumes the second type (ty_b),
 -- discarding any errors. Subsumption here means that the ty_b can fit into the
 -- ty_a, i.e. `tcSubsumes a b == True` if b is a subtype of a.
 tcSubsumes :: TcSigmaType -> TcSigmaType -> TcM Bool
-tcSubsumes ty_a ty_b = fst <$> tcCheckHoleFit dummyHole ty_a ty_b
+tcSubsumes ty_a ty_b = isJust <$> tcCheckHoleFit Shallow dummyHole ty_a ty_b
   where dummyHole = TypedHole { th_relevant_cts = emptyBag
                               , th_implics      = []
                               , th_hole         = Nothing }
@@ -931,16 +1023,22 @@ tcSubsumes ty_a ty_b = fst <$> tcCheckHoleFit dummyHole ty_a ty_b
 -- #14273. This makes sure that when checking whether a type fits the hole,
 -- the type has to be subsumed by type of the hole as well as fulfill all
 -- constraints on the type of the hole.
-tcCheckHoleFit :: TypedHole   -- ^ The hole to check against
+tcCheckHoleFit :: DeepSubsumptionFlag
+               -> TypedHole   -- ^ The hole to check against
                -> TcSigmaType
                -- ^ The type of the hole to check against (possibly modified,
                -- e.g. refined with additional holes for refinement hole-fits.)
-               -> TcSigmaType -- ^ The type to check whether fits.
-               -> TcM (Bool, HsWrapper)
-               -- ^ Whether it was a match, and the wrapper from hole_ty to ty.
-tcCheckHoleFit _ hole_ty ty | hole_ty `eqType` ty
-    = return (True, idHsWrapper)
-tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
+               -> TcSigmaType
+                 -- ^ The candidate fit type
+               -> TcM (Maybe HsWrapper)
+               -- ^ Whether it was a match, and the wrapper from hole_ty to cand_ty
+tcCheckHoleFit _ _ hole_ty cand_ty
+  -- (FastHoles2) from Note [Speeding up valid hole-fits]
+  | definitelyNotSubType cand_ty hole_ty
+  = return Nothing
+  | hole_ty `eqType` cand_ty
+  = return $ Just idHsWrapper
+tcCheckHoleFit ds_flag (TypedHole {..}) hole_ty cand_ty = discardErrs $
   do { -- We wrap the subtype constraint in the implications to pass along the
        -- givens, and so we must ensure that any nested implications and skolems
        -- end up with the correct level. The implications are ordered so that
@@ -951,16 +1049,21 @@ tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
                           [] -> getTcLevel
                           -- imp is the innermost implication
                           (imp:_) -> return (ic_tclvl imp)
-     ; (wrap, wanted) <- setTcLevel innermost_lvl $ captureConstraints $
-                         tcSubTypeSigma orig (ExprSigCtxt NoRRC) ty hole_ty
+
+     ; (wrap, wanted) <-
+         setTcLevel innermost_lvl $ captureConstraints $
+         tcSubTypeHoleFit ds_flag orig cand_ty hole_ty
+           -- See Note [Deep subsumption in tcCheckHoleFit]
+
      ; traceTc "Checking hole fit {" empty
      ; traceTc "wanteds are: " $ ppr wanted
      ; if | isEmptyWC wanted, isEmptyBag th_relevant_cts
           -> do { traceTc "}" empty
-                ; return (True, wrap) }
+                ; return $ Just wrap }
 
-          | checkInsoluble wanted -- See Note [Fast path for tcCheckHoleFit]
-          -> return (False, wrap)
+          -- (FastHoles3) from Note [Speeding up valid hole-fits]
+          | checkInsoluble wanted
+          -> return Nothing
 
           | otherwise
           -> do { fresh_binds <- newTcEvBinds
@@ -978,10 +1081,16 @@ tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
                   -- the wanteds, because they are freshly generated by the
                   -- call to`tcSubtype_NC`.
                 ; traceTc "final_wc is: " $ ppr final_wc
-                  -- See Note [Speeding up valid hole-fits]
-                ; (rem, _) <- tryTc $ runTcSEarlyAbort $ simplifyTopWanteds final_wc
+
+                  -- runTcSEarlyAbort: (FastHoles4) from Note [Speeding up valid hole-fits]
+                ; (rem, _) <- tryTc $ runTcSEarlyAbort
+                                    $ simplifyTopWanteds final_wc
                 ; traceTc "}" empty
-                ; return (any isSolvedWC rem, wrap) } }
+                ; return $
+                    if any isSolvedWC rem
+                    then Just wrap
+                    else Nothing
+                } }
   where
     orig = ExprHoleOrigin (hole_occ <$> th_hole)
 
@@ -992,15 +1101,15 @@ tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
     setWCAndBinds binds imp wc
       = mkImplicWC $ unitBag $ imp { ic_wanted = wc , ic_binds = binds }
 
-{- Note [Fast path for tcCheckHoleFit]
+{- Note [tcCheckHoleFit: fast insolubility check]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In `tcCheckHoleFit` we compare (with `tcSubTypeSigma`) the type of the hole
+In `tcCheckHoleFit` we compare (with `tcSubTypeHoleFit`) the type of the hole
 with the type of zillions of in-scope functions, to see which would "fit".
 Most of these checks fail!  They generate obviously-insoluble constraints.
 For these very-common cases we don't want to crank up the full constraint
 solver.  It's much more efficient to do a quick-and-dirty check for insolubility.
 
-Now, `tcSubTypeSigma` uses the on-the-fly unifier in GHC.Tc.Utils.Unify,
+Now, `tcSubTypeHoleFit` uses the on-the-fly unifier in GHC.Tc.Utils.Unify,
 it has already done the dirt-simple unification. So our quick-and-dirty
 check can simply look for constraints like (Int ~ Bool).  We don't need
 to worry about (Maybe Int ~ Maybe Bool).
@@ -1009,9 +1118,8 @@ The quick-and-dirty check is in `checkInsoluble`. It can make a big
 difference: For test hard_hole_fits, compile-time allocation goes down by 37%!
 -}
 
-
 checkInsoluble :: WantedConstraints -> Bool
--- See Note [Fast path for tcCheckHoleFit]
+-- See Note [tcCheckHoleFit: fast insolubility check]
 checkInsoluble (WC { wc_simple = simples })
   = any is_insol simples
   where
@@ -1020,7 +1128,7 @@ checkInsoluble (WC { wc_simple = simples })
                     _              -> False
 
 definitelyNotEqual :: Role -> TcType -> TcType -> Bool
--- See Note [Fast path for tcCheckHoleFit]
+-- See Note [tcCheckHoleFit: fast insolubility check]
 -- Specifically, does not need to recurse under type constructors
 definitelyNotEqual r t1 t2
   = go t1 t2
@@ -1040,3 +1148,46 @@ definitelyNotEqual r t1 t2
     go_tc _ (FunTy {})    = True
     go_tc _ (ForAllTy {}) = True
     go_tc _ _ = False
+
+-- | @definitelyNotSubType cand_ty hole_ty@ computes whether @cand_ty@ is
+-- **definitely not** a subtype of @hole_ty@, in order to quickly rule out
+-- a possible hole fit candidate without having to do any solving.
+--
+-- See (FastHoles2) in Note [Speeding up valid hole-fits].
+definitelyNotSubType :: TcType -> TcType -> Bool
+definitelyNotSubType = go
+  where
+    go cand_ty hole_ty
+      -- Expand type synonyms
+      | Just cand_ty' <- coreView cand_ty
+      = go cand_ty' hole_ty
+      | Just hole_ty' <- coreView hole_ty
+      = go cand_ty hole_ty'
+
+      -- Different TyCons at the head (looking through foralls and =>).
+      | Just tc1 <- tc_head cand_ty
+      , Just tc2 <- tc_head hole_ty
+      , tc1 /= tc2
+      = True
+
+      -- Non-forall type does not fit a forall-typed hole.
+      | isSigmaTy hole_ty
+      , isTauTy cand_ty
+      = True
+
+      | otherwise
+      = False
+
+    -- Is this Type a TyConApp, after looking under foralls and =>?
+    -- If so, return the TyCon at the head.
+    tc_head :: Type -> Maybe TyCon
+    tc_head (FunTy { ft_af = af, ft_res = res })
+      | not $ isVisibleFunArg af
+      = tc_head res
+      | otherwise
+      = Just $ funTyFlagTyCon af
+    tc_head (TyConApp tc _)
+      = Just tc
+    tc_head (ForAllTy _ body)
+      = tc_head body
+    tc_head _ = Nothing

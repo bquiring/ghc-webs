@@ -1,14 +1,4 @@
 -- Cmm representations using Hoopl's Graph CmmNode e x.
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE ExplicitNamespaces #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE EmptyCase #-}
 
 module GHC.Cmm (
      -- * Cmm top-level datatypes
@@ -161,15 +151,28 @@ instance OutputableP Platform CmmGraph where
 toBlockMap :: CmmGraph -> LabelMap CmmBlock
 toBlockMap (CmmGraph {g_graph=GMany NothingO body NothingO}) = body
 
+-- | Print the blocks reachable from the entry, in reverse postorder.
+--
+-- Under @-dppr-debug@ the unreachable blocks stored in the graph are appended
+-- too. See Note [unreachable blocks] in "GHC.Cmm.Pipeline".
 pprCmmGraph :: Platform -> CmmGraph -> SDoc
 pprCmmGraph platform g
    = text "{" <> text "offset"
-  $$ nest 2 (vcat $ map (pdoc platform) blocks)
+  $$ nest 2 (ppr_blocks blocks $$ unreachable)
   $$ text "}"
-  where blocks = revPostorder g
-    -- revPostorder has the side-effect of discarding unreachable code,
-    -- so pretty-printed Cmm will omit any unreachable blocks.  This can
-    -- sometimes be confusing.
+  where
+    ppr_blocks :: [CmmBlock] -> SDoc
+    ppr_blocks = vcat . map (pdoc platform)
+
+    blocks = revPostorder g
+
+    unreachable = getPprDebug $ \debug ->
+      if not debug || mapNull dead_blocks
+        then empty
+        else text "// unreachable blocks:"
+          $$ nest 2 (ppr_blocks (mapElems dead_blocks))
+
+    dead_blocks = foldl' (\bs b -> mapDelete (entryLabel b) bs) (toBlockMap g) blocks
 
 revPostorder :: CmmGraph -> [CmmBlock]
 revPostorder g = {-# SCC "revPostorder" #-}
@@ -278,7 +281,7 @@ data SectionType
   | InitArray           -- .init_array on ELF, .ctor on Windows
   | FiniArray           -- .fini_array on ELF, .dtor on Windows
   | CString
-  | OtherSection String
+  | IPE
   deriving (Show)
 
 data SectionProtection
@@ -288,8 +291,8 @@ data SectionProtection
   deriving (Eq)
 
 -- | Should a data in this section be considered constant at runtime
-sectionProtection :: Section -> SectionProtection
-sectionProtection (Section t _) = case t of
+sectionProtection :: SectionType -> SectionProtection
+sectionProtection t = case t of
     Text                    -> ReadOnlySection
     ReadOnlyData            -> ReadOnlySection
     RelocatableReadOnlyData -> WriteProtectedSection
@@ -298,7 +301,7 @@ sectionProtection (Section t _) = case t of
     CString                 -> ReadOnlySection
     Data                    -> ReadWriteSection
     UninitialisedData       -> ReadWriteSection
-    (OtherSection _)        -> ReadWriteSection
+    IPE                     -> ReadWriteSection
 
 {-
 Note [Relocatable Read-Only Data]
@@ -557,4 +560,4 @@ pprSectionType s = doubleQuotes $ case s of
   InitArray               -> text "initarray"
   FiniArray               -> text "finiarray"
   CString                 -> text "cstring"
-  OtherSection s'         -> text s'
+  IPE                     -> text "ipe"

@@ -35,6 +35,8 @@ module GHC.Internal.System.Posix.Internals where
 #include <ghcplatform.h>
 #include "HsBaseConfig.h"
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.System.Posix.Types
 
 import GHC.Internal.Foreign.C.Error
@@ -46,11 +48,14 @@ import GHC.Internal.Data.Maybe
 
 #if !defined(HTYPE_TCFLAG_T)
 import GHC.Internal.System.IO.Error
+#if !defined(mingw32_HOST_OS)
+import GHC.Internal.Err (errorWithoutStackTrace)
+#endif
 #endif
 
-import GHC.Internal.Base
 import GHC.Internal.Bits
 import GHC.Internal.Num
+import GHC.Internal.Prim (yield#)
 import GHC.Internal.Real
 import GHC.Internal.Word
 import GHC.Internal.IO
@@ -72,6 +77,7 @@ import qualified GHC.Internal.Foreign.C.String.Encoding as GHC
 import GHC.Internal.Int
 import GHC.Internal.Data.OldList (elem)
 #endif
+import GHC.Internal.Base as Rebindable( (>>=), (>>) ) -- For known-key names
 
 -- ---------------------------------------------------------------------------
 -- Debugging the base package
@@ -97,7 +103,11 @@ data {-# CTYPE "struct stat" #-}  CStat
 data {-# CTYPE "struct termios" #-} CTermios
 data {-# CTYPE "struct tm" #-} CTm
 data {-# CTYPE "struct tms" #-} CTms
+#if defined(mingw32_HOST_OS)
+data {-# CTYPE "struct _utimbuf" #-} CUtimbuf
+#else
 data {-# CTYPE "struct utimbuf" #-} CUtimbuf
+#endif
 data {-# CTYPE "struct utsname" #-} CUtsname
 
 type FD = CInt

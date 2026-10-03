@@ -1,4 +1,4 @@
-cabal-version: 3.0
+cabal-version: 3.8
 name: rts
 version: 1.0.3
 synopsis: The GHC runtime system
@@ -14,12 +14,9 @@ build-type: Configure
 extra-source-files:
     configure
     configure.ac
-    external-symbols.list.in
-    rts.buildinfo.in
 
 extra-tmp-files:
     autom4te.cache
-    rts.buildinfo
     config.log
     config.status
 
@@ -28,22 +25,13 @@ source-repository head
     location: https://gitlab.haskell.org/ghc/ghc.git
     subdir:   rts
 
-flag libm
-  default: False
-  manual: True
 flag librt
-  default: False
-  manual: True
-flag libdl
   default: False
   manual: True
 flag use-system-libffi
   default: False
   manual: True
 flag libffi-adjustors
-  default: False
-  manual: True
-flag need-pthread
   default: False
   manual: True
 flag libbfd
@@ -76,9 +64,6 @@ flag tables-next-to-code
 flag smp
   default: True
   manual: True
-flag find-ptr
-  default: False
-  manual: True
 -- Some cabal flags used to control the flavours we want to produce
 -- for libHSrts in hadrian. By default, we just produce vanilla and
 -- threaded. The flags "compose": if you enable debug and profiling,
@@ -101,6 +86,19 @@ flag thread-sanitizer
     Enable checking for data races using the ThreadSanitizer (TSAN)
     mechanism supported by GCC and Clang. See Note [ThreadSanitizer]
     in @rts/include/rts/TSANUtils.h@.
+  default: False
+  manual: True
+flag ubsan
+  description:
+    Link with -fsanitize=undefined, to be enabled when building with
+    UndefinedBehaviorSanitizer.
+  default: False
+  manual: True
+flag shared-libsan
+  description:
+    Link with -shared-libsan, to guarantee only one copy of the
+    sanitizer runtimes exist in the address space. See
+    needSharedLibSAN in hadrian/src/Flavour.hs.
   default: False
   manual: True
 
@@ -149,6 +147,7 @@ library
       install-includes: HsFFI.h MachDeps.h Rts.h RtsAPI.h Stg.h
                         ghcautoconf.h ghcconfig.h ghcplatform.h ghcversion.h
                         DerivedConstants.h
+                        rts/Types.h
                         stg/MachRegs.h
                         stg/MachRegs/arm32.h
                         stg/MachRegs/arm64.h
@@ -162,18 +161,6 @@ library
                         stg/Types.h
 
     else
-      -- If we are using an in-tree libffi then we must declare it as a bundled
-      -- library to ensure that Cabal installs it.
-      if !flag(use-system-libffi)
-        if os(windows)
-          extra-bundled-libraries: Cffi-6
-        else
-          extra-bundled-libraries: Cffi
-
-        install-includes: ffi.h ffitarget.h
-        -- ^ see Note [Packaging libffi headers] in
-        -- GHC.Driver.CodeOutput.
-
       -- Here we declare several flavours to be available when passing the
       -- suitable (combination of) flag(s) when configuring the RTS from hadrian,
       -- using Cabal.
@@ -212,21 +199,27 @@ library
         cc-options: -fsanitize=thread
         ld-options: -fsanitize=thread
 
+      if flag(ubsan)
+        ld-options: -fsanitize=undefined
+
+      if flag(shared-libsan)
+        ld-options: -shared-libsan
+
       if os(linux)
          -- the RTS depends upon libc. while this dependency is generally
          -- implicitly added by `cc`, we must explicitly add it here to ensure
          -- that it is ordered correctly with libpthread, since ghc-internal.cabal
          -- also explicitly lists libc. See #19029.
          extra-libraries: c
-      if flag(libm)
-         -- for ldexp()
-         extra-libraries: m
+         extra-libraries-static: c
       if flag(librt)
          extra-libraries: rt
-      if flag(libdl)
-         extra-libraries: dl
+         extra-libraries-static: rt
       if flag(use-system-libffi)
          extra-libraries: ffi
+         extra-libraries-static: ffi
+      else
+         build-depends: libffi-clib
       if os(windows)
          extra-libraries:
             -- for the linker
@@ -234,6 +227,10 @@ library
             -- for crash dump
             dbghelp
             -- for process information
+            psapi
+         extra-libraries-static:
+            wsock32 gdi32 winmm
+            dbghelp
             psapi
          -- TODO: Hadrian will use this cabal file, so drop WINVER from Hadrian's configs.
          -- Minimum supported Windows version.
@@ -244,20 +241,21 @@ library
          -- and also centralizes the versioning.
          cpp-options: -D_WIN32_WINNT=0x06010000
          cc-options: -D_WIN32_WINNT=0x06010000
-      if flag(need-pthread)
-         -- for pthread_getthreadid_np, pthread_create, ...
-         extra-libraries: pthread
       if flag(need-atomic)
          -- for sub-word-sized atomic operations (#19119)
          extra-libraries: atomic
+         extra-libraries-static: atomic
       if flag(libbfd)
          -- for debugging
          extra-libraries: bfd iberty
+         extra-libraries-static: bfd iberty
       if flag(libdw)
          -- for backtraces
          extra-libraries: elf dw
+         extra-libraries-static: elf dw
       if flag(libnuma)
          extra-libraries: numa
+         extra-libraries-static: numa
       if flag(libzstd)
          if flag(static-libzstd)
             if os(darwin)
@@ -266,6 +264,7 @@ library
                extra-libraries: :libzstd.a
          else
             extra-libraries: zstd
+         extra-libraries-static: zstd
       if !flag(smp)
          cpp-options: -DNOSMP
 
@@ -334,7 +333,7 @@ library
                         rts/storage/InfoTables.h
                         rts/storage/MBlock.h
                         rts/storage/TSO.h
-                        stg/DLL.h
+                        rts/RtsToHsIface.h
                         stg/MachRegs.h
                         stg/MachRegs/arm32.h
                         stg/MachRegs/arm64.h
@@ -354,8 +353,6 @@ library
 
       if os(osx)
         ld-options: "-Wl,-search_paths_first"
-                    -- See Note [Undefined symbols in the RTS]
-                    "-Wl,-undefined,dynamic_lookup"
         if !arch(x86_64) && !arch(aarch64)
            ld-options: -read_only_relocs warning
 
@@ -404,12 +401,14 @@ library
                  adjustor/AdjustorPool.c
                  ExecPage.c
                  Arena.c
+                 BuiltinClosures.c
                  Capability.c
                  CheckUnload.c
                  CheckVectorSupport.c
                  CloneStack.c
                  ClosureFlags.c
                  ClosureSize.c
+                 ClosureTable.c
                  Continuation.c
                  Disassembler.c
                  FileLock.c
@@ -442,13 +441,13 @@ library
                  RetainerProfile.c
                  RetainerSet.c
                  RtsAPI.c
-                 RtsDllMain.c
                  RtsFlags.c
                  RtsMain.c
                  RtsMessages.c
                  RtsStartup.c
                  RtsSymbolInfo.c
                  RtsSymbols.c
+                 RtsToHsIface.c
                  RtsUtils.c
                  STM.c
                  Schedule.c
@@ -465,6 +464,7 @@ library
                  ThreadPaused.c
                  Threads.c
                  Ticky.c
+                 TimeoutQueue.c
                  Timer.c
                  TopHandler.c
                  Trace.c
@@ -473,7 +473,7 @@ library
                  TSANUtils.c
                  WSDeque.c
                  Weak.c
-                 ZeroSlop.c
+                 MarkSlop.c
                  eventlog/EventLog.c
                  eventlog/EventLogWriter.c
                  hooks/FlagDefaults.c
@@ -509,7 +509,7 @@ library
                  sm/CNF.c
                  sm/Compact.c
                  sm/Evac.c
-                 sm/Evac_thr.c
+                 sm/Evac_par.c
                  sm/GC.c
                  sm/GCAux.c
                  sm/GCUtils.c
@@ -524,10 +524,23 @@ library
                  sm/NonMovingSweep.c
                  sm/Sanity.c
                  sm/Scav.c
-                 sm/Scav_thr.c
+                 sm/Scav_par.c
                  sm/Storage.c
                  sm/Sweep.c
                  fs.c
+                 prim/atomic.c
+                 prim/bitrev.c
+                 prim/bswap.c
+                 prim/clz.c
+                 prim/ctz.c
+                 prim/int64x2minmax.c
+                 prim/longlong.c
+                 prim/mulIntMayOflo.c
+                 prim/pdep.c
+                 prim/pext.c
+                 prim/popcnt.c
+                 prim/vectorQuotRem.c
+                 prim/word2float.c
                  -- I wish we had wildcards..., this would be:
                  -- *.c hooks/**/*.c sm/**/*.c eventlog/**/*.c linker/**/*.c
 
@@ -555,6 +568,9 @@ library
                    wasm/JSFFI.c
                    wasm/JSFFIGlobals.c
                    posix/Select.c
+                   posix/SelectBis.c
+                   posix/Poll.c
+                   posix/Timeout.c
         cmm-sources: wasm/jsval.cmm
                      wasm/blocker.cmm
                      wasm/scheduler.cmm
@@ -564,40 +580,11 @@ library
                     posix/Ticker.c
                     posix/OSMem.c
                     posix/OSThreads.c
+                    posix/FdWakeup.c
+                    posix/MIO.c
+                    posix/Poll.c
                     posix/Select.c
+                    posix/SelectBis.c
                     posix/Signals.c
+                    posix/Timeout.c
                     posix/TTY.c
-                    -- ticker/*.c
-                    -- We don't want to compile posix/ticker/*.c, these will be #included
-                    -- from Ticker.c
-
--- Note [Undefined symbols in the RTS]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- The RTS is built with a number of `-u` flags. This is to handle cyclic
--- dependencies between the RTS and other libraries which we normally think of as
--- downstream from the RTS. "Regular" dependencies from usages in those libraries
--- to definitions in the RTS are handled normally. "Reverse" dependencies from
--- usages in the RTS to definitions in those libraries get the `-u` flag in the
--- RTS.
---
--- The symbols are specified literally, but follow C ABI conventions (as all 3 of
--- C, C--, and Haskell do currently). Thus, we have to be careful to include a
--- leading underscore or not based on those conventions for the given platform in
--- question.
---
--- A tricky part is that different linkers have different policies regarding
--- undefined symbols (not defined in the current binary, or found in a shared
--- library that could be loaded at run time). GNU Binutils' linker is fine with
--- undefined symbols by default, but Apple's "cctools" linker is not. To appease
--- that linker we either need to do a blanket `-undefined dynamic_lookup` or
--- whitelist each such symbol with an additional `-U` (see the man page for more
--- details).
---
--- GHC already does `-undefined dynamic_lookup`, so we just do that for now, but
--- we might try to get more precise with `-U` in the future.
---
--- Note that the RTS also `-u`s some atomics symbols that *are* defined --- and
--- defined within the RTS! It is not immediately clear why this is needed. This
--- dates back to c06e3f46d24ef69f3a3d794f5f604cb8c2a40cbc which mentions a build
--- failure that it was suggested that this fix, but the precise reasoning is not
--- explained.

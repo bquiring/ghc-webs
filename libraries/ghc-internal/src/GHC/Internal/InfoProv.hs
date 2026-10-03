@@ -36,6 +36,7 @@ module GHC.Internal.InfoProv
 
 import GHC.Internal.Base
 import GHC.Internal.InfoProv.Types
+import GHC.Internal.Maybe (Maybe(..))
 
 -- | Get information about where a value originated from.
 -- This information is stored statically in a binary when @-finfo-table-map@ is

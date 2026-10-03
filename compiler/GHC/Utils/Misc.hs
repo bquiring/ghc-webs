@@ -3,7 +3,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE MonadComprehensions #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Highly random utility functions
 --
@@ -57,10 +56,10 @@ module GHC.Utils.Misc (
 
         -- * List operations controlled by another list
         takeList, dropList, splitAtList, split,
-        dropTail, capitalise,
+        replaceAt, dropTail, capitalise,
 
         -- * Sorting
-        sortWith, minWith, nubSort, ordNub, ordNubOn,
+        sortWith, minWith, nubSort,
 
         -- * Comparisons
         isEqual,
@@ -74,7 +73,7 @@ module GHC.Utils.Misc (
         transitiveClosure,
 
         -- * Strictness
-        seqList, strictMap, strictZipWith, strictZipWith3,
+        seqList, seqNonEmpty, strictMap, strictZipWith, strictZipWith3,
 
         -- * Module names
         looksLikeModuleName,
@@ -137,6 +136,8 @@ import Control.Monad    ( guard )
 import Control.Monad.IO.Class ( MonadIO, liftIO )
 import System.IO.Error as IO ( isDoesNotExistError )
 import System.Directory ( doesDirectoryExist, getModificationTime, renameFile )
+import qualified System.Directory.OsPath as OsPath
+import System.OsPath (OsPath)
 import System.FilePath
 
 import Data.Bifunctor   ( first, second )
@@ -569,23 +570,6 @@ minWith get_key xs = assert (not (null xs) )
 nubSort :: Ord a => [a] -> [a]
 nubSort = Set.toAscList . Set.fromList
 
--- | Remove duplicates but keep elements in order.
---   O(n * log n)
-ordNub :: Ord a => [a] -> [a]
-ordNub xs = ordNubOn id xs
-
--- | Remove duplicates but keep elements in order.
---   O(n * log n)
-ordNubOn :: Ord b => (a -> b) -> [a] -> [a]
-ordNubOn f xs
-  = go Set.empty xs
-  where
-    go _ [] = []
-    go s (x:xs)
-      | Set.member (f x) s = go s xs
-      | otherwise = x : go (Set.insert (f x) s) xs
-
-
 {-
 ************************************************************************
 *                                                                      *
@@ -716,6 +700,14 @@ splitAtList xs ys = go 0# xs ys
       go _  !_     []     = (ys, [])             -- length ys <= length xs
       go n  []     bs     = (take (I# n) ys, bs) -- = splitAt n ys
       go n  (_:as) (_:bs) = go (n +# 1#) as bs
+
+-- | given an index n and element y, replace the nth element of list xs with y
+replaceAt :: Int -> a -> [a] -> [a]
+replaceAt n y xs
+  | n >= length xs = xs
+  | n < 0 = xs
+  | otherwise = before ++ (y : drop 1 after)
+      where (before, after) = splitAt n xs
 
 -- | drop from the end of a list
 dropTail :: Int -> [a] -> [a]
@@ -968,6 +960,9 @@ unzipWith = fmap . uncurry
 seqList :: [a] -> b -> b
 seqList [] b = b
 seqList (x:xs) b = x `seq` seqList xs b
+
+seqNonEmpty :: NonEmpty a -> b -> b
+seqNonEmpty (x :| xs) b = x `seq` seqList xs b
 
 strictMap :: (a -> b) -> [a] -> [b]
 strictMap _ []     = []
@@ -1248,9 +1243,9 @@ getModificationUTCTime = getModificationTime
 -- --------------------------------------------------------------
 -- check existence & modification time at the same time
 
-modificationTimeIfExists :: FilePath -> IO (Maybe UTCTime)
+modificationTimeIfExists :: OsPath -> IO (Maybe UTCTime)
 modificationTimeIfExists f =
-  (do t <- getModificationUTCTime f; return (Just t))
+  (do t <- OsPath.getModificationTime f; return (Just t))
         `catchIO` \e -> if isDoesNotExistError e
                         then return Nothing
                         else ioError e

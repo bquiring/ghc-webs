@@ -40,7 +40,7 @@ module GHC.Internal.IO.Handle (
    hIsOpen, hIsClosed, hIsReadable, hIsWritable, hGetBuffering, hIsSeekable,
    hSetEcho, hGetEcho, hIsTerminalDevice,
 
-   hSetNewlineMode, Newline(..), NewlineMode(..), nativeNewline,
+   hSetNewlineMode, hGetNewlineMode, Newline(..), NewlineMode(..), nativeNewline,
    noNewlineTranslation, universalNewlineMode, nativeNewlineMode,
 
    hShow,
@@ -50,6 +50,8 @@ module GHC.Internal.IO.Handle (
    hGetBuf, hGetBufNonBlocking, hPutBuf, hPutBufNonBlocking
  ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.IO
 import GHC.Internal.IO.Exception
 import GHC.Internal.IO.Encoding
@@ -64,7 +66,7 @@ import GHC.Internal.IO.Handle.Internals
 import GHC.Internal.IO.Handle.Text
 import qualified GHC.Internal.IO.BufferedIO as Buffered
 
-import GHC.Internal.Base
+import GHC.Internal.Err ( errorWithoutStackTrace )
 import GHC.Internal.Exception
 import GHC.Internal.MVar
 import GHC.Internal.IORef
@@ -73,6 +75,7 @@ import GHC.Internal.Num
 import GHC.Internal.Real
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Data.Typeable
+import GHC.Internal.Control.Monad.Fail as Rebindable( fail )   -- For known-key names
 
 
 -- ---------------------------------------------------------------------------
@@ -238,7 +241,7 @@ hSetBuffering handle mode =
           return Handle__{ haBufferMode = mode,.. }
 
 -- -----------------------------------------------------------------------------
--- hSetEncoding
+-- Setting and getting the text encoding
 
 -- | The action 'hSetEncoding' @hdl@ @encoding@ changes the text encoding
 -- for the handle @hdl@ to @encoding@.  The default encoding when a 'Handle' is
@@ -480,7 +483,7 @@ hIsOpen handle =
       SemiClosedHandle     -> return False
       _                    -> return True
 
--- | @'hIsOpen' hdl@ returns whether the handle is closed.
+-- | @'hIsClosed' hdl@ returns whether the handle is closed.
 -- If the 'haType' of @hdl@ is 'ClosedHandle' this returns 'True'
 -- and 'False' otherwise.
 hIsClosed :: Handle -> IO Bool
@@ -502,9 +505,14 @@ hIsClosed handle =
 
 -- | @'hIsReadable' hdl@ returns whether it is possible to read from the handle.
 hIsReadable :: Handle -> IO Bool
-hIsReadable (DuplexHandle _ _ _) = return True
-hIsReadable handle =
-    withHandle_ "hIsReadable" handle $ \ handle_ -> do
+hIsReadable handle@(FileHandle _ var)
+    = hIsReadable' handle var
+hIsReadable handle@(DuplexHandle _ readingVar _)
+    = hIsReadable' handle readingVar
+
+hIsReadable' :: Handle -> MVar Handle__ -> IO Bool
+hIsReadable' handle readingVar =
+    withHandle_' "hIsReadable" handle readingVar $ \ handle_ -> do
     case haType handle_ of
       ClosedHandle         -> ioe_closedHandle
       SemiClosedHandle     -> ioe_semiclosedHandle
@@ -512,9 +520,14 @@ hIsReadable handle =
 
 -- | @'hIsWritable' hdl@ returns whether it is possible to write to the handle.
 hIsWritable :: Handle -> IO Bool
-hIsWritable (DuplexHandle _ _ _) = return True
-hIsWritable handle =
-    withHandle_ "hIsWritable" handle $ \ handle_ -> do
+hIsWritable handle@(FileHandle _ var)
+    = hIsWritable' handle var
+hIsWritable handle@(DuplexHandle _ _ writingVar)
+    = hIsWritable' handle writingVar
+
+hIsWritable' :: Handle -> MVar Handle__ -> IO Bool
+hIsWritable' handle writingVar =
+    withHandle_' "hIsWritable" handle writingVar $ \ handle_ -> do
     case haType handle_ of
       ClosedHandle         -> ioe_closedHandle
       SemiClosedHandle     -> ioe_semiclosedHandle
@@ -575,7 +588,7 @@ hGetEcho handle = do
 -- | Is the handle connected to a terminal?
 --
 -- On Windows the result of 'hIsTerminalDevide' might be misleading,
--- because non-native terminals, such as MinTTY used in MSYS and Cygwin environments,
+-- because non-native terminals, such as MinTTY used in MSYS environments,
 -- are implemented via redirection.
 -- Use @System.Win32.Types.withHandleToHANDLE System.Win32.MinTTY.isMinTTYHandle@
 -- to recognise it. Also consider @ansi-terminal@ package for crossplatform terminal
@@ -624,16 +637,24 @@ hSetBinaryMode handle bin =
                           haOutputNL = outputNL nl, .. }
 
 -- -----------------------------------------------------------------------------
--- hSetNewlineMode
+-- Setting and getting the newline mode
 
--- | Set the 'NewlineMode' on the specified 'Handle'.  All buffered
+-- | Set the 'NewlineMode' for the specified 'Handle'.  All buffered
 -- data is flushed first.
 hSetNewlineMode :: Handle -> NewlineMode -> IO ()
-hSetNewlineMode handle NewlineMode{ inputNL=i, outputNL=o } =
+hSetNewlineMode handle NewlineMode{..} =
   withAllHandles__ "hSetNewlineMode" handle $ \h_@Handle__{} ->
     do
          flushBuffer h_
-         return h_{ haInputNL=i, haOutputNL=o }
+         return h_{ haInputNL = inputNL, haOutputNL = outputNL }
+
+-- | Return the current 'NewlineMode' for the specified 'Handle'.
+--
+-- @since 4.23.0.0
+hGetNewlineMode :: Handle -> IO NewlineMode
+hGetNewlineMode hdl =
+  withHandle_ "hGetNewlineMode" hdl $ \h_@Handle__{..} ->
+    return NewlineMode{ inputNL = haInputNL, outputNL = haOutputNL }
 
 -- -----------------------------------------------------------------------------
 -- Duplicating a Handle

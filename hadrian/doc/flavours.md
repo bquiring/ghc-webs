@@ -37,8 +37,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>default<br></td>
     <td> </td>
-    <td>-O<br>-H32m<br></td>
-    <td>-O2<br>-H32m</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS<br></td>
+    <td>-O2<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-haddock</td>
     <td></td>
@@ -49,8 +49,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>quick</td>
     <td> </td>
-    <td>-O0<br>-H64m</td>
-    <td>-O0<br>-H64m</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-O</td>
     <td>-O2</td>
@@ -61,8 +61,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>quick-validate</td>
     <td></td>
-    <td>-O0<br>-H64m<br>-Werror</td>
-    <td>-O0<br>-H64m<br>-Werror</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS<br>-Werror</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS<br>-Werror</td>
     <td></td>
     <td>-O</td>
     <td>-O2</td>
@@ -73,8 +73,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>quick-debug</td>
     <td></td>
-    <td>-O0<br>-H64m</td>
-    <td>-O0<br>-H64m</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-O</td>
     <td>-O2</td>
@@ -83,22 +83,10 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
     <td>-debug (link)</td>
   </tr>
   <tr>
-    <th>quickest</td>
-    <td></td>
-    <td>-O0<br>-H64m</td>
-    <td>-O0<br>-H64m</td>
-    <td></td>
-    <td></td>
-    <td>-O</td>
-    <td></td>
-    <td>-O</td>
-    <td></td>
-  </tr>
-  <tr>
     <th>perf</td>
     <td> Yes (on supported platforms) </td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-O2</td>
     <td>-O2</td>
@@ -109,8 +97,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>release (same as perf with -haddock and +no_self_recomp+hash_unit_ids)</td>
     <td></td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-O2</td>
     <td>-O2</td>
@@ -119,22 +107,10 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
     <td>-O2</td>
   </tr>
   <tr>
-    <th>bench</td>
-    <td></td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
-    <td></td>
-    <td>-O2</td>
-    <td>-O2</td>
-    <td>-O0</td>
-    <td>-O2</td>
-    <td>-O2</td>
-  </tr>
-  <tr>
     <th>devel1</td>
     <td></td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-dcore-lint</td>
     <td>-O0<br>-DDEBUG</td>
@@ -145,8 +121,8 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>devel2</td>
     <td></td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
+    <td>-O<br>+RTS<br>-O64M<br>-RTS</td>
     <td></td>
     <td>-dcore-lint</td>
     <td>-O2</td>
@@ -157,7 +133,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>validate</td>
     <td></td>
-    <td>-O0<br>-H64m</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
     <td>-fllvm-fill-undef-with-garbage<br>-fcheck-prim-bounds</td>
     <td></td>
     <td>-O<br>-dcore-lint<br>-dno-debug-output</td>
@@ -169,7 +145,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   <tr>
     <th>slow-validate</td>
     <td></td>
-    <td>-O0<br>-H64m</td>
+    <td>-O0<br>+RTS<br>-O64M<br>-RTS</td>
     <td>-fllvm-fill-undef-with-garbage</td>
     <td></td>
     <td>-O<br>-dcore-lint<br>-dno-debug-output</td>
@@ -177,18 +153,6 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
     <td>-O<br>-DDEBUG<br>-dcore-lint<br>-dno-debug-output</td>
     <td>-O</td>
     <td>-O</td>
-  </tr>
-  <tr>
-    <th>static</td>
-    <td></td>
-    <td>-O<br>-H64m<br>-fPIC -static</td>
-    <td>-O<br>-H64m<br>-fPIC -static</td>
-    <td></td>
-    <td>-O2</td>
-    <td>-O2</td>
-    <td>-O2</td>
-    <td>-O<br>-optl -static</td>
-    <td>-O2<br>-optl -static</td>
   </tr>
 </table>
 
@@ -239,16 +203,16 @@ The supported transformers are listed below:
         <td>Build the runtime system with ThreadSanitizer support</td>
     </tr>
     <tr>
+        <td><code>ubsan</code></td>
+        <td>Build all stage1+ C/C++ code with UndefinedBehaviorSanitizer support</td>
+    </tr>
+    <tr>
         <td><code>llvm</code></td>
         <td>Use GHC's LLVM backend (`-fllvm`) for all stage1+ compilation.</td>
     </tr>
     <tr>
         <td><code>profiled_ghc</code></td>
         <td>Build the GHC executable with cost-centre profiling support.
-            It is recommended that you use this in conjunction with `no_dynamic_ghc` since
-            GHC does not support loading of profiled libraries with the
-            dynamic linker. You should use a flavour that builds profiling libs and rts,
-            i.e. not <code>quick</code>. <br>
             This flag adds cost centres with the -fprof-late flag.</td>
     </tr>
     <tr>
@@ -269,6 +233,10 @@ The supported transformers are listed below:
     <tr>
         <td><code>text_simdutf</code></td>
         <td>Enable building the <code>text</code> package with <code>simdutf</code> support.</td>
+    </tr>
+    <tr>
+        <td><code>with_profiled_libs</code></td>
+        <td>Enables building of stage1+ libraries and the RTS in profiled build ways (the opposite of <code>no_profiled_libs</code>).</td>
     </tr>
     <tr>
         <td><code>no_profiled_libs</code></td>
@@ -293,7 +261,11 @@ The supported transformers are listed below:
     </tr>
     <tr>
         <td><code>assertions</code></td>
-        <td>Build the stage2 compiler with assertions enabled. </td>
+        <td>Build the stage2 compiler with <code>-DDEBUG</code> assertions enabled. </td>
+    </tr>
+    <tr>
+        <td><code>assertions_stage1</code></td>
+        <td>Build the stage1 compiler with <code>-DDEBUG</code> assertions enabled. </td>
     </tr>
     <tr>
         <td><code>fully_static</code></td>
@@ -339,18 +311,6 @@ The supported transformers are listed below:
     </tr>
 </table>
 
-### Static
-
-The `static` flavour does not strictly follow the groupings in the table
-above because it links all the executables statically, not just GHC
-itself, and because it passes `-optc -static` when delegating to a C
-compiler.  It also turns off dynamic linking at runtime by by adding the
-`-dynamic-system-linker` cabal flag to the `ghc` package build because
-`musl` doesn't allow dynamic linking in executables that were statically
-linked against `libc`.  Static flags are only added when building in a
-non-dynamic _way_.  Some of the considerations for a static build aren't
-a great fit for the flavour system, so it's a little bit hacky.
-
 ## Ways
 
 Libraries and GHC can be built in different _ways_, e.g. with or without profiling
@@ -394,12 +354,5 @@ information. The following table lists ways that are built in different flavours
     <td>vanilla<br>dynamic</td>
     <td>debug<br>threaded<br>threadedDebug<br>debugDynamic<br>threadedDynamic<br>threadedDebugDynamic</td>
     <td>debug<br>threaded<br>threadedDebug<br>debugDynamic<br>threadedDynamic<br>threadedDebugDynamic</td>
-</tr>
-<tr>
-    <th>quickest<br>bench</th>
-    <td>vanilla</td>
-    <td>vanilla</td>
-    <td>vanilla<br>threaded</td>
-    <td>vanilla<br>threaded</td>
 </tr>
 </table>

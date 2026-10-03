@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Safe #-}
 
 -----------------------------------------------------------------------------
@@ -63,6 +64,9 @@ module System.Console.GetOpt (
 ) where
 
 import Prelude
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Essentials as Rebindable
+#endif
 import GHC.Internal.Data.List ( isPrefixOf, find )
 
 -- |What to do with options following non-options
@@ -315,7 +319,7 @@ arguments:
 >    module Opts1 where
 >
 >    import System.Console.GetOpt
->    import GHC.Internal.Data.Maybe ( fromMaybe )
+>    import Data.Maybe ( fromMaybe )
 >
 >    data Flag
 >     = Verbose  | Version
@@ -356,7 +360,7 @@ A different approach is to group the option values in a record of type
 >    module Opts2 where
 >
 >    import System.Console.GetOpt
->    import GHC.Internal.Data.Maybe ( fromMaybe )
+>    import Data.Maybe ( fromMaybe )
 >
 >    data Options = Options
 >     { optVerbose     :: Bool

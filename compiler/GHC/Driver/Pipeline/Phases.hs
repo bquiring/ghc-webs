@@ -1,6 +1,3 @@
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE RankNTypes #-}
-
 module GHC.Driver.Pipeline.Phases (TPhase(..), PhaseHook(..)) where
 
 import GHC.Prelude
@@ -32,6 +29,12 @@ data TPhase res where
   T_Cpp   :: PipeEnv -> HscEnv -> FilePath -> TPhase FilePath
   T_HsPp  :: PipeEnv -> HscEnv -> FilePath -> FilePath -> TPhase FilePath
   T_HscRecomp :: PipeEnv -> HscEnv -> FilePath -> HscSource -> TPhase (HscEnv, ModSummary, HscRecompStatus)
+
+  -- | Parse\/rename\/typecheck compilation phase.
+  --
+  -- NB: the consumer of the returned 'FrontendResult' is responsible for
+  -- shutting down all 'TcM' plugins (e.g. by calling 'shutdownTcMPluginsIO').
+  -- In particular, the 'HscPostTc' phase shuts down 'TcM' plugins.
   T_Hsc :: HscEnv -> ModSummary -> TPhase (FrontendResult, Messages GhcMessage)
   T_HscPostTc :: HscEnv -> ModSummary
               -> FrontendResult
@@ -52,4 +55,4 @@ data TPhase res where
   T_MergeForeign :: PipeEnv -> HscEnv -> FilePath -> [FilePath] -> TPhase FilePath
 
 -- | A wrapper around the interpretation function for phases.
-data PhaseHook = PhaseHook (forall a . TPhase a -> IO a)
+newtype PhaseHook = PhaseHook (forall a . TPhase a -> IO a)

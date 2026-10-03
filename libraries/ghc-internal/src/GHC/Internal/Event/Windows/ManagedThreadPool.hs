@@ -27,15 +27,20 @@ module GHC.Internal.Event.Windows.ManagedThreadPool
   , monitorThreadPool
   ) where
 
+import GHC.Internal.Base (return, ($))
+import qualified GHC.Internal.Base as Rebindable
 import GHC.Internal.Control.Concurrent.MVar
 import GHC.Internal.Data.Maybe
-import GHC.Internal.Base
+import GHC.Internal.Err (undefined)
 import GHC.Internal.Num ((-), (+))
-import GHC.Internal.Real (fromIntegral)
+import qualified GHC.Internal.Num as Rebindable
 import qualified GHC.Internal.Event.Array as A
 import GHC.Internal.IO.Handle.Internals (debugIO)
 import GHC.Internal.Conc.Sync (ThreadId(..))
-import GHC.Internal.RTS.Flags
+import GHC.Internal.RTS.Flags.Test
+import qualified GHC.Internal.Stack.Types as Rebindable
+  ( SrcLoc(..), pushCallStack, emptyCallStack )
+import GHC.Internal.Types (Int, IO)
 
 ------------------------------------------------------------------------
 -- Thread spool manager
@@ -60,7 +65,7 @@ startThreadPool job = do
   let thrMinThreads = 2
   let thrCurThreads = 0
   let thrCallBack   = job
-  thrMaxThreads     <- (fromIntegral . numIoWorkerThreads) `fmap` getMiscFlags
+  thrMaxThreads     <- getNumIoWorkerThreads
   thrActiveThreads  <- newMVar 0
   thrMonitor        <- newEmptyMVar
   thrThreadIds      <- undefined -- A.new thrMaxThreads

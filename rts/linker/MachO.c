@@ -64,7 +64,7 @@ static bool fitsBits(size_t bits, int64_t value);
 static int64_t decodeAddend(ObjectCode * oc, Section * section,
                      MachORelocationInfo * ri);
 static void encodeAddend(ObjectCode * oc, Section * section,
-                  MachORelocationInfo * ri, int64_t addend);
+                  MachORelocationInfo * ri, int64_t addend, MachOSymbol * symbol);
 
 /* Global Offset Table logic */
 static bool isGotLoad(MachORelocationInfo * ri);
@@ -361,15 +361,21 @@ fitsBits(size_t bits, int64_t value) {
 
 static void
 encodeAddend(ObjectCode * oc, Section * section,
-             MachORelocationInfo * ri, int64_t addend) {
+             MachORelocationInfo * ri, int64_t addend, MachOSymbol * symbol) {
     uint32_t * p = (uint32_t*)((uint8_t*)section->start + ri->r_address);
 
     checkProddableBlock(&oc->proddables, (void*)p, 1 << ri->r_length);
 
+    const char *symbol_name = symbol && symbol->name ? (char*)symbol->name : "<unknown>";
+    const char *file_name = oc->fileName ? (char*)oc->fileName : "<unknown>";
+
     switch (ri->r_type) {
         case ARM64_RELOC_UNSIGNED: {
-            if(!fitsBits(8 << ri->r_length, addend))
-                barf("Relocation out of range for UNSIGNED");
+            if(!fitsBits(8 << ri->r_length, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation out of range for UNSIGNED in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             switch (ri->r_length) {
                 case 0: *(uint8_t*)p  = (uint8_t)addend; break;
                 case 1: *(uint16_t*)p = (uint16_t)addend; break;
@@ -382,8 +388,11 @@ encodeAddend(ObjectCode * oc, Section * section,
             return;
         }
         case ARM64_RELOC_SUBTRACTOR: {
-            if(!fitsBits(8 << ri->r_length, addend))
-                barf("Relocation out of range for SUBTRACTOR");
+            if(!fitsBits(8 << ri->r_length, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation out of range for SUBTRACTOR in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             switch (ri->r_length) {
                 case 0: *(uint8_t*)p  = (uint8_t)addend; break;
                 case 1: *(uint16_t*)p = (uint16_t)addend; break;
@@ -400,8 +409,11 @@ encodeAddend(ObjectCode * oc, Section * section,
              * do not need the last two bits of the value. If the value >> 2
              * still exceeds 26bits, we won't be able to reach it.
              */
-            if(!fitsBits(26, addend >> 2))
-                barf("Relocation target for BRACH26 out of range.");
+            if(!fitsBits(26, addend >> 2)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for BRANCH26 out of range in %s: symbol '%s', addend 0x%llx (0x%llx >> 2), address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)(addend >> 2), (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             *p = (*p & 0xFC000000) | ((uint32_t)(addend >> 2) & 0x03FFFFFF);
             return;
         }
@@ -412,8 +424,12 @@ encodeAddend(ObjectCode * oc, Section * section,
              * with the PAGEOFF12 relocation allows to address a relative range
              * of +-4GB.
              */
-            if(!fitsBits(21, addend >> 12))
-                barf("Relocation target for PAGE21 out of range.");
+            if(!fitsBits(21, addend >> 12)) {
+                const char *reloc_type = (ri->r_type == ARM64_RELOC_PAGE21) ? "PAGE21" : "GOT_LOAD_PAGE21";
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for %s out of range in %s: symbol '%s', addend 0x%llx (0x%llx >> 12), address 0x%llx, library: %s",
+                     reloc_type, file_name, symbol_name, (long long)addend, (long long)(addend >> 12), (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             *p = (*p & 0x9F00001F) | (uint32_t)((addend << 17) & 0x60000000)
                                    | (uint32_t)((addend >> 9)  & 0x00FFFFE0);
             return;
@@ -423,8 +439,11 @@ encodeAddend(ObjectCode * oc, Section * section,
             /* Store an offset into a page (4k). Depending on the instruction
              * the bits are stored at slightly different positions.
              */
-            if(!fitsBits(12, addend))
-                barf("Relocation target for PAGEOFF12 out or range.");
+            if(!fitsBits(12, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for PAGEOFF12 out of range in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
 
             int shift = 0;
             if(isLoadStore(p)) {
@@ -589,7 +608,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                 MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];
                 int64_t addend = decodeAddend(oc, section, ri);
                 uint64_t value = symbol_value(oc, symbol);
-                encodeAddend(oc, section, ri, value + addend);
+                encodeAddend(oc, section, ri, value + addend, symbol);
                 break;
             }
             case ARM64_RELOC_SUBTRACTOR:
@@ -623,7 +642,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
 
                 // combine with addend and store
                 int64_t addend = decodeAddend(oc, section, ri);
-                encodeAddend(oc, section, ri, addend - sub_value + add_value);
+                encodeAddend(oc, section, ri, addend - sub_value + add_value, symbol1);
 
                 // skip next relocation: we've already handled it
                 i += 1;
@@ -664,7 +683,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                         }
                     }
                 }
-                encodeAddend(oc, section, ri, value - pc + addend);
+                encodeAddend(oc, section, ri, value - pc + addend, symbol);
                 break;
             }
             case ARM64_RELOC_PAGE21:
@@ -676,7 +695,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                 uint64_t pc = (uint64_t)section->start + ri->r_address;
                 uint64_t value = (uint64_t)(isGotLoad(ri) ? symbol->got_addr : symbol->addr);
                 ASSERT(!isGotLoad(ri) || (symbol->got_addr != 0));
-                encodeAddend(oc, section, ri, ((value + addend + explicit_addend) & (-4096)) - (pc & (-4096)));
+                encodeAddend(oc, section, ri, ((value + addend + explicit_addend) & (-4096)) - (pc & (-4096)), symbol);
 
                 // reset, just in case.
                 explicit_addend = 0;
@@ -690,7 +709,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                     barf("explicit_addend and addend can't be set at the same time.");
                 uint64_t value = (uint64_t)(isGotLoad(ri) ? symbol->got_addr : symbol->addr);
                 ASSERT(!isGotLoad(ri) || (symbol->got_addr != 0));
-                encodeAddend(oc, section, ri, 0xFFF & (value + addend + explicit_addend));
+                encodeAddend(oc, section, ri, 0xFFF & (value + addend + explicit_addend), symbol);
 
                 // reset, just in case.
                 explicit_addend = 0;
@@ -1402,8 +1421,13 @@ ocGetNames_MachO(ObjectCode* oc)
                 if((oc->info->nlist[i].n_type & N_TYPE) == N_UNDF
                     && (oc->info->nlist[i].n_value != 0))
                 {
-                    commonSize += oc->info->nlist[i].n_value;
                     oc->n_symbols++;
+                    /* Only allocate space for COMMON symbols not already
+                     * defined by a previously-loaded object. */
+                    SymbolName *nm_c = oc->info->macho_symbols[i].name;
+                    if (!lookupStrHashTable(symhash, nm_c)) {
+                        commonSize += oc->info->nlist[i].n_value;
+                    }
                 }
                 else if((oc->info->nlist[i].n_type & N_TYPE) == N_SECT)
                     oc->n_symbols++;
@@ -1417,7 +1441,7 @@ ocGetNames_MachO(ObjectCode* oc)
      */
     IF_DEBUG(linker, debugBelch("ocGetNames_MachO: %d external symbols\n",
                                 oc->n_symbols));
-    oc->symbols = stgMallocBytes(oc->n_symbols * sizeof(Symbol_t),
+    oc->symbols = stgCallocBytes(oc->n_symbols, sizeof(Symbol_t),
                                    "ocGetNames_MachO(oc->symbols)");
 
     if (oc->info->symCmd) {
@@ -1448,6 +1472,7 @@ ocGetNames_MachO(ObjectCode* oc)
                                                  , addr
                                                  , HS_BOOL_FALSE
                                                  , sym_type
+                                                 , 0
                                                  , oc);
 
                             oc->symbols[curSymbol].name = nm;
@@ -1469,8 +1494,10 @@ ocGetNames_MachO(ObjectCode* oc)
     }
 
     /* setup the common storage */
-    commonStorage = stgCallocBytes(1,commonSize,"ocGetNames_MachO(common symbols)");
-    commonCounter = (unsigned long)commonStorage;
+    if (commonSize > 0) {
+        commonStorage = stgCallocBytes(1, commonSize, "ocGetNames_MachO(common symbols)");
+        commonCounter = (unsigned long)commonStorage;
+    }
 
     if (oc->info->symCmd) {
         for (size_t i = 0; i < oc->info->n_macho_symbols; i++) {
@@ -1480,22 +1507,47 @@ ocGetNames_MachO(ObjectCode* oc)
              && (nlist->n_type & N_EXT)
              && (nlist->n_value != 0)) {
                 unsigned long sz = nlist->n_value;
-
-                nlist->n_value = commonCounter;
-
-                /* also set the final address to the macho_symbol */
-                oc->info->macho_symbols[i].addr = (void*)commonCounter;
                 /* TODO: Figure out how to determine this from object */
                 SymType sym_type = SYM_TYPE_CODE;
 
-                IF_DEBUG(linker_verbose, debugBelch("ocGetNames_MachO: inserting common symbol: %s\n", nm));
-                ghciInsertSymbolTable(oc->fileName, symhash, nm,
-                                       (void*)commonCounter, HS_BOOL_FALSE, sym_type, oc);
-                oc->symbols[curSymbol].name = nm;
-                oc->symbols[curSymbol].addr = oc->info->macho_symbols[i].addr;
-                curSymbol++;
+                RtsSymbolInfo *existing = lookupStrHashTable(symhash, nm);
+                if (existing != NULL) {
+                    /* COMMON symbol already allocated by a previously-loaded
+                     * object; reuse that address so relocations resolve to
+                     * the same storage. */
+                    if (sz > existing->size) {
+                        barf("linker: trying to link COMMON symbols %s with"
+                             " incompatible sizes: previous size %llu,"
+                             " new size %lu\n",
+                             nm,
+                             (long long unsigned int) existing->size,
+                             sz);
+                    }
+                    nlist->n_value = (unsigned long)existing->value;
+                    oc->info->macho_symbols[i].addr = existing->value;
+                    IF_DEBUG(linker_verbose,
+                             debugBelch("ocGetNames_MachO: COMMON symbol %s"
+                                        " reusing address %p\n",
+                                        nm, existing->value));
+                    /* Don't add to oc->symbols: not the owner */
+                } else {
+                    nlist->n_value = commonCounter;
+                    /* also set the final address to the macho_symbol */
+                    oc->info->macho_symbols[i].addr = (void*)commonCounter;
 
-                commonCounter += sz;
+                    IF_DEBUG(linker_verbose,
+                             debugBelch("ocGetNames_MachO: inserting common symbol: %s\n", nm));
+                    ghciInsertSymbolTable(oc->fileName, symhash, nm,
+                                         (void*)commonCounter, HS_BOOL_FALSE,
+                                         sym_type,
+                                         sz, oc);
+                    oc->symbols[curSymbol].name = nm;
+                    oc->symbols[curSymbol].addr = oc->info->macho_symbols[i].addr;
+                    oc->symbols[curSymbol].type = sym_type;
+                    curSymbol++;
+
+                    commonCounter += sz;
+                }
             }
         }
     }

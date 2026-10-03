@@ -1,5 +1,9 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE CPP, NoImplicitPrelude, MagicHash, UnboxedTuples #-}
+
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines Num
+
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -37,12 +41,13 @@ import qualified GHC.Internal.Integer
 import GHC.Internal.Base
 import GHC.Internal.Bignum.Integer
 import GHC.Internal.Bignum.Natural
+import GHC.Internal.Prim (
+    int2Word#, minusWord#, negateInt#, plusWord#, timesWord#, word2Int#,
+    (+#), (-#), (*#),
+  )
 
 infixl 7  *
 infixl 6  +, -
-
-default ()              -- Double isn't available yet,
-                        -- and we shouldn't be using defaults anyway
 
 -- | Basic numeric class.
 --

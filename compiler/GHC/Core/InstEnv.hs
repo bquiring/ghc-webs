@@ -7,12 +7,10 @@
 The bits common to GHC.Tc.TyCl.Instance and GHC.Tc.Deriv.
 -}
 
-{-# LANGUAGE DeriveDataTypeable, DeriveGeneric #-}
-
 module GHC.Core.InstEnv (
         DFunId, InstMatch, ClsInstLookupResult,
         CanonicalEvidence(..), PotentialUnifiers(..), getCoherentUnifiers, nullUnifiers,
-        OverlapFlag(..), OverlapMode(..), setOverlapModeMaybe,
+        OverlapFlag(..), OverlapMode(..),
         ClsInst(..), DFunInstType, pprInstance, pprInstanceHdr, pprDFunId, pprInstances,
         instanceWarning, instanceHead, instanceSig, mkLocalClsInst, mkImportedClsInst,
         instanceDFunId, updateClsInstDFuns, updateClsInstDFun,
@@ -42,6 +40,7 @@ import GHC.Core.RoughMap
 import GHC.Core.Class
 import GHC.Core.Unify
 import GHC.Core.FVs( orphNamesOfTypes, orphNamesOfType )
+import GHC.Hs.Decls.Overlap
 import GHC.Hs.Extension
 
 import GHC.Unit.Module.Env
@@ -52,10 +51,8 @@ import GHC.Types.Unique.DSet
 import GHC.Types.Var.Set
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Types.Basic
 import GHC.Types.Id
 import GHC.Generics (Generic)
-import Data.Data        ( Data )
 import Data.List.NonEmpty ( NonEmpty (..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe       ( isJust )
@@ -114,7 +111,6 @@ data ClsInst
                 -- See Note [Implementation of deprecated instances]
                 -- in GHC.Tc.Solver.Dict
     }
-  deriving Data
 
 -- | A fuzzy comparison function for class instances, intended for sorting
 -- instances before displaying them to the user.

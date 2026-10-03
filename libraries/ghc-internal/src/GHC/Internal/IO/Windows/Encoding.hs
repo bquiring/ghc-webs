@@ -24,6 +24,14 @@ module GHC.Internal.IO.Windows.Encoding
   , withUTF16ToGhcInternal
   ) where
 
+import GHC.Internal.Base (String, assert, return, ($), (.))
+import qualified GHC.Internal.Base as Rebindable ((>>=))
+import qualified GHC.Internal.IO.Exception as Rebindable (assertError)
+import GHC.Internal.Classes (Eq(..), Ord(..))
+import qualified GHC.Internal.Num as Rebindable (fromInteger)
+import GHC.Internal.Types (Int)
+import qualified GHC.Internal.Types as Rebindable
+import qualified GHC.Internal.Stack.Types as Rebindable
 import GHC.Internal.Word (Word8, Word16)
 import GHC.Internal.Foreign.C.Types        (CInt(..))
 import GHC.Internal.Foreign.C.String       (peekCAStringLen, peekCWStringLen,
@@ -34,7 +42,6 @@ import GHC.Internal.Foreign.Marshal.Unsafe (unsafeLocalState)
 import GHC.Internal.Windows
 import GHC.Internal.IO.Encoding.CodePage (CodePage, getCurrentCodePage)
 import GHC.Internal.IO
-import GHC.Internal.Base
 import GHC.Internal.Real
 
 -- | The "System.IO" output functions (e.g. `putStr`) don't

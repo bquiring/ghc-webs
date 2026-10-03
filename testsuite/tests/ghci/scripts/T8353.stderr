@@ -1,4 +1,3 @@
-
 Defer03.hs:4:5: warning: [GHC-83865] [-Wdeferred-type-errors (in -Wdefault)]
     • Couldn't match expected type ‘Int’ with actual type ‘Char’
     • In the expression: 'p'
@@ -9,15 +8,15 @@ Defer03.hs:7:5: warning: [GHC-88464] [-Wtyped-holes (in -Wdefault)]
     • In an equation for ‘f’: f = _
     • Relevant bindings include f :: Int (bound at Defer03.hs:7:1)
       Valid hole fits include
-        f :: Int (bound at Defer03.hs:7:1)
         a :: Int (defined at Defer03.hs:4:1)
+        f :: Int (bound at Defer03.hs:7:1)
         maxBound :: forall a. Bounded a => a
           with maxBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
         minBound :: forall a. Bounded a => a
           with minBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
 
 Defer03.hs:4:5: error: [GHC-83865]
@@ -30,15 +29,15 @@ Defer03.hs:7:5: error: [GHC-88464]
     • In an equation for ‘f’: f = _
     • Relevant bindings include f :: Int (bound at Defer03.hs:7:1)
       Valid hole fits include
-        f :: Int (bound at Defer03.hs:7:1)
         a :: Int (defined at Defer03.hs:4:1)
+        f :: Int (bound at Defer03.hs:7:1)
         maxBound :: forall a. Bounded a => a
           with maxBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
         minBound :: forall a. Bounded a => a
           with minBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
 
 Defer03.hs:4:5: warning: [GHC-83865] [-Wdeferred-type-errors (in -Wdefault)]
@@ -51,15 +50,15 @@ Defer03.hs:7:5: warning: [GHC-88464] [-Wtyped-holes (in -Wdefault)]
     • In an equation for ‘f’: f = _
     • Relevant bindings include f :: Int (bound at Defer03.hs:7:1)
       Valid hole fits include
-        f :: Int (bound at Defer03.hs:7:1)
         a :: Int (defined at Defer03.hs:4:1)
+        f :: Int (bound at Defer03.hs:7:1)
         maxBound :: forall a. Bounded a => a
           with maxBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
         minBound :: forall a. Bounded a => a
           with minBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
 
 Defer03.hs:4:5: error: [GHC-83865]
@@ -72,15 +71,15 @@ Defer03.hs:7:5: error: [GHC-88464]
     • In an equation for ‘f’: f = _
     • Relevant bindings include f :: Int (bound at Defer03.hs:7:1)
       Valid hole fits include
-        f :: Int (bound at Defer03.hs:7:1)
         a :: Int (defined at Defer03.hs:4:1)
+        f :: Int (bound at Defer03.hs:7:1)
         maxBound :: forall a. Bounded a => a
           with maxBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
         minBound :: forall a. Bounded a => a
           with minBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
 
 Defer03.hs:4:5: warning: [GHC-83865] [-Wdeferred-type-errors (in -Wdefault)]
@@ -93,13 +92,14 @@ Defer03.hs:7:5: warning: [GHC-88464] [-Wtyped-holes (in -Wdefault)]
     • In an equation for ‘f’: f = _
     • Relevant bindings include f :: Int (bound at Defer03.hs:7:1)
       Valid hole fits include
-        f :: Int (bound at Defer03.hs:7:1)
         a :: Int (defined at Defer03.hs:4:1)
+        f :: Int (bound at Defer03.hs:7:1)
         maxBound :: forall a. Bounded a => a
           with maxBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
         minBound :: forall a. Bounded a => a
           with minBound @Int
-          (imported from ‘Prelude’ at Defer03.hs:1:8-11
+          (imported from ‘Prelude’
            (and originally defined in ‘GHC.Internal.Enum’))
+

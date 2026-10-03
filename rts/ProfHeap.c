@@ -23,6 +23,7 @@
 #include "Printer.h"
 #include "Trace.h"
 #include "sm/GCThread.h"
+#include "IPE.h"
 
 #include <fs_rts.h>
 #include <string.h>
@@ -140,7 +141,10 @@ restore_locale( void )
  * store only up to (max_era - 1) as its creation or last use time.
  * -------------------------------------------------------------------------- */
 unsigned int era;
+
+#if defined(PROFILING)
 static uint32_t max_era;
+#endif
 
 StgWord user_era;
 
@@ -180,6 +184,28 @@ static void dumpCensus( Census *census );
 
 static bool closureSatisfiesConstraints( const StgClosure* p );
 
+static const char *closureTypeIdentity( const StgClosure *p )
+{
+    const StgInfoTable *info = get_itbl(p);
+    switch (info->type) {
+    case CONSTR:
+    case CONSTR_1_0:
+    case CONSTR_0_1:
+    case CONSTR_2_0:
+    case CONSTR_1_1:
+    case CONSTR_0_2:
+    case CONSTR_NOCAF:
+        return GET_CON_DESC(itbl_to_con_itbl(info));
+    default:
+        return closure_type_names[info->type];
+    }
+}
+
+static void formatIPELabel( char *str, size_t size, uint64_t table_id )
+{
+    snprintf(str, size, "0x%" PRIx64, table_id);
+}
+
 /* ----------------------------------------------------------------------------
  * Find the "closure identity", which is a unique pointer representing
  * the band to which this closure's heap space is attributed in the
@@ -214,25 +240,9 @@ closureIdentity( const StgClosure *p )
 #endif
 
     case HEAP_BY_CLOSURE_TYPE:
-    {
-        const StgInfoTable *info;
-        info = get_itbl(p);
-        switch (info->type) {
-        case CONSTR:
-        case CONSTR_1_0:
-        case CONSTR_0_1:
-        case CONSTR_2_0:
-        case CONSTR_1_1:
-        case CONSTR_0_2:
-        case CONSTR_NOCAF:
-            return GET_CON_DESC(itbl_to_con_itbl(info));
-        default:
-            return closure_type_names[info->type];
-        }
-    }
-    case HEAP_BY_INFO_TABLE: {
-        return get_itbl(p);
-        }
+        return closureTypeIdentity(p);
+    case HEAP_BY_INFO_TABLE:
+        return (void *) (p->header.info);
 
     default:
         barf("closureIdentity");
@@ -511,8 +521,10 @@ initHeapProfiling(void)
         n_censuses = 1;
     }
 
+#if defined(PROFILING)
     // max_era = 2^LDV_SHIFT
     max_era = 1 << LDV_SHIFT;
+#endif
 
     censuses = stgMallocBytes(sizeof(Census) * n_censuses, "initHeapProfiling");
 
@@ -662,6 +674,8 @@ fprint_ccs(FILE *fp, CostCentreStack *ccs, uint32_t max_length)
     fprintf(fp, "%s", buf);
 }
 
+#endif /* PROFILING */
+
 bool
 strMatchesSelector( const char* str, const char* sel )
 {
@@ -686,8 +700,6 @@ strMatchesSelector( const char* str, const char* sel )
    }
 }
 
-#endif /* PROFILING */
-
 /* -----------------------------------------------------------------------------
  * Figure out whether a closure should be counted in this census, by
  * testing against all the specified constraints.
@@ -695,11 +707,8 @@ strMatchesSelector( const char* str, const char* sel )
 static bool
 closureSatisfiesConstraints( const StgClosure* p )
 {
-#if !defined(PROFILING)
-    (void)p;   /* keep gcc -Wall happy */
-    return true;
-#else
-   bool b;
+    bool b;
+#if defined(PROFILING)
 
    // The CCS has a selected field to indicate whether this closure is
    // deselected by not being mentioned in the module, CC, or CCS
@@ -719,7 +728,8 @@ closureSatisfiesConstraints( const StgClosure* p )
        if (!b) return false;
    }
    if (RtsFlags.ProfFlags.eraSelector) {
-      return (p->header.prof.hp.era == RtsFlags.ProfFlags.eraSelector);
+       b = p->header.prof.hp.era == RtsFlags.ProfFlags.eraSelector;
+       if (!b) return false;
    }
    if (RtsFlags.ProfFlags.retainerSelector) {
        RetainerSet *rs;
@@ -740,8 +750,21 @@ closureSatisfiesConstraints( const StgClosure* p )
        }
        return false;
    }
-   return true;
+#else
+    if (RtsFlags.ProfFlags.closureTypeSelector) {
+        b = strMatchesSelector( closureTypeIdentity(p),
+                                RtsFlags.ProfFlags.closureTypeSelector );
+        if (!b) return false;
+    }
+    if (RtsFlags.ProfFlags.infoTableSelector) {
+        char str[100];
+        formatIPELabel(str, sizeof str, lookupIPEId(p->header.info));
+        b = strMatchesSelector( str,
+                                RtsFlags.ProfFlags.infoTableSelector );
+        if (!b) return false;
+    }
 #endif /* PROFILING */
+    return true;
 }
 
 /* -----------------------------------------------------------------------------
@@ -853,6 +876,19 @@ aggregateCensusInfo( void )
 }
 #endif
 
+static void
+recordIPEHeapSample(FILE *hp_file, uint64_t table_id, size_t count)
+{
+    char str[100];
+    formatIPELabel(str, sizeof str, table_id);
+
+    // Print to heap profile file
+    fprintf(hp_file, "%s\t%" FMT_Word "\n", str, (W_)(count * sizeof(W_)));
+
+    // Emit the profiling sample (convert count to bytes)
+    traceHeapProfSampleString(str, count * sizeof(W_));
+}
+
 /* -----------------------------------------------------------------------------
  * Print out the results of a heap census.
  * -------------------------------------------------------------------------- */
@@ -915,6 +951,11 @@ dumpCensus( Census *census )
     }
 #endif
 
+    // Census entries which we need to group together.
+    // Used by IPE profiling to group together bands which don't have IPE information.
+    // Printing at the end in the 0 band
+    uint64_t uncategorised_count = 0;
+
     for (ctr = census->ctrs; ctr != NULL; ctr = ctr->next) {
 
 #if defined(PROFILING)
@@ -940,33 +981,46 @@ dumpCensus( Census *census )
 
         switch (RtsFlags.ProfFlags.doHeapProfile) {
         case HEAP_BY_CLOSURE_TYPE:
-            fprintf(hp_file, "%s", (char *)ctr->identity);
+            fprintf(hp_file, "%s\t%" FMT_Word "\n",
+                    (char *)ctr->identity,
+                    (W_)(count * sizeof(W_)));
             traceHeapProfSampleString((char *)ctr->identity,
                                       count * sizeof(W_));
             break;
         case HEAP_BY_INFO_TABLE:
-            fprintf(hp_file, "%p", ctr->identity);
-            char str[100];
-            sprintf(str, "%p", ctr->identity);
-            traceHeapProfSampleString(str, count * sizeof(W_));
+        {
+            uint64_t table_id = lookupIPEId(ctr->identity);
+            if (! table_id) {
+              uncategorised_count += count;
+              continue;
+            }
+            recordIPEHeapSample(hp_file, table_id, count);
             break;
+        }
 #if defined(PROFILING)
         case HEAP_BY_CCS:
             fprint_ccs(hp_file, (CostCentreStack *)ctr->identity,
                        RtsFlags.ProfFlags.ccsLength);
+            fprintf(hp_file, "\t%" FMT_Word "\n",
+                    (W_)(count * sizeof(W_)));
             traceHeapProfSampleCostCentre((CostCentreStack *)ctr->identity,
                                           count * sizeof(W_));
             break;
         case HEAP_BY_ERA:
-            fprintf(hp_file, "%" FMT_Word, (StgWord)ctr->identity);
+        {
             char str_era[100];
-            sprintf(str_era, "%" FMT_Word, (StgWord)ctr->identity);
+            snprintf(str_era, sizeof str_era, "%" FMT_Word,
+                     (StgWord)ctr->identity);
+            fprintf(hp_file, "%s\t%" FMT_Word "\n",
+                    str_era, (W_)(count * sizeof(W_)));
             traceHeapProfSampleString(str_era, count * sizeof(W_));
             break;
+        }
         case HEAP_BY_MOD:
         case HEAP_BY_DESCR:
         case HEAP_BY_TYPE:
-            fprintf(hp_file, "%s", (char *)ctr->identity);
+            fprintf(hp_file, "%s\t%" FMT_Word "\n",
+                    (char *)ctr->identity, (W_)(count * sizeof(W_)));
             traceHeapProfSampleString((char *)ctr->identity,
                                       count * sizeof(W_));
             break;
@@ -977,29 +1031,38 @@ dumpCensus( Census *census )
             // it might be the distinguished retainer set rs_MANY:
             if (rs == &rs_MANY) {
                 fprintf(hp_file, "MANY");
-                break;
+            } else {
+
+                // Mark this retainer set by negating its id, because it
+                // has appeared in at least one census.  We print the
+                // values of all such retainer sets into the log file at
+                // the end.  A retainer set may exist but not feature in
+                // any censuses if it arose as the intermediate retainer
+                // set for some closure during retainer set calculation.
+                if (rs->id > 0)
+                    rs->id = -(rs->id);
+
+                // report in the unit of bytes: * sizeof(StgWord)
+                printRetainerSetShort(hp_file, rs, (W_)(count * sizeof(W_))
+                                                , RtsFlags.ProfFlags.ccsLength);
             }
-
-            // Mark this retainer set by negating its id, because it
-            // has appeared in at least one census.  We print the
-            // values of all such retainer sets into the log file at
-            // the end.  A retainer set may exist but not feature in
-            // any censuses if it arose as the intermediate retainer
-            // set for some closure during retainer set calculation.
-            if (rs->id > 0)
-                rs->id = -(rs->id);
-
-            // report in the unit of bytes: * sizeof(StgWord)
-            printRetainerSetShort(hp_file, rs, (W_)count * sizeof(W_)
-                                             , RtsFlags.ProfFlags.ccsLength);
+            fprintf(hp_file, "\t%" FMT_Word "\n", (W_)(count * sizeof(W_)));
             break;
         }
 #endif
         default:
             barf("dumpCensus; doHeapProfile");
         }
+    }
 
-        fprintf(hp_file, "\t%" FMT_Word "\n", (W_)count * sizeof(W_));
+    // Print the unallocated data into the 0 band for info table profiling.
+    switch (RtsFlags.ProfFlags.doHeapProfile) {
+        case HEAP_BY_INFO_TABLE:
+            recordIPEHeapSample(hp_file, 0, uncategorised_count);
+            break;
+        default:
+            ASSERT(uncategorised_count == 0);
+            break;
     }
 
     traceHeapProfSampleEnd(era);
@@ -1259,20 +1322,8 @@ heapCensusBlock(Census *census, bdescr *bd)
 
         p += size;
 
-        /* skip over slop, see Note [slop on the heap] */
-        while (p < bd->free && !*p) p++;
-        /* Note [skipping slop in the heap profiler]
-         * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-         * We make sure to zero slop that can remain after a major GC so
-         * here we can assume any slop words we see until the block's free
-         * pointer are zero. Since info pointers are always nonzero we can
-         * use this to scan for the next valid heap closure.
-         *
-         * Note that not all types of slop are relevant here, only the ones
-         * that can remain after major GC. So essentially just large objects
-         * and pinned objects. All other closures will have been packed nice
-         * and tight into fresh blocks.
-         */
+        /* See Note [Skipping slop when scanning the heap] in ClosureMacros.h */
+        p = skipSlop(p, bd->free);
     }
 }
 
@@ -1397,8 +1448,6 @@ heapCensusChain( Census *census, bdescr *bd )
         // of the associated block descriptor, thus introducing slop at the end
         // of the object.  This slop remains after GC, violating the assumption
         // of the loop below that all slop has been eliminated (#11627).
-        // The slop isn't always zeroed (e.g. in non-profiling mode, cf
-        // OVERWRITING_CLOSURE_OFS).
         // Consequently, we handle large ARR_WORDS objects as a special case.
         if (bd->flags & BF_LARGE) {
             StgPtr p = bd->start;

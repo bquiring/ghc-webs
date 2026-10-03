@@ -1,5 +1,3 @@
-{-# LANGUAGE DerivingStrategies #-}
-
 {-
 
 Describes predicates as they are considered by the solver.
@@ -19,12 +17,12 @@ module GHC.Core.Predicate (
 
   -- Class predicates
   mkClassPred, isDictTy, typeDeterminesValue,
-  isClassPred, isEqualityClass, isCTupleClass,
+  isClassPred, isEqualityClass, isCTupleClass, isUnaryClass,
   getClassPredTys, getClassPredTys_maybe,
   classMethodTy, classMethodInstTy,
 
   -- Implicit parameters
-  couldBeIPLike, mightMentionIP, isIPTyCon, isIPClass,
+  couldBeIPLike, mightMentionIP, isIPTyCon, isIPClass, decomposeIPPred,
   isCallStackTy, isCallStackPred, isCallStackPredTy,
   isExceptionContextPred, isExceptionContextTy,
   isIPPred_maybe,
@@ -55,8 +53,8 @@ import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Core.Multiplicity ( scaledThing )
 
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim( eqPrimTyCon, eqReprPrimTyCon )
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Prim( eqPrimTyCon, eqReprPrimTyCon )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
@@ -217,7 +215,7 @@ in GHC.Tc.Solver.Dict.
 -- See Note [Types for coercions, predicates, and evidence] in "GHC.Core.TyCo.Rep"
 isEqPred :: PredType -> Bool
 -- True of (s ~# t) (s ~R# t)
--- NB: but NOT true of (s ~ t) or (s ~~ t) or (Coecible s t)
+-- NB: but NOT true of (s ~ t) or (s ~~ t) or (Coercible s t)
 isEqPred ty
   | Just tc <- tyConAppTyCon_maybe ty
   = tc `hasKey` eqPrimTyConKey || tc `hasKey` eqReprPrimTyConKey
@@ -268,6 +266,9 @@ isEqualityClass cls
 
 isCTupleClass :: Class -> Bool
 isCTupleClass cls = isTupleTyCon (classTyCon cls)
+
+isUnaryClass :: Class -> Bool
+isUnaryClass cls = isUnaryClassTyCon (classTyCon cls)
 
 getClassPredTys :: HasDebugCallStack => PredType -> (Class, [Type])
 getClassPredTys ty = case getClassPredTys_maybe ty of
@@ -351,12 +352,12 @@ mkReprEqPred ty1  ty2
     k1 = typeKind ty1
     k2 = typeKind ty2
 
--- | Makes a lifted equality predicate at the given role
+-- | Makes a primitive unlifted equality predicate at the given role
 mkEqPred :: EqRel -> Type -> Type -> PredType
 mkEqPred NomEq  = mkNomEqPred
 mkEqPred ReprEq = mkReprEqPred
 
--- | Makes a lifted equality predicate at the given role
+-- | Makes a primitive unlifted equality predicate at the given role
 mkEqPredRole :: Role -> Type -> Type -> PredType
 mkEqPredRole Nominal          = mkNomEqPred
 mkEqPredRole Representational = mkReprEqPred
@@ -407,6 +408,8 @@ pprPredType pred
 *                                                                      *
 ********************************************************************* -}
 
+-- --------------------- Nomal implicit-parameter predicates ---------------
+
 isIPTyCon :: TyCon -> Bool
 isIPTyCon tc = tc `hasKey` ipClassKey
   -- Class and its corresponding TyCon have the same Unique
@@ -423,6 +426,18 @@ isIPPred_maybe cls tys
   = Just (t1,t2)
   | otherwise
   = Nothing
+
+-- | Take a type (IP sym ty), where IP is the built in IP class
+-- and return (ip, MkIP, [sym,ty]), where
+--    `ip` is the class-op for class IP
+--    `MkIP` is the data constructor for class IP
+decomposeIPPred :: Type -> (Id, [Type])
+decomposeIPPred ty
+  | Just (cls, tys) <- getClassPredTys_maybe ty
+  , [ip_op] <- classMethods cls
+  = assertPpr (isIPClass cls && isUnaryClass cls) (ppr ty) $
+    (ip_op, tys)
+  | otherwise = pprPanic "decomposeIP" (ppr ty)
 
 -- --------------------- ExceptionContext predicates --------------------------
 

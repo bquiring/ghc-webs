@@ -2,23 +2,16 @@
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
-
 Type checking of type signatures in interface files
 -}
 
-
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE FlexibleContexts #-}
-
 {-# LANGUAGE RecursiveDo #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RecordWildCards #-}
 
+{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+
 module GHC.IfaceToCore (
-        tcLookupImported_maybe,
         importDecl, checkWiredInTyCon, tcHiBootIface, typecheckIface,
         typecheckWholeCoreBindings,
         tcIfaceDefaults,
@@ -39,12 +32,11 @@ import GHC.Prelude
 
 import GHC.ByteCode.Types
 
-import GHC.Driver.Env
 import GHC.Driver.Session
 import GHC.Driver.Config.Core.Lint ( initLintConfig )
 
-import GHC.Builtin.Types.Literals(typeNatCoAxiomRules)
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.TypeLits(typeNatCoAxiomRules)
+import GHC.Builtin.WiredIn.Types
 
 import GHC.Iface.Syntax
 import GHC.Iface.Load
@@ -78,8 +70,10 @@ import GHC.Core.Class
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
+import GHC.Core.Opt.OccurAnal ( occurAnalyseBndrsAndExpr )
 import GHC.Core.Ppr
+
+import GHC.Hs.Extension ( GhcRn )
 
 import GHC.Unit.External
 import GHC.Unit.Module
@@ -126,9 +120,7 @@ import GHC.Types.Tickish
 import GHC.Types.TyThing
 import GHC.Types.Error
 
-import GHC.Parser.Annotation (noLocA)
-
-import GHC.Hs.Extension ( GhcRn )
+import GHC.Parser.Annotation (noLocA, noAnn)
 
 import GHC.Fingerprint
 
@@ -138,12 +130,13 @@ import GHC.Unit.Module.WholeCoreBindings
 import Data.IORef
 import Data.Foldable
 import Data.List(nub)
-import GHC.Builtin.Names (ioTyConName, rOOT_MAIN)
+import GHC.Builtin.Modules   ( rOOT_MAIN )
 import GHC.Iface.Errors.Types
 
 import Language.Haskell.Syntax.BooleanFormula (BooleanFormula)
 import Language.Haskell.Syntax.BooleanFormula qualified as BF(BooleanFormula(..))
 import Language.Haskell.Syntax.Extension (NoExtField (NoExtField))
+import GHC.Builtin.KnownKeys (ioTyConKey)
 
 {-
 This module takes
@@ -281,7 +274,7 @@ typecheckWholeCoreBindings type_var WholeCoreBindings {wcb_bindings, wcb_module}
 isAbstractIfaceDecl :: IfaceDecl -> Bool
 isAbstractIfaceDecl IfaceData{ ifCons = IfAbstractTyCon {} } = True
 isAbstractIfaceDecl IfaceClass{ ifBody = IfAbstractClass } = True
-isAbstractIfaceDecl IfaceFamily{ ifFamFlav = IfaceAbstractClosedSynFamilyTyCon } = True
+isAbstractIfaceDecl IfaceFamily{ ifFamFlav = IfaceClosedTypeFamilyTyCon IfaceAbstractClosedTyFamTyCon } = True
 isAbstractIfaceDecl _ = False
 
 ifMaybeRoles :: IfaceDecl -> Maybe [Role]
@@ -724,26 +717,29 @@ tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
         ; info <- tcIdInfo ignore_prags TopLevel name ty info
         ; return (AnId (mkGlobalId details name ty info)) }
 
-tc_iface_decl _ _ (IfaceData {ifName = tc_name,
-                          ifCType = cType,
-                          ifBinders = binders,
-                          ifResKind = res_kind,
-                          ifRoles = roles,
-                          ifCtxt = ctxt, ifGadtSyntax = gadt_syn,
-                          ifCons = rdr_cons,
-                          ifParent = mb_parent })
-  = bindIfaceTyConBinders_AT binders $ \ binders' -> do
-    { res_kind' <- tcIfaceType res_kind
-
-    ; tycon <- fixM $ \ tycon -> do
-            { stupid_theta <- tcIfaceCtxt ctxt
-            ; parent' <- tc_parent tc_name mb_parent
-            ; cons <- tcIfaceDataCons tc_name tycon binders' rdr_cons
-            ; return (mkAlgTyCon tc_name binders' res_kind'
-                                 roles cType stupid_theta
-                                 cons parent' gadt_syn) }
-    ; traceIf (text "tcIfaceDecl4" <+> ppr tycon)
-    ; return (ATyCon tycon) }
+tc_iface_decl _ _
+  (IfaceData {ifName = tc_name,
+              ifKind = kind,
+              ifCType = cType,
+              ifBinders = binders,
+              ifNbEtaBinders = nb_eta_binders,
+              ifResKind = res_kind,
+              ifRoles = roles,
+              ifCtxt = ctxt, ifGadtSyntax = gadt_syn,
+              ifCons = rdr_cons,
+              ifParent = mb_parent })
+  = do { kind' <- tcIfaceType kind
+       ; tycon <- fixM $ \ tycon -> do
+               { cons <- tcIfaceDataCons tc_name tycon rdr_cons
+               ; bindIfaceTyConBinders_AT binders $ \ binders' ->
+            do { res_kind' <- tcIfaceType res_kind
+               ; stupid_theta <- tcIfaceCtxt ctxt
+               ; parent' <- tc_parent tc_name mb_parent
+               ; return (mkAlgTyCon tc_name kind' binders' nb_eta_binders res_kind'
+                                    roles cType stupid_theta
+                                    cons parent' gadt_syn) } }
+       ; traceIf (text "tcIfaceDecl4" <+> ppr tycon)
+       ; return (ATyCon tycon) }
   where
     tc_parent :: Name -> IfaceTyConParent -> IfL AlgTyConFlav
     tc_parent tc_name IfNoParent
@@ -755,32 +751,38 @@ tc_iface_decl _ _ (IfaceData {ifName = tc_name,
            ; lhs_tys <- tcIfaceAppArgs arg_tys
            ; return (DataFamInstTyCon ax fam_tc lhs_tys) }
 
-tc_iface_decl _ _ (IfaceSynonym {ifName = tc_name,
-                                      ifRoles = roles,
-                                      ifSynRhs = rhs_ty,
-                                      ifBinders = binders,
-                                      ifResKind = res_kind })
-   = bindIfaceTyConBinders_AT binders $ \ binders' -> do
-     { res_kind' <- tcIfaceType res_kind     -- Note [Synonym kind loop]
-     ; rhs      <- forkM (mk_doc tc_name) $
-                   tcIfaceType rhs_ty
-     ; let tycon = buildSynTyCon tc_name binders' res_kind' roles rhs
-     ; return (ATyCon tycon) }
+tc_iface_decl _ _
+  (IfaceSynonym {ifName = tc_name,
+                 ifKind = kind,
+                 ifRoles = roles,
+                 ifSynRhs = rhs_ty,
+                 ifBinders = binders,
+                 ifResKind = res_kind })
+   = do { kind' <- tcIfaceType kind
+        ; bindIfaceTyConBinders_AT binders $ \ binders' ->
+     do { res_kind' <- tcIfaceType res_kind     -- Note [Synonym kind loop]
+        ; rhs      <- forkM (mk_doc tc_name) $
+                      tcIfaceType rhs_ty
+        ; let tycon = buildSynTyCon tc_name kind' binders' res_kind' roles rhs
+        ; return (ATyCon tycon) } }
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
 tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
+                                     ifKind = kind,
                                      ifFamFlav = fam_flav,
                                      ifBinders = binders,
+                                     ifNbEtaBinders = nb_eta,
                                      ifResKind = res_kind,
                                      ifResVar = res, ifFamInj = inj })
-   = bindIfaceTyConBinders_AT binders $ \ binders' -> do
-     { res_kind' <- tcIfaceType res_kind    -- Note [Synonym kind loop]
-     ; rhs      <- forkM (mk_doc tc_name) $
-                   tc_fam_flav tc_name fam_flav
-     ; res_name <- traverse (newIfaceName . mkTyVarOccFS . ifLclNameFS) res
-     ; let tycon = mkFamilyTyCon tc_name binders' res_kind' res_name rhs parent inj
-     ; return (ATyCon tycon) }
+   = do { kind' <- tcIfaceType kind
+        ; bindIfaceTyConBinders_AT binders $ \ binders' ->
+     do { res_kind' <- tcIfaceType res_kind    -- Note [Synonym kind loop]
+        ; rhs      <- forkM (mk_doc tc_name) $
+                      tc_fam_flav tc_name fam_flav
+        ; res_name <- traverse (newIfaceName . mkTyVarOccFS . ifLclNameFS) res
+        ; let tycon = mkFamilyTyCon tc_name kind' binders' nb_eta res_kind' res_name rhs parent inj
+        ; return (ATyCon tycon) } }
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
@@ -788,50 +790,55 @@ tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
      tc_fam_flav tc_name IfaceDataFamilyTyCon
        = do { tc_rep_name <- newTyConRepName tc_name
             ; return (DataFamilyTyCon tc_rep_name) }
-     tc_fam_flav _ IfaceOpenSynFamilyTyCon= return OpenSynFamilyTyCon
-     tc_fam_flav _ (IfaceClosedSynFamilyTyCon mb_ax_name_branches)
-       = do { ax <- traverse (tcIfaceBranchedAxiom . fst) mb_ax_name_branches
-            ; return (ClosedSynFamilyTyCon ax) }
-     tc_fam_flav _ IfaceAbstractClosedSynFamilyTyCon
-         = return AbstractClosedSynFamilyTyCon
-     tc_fam_flav _ IfaceBuiltInSynFamTyCon
-         = pprPanic "tc_iface_decl"
-                    (text "IfaceBuiltInSynFamTyCon in interface file")
+     tc_fam_flav _ IfaceOpenTypeFamilyTyCon = return OpenTypeFamilyTyCon
+     tc_fam_flav _ (IfaceClosedTypeFamilyTyCon ctf) = ClosedTypeFamilyTyCon <$>
+       case ctf of
+        IfaceClosedTyFamTyCon mb_ax_name_branches ->
+         do { ax <- traverse (tcIfaceBranchedAxiom . fst) mb_ax_name_branches
+            ; return (CTF ax) }
+        IfaceAbstractClosedTyFamTyCon -> return CTF_Abstract
+        IfaceBuiltInClosedTyFamTyCon ->
+          pprPanic "tc_iface_decl" $
+            text "IfaceBuiltInClosedTyFamTyCon in interface file"
 
 tc_iface_decl _parent _ignore_prags
             (IfaceClass {ifName = tc_name,
+                         ifKind = kind,
                          ifRoles = roles,
                          ifBinders = binders,
                          ifFDs = rdr_fds,
                          ifBody = IfAbstractClass})
-  = bindIfaceTyConBinders binders $ \ binders' -> do
-    { fds  <- mapM tc_fd rdr_fds
-    ; cls  <- buildClass tc_name binders' roles fds Nothing
-    ; return (ATyCon (classTyCon cls)) }
+  = do { kind' <- tcIfaceType kind
+       ; bindIfaceTyConBinders binders $ \ binders' ->
+    do { fds  <- mapM tc_fd rdr_fds
+       ; cls  <- buildAbstractClass tc_name kind' binders' roles fds
+       ; return (ATyCon (classTyCon cls)) } }
 
 tc_iface_decl _parent ignore_prags
             (IfaceClass {ifName = tc_name,
+                         ifKind = kind,
                          ifRoles = roles,
                          ifBinders = binders,
                          ifFDs = rdr_fds,
                          ifBody = IfConcreteClass {
                              ifClassCtxt = rdr_ctxt,
                              ifATs = rdr_ats, ifSigs = rdr_sigs,
-                             ifMinDef = if_mindef
+                             ifMinDef = if_mindef, ifUnary = unary
                          }})
-  = bindIfaceTyConBinders binders $ \ binders' -> do
-    { traceIf (text "tc-iface-class1" <+> ppr tc_name)
-    ; ctxt <- mapM tc_sc rdr_ctxt
-    ; traceIf (text "tc-iface-class2" <+> ppr tc_name)
-    ; sigs <- mapM tc_sig rdr_sigs
-    ; fds  <- mapM tc_fd rdr_fds
-    ; traceIf (text "tc-iface-class3" <+> ppr tc_name)
-    ; mindef <- tc_boolean_formula if_mindef
-    ; cls  <- fixM $ \ cls -> do
-              { ats  <- mapM (tc_at cls) rdr_ats
-              ; traceIf (text "tc-iface-class4" <+> ppr tc_name)
-              ; buildClass tc_name binders' roles fds (Just (ctxt, ats, sigs, mindef)) }
-    ; return (ATyCon (classTyCon cls)) }
+  = do { kind' <- tcIfaceType kind
+       ; bindIfaceTyConBinders binders $ \ binders' ->
+    do { traceIf (text "tc-iface-class1" <+> ppr tc_name)
+       ; ctxt <- mapM tc_sc rdr_ctxt
+       ; traceIf (text "tc-iface-class2" <+> ppr tc_name)
+       ; sigs <- mapM tc_sig rdr_sigs
+       ; fds  <- mapM tc_fd rdr_fds
+       ; traceIf (text "tc-iface-class3" <+> ppr tc_name)
+       ; mindef <- tc_boolean_formula if_mindef
+       ; cls  <- fixM $ \ cls -> do
+                 { ats  <- mapM (tc_at cls) rdr_ats
+                 ; traceIf (text "tc-iface-class4" <+> ppr tc_name)
+                 ; buildClass tc_name kind' binders' roles fds ctxt ats sigs mindef unary }
+       ; return (ATyCon (classTyCon cls)) } }
   where
    tc_sc pred = forkM (mk_sc_doc pred) (tcIfaceType pred)
         -- The *length* of the superclasses is used by buildClass, and hence must
@@ -876,10 +883,10 @@ tc_iface_decl _parent ignore_prags
           return (ATI tc mb_def)
 
    tc_boolean_formula :: IfaceBooleanFormula -> IfL (BooleanFormula GhcRn)
-   tc_boolean_formula (IfAnd ibfs  ) = BF.And    . map noLocA <$> traverse tc_boolean_formula ibfs
-   tc_boolean_formula (IfOr ibfs   ) = BF.Or     . map noLocA <$> traverse tc_boolean_formula ibfs
-   tc_boolean_formula (IfParens ibf) = BF.Parens .     noLocA <$>          tc_boolean_formula ibf
-   tc_boolean_formula (IfVar nm    ) = BF.Var    .     noLocA <$> (lookupIfaceTop . mkVarOccFS . ifLclNameFS $ nm)
+   tc_boolean_formula (IfAnd ibfs  ) = BF.And    NoExtField . map noLocA <$> traverse tc_boolean_formula ibfs
+   tc_boolean_formula (IfOr ibfs   ) = BF.Or     NoExtField . map noLocA <$> traverse tc_boolean_formula ibfs
+   tc_boolean_formula (IfParens ibf) = BF.Parens noAnn      .     noLocA <$>          tc_boolean_formula ibf
+   tc_boolean_formula (IfVar nm    ) = BF.Var    NoExtField .     noLocA <$> (lookupIfaceTop . mkVarOccFS . ifLclNameFS $ nm)
 
    mk_sc_doc pred = text "Superclass" <+> ppr pred
    mk_at_doc tc = text "Associated type" <+> ppr tc
@@ -976,9 +983,13 @@ mk_top_id (IfGblTopBndr gbl_name)
   -- rather than the current module so we need this special case.
   -- See some similar logic in `GHC.Rename.Env`.
   | Just rOOT_MAIN == nameModule_maybe gbl_name
-    = do
-        ATyCon ioTyCon <- tcIfaceGlobal ioTyConName
-        return $ mkExportedVanillaId gbl_name (mkTyConApp ioTyCon [unitTy])
+    = loadKnownKeyOccMaps >>= \case
+        Failed err -> failIfM (pprDiagnostic err)
+        Succeeded kk_maps -> lookupKnownKeyThing ioTyConKey (KES_FromModule kk_maps) >>= \case
+          Failed err          -> failIfM (pprDiagnostic err)
+          Succeeded ioTyThing -> do
+            ATyCon ioTyCon <- pure ioTyThing
+            return $ mkExportedVanillaId gbl_name (mkTyConApp ioTyCon [unitTy])
   | otherwise = tcIfaceExtId gbl_name
 mk_top_id (IfLclTopBndr raw_name iface_type info details) = do
    ty <- tcIfaceType iface_type
@@ -1134,8 +1145,8 @@ tc_ax_branch prev_branches
                           , cab_incomps = map (prev_branches `getNth`) incomps }
     ; return (prev_branches ++ [br]) }
 
-tcIfaceDataCons :: Name -> TyCon -> [TyConBinder] -> IfaceConDecls -> IfL AlgTyConRhs
-tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
+tcIfaceDataCons :: Name -> TyCon -> IfaceConDecls -> IfL AlgTyConRhs
+tcIfaceDataCons tycon_name tycon if_cons
   = case if_cons of
         IfAbstractTyCon
           -> return AbstractTyCon
@@ -1150,13 +1161,12 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
           -> do  { data_con  <- tc_con_decl con
                  ; mkNewTyConRhs tycon_name tycon data_con }
   where
-    univ_tvs :: [TyVar]
-    univ_tvs = binderVars tc_tybinders
 
     tag_map :: NameEnv ConTag
     tag_map = mkTyConTagMap tycon
 
     tc_con_decl (IfCon { ifConInfix = is_infix,
+                         ifConUnivTvs = univ_bndrs,
                          ifConExTCvs = ex_bndrs,
                          ifConUserTvBinders = user_bndrs,
                          ifConName = dc_name,
@@ -1164,24 +1174,10 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
                          ifConArgTys = args, ifConFields = lbl_names,
                          ifConStricts = if_stricts,
                          ifConSrcStricts = if_src_stricts})
-     = -- Universally-quantified tyvars are shared with
-       -- parent TyCon, and are already in scope
-       bindIfaceBndrs ex_bndrs    $ \ ex_tvs -> do
-        { traceIf (text "Start interface-file tc_con_decl" <+> ppr dc_name)
-
-          -- By this point, we have bound every universal and existential
-          -- tyvar. Because of the dcUserTyVarBinders invariant
-          -- (see Note [DataCon user type variable binders]), *every* tyvar in
-          -- ifConUserTvBinders has a matching counterpart somewhere in the
-          -- bound universals/existentials. As a result, calling tcIfaceTyVar
-          -- below is always guaranteed to succeed.
-        ; user_tv_bndrs <- mapM (\(Bndr bd vis) ->
-                                   case bd of
-                                     IfaceIdBndr (_, name, _) ->
-                                       Bndr <$> tcIfaceLclId name <*> pure vis
-                                     IfaceTvBndr (name, _) ->
-                                       Bndr <$> tcIfaceTyVar name <*> pure vis)
-                                user_bndrs
+     = bindIfaceForAllBndrs user_bndrs $ \ user_tvs ->
+       bindDataConBinders   univ_bndrs $ \ univ_tvs ->
+       bindDataConBinders   ex_bndrs   $ \ ex_tvs  ->
+     do { traceIf (text "Start interface-file tc_con_decl" <+> ppr dc_name)
 
         -- Read the context and argument types, but lazily for two reasons
         -- (a) to avoid looking tugging on a recursive use of
@@ -1207,7 +1203,7 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
         -- Remember, tycon is the representation tycon
         ; let orig_res_ty = mkFamilyTyConApp tycon
                               (substTyCoVars (mkTvSubstPrs (map eqSpecPair eq_spec))
-                                             (binderVars tc_tybinders))
+                                             univ_tvs)
 
         ; prom_rep_name <- newTyConRepName dc_name
 
@@ -1221,7 +1217,7 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
                        dc_name is_infix prom_rep_name
                        (map src_strict if_src_stricts)
                        lbl_names
-                       univ_tvs ex_tvs user_tv_bndrs
+                       univ_tvs ex_tvs user_tvs
                        eq_spec theta
                        arg_tys orig_res_ty tycon tag_map
         ; traceIf (text "Done interface-file tc_con_decl" <+> ppr dc_name)
@@ -1237,6 +1233,21 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
 
     src_strict :: IfaceSrcBang -> HsSrcBang
     src_strict (IfSrcBang unpk bang) = HsSrcBang NoSourceText unpk bang
+
+bindDataConBinders :: [IfaceBndr] -> ([CoreBndr] -> IfL a) -> IfL a
+bindDataConBinders [] thing_inside
+  = thing_inside []
+bindDataConBinders (b : bs) thing_inside
+  = bind_tv            b  $ \b'  ->
+    bindDataConBinders bs $ \bs' ->
+    thing_inside (b':bs')
+  where
+    bind_tv tv thing =
+      do { mb_tv <- lookupIfaceVar tv
+         ; case mb_tv of
+             Just b' -> thing b'
+             Nothing -> bindIfaceBndr tv thing
+         }
 
 tcIfaceEqSpec :: IfaceEqSpec -> IfL [EqSpec]
 tcIfaceEqSpec spec
@@ -1402,22 +1413,28 @@ tcIfaceRule (IfaceRule {ifRuleName = name, ifActivation = act, ifRuleBndrs = bnd
                           Nothing   -> return ()
                           Just errs -> do
                             logger <- getLogger
-                            liftIO $ displayLintResults logger False doc
+                            liftIO $ displayLintResults logger doc
                                                (pprCoreExpr rhs')
                                                (emptyBag, errs) }
                    ; return (bndrs', args', rhs') }
         ; let mb_tcs = map ifTopFreeName args
+              (bndrs_occ, rhs_occ) = occurAnalyseBndrsAndExpr bndrs' rhs'
+                   -- See (OUR1) in Note [OccInfo in unfoldings and rules]
+
         ; this_mod <- getIfModule
-        ; return (Rule { ru_name = name, ru_fn = fn, ru_act = act,
-                          ru_bndrs = bndrs', ru_args = args',
-                          ru_rhs = occurAnalyseExpr rhs',
-                          ru_rough = mb_tcs,
-                          ru_origin = this_mod,
-                          ru_orphan = orph,
-                          ru_auto = auto,
-                          ru_local = False }) } -- An imported RULE is never for a local Id
-                                                -- or, even if it is (module loop, perhaps)
-                                                -- we'll just leave it in the non-local set
+        ; return (Rule { ru_name   = name
+                       , ru_fn     = fn
+                       , ru_act    = act
+                       , ru_bndrs  = bndrs_occ
+                       , ru_args   = args'
+                       , ru_rhs    = rhs_occ
+                       , ru_rough  = mb_tcs
+                       , ru_origin = this_mod
+                       , ru_orphan = orph
+                       , ru_auto   = auto
+                       , ru_local  = False }) }
+              -- ru_local=False: an imported RULE is never for a local Id or, even if
+              -- it is (module loop, perhaps) we'll just leave it in the non-local set
   where
         -- This function *must* mirror exactly what Rules.roughTopNames does
         -- We could have stored the ru_rough field in the iface file
@@ -1575,9 +1592,12 @@ tcIfaceCo = go
     go (IfaceFunCo r w c1 c2)    = mkFunCoNoFTF r <$> go w <*> go c1 <*> go c2
     go (IfaceTyConAppCo r tc cs) = TyConAppCo r <$> tcIfaceTyCon tc <*> mapM go cs
     go (IfaceAppCo c1 c2)        = AppCo <$> go c1 <*> go c2
-    go (IfaceForAllCo tv visL visR k c) = do { k' <- go k
-                                      ; bindIfaceBndr tv $ \ tv' ->
-                                        ForAllCo tv' visL visR k' <$> go c }
+    go (IfaceForAllCo tcv visL visR k co)
+      = do { k' <- go_mco k
+           ; bindIfaceBndr tcv $ \ tv' ->
+        do { co' <- go co
+           ; return (ForAllCo { fco_tcv = tv', fco_visL = visL, fco_visR = visR
+                              , fco_kind = k', fco_body = co' }) } }
     go (IfaceCoVarCo n)           = CoVarCo <$> go_var n
     go (IfaceUnivCo p r t1 t2 ds) = do { t1' <- tcIfaceType t1; t2' <- tcIfaceType t2
                                        ; ds' <- mapM go ds
@@ -1785,10 +1805,9 @@ tcIfaceDataAlt mult con inst_tys arg_strs rhs
 -}
 
 tcIdDetails :: Name -> Type -> IfaceIdDetails -> IfL IdDetails
-tcIdDetails _ _  IfVanillaId = return VanillaId
+tcIdDetails _ _  IfVanillaId           = return VanillaId
 tcIdDetails _ _  (IfWorkerLikeId dmds) = return $ WorkerLikeId dmds
-tcIdDetails _ ty IfDFunId
-  = return (DFunId (isNewTyCon (classTyCon cls)))
+tcIdDetails _ ty IfDFunId              = return (mkDFunIdDetails cls)
   where
     (_, _, cls, _) = tcSplitDFunTy ty
 
@@ -1992,7 +2011,7 @@ tcUnfoldingRhs is_compulsory toplvl name expr
         case lintUnfolding is_compulsory (initLintConfig dflags in_scope) noSrcLoc core_expr' of
           Nothing   -> return ()
           Just errs -> liftIO $
-            displayLintResults logger False doc
+            displayLintResults logger doc
                                (pprCoreExpr core_expr') (emptyBag, errs)
     return core_expr'
   where
@@ -2025,7 +2044,7 @@ tcIfaceOneShot IfaceOneShot = OneShotLam
 ************************************************************************
 -}
 
-tcIfaceGlobal :: Name -> IfL TyThing
+tcIfaceGlobal :: HasDebugCallStack => Name -> IfL TyThing
 tcIfaceGlobal name
   | Just thing <- wiredInNameTyThing_maybe name
         -- Wired-in things include TyCons, DataCons, and Ids
@@ -2035,90 +2054,13 @@ tcIfaceGlobal name
   = do { ifCheckWiredInThing thing; return thing }
 
   | otherwise
-  = do  { env <- getGblEnv
-        ; cur_mod <- if_mod <$> getLclEnv
-        ; case lookupKnotVars (if_rec_types env) (fromMaybe cur_mod (nameModule_maybe name))  of     -- Note [Tying the knot]
-            Just get_type_env
-                -> do           -- It's defined in a module in the hs-boot loop
-                { type_env <- setLclEnv () get_type_env         -- yuk
-                ; case lookupNameEnv type_env name of
-                    Just thing -> return thing
-                    -- See Note [Knot-tying fallback on boot]
-                    Nothing   -> via_external
-                }
-
-            _ -> via_external }
-  where
-    via_external =  do
-        { hsc_env <- getTopEnv
-        ; mb_thing <- liftIO (lookupType hsc_env name)
-        ; case mb_thing of {
-            Just thing -> return thing ;
-            Nothing    -> do
-
-        { mb_thing <- importDecl name   -- It's imported; go get it
-        ; case mb_thing of
+  = do { mod <- case nameModule_maybe name of
+                  Just mod -> return mod
+                  Nothing  -> if_mod <$> getLclEnv
+       ; mb_thing <- loadGlobalName name mod
+       ; case mb_thing of
             Failed err      -> failIfM (ppr name <+> pprDiagnostic err)
-            Succeeded thing -> return thing
-        }}}
-
--- Note [Tying the knot]
--- ~~~~~~~~~~~~~~~~~~~~~
--- The if_rec_types field is used when we are compiling M.hs, which indirectly
--- imports Foo.hi, which mentions M.T Then we look up M.T in M's type
--- environment, which is splatted into if_rec_types after we've built M's type
--- envt.
---
--- This is a dark and complicated part of GHC type checking, with a lot
--- of moving parts.  Interested readers should also look at:
---
---      * Note [Knot-tying typecheckIface]
---      * Note [DFun knot-tying]
---      * Note [hsc_type_env_var hack]
---      * Note [Knot-tying fallback on boot]
---      * Note [Hydrating Modules]
---
--- There is also a wiki page on the subject, see:
---
---      https://gitlab.haskell.org/ghc/ghc/wikis/commentary/compiler/tying-the-knot
-
--- Note [Knot-tying fallback on boot]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- Suppose that you are typechecking A.hs, which transitively imports,
--- via B.hs, A.hs-boot. When we poke on B.hs and discover that it
--- has a reference to a type T from A, what TyThing should we wire
--- it up with? Clearly, if we have already typechecked T and
--- added it into the type environment, we should go ahead and use that
--- type. But what if we haven't typechecked it yet?
---
--- For the longest time, GHC adopted the policy that this was
--- *an error condition*; that you MUST NEVER poke on B.hs's reference
--- to a T defined in A.hs until A.hs has gotten around to kind-checking
--- T and adding it to the env. However, actually ensuring this is the
--- case has proven to be a bug farm, because it's really difficult to
--- actually ensure this never happens. The problem was especially poignant
--- with type family consistency checks, which eagerly happen before any
--- typechecking takes place.
---
--- Today, we take a different strategy: if we ever try to access
--- an entity from A which doesn't exist, we just fall back on the
--- definition of A from the hs-boot file. This is complicated in
--- its own way: it means that you may end up with a mix of A.hs and
--- A.hs-boot TyThings during the course of typechecking.  We don't
--- think (and have not observed) any cases where this would cause
--- problems, but the hypothetical situation one might worry about
--- is something along these lines in Core:
---
---    case x of
---        A -> e1
---        B -> e2
---
--- If, when typechecking this, we find x :: T, and the T we are hooked
--- up with is the abstract one from the hs-boot file, rather than the
--- one defined in this module with constructors A and B.  But it's hard
--- to see how this could happen, especially because the reference to
--- the constructor (A and B) means that GHC will always typecheck
--- this expression *after* typechecking T.
+            Succeeded thing -> return thing }
 
 tcIfaceTyCon :: IfaceTyCon -> IfL TyCon
 tcIfaceTyCon (IfaceTyCon name _info)
@@ -2295,3 +2237,5 @@ tcIfaceImport (IfaceImport spec (ImpIfaceEverythingBut ns))
   = ImpUserSpec spec (ImpUserEverythingBut (mkNameSet ns))
 tcIfaceImport (IfaceImport spec (ImpIfaceExplicit gre implicit_parents))
   = ImpUserSpec spec (ImpUserExplicit (getDetOrdAvails gre) $ mkNameSet implicit_parents)
+tcIfaceImport (IfaceImport spec ImpIfaceDependOnly)
+  = ImpUserSpec spec ImpUserDependOnly

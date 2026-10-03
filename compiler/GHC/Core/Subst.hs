@@ -13,7 +13,8 @@ module GHC.Core.Subst (
 
         -- ** Substituting into expressions and related types
         deShadowBinds, substRuleInfo, substRulesForImportedIds,
-        substTyUnchecked, substCo, substExpr, substExprSC, substBind, substBindSC,
+        substTy, substTyUnchecked, substCo,
+        substExpr, substExprSC, substBind, substBindSC,
         substUnfolding, substUnfoldingSC,
         lookupIdSubst, lookupIdSubst_maybe, substIdType, substIdOcc,
         substTickish, substDVarSet, substIdInfo,
@@ -42,12 +43,12 @@ import GHC.Core.FVs
 import GHC.Core.Seq
 import GHC.Core.Utils
 
-        -- We are defining local versions
-import GHC.Core.Type hiding ( substTy )
-import GHC.Core.Coercion
-    ( tyCoFVsOfCo, mkCoVarCo, substCoVarBndr )
+import GHC.Core.Type
+import GHC.Core.Coercion( mkCoVarCo, substCoVarBndr )
+import GHC.Core.TyCo.FVs
 
 import GHC.Types.Var.Set
+import GHC.Types.Var.FV
 import GHC.Types.Var.Env as InScopeSet
 import GHC.Types.Id
 import GHC.Types.Name     ( Name )
@@ -56,7 +57,7 @@ import GHC.Types.Tickish
 import GHC.Types.Id.Info
 import GHC.Types.Unique.Supply
 
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 import GHC.Data.Maybe
 
 import GHC.Utils.Misc
@@ -380,8 +381,10 @@ substIdBndr _doc rec_subst subst@(Subst in_scope env tvs cvs) old_id
 
     old_ty = idType old_id
     old_w = idMult old_id
-    no_type_change = (isEmptyVarEnv tvs && isEmptyVarEnv cvs) ||
+    no_type_change = isEmptyTCvSubst subst ||
                      (noFreeVarsOfType old_ty && noFreeVarsOfType old_w)
+                     -- isEmptyTCvSubst: see Note [Keeping the substitution empty]
+                     --                  in GHC.Core.TyCo.Subst
 
         -- new_id has the right IdInfo
         -- The lazy-set is because we're in a loop here, with
@@ -586,20 +589,17 @@ substRule subst subst_ru_fn rule@(Rule { ru_bndrs = bndrs, ru_args = args
 
 ------------------
 substDVarSet :: HasDebugCallStack => Subst -> DVarSet -> DVarSet
+-- Apply the substitution to the vars in the set,
+-- and take the shallow free vars of the result
 substDVarSet subst@(Subst _ _ tv_env cv_env) fvs
-  = mkDVarSet $ fst $ foldr subst_fv ([], emptyVarSet) $ dVarSetElems fvs
+  = runFVSelective isLocalVar $
+    strictFoldDVarSet (mappend . do_one) mempty fvs
   where
-  subst_fv :: Var -> ([Var], VarSet) -> ([Var], VarSet)
-  subst_fv fv acc
-     | isTyVar fv
-     , let fv_ty = lookupVarEnv tv_env fv `orElse` mkTyVarTy fv
-     = tyCoFVsOfType fv_ty (const True) emptyVarSet $! acc
-     | isCoVar fv
-     , let fv_co = lookupVarEnv cv_env fv `orElse` mkCoVarCo fv
-     = tyCoFVsOfCo fv_co (const True) emptyVarSet $! acc
-     | otherwise
-     , let fv_expr = lookupIdSubst subst fv
-     = exprLocalFVs fv_expr (const True) emptyVarSet $! acc
+  do_one :: Var -> SelectiveDFV
+  do_one fv
+     | isTyVar fv = shallowSelTypeFV (lookupVarEnv tv_env fv `orElse` mkTyVarTy fv)
+     | isCoVar fv = shallowSelCoFV   (lookupVarEnv cv_env fv `orElse` mkCoVarCo fv)
+     | otherwise  = exprFVs (lookupIdSubst subst fv)
 
 ------------------
 -- | Drop free vars from the breakpoint if they have a non-variable substitution.

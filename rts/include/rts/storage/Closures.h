@@ -312,6 +312,15 @@ typedef struct {
     StgClosure *result;
 } StgDeadThreadFrame;
 
+// Stack frame annotating an execution context with a Haskell value
+// for backtrace purposes.
+//
+// Closure types: ANN_FRAME
+typedef struct {
+    StgHeader header;
+    StgClosure *ann;
+} StgAnnFrame;
+
 // A function return stack frame: used when saving the state for a
 // garbage collection at a function entry point.  The function
 // arguments are on the stack, and we also save the function (its
@@ -611,6 +620,13 @@ typedef struct MessageCloneStack_ {
     StgTSO    *tso;
 } MessageCloneStack;
 
+typedef struct MessageUpdTSOFlag_ {
+    StgHeader header;
+    Message   *link;
+    StgTSO    *tso;
+    StgWord   flag;
+    StgWord   set; // bool: true=SET; false=UNSET
+} MessageUpdTSOFlag;
 
 /* ----------------------------------------------------------------------------
    Compact Regions
@@ -700,3 +716,167 @@ typedef struct {
     StgWord stack[];
 } StgContinuation;
 
+/* ----------------------------------------------------------------------------
+   TimeoutQueue data structure used by some RTS I/O managers for their timeout
+   functionality. See TimeoutQueue.{h,c} for details.
+   ------------------------------------------------------------------------- */
+
+union NotifyCompletion {
+    StgTSO    *tso;
+    StgMVar   *mvar;
+    StgTVar   *tvar;
+};
+enum NotifyCompletionType {
+    NotifyTSO  = 0, // thread-synchronous I/O
+    NotifyMVar = 1, // async I/O with MVar notification
+    NotifyTVar = 2  // async I/O with TVar notification
+};
+
+/* A node in the leftist heap. */
+typedef struct StgTimeoutQueue_ {
+    StgHeader header;
+
+    /* What to notify of the completion of the timeout, either a TSO,
+     * an MVar, or hopefully in future a TVar.
+     * The notify_type field below tells us which of these it is.
+     */
+    union NotifyCompletion notify;
+
+    /* Left and right sub-trees, plus parent pointer */
+    struct StgTimeoutQueue_ *parent;
+    struct StgTimeoutQueue_ *a;
+    struct StgTimeoutQueue_ *b;
+
+    /* In a leftist heap we track the "rank" of each node. */
+    uint32_t rank;
+
+    /* In the threaded way there is one timeout heap per capability. We have to
+     * handle cross-capability timeout cancellation specially, so we need to
+     * know which capability a heap entry belongs to.
+     */
+    uint16_t capno;
+    /* "16 bits ought to be enough for anybody!" quoth Mr Gamari, 2024 */
+
+    /* This tells us which thing the notify union above contains. It is a
+     * value from enum NotifyCompletionType but we don't use the enum type
+     * here due to portability concerns for this C bitfield.
+     */
+    uint16_t notify_type: 2;
+
+    /* 14 bits going spare! */
+
+#if defined(wasm32_HOST_ARCH)
+    /* On wasm32, the ABI alignment rules for structs are stronger than on
+     * other 32bit platforms: size 8 fields (like Time) must be 8 byte aligned,
+     * and the overall struct size must be a multiple of the maximum alignment
+     * (also 8). This means that on this platform, the non-pointer fields take
+     * up 5 words rather than 4, due to the extra padding word to get the Time
+     * field aligned. The size is thus 4 * (1+4+5) bytes, which is a multiple
+     * of 8 as required.
+     *
+     * Note that we don't strictly need this padding field. It will be inserted
+     * automagically by the wasm C compiler. This is just to be explicit, act
+     * as a sanity check, and somewhere to document this quirk.
+     */
+    uint32_t padding;
+#endif
+
+    /* The wakeup time, as a time absolute in the monotonic clock. This is a
+     * 64bit time, even on 32bit arches.
+     * The tree is a minimum ordered heap, ordered by this key.
+     */
+    Time waketime;
+
+    /* Note that because Time is 64bit even on 32bit arches, then the size in
+     * words of this heap object is different on 32bit and 64bit platforms.
+     * We handle this in the INFO_TABLE_CONSTR decl for stg_TIMEOUT_QUEUE using
+     * stg_TIMEOUT_QUEUE_NUM_NONPTRS in constants.h.
+     */
+} StgTimeoutQueue;
+
+/* ----------------------------------------------------------------------------
+   Asynchronous I/O operation data structures used by some RTS I/O managers
+   ------------------------------------------------------------------------- */
+
+/* A handle to an in-progress asynchronous I/O operation.
+ */
+typedef struct {
+    StgHeader header;
+
+      // What to notify of the completion of the I/O operation, either a TSO,
+      // an MVar, or hopefully in future a TVar.
+      // The notify_type field below tells us which of these it is.
+    union NotifyCompletion notify;
+
+      // Any heap object to keep alive for the duration of the I/O operation,
+      // for example I/O buffers.
+    StgClosure *live;
+
+      // The (per-capability) index of this I/O operation. The index is into a
+      // table maintained by the active I/O manager. Some I/O managers ensure
+      // that the index is stable for the duration of the I/O (and pass it as
+      // an identifier to the kernel). Other I/O managers however will reorder
+      // the table and update the index in this struct.
+    uint32_t index;
+
+      // The capability the I/O op is running on.
+      // In the threaded way there is one I/O manager per capability. We have
+      // to handle cross-capability I/O op cancellation specially, so we need
+      // to know which capability an aiop is being managed on.
+      //
+      // We could probably afford to steal some bits here if needed.
+    uint16_t capno;
+
+      // This tells us which thing the notify union above contains. It is a
+      // value from enum NotifyCompletionType but we don't use the enum type
+      // here due to portability concerns for this C bitfield.
+    uint16_t notify_type: 2;
+
+      // The outcome (see enum IOOpOutcome):
+      // 0: IOOpOutcomeInFlight: still in-progress, no further detail.
+      // 1: IOOpOutcomeSuccess: result field contains the result code.
+      // 2: IOOpOutcomeFailed: error field contains the error code.
+      // 3: IOOpOutcomeCancelled: cancelled, no further detail.
+    uint16_t outcome: 2;
+
+      // The I/O operation we are performing. It is a value from enum IOOpCode,
+      // but we don't use the enum type here due to portability concerns for
+      // this C bitfield.
+      //
+      // The size of this field, allows us up to 64 opcodes.
+    uint16_t operation: 6;
+
+      // 6 bits going spare!
+    uint16_t padding: 6;
+
+      // The file descriptor the operation is on. This is used in several I/O
+      // managers to group StgAsyncIOOps by fd. In particular this is needed
+      // for cancelling all wait-notification ops when closing an fd. It is
+      // also handy for logging and debugging.
+      //
+      // Note that it is technically possible to stuff Win32 HANDLEs into here,
+      // but no Win32 I/O manager does this _yet_. See:
+      // https://learn.microsoft.com/en-us/windows/win32/winprog64/interprocess-communication
+      // > 64-bit versions of Windows use 32-bit handles for interoperability.
+      // > When sharing a handle between 32-bit and 64-bit applications, only
+      // > the lower 32 bits are significant, so it is safe to truncate the
+      // > handle (when passing it from 64-bit to 32-bit) or sign-extend the
+      // > handle (when passing it from 32-bit to 64-bit).
+    uint32_t fd;
+
+    union {
+          // For successful outcomes, this is the result code of the operation.
+          // The interpretation of the result code depends on the operation.
+          // For example, for I/O readiness notification it is always 0, while
+          // for fd read/write it will be the number of bytes transferred.
+        uint32_t result;
+
+          // For failed outcomes, this is the error code.
+        uint32_t error;
+    };
+
+      // Note that because we use fixed size Ctypes here then the size in words
+      // of this heap object is different on 32bit and 64bit platforms.
+      // We handle this in the INFO_TABLE_CONSTR decl for stg_ASYNCIOOP using
+      // stg_ASYNCIOOP_NUM_NONPTRS in constants.h.
+} StgAsyncIOOp;

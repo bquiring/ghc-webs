@@ -1,6 +1,4 @@
-
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE LambdaCase #-}
 
 {-
 (c) The University of Glasgow 2006-2008
@@ -41,7 +39,6 @@ import GHC.Types.Basic
 import GHC.Types.TyThing
 
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Misc
 
 import GHC.Data.Maybe
 import Data.List ( findIndex, mapAccumL )
@@ -54,12 +51,12 @@ import Data.List ( findIndex, mapAccumL )
 ************************************************************************
 -}
 
-tyThingToIfaceDecl :: Bool -> TyThing -> IfaceDecl
-tyThingToIfaceDecl _ (AnId id)      = idToIfaceDecl id
-tyThingToIfaceDecl _ (ATyCon tycon) = snd (tyConToIfaceDecl emptyTidyEnv tycon)
-tyThingToIfaceDecl _ (ACoAxiom ax)  = coAxiomToIfaceDecl ax
-tyThingToIfaceDecl show_linear_types (AConLike cl)  = case cl of
-    RealDataCon dc -> dataConToIfaceDecl show_linear_types dc -- for ppr purposes only
+tyThingToIfaceDecl :: TyThing -> IfaceDecl
+tyThingToIfaceDecl (AnId id)      = idToIfaceDecl id
+tyThingToIfaceDecl (ATyCon tycon) = snd (tyConToIfaceDecl emptyTidyEnv tycon)
+tyThingToIfaceDecl (ACoAxiom ax)  = coAxiomToIfaceDecl ax
+tyThingToIfaceDecl (AConLike cl)  = case cl of
+    RealDataCon dc -> dataConToIfaceDecl dc
     PatSynCon ps   -> patSynToIfaceDecl ps
 
 --------------------------
@@ -75,10 +72,10 @@ idToIfaceDecl id
               ifIdInfo    = toIfaceIdInfo (idInfo id) }
 
 --------------------------
-dataConToIfaceDecl :: Bool -> DataCon -> IfaceDecl
-dataConToIfaceDecl show_linear_types dataCon
+dataConToIfaceDecl :: DataCon -> IfaceDecl
+dataConToIfaceDecl dataCon
   = IfaceId { ifName      = getName dataCon,
-              ifType      = toIfaceType (dataConDisplayType show_linear_types dataCon),
+              ifType      = toIfaceType (dataConWrapperType dataCon),
               ifIdDetails = IfVanillaId,
               ifIdInfo    = [] }
 
@@ -133,6 +130,7 @@ tyConToIfaceDecl env tycon
   | Just syn_rhs <- synTyConRhs_maybe tycon
   = ( tc_env1
     , IfaceSynonym { ifName    = getName tycon,
+                     ifKind    = if_kind,
                      ifRoles   = tyConRoles tycon,
                      ifSynRhs  = if_syn_type syn_rhs,
                      ifBinders = if_binders,
@@ -142,9 +140,11 @@ tyConToIfaceDecl env tycon
   | Just fam_flav <- famTyConFlav_maybe tycon
   = ( tc_env1
     , IfaceFamily { ifName    = getName tycon,
+                    ifKind    = if_kind,
                     ifResVar  = mkIfLclName <$> if_res_var,
                     ifFamFlav = to_if_fam_flav fam_flav,
                     ifBinders = if_binders,
+                    ifNbEtaBinders = tyConEtaBinders tycon,
                     ifResKind = if_res_kind,
                     ifFamInj  = tyConInjectivityInfo tycon
                   })
@@ -152,7 +152,9 @@ tyConToIfaceDecl env tycon
   | isAlgTyCon tycon
   = ( tc_env1
     , IfaceData { ifName    = getName tycon,
+                  ifKind    = if_kind,
                   ifBinders = if_binders,
+                  ifNbEtaBinders = tyConEtaBinders tycon,
                   ifResKind = if_res_kind,
                   ifCType   = tyConCType_maybe tycon,
                   ifRoles   = tyConRoles tycon,
@@ -167,7 +169,9 @@ tyConToIfaceDecl env tycon
   -- to put them into interface files
   = ( env
     , IfaceData { ifName       = getName tycon,
+                  ifKind       = if_kind,
                   ifBinders    = if_binders,
+                  ifNbEtaBinders = tyConEtaBinders tycon,
                   ifResKind    = if_res_kind,
                   ifCType      = Nothing,
                   ifRoles      = tyConRoles tycon,
@@ -179,58 +183,66 @@ tyConToIfaceDecl env tycon
     -- NOTE: Not all TyCons have `tyConTyVars` field. Forcing this when `tycon`
     -- is one of these TyCons (FunTyCon, PrimTyCon, PromotedDataCon) will cause
     -- an error.
+    if_kind        = tidyToIfaceType emptyTidyEnv $ tyConKind tycon
+                     -- emptyTidyEnv: the kind as a whole is not under any binders
     (tc_env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)
-    tc_tyvars      = binderVars tc_binders
     if_binders     = toIfaceForAllBndrs tc_binders
                      -- No tidying of the binders; they are already tidy
     if_res_kind    = tidyToIfaceType tc_env1 (tyConResKind tycon)
     if_syn_type ty = tidyToIfaceType tc_env1 ty
     if_res_var     = getOccFS `fmap` tyConFamilyResVar_maybe tycon
 
-    parent = case tyConFamInstSig_maybe tycon of
+    parent = case tyConDataFamInstSig_maybe tycon of
                Just (tc, ty, ax) -> IfDataInstance (coAxiomName ax)
                                                    (toIfaceTyCon tc)
                                                    (tidyToIfaceTcArgs tc_env1 tc ty)
                Nothing           -> IfNoParent
 
-    to_if_fam_flav OpenSynFamilyTyCon             = IfaceOpenSynFamilyTyCon
-    to_if_fam_flav AbstractClosedSynFamilyTyCon   = IfaceAbstractClosedSynFamilyTyCon
-    to_if_fam_flav (DataFamilyTyCon {})           = IfaceDataFamilyTyCon
-    to_if_fam_flav (BuiltInSynFamTyCon {})        = IfaceBuiltInSynFamTyCon
-    to_if_fam_flav (ClosedSynFamilyTyCon Nothing) = IfaceClosedSynFamilyTyCon Nothing
-    to_if_fam_flav (ClosedSynFamilyTyCon (Just ax))
-      = IfaceClosedSynFamilyTyCon (Just (axn, ibr))
+    to_if_fam_flav :: FamTyConFlav -> IfaceFamTyConFlav
+    to_if_fam_flav OpenTypeFamilyTyCon         = IfaceOpenTypeFamilyTyCon
+    to_if_fam_flav (DataFamilyTyCon {})        = IfaceDataFamilyTyCon
+    to_if_fam_flav (ClosedTypeFamilyTyCon ctf) = IfaceClosedTypeFamilyTyCon (to_if_ctf ctf)
+
+    to_if_ctf :: ClosedTyFam -> IfaceClosedTyFamTyCon
+    to_if_ctf CTF_Abstract     = IfaceAbstractClosedTyFamTyCon
+    to_if_ctf (CTF_BuiltIn {}) = IfaceBuiltInClosedTyFamTyCon
+    to_if_ctf (CTF Nothing)    = IfaceClosedTyFamTyCon Nothing
+    to_if_ctf (CTF (Just ax))
+      = IfaceClosedTyFamTyCon (Just (axn, ibr))
       where defs = fromBranches $ coAxiomBranches ax
             lhss = map coAxBranchLHS defs
             ibr  = map (coAxBranchToIfaceBranch tycon lhss) defs
             axn  = coAxiomName ax
 
-    ifaceConDecls (NewTyCon { data_con = con })    = IfNewTyCon  (ifaceConDecl con)
     ifaceConDecls (DataTyCon { data_cons = cons, is_type_data = type_data })
       = IfDataTyCon type_data (map ifaceConDecl cons)
-    ifaceConDecls (TupleTyCon { data_con = con })  = IfDataTyCon False [ifaceConDecl con]
-    ifaceConDecls (SumTyCon { data_cons = cons })  = IfDataTyCon False (map ifaceConDecl cons)
-    ifaceConDecls AbstractTyCon                    = IfAbstractTyCon
-        -- The AbstractTyCon case happens when a TyCon has been trimmed
-        -- during tidying.
-        -- Furthermore, tyThingToIfaceDecl is also used in GHC.Tc.Module
-        -- for GHCi, when browsing a module, in which case the
-        -- AbstractTyCon and TupleTyCon cases are perfectly sensible.
-        -- (Tuple declarations are not serialised into interface files.)
+    ifaceConDecls (NewTyCon { data_con = con })        = IfNewTyCon        (ifaceConDecl con)
+    ifaceConDecls (UnaryClassTyCon { data_con = con})  = IfDataTyCon False [ifaceConDecl con]
+    ifaceConDecls (TupleTyCon { data_con = con })      = IfDataTyCon False [ifaceConDecl con]
+    ifaceConDecls (SumTyCon { data_cons = cons })      = IfDataTyCon False (map ifaceConDecl cons)
+    ifaceConDecls AbstractTyCon                        = IfAbstractTyCon
+        -- The AbstractTyCon case happens when a TyCon has been trimmed during tidying.
+        --
+        -- NB: TupleTyCon/SumTyCon/UnaryClassTyCon are never serialised into interface files
+        --     But tyThingToIfaceDecl is also used in GHC.Tc.Module
+        --     for GHCi, when browsing a module, in which case the
+        --     AbstractTyCon, TupleTyCon, SumTyCon are perfectly sensible.
+        --     (Not sure about UnaryClassTyCon, but easier to treat it uniformly.)
 
     ifaceConDecl data_con
         = IfCon   { ifConName    = dataConName data_con,
                     ifConInfix   = dataConIsInfix data_con,
                     ifConWrapper = isJust (dataConWrapId_maybe data_con),
+                    ifConUnivTvs = map toIfaceBndr univ_tvs',
                     ifConExTCvs  = map toIfaceBndr ex_tvs',
                     ifConUserTvBinders = toIfaceForAllBndrs user_bndrs',
                     ifConEqSpec  = map (to_eq_spec . eqSpecPair) eq_spec,
-                    ifConCtxt    = tidyToIfaceContext con_env2 theta,
+                    ifConCtxt    = tidyToIfaceContext con_env3 theta,
                     ifConArgTys  =
-                      map (\(Scaled w t) -> (tidyToIfaceType con_env2 w
-                                          , (tidyToIfaceType con_env2 t))) arg_tys,
+                      map (\(Scaled w t) -> (tidyToIfaceType con_env3 w
+                                          , (tidyToIfaceType con_env3 t))) arg_tys,
                     ifConFields  = dataConFieldLabels data_con,
-                    ifConStricts = map (toIfaceBang con_env2)
+                    ifConStricts = map (toIfaceBang con_env1)
                                        (dataConImplBangs data_con),
                     ifConSrcStricts = map toIfaceSrcBang
                                           (dataConSrcBangs data_con)}
@@ -239,35 +251,18 @@ tyConToIfaceDecl env tycon
             = dataConFullSig data_con
           user_bndrs = dataConUserTyVarBinders data_con
 
-          -- Tidy the univ_tvs of the data constructor to be identical
-          -- to the tyConTyVars of the type constructor.  This means
-          -- (a) we don't need to redundantly put them into the interface file
-          -- (b) when pretty-printing an Iface data declaration in H98-style syntax,
-          --     we know that the type variables will line up
-          -- The latter (b) is important because we pretty-print type constructors
-          -- by converting to Iface syntax and pretty-printing that
-          con_env1 = (fst tc_env1, mkVarEnv (zipEqual univ_tvs tc_tyvars))
-                     -- A bit grimy, perhaps, but it's simple!
-
-          (con_env2, ex_tvs') = tidyVarBndrs con_env1 ex_tvs
-          user_bndrs' = map (tidyUserForAllTyBinder con_env2) user_bndrs
-          to_eq_spec (tv,ty) = (tidyTyVar con_env2 tv, tidyToIfaceType con_env2 ty)
-
-          -- By this point, we have tidied every universal and existential
-          -- tyvar. Because of the dcUserForAllTyBinders invariant
-          -- (see Note [DataCon user type variable binders]), *every*
-          -- user-written tyvar must be contained in the substitution that
-          -- tidying produced. Therefore, tidying the user-written tyvars is a
-          -- simple matter of looking up each variable in the substitution,
-          -- which tidyTyCoVarOcc accomplishes.
-          tidyUserForAllTyBinder :: TidyEnv -> TyVarBinder -> TyVarBinder
-          tidyUserForAllTyBinder env (Bndr tv vis) =
-            Bndr (tidyTyCoVarOcc env tv) vis
+          -- Start with 'emptyTidyEnv' not 'tc_env1', because the type of the
+          -- data constructor is fully standalone
+          (con_env1, user_bndrs') = tidyForAllTyBinders emptyTidyEnv user_bndrs
+          (con_env2, univ_tvs') = mapAccumL tidyFreeTyCoVarX con_env1 univ_tvs
+          (con_env3, ex_tvs') = mapAccumL tidyFreeTyCoVarX con_env2 ex_tvs
+          to_eq_spec (tv,ty) = (tidyTyVar con_env3 tv, tidyToIfaceType con_env3 ty)
 
 classToIfaceDecl :: TidyEnv -> Class -> (TidyEnv, IfaceDecl)
 classToIfaceDecl env clas
   = ( env1
     , IfaceClass { ifName   = getName tycon,
+                   ifKind   = tidyToIfaceType env1 $ tyConKind tycon,
                    ifRoles  = tyConRoles (classTyCon clas),
                    ifBinders = toIfaceForAllBndrs tc_binders,
                    ifBody   = body,
@@ -283,7 +278,8 @@ classToIfaceDecl env clas
                 ifClassCtxt   = tidyToIfaceContext env1 sc_theta,
                 ifATs    = map toIfaceAT clas_ats,
                 ifSigs   = map toIfaceClassOp op_stuff,
-                ifMinDef = toIfaceBooleanFormula (classMinimalDef clas)
+                ifMinDef = toIfaceBooleanFormula (classMinimalDef clas),
+                ifUnary  = isUnaryClassTyCon tycon
             }
 
     (env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)

@@ -3,6 +3,7 @@
 -- argument.
 module Main where
 
+import Language.Haskell.Syntax.Text
 import GHC.Data.FastString
 import GHC.Types.Basic
 import GHC.Types.SourceText
@@ -53,9 +54,11 @@ testOneFile libdir fileName = do
      doHsLit (HsCharPrim   (SourceText src) c)
        = ["HsCharPrim [" ++ unpackFS src ++ "] " ++ show c]
      doHsLit (HsString     (SourceText src) c)
-       = ["HsString [" ++ unpackFS src ++ "] " ++ show c]
+       = ["HsString [" ++ unpackFS src ++ "] " ++ show (unpackHText c)]
      doHsLit (HsStringPrim (SourceText src) c)
        = ["HsStringPrim [" ++ unpackFS src ++ "] " ++ show c]
+     doHsLit (HsNatural  _ (IL (SourceText src) _ c))
+       = ["HsNatural [" ++ unpackFS src ++ "] " ++ show c]
      doHsLit (HsInt  _     (IL (SourceText src) _ c))
        = ["HsInt [" ++ unpackFS src ++ "] " ++ show c]
      doHsLit (HsIntPrim (SourceText src) c)
@@ -68,11 +71,12 @@ testOneFile libdir fileName = do
        = ["HsWord64Prim [" ++ unpackFS src ++ "] " ++ show c]
      doHsLit _ = []
 
-     doOverLit :: OverLitVal -> [String]
+     doOverLit :: OverLitVal GhcPs -> [String]
      doOverLit (HsIntegral  (IL (SourceText src) _ c))
        = ["HsIntegral [" ++ unpackFS src ++ "] " ++ show c]
-     doOverLit (HsIsString  (SourceText src) c)
-       = ["HsIsString [" ++ unpackFS src ++ "] " ++ show c]
+     doOverLit (HsIsString c)
+       = let SourceText src = stringLitSourceText c
+         in  ["HsIsString [" ++ unpackFS src ++ "] " ++ show c]
      doOverLit _ = []
 
 pp a = showPprUnsafe a

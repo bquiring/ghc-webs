@@ -31,8 +31,8 @@
 #define __STDC_VERSION__ 0
 #endif
 
-#if !(__STDC_VERSION__ >= 199901L) && !(__cplusplus >= 201103L)
-# error __STDC_VERSION__ does not advertise C99, C++11 or later
+#if !(__STDC_VERSION__ >= 201112L) && !(__cplusplus >= 201103L)
+# error __STDC_VERSION__ does not advertise C11, C++11 or later
 #endif
 
 /*
@@ -48,10 +48,6 @@
  */
 #if !defined(IN_STG_CODE)
 # define IN_STG_CODE 1
-
-// Turn on C99 for .hc code.  This gives us the INFINITY and NAN
-// constants from math.h, which we occasionally need to use in .hc (#1861)
-# define _ISOC99_SOURCE
 
 // We need _BSD_SOURCE so that math.h defines things like gamma
 // on Linux
@@ -131,20 +127,12 @@
 /*
  * GCC attributes
  */
-#if defined(__GNUC__)
 #define GNU_ATTRIBUTE(at) __attribute__((at))
-#else
-#define GNU_ATTRIBUTE(at)
-#endif
 
-#if __GNUC__ >= 3
 #define GNUC3_ATTRIBUTE(at) __attribute__((at))
-#else
-#define GNUC3_ATTRIBUTE(at)
-#endif
 
 /* Used to mark a switch case that falls-through */
-#if (defined(__GNUC__) && __GNUC__ >= 7)
+#if __GNUC__ >= 7
 // N.B. Don't enable fallthrough annotations when compiling with Clang.
 // Apparently clang doesn't enable implicitly fallthrough warnings by default
 // http://llvm.org/viewvc/llvm-project?revision=167655&view=revision
@@ -154,7 +142,7 @@
 #define FALLTHROUGH ((void)0)
 #endif /* __GNUC__ >= 7 */
 
-#if !defined(DEBUG) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
+#if !defined(DEBUG)
 #define GNUC_ATTR_HOT __attribute__((hot))
 #else
 #define GNUC_ATTR_HOT /* nothing */
@@ -168,21 +156,13 @@
    See Note [Windows Stack allocations] */
 #if defined(__clang__)
 #define STG_NO_OPTIMIZE __attribute__((optnone))
-#elif defined(__GNUC__) || defined(__GNUG__)
-#define STG_NO_OPTIMIZE __attribute__((optimize("O0")))
 #else
-#define STG_NO_OPTIMIZE /* nothing */
+#define STG_NO_OPTIMIZE __attribute__((optimize("O0")))
 #endif
 
 // Mark a function as accepting a printf-like format string.
-#if !defined(__GNUC__) && defined(mingw32_HOST_OS)
-/* On Win64, if we say "printf" then gcc thinks we are going to use
-   MS format specifiers like %I64d rather than %llu */
-#define STG_PRINTF_ATTR(fmt_arg, rest) GNUC3_ATTRIBUTE(format(gnu_printf, fmt_arg, rest))
-#else
 /* However, on OS X, "gnu_printf" isn't recognised */
 #define STG_PRINTF_ATTR(fmt_arg, rest) GNUC3_ATTRIBUTE(format(printf, fmt_arg, rest))
-#endif
 
 #define STG_RESTRICT __restrict__
 
@@ -204,13 +184,9 @@
 # define stg__has_attribute(attr) (0)
 #endif
 
-#ifdef __GNUC__
-# define STG_GNUC_GUARD_VERSION(major, minor) \
+#define STG_GNUC_GUARD_VERSION(major, minor) \
     ((__GNUC__ > (major)) || \
       ((__GNUC__ == (major)) && (__GNUC_MINOR__ >= (minor))))
-#else
-# define STG_GNUC_GUARD_VERSION(major, minor) (0)
-#endif
 
 /*
  * The versions of the `__malloc__` attribute which take arguments are only
@@ -352,7 +328,6 @@ external prototype return neither of these types to workaround #11395.
    Other Stg stuff...
    -------------------------------------------------------------------------- */
 
-#include "stg/DLL.h"
 #include "stg/MachRegsForHost.h"
 #include "stg/Regs.h"
 #include "stg/Ticky.h"
@@ -364,9 +339,12 @@ external prototype return neither of these types to workaround #11395.
  * StgInfoTable, StgClosure and so on.
  */
 #include "stg/MiscClosures.h"
+/* And this is included for references to ghc_hs_iface */
+#include "rts/Types.h"
+#include "rts/RtsToHsIface.h"
 #endif
 
-#include "stg/Prim.h" /* ghc-internal fallbacks */
+#include "stg/Prim.h"
 #include "stg/SMP.h"
 
 /* -----------------------------------------------------------------------------
@@ -537,79 +515,3 @@ INLINE_HEADER StgInt64 PK_Int64(W_ p_src[])
 }
 
 #endif /* SIZEOF_HSWORD == 4 */
-
-/* -----------------------------------------------------------------------------
-   Integer multiply with overflow
-   -------------------------------------------------------------------------- */
-
-/* Multiply with overflow checking.
- *
- * This is tricky - the usual sign rules for add/subtract don't apply.
- *
- * On 32-bit machines we use gcc's 'long long' types, finding
- * overflow with some careful bit-twiddling.
- *
- * On 64-bit machines where gcc's 'long long' type is also 64-bits,
- * we use a crude approximation, testing whether either operand is
- * larger than 32-bits; if neither is, then we go ahead with the
- * multiplication.
- *
- * Return non-zero if there is any possibility that the signed multiply
- * of a and b might overflow.  Return zero only if you are absolutely sure
- * that it won't overflow.  If in doubt, return non-zero.
- */
-
-#if SIZEOF_VOID_P == 4
-
-#if defined(WORDS_BIGENDIAN)
-#define RTS_CARRY_IDX__ 0
-#define RTS_REM_IDX__  1
-#else
-#define RTS_CARRY_IDX__ 1
-#define RTS_REM_IDX__ 0
-#endif
-
-typedef union {
-    StgInt64 l;
-    StgInt32 i[2];
-} long_long_u ;
-
-#define mulIntMayOflo(a,b)       \
-({                                              \
-  StgInt32 r, c;           \
-  long_long_u z;           \
-  z.l = (StgInt64)a * (StgInt64)b;     \
-  r = z.i[RTS_REM_IDX__];        \
-  c = z.i[RTS_CARRY_IDX__];         \
-  if (c == 0 || c == -1) {       \
-    c = ((StgWord)((a^b) ^ r))         \
-      >> (BITS_IN (I_) - 1);        \
-  }                  \
-  c;                                            \
-})
-
-/* Careful: the carry calculation above is extremely delicate.  Make sure
- * you test it thoroughly after changing it.
- */
-
-#else
-
-/* Approximate version when we don't have long arithmetic (on 64-bit archs) */
-
-/* If we have n-bit words then we have n-1 bits after accounting for the
- * sign bit, so we can fit the result of multiplying 2 (n-1)/2-bit numbers */
-#define HALF_POS_INT  (((I_)1) << ((BITS_IN (I_) - 1) / 2))
-#define HALF_NEG_INT  (-HALF_POS_INT)
-
-#define mulIntMayOflo(a,b)       \
-({                                              \
-  I_ c;              \
-  if ((I_)a <= HALF_NEG_INT || a >= HALF_POS_INT    \
-      || (I_)b <= HALF_NEG_INT || b >= HALF_POS_INT) {\
-    c = 1;              \
-  } else {              \
-    c = 0;              \
-  }                  \
-  c;                                            \
-})
-#endif

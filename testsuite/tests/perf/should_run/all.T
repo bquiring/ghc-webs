@@ -30,6 +30,13 @@ test('T10359',
      compile_and_run,
      ['-O'])
 
+test('T11226',
+     [collect_runtime_residency(10),
+      only_ways(['normal'])
+      ],
+     compile_and_run,
+     ['-O2'])
+
 test('T14955',
      [collect_stats('bytes allocated',5),
       only_ways(['normal'])
@@ -43,6 +50,7 @@ test('T3586',
      [collect_runtime_residency(2),
       collect_stats('bytes allocated', 5),
       only_ways(['normal']),
+      when(have_cpu_feature('pni') or have_cpu_feature('sse3'), extra_hc_opts('-optc-msse3')),
       ],
      compile_and_run,
      ['-O'])
@@ -111,6 +119,13 @@ test('T149',
      ],
      makefile_test, ['T149'])
 
+test ('T1216',
+      [collect_stats('bytes allocated',5),
+       only_ways(['normal'])
+       ],
+      compile_and_run,
+      ['-O'])
+
 test('T5113',
      [collect_stats('bytes allocated',5),
       only_ways(['normal'])
@@ -127,7 +142,7 @@ test('T4978',
      ['-O2'])
 
 test('T5205',
-     [collect_stats('bytes allocated',5),
+     [collect_stats('bytes allocated',15),
       only_ways(['normal', 'optasm'])
       ],
      compile_and_run,
@@ -419,6 +434,7 @@ test('T17949', [collect_stats('bytes allocated', 1), only_ways(['normal'])], com
 test('ByteCodeAsm',
                [ extra_run_opts('"' + config.libdir + '"')
                , js_broken(22261)
+               , when(arch('wasm32'), run_timeout_multiplier(10))
                , collect_stats('bytes allocated', 10),
                ],
                compile_and_run,

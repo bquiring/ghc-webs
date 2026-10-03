@@ -27,6 +27,7 @@ module GHC.Internal.IOArray (
 import GHC.Internal.Base
 import GHC.Internal.IO
 import GHC.Internal.Arr
+import GHC.Internal.Prim (RealWorld)
 
 -- ---------------------------------------------------------------------------
 -- | An 'IOArray' is a mutable, boxed, non-strict array in the 'IO' monad.

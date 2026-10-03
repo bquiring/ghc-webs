@@ -15,10 +15,8 @@ test('ghc-e-fail2', req_interp, makefile_test, ['ghc-e-fail2'])
 test('T9930fail',
      [extra_files(['T9930']),
       when(opsys('mingw32'), skip),
-      normalise_errmsg_fun(lambda s: normalise_version_("ghc")(s).replace('ghc-<VERSION>-<HASH>','ghc')),
-      # broken for JS until cross-compilers become stage2 compilers (#19174)
-      # or until we bootstrap with a 9.10 compiler
-      js_broken(19174)],
+      normalise_errmsg_fun(lambda s: normalise_version_("ghc")(s).replace('ghc-<VERSION>-<HASH>','ghc'))
+      ],
      makefile_test, ['T9930fail'])
 
 test('T18441fail0', req_interp, makefile_test, ['T18441fail0'])
@@ -27,7 +25,7 @@ test('T18441fail1', req_interp, makefile_test, ['T18441fail1'])
 
 test('T18441fail2', [req_interp, normalise_version('ghc')], makefile_test, ['T18441fail2'])
 
-test('T18441fail3', [ignore_stderr, exit_code(1)], run_command, ['{compiler} -e ":! abcde"'])
+test('T18441fail3', [req_interp, ignore_stderr, exit_code(1)], run_command, ['{compiler} -e ":! abcde"'])
 
 test('T18441fail4', req_interp, makefile_test, ['T18441fail4'])
 
@@ -59,7 +57,7 @@ test('T18441fail17', req_interp, makefile_test, ['T18441fail17'])
 
 test('T18441fail18', req_interp, makefile_test, ['T18441fail18'])
 
-test('T18441fail19', [ignore_stderr, exit_code(1)], run_command, ['{compiler} -e ":cd abcd"'])
+test('T18441fail19', [req_interp, ignore_stderr, exit_code(1)], run_command, ['{compiler} -e ":cd abcd"'])
 
 test('T23663', [req_interp, normalise_version('ghc')], makefile_test, ['T23663'])
 

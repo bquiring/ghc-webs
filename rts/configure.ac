@@ -22,7 +22,7 @@ dnl     #define SIZEOF_CHAR 0
 dnl   recently.
 AC_PREREQ([2.69])
 
-AC_CONFIG_FILES([ghcplatform.h.top])
+AC_CONFIG_FILES([ghcplatform.h.top rts.buildinfo])
 
 AC_CONFIG_HEADERS([ghcautoconf.h.autoconf])
 
@@ -96,7 +96,7 @@ dnl    off_t, because it will affect the result of that test.
 AC_SYS_LARGEFILE
 
 dnl ** check for specific header (.h) files that we are interested in
-AC_CHECK_HEADERS([ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timerfd.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h utime.h windows.h winsock.h sched.h])
+AC_CHECK_HEADERS([ctype.h dlfcn.h errno.h fcntl.h limits.h locale.h nlist.h pthread.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timerfd.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h utime.h windows.h winsock.h sched.h])
 
 dnl sys/cpuset.h needs sys/param.h to be included first on FreeBSD 9.1; #7708
 AC_CHECK_HEADERS([sys/cpuset.h], [], [],
@@ -148,7 +148,7 @@ FP_CHECK_FUNC([GetModuleFileName],
 
 dnl ** check for more functions
 dnl ** The following have been verified to be used in ghc/, but might be used somewhere else, too.
-AC_CHECK_FUNCS([getclock getrusage gettimeofday setitimer siginterrupt sysconf times ctime_r sched_setaffinity sched_getaffinity setlocale uselocale])
+AC_CHECK_FUNCS([getclock getrusage gettimeofday sysconf times ctime_r sched_setaffinity sched_getaffinity uselocale])
 
 dnl ** On OS X 10.4 (at least), time.h doesn't declare ctime_r if
 dnl ** _POSIX_C_SOURCE is defined
@@ -162,14 +162,7 @@ AC_CHECK_DECLS([program_invocation_short_name], , ,
 [#define _GNU_SOURCE 1
 #include <errno.h>])
 
-dnl ** check for math library
-dnl    Keep that check as early as possible.
-dnl    as we need to know whether we need libm
-dnl    for math functions or not
-dnl    (see https://gitlab.haskell.org/ghc/ghc/issues/3730)
-AS_IF(
-  [test "$CABAL_FLAG_libm" = 1],
-  [AC_DEFINE([HAVE_LIBM], [1], [Define to 1 if you need to link with libm])])
+AC_SEARCH_LIBS([exp2], [m])
 
 AS_IF([test "$CABAL_FLAG_libbfd" = 1], [FP_WHEN_ENABLED_BFD])
 
@@ -178,9 +171,12 @@ dnl Check for libraries
 dnl ################################################################
 
 dnl ** check whether we need -ldl to get dlopen()
-AC_CHECK_LIB([dl], [dlopen])
+AC_SEARCH_LIBS([dlopen], [dl])
 dnl ** check whether we have dlinfo
 AC_CHECK_FUNCS([dlinfo])
+
+FP_CHECK_PTHREAD_LIB
+
 
 dnl --------------------------------------------------
 dnl * Miscellaneous feature tests
@@ -204,13 +200,10 @@ if test "$CABAL_FLAG_leading_underscore" = 1; then
    AC_DEFINE([LEADING_UNDERSCORE], [1], [Define to 1 if C symbols have a leading underscore added by the compiler.])
 fi
 
-FP_VISIBILITY_HIDDEN
-
 FP_MUSTTAIL
 
 dnl ** check for librt
 AC_CHECK_FUNCS(clock_gettime timer_settime)
-FP_CHECK_TIMER_CREATE
 
 dnl ** check for Apple's "interesting" long double compatibility scheme
 AC_MSG_CHECKING(for printf\$LDBLStub)
@@ -233,19 +226,6 @@ AC_CHECK_HEADERS([sys/eventfd.h])
 AC_CHECK_FUNCS([eventfd])
 
 AC_CHECK_FUNCS([getpid getuid raise])
-
-dnl ** Check for __thread support in the compiler
-AC_MSG_CHECKING(for __thread support)
-AC_COMPILE_IFELSE(
-  [ AC_LANG_SOURCE([[__thread int tester = 0;]]) ],
-  [
-   AC_MSG_RESULT(yes)
-   AC_DEFINE([CC_SUPPORTS_TLS],[1],[Define to 1 if __thread is supported])
-  ],
-  [
-   AC_MSG_RESULT(no)
-   AC_DEFINE([CC_SUPPORTS_TLS],[0],[Define to 1 if __thread is supported])
-  ])
 
 dnl large address space support (see rts/include/rts/storage/MBlock.h)
 dnl
@@ -388,6 +368,34 @@ GHC_IOMANAGER_ENABLE([select], [EnableIOManagerSelect], [IOMGR_BUILD_SELECT],
            [AC_MSG_ERROR([sys/select.h required by select I/O manager])],[])
    fi])
 
+GHC_IOMANAGER_ENABLE([selectbis], [EnableIOManagerSelectBis], [IOMGR_BUILD_SELECTBIS],
+  [if test "$HostOS" = "mingw32"; then
+       EnableIOManagerSelectBis=NO
+   else
+       AC_CHECK_HEADER([sys/select.h],
+           [EnableIOManagerSelectBis=YES],
+           [AC_MSG_ERROR([sys/select.h required by selectbis I/O manager])],[])
+   fi])
+
+GHC_IOMANAGER_ENABLE([poll], [EnableIOManagerPoll], [IOMGR_BUILD_POLL],
+  [if test "$HostOS" = "mingw32"; then
+       EnableIOManagerPoll=NO
+   else
+       AC_CHECK_HEADER([poll.h],
+           [EnableIOManagerPoll=YES],
+           [AC_MSG_ERROR([poll.h required by poll I/O manager])],[])
+       AC_CHECK_DECLS([ppoll],[],[],
+           [#define _GNU_SOURCE 1
+            #include <signal.h>
+            #include <poll.h>])
+       if test "$HostOS" = "darwin" -a "$EnableIOManagerPoll" = "YES"; then
+           dnl Sadly poll is broken on macOS. See the macOS man page:
+           dnl it doesn't work for device files!
+           AC_MSG_WARN([macOS poll() does not work properly. Disabling.])
+           EnableIOManagerPoll=NO
+       fi
+   fi])
+
 GHC_IOMANAGER_ENABLE([mio], [EnableIOManagerMIO], [IOMGR_BUILD_MIO],
   [EnableIOManagerMIO=YES])
 
@@ -407,6 +415,8 @@ if test "$HostOS" = "mingw32"; then
   GHC_IOMANAGER_DEFAULT_SELECT([IOManagerThreadedDefault], [mio], [EnableIOManagerMIO])
 else
   GHC_IOMANAGER_DEFAULT_SELECT([IOManagerNonThreadedDefault], [select], [EnableIOManagerSelect])
+  GHC_IOMANAGER_DEFAULT_SELECT([IOManagerNonThreadedDefault], [selectbis], [EnableIOManagerSelectBis])
+  GHC_IOMANAGER_DEFAULT_SELECT([IOManagerNonThreadedDefault], [poll], [EnableIOManagerPoll])
   GHC_IOMANAGER_DEFAULT_SELECT([IOManagerThreadedDefault], [mio], [EnableIOManagerMIO])
 fi
 GHC_IOMANAGER_DEFAULT_CHECK_NOT_EMPTY([IOManagerNonThreadedDefault],[non-threaded])
@@ -420,6 +430,12 @@ GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerNonThreadedDefault], [non-threaded],
                                 [select], [IOMGR_DEFAULT_NON_THREADED_SELECT])
 
 GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerNonThreadedDefault], [non-threaded],
+                                [selectbis], [IOMGR_DEFAULT_NON_THREADED_SELECTBIS])
+
+GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerNonThreadedDefault], [non-threaded],
+                                [poll], [IOMGR_DEFAULT_NON_THREADED_POLL])
+
+GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerNonThreadedDefault], [non-threaded],
                                 [winio], [IOMGR_DEFAULT_NON_THREADED_WINIO])
 
 GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerNonThreadedDefault], [non-threaded],
@@ -431,6 +447,18 @@ GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerThreadedDefault], [threaded],
 GHC_IOMANAGER_DEFAULT_AC_DEFINE([IOManagerThreadedDefault], [threaded],
                                 [winio], [IOMGR_DEFAULT_THREADED_WINIO])
 
+dnl ** FFI
+dnl --------------------------------------------------------------
+
+FP_FIND_LIBFFI
+AC_SUBST(FFILibDir)
+AC_SUBST(FFIIncludeDir)
+
+dnl ######################################################################
+dnl Generate build-info
+dnl ######################################################################
+
+AC_SUBST([EXTRA_LIBS],[` printf " %s " "$LIBS" | sed -E 's/ -l([[^ ]]*)/\1 /g' `])
 
 dnl ** Write config files
 dnl --------------------------------------------------------------
@@ -478,45 +506,4 @@ cat ghcautoconf.h.autoconf | sed \
    -e '/REMOVE ME/d' \
    >> include/ghcautoconf.h
 echo "#endif /* __GHCAUTOCONF_H__ */" >> include/ghcautoconf.h
-]
-
-dnl ######################################################################
-dnl Generate external symbol flags (-Wl,-u...)
-dnl ######################################################################
-
-dnl See Note [Undefined symbols in the RTS]
-
-[
-symbolExtraDefs=''
-if [ "$CABAL_FLAG_find_ptr" = 1 ]; then
-    symbolExtraDefs+=' -DFIND_PTR'
-fi
-
-cat $srcdir/external-symbols.list.in \
-    | "$CC" $symbolExtraDefs -E -P -traditional -Iinclude - -o - \
-    | sed -e '/^ *$/d' \
-    > external-symbols.list \
-    || exit 1
-
-if [ "$CABAL_FLAG_leading_underscore" = 1 ]; then
-    sedExpr='s/^(.*)$/  "-Wl,-u,_\1"/'
-else
-    sedExpr='s/^(.*)$/  "-Wl,-u,\1"/'
-fi
-sed -E -e "${sedExpr}" external-symbols.list > external-symbols.flags
-unset sedExpr
-rm -f external-symbols.list
-]
-
-dnl ######################################################################
-dnl Generate build-info
-dnl ######################################################################
-
-[
-cat $srcdir/rts.buildinfo.in \
-    | "$CC" -E -P -traditional - -o - \
-    | sed -e '/^ *$/d' \
-    > rts.buildinfo \
-    || exit 1
-rm -f external-symbols.flags
 ]

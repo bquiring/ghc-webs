@@ -55,9 +55,10 @@ module GHC.Internal.Foreign.Ptr (
     -- for why the constructors for IntPtr and WordPtr are exported.
  ) where
 
-import GHC.Internal.Ptr
 import GHC.Internal.Base
+import GHC.Internal.Ptr
 import GHC.Internal.Num
+import GHC.Internal.Prim (addr2Int#, int2Addr#, int2Word#, word2Int#)
 import GHC.Internal.Read
 import GHC.Internal.Real
 import GHC.Internal.Show

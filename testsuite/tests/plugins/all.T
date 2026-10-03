@@ -131,7 +131,7 @@ test('T10294a',
       pre_cmd('$MAKE -s --no-print-directory -C annotation-plugin package.T10294a TOP={top}')],
      makefile_test, [])
 
-test('frontend01', [extra_files(['FrontendPlugin.hs']), when(opsys('linux') and not ghc_dynamic(), expect_broken(20706))],
+test('frontend01', [extra_files(['FrontendPlugin.hs']), when(opsys('linux') and not ghc_dynamic(), fragile(20706))],
      makefile_test, [])
 
 test('T11244',
@@ -332,6 +332,19 @@ test('T20803b',
      compile_fail,
      ['-package-db T20803-plugin/pkg.T20803b/local.package.conf -fplugin AddErrorPlugin -package T20803-plugin ' + config.plugin_way_flags])
 
+# Check that we run the plugins for set +c.
+# The .stdout file should contain a call to 'parsePlugin' AFTER
+# the line 'Collecting type info...'
+test('T23110'
+    , [ extra_files([ 'simple-plugin/'])
+      , only_ways(['ghci'])
+      , pre_cmd('$MAKE -s --no-print-directory -C simple-plugin package.simpleplug TOP={top}')
+      , extra_hc_opts('-package-db simple-plugin/pkg.simpleplug/local.package.conf')
+      ]
+    , ghci_script
+    , [ 'T23110.script' ]
+    )
+
 test('test-echo-in-turn',
      [extra_files(['echo-plugin/']),
       pre_cmd('$MAKE -s --no-print-directory -C echo-plugin package.test-echo-in-turn TOP={top}')],
@@ -355,14 +368,14 @@ test('test-echo-in-line-many-args',
 test('plugins-external',
      [extra_files(['shared-plugin/']),
       pre_cmd('$MAKE -s --no-print-directory -C shared-plugin package.plugins01 TOP={top}'),
-      when(opsys('mingw32') or (opsys('linux') and not ghc_dynamic()), expect_broken(20706))],
+      when(opsys('mingw32') or (opsys('linux') and not ghc_dynamic()), fragile(20706))],
      makefile_test, [])
 
 test('test-phase-hooks-plugin',
      [extra_files(['hooks-plugin/']),
       pre_cmd('$MAKE -s --no-print-directory -C hooks-plugin package.test-phase-hooks-plugin TOP={top}'),
 
-      when(opsys('linux') and not ghc_dynamic(), expect_broken(20706))],
+      when(opsys('linux') and not ghc_dynamic(), fragile(20706))],
      compile,
      ['-package-db hooks-plugin/pkg.test-phase-hooks-plugin/local.package.conf -fplugin Hooks.PhasePlugin -package hooks-plugin ' + config.plugin_way_flags])
 
@@ -376,3 +389,16 @@ test('test-late-plugin',
      [extra_files(['late-plugin/LatePlugin.hs']), ignore_stdout],
      makefile_test,
      [])
+
+test('T21730',
+     [extra_files(['T21730-plugin/']),
+      pre_cmd('$MAKE -s --no-print-directory -C T21730-plugin package.T21730-plugin TOP={top}')
+      ],
+     makefile_test, [])
+
+test('T24486',
+     [extra_files(['T24486-plugin/', 'T24486_Helper.hs']),
+      when(opsys('mingw32'), skip),
+      pre_cmd('$MAKE -s --no-print-directory -C T24486-plugin package.T24486-plugin TOP={top}')
+      ],
+     makefile_test, [])

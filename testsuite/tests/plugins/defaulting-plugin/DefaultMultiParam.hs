@@ -10,7 +10,7 @@ import GHC.Tc.Solver
 import GHC.Core.Type
 import GHC.Core.Class
 import GHC.Data.Bag
-import GHC.Builtin.Types (doubleTy, intTy)
+import GHC.Builtin.WiredIn.Types (doubleTy, intTy)
 import Data.Maybe (mapMaybe)
 
 plugin :: Plugin
@@ -18,7 +18,8 @@ plugin = defaultPlugin
     { defaultingPlugin = \_ -> Just DefaultingPlugin
         { dePluginInit = pure ()
         , dePluginRun = \ _ -> defaultBinaryClassesToDoubleInt
-        , dePluginStop = \ _ -> pure ()
+        , dePluginPostTc = \ _ -> pure ()
+        , dePluginShutdown = \ _ -> pure ()
         }
     }
 

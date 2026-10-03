@@ -40,10 +40,14 @@ module GHC.Internal.Event.PSQ
     , atMost
     ) where
 
-import GHC.Internal.Base hiding (empty)
+import GHC.Internal.Base hiding( empty )
 import GHC.Internal.Event.Unique
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Word (Word64)
 import GHC.Internal.Num (Num(..))
+import GHC.Internal.Prim (
+    and#, clz#, minusWord#, seq, uncheckedShiftL#, word2Int#, xor#,
+  )
 import GHC.Internal.Real (fromIntegral)
 
 #include "MachDeps.h"

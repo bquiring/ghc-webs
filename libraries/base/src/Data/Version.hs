@@ -1,4 +1,10 @@
+{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE Safe #-}
+
+{-# LANGUAGE StandaloneDeriving #-}
+
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- |
 -- Module      :  Data.Version
@@ -33,3 +39,30 @@ module Data.Version (
       ) where
 
 import GHC.Internal.Data.Version
+
+#if __GLASGOW_HASKELL__ >= 1001
+
+import qualified GHC.Essentials as Rebindable
+import Control.Applicative (pure, (*>))
+import Data.Functor (fmap)
+import Data.Char (isDigit, isAlphaNum)
+import Text.ParserCombinators.ReadP (ReadP, char, munch1, sepBy1, many)
+import Text.Read (Read, read)
+
+{-NOTE:
+    The following instance is technically an orphan, but practically it is not,
+    since ordinary users should not use @ghc-internal@ directly and thus get
+    'Version' only through this module.
+-}
+
+-- | @since base-2.01
+deriving instance Read Version
+
+-- | A parser for versions in the format produced by 'showVersion'.
+--
+parseVersion :: ReadP Version
+parseVersion = do branch <- sepBy1 (fmap read (munch1 isDigit)) (char '.')
+                  tags   <- many (char '-' *> munch1 isAlphaNum)
+                  pure (Version branch tags)
+
+#endif

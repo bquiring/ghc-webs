@@ -40,11 +40,11 @@ given compilation phase:
     Use ⟨cmd⟩ as the JavaScript C pre-processor (only for javascript-backend).
 
 .. ghc-flag:: -pgmCmmP ⟨cmd⟩
-    :shortdesc: Use ⟨cmd⟩ as the C-- C pre-processor
+    :shortdesc: Use ⟨cmd⟩ as the C-\- C pre-processor
     :type: dynamic
     :category: phase-programs
 
-    Use ⟨cmd⟩ as the C-- C pre-processor.
+    Use ⟨cmd⟩ as the C-\- C pre-processor.
 
 .. ghc-flag:: -pgmc ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the C compiler
@@ -124,7 +124,7 @@ given compilation phase:
 
     Use ⟨cmd⟩ as the program to inspect mach-o dynamic libraries and
     executables to read the dynamic library dependencies.  We will compute
-    the necessary ``runpath``s to embed for the dependencies based on the
+    the necessary ``runpath``\s to embed for the dependencies based on the
     result of the ``otool`` call.
 
 .. ghc-flag:: -pgminstall_name_tool ⟨cmd⟩
@@ -132,7 +132,7 @@ given compilation phase:
     :type: dynamic
     :category: phase-programs
 
-    Use ⟨cmd⟩ as the program to inject ``runpath``s into mach-o dynamic
+    Use ⟨cmd⟩ as the program to inject ``runpath``\s into mach-o dynamic
     libraries and executables.  As detected by the ``otool`` call.
 
 .. ghc-flag:: -pgmwindres ⟨cmd⟩
@@ -151,9 +151,11 @@ given compilation phase:
     :category: phase-programs
 
     Use ⟨cmd⟩ as the external interpreter command (see
-    :ref:`external-interpreter`).  Default: ``ghc-iserv-prof`` if
-    :ghc-flag:`-prof` is enabled, ``ghc-iserv-dyn`` if :ghc-flag:`-dynamic` is
-    enabled, or ``ghc-iserv`` otherwise.
+    :ref:`external-interpreter`).  By default GHC builds an on-demand external
+    interpreter using the installed ``ghci`` unit and runs it directly. This
+    requires that target executables can run on the build host; when
+    cross-compiling, pass ``-pgmi`` to use a proxy such as ``iserv-proxy``.
+
 
 .. _forcing-options-through:
 
@@ -192,14 +194,14 @@ the following flags:
     Pass ⟨option⟩ to JavaScript C pre-processor (only for javascript-backend).
 
 .. ghc-flag:: -optCmmP ⟨option⟩
-    :shortdesc: pass ⟨option⟩ to the C-- C pre-processor.
+    :shortdesc: pass ⟨option⟩ to the C-\- C pre-processor.
     :type: dynamic
     :category: phase-options
 
-    Pass ⟨option⟩ to the C-- C pre-processor.
+    Pass ⟨option⟩ to the C-\- C pre-processor.
 
-    The C-- C pre-processor also receives C compiler flags.  Those flags will
-    come _before_ the flags added by this option.  As a result, the net effect
+    The C-\- C pre-processor also receives C compiler flags.  Those flags will
+    come *before* the flags added by this option.  As a result, the net effect
     of the following pair of flags is zero: :code:`-optCmmP-UFOO -optc-DFOO`.
 
 .. ghc-flag:: -optF ⟨option⟩
@@ -215,7 +217,7 @@ the following flags:
     :type: dynamic
     :category: phase-options
 
-    Pass ⟨option⟩ to the C compiler and, for compatibility, C-- pre-processor.
+    Pass ⟨option⟩ to the C compiler and, for compatibility, C-\- pre-processor.
 
 .. ghc-flag:: -pgmc-supports-no-pie
     :shortdesc: *(deprecated)*
@@ -551,8 +553,10 @@ SIMD macros
     These are defined conditionally based on the SIMD
     flags used for compilation:
 
-    ``__SSE__``, ``__SSE2__``, ``__SSE4_2__``, ``__FMA__``,
-    ``__AVX__``, ``__AVX2__``, ``__AVX512CD__``, ``__AVX512ER__``, ``__AVX512F__``, ``__AVX512PF__``,
+    ``__SSE__``, ``__SSE2__``, ``__SSE3__``, ``__SSSE3__``,
+    ``__SSE4_1__``, ``__SSE4_2__``, ``__FMA__``, ``__AVX__``, ``__AVX2__``,
+    ``__AVX512BW__``, ``__AVX512CD__``, ``__AVX512DQ__``, ``__AVX512ER__``,
+    ``__AVX512F__``, ``__AVX512PF__``, ``__AVX512VL__``, ``__GFNI__``
 
 .. _cpp-string-gaps:
 
@@ -599,7 +603,7 @@ Options affecting a Haskell pre-processor
     appropriate and useful. The ``-F`` option lets you run a
     pre-processor as part of the overall GHC compilation pipeline, which
     has the advantage over running a Haskell pre-processor separately in
-    that it works in interpreted mode and you can continue to take reap
+    that it works in interpreted mode and you can continue to reap
     the benefits of GHC's recompilation checker.
 
     The pre-processor is run just before the Haskell compiler proper
@@ -617,6 +621,10 @@ Options affecting a Haskell pre-processor
     Additional arguments to the pre-processor can be passed in using the
     :ghc-flag:`-optF ⟨option⟩` option. These are fed to ⟨cmd⟩ on the command
     line after the three standard input and output arguments.
+
+    GHC sets the environment variable `GHC_VERSION` to the current GHC version
+    when invoking a pre-processor.  The pre-processor can use this to emit
+    backward-compatible code.
 
     An example of a pre-processor is to convert your source files to the
     input encoding that GHC expects, i.e. create a script ``convert.sh``
@@ -770,10 +778,9 @@ Options affecting code generation
     :type: dynamic
     :category: codegen
 
-    Generate position-independent code (code that can be put into shared
-    libraries). This currently works on Linux x86 and x86-64. On
-    Windows, position-independent code is never used so the flag is a
-    no-op on that platform.
+    Generate position-independent code (PIC). This code can be put into shared
+    libraries and is sometimes required by operating systems, e.g. systems using
+    Address Space Layout Randomization (ASLR).
 
 .. ghc-flag:: -fexternal-dynamic-refs
     :shortdesc: Generate code for linking against dynamic libraries
@@ -790,9 +797,7 @@ Options affecting code generation
     :category: codegen
 
     Generate code in such a way to be linkable into a position-independent
-    executable This currently works on Linux x86 and x86-64. On Windows,
-    position-independent code is never used so the flag is a no-op on that
-    platform. To link the final executable use :ghc-flag:`-pie`.
+    executable. To link the final executable use :ghc-flag:`-pie`.
 
 .. ghc-flag:: -dynamic
     :shortdesc: Build dynamically-linked object files and executables
@@ -849,8 +854,11 @@ Options affecting code generation
     :type: dynamic
     :category: codegen
 
-    If a home package module has byte-code available then use that instead of
+    If a module has byte-code available then use that instead of
     an object file (if that's available) to evaluate and run TH splices.
+
+    This also prefers to load bytecode libraries when trying to find the library
+    to satisfy a package dependency.
 
     This is useful with flags such as :ghc-flag:`-fbyte-code-and-object-code`, which
     tells the compiler to generate byte-code, and :ghc-flag:`-fwrite-if-simplified-core` which
@@ -859,6 +867,19 @@ Options affecting code generation
     This flag also interacts with :ghc-flag:`-fno-code`, if this flag is enabled
     then any modules which are required to be compiled for Template Haskell evaluation
     will generate byte-code rather than object code.
+
+.. ghc-flag:: -fwrite-byte-code
+    :shortdesc: Write byte-code object files
+    :type: dynamic
+    :category: codegen
+
+    Write byte-code files (``.gbc``) when byte-code is generated.
+    These files can be used to avoid recompiling modules when using the byte-code
+    interpreter.
+
+    By default when using :ghc-flag:`-fbyte-code` no byte-code files are written.
+    This flag is implied by :ghc-flag:`-fbyte-code-and-object-code`.
+
 
 
 .. _options-linker:
@@ -943,6 +964,58 @@ for example).
     To control the name, use the :ghc-flag:`-o ⟨file⟩` option
     as usual. The default name is ``liba.a``.
 
+.. ghc-flag:: -static-external
+    :shortdesc: Link external C dependencies statically when
+        building an executable.
+    :type: dynamic
+    :category: linking
+
+    Link external system libraries statically when building an executable.
+    By default, this excludes the following libraries on unix:
+    ``c``, ``m``, ``rt``, ``dl``, ``pthread``, ``stdc++``, ``c++``, ``c++abi``, ``atomic``.
+    And the following libraries on windows:
+    ``wsock32``, ``gdi32``, ``winmm``, ``dbghelp``, ``psapi``, ``user32``, ``shell32`` ,
+    ``mingw32``, ``kernel32``, ``advapi32``, ``mingwex``, ``ws2_32``, ``shlwapi`` ,
+    ``ole32``, ``rpcrt4``, ``ntdll``, ``ucrt``.
+    Also see :ghc-flag:`-exclude-static-external ⟨lib1,lib2,...⟩` for more control.
+    It is required that all system dependencies and their
+    static libraries are installed. This does not affect how Haskell libraries
+    are linked. You can combine this with ghc-flag:`-static` to produce binaries
+    that are only dynamically linked against e.g. libc.
+
+    Also note that this option is not terribly portable. It relies on the "verbatim namespace"
+    convention that some linkers support (``-l:foo.a``). On systems where
+    this isn't supported, GHC falls back to trying to look up the absolute path
+    of the static archives, which may not always work.
+
+    To control how Haskell libraries are linked, see :ghc-flag:`-static` and
+    :ghc-flag:`-dynamic`.
+
+.. ghc-flag:: -exclude-static-external ⟨lib1,lib2,...⟩
+    :shortdesc: Don't link the following libraries statically
+    :type: dynamic
+    :category: linking
+
+    When linking system libraries statically, allow to specify a comma separated list
+    of libraries to not link statically (as in: dynamic). Since :ghc-flag:`-static-external`
+    is not meant for fully static linking and gives more control than :ghc-flag:`-fully-static`,
+    this option allows to exclude certain libraries. By default, these are: ``c``, ``m``, ``rt``, ``dl``, ``pthread``, ``stdc++``, ``c++``, ``c++abi``, ``atomic``.
+
+    When this option is specified without arguments, no libraries are excluded.
+
+.. ghc-flag:: -fully-static
+    :shortdesc: Link everything statically when
+        building an executable.
+    :type: dynamic
+    :category: linking
+
+    Link all libraries statically when building an executable. This includes
+    external libraries, Haskell libraries, as well as libc.
+    This requires that all dependencies and their static libraries are installed.
+    Musl is commonly used to provide a static libc.
+
+    This flag is incompatible with :ghc-flag:`-dynamic`.
+
 .. ghc-flag:: -L ⟨dir⟩
     :shortdesc: Add ⟨dir⟩ to the list of directories searched for libraries
     :type: dynamic
@@ -998,6 +1071,9 @@ for example).
     Tell the linker to avoid shared Haskell libraries, if possible. This
     is the default.
 
+    To further control linking behavior, also see :ghc-flag:`-fully-static`
+    and :ghc-flag:`-static-external`.
+
 .. ghc-flag:: -dynamic
     :shortdesc: Build dynamically-linked object files and executables
     :type: dynamic
@@ -1034,6 +1110,23 @@ for example).
     must be named properly, so that GHC recognizes the shared object
     when linking against this package.
     See :ref:`shared object name mangling <building-packages>` for details.
+
+.. ghc-flag:: -bytecodelib
+    :shortdesc: Generate a bytecode library
+    :type: dynamic
+    :category: linking
+
+    Generate a bytecode library. A bytecode library is a collection of bytecode
+    artifacts and a library for foreign sources.
+
+    This mode can be used to package bytecode together for a library.
+
+    When used in one-shot mode, the arguments are expected to be bytecode files (.gbc files)
+    and any additional foreign object files needed to create the library.
+
+
+
+
 
 .. ghc-flag:: -dynload
     :shortdesc: Selects one of a number of modes for finding shared libraries at runtime.

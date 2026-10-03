@@ -14,11 +14,26 @@
 
 #include "IOManager.h"
 
+#if defined(IOMGR_ENABLED_SELECTBIS) \
+ || defined(IOMGR_ENABLED_POLL)
+#include "ClosureTable.h"
+#include "TimeoutQueue.h"
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+#include <sys/select.h> /* for fd_set */
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+#include <poll.h> /* for struct pollfd */
+#endif
+
 #include "BeginPrivate.h"
 
 /* The per-capability data structures belonging to the I/O manager.
  *
- * It can be accessed as cap->iomgr.
+ * It can be accessed as cap->iomgr. Or given just the iomgr, you can access
+ * the owning cap as iomgr->cap.
  *
  * The content of the structure is defined conditionally so it is different for
  * each I/O manager implementation.
@@ -27,6 +42,9 @@
  */
 struct _CapIOManager {
 
+   /* Back reference to the containing capability */
+    Capability *cap;
+
 #if defined(IOMGR_ENABLED_SELECT)
     /* Thread queue for threads blocked on I/O completion. */
     StgTSO *blocked_queue_hd;
@@ -34,6 +52,34 @@ struct _CapIOManager {
 
     /* Thread queue for threads blocked on timeouts. */
     StgTSO *sleeping_queue;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECT) \
+ || defined(IOMGR_ENABLED_SELECTBIS) \
+ || defined(IOMGR_ENABLED_POLL)
+#if defined(HAVE_PREEMPTION)
+    /* FDs for waking up the I/O manager when it is blocked waiting */
+    int interrupt_fd_r, interrupt_fd_w;
+#endif
+#endif
+
+#if defined(IOMGR_ENABLED_POLL) \
+ || defined(IOMGR_ENABLED_SELECTBIS)
+    /* AIOP and timeout collections shared by several I/O manager impls */
+    ClosureTable     aiop_table;
+    StgTimeoutQueue *timeout_queue;
+#endif
+
+#if defined(IOMGR_ENABLED_SELECTBIS)
+    fd_set *rfds, *wfds;
+#endif
+
+#if defined(IOMGR_ENABLED_POLL)
+    /* Auxiliary table with size and indexes matching the aiop_table. This is
+     * aliased to the tail of the full poll table, which has a head entry for
+     * the wakeup_fd_r above, so we can also poll that fd.
+     */
+    struct pollfd *aiop_poll_table, *full_poll_table;
 #endif
 
 #if defined(IOMGR_ENABLED_WIN32_LEGACY)
@@ -49,6 +95,26 @@ struct _CapIOManager {
 #endif
 
 };
+
+/* Fill in the outcome and result/error on the TSO's stack frame.
+ * The TSO must be blocked using one of the stg_block_io_* blocking actions.
+ *
+ * Once the thread is resumed (by the scheduler) the code for stg_block_*_info
+ * will pick up the info from the stack frame and use it to see if there's been
+ * a failure, and if so to raise a PrimIOException.
+ *
+ * See Note [Thread blocking for new I/O primops].
+ */
+INLINE_HEADER void setTsoIOOpOutcome (StgTSO *tso,
+                                      enum IOOpOutcome outcome,
+                                      uint32_t result)
+{
+    ASSERT((StgPtr *)tso->stackobj->sp[0] == (StgPtr *)&stg_block_io_unit_info
+        || (StgPtr *)tso->stackobj->sp[0] == (StgPtr *)&stg_block_io_int_info);
+
+    tso->stackobj->sp[1] = (W_)outcome;
+    tso->stackobj->sp[2] = (W_)result;
+}
 
 #include "EndPrivate.h"
 

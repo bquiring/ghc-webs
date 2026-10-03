@@ -117,7 +117,7 @@ module GHC.Types.Id (
         setIdCbvMarks,
         idCbvMarks_maybe,
         idCbvMarkArity,
-        asWorkerLikeId, asNonWorkerLikeId,
+        setCbvCandidate, removeCbvCandidate,
 
         idDemandInfo,
         idDmdSig,
@@ -153,17 +153,18 @@ import GHC.Core.Multiplicity
 import GHC.Types.RepType
 import GHC.Types.Demand
 import GHC.Types.Cpr
+import GHC.Types.InlinePragma
 import GHC.Types.Name
 import GHC.Types.ForeignCall
 import GHC.Types.SrcLoc
 import GHC.Types.Unique
+import GHC.Types.Unique.Supply
 
 import GHC.Stg.EnforceEpt.TagSig
 
 import GHC.Unit.Module
 import {-# SOURCE #-} GHC.Builtin.PrimOps (PrimOp)
 import GHC.Builtin.Uniques (mkBuiltinUnique)
-import GHC.Types.Unique.Supply
 
 import GHC.Data.Maybe
 import GHC.Data.FastString
@@ -562,7 +563,7 @@ isDataConId id = case Var.idDetails id of
 
 -- | An Id for which we might require all callers to pass strict arguments properly tagged + evaluated.
 --
--- See Note [CBV Function Ids]
+-- See Note [CBV Function Ids: overview]
 isWorkerLikeId :: Id -> Bool
 isWorkerLikeId id = case Var.idDetails id of
   WorkerLikeId _  -> True
@@ -601,16 +602,18 @@ hasNoBinding :: Id -> Bool
 -- more.  Instead, we inject a binding for them at the CorePrep stage. The
 -- exception to this is unboxed tuples and sums datacons, which definitely have
 -- no binding
-hasNoBinding id = case Var.idDetails id of
+hasNoBinding id =
+  case Var.idDetails id of
 
--- TEMPORARILY make all primops hasNoBinding, to avoid #20155
--- The goal is to understand #20155 and revert to the commented out version
-                        PrimOpId _ _ -> True    -- See Note [Eta expanding primops] in GHC.Builtin.PrimOps
---                        PrimOpId _ lev_poly -> lev_poly    -- TEMPORARILY commented out
+    -- TEMPORARILY make all primops hasNoBinding, to avoid #20155
+    -- The goal is to understand #20155 and revert to the commented out version
+    PrimOpId _ _ -> True    -- See Note [Eta expanding primops] in GHC.Builtin.PrimOps
+--  PrimOpId _ lev_poly -> lev_poly    -- TEMPORARILY commented out
 
-                        FCallId _        -> True
-                        DataConWorkId dc -> isUnboxedTupleDataCon dc || isUnboxedSumDataCon dc
-                        _                -> isCompulsoryUnfolding (realIdUnfolding id)
+    FCallId _        -> True
+    RepPolyId {}     -> True -- e.g. seq, coerce, unsafeCoerce, box/unbox...
+    DataConWorkId dc -> dataConHasNoBinding dc
+    _                -> isCompulsoryUnfolding (realIdUnfolding id)
   -- Note: this function must be very careful not to force
   -- any of the fields that aren't the 'uf_src' field of
   -- the 'Unfolding' of the 'Id'. This is because these fields are computed
@@ -663,19 +666,20 @@ idJoinArity id = case idJoinPointHood id of
                    NotJoinPoint -> pprPanic "idJoinArity" (ppr id)
 
 asJoinId :: Id -> JoinArity -> JoinId
-asJoinId id arity = warnPprTrace (not (isLocalId id))
-                         "global id being marked as join var"  (ppr id) $
-                    warnPprTrace (not (is_vanilla_or_join id))
-                         "asJoinId"
-                         (ppr id <+> pprIdDetails (idDetails id)) $
-                    id `setIdDetails` JoinId arity (idCbvMarks_maybe id)
+asJoinId id arity
+  = warnPprTrace (not (isLocalId id))
+      "global id being marked as join var"  (ppr id) $
+    id `setIdDetails` JoinId arity cbv_info
   where
-    is_vanilla_or_join id = case Var.idDetails id of
-                              VanillaId -> True
-                              -- Can workers become join ids? Yes!
-                              WorkerLikeId {} -> pprTraceDebug "asJoinId (call by value function)" (ppr id) True
-                              JoinId {} -> True
-                              _         -> False
+   cbv_info = case Var.idDetails id of
+                 VanillaId          -> Nothing
+                 WorkerLikeId marks -> Just marks
+                 JoinId _ mb_marks  -> mb_marks
+                 _ -> pprTraceDebug "asJoinId"
+                         (ppr id <+> pprIdDetails (idDetails id)) $
+                      Nothing
+   -- Can workers become join ids? Yes!
+   -- See Note [CBV Function Ids: overview] in GHC.Types.Id.Info
 
 zapJoinId :: Id -> Id
 -- May be a regular id already
@@ -686,7 +690,7 @@ zapJoinId jid | isJoinId jid = zapIdTailCallInfo (newIdDetails `seq` jid `setIdD
               where
                 newIdDetails = case idDetails jid of
                   -- We treat join points as CBV functions. Even after they are floated out.
-                  -- See Note [Use CBV semantics only for join points and workers]
+                  -- See Note [Which Ids should be CBV candidates?]
                   JoinId _ (Just marks) -> WorkerLikeId marks
                   JoinId _ Nothing      -> WorkerLikeId []
                   _                     -> panic "zapJoinId: newIdDetails can only be used if Id was a join Id."
@@ -789,7 +793,7 @@ alwaysActiveUnfoldingFun id
 -- | Returns an unfolding only if
 --   (a) not a strong loop breaker and
 --   (b) active in according to is_active
-whenActiveUnfoldingFun :: (Activation -> Bool) -> IdUnfoldingFun
+whenActiveUnfoldingFun :: (ActivationGhc -> Bool) -> IdUnfoldingFun
 whenActiveUnfoldingFun is_active id
   | is_active (idInlineActivation id) = idUnfolding id
   | otherwise                         = NoUnfolding
@@ -835,7 +839,7 @@ setIdCbvMarks id marks
       -- Perhaps that's sensible but for now be conservative.
       -- Similarly we don't need any lazy marks at the end of the list.
       -- This way the length of the list is always exactly number of arguments
-      -- that must be visible to CodeGen. See See Note [CBV Function Ids]
+      -- that must be visible to CodeGen. See Note [CBV Function Ids: overview]
       -- for more details.
       trimmedMarks = dropWhileEndLE (not . isMarkedCbv) $ take (idArity id) marks
 
@@ -846,28 +850,30 @@ idCbvMarks_maybe id = case idDetails id of
   _                    -> Nothing
 
 -- Id must be called with at least this arity in order to allow arguments to
--- be passed unlifted.
+-- be passed unlifted.  Return 0 if there are no CBV marks.
 idCbvMarkArity :: Id -> Arity
 idCbvMarkArity fn = maybe 0 length (idCbvMarks_maybe fn)
 
--- | Remove any cbv marks on arguments from a given Id.
-asNonWorkerLikeId :: Id -> Id
-asNonWorkerLikeId id =
-  let details = case idDetails id of
-        WorkerLikeId{}      -> Just $ VanillaId
-        JoinId arity Just{} -> Just $ JoinId arity Nothing
-        _                   -> Nothing
-  in maybeModifyIdDetails details id
-
--- | Turn this id into a WorkerLikeId if possible.
-asWorkerLikeId :: Id -> Id
-asWorkerLikeId id =
+-- | Make this Id into a candidate for CBV treatment, if possible.
+-- See Note [CBV Function Ids: overview] in GHC.Types.Id.Info
+setCbvCandidate :: Id -> Id
+setCbvCandidate id =
   let details = case idDetails id of
         WorkerLikeId{}        -> Nothing
         JoinId _arity Just{}  -> Nothing
         JoinId arity Nothing  -> Just (JoinId arity (Just []))
         VanillaId             -> Just $ WorkerLikeId []
         _                     -> Nothing
+  in maybeModifyIdDetails details id
+
+-- | Remove any CBV-candidate info from a given Id.
+-- See Note [CBV Function Ids: overview] in GHC.Types.Id.Info
+removeCbvCandidate :: Id -> Id
+removeCbvCandidate id =
+  let details = case idDetails id of
+        WorkerLikeId{}      -> Just $ VanillaId
+        JoinId arity Just{} -> Just $ JoinId arity Nothing
+        _                   -> Nothing
   in maybeModifyIdDetails details id
 
 setCaseBndrEvald :: StrictnessMark -> Id -> Id
@@ -937,19 +943,19 @@ The inline pragma tells us to be very keen to inline this Id, but it's still
 OK not to if optimisation is switched off.
 -}
 
-idInlinePragma :: Id -> InlinePragma
+idInlinePragma :: Id -> InlinePragmaInfo
 idInlinePragma id = inlinePragInfo (idInfo id)
 
-setInlinePragma :: Id -> InlinePragma -> Id
+setInlinePragma :: Id -> InlinePragmaInfo -> Id
 setInlinePragma id prag = modifyIdInfo (`setInlinePragInfo` prag) id
 
-modifyInlinePragma :: Id -> (InlinePragma -> InlinePragma) -> Id
+modifyInlinePragma :: Id -> (InlinePragmaInfo -> InlinePragmaInfo) -> Id
 modifyInlinePragma id fn = modifyIdInfo (\info -> info `setInlinePragInfo` (fn (inlinePragInfo info))) id
 
-idInlineActivation :: Id -> Activation
+idInlineActivation :: Id -> ActivationGhc
 idInlineActivation id = inlinePragmaActivation (idInlinePragma id)
 
-setInlineActivation :: Id -> Activation -> Id
+setInlineActivation :: Id -> ActivationGhc -> Id
 setInlineActivation id act = modifyInlinePragma id (\prag -> setInlinePragmaActivation prag act)
 
 idRuleMatchInfo :: Id -> RuleMatchInfo

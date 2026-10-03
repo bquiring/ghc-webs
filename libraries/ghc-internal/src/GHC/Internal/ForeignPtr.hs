@@ -53,16 +53,24 @@ module GHC.Internal.ForeignPtr
         finalizeForeignPtr
   ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.Storable
 import GHC.Internal.Data.Foldable    ( sequence_ )
-
 import GHC.Internal.Show
-import GHC.Internal.Base
+import GHC.Internal.Err ( errorWithoutStackTrace, undefined )
 import GHC.Internal.IORef
+import GHC.Internal.Prim (
+    Addr#, Int#, MutableByteArray#, RealWorld, State#, Weak#,
+    addCFinalizerToWeak#, atomicModifyMutVar2#, coerce, finalizeWeak#,
+    keepAlive#, mkWeak#, mkWeakNoFinalizer#, mutableByteArrayContents#,
+    newAlignedPinnedByteArray#, newPinnedByteArray#, nullAddr#, plusAddr#,
+    touch#,
+  )
 import GHC.Internal.STRef        ( STRef(..) )
 import GHC.Internal.Ptr          ( Ptr(..), FunPtr(..) )
-
 import GHC.Internal.Unsafe.Coerce    ( unsafeCoerce )
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
+import qualified GHC.Internal.Stack.Types as Rebindable
 
 -- |The type 'ForeignPtr' represents references to objects that are
 -- maintained in a foreign language, i.e., that are not part of the

@@ -80,7 +80,7 @@ test('length001',
      # excessive amounts of stack space. So we specifically set a low
      # stack limit and mark it as failing under a few conditions.
      [extra_run_opts('+RTS -K8m -RTS'),
-     expect_fail_for(['normal', 'threaded1', 'llvm', 'nonmoving', 'nonmoving_thr', 'nonmoving_thr_ghc']),
+     expect_fail_for(['normal', 'threaded1', 'llvm', 'nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity', 'nonmoving_thr_ghc', 'ext-interp']),
      # JS doesn't support stack limit so the test sometimes passes just fine. Therefore the test is
      # marked as fragile.
      when(js_arch(), fragile(22921))],
@@ -135,7 +135,8 @@ test('list003', when(fast(), skip), compile_and_run, [''])
 test('isSuffixOf', normal, compile_and_run, [''])
 
 test('memo001', [extra_files(['Memo1.lhs']),
-                 extra_run_opts('+RTS -A10k -RTS')], multimod_compile_and_run,
+                 extra_run_opts('+RTS -A10k -RTS'),
+                 expect_broken_for(27396, opt_ways)], multimod_compile_and_run,
      ['memo001', ''])
 
 test('memo002', [extra_files(['Memo2.lhs']),
@@ -242,7 +243,7 @@ test('T8684', expect_broken(8684), compile_and_run, [''])
 test('hWaitForInput-accurate-stdin', [js_broken(22349), expect_broken_for(16535, threaded_ways), req_process], compile_and_run, [''])
 test('T9826',normal, compile_and_run,[''])
 test('T9848',
-        [ collect_stats('bytes allocated')
+        [ collect_stats('bytes allocated', 2)
         , only_ways(['normal'])
         , js_broken(22261)
         ],
@@ -318,6 +319,7 @@ test('T23687', normal, compile_and_run, [''])
 test('T23697',
   [ when(opsys('mingw32'), skip) # header not found
   , when(opsys('darwin'), skip)  # permission denied
+  , js_broken(22355)
   ], makefile_test, ['T23697'])
 test('stimesEndo', normal, compile_and_run, [''])
 test('T24807', exit_code(1), compile_and_run, [''])

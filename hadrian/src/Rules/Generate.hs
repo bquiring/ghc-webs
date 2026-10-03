@@ -1,16 +1,15 @@
 module Rules.Generate (
     isGeneratedCmmFile, compilerDependencies, generatePackageCode,
     generateRules, copyRules, generatedDependencies,
-    templateRules
+    templateRules, generateSettings
     ) where
 
 import Development.Shake.FilePath
-import Data.Char (isSpace)
 import qualified Data.Set as Set
 import Base
 import qualified Context
 import Expression
-import Hadrian.Oracles.TextFile (lookupSystemConfig)
+import Hadrian.Oracles.TextFile (lookupStageBuildConfig)
 import Oracles.Flag hiding (arSupportsAtFile, arSupportsDashL)
 import Oracles.ModuleFiles
 import Oracles.Setting
@@ -18,15 +17,14 @@ import Hadrian.Haskell.Cabal.Type (PackageData(version))
 import Hadrian.Haskell.Cabal
 import Hadrian.Oracles.Cabal (readPackageData)
 import Packages
-import Rules.Libffi
 import Settings
 import Target
 import Utilities
 
 import GHC.Toolchain as Toolchain hiding (HsCpp(HsCpp))
-import GHC.Toolchain.Program
 import GHC.Platform.ArchOS
 import Settings.Program (ghcWithInterpreter)
+import UserSettings (finalStage)
 
 -- | Track this file to rebuild generated files whenever it changes.
 trackGenerateHs :: Expr ()
@@ -51,14 +49,13 @@ ghcInternalDependencies :: Expr [FilePath]
 ghcInternalDependencies = do
     stage <- getStage
     path  <- expr $ buildPath (vanillaContext stage ghcInternal)
-    return [path -/- "GHC/Internal/Prim.hs", path -/- "GHC/Internal/PrimopWrappers.hs"]
+    return [path -/- "GHC/Internal/PrimopWrappers.hs"]
 
 rtsDependencies :: Expr [FilePath]
 rtsDependencies = do
     stage   <- getStage
     rtsPath <- expr (rtsBuildPath stage)
-    jsTarget <- expr isJsTarget
-    useSystemFfi <- expr (flag UseSystemFfi)
+    jsTarget <- expr (isJsTarget stage)
 
     let -- headers common to native and JS RTS
         common_headers =
@@ -70,7 +67,6 @@ rtsDependencies = do
             [ "rts" -/- "EventTypes.h"
             , "rts" -/- "EventLogConstants.h"
             ]
-            ++ (if useSystemFfi then [] else libffiHeaderFiles)
         headers
           | jsTarget  = common_headers
           | otherwise = common_headers ++ native_headers
@@ -145,7 +141,6 @@ generatePackageCode context@(Context stage pkg _ _) = do
             root -/- "**" -/- dir -/- "GHC/Settings/Config.hs" %> go generateConfigHs
             root -/- "**" -/- dir -/- "*.hs-incl" %> genPrimopCode context
         when (pkg == ghcInternal) $ do
-            root -/- "**" -/- dir -/- "GHC/Internal/Prim.hs" %> genPrimopCode context
             root -/- "**" -/- dir -/- "GHC/Internal/PrimopWrappers.hs" %> genPrimopCode context
         when (pkg == ghcBoot) $ do
             root -/- "**" -/- dir -/- "GHC/Version.hs" %> go generateVersionHs
@@ -154,7 +149,7 @@ generatePackageCode context@(Context stage pkg _ _) = do
     when (pkg == compiler) $ do
         root -/- primopsTxt stage %> \file -> do
             need $ [primopsSource]
-            build $ target context HsCpp [primopsSource] [file]
+            build $ target context (HsCpp stage) [primopsSource] [file]
 
     when (pkg == rts) $ do
         root -/- "**" -/- dir -/- "cmm/AutoApply.cmm" %> \file -> do
@@ -247,9 +242,6 @@ copyRules = do
         prefix -/- "html/**"           <~ return "utils/haddock/haddock-api/resources"
         prefix -/- "latex/**"          <~ return "utils/haddock/haddock-api/resources"
 
-        forM_ [Inplace, Final] $ \iplace ->
-          root -/- relativePackageDbPath (PackageDbLoc stage iplace) -/- systemCxxStdLibConf %> \file -> do
-            copyFile ("mk" -/- "system-cxx-std-lib-1.0.conf") file
 
 generateRules :: Rules ()
 generateRules = do
@@ -261,8 +253,30 @@ generateRules = do
 
     forM_ allStages $ \stage -> do
         let prefix = root -/- stageString stage -/- "lib"
-            go gen file = generate file (semiEmptyTarget (succStage stage)) gen
-        (prefix -/- "settings") %> \out -> go (generateSettings out) out
+            -- For the finalStage, we generate settings for that stage. For
+            -- others we look at the next stage. Why? Because cross-compilers
+            -- require libs from the successor stage, otherwise they are
+            -- compiled for the host and not the target.
+            stage' = if stage /= finalStage then succStage stage else stage
+            go gen file = generate file (semiEmptyTarget stage') gen
+        (prefix -/- "settings") %> \out -> do
+            let get_pkg_db stg = packageDbPath (PackageDbLoc stg Final)
+            -- For cross, LibDir points to stage' lib dir, so pkgDb must also
+            -- be relative to stage' lib dir.
+            isCross <- crossStage stage
+            let libStage = case stage of
+                    Stage0 {} -> Stage1
+                    _         -> if isCross then stage' else stage
+            pkgDb <- get_pkg_db libStage
+            -- addTrailingPathSeparator needed: makeRelativeNoSysLink uses
+            -- splitPath where "lib" and "lib/" are distinct components.
+            let libTopDir = addTrailingPathSeparator $
+                    if isCross
+                      then root -/- stageString stage' -/- "lib"
+                      else prefix
+                relPkgDb = makeRelativeNoSysLink libTopDir pkgDb
+            go (generateSettings out True relPkgDb) out
+        (prefix -/- "targets" -/- "default.target") %> \out -> go (show <$> expr (targetStage (succStage stage))) out
 
   where
     file <~+ gen = file %> \out -> generate out emptyTarget gen >> makeExecutable out
@@ -302,7 +316,7 @@ runInterpolations (Interpolations mk_substs) input = do
     return (subst input)
 
 -- | Interpolate the given variable with the value of the given 'Setting'.
-interpolateSetting :: String -> Setting -> Interpolations
+interpolateSetting :: String -> ProjectSetting -> Interpolations
 interpolateSetting name settng = interpolateVar name $ setting settng
 
 -- | Interpolate the @ProjectVersion@, @ProjectVersionMunged@, and @ProjectVersionForLib@ variables.
@@ -320,13 +334,15 @@ packageVersions = foldMap f [ base, ghcPrim, compiler, ghc, cabal, templateHaske
     f pkg = interpolateVar var $ version <$> readPackageData pkg
       where var = "LIBRARY_" <> escapedPkgName pkg <> "_VERSION"
 
-packageUnitIds :: Stage -> Interpolations
-packageUnitIds stage =
+-- We don't want to use the hash in the html documentation because it
+-- makes it harder for non-boot packages to link to boot packages, see #26635
+packageIds :: Interpolations
+packageIds =
     foldMap f [ base, ghcPrim, compiler, ghc, cabal, templateHaskell, ghcCompact, array ]
   where
     f :: Package -> Interpolations
-    f pkg = interpolateVar var $ pkgUnitId stage pkg
-      where var = "LIBRARY_" <> escapedPkgName pkg <> "_UNIT_ID"
+    f pkg = interpolateVar var $ pkgSimpleIdentifier pkg
+      where var = "LIBRARY_" <> escapedPkgName pkg <> "_ID"
 
 escapedPkgName :: Package -> String
 escapedPkgName = map f . pkgName
@@ -339,7 +355,7 @@ templateRuleFrom inPath outPath interps = do
     outPath %> \_ -> do
         s <- readFile' inPath
         result <- runInterpolations interps s
-        writeFile' outPath result
+        writeFileAtomic outPath result
         putSuccess ("| Successfully generated " ++ outPath ++ " from its template")
 
 templateRule :: FilePath -> Interpolations -> Rules ()
@@ -351,7 +367,6 @@ templateRules = do
   templateRule "compiler/ghc.cabal" $ projectVersion
   templateRule "driver/ghci/ghci-wrapper.cabal" $ projectVersion
   templateRule "ghc/ghc-bin.cabal" $ projectVersion
-  templateRule "utils/iserv/iserv.cabal" $ projectVersion
   templateRule "utils/remote-iserv/remote-iserv.cabal" $ projectVersion
   templateRule "utils/runghc/runghc.cabal" $ projectVersion
   templateRule "libraries/ghc-boot/ghc-boot.cabal" $ projectVersion
@@ -382,10 +397,10 @@ templateRules = do
     , interpolateSetting "ProjectPatchLevel1" ProjectPatchLevel1
     , interpolateSetting "ProjectPatchLevel2" ProjectPatchLevel2
     ]
-  templateRule "docs/index.html" $ packageUnitIds Stage1
+  templateRule "docs/index.html" $ packageIds
   templateRule "docs/users_guide/ghc_config.py" $ mconcat
     [ projectVersion
-    , packageUnitIds Stage1
+    , packageIds
     , interpolateSetting "LlvmMinVersion" LlvmMinVersion
     , interpolateSetting "LlvmMaxVersion" LlvmMaxVersion
     ]
@@ -425,21 +440,26 @@ bindistRules = do
     , interpolateSetting "LlvmMinVersion" LlvmMinVersion
     , interpolateVar "LlvmTarget" $ getTarget tgtLlvmTarget
     , interpolateSetting "ProjectVersion" ProjectVersion
-    , interpolateVar "SettingsUseDistroMINGW" $ lookupSystemConfig "settings-use-distro-mingw"
+    , interpolateVar "EnableDistroToolchain" $ interp (staged (lookupStageBuildConfig "settings-use-distro-mingw"))
     , interpolateVar "TablesNextToCode" $ yesNo <$> getTarget tgtTablesNextToCode
-    , interpolateVar "TargetHasLibm" $ lookupSystemConfig "target-has-libm"
+    , interpolateVar "TargetHasLibm" $ yesNo <$> getTarget tgtHasLibm
     , interpolateVar "TargetPlatform" $ getTarget targetPlatformTriple
+    , interpolateVar "BuildPlatform"  $ interp $ queryBuild targetPlatformTriple
+    , interpolateVar "HostPlatform"   $ interp $ queryHost targetPlatformTriple
     , interpolateVar "TargetWordBigEndian" $ getTarget isBigEndian
     , interpolateVar "TargetWordSize" $ getTarget wordSize
     , interpolateVar "Unregisterised" $ yesNo <$> getTarget tgtUnregisterised
-    , interpolateVar "UseLibdw" $ fmap yesNo $ interp $ getFlag UseLibdw
+    , interpolateVar "UseLibdw" $ fmap yesNo $ interp $ staged (fmap (isJust . tgtRTSWithLibdw) . targetStage)
     , interpolateVar "UseLibffiForAdjustors" $ yesNo <$> getTarget tgtUseLibffiForAdjustors
-    , interpolateVar "GhcWithSMP" $ yesNo <$> targetSupportsSMP
     , interpolateVar "BaseUnitId" $ pkgUnitId Stage1 base
+    , interpolateVar "GhcWithSMP" $ yesNo <$> targetSupportsSMP Stage2
+    , interpolateVar "TargetPlatformFull" (setting TargetPlatformFull)
+    , interpolateVar "BuildPlatformFull" (setting BuildPlatformFull)
+    , interpolateVar "HostPlatformFull"  (setting HostPlatformFull)
     ]
   where
     interp = interpretInContext (semiEmptyTarget Stage2)
-    getTarget = interp . queryTarget
+    getTarget = interp . queryTarget Stage2
 
 -- | Given a 'String' replace characters '.' and '-' by underscores ('_') so that
 -- the resulting 'String' is a valid C preprocessor identifier.
@@ -459,18 +479,16 @@ ghcWrapper stage  = do
     return $ unwords $ map show $ [ ghcPath ]
                                ++ [ "$@" ]
 
-generateSettings :: FilePath -> Expr String
-generateSettings settingsFile = do
+-- | Generate settings file, optionally including @LibDir@.
+--
+-- @rel_pkg_db@: package DB path relative to the lib dir (e.g.
+-- "package.conf.d"). Callers supply the correct relative path. For bindists
+-- the layout is known statically; for in-tree builds callers compute it. For
+-- bindists, we omit @LibDir@ so it defaults to @topDir@ at runtime.
+generateSettings :: FilePath -> Bool -> FilePath -> Expr String
+generateSettings settingsFile includeLibDir rel_pkg_db = do
     ctx <- getContext
     stage <- getStage
-
-    package_db_path <- expr $ do
-      let get_pkg_db stg = packageDbPath (PackageDbLoc stg Final)
-      case stage of
-        Stage0 {} -> error "Unable to generate settings for stage0"
-        Stage1 -> get_pkg_db Stage1
-        Stage2 -> get_pkg_db Stage1
-        Stage3 -> get_pkg_db Stage2
 
     -- The unit-id of the base package which is always linked against (#25382)
     base_unit_id <- expr $ do
@@ -480,69 +498,29 @@ generateSettings settingsFile = do
         Stage2 -> pkgUnitId Stage1 base
         Stage3 -> pkgUnitId Stage2 base
 
-    let rel_pkg_db = makeRelativeNoSysLink (dropFileName settingsFile) package_db_path
+    -- For cross compilers, LibDir points to the succeeding stage's lib dir
+    -- (which contains the target architecture's libraries). For non-cross,
+    -- it points to the preceding stage's lib dir as usual.
+    let compilerStage = predStage stage  -- the GHC that builds packages in this stage
+    isCrossLibDir <- expr $ crossStage compilerStage
+    let stage_dir_stage = if isCrossLibDir then stage else compilerStage
+
+    -- addTrailingPathSeparator is needed because makeRelativeNoSysLink uses
+    -- splitPath internally, where "lib" and "lib/" are distinct components.
+    lib_topDir :: FilePath <- expr $ addTrailingPathSeparator <$> stageLibPath stage_dir_stage
+    let rel_lib_topDir = makeRelativeNoSysLink (dropFileName settingsFile) lib_topDir
 
     settings <- traverse sequence $
-        [ ("C compiler command",   queryTarget ccPath)
-        , ("C compiler flags",     queryTarget ccFlags)
-        , ("C++ compiler command", queryTarget cxxPath)
-        , ("C++ compiler flags",   queryTarget cxxFlags)
-        , ("C compiler link flags",       queryTarget clinkFlags)
-        , ("C compiler supports -no-pie", queryTarget linkSupportsNoPie)
-        , ("CPP command",         queryTarget cppPath)
-        , ("CPP flags",           queryTarget cppFlags)
-        , ("Haskell CPP command", queryTarget hsCppPath)
-        , ("Haskell CPP flags",   queryTarget hsCppFlags)
-        , ("JavaScript CPP command", queryTarget jsCppPath)
-        , ("JavaScript CPP flags", queryTarget jsCppFlags)
-        , ("C-- CPP command", queryTarget cmmCppPath)
-        , ("C-- CPP flags",   queryTarget cmmCppFlags)
-        , ("C-- CPP supports -g0", queryTarget cmmCppSupportsG0')
-        , ("ld supports compact unwind", queryTarget linkSupportsCompactUnwind)
-        , ("ld supports filelist",       queryTarget linkSupportsFilelist)
-        , ("ld supports single module",       queryTarget linkSupportsSingleModule)
-        , ("ld is GNU ld",               queryTarget linkIsGnu)
-        , ("Merge objects command", queryTarget mergeObjsPath)
-        , ("Merge objects flags", queryTarget mergeObjsFlags)
-        , ("Merge objects supports response files", queryTarget mergeObjsSupportsResponseFiles')
-        , ("ar command",          queryTarget arPath)
-        , ("ar flags",            queryTarget arFlags)
-        , ("ar supports at file", queryTarget arSupportsAtFile')
-        , ("ar supports -L",      queryTarget arSupportsDashL')
-        , ("ranlib command",      queryTarget ranlibPath)
-        , ("otool command",       queryTarget otoolPath)
-        , ("install_name_tool command", queryTarget installNameToolPath)
-        , ("windres command", queryTarget (maybe "/bin/false" prgPath . tgtWindres)) -- TODO: /bin/false is not available on many distributions by default, but we keep it as it were before the ghc-toolchain patch. Fix-me.
-        , ("unlit command", ("$topdir/../bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
-        , ("cross compiling", expr $ yesNo <$> flag CrossCompiling)
-        , ("target platform string", queryTarget targetPlatformTriple)
-        , ("target os",        queryTarget (show . archOS_OS . tgtArchOs))
-        , ("target arch",      queryTarget (show . archOS_arch . tgtArchOs))
-        , ("target word size", queryTarget wordSize)
-        , ("target word big endian",       queryTarget isBigEndian)
-        , ("target has GNU nonexec stack", queryTarget (yesNo . Toolchain.tgtSupportsGnuNonexecStack))
-        , ("target has .ident directive",  queryTarget (yesNo . Toolchain.tgtSupportsIdentDirective))
-        , ("target has subsections via symbols", queryTarget (yesNo . Toolchain.tgtSupportsSubsectionsViaSymbols))
-        , ("target has libm", expr $  lookupSystemConfig "target-has-libm")
-        , ("Unregisterised", queryTarget (yesNo . tgtUnregisterised))
-        , ("LLVM target", queryTarget tgtLlvmTarget)
-        , ("LLVM llc command", queryTarget llcPath)
-        , ("LLVM opt command", queryTarget optPath)
-        , ("LLVM llvm-as command", queryTarget llvmAsPath)
-        , ("LLVM llvm-as flags", queryTarget llvmAsFlags)
-        , ("Use inplace MinGW toolchain", expr $ lookupSystemConfig "settings-use-distro-mingw")
-
-        , ("target RTS linker only supports shared libraries", expr $ yesNo <$> targetRTSLinkerOnlySupportsSharedLibs)
-        , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter (predStage stage))
-        , ("Support SMP", expr $ yesNo <$> targetSupportsSMP)
-        , ("RTS ways", escapeArgs . map show . Set.toList <$> getRtsWays)
-        , ("Tables next to code", queryTarget (yesNo . tgtTablesNextToCode))
-        , ("Leading underscore",  queryTarget (yesNo . tgtSymbolsHaveLeadingUnderscore))
-        , ("Use LibFFI", expr $ yesNo <$> useLibffiForAdjustors)
-        , ("RTS expects libdw", yesNo <$> getFlag UseLibdw)
-        , ("Relative Global Package DB", pure rel_pkg_db)
-        , ("base unit-id", pure base_unit_id)
-        ]
+          [ ("unlit command", ("$topdir/../bin/" <>) <$> expr (programName (ctx { Context.package = unlit, Context.stage = compilerStage })))
+          , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter compilerStage)
+          -- Hard-coded as Cabal queries these to determine way support and we
+          -- need to always advertise all ways when bootstrapping.
+          -- The settings file is generated at install time when installing a bindist.
+          , ("RTS ways", unwords . map show . Set.toList <$> getRtsWays)
+          , ("Relative Global Package DB", pure rel_pkg_db)
+          , ("base unit-id", pure base_unit_id)
+          ]
+          ++ ([("LibDir", pure rel_lib_topDir) | includeLibDir])
     let showTuple (k, v) = "(" ++ show k ++ ", " ++ show v ++ ")"
     pure $ case settings of
         [] -> "[]"
@@ -550,40 +528,6 @@ generateSettings settingsFile = do
             ("[" ++ showTuple s)
             : ((\s' -> "," ++ showTuple s') <$> ss)
             ++ ["]"]
-  where
-    ccPath  = prgPath . ccProgram . tgtCCompiler
-    ccFlags = escapeArgs . prgFlags . ccProgram . tgtCCompiler
-    cxxPath  = prgPath . cxxProgram . tgtCxxCompiler
-    cxxFlags = escapeArgs . prgFlags . cxxProgram . tgtCxxCompiler
-    clinkFlags = escapeArgs . prgFlags . ccLinkProgram . tgtCCompilerLink
-    linkSupportsNoPie = yesNo . ccLinkSupportsNoPie . tgtCCompilerLink
-    cppPath  = prgPath . cppProgram . tgtCPreprocessor
-    cppFlags = escapeArgs . prgFlags . cppProgram . tgtCPreprocessor
-    hsCppPath  = prgPath . hsCppProgram . tgtHsCPreprocessor
-    hsCppFlags = escapeArgs . prgFlags . hsCppProgram . tgtHsCPreprocessor
-    jsCppPath  = maybe "" (prgPath . jsCppProgram) . tgtJsCPreprocessor
-    jsCppFlags = maybe "" (escapeArgs . prgFlags . jsCppProgram) . tgtJsCPreprocessor
-    cmmCppPath  = prgPath . cmmCppProgram . tgtCmmCPreprocessor
-    cmmCppFlags = escapeArgs . prgFlags . cmmCppProgram . tgtCmmCPreprocessor
-    cmmCppSupportsG0' = yesNo . cmmCppSupportsG0 . tgtCmmCPreprocessor
-    mergeObjsPath  = maybe "" (prgPath . mergeObjsProgram) . tgtMergeObjs
-    mergeObjsFlags = maybe "" (escapeArgs . prgFlags . mergeObjsProgram) . tgtMergeObjs
-    linkSupportsSingleModule    = yesNo . ccLinkSupportsSingleModule . tgtCCompilerLink
-    linkSupportsFilelist        = yesNo . ccLinkSupportsFilelist . tgtCCompilerLink
-    linkSupportsCompactUnwind   = yesNo . ccLinkSupportsCompactUnwind . tgtCCompilerLink
-    linkIsGnu                   = yesNo . ccLinkIsGnu . tgtCCompilerLink
-    llcPath = maybe "" prgPath . tgtLlc
-    optPath = maybe "" prgPath . tgtOpt
-    llvmAsPath = maybe "" prgPath . tgtLlvmAs
-    llvmAsFlags = escapeArgs . maybe [] prgFlags . tgtLlvmAs
-    arPath  = prgPath . arMkArchive . tgtAr
-    arFlags = escapeArgs . prgFlags . arMkArchive . tgtAr
-    arSupportsAtFile' = yesNo . arSupportsAtFile . tgtAr
-    arSupportsDashL' = yesNo . arSupportsDashL . tgtAr
-    otoolPath = maybe "" prgPath . tgtOtool
-    installNameToolPath = maybe "" prgPath . tgtInstallNameTool
-    ranlibPath  = maybe "" (prgPath . ranlibProgram) . tgtRanlib
-    mergeObjsSupportsResponseFiles' = maybe "NO" (yesNo . mergeObjsSupportsResponseFiles) . tgtMergeObjs
 
 isBigEndian, wordSize :: Toolchain.Target -> String
 isBigEndian = yesNo . (\case BigEndian -> True; LittleEndian -> False) . tgtEndianness
@@ -594,8 +538,10 @@ generateConfigHs :: Expr String
 generateConfigHs = do
     stage <- getStage
     let chooseSetting x y = case stage of { Stage0 {} -> x; _ -> y }
+    let queryTarget f = f <$> expr (targetStage stage)
+    -- Not right for stage3
     buildPlatform <- chooseSetting (queryBuild targetPlatformTriple) (queryHost targetPlatformTriple)
-    hostPlatform <- chooseSetting (queryHost targetPlatformTriple) (queryTarget targetPlatformTriple)
+    hostPlatform <- queryTarget targetPlatformTriple
     trackGenerateHs
     cProjectName        <- getSetting ProjectName
     cBooterVersion      <- getSetting GhcVersion
@@ -603,7 +549,7 @@ generateConfigHs = do
     -- See Note [GHC's Unit Id] in GHC.Unit.Types
     --
     -- It's crucial that the unit-id matches the unit-key -- ghc is no longer
-    -- part of the WiringMap, so we don't to go back and forth between the
+    -- part of the WireMap, so we don't to go back and forth between the
     -- unit-id and the unit-key -- we take care that they are the same by using
     -- 'pkgUnitId' on 'compiler' (the ghc-library package) to create the
     -- unit-id in both situations.
@@ -694,8 +640,12 @@ generateVersionHs = do
 generatePlatformHostHs :: Expr String
 generatePlatformHostHs = do
     trackGenerateHs
-    cHostPlatformArch <- queryHost (archOS_arch . tgtArchOs)
-    cHostPlatformOS   <- queryHost (archOS_OS . tgtArchOs)
+    stage <- getStage
+    let chooseHostQuery = case stage of
+            Stage0 {} -> queryHost
+            _         -> queryTarget stage
+    cHostPlatformArch <- chooseHostQuery (archOS_arch . tgtArchOs)
+    cHostPlatformOS   <- chooseHostQuery (archOS_OS . tgtArchOs)
     return $ unlines
         [ "module GHC.Platform.Host where"
         , ""
@@ -710,19 +660,3 @@ generatePlatformHostHs = do
         , "hostPlatformArchOS :: ArchOS"
         , "hostPlatformArchOS = ArchOS hostPlatformArch hostPlatformOS"
         ]
-
--- | Just like 'GHC.ResponseFile.escapeArgs', but use spaces instead of newlines
--- for splitting elements.
-escapeArgs :: [String] -> String
-escapeArgs = unwords . map escapeArg
-
-escapeArg :: String -> String
-escapeArg = reverse . foldl' escape []
-
-escape :: String -> Char -> String
-escape cs c
-  |    isSpace c
-    || '\\' == c
-    || '\'' == c
-    || '"'  == c = c:'\\':cs -- n.b., our caller must reverse the result
-  | otherwise    = c:cs

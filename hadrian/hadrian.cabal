@@ -78,6 +78,7 @@ executable hadrian
                        , Rules
                        , Rules.BinaryDist
                        , Rules.CabalReinstall
+                       , Rules.Changelog
                        , Rules.Clean
                        , Rules.Codes
                        , Rules.Compile
@@ -86,7 +87,6 @@ executable hadrian
                        , Rules.Documentation
                        , Rules.Generate
                        , Rules.Gmp
-                       , Rules.Libffi
                        , Rules.Library
                        , Rules.Lint
                        , Rules.Nofib
@@ -115,19 +115,16 @@ executable hadrian
                        , Settings.Builders.Ar
                        , Settings.Builders.Ld
                        , Settings.Builders.Make
-                       , Settings.Builders.MergeObjects
                        , Settings.Builders.SplitSections
                        , Settings.Builders.RunTest
                        , Settings.Builders.Win32Tarballs
                        , Settings.Builders.Xelatex
                        , Settings.Default
-                       , Settings.Flavours.Benchmark
                        , Settings.Flavours.Development
                        , Settings.Flavours.GhcInGhci
                        , Settings.Flavours.Performance
                        , Settings.Flavours.Quick
                        , Settings.Flavours.QuickCross
-                       , Settings.Flavours.Quickest
                        , Settings.Flavours.Validate
                        , Settings.Flavours.Release
                        , Settings.Packages
@@ -136,6 +133,7 @@ executable hadrian
                        , Settings.Warnings
                        , Stage
                        , Target
+                       , BindistConfig
                        , UserSettings
                        , Utilities
                        , Way
@@ -153,7 +151,7 @@ executable hadrian
                        , TypeOperators
     other-extensions:    MultiParamTypeClasses
                        , TypeFamilies
-    build-depends:       Cabal                >= 3.13    && < 3.15
+    build-depends:       Cabal                >= 3.13    && < 3.17
                        , base                 >= 4.11    && < 5
                        , bytestring           >= 0.10    && < 0.13
                        , containers           >= 0.5     && < 0.9
@@ -165,7 +163,8 @@ executable hadrian
                        , time
                        , mtl                  >= 2.2     && < 2.4
                        , parsec               >= 3.1     && < 3.2
-                       , shake                >= 0.18.3  && < 0.20
+                         -- shake 0.19.9 has some fixes to greatly improve error messages
+                       , shake                >= 0.19.9  && < 0.20
                        , transformers         >= 0.4     && < 0.7
                        , unordered-containers >= 0.2.1   && < 0.3
                        , text                 >= 1.2     && < 3
@@ -192,4 +191,4 @@ executable hadrian
     if flag(selftest)
       other-modules:   Rules.Selftest
       cpp-options:     -DHADRIAN_ENABLE_SELFTEST
-      build-depends:   QuickCheck           >= 2.6     && < 2.15
+      build-depends:   QuickCheck           >= 2.6     && < 2.18

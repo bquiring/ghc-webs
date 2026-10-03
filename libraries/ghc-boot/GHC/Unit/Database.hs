@@ -68,6 +68,8 @@ module GHC.Unit.Database
    -- * Misc
    , mkMungePathUrl
    , mungeUnitInfoPaths
+   , writeFileAtomic
+   , unsafeDecodeUtf
    )
 where
 
@@ -86,18 +88,23 @@ import Data.Binary.Get as Bin
 import Data.List (intersperse)
 import Control.Exception as Exception
 import Control.Monad (when)
-import System.FilePath as FilePath
+import qualified System.FilePath as FilePath
 #if !defined(mingw32_HOST_OS)
 import Data.Bits ((.|.))
-import System.Posix.Files
+import System.Posix.Files.PosixString
 import System.Posix.Types (FileMode)
+import System.OsString.Internal.Types (getOsString)
 #endif
 import System.IO
 import System.IO.Error
 import GHC.IO.Exception (IOErrorType(InappropriateType))
 import qualified GHC.Data.ShortText as ST
 import GHC.IO.Handle.Lock
-import System.Directory
+import GHC.Stack.Types (HasCallStack)
+import System.OsPath
+import qualified System.Directory.OsPath as OsPath
+import qualified System.Directory.Internal as OsPath.Internal
+import qualified System.File.OsPath as FileIO
 
 -- | @ghc-boot@'s UnitInfo, serialized to the database.
 type DbUnitInfo      = GenericUnitInfo BS.ByteString BS.ByteString BS.ByteString BS.ByteString DbModule
@@ -170,6 +177,10 @@ data GenericUnitInfo srcpkgid srcpkgname uid modulename mod = GenericUnitInfo
    , unitExtDepLibsSys  :: [ST.ShortText]
       -- ^ Names of the external system libraries that this unit depends on. See
       -- also `unitExtDepLibsGhc` field.
+      --
+   , unitExtDepLibsStaticSys  :: [ST.ShortText]
+      -- ^ Names of the external static system libraries that this unit depends on. See
+      -- also `unitExtDepLibsGhc` field.
 
    , unitExtDepLibsGhc  :: [ST.ShortText]
       -- ^ Because of slight differences between the GHC dynamic linker (in
@@ -188,6 +199,13 @@ data GenericUnitInfo srcpkgid srcpkgname uid modulename mod = GenericUnitInfo
       --
       -- It seems to be used to store paths to external library dependencies
       -- too.
+      --
+   , unitLibraryDirsStatic :: [FilePathST]
+      -- ^ Directories containing static libraries provided by this unit. See also
+      -- `unitLibraryDynDirs`.
+      --
+      -- It seems to be used to store paths to external library dependencies
+      -- too.
 
    , unitLibraryDynDirs :: [FilePathST]
       -- ^ Directories containing the dynamic libraries provided by this unit.
@@ -195,6 +213,7 @@ data GenericUnitInfo srcpkgid srcpkgname uid modulename mod = GenericUnitInfo
       --
       -- It seems to be used to store paths to external dynamic library
       -- dependencies too.
+   , unitLibraryBytecodeDirs :: [FilePathST]
 
    , unitExtDepFrameworks :: [ST.ShortText]
       -- ^ Names of the external MacOS frameworks that this unit depends on.
@@ -302,13 +321,13 @@ data DbInstUnitId
 newtype PackageDbLock = PackageDbLock Handle
 
 -- | Acquire an exclusive lock related to package DB under given location.
-lockPackageDb :: FilePath -> IO PackageDbLock
+lockPackageDb :: OsPath -> IO PackageDbLock
 
 -- | Release the lock related to package DB.
 unlockPackageDb :: PackageDbLock -> IO ()
 
 -- | Acquire a lock of given type related to package DB under given location.
-lockPackageDbWith :: LockMode -> FilePath -> IO PackageDbLock
+lockPackageDbWith :: LockMode -> OsPath -> IO PackageDbLock
 lockPackageDbWith mode file = do
   -- We are trying to open the lock file and then lock it. Thus the lock file
   -- needs to either exist or we need to be able to create it. Ideally we
@@ -338,10 +357,10 @@ lockPackageDbWith mode file = do
     (lockFileOpenIn ReadWriteMode)
     (const $ lockFileOpenIn ReadMode)
   where
-    lock = file <.> "lock"
+    lock = file <.> OsPath.Internal.os "lock"
 
     lockFileOpenIn io_mode = bracketOnError
-      (openBinaryFile lock io_mode)
+      (FileIO.openBinaryFile lock io_mode)
       hClose
       -- If file locking support is not available, ignore the error and proceed
       -- normally. Without it the only thing we lose on non-Windows platforms is
@@ -375,7 +394,7 @@ isDbOpenReadMode = \case
 
 -- | Read the part of the package DB that GHC is interested in.
 --
-readPackageDbForGhc :: FilePath -> IO [DbUnitInfo]
+readPackageDbForGhc :: OsPath -> IO [DbUnitInfo]
 readPackageDbForGhc file =
   decodeFromFile file DbOpenReadOnly getDbForGhc >>= \case
     (pkgs, DbOpenReadOnly) -> return pkgs
@@ -397,7 +416,7 @@ readPackageDbForGhc file =
 -- we additionally receive a PackageDbLock that represents a lock on the
 -- database, so that we can safely update it later.
 --
-readPackageDbForGhcPkg :: Binary pkgs => FilePath -> DbOpenMode mode t ->
+readPackageDbForGhcPkg :: Binary pkgs => OsPath -> DbOpenMode mode t ->
                           IO (pkgs, DbOpenMode mode PackageDbLock)
 readPackageDbForGhcPkg file mode =
     decodeFromFile file mode getDbForGhcPkg
@@ -413,7 +432,7 @@ readPackageDbForGhcPkg file mode =
 
 -- | Write the whole of the package DB, both parts.
 --
-writePackageDb :: Binary pkgs => FilePath -> [DbUnitInfo] -> pkgs -> IO ()
+writePackageDb :: Binary pkgs => OsPath -> [DbUnitInfo] -> pkgs -> IO ()
 writePackageDb file ghcPkgs ghcPkgPart = do
   writeFileAtomic file (runPut putDbForGhcPkg)
 #if !defined(mingw32_HOST_OS)
@@ -434,10 +453,10 @@ writePackageDb file ghcPkgs ghcPkgPart = do
         ghcPart    = encode ghcPkgs
 
 #if !defined(mingw32_HOST_OS)
-addFileMode :: FilePath -> FileMode -> IO ()
+addFileMode :: OsPath -> FileMode -> IO ()
 addFileMode file m = do
-  o <- fileMode <$> getFileStatus file
-  setFileMode file (m .|. o)
+  o <- fileMode <$> getFileStatus (getOsString file)
+  setFileMode (getOsString file) (m .|. o)
 #endif
 
 getHeader :: Get (Word32, Word32)
@@ -484,7 +503,7 @@ headerMagic = BS.Char8.pack "\0ghcpkg\0"
 
 -- | Feed a 'Get' decoder with data chunks from a file.
 --
-decodeFromFile :: FilePath -> DbOpenMode mode t -> Get pkgs ->
+decodeFromFile :: OsPath -> DbOpenMode mode t -> Get pkgs ->
                   IO (pkgs, DbOpenMode mode PackageDbLock)
 decodeFromFile file mode decoder = case mode of
   DbOpenReadOnly -> do
@@ -505,7 +524,7 @@ decodeFromFile file mode decoder = case mode of
     bracketOnError (lockPackageDb file) unlockPackageDb $ \lock -> do
       (, DbOpenReadWrite lock) <$> decodeFileContents
   where
-    decodeFileContents = withBinaryFile file ReadMode $ \hnd ->
+    decodeFileContents = FileIO.withBinaryFile file ReadMode $ \hnd ->
       feed hnd (runGetIncremental decoder)
 
     feed hnd (Partial k)  = do chunk <- BS.hGet hnd BS.Lazy.defaultChunkSize
@@ -515,21 +534,21 @@ decodeFromFile file mode decoder = case mode of
     feed _ (Done _ _ res) = return res
     feed _ (Fail _ _ msg) = ioError err
       where
-        err = mkIOError InappropriateType loc Nothing (Just file)
+        err = mkIOError InappropriateType loc Nothing (Just $ unsafeDecodeUtf file)
               `ioeSetErrorString` msg
         loc = "GHC.Unit.Database.readPackageDb"
 
 -- Copied from Cabal's Distribution.Simple.Utils.
-writeFileAtomic :: FilePath -> BS.Lazy.ByteString -> IO ()
+writeFileAtomic :: OsPath -> BS.Lazy.ByteString -> IO ()
 writeFileAtomic targetPath content = do
   let (targetDir, targetFile) = splitFileName targetPath
   Exception.bracketOnError
-    (openBinaryTempFileWithDefaultPermissions targetDir $ targetFile <.> "tmp")
-    (\(tmpPath, handle) -> hClose handle >> removeFile tmpPath)
+    (FileIO.openBinaryTempFileWithDefaultPermissions targetDir $ targetFile <.> OsPath.Internal.os "tmp")
+    (\(tmpPath, handle) -> hClose handle >> OsPath.removeFile tmpPath)
     (\(tmpPath, handle) -> do
         BS.Lazy.hPut handle content
         hClose handle
-        renameFile tmpPath targetPath)
+        OsPath.renameFile tmpPath targetPath)
 
 instance Binary DbUnitInfo where
   put (GenericUnitInfo
@@ -538,8 +557,8 @@ instance Binary DbUnitInfo where
          unitPackageName unitPackageVersion
          unitComponentName
          unitAbiHash unitDepends unitAbiDepends unitImportDirs
-         unitLibraries unitExtDepLibsSys unitExtDepLibsGhc
-         unitLibraryDirs unitLibraryDynDirs
+         unitLibraries unitExtDepLibsSys unitExtDepLibsStaticSys unitExtDepLibsGhc
+         unitLibraryDirs unitLibraryDirsStatic unitLibraryDynDirs unitLibraryBytecodeDirs
          unitExtDepFrameworks unitExtDepFrameworkDirs
          unitLinkerOptions unitCcOptions
          unitIncludes unitIncludeDirs
@@ -559,9 +578,12 @@ instance Binary DbUnitInfo where
     put unitImportDirs
     put unitLibraries
     put unitExtDepLibsSys
+    put unitExtDepLibsStaticSys
     put unitExtDepLibsGhc
     put unitLibraryDirs
+    put unitLibraryDirsStatic
     put unitLibraryDynDirs
+    put unitLibraryBytecodeDirs
     put unitExtDepFrameworks
     put unitExtDepFrameworkDirs
     put unitLinkerOptions
@@ -590,9 +612,12 @@ instance Binary DbUnitInfo where
     unitImportDirs     <- get
     unitLibraries      <- get
     unitExtDepLibsSys  <- get
+    unitExtDepLibsStaticSys <- get
     unitExtDepLibsGhc  <- get
     libraryDirs        <- get
+    libraryDirsStatic  <- get
     libraryDynDirs     <- get
+    libraryBytecodeDirs <- get
     frameworks         <- get
     frameworkDirs      <- get
     unitLinkerOptions  <- get
@@ -618,8 +643,8 @@ instance Binary DbUnitInfo where
               unitDepends
               unitAbiDepends
               unitImportDirs
-              unitLibraries unitExtDepLibsSys unitExtDepLibsGhc
-              libraryDirs libraryDynDirs
+              unitLibraries unitExtDepLibsSys unitExtDepLibsStaticSys unitExtDepLibsGhc
+              libraryDirs libraryDirsStatic libraryDynDirs libraryBytecodeDirs
               frameworks frameworkDirs
               unitLinkerOptions unitCcOptions
               unitIncludes unitIncludeDirs
@@ -693,7 +718,7 @@ mkMungePathUrl top_dir pkgroot = (munge_path, munge_url)
     -- rather than letting FilePath change it to use \ as the separator
     stripVarPrefix var path = case ST.stripPrefix var path of
                               Just "" -> Just ""
-                              Just cs | isPathSeparator (ST.head cs) -> Just cs
+                              Just cs | FilePath.isPathSeparator (ST.head cs) -> Just cs
                               _ -> Nothing
 
 
@@ -713,6 +738,8 @@ mungeUnitInfoPaths top_dir pkgroot pkg =
       , unitIncludeDirs         = munge_paths (unitIncludeDirs pkg)
       , unitLibraryDirs         = munge_paths (unitLibraryDirs pkg)
       , unitLibraryDynDirs      = munge_paths (unitLibraryDynDirs pkg)
+      , unitLibraryDirsStatic   = munge_paths (unitLibraryDirsStatic pkg)
+      , unitLibraryBytecodeDirs = munge_paths (unitLibraryBytecodeDirs pkg)
       , unitExtDepFrameworkDirs = munge_paths (unitExtDepFrameworkDirs pkg)
       , unitHaddockInterfaces   = munge_paths (unitHaddockInterfaces pkg)
         -- haddock-html is allowed to be either a URL or a file
@@ -722,3 +749,8 @@ mungeUnitInfoPaths top_dir pkgroot pkg =
       munge_paths = map munge_path
       munge_urls  = map munge_url
       (munge_path,munge_url) = mkMungePathUrl top_dir pkgroot
+
+-- | Decode an 'OsPath' to 'FilePath', throwing an 'error' if decoding failed.
+-- Prefer 'decodeUtf' and gracious error handling.
+unsafeDecodeUtf :: HasCallStack => OsPath -> FilePath
+unsafeDecodeUtf = OsPath.Internal.so

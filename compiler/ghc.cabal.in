@@ -50,7 +50,7 @@ extra-source-files:
 
 
 custom-setup
-    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.14, directory, process, filepath, containers
+    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.16, directory, process, filepath, containers
 
 Flag internal-interpreter
     Description: Build with internal interpreter support.
@@ -92,7 +92,7 @@ Flag bootstrap
         Manual: True
 
 Library
-    Default-Language: GHC2021
+    Default-Language: GHC2024
     Exposed: False
     Includes: Unique.h
               -- CodeGen.Platform.h -- invalid as C, skip
@@ -114,13 +114,14 @@ Library
         extra-libraries: zstd
       CPP-Options: -DHAVE_LIBZSTD
 
-    Build-Depends: base       >= 4.11 && < 4.23,
+    Build-Depends: base       >= 4.11 && < 4.24,
                    deepseq    >= 1.4 && < 1.6,
                    directory  >= 1   && < 1.4,
                    process    >= 1   && < 1.7,
                    bytestring >= 0.11 && < 0.13,
                    binary     == 0.8.*,
-                   time       >= 1.4 && < 1.15,
+                   text       >= 2.0 && < 2.2,
+                   time       >= 1.4 && < 1.16,
                    containers >= 0.6.2.1 && < 0.9,
                    array      >= 0.1 && < 0.6,
                    filepath   >= 1.5 && < 1.6,
@@ -131,8 +132,9 @@ Library
                    semaphore-compat,
                    stm,
                    rts,
+                   ghc-toolchain,
                    ghc-boot   == @ProjectVersionMunged@,
-                   ghc-heap   == @ProjectVersionMunged@,
+                   ghc-heap   >=9.10.1 && <=@ProjectVersionMunged@,
                    ghci == @ProjectVersionMunged@
 
     if flag(bootstrap)
@@ -148,6 +150,7 @@ Library
     else
         Build-Depends: unix   >= 2.7 && < 2.9
 
+    -- Hadrian further set some warnings in its Settings.Warnings module.
     GHC-Options: -Wall
                  -Wno-name-shadowing
                  -Wnoncanonical-monad-instances
@@ -155,6 +158,7 @@ Library
 
     if flag(internal-interpreter)
         CPP-Options: -DHAVE_INTERNAL_INTERPRETER
+        cc-options: -DHAVE_INTERNAL_INTERPRETER
 
     -- if no dynamic system linker is available, don't try DLLs.
     if flag(dynamic-system-linker)
@@ -162,28 +166,11 @@ Library
 
     Other-Extensions:
         CPP
-        DataKinds
-        DeriveDataTypeable
-        DeriveFoldable
-        DeriveFunctor
-        DeriveTraversable
-        DisambiguateRecordFields
-        ExplicitForAll
-        FlexibleContexts
-        FlexibleInstances
-        GADTs
-        GeneralizedNewtypeDeriving
         MagicHash
-        MultiParamTypeClasses
-        NamedFieldPuns
         NondecreasingIndentation
-        RankNTypes
         RecordWildCards
-        StandaloneDeriving
         Trustworthy
-        TupleSections
         TypeFamilies
-        TypeSynonymInstances
         UnboxedTuples
         UndecidableInstances
 
@@ -209,25 +196,32 @@ Library
     -- we use an explicit Prelude
     Default-Extensions:
         NoImplicitPrelude
-       ,MonoLocalBinds
 
     Exposed-Modules:
         GHC
-        GHC.Builtin.Names
-        GHC.Builtin.Names.TH
+        GHC.Builtin
+        GHC.Builtin.KnownKeys
+        GHC.Builtin.KnownOccs
+        GHC.Builtin.Modules
         GHC.Builtin.PrimOps
         GHC.Builtin.PrimOps.Casts
         GHC.Builtin.PrimOps.Ids
-        GHC.Builtin.Types
-        GHC.Builtin.Types.Literals
-        GHC.Builtin.Types.Prim
+        GHC.Builtin.TH
+        GHC.Builtin.WiredIn.Types
+        GHC.Builtin.WiredIn.Types.Box
+        GHC.Builtin.WiredIn.TypeLits
+        GHC.Builtin.WiredIn.Prim
+        GHC.Builtin.WiredIn.Ids
         GHC.Builtin.Uniques
-        GHC.Builtin.Utils
         GHC.ByteCode.Asm
+        GHC.ByteCode.Binary
         GHC.ByteCode.Breakpoints
         GHC.ByteCode.InfoTable
         GHC.ByteCode.Instr
         GHC.ByteCode.Linker
+        GHC.ByteCode.Recomp.Binary
+        GHC.ByteCode.Serialize
+        GHC.ByteCode.Show
         GHC.ByteCode.Types
         GHC.Cmm
         GHC.Cmm.BlockId
@@ -325,6 +319,7 @@ Library
         GHC.CmmToAsm.Reg.Linear.X86
         GHC.CmmToAsm.Reg.Linear.X86_64
         GHC.CmmToAsm.Reg.Liveness
+        GHC.CmmToAsm.Reg.Regs
         GHC.CmmToAsm.Reg.Target
         GHC.CmmToAsm.Reg.Utils
         GHC.CmmToAsm.RV64
@@ -371,12 +366,15 @@ Library
         GHC.Core.InstEnv
         GHC.Core.Lint
         GHC.Core.Lint.Interactive
+        GHC.Core.Lint.SubstTypeLets
         GHC.Core.LateCC
         GHC.Core.LateCC.Types
         GHC.Core.LateCC.TopLevelBinds
         GHC.Core.LateCC.Utils
         GHC.Core.LateCC.OverloadedCalls
         GHC.Core.Make
+        GHC.Core.Make.BigTuple
+        GHC.Core.Make.Box
         GHC.Core.Map.Expr
         GHC.Core.Map.Type
         GHC.Core.Multiplicity
@@ -396,6 +394,7 @@ Library
         GHC.Core.Opt.OccurAnal
         GHC.Core.Opt.Pipeline
         GHC.Core.Opt.Pipeline.Types
+        GHC.Core.Opt.Range
         GHC.Core.Opt.SetLevels
         GHC.Core.Opt.Simplify
         GHC.Core.Opt.Simplify.Env
@@ -424,6 +423,7 @@ Library
         GHC.CoreToIface
         GHC.CoreToStg
         GHC.CoreToStg.Prep
+        GHC.CoreToStg.AddImplicitBinds
         GHC.Core.TyCo.FVs
         GHC.Core.TyCo.Compare
         GHC.Core.TyCon
@@ -471,10 +471,10 @@ Library
         GHC.Data.OrdList
         GHC.Data.OsPath
         GHC.Data.Pair
-        GHC.Data.SmallArray
         GHC.Data.Stream
         GHC.Data.Strict
         GHC.Data.StringBuffer
+        GHC.Data.StringTrie
         GHC.Data.TrieMap
         GHC.Data.Unboxed
         GHC.Data.UnionFind
@@ -489,6 +489,7 @@ Library
         GHC.Driver.Backend.Internal
         GHC.Driver.Backpack
         GHC.Driver.Backpack.Syntax
+        GHC.Driver.ByteCode
         GHC.Driver.CmdLine
         GHC.Driver.CodeOutput
         GHC.Driver.Config
@@ -510,6 +511,7 @@ Library
         GHC.Driver.Config.HsToCore
         GHC.Driver.Config.HsToCore.Ticks
         GHC.Driver.Config.HsToCore.Usage
+        GHC.Driver.Config.Interpreter
         GHC.Driver.Config.Linker
         GHC.Driver.Config.Logger
         GHC.Driver.Config.Parser
@@ -535,6 +537,10 @@ Library
         GHC.Driver.LlvmConfigCache
         GHC.Driver.MakeSem
         GHC.Driver.Main
+        GHC.Driver.Main.Compile
+        GHC.Driver.Main.Hsc
+        GHC.Driver.Main.Interactive
+        GHC.Driver.Main.Passes
         GHC.Driver.Make
         GHC.Driver.Messager
         GHC.Driver.MakeAction
@@ -556,22 +562,24 @@ Library
         GHC.Hs.Basic
         GHC.Hs.Binds
         GHC.Hs.Decls
+        GHC.Hs.Decls.Overlap
         GHC.Hs.Doc
         GHC.Hs.DocString
         GHC.Hs.Dump
         GHC.Hs.Expr
         GHC.Hs.Syn.Type
         GHC.Hs.Extension
+        GHC.Hs.Extension.Pass
         GHC.Hs.ImpExp
         GHC.Hs.Instances
         GHC.Hs.Lit
         GHC.Hs.Pat
-        GHC.Hs.Specificity
         GHC.Hs.Stats
         GHC.HsToCore
         GHC.HsToCore.Arrows
         GHC.HsToCore.Binds
         GHC.HsToCore.Breakpoints
+        GHC.HsToCore.Breakpoints.Types
         GHC.HsToCore.Coverage
         GHC.HsToCore.Docs
         GHC.HsToCore.Errors.Ppr
@@ -641,11 +649,12 @@ Library
         GHC.JS.JStg.Syntax
         GHC.JS.JStg.Monad
         GHC.JS.Transform
+        GHC.Linker.ByteCode
         GHC.Linker.Config
         GHC.Linker.Deps
         GHC.Linker.Dynamic
         GHC.Linker.External
-        GHC.Linker.ExtraObj
+        GHC.Linker.Executable
         GHC.Linker.Loader
         GHC.Linker.MacOS
         GHC.Linker.Static
@@ -682,6 +691,7 @@ Library
         GHC.Platform.NoRegs
         GHC.Platform.PPC
         GHC.Platform.Profile
+        GHC.Platform.Tag
         GHC.Platform.Reg
         GHC.Platform.Reg.Class
         GHC.Platform.Reg.Class.NoVectors
@@ -703,6 +713,7 @@ Library
         GHC.Rename.Expr
         GHC.Rename.Fixity
         GHC.Rename.HsType
+        GHC.Rename.Lit
         GHC.Rename.Module
         GHC.Rename.Names
         GHC.Rename.Pat
@@ -718,6 +729,8 @@ Library
         GHC.Runtime.Heap.Inspect
         GHC.Runtime.Heap.Layout
         GHC.Runtime.Interpreter
+        GHC.Runtime.Interpreter.C
+        GHC.Runtime.Interpreter.Init
         GHC.Runtime.Interpreter.JS
         GHC.Runtime.Interpreter.Process
         GHC.Runtime.Interpreter.Types
@@ -736,6 +749,7 @@ Library
         GHC.Stg.EnforceEpt.Rewrite
         GHC.Stg.EnforceEpt.TagSig
         GHC.Stg.EnforceEpt.Types
+        GHC.Stg.Debug.Types
         GHC.Stg.FVs
         GHC.Stg.Lift
         GHC.Stg.Lift.Analysis
@@ -834,6 +848,7 @@ Library
         GHC.Tc.Gen.Bind
         GHC.Tc.Gen.Default
         GHC.Tc.Gen.Do
+        GHC.Tc.Gen.Expand
         GHC.Tc.Gen.Export
         GHC.Tc.Gen.Expr
         GHC.Tc.Gen.Foreign
@@ -857,6 +872,7 @@ Library
         GHC.Tc.Solver.Irred
         GHC.Tc.Solver.Equality
         GHC.Tc.Solver.Dict
+        GHC.Tc.Solver.FunDeps
         GHC.Tc.Solver.Monad
         GHC.Tc.Solver.Types
         GHC.Tc.TyCl
@@ -868,7 +884,6 @@ Library
         GHC.Tc.Types
         GHC.Tc.Types.Constraint
         GHC.Tc.Types.Evidence
-        GHC.Tc.Types.EvTerm
         GHC.Tc.Types.Origin
         GHC.Tc.Types.Rank
         GHC.Tc.Types.CtLoc
@@ -892,6 +907,7 @@ Library
         GHC.Tc.Zonk.Type
         GHC.ThToHs
         GHC.Types.Annotations
+        GHC.Types.Arity
         GHC.Types.Avail
         GHC.Types.Basic
         GHC.Types.CompleteMatch
@@ -912,11 +928,14 @@ Library
         GHC.Types.Hint.Ppr
         GHC.Types.HpcInfo
         GHC.Types.Id
+        GHC.Types.UnresolvedImport
         GHC.Types.IPE
+        GHC.Types.InlinePragma
         GHC.Types.ThLevelIndex
         GHC.Types.Id.Info
         GHC.Types.Id.Make
         GHC.Types.Literal
+        GHC.Types.Literal.Floating
         GHC.Types.Meta
         GHC.Types.Name
         GHC.Types.Name.Cache
@@ -953,9 +972,19 @@ Library
         GHC.Types.Var
         GHC.Types.Var.Env
         GHC.Types.Var.Set
+        GHC.Types.Var.FV
         GHC.Unit
         GHC.Unit.Env
         GHC.Unit.External
+        GHC.Unit.External.Database
+        GHC.Unit.External.Index
+        GHC.Unit.External.ModuleOrigin
+        GHC.Unit.External.Providers
+        GHC.Unit.External.Query
+        GHC.Unit.External.Substitution
+        GHC.Unit.External.Validate
+        GHC.Unit.External.Visibility
+        GHC.Unit.External.Wired
         GHC.Unit.Finder
         GHC.Unit.Finder.Types
         GHC.Unit.Home
@@ -984,16 +1013,15 @@ Library
         GHC.Unit.Types
         GHC.Utils.Asm
         GHC.Utils.Binary
-        GHC.Utils.Binary.Typeable
         GHC.Utils.BufHandle
         GHC.Utils.CliOption
         GHC.Utils.Constants
         GHC.Utils.Containers.Internal.BitUtil
         GHC.Utils.Containers.Internal.StrictPair
         GHC.Utils.Error
+        GHC.Utils.EndoOS
         GHC.Utils.Exception
         GHC.Utils.Fingerprint
-        GHC.Utils.FV
         GHC.Utils.GlobalVars
         GHC.Utils.IO.Unsafe
         GHC.Utils.Json
@@ -1024,8 +1052,12 @@ Library
         Language.Haskell.Syntax
         Language.Haskell.Syntax.Basic
         Language.Haskell.Syntax.Binds
+        Language.Haskell.Syntax.Binds.InlinePragma
         Language.Haskell.Syntax.BooleanFormula
         Language.Haskell.Syntax.Decls
+        Language.Haskell.Syntax.Decls.Foreign
+        Language.Haskell.Syntax.Decls.Overlap
+        Language.Haskell.Syntax.Doc
         Language.Haskell.Syntax.Expr
         Language.Haskell.Syntax.Extension
         Language.Haskell.Syntax.ImpExp
@@ -1034,6 +1066,7 @@ Library
         Language.Haskell.Syntax.Module.Name
         Language.Haskell.Syntax.Pat
         Language.Haskell.Syntax.Specificity
+        Language.Haskell.Syntax.Text
         Language.Haskell.Syntax.Type
 
     autogen-modules: GHC.Platform.Constants

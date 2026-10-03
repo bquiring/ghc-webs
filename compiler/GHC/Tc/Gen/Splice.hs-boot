@@ -12,6 +12,7 @@ import GHC.Hs.Extension ( GhcRn, GhcPs, GhcTc )
 
 import GHC.Hs ( HsQuote, HsExpr, LHsExpr, LHsType, LPat, LHsDecl, ThModFinalizers, HsUntypedSpliceResult, HsTypedSpliceResult, HsTypedSplice )
 import qualified GHC.Boot.TH.Syntax as TH
+import qualified GHC.Boot.TH.Monad as TH
 
 tcTypedSplice :: HsTypedSpliceResult
               -> HsTypedSplice GhcRn
@@ -41,6 +42,6 @@ runMetaT :: LHsExpr GhcTc -> TcM (LHsType GhcPs)
 runMetaD :: LHsExpr GhcTc -> TcM [LHsDecl GhcPs]
 
 lookupThName_maybe :: TH.Name -> TcM (Maybe Name)
-runQuasi :: TH.Q a -> TcM a
+runQinTcM :: TH.Q a -> TcM a
 runRemoteModFinalizers :: ThModFinalizers -> TcM ()
 finishTH :: TcM ()

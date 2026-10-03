@@ -15,31 +15,25 @@ module GHC.Core.Make (
         mkIntExpr, mkIntExprInt, mkUncheckedIntExpr,
         mkIntegerExpr, mkNaturalExpr,
         mkFloatExpr, mkDoubleExpr,
-        mkCharExpr, mkStringExpr, mkStringExprFS, mkStringExprFSWith,
+        mkCharExpr, mkStringExprWith, mkStringExprFSWith,
         MkStringIds (..), getMkStringIds,
 
-        -- * Floats
-        FloatBind(..), wrapFloat, wrapFloats, floatBindings,
-
         -- * Constructing small tuples
-        mkCoreVarTupTy, mkCoreTup, mkCoreUnboxedTuple, mkCoreUnboxedSum,
+        mkCoreVarTupTy, mkCoreTup, mkCoreBoxedTuple,
+        mkCoreUnboxedTuple, mkCoreUnboxedSum,
         mkCoreTupBoxity, unitExpr,
 
-        -- * Constructing big tuples
-        mkChunkified, chunkify,
-        mkBigCoreVarTup, mkBigCoreVarTupSolo,
-        mkBigCoreVarTupTy, mkBigCoreTupTy,
-        mkBigCoreTup,
-
-          -- * Deconstructing big tuples
-        mkBigTupleSelector, mkBigTupleSelectorSolo, mkBigTupleCase,
+        -- * Pattern matching on chunked tuples
+        mkChunkedTupleCase,
 
         -- * Constructing list expressions
         mkNilExpr, mkConsExpr, mkListExpr,
-        mkFoldrExpr, mkBuildExpr,
 
         -- * Constructing Maybe expressions
         mkNothingExpr, mkJustExpr,
+
+        -- * Floats
+        wrapFloat, wrapFloats,
 
         -- * Error Ids
         mkRuntimeErrorApp, mkImpossibleExpr, mkAbsentErrorApp, errorIds,
@@ -53,18 +47,17 @@ import GHC.Prelude
 import GHC.Platform
 
 import GHC.Types.Id
-import GHC.Types.Var  ( setTyVarUnique, visArgConstraintLike )
-import GHC.Types.TyThing
+import GHC.Types.Var  ( visArgConstraintLike )
 import GHC.Types.Id.Info
 import GHC.Types.Cpr
 import GHC.Types.Basic( TypeOrConstraint(..) )
 import GHC.Types.Demand
 import GHC.Types.Name      hiding ( varName )
 import GHC.Types.Literal
-import GHC.Types.Unique.Supply
+import GHC.Types.Unique.Supply ( MonadUnique )
 
 import GHC.Core
-import GHC.Core.Utils ( exprType, mkSingleAltCase, bindNonRec, mkCast )
+import GHC.Core.Utils ( exprType, mkSingleAltCase, bindNonRec, mkCast, mkTick )
 import GHC.Core.Type
 import GHC.Core.Predicate    ( scopedSort, isEqPred )
 import GHC.Core.TyCo.Compare ( eqType )
@@ -72,21 +65,23 @@ import GHC.Core.Coercion     ( isCoVar, mkRepReflCo, mkForAllVisCos )
 import GHC.Core.DataCon      ( DataCon, dataConWorkId, dataConWrapId )
 import GHC.Core.Multiplicity
 
-import GHC.Builtin.Types
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.Modules
+import GHC.Builtin.WiredIn.Prim
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 
-import GHC.Settings.Constants( mAX_TUPLE_SIZE )
 import GHC.Data.FastString
+import GHC.Data.OrdList
 import GHC.Data.Maybe ( expectJust )
 
 import Data.List        ( partition )
 import Data.List.NonEmpty ( NonEmpty (..) )
 import Data.Char        ( ord )
+import Data.Foldable    ( foldrM )
 
 infixl 4 `mkCoreApp`, `mkCoreApps`
 
@@ -111,7 +106,7 @@ sortQuantVars vs = sorted_tcvs ++ ids
 
 -- | Bind a binding group over an expression, using a @let@ or @case@ as
 -- appropriate (see "GHC.Core#let_can_float_invariant")
-mkCoreLet :: CoreBind -> CoreExpr -> CoreExpr
+mkCoreLet :: HasDebugCallStack => CoreBind -> CoreExpr -> CoreExpr
 mkCoreLet (NonRec bndr rhs) body        -- See Note [Core let-can-float invariant]
   = bindNonRec bndr rhs body
 mkCoreLet bind body
@@ -133,7 +128,7 @@ mkCoreTyLams binders body = mkCast lam co
 
 -- | Bind a list of binding groups over an expression. The leftmost binding
 -- group becomes the outermost group in the resulting expression
-mkCoreLets :: [CoreBind] -> CoreExpr -> CoreExpr
+mkCoreLets :: HasDebugCallStack => [CoreBind] -> CoreExpr -> CoreExpr
 mkCoreLets binds body = foldr mkCoreLet body binds
 
 -- | Construct an expression which represents the application of a number of
@@ -151,37 +146,28 @@ mkCoreConWrapApps con args = mkCoreApps (Var (dataConWrapId con)) args
 
 -- | Construct an expression which represents the application of a number of
 -- expressions to another. The leftmost expression in the list is applied first
-mkCoreApps :: CoreExpr -- ^ function
+-- See Note [Assertion checking in mkCoreApp]
+mkCoreApps :: CoreExpr   -- ^ function
            -> [CoreExpr] -- ^ arguments
            -> CoreExpr
-mkCoreApps fun args
-  = fst $
-    foldl' (mkCoreAppTyped doc_string) (fun, fun_ty) args
-  where
-    doc_string = ppr fun_ty $$ ppr fun $$ ppr args
-    fun_ty = exprType fun
+mkCoreApps fun args = foldl' mkCoreApp fun args
 
 -- | Construct an expression which represents the application of one expression
 -- to the other
-mkCoreApp :: SDoc
-          -> CoreExpr -- ^ function
+-- See Note [Assertion checking in mkCoreApp]
+mkCoreApp :: CoreExpr -- ^ function
           -> CoreExpr -- ^ argument
           -> CoreExpr
-mkCoreApp s fun arg
-  = fst $ mkCoreAppTyped s (fun, exprType fun) arg
+mkCoreApp fun arg = App fun arg
 
--- | Construct an expression which represents the application of one expression
--- paired with its type to an argument. The result is paired with its type. This
--- function is not exported and used in the definition of 'mkCoreApp' and
--- 'mkCoreApps'.
-mkCoreAppTyped :: SDoc -> (CoreExpr, Type) -> CoreExpr -> (CoreExpr, Type)
-mkCoreAppTyped _ (fun, fun_ty) (Type ty)
-  = (App fun (Type ty), piResultTy fun_ty ty)
-mkCoreAppTyped _ (fun, fun_ty) (Coercion co)
-  = (App fun (Coercion co), funResultTy fun_ty)
-mkCoreAppTyped d (fun, fun_ty) arg
-  = assertPpr (isFunTy fun_ty) (ppr fun $$ ppr arg $$ d)
-    (App fun arg, funResultTy fun_ty)
+{- Note [Assertion checking in mkCoreApp]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+At one time we had an assertion to check that the function and argument type match up,
+but that turned out to take 90% of all compile time (!) when compiling test
+`unboxedsums/UbxSumUnpackedSize.hs`. The reason was an unboxed sum constructor with
+hundreds of foralls.   It's most straightforward just to remove the assert, and
+rely on Lint to discover any mis-constructed terms.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -199,6 +185,9 @@ mkWildValBinder :: Mult -> Type -> Id
 mkWildValBinder w ty = mkLocalIdOrCoVar wildCardName w ty
   -- "OrCoVar" since a coercion can be a scrutinee with -fdefer-type-errors
   -- (e.g. see test T15695). Ticket #17291 covers fixing this problem.
+
+wildCardName :: Name
+wildCardName = mkSystemVarName wildCardKey (fsLit "wild")
 
 -- | Make a case expression whose case binder is unused
 -- The alts and res_ty should not have any occurrences of WildId
@@ -235,13 +224,16 @@ mkLitRubbish :: Type -> Maybe CoreExpr
 -- Fail (returning Nothing) if
 --    * the RuntimeRep of the Type is not monomorphic;
 --    * the type is (a ~# b), the type of coercion
--- See INVARIANT 1 and 2 of item (2) in Note [Rubbish literals]
+--    * the type is terminating (isTerminatingType), e.g. a dictionary
+-- See INVARIANT 1, 2 and 3 of item (2) in Note [Rubbish literals]
 -- in GHC.Types.Literal
 mkLitRubbish ty
   | not (noFreeVarsOfType rep)
   = Nothing   -- Satisfy INVARIANT 1
   | isEqPred ty
   = Nothing   -- Satisfy INVARIANT 2
+  | isTerminatingType ty
+  = Nothing   -- Satisfy INVARIANT 3
   | otherwise
   = Just (Lit (LitRubbish torc rep) `mkTyApps` [ty])
   where
@@ -285,39 +277,32 @@ mkNaturalExpr platform w
   | platformInWordRange platform w = mkCoreConApps naturalNSDataCon [mkWordLit platform w]
   | otherwise                      = mkCoreConApps naturalNBDataCon [Lit (mkLitBigNat w)]
 
--- | Create a 'CoreExpr' which will evaluate to the given @Float@
-mkFloatExpr :: Float -> CoreExpr
-mkFloatExpr f = mkCoreConApps floatDataCon [mkFloatLitFloat f]
+-- | Create a 'CoreExpr' which will evaluate to a
+-- (lifted) @Float@ approximating the given @Rational@
+mkFloatExpr  :: Rational -> CoreExpr
+mkFloatExpr  r = mkCoreConApps floatDataCon  [mkFloatLit  r]
 
--- | Create a 'CoreExpr' which will evaluate to the given @Double@
-mkDoubleExpr :: Double -> CoreExpr
-mkDoubleExpr d = mkCoreConApps doubleDataCon [mkDoubleLitDouble d]
+-- | Create a 'CoreExpr' which will evaluate to a
+-- (lifted) @Double@ approximating the given @Rational@
+mkDoubleExpr :: Rational -> CoreExpr
+mkDoubleExpr r = mkCoreConApps doubleDataCon [mkDoubleLit r]
 
 
 -- | Create a 'CoreExpr' which will evaluate to the given @Char@
 mkCharExpr     :: Char             -> CoreExpr      -- Result = C# c :: Int
 mkCharExpr c = mkCoreConApps charDataCon [mkCharLit c]
 
--- | Create a 'CoreExpr' which will evaluate to the given @String@
-mkStringExpr   :: MonadThings m => String     -> m CoreExpr  -- Result :: String
-mkStringExpr str = mkStringExprFS (mkFastString str)
-
--- | Create a 'CoreExpr' which will evaluate to a string morally equivalent to the given @FastString@
-mkStringExprFS :: MonadThings m => FastString -> m CoreExpr  -- Result :: String
-mkStringExprFS = mkStringExprFSLookup lookupId
-
-mkStringExprFSLookup :: Monad m => (Name -> m Id) -> FastString -> m CoreExpr
-mkStringExprFSLookup lookupM str = do
-  mk <- getMkStringIds lookupM
-  pure (mkStringExprFSWith mk str)
-
-getMkStringIds :: Applicative m => (Name -> m Id) -> m MkStringIds
-getMkStringIds lookupM = MkStringIds <$> lookupM unpackCStringName <*> lookupM unpackCStringUtf8Name
-
 data MkStringIds = MkStringIds
   { unpackCStringId     :: !Id
   , unpackCStringUtf8Id :: !Id
   }
+
+getMkStringIds :: Applicative m => (KnownKey -> m Id) -> m MkStringIds
+getMkStringIds lookupM = MkStringIds <$> lookupM unpackCStringIdKey <*> lookupM unpackCStringUtf8IdKey
+
+-- | Create a 'CoreExpr' which will evaluate to the given @String@
+mkStringExprWith :: MkStringIds -> String -> CoreExpr  -- Result :: String
+mkStringExprWith mks = mkStringExprFSWith mks . mkFastString
 
 mkStringExprFSWith :: MkStringIds -> FastString -> CoreExpr
 mkStringExprFSWith ids str
@@ -345,6 +330,10 @@ mkStringExprFSWith ids str
 ************************************************************************
 -}
 
+-- | The unit expression
+unitExpr :: CoreExpr
+unitExpr = Var unitDataConId
+
 {- Note [Flattening one-tuples]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This family of functions creates a tuple of variables/expressions/types.
@@ -355,7 +344,7 @@ We could do one of two things:
 * Flatten it out, so that
     mkCoreTup [e1] = e1
 
-* Build a one-tuple (see Note [One-tuples] in GHC.Builtin.Types)
+* Build a one-tuple (see Note [One-tuples] in GHC.Builtin.WiredIn.Types)
     mkCoreTupSolo [e1] = Solo e1
   We use a suffix "Solo" to indicate this.
 
@@ -375,13 +364,16 @@ This arose from discussions in #16881.
 One-tuples that arise internally depend on the circumstance; often flattening
 is a good idea. Decisions are made on a case-by-case basis.
 
-'mkCoreBoxedTuple` and `mkBigCoreVarTupSolo` build tuples without flattening.
+`mkCoreBoxedTuple` and `mkBigCoreVarTup BareElements` (in GHC.Core.Make.BigTuple)
+build tuples without flattening.
 -}
 
--- | Build a small tuple holding the specified expressions
--- One-tuples are *not* flattened; see Note [Flattening one-tuples]
--- See also Note [Don't flatten tuples from HsSyn]
--- Arguments must have kind Type
+-- | Build a small tuple holding the specified expressions.
+--
+-- One-tuples are *not* flattened; see Note [Flattening one-tuples] as well
+-- as Note [Don't flatten tuples from HsSyn].
+--
+-- Arguments must have kind @Type@.
 mkCoreBoxedTuple :: HasDebugCallStack => [CoreExpr] -> CoreExpr
 mkCoreBoxedTuple cs
   = assertPpr (all (tcIsLiftedTypeKind . typeKind . exprType) cs) (ppr cs)
@@ -428,308 +420,47 @@ mkCoreUnboxedSum arity alt tys exp
                    ++ map Type tys
                    ++ [exp])
 
-{- Note [Big tuples]
-~~~~~~~~~~~~~~~~~~~~
-"Big" tuples (`mkBigCoreTup` and friends) are more general than "small"
-ones (`mkCoreTup` and friends) in two ways.
-
-1. GHCs built-in tuples can only go up to 'mAX_TUPLE_SIZE' in arity, but
-   we might conceivably want to build such a massive tuple as part of the
-   output of a desugaring stage (notably that for list comprehensions).
-
-   `mkBigCoreTup` encodes such big tuples by creating and pattern
-   matching on /nested/ small tuples that are directly expressible by
-   GHC.
-
-   Nesting policy: it's better to have a 2-tuple of 10-tuples (3 objects)
-   than a 10-tuple of 2-tuples (11 objects), so we want the leaves of any
-   construction to be big.
-
-2. When desugaring arrows we gather up a tuple of free variables, which
-   may include dictionaries (of kind Constraint) and unboxed values.
-
-   These can't live in a tuple. `mkBigCoreTup` encodes such tuples by
-   boxing up the offending arguments: see Note [Boxing constructors]
-   in GHC.Builtin.Types.
-
-If you just use the 'mkBigCoreTup', 'mkBigCoreVarTupTy', 'mkBigTupleSelector'
-and 'mkBigTupleCase' functions to do all your work with tuples you should be
-fine, and not have to worry about the arity limitation, or kind limitation at
-all.
-
-The "big" tuple operations flatten 1-tuples just like "small" tuples.
-But see Note [Don't flatten tuples from HsSyn]
--}
-
-mkBigCoreVarTupSolo :: [Id] -> CoreExpr
--- Same as mkBigCoreVarTup, but:
---   - one-tuples are not flattened
---     see Note [Flattening one-tuples]
---   - arguments should have kind Type
-mkBigCoreVarTupSolo [id] = mkCoreBoxedTuple [Var id]
-mkBigCoreVarTupSolo ids  = mkChunkified mkCoreTup (map Var ids)
-
--- | Build a big tuple holding the specified variables
--- One-tuples are flattened; see Note [Flattening one-tuples]
--- Arguments don't have to have kind Type
-mkBigCoreVarTup :: [Id] -> CoreExpr
-mkBigCoreVarTup ids = mkBigCoreTup (map Var ids)
-
--- | Build a "big" tuple holding the specified expressions
--- One-tuples are flattened; see Note [Flattening one-tuples]
--- Arguments don't have to have kind Type; ones that do not are boxed
--- This function crashes (in wrapBox) if given a non-Type
--- argument that it doesn't know how to box.
-mkBigCoreTup :: [CoreExpr] -> CoreExpr
-mkBigCoreTup exprs = mkChunkified mkCoreTup (map wrapBox exprs)
-
--- | Build the type of a big tuple that holds the specified variables
--- One-tuples are flattened; see Note [Flattening one-tuples]
-mkBigCoreVarTupTy :: HasDebugCallStack => [Id] -> Type
-mkBigCoreVarTupTy ids = mkBigCoreTupTy (map idType ids)
-
--- | Build the type of a big tuple that holds the specified type of thing
--- One-tuples are flattened; see Note [Flattening one-tuples]
-mkBigCoreTupTy :: HasDebugCallStack => [Type] -> Type
-mkBigCoreTupTy tys = mkChunkified mkBoxedTupleTy $
-                     map boxTy tys
-
--- | The unit expression
-unitExpr :: CoreExpr
-unitExpr = Var unitDataConId
-
---------------------------------------------------------------
-wrapBox :: CoreExpr -> CoreExpr
--- ^ If (e :: ty) and (ty :: Type), wrapBox is a no-op
--- But if (ty :: ki), and ki is not Type, wrapBox returns (K @ty e)
---     which has kind Type
--- where K is the boxing data constructor for ki
--- See Note [Boxing constructors] in GHC.Builtin.Types
--- Panics if there /is/ no boxing data con
-wrapBox e
-  = case boxingDataCon e_ty of
-      BI_NoBoxNeeded                       -> e
-      BI_Box { bi_inst_con = boxing_expr } -> App boxing_expr e
-      BI_NoBoxAvailable -> pprPanic "wrapBox" (ppr e $$ ppr (exprType e))
-                           -- We should do better than panicing: #22336
+-- | Pattern match on a tuple built by @'mkChunkified' 'mkCoreTup'@, binding the
+-- given variables in the body. Strict in the entire chunked tuple:
+--
+-- > mkChunkedTupleCase [a,b,c,d] body e
+-- >   = case e of v { (p,q) ->
+-- >     case p of p { (a,b) ->
+-- >     case q of q { (c,d) ->
+-- >     body }}}
+--
+-- (pretending 'mAX_TUPLE_SIZE' is 2).
+mkChunkedTupleCase
+  :: MonadUnique m
+  => [Id]       -- ^ The tuple identifiers to pattern match on;
+                --   bring these into scope in the body
+  -> CoreExpr   -- ^ Body of the case
+  -> CoreExpr   -- ^ Scrutinee
+  -> m CoreExpr
+mkChunkedTupleCase all_vars all_body scrut
+  = go (chunkify all_vars) all_body
   where
-    e_ty = exprType e
-
-boxTy :: HasDebugCallStack => Type -> Type
--- ^ `boxTy ty` is the boxed version of `ty`. That is,
--- if `e :: ty`, then `wrapBox e :: boxTy ty`.
--- Note that if `ty :: Type`, `boxTy ty` just returns `ty`.
--- Panics if it is not possible to box `ty`, like `wrapBox` (#22336)
--- See Note [Boxing constructors] in GHC.Builtin.Types
-boxTy ty
-  = case boxingDataCon ty of
-      BI_NoBoxNeeded -> ty
-      BI_Box { bi_boxed_type = box_ty } -> box_ty
-      BI_NoBoxAvailable -> pprPanic "boxTy" (ppr ty)
-                           -- We should do better than panicing: #22336
-
-unwrapBox :: UniqSupply -> Id -> CoreExpr
-                 -> (UniqSupply, Id, CoreExpr)
--- If v's type required boxing (i.e it is unlifted or a constraint)
--- then (unwrapBox us v body) returns
---          (case box_v of MkDict v -> body)
---          together with box_v
---      where box_v is a fresh variable
--- Otherwise unwrapBox is a no-op
--- Panics if no box is available (#22336)
-unwrapBox us var body
-  = case boxingDataCon var_ty of
-      BI_NoBoxNeeded    -> (us, var, body)
-      BI_NoBoxAvailable -> pprPanic "unwrapBox" (ppr var $$ ppr var_ty)
-                           -- We should do better than panicing: #22336
-      BI_Box { bi_data_con = box_con, bi_boxed_type = box_ty }
-         -> (us', var', body')
-         where
-           var'  = mkSysLocal (fsLit "uc") uniq ManyTy box_ty
-           body' = Case (Var var') var' (exprType body)
-                        [Alt (DataAlt box_con) [var] body]
-  where
-    var_ty      = idType var
-    (uniq, us') = takeUniqFromSupply us
-
--- | Lifts a \"small\" constructor into a \"big\" constructor by recursive decomposition
-mkChunkified :: ([a] -> a)      -- ^ \"Small\" constructor function, of maximum input arity 'mAX_TUPLE_SIZE'
-             -> [a]             -- ^ Possible \"big\" list of things to construct from
-             -> a               -- ^ Constructed thing made possible by recursive decomposition
-mkChunkified small_tuple as = mk_big_tuple (chunkify as)
-  where
-        -- Each sub-list is short enough to fit in a tuple
-    mk_big_tuple [as] = small_tuple as
-    mk_big_tuple as_s = mk_big_tuple (chunkify (map small_tuple as_s))
-
-chunkify :: [a] -> [[a]]
--- ^ Split a list into lists that are small enough to have a corresponding
--- tuple arity. The sub-lists of the result all have length <= 'mAX_TUPLE_SIZE'
--- But there may be more than 'mAX_TUPLE_SIZE' sub-lists
-chunkify xs
-  | n_xs <= mAX_TUPLE_SIZE = [xs]
-  | otherwise              = split xs
-  where
-    n_xs     = length xs
-    split [] = []
-    split xs = let (as, bs) = splitAt mAX_TUPLE_SIZE xs
-               in as : split bs
-
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Tuple destructors}
-*                                                                      *
-************************************************************************
--}
-
--- | Builds a selector which scrutinises the given
--- expression and extracts the one name from the list given.
--- If you want the no-shadowing rule to apply, the caller
--- is responsible for making sure that none of these names
--- are in scope.
---
--- If there is just one 'Id' in the tuple, then the selector is
--- just the identity.
---
--- If necessary, we pattern match on a \"big\" tuple.
---
--- A tuple selector is not linear in its argument. Consequently, the case
--- expression built by `mkBigTupleSelector` must consume its scrutinee 'Many'
--- times. And all the argument variables must have multiplicity 'Many'.
-mkBigTupleSelector, mkBigTupleSelectorSolo
-    :: [Id]         -- ^ The 'Id's to pattern match the tuple against
-    -> Id           -- ^ The 'Id' to select
-    -> Id           -- ^ A variable of the same type as the scrutinee
-    -> CoreExpr     -- ^ Scrutinee
-    -> CoreExpr     -- ^ Selector expression
-
--- mkBigTupleSelector [a,b,c,d] b v e
---          = case e of v {
---                (p,q) -> case p of p {
---                           (a,b) -> b }}
--- We use 'tpl' vars for the p,q, since shadowing does not matter.
---
--- In fact, it's more convenient to generate it innermost first, getting
---
---        case (case e of v
---                (p,q) -> p) of p
---          (a,b) -> b
-mkBigTupleSelector vars the_var scrut_var scrut
-  = mk_tup_sel (chunkify vars) the_var
-  where
-    mk_tup_sel [vars] the_var = mkSmallTupleSelector vars the_var scrut_var scrut
-    mk_tup_sel vars_s the_var = mkSmallTupleSelector group the_var tpl_v $
-                                mk_tup_sel (chunkify tpl_vs) tpl_v
-        where
-          tpl_tys = [mkBoxedTupleTy (map idType gp) | gp <- vars_s]
-          tpl_vs  = mkTemplateLocals tpl_tys
-          (tpl_v, group) = case
-            [ (tpl,gp)
-            | (tpl,gp) <- zipEqual tpl_vs vars_s
-            , the_var `elem` gp
-            ] of
-              [x] -> x
-              _ -> panic "mkBigTupleSelector"
--- ^ 'mkBigTupleSelectorSolo' is like 'mkBigTupleSelector'
--- but one-tuples are NOT flattened (see Note [Flattening one-tuples])
-mkBigTupleSelectorSolo vars the_var scrut_var scrut
-  | [_] <- vars
-  = mkSmallTupleSelector1 vars the_var scrut_var scrut
-  | otherwise
-  = mkBigTupleSelector vars the_var scrut_var scrut
-
--- | `mkSmallTupleSelector` is like 'mkBigTupleSelector', but for tuples that
--- are guaranteed never to be "big".  Also does not unwrap boxed types.
---
--- > mkSmallTupleSelector [x] x v e = [| e |]
--- > mkSmallTupleSelector [x,y,z] x v e = [| case e of v { (x,y,z) -> x } |]
-mkSmallTupleSelector, mkSmallTupleSelector1
-          :: [Id]        -- The tuple args
-          -> Id          -- The selected one
-          -> Id          -- A variable of the same type as the scrutinee
-          -> CoreExpr    -- Scrutinee
-          -> CoreExpr
-mkSmallTupleSelector [var] should_be_the_same_var _ scrut
-  = assert (var == should_be_the_same_var) $
-    scrut  -- Special case for 1-tuples
-mkSmallTupleSelector vars the_var scrut_var scrut
-  = mkSmallTupleSelector1 vars the_var scrut_var scrut
-
--- ^ 'mkSmallTupleSelector1' is like 'mkSmallTupleSelector'
--- but one-tuples are NOT flattened (see Note [Flattening one-tuples])
-mkSmallTupleSelector1 vars the_var scrut_var scrut
-  = assert (notNull vars) $
-    Case scrut scrut_var (idType the_var)
-         [Alt (DataAlt (tupleDataCon Boxed (length vars))) vars (Var the_var)]
-
--- | A generalization of 'mkBigTupleSelector', allowing the body
--- of the case to be an arbitrary expression.
---
--- To avoid shadowing, we use uniques to invent new variables.
---
--- If necessary we pattern match on a "big" tuple.
-mkBigTupleCase :: MonadUnique m    --   For inventing names of intermediate variables
-               => [Id]             -- ^ The tuple identifiers to pattern match on;
-                                   --   Bring these into scope in the body
-               -> CoreExpr         -- ^ Body of the case
-               -> CoreExpr         -- ^ Scrutinee
-               -> m CoreExpr
--- ToDo: eliminate cases where none of the variables are needed.
---
---         mkBigTupleCase uniqs [a,b,c,d] body v e
---           = case e of v { (p,q) ->
---             case p of p { (a,b) ->
---             case q of q { (c,d) ->
---             body }}}
-mkBigTupleCase vars body scrut
-  = do us <- getUniqueSupplyM
-       let (wrapped_us, wrapped_vars, wrapped_body) = foldr unwrap (us,[],body) vars
-       return $ mk_tuple_case wrapped_us (chunkify wrapped_vars) wrapped_body
-  where
-    scrut_ty = exprType scrut
-
-    unwrap var (us,vars,body)
-      = (us', var':vars, body')
-      where
-        (us', var', body') = unwrapBox us var body
-
-    mk_tuple_case :: UniqSupply -> [[Id]] -> CoreExpr -> CoreExpr
-    -- mk_tuple_case [[a1..an], [b1..bm], ...] body
+    -- go [[a1..an], [b1..bm], ...] body
     --    case scrut of (p,q, ...) ->
     --    case p of (a1,..an) ->
     --    case q of (b1,..bm) ->
     --    ... -> body
-    -- This is the case where don't need any nesting
-    mk_tuple_case us [vars] body
-      = mkSmallTupleCase vars body scrut_var scrut
-      where
-        scrut_var = case scrut of
-                       Var v -> v
-                       _ -> snd (new_var us scrut_ty)
+    go [vars] body
+      = do { scrut_var <- case scrut of
+                            Var v -> return v
+                            _     -> mkSysLocalM (fsLit "ds") ManyTy (exprType scrut)
+           ; return (mkSmallTupleCase vars body scrut_var scrut) }
+    go vars_s body
+      = do { (vars', body') <- foldrM one_tuple_case ([], body) vars_s
+           ; go (chunkify vars') body' }
 
-    -- This is the case where we must nest tuples at least once
-    mk_tuple_case us vars_s body
-      = mk_tuple_case us' (chunkify vars') body'
-      where
-        (us', vars', body') = foldr one_tuple_case (us, [], body) vars_s
+    one_tuple_case chunk_vars (vs, body)
+      = do { scrut_var <- mkSysLocalM (fsLit "ds") ManyTy (mkCoreVarTupTy chunk_vars)
+           ; return ( scrut_var:vs
+                    , mkSmallTupleCase chunk_vars body scrut_var (Var scrut_var) ) }
 
-    one_tuple_case chunk_vars (us, vs, body)
-      = (us', scrut_var:vs, body')
-      where
-        tup_ty           = mkBoxedTupleTy (map idType chunk_vars)
-        (us', scrut_var) = new_var us tup_ty
-        body' = mkSmallTupleCase chunk_vars body scrut_var (Var scrut_var)
-
-    new_var :: UniqSupply -> Type -> (UniqSupply, Id)
-    new_var us ty = (us', id)
-       where
-         (uniq, us') = takeUniqFromSupply us
-         id = mkSysLocal (fsLit "ds") uniq ManyTy ty
-
--- | As 'mkBigTupleCase', but for a tuple that is small enough to be guaranteed
--- not to need nesting.
+-- | Pattern match on a tuple of arity at most 'mAX_TUPLE_SIZE', flattening
+-- one-tuples.
 mkSmallTupleCase
         :: [Id]         -- ^ The tuple args
         -> CoreExpr     -- ^ Body of the case
@@ -742,42 +473,6 @@ mkSmallTupleCase [var] body _scrut_var scrut
 mkSmallTupleCase vars body scrut_var scrut
   = Case scrut scrut_var (exprType body)
          [Alt (DataAlt (tupleDataCon Boxed (length vars))) vars body]
-
-{-
-************************************************************************
-*                                                                      *
-                Floats
-*                                                                      *
-************************************************************************
--}
-
-data FloatBind
-  = FloatLet  CoreBind
-  | FloatCase CoreExpr Id AltCon [Var]
-      -- case e of y { C ys -> ... }
-      -- See Note [Floating single-alternative cases] in GHC.Core.Opt.SetLevels
-
-instance Outputable FloatBind where
-  ppr (FloatLet b) = text "LET" <+> ppr b
-  ppr (FloatCase e b c bs) = hang (text "CASE" <+> ppr e <+> text "of" <+> ppr b)
-                                2 (ppr c <+> ppr bs)
-
-wrapFloat :: FloatBind -> CoreExpr -> CoreExpr
-wrapFloat (FloatLet defns)       body = Let defns body
-wrapFloat (FloatCase e b con bs) body = mkSingleAltCase e b con bs body
-
--- | Applies the floats from right to left. That is @wrapFloats [b1, b2, …, bn]
--- u = let b1 in let b2 in … in let bn in u@
-wrapFloats :: [FloatBind] -> CoreExpr -> CoreExpr
-wrapFloats floats expr = foldr wrapFloat expr floats
-
-bindBindings :: CoreBind -> [Var]
-bindBindings (NonRec b _) = [b]
-bindBindings (Rec bnds) = map fst bnds
-
-floatBindings :: FloatBind -> [Var]
-floatBindings (FloatLet bnd) = bindBindings bnd
-floatBindings (FloatCase _ b _ bs) = b:bs
 
 {-
 ************************************************************************
@@ -802,44 +497,6 @@ mkConsExpr ty hd tl = mkCoreConApps consDataCon [Type ty, hd, tl]
 mkListExpr :: Type -> [CoreExpr] -> CoreExpr
 mkListExpr ty xs = foldr (mkConsExpr ty) (mkNilExpr ty) xs
 
--- | Make a fully applied 'foldr' expression
-mkFoldrExpr :: MonadThings m
-            => Type             -- ^ Element type of the list
-            -> Type             -- ^ Fold result type
-            -> CoreExpr         -- ^ "Cons" function expression for the fold
-            -> CoreExpr         -- ^ "Nil" expression for the fold
-            -> CoreExpr         -- ^ List expression being folded acress
-            -> m CoreExpr
-mkFoldrExpr elt_ty result_ty c n list = do
-    foldr_id <- lookupId foldrName
-    return (Var foldr_id `App` Type elt_ty
-           `App` Type result_ty
-           `App` c
-           `App` n
-           `App` list)
-
--- | Make a 'build' expression applied to a locally-bound worker function
-mkBuildExpr :: (MonadFail m, MonadThings m, MonadUnique m)
-            => Type                                     -- ^ Type of list elements to be built
-            -> ((Id, Type) -> (Id, Type) -> m CoreExpr) -- ^ Function that, given information about the 'Id's
-                                                        -- of the binders for the build worker function, returns
-                                                        -- the body of that worker
-            -> m CoreExpr
-mkBuildExpr elt_ty mk_build_inside = do
-    n_tyvar <- newTyVar alphaTyVar
-    let n_ty = mkTyVarTy n_tyvar
-        c_ty = mkVisFunTysMany [elt_ty, n_ty] n_ty
-    [c, n] <- sequence [mkSysLocalM (fsLit "c") ManyTy c_ty, mkSysLocalM (fsLit "n") ManyTy n_ty]
-
-    build_inside <- mk_build_inside (c, c_ty) (n, n_ty)
-
-    build_id <- lookupId buildName
-    return $ Var build_id `App` Type elt_ty `App` mkLams [n_tyvar, c, n] build_inside
-  where
-    newTyVar tyvar_tmpl = do
-      uniq <- getUniqueM
-      return (setTyVarUnique tyvar_tmpl uniq)
-
 {-
 ************************************************************************
 *                                                                      *
@@ -856,6 +513,25 @@ mkNothingExpr ty = mkConApp nothingDataCon [Type ty]
 -- | Makes a Just from a value of the specified type
 mkJustExpr :: Type -> CoreExpr -> CoreExpr
 mkJustExpr ty val = mkConApp justDataCon [Type ty, val]
+
+
+{-
+************************************************************************
+*                                                                      *
+             Manipulating Floats
+*                                                                      *
+************************************************************************
+-}
+
+wrapFloat :: FloatBind -> CoreExpr -> CoreExpr
+wrapFloat (FloatTick t)          body = mkTick t body
+wrapFloat (FloatLet defns)       body = Let defns body
+wrapFloat (FloatCase e b con bs) body = mkSingleAltCase e b con bs body
+
+-- | Applies the floats from right to left. That is @wrapFloats [b1, b2, …, bn]
+-- u = let b1 in let b2 in … in let bn in u@
+wrapFloats :: FloatBinds -> CoreExpr -> CoreExpr
+wrapFloats floats expr = foldrOL wrapFloat expr floats
 
 
 {-
@@ -1302,4 +978,3 @@ mkRuntimeErrorTy torc = mkSpecForAllTys [runtimeRep1TyVar, tyvar] $
     kind = case torc of
               TypeLike       -> mkTYPEapp       runtimeRep1Ty
               ConstraintLike -> mkCONSTRAINTapp runtimeRep1Ty
-

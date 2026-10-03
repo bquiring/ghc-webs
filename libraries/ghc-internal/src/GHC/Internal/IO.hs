@@ -6,6 +6,10 @@
            , ScopedTypeVariables
            , UnboxedTuples
   #-}
+
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines seq#
+
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
@@ -50,15 +54,20 @@ module GHC.Internal.IO (
     ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Maybe ( Maybe(..) )
+import GHC.Internal.Prim (
+    RealWorld, State#, catch#, getMaskingState#, maskAsyncExceptions#,
+    maskUninterruptible#, raiseIO#, unmaskAsyncExceptions#,
+  )
 import GHC.Internal.ST
 import GHC.Internal.Exception
-import GHC.Internal.Exception.Type (NoBacktrace(..), WhileHandling(..), HasExceptionContext, ExceptionWithContext(..))
+import GHC.Internal.Exception.Type (NoBacktrace(..), whileHandling, WhileHandling(..), HasExceptionContext, ExceptionWithContext(..))
 import GHC.Internal.Show
 import GHC.Internal.IO.Unsafe
 import GHC.Internal.Unsafe.Coerce ( unsafeCoerce )
 
+import GHC.Internal.Stack.Types
 import GHC.Internal.Exception.Context ( ExceptionAnnotation )
-import GHC.Internal.Stack.Types ( HasCallStack )
 import {-# SOURCE #-} GHC.Internal.Stack ( withFrozenCallStack )
 import {-# SOURCE #-} GHC.Internal.IO.Exception ( userError, IOError )
 
@@ -363,7 +372,7 @@ getMaskingState  = IO $ \s ->
 
 onException :: IO a -> IO b -> IO a
 onException io what = io `catchExceptionNoPropagate` \e -> do
-    _ <- what
+    _ <- annotateIO (whileHandling e) what
     rethrowIO (e :: ExceptionWithContext SomeException)
 
 -- | Executes an IO computation with asynchronous

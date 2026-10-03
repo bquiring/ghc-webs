@@ -13,6 +13,7 @@ import GHC.Prelude
 import GHC.Driver.DynFlags
 import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
 import GHC.Driver.Env
+import GHC.Driver.Config (initSimpleOpts)
 import GHC.Driver.Config.Core.Lint ( endPass )
 import GHC.Driver.Config.Core.Opt.LiberateCase ( initLiberateCaseOpts )
 import GHC.Driver.Config.Core.Opt.Simplify ( initSimplifyOpts, initSimplMode, initGentleSimplMode )
@@ -21,9 +22,10 @@ import GHC.Driver.Config.Core.Rules ( initRuleOpts )
 import GHC.Platform.Ways  ( hasWay, Way(WayProf) )
 
 import GHC.Core
+import GHC.Core.SimpleOpt (simpleOptPgm)
 import GHC.Core.Opt.CSE  ( cseProgram )
 import GHC.Core.Rules   ( RuleBase, ruleCheckProgram, getRules )
-import GHC.Core.Ppr     ( pprCoreBindings )
+import GHC.Core.Ppr     ( pprCoreBindings, pprRules )
 import GHC.Core.Utils   ( dumpIdInfoOfProgram )
 import GHC.Core.Lint    ( lintAnnots )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
@@ -55,13 +57,13 @@ import GHC.Utils.Panic
 import GHC.Unit.Module.ModGuts
 
 import GHC.Types.Id.Info
-import GHC.Types.Basic
+import GHC.Types.InlinePragma ( CompilerPhase(..) )
 import GHC.Types.Demand ( zapDmdEnvSig )
 import GHC.Types.Name.Ppr
 import GHC.Types.Var ( Var )
+import GHC.Types.Unique.Supply ( UniqueTag(..) )
 
 import Control.Monad
-import qualified GHC.LanguageExtensions as LangExt
 import GHC.Unit.Module
 
 {-
@@ -78,7 +80,7 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_rdr_env = rdr_env })
   = do { hpt_rule_base <- home_pkg_rules
        ; let builtin_passes = getCoreToDo dflags hpt_rule_base extra_vars
-             uniq_tag = 's'
+             uniq_tag = SimplTag
 
        ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_tag mod
                                     name_ppr_ctx loc $
@@ -140,7 +142,6 @@ getCoreToDo dflags hpt_rule_base extra_vars
     static_args   = gopt Opt_StaticArgumentTransformation dflags
     rules_on      = gopt Opt_EnableRewriteRules           dflags
     ww_on         = gopt Opt_WorkerWrapper                dflags
-    static_ptrs   = xopt LangExt.StaticPointers           dflags
     profiling     = ways dflags `hasWay` WayProf
 
     do_presimplify = do_specialise -- TODO: any other optimizations benefit from pre-simplification?
@@ -179,21 +180,6 @@ getCoreToDo dflags hpt_rule_base extra_vars
                            [simplify "post-worker-wrapper"]
                            ))
 
-    -- Static forms are moved to the top level with the FloatOut pass.
-    -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
-    static_ptrs_float_outwards =
-      runWhen static_ptrs $ CoreDoPasses
-        [ simpl_gently -- Float Out can't handle type lets (sometimes created
-                       -- by simpleOptPgm via mkParallelBindings)
-        , CoreDoFloatOutwards $ FloatOutSwitches
-          { floatOutLambdas   = Just 0
-          , floatOutConstants = True
-          , floatOutOverSatApps = False
-          , floatToTopLevelOnly = True
-          , floatJoinsToTop = False
-          }
-        ]
-
     add_caller_ccs =
         runWhen (profiling && not (null $ callerCcFilters dflags)) CoreAddCallerCcs
 
@@ -202,10 +188,14 @@ getCoreToDo dflags hpt_rule_base extra_vars
 
     core_todo =
      [
-    -- We want to do the static argument transform before full laziness as it
-    -- may expose extra opportunities to float things outwards. However, to fix
-    -- up the output of the transformation we need at do at least one simplify
-    -- after this before anything else
+        -- We always perform a run of the simple optimizer after desugaring to
+        -- remove really bad code
+        CoreDesugarOpt,
+
+        -- We want to do the static argument transform before full laziness as it
+        -- may expose extra opportunities to float things outwards. However, to fix
+        -- up the output of the transformation we need at do at least one simplify
+        -- after this before anything else
         runWhen static_args (CoreDoPasses [ simpl_gently, CoreDoStaticArgs ]),
 
         -- initial simplify: mk specialiser happy: minimum effort please
@@ -215,14 +205,14 @@ getCoreToDo dflags hpt_rule_base extra_vars
         -- so that overloaded functions have all their dictionary lambdas manifest
         runWhen do_specialise CoreDoSpecialising,
 
-        if full_laziness then
-           CoreDoFloatOutwards $ FloatOutSwitches
+        runWhen full_laziness
+           (CoreDoFloatOutwards $ FloatOutSwitches
                 { floatOutLambdas     = Just 0
                 , floatOutConstants   = True
                 , floatOutOverSatApps = False
                 , floatToTopLevelOnly = False
                 , floatJoinsToTop     = False  -- Initially, don't float join points at all
-                }
+                }),
                 -- I have no idea why, but not floating constants to
                 -- top level is very bad in some cases.
                 --
@@ -238,11 +228,6 @@ getCoreToDo dflags hpt_rule_base extra_vars
                 -- difference at all to performance if we do it here,
                 -- but maybe we save some unnecessary to-and-fro in
                 -- the simplifier.
-        else
-           -- Even with full laziness turned off, we still need to float static
-           -- forms to the top level. See Note [Grand plan for static forms] in
-           -- GHC.Iface.Tidy.StaticPtrTable.
-           static_ptrs_float_outwards,
 
         -- Run the simplifier phases 2,1,0 to allow rewrite rules to fire
         runWhen do_simpl3
@@ -467,6 +452,7 @@ doCorePass pass guts = do
   let fam_envs = (p_fam_env, mg_fam_inst_env guts)
   let updateBinds  f = return $ guts { mg_binds = f (mg_binds guts) }
   let updateBindsM f = f (mg_binds guts) >>= \b' -> return $ guts { mg_binds = b' }
+  let updateBindsAndRulesM f = f (mg_binds guts) (mg_rules guts) >>= \(b',r') -> return $ guts { mg_binds = b', mg_rules = r' }
   -- Important to force this now as name_ppr_ctx lives through an entire phase in
   -- the optimiser and if it's not forced then the entire previous `ModGuts` will
   -- be retained until the end of the phase. (See #24328 for more analysis)
@@ -479,6 +465,9 @@ doCorePass pass guts = do
 
 
   case pass of
+    CoreDesugarOpt            -> {-# SCC "DesugarOpt" #-}
+                                 updateBindsAndRulesM (desugarOpt dflags logger (mg_module guts))
+
     CoreDoSimplify opts       -> {-# SCC "Simplify" #-}
                                  liftIOWithCount $ simplifyPgm logger (hsc_unit_env hsc_env) name_ppr_ctx opts guts
 
@@ -537,7 +526,6 @@ doCorePass pass guts = do
     CoreDoPluginPass _ p      -> {-# SCC "Plugin" #-} p guts
 
     CoreDesugar               -> pprPanic "doCorePass" (ppr pass)
-    CoreDesugarOpt            -> pprPanic "doCorePass" (ppr pass)
     CoreTidy                  -> pprPanic "doCorePass" (ppr pass)
     CorePrep                  -> pprPanic "doCorePass" (ppr pass)
 
@@ -580,3 +568,22 @@ dmdAnal logger before_ww dflags fam_envs rules binds = do
     dumpIdInfoOfProgram (hasPprDebug dflags) (ppr . zapDmdEnvSig . dmdSigInfo) binds_plus_dmds
   -- See Note [Stamp out space leaks in demand analysis] in GHC.Core.Opt.DmdAnal
   seqBinds binds_plus_dmds `seq` return binds_plus_dmds
+
+
+-- | Simple optimization after desugaring.
+--
+-- This performs some quick basic optimizations even with -O0.
+-- See Note [The simple optimiser] for details.
+--
+-- We could call it directly in the desugarer but we implement it as the first
+-- Core-to-Core pass to accomodate Core plugins that want to see Core even
+-- before the first (simple) optimization took place. See #23337
+desugarOpt :: DynFlags -> Logger -> Module -> CoreProgram -> [CoreRule] -> CoreM (CoreProgram,[CoreRule])
+desugarOpt dflags logger mod binds rules = liftIO $ do
+  let simpl_opts = initSimpleOpts dflags
+  let !(ds_binds, ds_rules_for_imps, occ_anald_binds) = simpleOptPgm simpl_opts mod binds rules
+
+  putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
+    FormatCore (pprCoreBindings occ_anald_binds $$ pprRules ds_rules_for_imps )
+
+  pure (ds_binds, ds_rules_for_imps)

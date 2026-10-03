@@ -1,0 +1,4 @@
+LIBRARY @GhcInternalDll@
+
+EXPORTS
+    init_ghc_hs_iface

@@ -1,8 +1,9 @@
 setTestOpts(
   # Currently, the only GHC backends to support SIMD are:
   #   - the X86 NCG
+  #   - the AArch64 NCG
   #   - LLVM (any architecture)
-  [ unless(arch('x86_64'), only_ways(llvm_ways))
+  [ unless(arch('x86_64') or arch('aarch64'), only_ways(llvm_ways))
 
   # Architectures which support at least 128 bit wide SIMD vectors:
   #  - X86 with SSE2
@@ -48,8 +49,15 @@ test('int16x8_shuffle_baseline', [], compile_and_run, [''])
 test('int32x4_shuffle_baseline', [], compile_and_run, [''])
 test('int64x2_shuffle_baseline', [], compile_and_run, [''])
 
+test('T25030', [when(arch('i386'), expect_broken_for(25498, ['optllvm']))], makefile_test, [])
+
 test('T25658', [], compile_and_run, ['']) # #25658 is a bug with SSE2 code generation
 test('T25659', [], compile_and_run, [''])
+
+# This test case uses SIMD instructions, even though the bug isn't in any way
+# tied to SIMD registers. It's useful to include it in this file so that
+# we re-use the logic for which architectures to run the test on.
+test('T26550', [], compile_and_run, ['-O1 -fno-worker-wrapper'])
 
 # Ensure we set the CPU features we have available.
 #
@@ -61,6 +69,9 @@ setTestOpts(
   , when(have_cpu_feature('avx'), extra_hc_opts('-mavx'))
   , when(have_cpu_feature('avx2'), extra_hc_opts('-mavx2'))
   , when(have_cpu_feature('avx512f'), extra_hc_opts('-mavx512f'))
+  , when(have_cpu_feature('avx512vl'), extra_hc_opts('-mavx512vl'))
+  , when(have_cpu_feature('avx512bw'), extra_hc_opts('-mavx512bw'))
+  , when(have_cpu_feature('avx512dq'), extra_hc_opts('-mavx512dq'))
   ])
 
 test('simd000', [], compile_and_run, [''])
@@ -69,11 +80,12 @@ test('simd002', [], compile_and_run, [''])
 test('simd003', [], compile_and_run, [''])
 test('simd004', [], compile_and_run, ['-O2'])
 test('simd005', [], compile_and_run, [''])
-test('simd006', [], compile_and_run, [''])
+test('simd006', [mini_quickcheck], multimod_compile_and_run, ['simd006', ''])
 test('simd007', [], compile_and_run, [''])
 test('simd008', [], compile_and_run, [''])
 test('simd009', [ req_th
                 , extra_files(['Simd009b.hs', 'Simd009c.hs'])
+                , when(arch('i386'), expect_broken_for(25498, ['optllvm']))
                 ]
               , multimod_compile_and_run, ['simd009', ''])
 test('simd010', [], compile_and_run, [''])
@@ -83,7 +95,8 @@ test('simd011', [ unless(have_cpu_feature('fma'), skip)
 test('simd012', [], compile_and_run, [''])
 test('simd013',
      [ req_c
-     , unless(arch('x86_64'), skip) # because the C file uses Intel intrinsics
+     , unless(arch('x86_64') or arch('aarch64'), skip) # because the C file uses Intel or NEON intrinsics
+     , extra_ways(["optasm"]) # #26526 demonstrated a bug in the optasm way
      ],
      compile_and_run, ['simd013C.c'])
 test('simd014',
@@ -92,6 +105,15 @@ test('simd014',
         # of the XMM4 register, which may not be mapped to a real machine
         # register on non-x86 architectures.
      compile_and_run, ['simd014Cmm.cmm'])
+test('simd015',
+     [ when(have_llvm(), extra_ways(["optllvm"])) ],
+     compile_and_run, [''])
+test('simd016',
+     [ when(have_llvm(), extra_ways(["optllvm"])) ],
+     compile_and_run, [''])
+test('simd017',
+     [ when(have_llvm(), extra_ways(["optllvm"])) ],
+     compile_and_run, [''])
 
 test('simd_insert', [], compile_and_run, [''])
 test('simd_insert_array', [], compile_and_run, [''])
@@ -107,10 +129,10 @@ test('floatx4_arith', [], compile_and_run, [''])
 test('doublex2_arith', [], compile_and_run, [''])
 test('floatx4_shuffle', [], compile_and_run, [''])
 test('doublex2_shuffle', [], compile_and_run, [''])
-test('floatx4_fma', [ unless(have_cpu_feature('fma'), skip)
+test('floatx4_fma', [ unless(have_cpu_feature('fma') or arch('aarch64'), skip)
                     , extra_hc_opts('-mfma')
                     ], compile_and_run, [''])
-test('doublex2_fma', [ unless(have_cpu_feature('fma'), skip)
+test('doublex2_fma', [ unless(have_cpu_feature('fma') or arch('aarch64'), skip)
                      , extra_hc_opts('-mfma')
                      ], compile_and_run, [''])
 test('int8x16_arith', [], compile_and_run, [''])
@@ -130,11 +152,14 @@ test('T22187', [],compile,[''])
 test('T22187_run', [],compile_and_run,[''])
 test('T25062_V16', [], compile_and_run, [''])
 test('T25561', [], compile_and_run, [''])
+test('T26542', [], compile_and_run, [''])
+test('T26411', [], compile_and_run, [''])
+test('T26411b', [], compile_and_run, ['-O'])
 
 # Even if the CPU we run on doesn't support *executing* those tests we should try to
 # compile them.
 # Currently even for compilation we only support 256+ bit on x86
-only_V32_plus_compilation_support = unless(arch('x86_64'), skip)
+only_V32_plus_compilation_support = unless(arch('x86_64') or arch('i386'), skip)
 
 test('T25062_V32'
     ,   [ extra_hc_opts('-mavx2')
@@ -152,6 +177,45 @@ test('T25062_V64'
     , compile_and_run if have_cpu_feature('avx512f') else compile
     , [''])
 
-test('T25169', [], compile_and_run, [''])
+test('T25169', [when(arch('i386'), expect_broken_for(25498, ['optllvm']))], compile_and_run, [''])
 test('T25455', [], compile_and_run, [''])
 test('T25486', [], compile_and_run, [''])
+
+test('T26410_ffi'
+    , [ only_ways(llvm_ways) # SIMD NCG TODO: support 512-bit wide vectors
+      , unless(arch('x86_64') or arch('i386'), skip)
+      , extra_hc_opts('-mavx512f -optc -mavx512f -optlc -mcpu=penryn')
+      ]
+    , compile_and_run if have_cpu_feature('avx512f') else compile
+    , ['T26410_ffi_c.c'])
+
+test('T26410_prim'
+    , [ only_ways(llvm_ways) # SIMD NCG TODO: support 512-bit wide vectors
+      , unless(arch('x86_64') or arch('i386'), skip)
+      , extra_hc_opts('-mavx512f -optlc -mcpu=penryn')
+      ]
+    , compile_and_run if have_cpu_feature('avx512f') else compile
+    , [''])
+
+test('FloatConstant', [], compile_and_run, [''])
+test('IntConstant', [], compile_and_run, [''])
+
+test('StackAlignment32'
+    , [ only_ways(llvm_ways) # SIMD NCG TODO: support 256-bit wide vectors
+      , unless(arch('x86_64') or arch('i386'), skip)
+      , extra_hc_opts("-mavx -optc -mavx -no-hs-main")
+      ]
+    , compile_and_run if have_cpu_feature('avx') else compile
+    , ['StackAlignment32_main.c']
+    )
+
+test('StackAlignment64'
+    , [ only_ways(llvm_ways) # SIMD NCG TODO: support 512-bit wide vectors
+      , unless(arch('x86_64') or arch('i386'), skip)
+      , extra_hc_opts("-mavx512f -optc -mavx512f -no-hs-main")
+      ]
+    , compile_and_run if have_cpu_feature('avx512f') else compile
+    , ['StackAlignment64_main.c']
+    )
+
+test('T27565', [], compile_and_run, [''])

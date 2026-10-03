@@ -10,9 +10,14 @@ module GHC.Internal.Event.Unique
     , newUnique
     ) where
 
-import GHC.Internal.Base
-import GHC.Internal.Num(Num)
+import GHC.Internal.Num( Num )
 import GHC.Internal.Show(Show(..))
+import GHC.Internal.Prim (
+    MutableByteArray#, RealWorld, newByteArray#, fetchAddIntArray#,
+  )
+
+import GHC.Internal.Base
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 #include "MachDeps.h"
 

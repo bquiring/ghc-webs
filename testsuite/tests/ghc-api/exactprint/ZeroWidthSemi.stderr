@@ -8,11 +8,16 @@
    (EpAnn
     (EpaSpan { ZeroWidthSemi.hs:1:1 })
     (AnnsModule
-     (NoEpTok)
+     (EpTok
+      (EpaSpan { <no location info> }))
      (EpTok
       (EpaSpan { ZeroWidthSemi.hs:1:1-6 }))
      (EpTok
       (EpaSpan { ZeroWidthSemi.hs:1:22-26 }))
+     ((,,)
+      (EpTok (EpaSpan { <no location info> }))
+      (EpTok (EpaSpan { <no location info> }))
+      [])
      []
      []
      (Just
@@ -35,15 +40,14 @@
          "-- Trailing comment, should be in HsModule extension point")
         { ZeroWidthSemi.hs:6:5 }))]))
    (EpVirtualBraces
-    (1))
+    (EpaSpan { ZeroWidthSemi.hs:6:1 }))
    (Nothing)
    (Nothing))
   (Just
    (L
     (EpAnn
      (EpaSpan { ZeroWidthSemi.hs:1:8-20 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     {ModuleName: ZeroWidthSemi}))
@@ -52,8 +56,7 @@
   [(L
     (EpAnn
      (EpaSpan { ZeroWidthSemi.hs:6:1-5 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       [(L
         (EpaSpan
@@ -76,23 +79,22 @@
        (Unqual
         {OccName: a}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { ZeroWidthSemi.hs:6:1-5 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { ZeroWidthSemi.hs:6:1-5 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -110,11 +112,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -140,8 +147,7 @@
                (L
                 (EpAnn
                  (EpaSpan { ZeroWidthSemi.hs:6:5 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsOverLit

@@ -8,11 +8,6 @@
 Haskell. [WDP 94/11])
 -}
 
-{-# LANGUAGE BinaryLiterals #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
@@ -20,6 +15,7 @@ Haskell. [WDP 94/11])
 module GHC.Types.Id.Info (
         -- * The IdDetails type
         IdDetails(..), pprIdDetails, coVarDetails, isCoVarDetails,
+        mkDFunIdDetails,
         JoinArity, isJoinIdDetails_maybe,
 
         RecSelParent(..), recSelParentName, recSelFirstConName,
@@ -57,7 +53,7 @@ module GHC.Types.Id.Info (
         realUnfoldingInfo, unfoldingInfo, setUnfoldingInfo, hasInlineUnfolding,
 
         -- ** The InlinePragInfo type
-        InlinePragInfo,
+        InlinePragmaInfo,
         inlinePragInfo, setInlinePragInfo,
 
         -- ** The OccInfo type
@@ -109,6 +105,7 @@ import GHC.Types.ForeignCall
 import GHC.Unit.Module
 import GHC.Types.Demand
 import GHC.Types.Cpr
+import GHC.Types.InlinePragma
 import {-# SOURCE #-} GHC.Tc.Utils.TcType ( ConcreteTyVars, noConcreteTyVars )
 
 import GHC.Utils.Outputable
@@ -201,9 +198,8 @@ data IdDetails
   | TickBoxOpId TickBoxOp       -- ^ The 'Id' is for a HPC tick box (both traditional and binary)
 
   | DFunId Bool                 -- ^ A dictionary function.
-       -- Bool = True <=> the class has only one method, so may be
-       --                  implemented with a newtype, so it might be bad
-       --                  to be strict on this dictionary
+       -- Bool = True <=> a dictionary of this class cannot be bottom
+       -- See Note [NON-BOTTOM-DICTS invariant] in GHC.Core
 
   | CoVarId    -- ^ A coercion variable
                -- This only covers /un-lifted/ coercions, of type
@@ -212,17 +208,20 @@ data IdDetails
         -- ^ An 'Id' for a join point taking n arguments
         -- Note [Join points] in "GHC.Core"
         -- Can also work as a WorkerLikeId if given `CbvMark`s.
-        -- See Note [CBV Function Ids]
+        -- See Note [CBV Function Ids: overview]
         -- The [CbvMark] is always empty (and ignored) until after Tidy.
+
   | WorkerLikeId [CbvMark]
         -- ^ An 'Id' for a worker like function, which might expect some arguments to be
         -- passed both evaluated and tagged.
         -- Worker like functions are create by W/W and SpecConstr and we can expect that they
         -- aren't used unapplied.
-        -- See Note [CBV Function Ids]
+        -- See Note [CBV Function Ids: overview]
         -- See Note [EPT enforcement]
-        -- The [CbvMark] is always empty (and ignored) until after Tidy for ids from the current
-        -- module.
+        -- Invariants:
+        --   - the [CbvMark] is always empty (and ignored) until after Tidy
+        --     for ids from the current module
+        --   - If non-empty, at least is isMarkedCbbv; see (CBV2)
 
 data RecSelInfo
   = RSI { rsi_def   :: [ConLike]   -- Record selector defined for these
@@ -248,85 +247,122 @@ conLikesRecSelInfo con_likes lbls
     has_fld dc lbl = any (\ fl -> flLabel fl == lbl) (conLikeFieldLabels dc)
 
 
-{- Note [CBV Function Ids]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-A WorkerLikeId essentially allows us to constrain the calling convention
-for the given Id. Each such Id carries with it a list of CbvMarks
-with each element representing a value argument. Arguments who have
-a matching `MarkedCbv` entry in the list need to be passed evaluated+*properly tagged*.
+{- Note [CBV Function Ids: overview]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC can decide to use a call-by-value (CBV) calling convention for
+(some arguments of) a function, implying that:
 
-CallByValueFunIds give us additional expressiveness which we use to improve
-runtime. This is all part of the EPT enforcement work. See also Note [EPT enforcement].
+* The caller /must/ pass an argument that is evaluated and properly
+  tagged (EPT).  See Note [Evaluated and Properly Tagged] in GHC.Stg.EnforceEpt.
 
-They allows us to express the fact that an argument is not only evaluated to WHNF once we
-entered it's RHS but also that an lifted argument is already *properly tagged* once we jump
-into the RHS.
-This means when e.g. branching on such an argument the RHS doesn't needed to perform
-an eval check to ensure the argument isn't an indirection. All seqs on such an argument in
-the functions body become no-ops as well.
+* The function may /assume/ that the argument is EPT, and thereby omit
+  evals that would otherwise be necessary.
 
-The invariants around the arguments of call by value function like Ids are then:
+CBV-ness is part of the calling convention; it is not optional. If a function
+is compiled with CBV arguments, callers /must/ respect it, else seg-fault
+beckon.
 
-* In any call `(f e1 .. en)`, if `f`'s i'th argument is marked `MarkedCbv`,
-  then the caller must ensure that the i'th argument
-  * points directly to the value (and hence is certainly evaluated before the call)
-  * is a properly tagged pointer to that value
+Apart from the more efficent calling convention, a compelling reason for
+a CBV calling conventions is worker-functions for strict data types.
+Example:
+   data T a = MkT ![a]
+   f :: T Int -> blah
+   f (MkT y) = ...
+We get a w/w split
+   $wf y = let x = MkT y in ...
+   f x = case x of MkT y -> $wf y
+But in `$wf`, in general, we'd need to evaluate `y`, becuase `MkT` is strict.
+With a CBV calling convention we can drop that stupid extra eval.
 
-* The following functions (and only these functions) have `CbvMarks`:
-  * Any `WorkerLikeId`
-  * Some `JoinId` bindings.
+Here's how it all works:
 
-This works analogous to the EPT Invariant. See also Note [EPT enforcement].
+* We identify some function Ids as "CBV candidates";
+  see Note [Which Ids should be CBV candidates?]
 
-To make this work what we do is:
-* During W/W and SpecConstr any worker/specialized binding we introduce
-  is marked as a worker binding by `asWorkerLikeId`.
-* W/W and SpecConstr further set OtherCon[] unfoldings on arguments which
-  represent contents of a strict fields.
-* During Tidy we look at all bindings.
-  For any callByValueLike Id and join point we mark arguments as cbv if they
-  Are strict. We don't do so for regular bindings.
-  See Note [Use CBV semantics only for join points and workers] for why.
-  We might have made some ids rhs *more* strict in order to make their arguments
-  be passed CBV. See Note [Call-by-value for worker args] for why.
-* During CorePrep calls to CallByValueFunIds are eta expanded.
+* During W/W and SpecConstr: any worker/specialized binding we introduce
+  is marked as a CBV-candidate by `asCbvCandidate`.  This simply marks
+  the binding as a candidate for CBV-ness, using IdDetails `WorkerLikeId []`.
+  See Note [Which Ids should be CBV candidates?].
+
+  See also Note [Call-by-value for worker args] for how we build the worker RHS.
+
+* A CBV candidate may become a join point; we are careful to retain
+  its CBV-candidature; see `GHC.Types.Id.asJoinId`.  (Actually that hardly
+  matters because all join points are CBV-candidates.)  A join point can also
+  become an ordinary Id, due to floating (see `zapJoinId`); again we are
+  careful to retain CBV-candidature.
+
+* During Tidy, for CBV-candidate Ids, including join points, we mark any
+  /strict/ arguments as CBV. This is the point at which the CbvMarks inside a
+  WorkerLikeId are set.  See `GHC.Core.Tidy.computeCbvInfo`, and
+
+  This step is informed by a late demand analysis, performed just before tidying
+  to identify strict arguments.  See Note [Call-by-value for worker args] for
+  how a worker guarantees to be strict in strict datacon fields.
+
+  See (CBV1) and (CBV2).
+
+* During CorePrep calls to CBV Ids are eta expanded.
+  See `GHC.CoreToStg.Prep.maybeSaturate`.
+
 * During Stg CodeGen:
   * When we see a call to a callByValueLike Id:
     * We check if all arguments marked to be passed unlifted are already tagged.
     * If they aren't we will wrap the call in case expressions which will evaluate+tag
       these arguments before jumping to the function.
+  See (EPT-rewrite) in Note [EPT enforcement] in GHC.Stg.EnforceEpt
+
 * During Cmm codeGen:
   * When generating code for the RHS of a StrictWorker binding
     we omit tag checks when using arguments marked as tagged.
+  See (EPT-codegen) in Note [EPT enforcement] in GHC.Stg.EnforceEpt
 
+* Imported functions may be CBV, and then there is no point in eta-reducing
+  them; we'll just have to eta-expand later; see GHC.Core.Opt.Arity.cantEtaReduceFun.
+
+Wrinkles
+
+(CBV1) We do not set the CBV-marks for a function that takes an unboxed sum or tuple,
+  as an argument, because then we'd have to predict the result of unarisation.
+  It would be nice to do so in future. See `computeCbvInfo`.
+
+(CBV2) We do not set CBV-marks if none of them are `isMarkedCbv`.  Why not?
+  Because if none are CBV then there is nothing special to do for this function;
+  in particular, we don't need to saturate its calls.  See `computeCbvInfo`.
+
+*** SPJ really? Andreas? ****
 We only use this for workers and specialized versions of SpecConstr
 But we also check other functions during tidy and potentially turn some of them into
 call by value functions and mark some of their arguments as call-by-value by looking at
 argument unfoldings.
 
-NB: I choose to put the information into a new Id constructor since these are loaded
-at all optimization levels. This makes it trivial to ensure the additional
-calling convention demands are available at all call sites. Putting it into
-IdInfo would require us at the very least to always decode the IdInfo
+
+NB: I choose to put the CBV information into the IdDetails since these are
+loaded at all optimization levels. This makes it trivial to ensure the
+additional calling convention demands are available at all call sites. Putting
+it into IdInfo would require us at the very least to always decode the IdInfo
 just to decide if we need to throw it away or not after.
 
-Note [Use CBV semantics only for join points and workers]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A function with cbv-semantics requires arguments to be visible
-and if no arguments are visible requires us to eta-expand it's
-call site. That is for a binding with three cbv arguments like
-`w[WorkerLikeId[!,!,!]]` we would need to eta expand undersaturated
-occurrences like `map w xs` into `map (\x1 x2 x3 -> w x1 x2 x3) xs.
+Note [Which Ids should be CBV candidates?]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In principle, we could use a CBV calling convention for /any/ strict function.
+But when we use CBV semantics the caller must obey the EPT calling convention,
+and that may mean eta-expansion. For example, for a binding with three CBV
+arguments like `foo[WorkerLikeId[!,!,!]]` we would need to eta expand undersaturated
+occurrences like `map foo xs` into `map (\x1 x2 x3 -> w x1 x2 x3) xs.
 
-In experiments it turned out that the code size increase of doing so
-can outweigh the performance benefits of doing so.
-So we only do this for join points, workers and
-specialized functions (from SpecConstr).
-Join points are naturally always called saturated so
-this problem can't occur for them.
-For workers and specialized functions there are also always at least
-some applied arguments as we won't inline the wrapper/apply their rule
-if there are unapplied occurrences like `map f xs`.
+In experiments it turned out that the code size increase of doing so can
+outweigh the performance benefits of doing so.
+
+So we treat only certain functions as candidates for CBV treatment:
+  * Workers created by worker/wrapper.
+  * Specialised functions from SpecConstr
+  * Join points
+
+Reason:
+  * All of these are always called saturated (at birth anyway)
+  * For workers in particular we want to use CBV for strict
+    fields of data constructors
 -}
 
 -- | Parent of a record selector function.
@@ -366,7 +402,7 @@ recSelParentCons (RecSelPatSyn ps) = [PatSynCon ps]
 instance Outputable RecSelParent where
   ppr p = case p of
     RecSelData tc
-      | Just (parent_tc, tys) <- tyConFamInst_maybe tc
+      | Just (parent_tc, tys) <- tyConDataFamInst_maybe tc
       -> ppr (mkTyConApp parent_tc tys)
       | otherwise
       -> ppr tc
@@ -387,6 +423,9 @@ isJoinIdDetails_maybe :: IdDetails -> Maybe (JoinArity, (Maybe [CbvMark]))
 isJoinIdDetails_maybe (JoinId join_arity marks) = Just (join_arity, marks)
 isJoinIdDetails_maybe _                   = Nothing
 
+mkDFunIdDetails :: Class -> IdDetails
+mkDFunIdDetails cls = DFunId (isTerminatingTyCon (classTyCon cls))
+
 instance Outputable IdDetails where
     ppr = pprIdDetails
 
@@ -403,7 +442,8 @@ pprIdDetails other     = brackets (pp other)
    pp (PrimOpId {})           = text "PrimOp"
    pp (FCallId _)             = text "ForeignCall"
    pp (TickBoxOpId _)         = text "TickBoxOp"
-   pp (DFunId nt)             = text "DFunId" <> ppWhen nt (text "(nt)")
+   pp (DFunId terminating)    = text "DFunId"
+                                <> ppWhen (not terminating) (text "(may-be-bottom)")
    pp (RecSelId { sel_naughty = is_naughty })
                               = brackets $ text "RecSel" <>
                                            ppWhen is_naughty (text "(naughty)")
@@ -442,7 +482,7 @@ data IdInfo
         -- See Note [Specialisations and RULES in IdInfo]
         realUnfoldingInfo   :: Unfolding,
         -- ^ The 'Id's unfolding
-        inlinePragInfo  :: InlinePragma,
+        inlinePragInfo  :: InlinePragmaInfo,
         -- ^ Any inline pragma attached to the 'Id'
         occInfo         :: OccInfo,
         -- ^ How the 'Id' occurs in the program
@@ -555,8 +595,10 @@ tagSigInfo = tagSig
 
 setRuleInfo :: IdInfo -> RuleInfo -> IdInfo
 setRuleInfo       info sp = sp `seq` info { ruleInfo = sp }
-setInlinePragInfo :: IdInfo -> InlinePragma -> IdInfo
+
+setInlinePragInfo :: IdInfo -> InlinePragmaInfo -> IdInfo
 setInlinePragInfo info pr = pr `seq` info { inlinePragInfo = pr }
+
 setOccInfo :: IdInfo -> OccInfo -> IdInfo
 setOccInfo        info oc = oc `seq` info { occInfo = oc }
         -- Try to avoid space leaks by seq'ing
@@ -583,7 +625,12 @@ hasInlineUnfolding :: IdInfo -> Bool
 -- ^ True of a /non-loop-breaker/ Id that has a /stable/ unfolding that is
 --   (a) always inlined; that is, with an `UnfWhen` guidance, or
 --   (b) a DFunUnfolding which never needs to be inlined
-hasInlineUnfolding info = isInlineUnfolding (unfoldingInfo info)
+--
+-- Very important that this work with `realUnfoldingInfo` and so returns
+-- True even for a loop-breaker that has an INLINE pragma.
+-- See (CWW4) in Note [Cast worker/wrapper] in GHC.Core.Opt.Simplify.Iteration
+-- for discussion, and #26903 for the dire consequences of getting this wrong.
+hasInlineUnfolding info = isInlineUnfolding (realUnfoldingInfo info)
 
 setArityInfo :: IdInfo -> ArityInfo -> IdInfo
 setArityInfo info ar =
@@ -704,27 +751,6 @@ unknownArity = 0
 ppArityInfo :: Int -> SDoc
 ppArityInfo 0 = empty
 ppArityInfo n = hsep [text "Arity", int n]
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Inline-pragma information}
-*                                                                      *
-************************************************************************
--}
-
--- | Inline Pragma Information
---
--- Tells when the inlining is active.
--- When it is active the thing may be inlined, depending on how
--- big it is.
---
--- If there was an @INLINE@ pragma, then as a separate matter, the
--- RHS will have been made to look small with a Core inline 'Note'
---
--- The default 'InlinePragInfo' is 'AlwaysActive', so the info serves
--- entirely as a way to inhibit inlining until we want it
-type InlinePragInfo = InlinePragma
 
 {-
 ************************************************************************
@@ -903,14 +929,15 @@ zapUsedOnceInfo info
                   , demandInfo     = zapUsedOnceDemand (demandInfo     info) }
 
 zapFragileInfo :: IdInfo -> Maybe IdInfo
--- ^ Zap info that depends on free variables
+-- ^ Zap fragile 'IdInfo', such as info that depends on free variables
+-- or fragile occurrence info (see 'zapFragileOccInfo').
 zapFragileInfo info@(IdInfo { occInfo = occ, realUnfoldingInfo = unf })
   = new_unf `seq`  -- The unfolding field is not (currently) strict, so we
                    -- force it here to avoid a (zapFragileUnfolding unf) thunk
                    -- which might leak space
     Just (info `setRuleInfo` emptyRuleInfo
                `setUnfoldingInfo` new_unf
-               `setOccInfo`       zapFragileOcc occ)
+               `setOccInfo`       zapFragileOccInfo occ)
   where
     new_unf = zapFragileUnfolding unf
 

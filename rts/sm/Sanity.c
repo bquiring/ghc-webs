@@ -128,6 +128,7 @@ checkStackFrame( StgPtr c )
     case UNDERFLOW_FRAME:
     case STOP_FRAME:
     case RET_SMALL:
+    case ANN_FRAME:
         size = BITMAP_SIZE(info->i.layout.bitmap);
         checkSmallBitmap((StgPtr)c + 1,
                          BITMAP_BITS(info->i.layout.bitmap), size);
@@ -604,9 +605,9 @@ void checkHeapChain (bdescr *bd)
                 ASSERT( size >= MIN_PAYLOAD_SIZE + sizeofW(StgHeader) );
                 p += size;
 
-                /* skip over slop, see Note [slop on the heap] */
-                while (p < bd->free &&
-                       (*p < 0x1000 || !LOOKS_LIKE_INFO_PTR(*p))) { p++; }
+                /* See Note [Skipping slop when scanning the heap]
+                   in ClosureMacros.h */
+                p = skipSlop(p, bd->free);
             }
         }
     }
@@ -691,7 +692,7 @@ checkCompactObjects(bdescr *bd)
         ASSERT((W_)str == (W_)block + sizeof(StgCompactNFDataBlock));
 
         StgWord totalW = 0;
-        StgCompactNFDataBlock *last;
+        StgCompactNFDataBlock *last = block;
         for ( ; block ; block = block->next) {
             last = block;
             ASSERT(block->owner == str);
@@ -778,13 +779,45 @@ checkTSO(StgTSO *tso)
            info == &stg_WHITEHOLE_info); // used to happen due to STM doing
                                          // lockTSO(), might not happen now
 
-    if (   tso->why_blocked == BlockedOnMVar
-        || tso->why_blocked == BlockedOnMVarRead
-        || tso->why_blocked == BlockedOnBlackHole
-        || tso->why_blocked == BlockedOnMsgThrowTo
-        || tso->why_blocked == NotBlocked
-        ) {
+    StgThreadWhyBlocked why_blocked = ACQUIRE_LOAD(&tso->why_blocked);
+    switch (why_blocked) {
+    case NotBlocked:
+    case BlockedOnMVar:
+    case BlockedOnMVarRead:
+    case BlockedOnBlackHole:
+    case BlockedOnMsgThrowTo:
+    case BlockedOnRead:
+    case BlockedOnWrite:
+    case BlockedOnDelay:
+        //TODO: we could be more specific and check BlockedOnMVar has an MVar,
+        // BlockedOnBlackHole has a message, BlockedOnRead has an AIOP etc.
+        ASSERT(IsBlockInfoClosure(why_blocked));
         ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->block_info.closure));
+        break;
+
+    case BlockedOnSTM:
+    case BlockedOnCCall:
+    case BlockedOnCCall_Interruptible:
+    case ThreadMigrating:
+        ASSERT(!IsBlockInfoClosure(why_blocked));
+        ASSERT(tso->block_info.unused == END_TSO_QUEUE);
+        break;
+
+#if !defined(THREADED_RTS)
+    // Only these three can use BlockInfoForceNonClosure
+    case BlockedOnRead  | BlockInfoForceNonClosure:
+    case BlockedOnWrite | BlockInfoForceNonClosure:
+    case BlockedOnDelay | BlockInfoForceNonClosure:
+#if defined(mingw32_HOST_OS)
+    case BlockedOnDoProc:
+#endif
+        ASSERT(!IsBlockInfoClosure(why_blocked));
+        break;
+#endif
+
+    default:
+        barf("checkTSO: strange tso->why_blocked: %d for TSO %"
+             FMT_StgThreadID " (%p)", why_blocked, tso->id, tso);
     }
 
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->bq));
@@ -980,9 +1013,9 @@ static void checkGeneration (generation *gen,
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // heap sanity checking doesn't work with SMP for two reasons:
     //
-    //   * We can't zero the slop. However, we can sanity-check the heap after a
+    //   * We can't mark the slop. However, we can sanity-check the heap after a
     //     major gc, because there is no slop. See also Updates.h and Note
-    //     [zeroing slop when overwriting closures].
+    //     [marking slop when overwriting immutable closures].
     //
     //   * The nonmoving collector may be mutating its large object lists,
     //     unless we were in fact called by the nonmoving collector.

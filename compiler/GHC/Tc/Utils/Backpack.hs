@@ -1,7 +1,5 @@
-
 {-# LANGUAGE DuplicateRecordFields    #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE ScopedTypeVariables      #-}
 {-# LANGUAGE TypeFamilies             #-}
 
 module GHC.Tc.Utils.Backpack (
@@ -37,6 +35,7 @@ import GHC.Types.SourceFile
 import GHC.Types.Var
 import GHC.Types.Id( idType )
 import GHC.Types.Unique.DSet
+import GHC.Types.UnresolvedImport ( UnresolvedImport )
 import GHC.Types.Name.Shape
 import GHC.Types.PkgQual
 
@@ -280,12 +279,12 @@ findExtraSigImports _ _ _ = return []
 -- example, if they 'import M' and M resolves to p[A=<B>,C=D], then
 -- they actually also import the local requirement B.
 implicitRequirements :: HscEnv
-                     -> [(PkgQual, Located ModuleName)]
+                     -> [UnresolvedImport PkgQual]
                      -> IO [ModuleName]
 implicitRequirements hsc_env normal_imports
   = fmap concat $
-    forM normal_imports $ \(mb_pkg, L _ imp) -> do
-        found <- findImportedModule hsc_env imp mb_pkg
+    forM normal_imports $ \e -> do
+        found <- resolveImport hsc_env e
         case found of
             Found _ mod | notHomeModuleMaybe mhome_unit mod ->
                 return (uniqDSetToList (moduleFreeHoles mod))
@@ -293,28 +292,28 @@ implicitRequirements hsc_env normal_imports
   where
     mhome_unit = hsc_home_unit_maybe hsc_env
 
--- | Like @implicitRequirements'@, but returns either the module name, if it is
--- a free hole, or the instantiated unit the imported module is from, so that
--- that instantiated unit can be processed and via the batch mod graph (rather
--- than a transitive closure done here) all the free holes are still reachable.
+-- | Like @implicitRequirements'@, but returns the instantiated unit the
+-- imported module is from, so that that instantiated unit can be processed and
+-- via the batch mod graph (rather than a transitive closure done here) all the
+-- free holes are still reachable.
 implicitRequirementsShallow
   :: HscEnv
-  -> [(ImportLevel, PkgQual, Located ModuleName)]
-  -> IO ([ModuleName], [InstantiatedUnit])
-implicitRequirementsShallow hsc_env normal_imports = go ([], []) normal_imports
+  -> [UnresolvedImport PkgQual]
+  -> IO [InstantiatedUnit]
+implicitRequirementsShallow hsc_env normal_imports = go [] normal_imports
  where
   mhome_unit = hsc_home_unit_maybe hsc_env
 
   go acc [] = pure acc
-  go (accL, accR) ((_stage, mb_pkg, L _ imp):imports) = do
-    found <- findImportedModule hsc_env imp mb_pkg
+  go accR (e:imports) = do
+    found <- resolveImport hsc_env e
     let acc' = case found of
           Found _ mod | notHomeModuleMaybe mhome_unit mod ->
               case moduleUnit mod of
-                  HoleUnit -> (moduleName mod : accL, accR)
-                  RealUnit _ -> (accL, accR)
-                  VirtUnit u -> (accL, u:accR)
-          _ -> (accL, accR)
+                  HoleUnit -> panic "implicitRequirementsShallow: HoleUnit is unreachable through findImportedModule!"
+                  RealUnit _ -> accR
+                  VirtUnit u -> u:accR
+          _ -> accR
     go acc' imports
 
 -- | Given a 'Unit', make sure it is well typed.  This is because
@@ -343,7 +342,7 @@ tcRnCheckUnit hsc_env uid =
    withTiming logger
               (text "Check unit id" <+> ppr uid)
               (const ()) $
-   initTc hsc_env
+   initTc StartAndStopTcMPlugins hsc_env
           HsigFile -- bogus
           False
           (mainModIs (hsc_HUE hsc_env))
@@ -364,7 +363,7 @@ tcRnMergeSignatures hsc_env hpm orig_tcg_env iface =
   withTiming logger
              (text "Signature merging" <+> brackets (ppr this_mod))
              (const ()) $
-  initTc hsc_env HsigFile False this_mod real_loc $
+  initTc StartAndStopTcMPlugins hsc_env HsigFile False this_mod real_loc $
     mergeSignatures hpm orig_tcg_env iface
  where
   logger   = hsc_logger hsc_env
@@ -412,7 +411,7 @@ thinModIface avails iface =
 ifaceDeclNeverExportedRefs :: IfaceDecl -> [Name]
 ifaceDeclNeverExportedRefs d@IfaceFamily{} =
     case ifFamFlav d of
-        IfaceClosedSynFamilyTyCon (Just (n, _))
+        IfaceClosedTypeFamilyTyCon (IfaceClosedTyFamTyCon (Just (n, _)))
             -> [n]
         _   -> []
 ifaceDeclNeverExportedRefs _ = []
@@ -573,12 +572,12 @@ mergeSignatures
             as1 <- tcRnModExports insts ireq_iface
             -- 3(b). Thin the interface if it comes from a signature package.
             (thinned_iface, as2) <- case mb_exports of
-                    Just (L loc _)
+                    Just es
                       -- Check if the package containing this signature is
                       -- a signature package (i.e., does not expose any
                       -- modules.)  If so, we can thin it.
                       | isFromSignaturePackage
-                      -> setSrcSpanA loc $ do
+                      -> setSrcSpan (locA (listLocation es)) $ do
                         -- Suppress missing errors; they might be used to refer
                         -- to entities from other signatures we are merging in.
                         -- If an identifier truly doesn't exist in any of the
@@ -741,7 +740,7 @@ mergeSignatures
                             , rdr_elt <- lookupGRE rdr_env (LookupOccName occ AllRelevantGREs) ]
 
     -- STEP 5: Typecheck the interfaces
-    let type_env_var = tcg_type_env_var tcg_env
+    let knot_type_env = tcg_knot_vars tcg_env
 
     -- typecheckIfacesForMerging does two things:
     --      1. It merges the all of the ifaces together, and typechecks the
@@ -750,7 +749,7 @@ mergeSignatures
     --      resolving to the merged type_env from (1).
     -- See typecheckIfacesForMerging for more details.
     (type_env, detailss) <- initIfaceTcRn $
-                            typecheckIfacesForMerging inner_mod ifaces type_env_var
+                            typecheckIfacesForMerging inner_mod ifaces knot_type_env
     let infos = zip ifaces detailss
 
     -- Test for cycles
@@ -766,7 +765,7 @@ mergeSignatures
     -- NB: Why do we set tcg_tcs/tcg_patsyns/tcg_type_env directly,
     -- rather than use tcExtendGlobalEnv (the normal method to add newly
     -- defined types to TcGblEnv?)  tcExtendGlobalEnv adds these
-    -- TyThings to 'tcg_type_env_var', which is consulted when
+    -- TyThings to 'tcg_knot_vars', which is consulted when
     -- we read in interfaces to tie the knot.  But *these TyThings themselves
     -- come from interface*, so that would result in deadlock.  Don't
     -- update it!
@@ -905,7 +904,7 @@ tcRnInstantiateSignature hsc_env this_mod real_loc =
    withTiming logger
               (text "Signature instantiation"<+>brackets (ppr this_mod))
               (const ()) $
-   initTc hsc_env HsigFile False this_mod real_loc $ instantiateSignature
+   initTc StartAndStopTcMPlugins hsc_env HsigFile False this_mod real_loc $ instantiateSignature
   where
    logger = hsc_logger hsc_env
 

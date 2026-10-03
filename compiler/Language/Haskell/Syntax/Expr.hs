@@ -1,12 +1,3 @@
-
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -27,13 +18,10 @@ import Language.Haskell.Syntax.Pat
 import Language.Haskell.Syntax.Lit
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Module.Name (ModuleName)
+import Language.Haskell.Syntax.Text
 import Language.Haskell.Syntax.Type
 import Language.Haskell.Syntax.Binds
 
--- others:
-import GHC.Types.SourceText (StringLiteral)
-
-import GHC.Data.FastString (FastString)
 
 -- libraries:
 import Data.Data hiding (Fixity(..))
@@ -232,7 +220,7 @@ ambiguous. You have to use a qualified name. And there is no way to do
 this if both data types are declared in the same module.
 
 NB 2: The notation getField @"size" e is short for
-HsApp (HsAppType (HsVar "getField") (HsWC (HsTyLit (HsStrTy "size")) [])) e.
+HsApp (HsAppType (HsVar "getField") (HsWC (HsTyLit (HsString "size")) [])) e.
 We track the original parsed syntax via ExpandedThingRn.
 
 -}
@@ -265,6 +253,7 @@ with constructs that previously could only occur at the type level:
   * Constraint arrows: a => b
   * Universal quantification: forall a. b
   * Visible universal quantification: forall a -> b
+  * The star notation for kinds: * (StarIsType)
 
 This syntax can't be used to construct a type at the term level because `Type`
 is not inhabited by any terms. Its use is limited to required type arguments:
@@ -289,18 +278,23 @@ expressions and their grammar:
   -- Language/Haskell/Syntax/Expr.hs
   data HsExpr p =
     ...
+    | HsStar (XStar p)
     | HsForAll (XForAll p) (HsForAllTelescope p) (LHsExpr p)
     | HsQual (XQual p) (XRec p [LHsExpr p]) (LHsExpr p)
     | HsFunArr (XFunArr p) (HsMultAnnOf (LHsExpr p) p) (LHsExpr p) (LHsExpr p)
 
   -- GHC/Parser.y
+  infixexp2s :: { ECP }
+    : infixexp2 %shift { ... }
+    | '*'              { ... }
   infixexp2 :: { ECP }
-    : infixexp %shift                  { ... }
-    | infixexp         '->'  infixexp2 { ... }
-    | infixexp expmult '->'  infixexp2 { ... }
-    | infixexp         '->.' infixexp2 { ... }
-    | expcontext       '=>'  infixexp2 { ... }
-    | forall_telescope infixexp2       { ... }
+    : infixexp %shift                   { ... }
+    | '*'              '->'  infixexp2s { ... }
+    | infixexp         '->'  infixexp2s { ... }
+    | infixexp expmult '->'  infixexp2s { ... }
+    | infixexp         '->.' infixexp2s { ... }
+    | expcontext       '=>'  infixexp2s { ... }
+    | forall_telescope infixexp2s       { ... }
 
 These constructors and non-terminals mirror those found in HsType
 
@@ -309,6 +303,7 @@ These constructors and non-terminals mirror those found in HsType
      HsForAllTy  |  HsForAll
      HsFunTy     |  HsFunArr
      HsQualTy    |  HsQual
+     HsStarTy    |  HsStar
 
 The resulting code duplication can be removed if we unify HsExpr and HsType
 into one type (#25121).
@@ -334,16 +329,18 @@ data HsExpr p
               (LIdOccP p) -- ^ Variable
                           -- See Note [Located RdrNames]
 
-  | HsOverLabel (XOverLabel p) FastString
+  | HsOverLabel (XOverLabel p) HText
      -- ^ Overloaded label (Note [Overloaded labels] in GHC.OverloadedLabels)
 
   | HsIPVar   (XIPVar p)
               HsIPName   -- ^ Implicit parameter (not in use after typechecking)
+
   | HsOverLit (XOverLitE p)
               (HsOverLit p)  -- ^ Overloaded literals
-
   | HsLit     (XLitE p)
               (HsLit p)      -- ^ Simple (non-overloaded) literals
+  | HsQualLit (XQualLitE p)
+              (HsQualLit p)  -- ^ Qualified literals
 
   -- | Lambda, Lambda-case, and Lambda-cases
   | HsLam     (XLam p)
@@ -515,6 +512,13 @@ data HsExpr p
   | HsEmbTy   (XEmbTy p)
               (LHsWcType (NoGhcTc p))
 
+  -- | The @*@ syntax standing for 'Data.Kind.Type', enabled by the
+  -- @StarIsType@ extension.
+  --
+  -- Used with @RequiredTypeArguments@, e.g. @fn (* -> *)@.
+  -- See Note [Types in terms]
+  | HsStar    (XStar p)
+
    -- | Holes in expressions, i.e. '_'.
    -- See Note [Holes in expressions] in GHC.Tc.Types.Constraint.
   | HsHole (XHole p)
@@ -527,12 +531,12 @@ data HsExpr p
   -- Constrained types @ctx => t@.
   -- Used with @RequiredTypeArguments@, e.g. @fn (Bounded a => a)@.
   -- See Note [Types in terms]
-  | HsQual (XQual p) (XRec p [LHsExpr p]) (LHsExpr p)
+  | HsQual (XQual p) (XRec p (HsContextDetails p (LHsExpr p)))  (LHsExpr p)
 
   -- | Function types @a -> b@.
   -- Used with @RequiredTypeArguments@, e.g. @fn (Int -> Bool)@.
   -- See Note [Types in terms]
-  | HsFunArr (XFunArr p) (HsMultAnnOf (LHsExpr p) p) (LHsExpr p) (LHsExpr p)
+  | HsFunArr (XFunArr p) (HsModifiedFunArrOf (LHsExpr p) p) (LHsExpr p) (LHsExpr p)
 
   | XExpr       !(XXExpr p)
   -- Note [Trees That Grow] in Language.Haskell.Syntax.Extension for the
@@ -553,7 +557,7 @@ data DotFieldOcc p
 -- | A pragma, written as {-# ... #-}, that may appear within an expression.
 data HsPragE p
   = HsPragSCC   (XSCC p)
-                StringLiteral         -- "set cost centre" SCC pragma
+                (StringLiteral p) -- "set cost centre" SCC pragma
 
   | XHsPragE !(XXPragE p)
 
@@ -691,7 +695,7 @@ various phases and why.
 Parsing
 -------
 An empty list is parsed by the sysdcon nonterminal. It thus comes to life via
-HsVar nilDataCon (defined in GHC.Builtin.Types). A freshly-parsed (HsExpr GhcPs) empty list
+HsVar nilDataCon (defined in GHC.Builtin.WiredIn.Types). A freshly-parsed (HsExpr GhcPs) empty list
 is never a ExplicitList.
 
 Renaming
@@ -1319,8 +1323,8 @@ data HsUntypedSplice id
 
    | HsQuasiQuote            -- See Note [Quasi-quote overview]
         (XQuasiQuote id)
-        (LIdP id)             -- The quoter (the bit between `[` and `|`)
-        (XRec id FastString) -- The enclosed string
+        (LIdP id)            -- The quoter (the bit between `[` and `|`)
+        (XRec id HText)      -- The enclosed string
 
    | XUntypedSplice !(XXUntypedSplice id) -- Extension point; see Note [Trees That Grow]
                                           -- in Language.Haskell.Syntax.Extension
@@ -1403,7 +1407,7 @@ data HsMatchContext fn
 
   | ThPatSplice            -- ^A Template Haskell pattern splice
   | ThPatQuote             -- ^A Template Haskell pattern quotation [p| (a,b) |]
-  | PatSyn                 -- ^A pattern synonym declaration
+  | PatSynCtx              -- ^A pattern synonym declaration
   | LazyPatCtx             -- ^An irrefutable pattern
 
 {- Note [mc_fun field of FunRhs]
@@ -1442,7 +1446,7 @@ data HsStmtContext fn
   | PatGuard (HsMatchContext fn)      -- ^ Pattern guard for specified thing
   | ParStmtCtxt (HsStmtContext fn)    -- ^ A branch of a parallel stmt
   | TransStmtCtxt (HsStmtContext fn)  -- ^ A branch of a transform stmt
-  | ArrowExpr                         -- ^ do-notation in an arrow-command context
+  | ArrowExpr                         -- ^ Do-notation in an arrow-command context
 
 -- | Haskell arrow match context.
 data HsArrowMatchContext
@@ -1467,8 +1471,8 @@ qualifiedDoModuleName_maybe ctxt = case ctxt of
 isPatSynCtxt :: HsMatchContext fn -> Bool
 isPatSynCtxt ctxt =
   case ctxt of
-    PatSyn -> True
-    _      -> False
+    PatSynCtx -> True
+    _         -> False
 
 isComprehensionContext :: HsStmtContext fn -> Bool
 -- Uses comprehension syntax [ e | quals ]

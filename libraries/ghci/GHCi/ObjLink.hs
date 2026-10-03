@@ -12,7 +12,7 @@
 -- dynamic linker.
 module GHCi.ObjLink
   ( initObjLinker, ShouldRetainCAFs(..)
-  , loadDLL
+  , loadDLLs
   , loadArchive
   , loadObj
   , unloadObj
@@ -31,6 +31,9 @@ import GHCi.RemoteTypes
 import GHCi.Message (LoadedDLL)
 import Control.Exception (throwIO, ErrorCall(..))
 import Control.Monad    ( when )
+import qualified Data.ByteString.Short as BS
+import Data.Char (ord)
+import Data.Foldable
 import Foreign.C
 import Foreign.Marshal.Alloc ( alloca, free )
 import Foreign          ( nullPtr, peek )
@@ -41,6 +44,10 @@ import System.FilePath  ( dropExtension, normalise )
 #if defined(wasm32_HOST_ARCH)
 import Control.Exception (catch, evaluate)
 import GHC.Wasm.Prim
+#endif
+
+#if defined(wasm32_HOST_ARCH)
+import Data.List (intercalate)
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -67,20 +74,25 @@ data ShouldRetainCAFs
 initObjLinker :: ShouldRetainCAFs -> IO ()
 initObjLinker _ = pure ()
 
-loadDLL :: String -> IO (Either String (Ptr LoadedDLL))
-loadDLL f =
+-- Batch load multiple DLLs at once via dyld to enable a single
+-- dependency resolution and more parallel compilation. We pass a
+-- NUL-delimited JSString to avoid array marshalling on wasm.
+loadDLLs :: [String] -> IO (Either String [Ptr LoadedDLL])
+loadDLLs fs =
   m `catch` \(err :: JSException) ->
-    pure $ Left $ "loadDLL failed for " <> f <> ": " <> show err
+    pure $ Left $ "loadDLLs failed: " <> show err
   where
+    packed :: JSString
+    packed = toJSString (intercalate ['\0'] fs)
     m = do
-      evaluate =<< js_loadDLL (toJSString f)
-      pure $ Right nullPtr
+      evaluate =<< js_loadDLLs packed
+      pure $ Right (replicate (length fs) nullPtr)
 
 -- See Note [Variable passing in JSFFI] for where
 -- __ghc_wasm_jsffi_dyld comes from
 
-foreign import javascript safe "__ghc_wasm_jsffi_dyld.loadDLL($1)"
-  js_loadDLL :: JSString -> IO ()
+foreign import javascript safe "__ghc_wasm_jsffi_dyld.loadDLLs($1)"
+  js_loadDLLs :: JSString -> IO ()
 
 loadArchive :: String -> IO ()
 loadArchive f = throwIO $ ErrorCall $ "loadArchive: unsupported on wasm for " <> f
@@ -94,17 +106,16 @@ unloadObj f = throwIO $ ErrorCall $ "unloadObj: unsupported on wasm for " <> f
 purgeObj :: String -> IO ()
 purgeObj f = throwIO $ ErrorCall $ "purgeObj: unsupported on wasm for " <> f
 
-lookupSymbol :: String -> IO (Maybe (Ptr a))
-lookupSymbol sym = do
-  r <- js_lookupSymbol $ toJSString sym
+lookupSymbol :: BS.ShortByteString -> IO (Maybe (Ptr a))
+lookupSymbol sym@(BS.SBS ba#) = do
+  r <- js_lookupSymbolPtr ba# (BS.length sym)
   evaluate $ if r == nullPtr then Nothing else Just r
 
-foreign import javascript unsafe "__ghc_wasm_jsffi_dyld.lookupSymbol($1)"
-  js_lookupSymbol :: JSString -> IO (Ptr a)
+foreign import javascript unsafe "__ghc_wasm_jsffi_dyld.lookupSymbolPtr($1,$2)"
+  js_lookupSymbolPtr :: ByteArray# -> Int -> IO (Ptr a)
 
-lookupSymbolInDLL :: Ptr LoadedDLL -> String -> IO (Maybe (Ptr a))
-lookupSymbolInDLL _ sym =
-  throwIO $ ErrorCall $ "lookupSymbolInDLL: unsupported on wasm for " <> sym
+lookupSymbolInDLL :: Ptr LoadedDLL -> BS.ShortByteString -> IO (Maybe (Ptr a))
+lookupSymbolInDLL _ _ = pure Nothing
 
 resolveObjs :: IO Bool
 resolveObjs = pure True
@@ -140,27 +151,27 @@ initObjLinker :: ShouldRetainCAFs -> IO ()
 initObjLinker RetainCAFs = c_initLinker_ 1
 initObjLinker _ = c_initLinker_ 0
 
-lookupSymbol :: String -> IO (Maybe (Ptr a))
+lookupSymbol :: BS.ShortByteString -> IO (Maybe (Ptr a))
 lookupSymbol str_in = do
    let str = prefixUnderscore str_in
-   withCAString str $ \c_str -> do
+   BS.useAsCString str $ \c_str -> do
      addr <- c_lookupSymbol c_str
      if addr == nullPtr
         then return Nothing
         else return (Just addr)
 
-lookupSymbolInDLL :: Ptr LoadedDLL -> String -> IO (Maybe (Ptr a))
+lookupSymbolInDLL :: Ptr LoadedDLL -> BS.ShortByteString -> IO (Maybe (Ptr a))
 lookupSymbolInDLL dll str_in = do
    let str = prefixUnderscore str_in
-   withCAString str $ \c_str -> do
+   BS.useAsCString str $ \c_str -> do
      addr <- c_lookupSymbolInNativeObj dll c_str
      if addr == nullPtr
        then return Nothing
        else return (Just addr)
 
-prefixUnderscore :: String -> String
+prefixUnderscore :: BS.ShortByteString -> BS.ShortByteString
 prefixUnderscore
- | cLeadingUnderscore = ('_':)
+ | cLeadingUnderscore = BS.cons (fromIntegral (ord '_'))
  | otherwise          = id
 
 -- | loadDLL loads a dynamic library using the OS's native linker
@@ -241,6 +252,16 @@ resolveObjs = do
    r <- c_resolveObjs
    return (r /= 0)
 
+loadDLLs :: [String] -> IO (Either String [Ptr LoadedDLL])
+loadDLLs = foldrM load_one $ Right []
+  where
+    load_one _ err@(Left _) = pure err
+    load_one p (Right dlls) = do
+      r <- loadDLL p
+      pure $ case r of
+        Left err -> Left err
+        Right dll -> Right $ dll : dlls
+
 -- ---------------------------------------------------------------------------
 -- Foreign declarations to RTS entry points which does the real work;
 -- ---------------------------------------------------------------------------
@@ -279,7 +300,7 @@ isWindowsHost = False
 
 #endif
 
-lookupClosure :: String -> IO (Maybe HValueRef)
+lookupClosure :: BS.ShortByteString -> IO (Maybe HValueRef)
 lookupClosure str = do
   m <- lookupSymbol str
   case m of

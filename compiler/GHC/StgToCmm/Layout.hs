@@ -23,6 +23,7 @@ module GHC.StgToCmm.Layout (
         mkVirtHeapOffsetsWithPadding,
         mkVirtConstrOffsets,
         mkVirtConstrSizes,
+        litsWithPaddingToLits,
         getHpRelOffset,
 
         ArgRep(..), toArgRep, toArgRepOrV, idArgRep, argRepSizeW, -- re-exported from GHC.StgToCmm.ArgRep
@@ -56,7 +57,8 @@ import GHC.Platform.Profile
 import GHC.Unit
 
 import GHC.Utils.Misc
-import Data.List (mapAccumL, partition)
+import Data.List (mapAccumL, partition, sortBy)
+import Data.Ord (comparing)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
@@ -65,6 +67,7 @@ import Control.Monad
 import GHC.StgToCmm.Config (stgToCmmPlatform)
 import GHC.StgToCmm.Types
 import Data.List.NonEmpty (nonEmpty)
+import GHC.Types.Literal
 
 ------------------------------------------------------------------------
 --                Call and return sequences
@@ -240,7 +243,7 @@ slowCall fun stg_args
              end_lbl <- newBlockId
 
              let correct_arity = cmmEqWord platform (funInfoArity profile fun_iptr)
-                                                    (mkIntExpr platform n_args)
+                                                    (mkIntExpr platform (toTargetInt n_args))
 
              tscope <- getTickScope
              emit (mkCbranch (cmmIsTagged platform funv)
@@ -422,6 +425,10 @@ data FieldOffOrPadding a
     | Padding ByteOff  -- Length of padding in bytes.
               ByteOff  -- Offset in bytes.
 
+instance Outputable a => Outputable (FieldOffOrPadding a) where
+    ppr (FieldOff (NonVoid a) off) = text "Field" <+> ppr a <+> text "at offset" <+> int off
+    ppr (Padding size off) = text "Padding of size" <+> int size <+> text "at offset" <+> int off
+
 -- | Used to tell the various @mkVirtHeapOffsets@ functions what kind
 -- of header the object has.  This will be accounted for in the
 -- offsets of the fields returned.
@@ -459,10 +466,19 @@ mkVirtHeapOffsetsWithPadding profile header things =
       ThunkHeader -> thunkHdrSize profile
     hdr_bytes = wordsToBytes platform hdr_words
 
-    (ptrs, non_ptrs) = partition (isGcPtrRep . fst . fromNonVoid) things
+    (ptrs, unsorted_non_ptrs) = partition (isGcPtrRep . fst . fromNonVoid) things
+
+    -- Sort the non-pointer fields by their size, starting with the largest
+    -- size, so that we can pack them more efficiently.
+
+    cmp_sizes (NonVoid (rep1, _)) (NonVoid (rep2, _)) =
+        comparing (primRepSizeB platform) rep2 rep1
+
+    non_ptrs = sortBy cmp_sizes unsorted_non_ptrs
 
     (bytes_of_ptrs, ptrs_w_offsets) =
        mapAccumL computeOffset 0 ptrs
+
     (tot_bytes, non_ptrs_w_offsets) =
        mapAccumL computeOffset bytes_of_ptrs non_ptrs
 
@@ -502,6 +518,25 @@ mkVirtHeapOffsetsWithPadding profile header things =
                              , field_off
                              ]
 
+-- | Flatten a list of @'FieldOffOrPadding' StgArg@ into a list of @NonVoid StgArg@
+-- by decompose padding into zero-valued 'StgLitArgs' units of length 8, 4, 2, or 1 bytes.
+litsWithPaddingToLits :: [FieldOffOrPadding StgArg] -> [NonVoid StgArg]
+litsWithPaddingToLits = concatMap $ \case
+  FieldOff (NonVoid arg) _ -> [NonVoid arg]
+  Padding size _ -> map (NonVoid . StgLitArg) (zeroBytes size)
+  where
+    -- Make literals of value 0 for a total of n bytes of padding.
+    zeroBytes :: ByteOff -> [Literal]
+    zeroBytes n
+      | n == 0       = []
+      | n == 1       = [LitNumber LitNumWord8  0]
+      | n == 2       = [LitNumber LitNumWord16 0]
+      | n == 4       = [LitNumber LitNumWord32 0]
+      | n == 8       = [LitNumber LitNumWord64 0]
+      | testBit n 0  = LitNumber LitNumWord8  0 : zeroBytes (n-1)
+      | testBit n 1  = LitNumber LitNumWord16 0 : zeroBytes (n-2)
+      | testBit n 2  = LitNumber LitNumWord32 0 : zeroBytes (n-4)
+      | otherwise    = LitNumber LitNumWord64 0 : zeroBytes (n-8)
 
 mkVirtHeapOffsets
   :: Profile

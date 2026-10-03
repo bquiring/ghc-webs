@@ -52,6 +52,7 @@ module GHC.Internal.Foreign.Marshal.Utils (
   fillBytes,
 ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Ptr                  ( Ptr(..), nullPtr )
 import GHC.Internal.Foreign.Storable         ( Storable(poke) )
@@ -59,7 +60,10 @@ import GHC.Internal.Foreign.Marshal.Alloc    ( malloc, alloca )
 import GHC.Internal.Word                 ( Word8(..) )
 
 import GHC.Internal.Num
-import GHC.Internal.Base
+import GHC.Internal.Prim (
+    coerce, copyAddrToAddr#, copyAddrToAddrNonOverlapping#, setAddrRange#,
+    word2Int#, word8ToWord#,
+  )
 
 -- combined allocation and marshalling
 -- -----------------------------------

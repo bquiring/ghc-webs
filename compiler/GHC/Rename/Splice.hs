@@ -1,6 +1,4 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE MultiWayIf #-}
 
 module GHC.Rename.Splice (
         rnTopSpliceDecls,
@@ -33,7 +31,7 @@ import GHC.Rename.Unbound ( isUnboundName )
 import GHC.Rename.Module  ( rnSrcDecls, findSplice )
 import GHC.Rename.Pat     ( rnPat )
 import GHC.Types.Error
-import GHC.Types.Basic    ( TopLevelFlag, isTopLevel, maxPrec )
+import GHC.Types.Basic    ( maxPrec )
 import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.ThLevelIndex
 import GHC.Utils.Outputable
@@ -41,20 +39,18 @@ import GHC.Unit.Module
 import GHC.Types.SrcLoc
 import GHC.Rename.HsType ( rnLHsType )
 
-import Control.Monad    ( unless, when )
+import Control.Monad    ( unless, when, void )
 
 import {-# SOURCE #-} GHC.Rename.Expr ( rnLExpr )
 
-import GHC.Tc.Utils.Env     ( tcMetaTy )
+import GHC.Tc.Utils.Env     ( tcMetaKnownOccTy )
 
 import GHC.Driver.DynFlags
 import GHC.Data.FastString
 import GHC.Utils.Logger
 import GHC.Utils.Panic
 import GHC.Driver.Hooks
-import GHC.Builtin.Names.TH ( decsQTyConName, expQTyConName
-                            , patQTyConName, quoteDecName, quoteExpName
-                            , quotePatName, quoteTypeName, typeQTyConName)
+import GHC.Builtin.TH
 
 import {-# SOURCE #-} GHC.Tc.Gen.Expr   ( tcCheckPolyExpr )
 import {-# SOURCE #-} GHC.Tc.Gen.Splice
@@ -68,10 +64,11 @@ import {-# SOURCE #-} GHC.Tc.Gen.Splice
 import GHC.Tc.Zonk.Type
 
 import GHCi.RemoteTypes ( ForeignRef )
-import qualified GHC.Boot.TH.Syntax as TH (Q)
+import qualified GHC.Boot.TH.Monad  as TH (Q)
 
 import qualified GHC.LanguageExtensions as LangExt
 import qualified Data.Set as Set
+import Language.Haskell.Syntax.Text
 
 {-
 ************************************************************************
@@ -119,7 +116,7 @@ occurred in a typed splice: #24190.)
 
 -}
 
-rnTypedBracket :: HsExpr GhcPs -> LHsExpr GhcPs -> RnM (HsExpr GhcRn, FreeVars)
+rnTypedBracket :: HsExpr GhcPs -> LHsExpr GhcPs -> RnM (HsExpr GhcRn, FreeNames)
 rnTypedBracket e br_body
   = addErrCtxt (TypedTHBracketCtxt br_body) $
     do { checkForTemplateHaskellQuotes e
@@ -147,7 +144,7 @@ rnTypedBracket e br_body
 
        }
 
-rnUntypedBracket :: HsExpr GhcPs -> HsQuote GhcPs -> RnM (HsExpr GhcRn, FreeVars)
+rnUntypedBracket :: HsExpr GhcPs -> HsQuote GhcPs -> RnM (HsExpr GhcRn, FreeNames)
 rnUntypedBracket e br_body
   = addErrCtxt (UntypedTHBracketCtxt br_body) $
     do { checkForTemplateHaskellQuotes e
@@ -181,19 +178,20 @@ rnUntypedBracket e br_body
 
        }
 
-rn_utbracket :: HsQuote GhcPs -> RnM (HsQuote GhcRn, FreeVars)
-rn_utbracket (VarBr _ flg rdr_name)
-  = do { name <- lookupOccRn (if flg then WL_Term else WL_Type) (unLoc rdr_name)
-       ; let res_name = L (l2l (locA rdr_name)) (WithUserRdr (unLoc rdr_name) name)
-       ; if flg then checkThLocalNameNoLift res_name else checkThLocalTyName name
-       ; check_namespace flg name
-       ; return (VarBr noExtField flg (noLocA name), unitFV name) }
+rn_utbracket :: HsQuote GhcPs -> RnM (HsQuote GhcRn, FreeNames)
+rn_utbracket (VarBr _ is_value_name rdr_name)
+  = do { gre <- lookupOccRnGRE (if is_value_name then WL_Term else WL_Type) (unLoc rdr_name)
+       ; let loc_name = L (l2l (locA rdr_name)) (WithUserRdr (unLoc rdr_name) gre)
+       ; let name = greName gre
+       ; if is_value_name then checkThLocalNameNoLift loc_name else checkThLocalTyName gre
+       ; check_namespace is_value_name $ greName gre
+       ; return (VarBr noExtField is_value_name (fmap (greName . unwrapUserRdr) loc_name), unitFN name) }
 
 rn_utbracket (ExpBr _ e) = do { (e', fvs) <- rnLExpr e
                                 ; return (ExpBr noExtField e', fvs) }
 
 rn_utbracket (PatBr _ p)
-  = rnPat ThPatQuote p $ \ p' -> return (PatBr noExtField p', emptyFVs)
+  = rnPat ThPatQuote p $ \ p' -> return (PatBr noExtField p', emptyFNs)
 
 rn_utbracket (TypBr _ t) = do { (t', fvs) <- rnLHsType TypBrCtx t
                                 ; return (TypBr noExtField t', fvs) }
@@ -272,12 +270,12 @@ returns a bogus term/type, so that it can report more than one error.
 We don't want the type checker to see these bogus unbound variables.
 -}
 
-rnUntypedSpliceGen :: (HsUntypedSplice GhcRn -> RnM (a, FreeVars))
+rnUntypedSpliceGen :: (HsUntypedSplice GhcRn -> RnM (a, FreeNames))
                                                     -- Outside brackets, run splice
                    -> (UntypedSpliceFlavour, HsUntypedSpliceResult z -> HsUntypedSplice GhcRn -> RnM a)
                                                    -- Inside brackets, make it pending
                    -> HsUntypedSplice GhcPs
-                   -> RnM (a, FreeVars)
+                   -> RnM (a, FreeNames)
 rnUntypedSpliceGen run_splice (flavour, run_pending) splice
   = addErrCtxt (UntypedSpliceCtxt splice) $ do
     { level <- getThLevel
@@ -305,7 +303,7 @@ rnUntypedSpliceGen run_splice (flavour, run_pending) splice
                    -- renaming it failed; otherwise we get a cascade of
                    -- errors from e.g. unbound variables
                  ; (result, fvs2) <- run_splice splice'
-                 ; return (result, fvs1 `plusFV` fvs2) } }
+                 ; return (result, fvs1 `plusFN` fvs2) } }
 
 
 -- Nested splices are fine without TemplateHaskell because they
@@ -340,13 +338,13 @@ runRnSplice flavour run_meta ppr_res splice
             Just h  -> h splice
 
        -- TODO: Should call tcUntypedSplice here
-       ; let the_expr = case splice' of
-                HsUntypedSpliceExpr _ e ->  e
-                HsQuasiQuote _ q str -> mkQuasiQuoteExpr flavour q str
-                XUntypedSplice {} -> pprPanic "runRnSplice: XUntypedSplice" (pprUntypedSplice False Nothing splice')
+       ; the_expr <- case splice' of
+            HsUntypedSpliceExpr _ e -> pure e
+            HsQuasiQuote _ q str -> fst <$> rnLExpr (mkQuasiQuoteExpr flavour q str)
+            XUntypedSplice {} -> pprPanic "runRnSplice: XUntypedSplice" (pprUntypedSplice False Nothing splice')
 
              -- Typecheck the expression
-       ; meta_exp_ty   <- tcMetaTy meta_ty_name
+       ; meta_exp_ty   <- tcMetaKnownOccTy meta_ty_name
        ; zonked_q_expr <- zonkTopLExpr =<<
                             tcTopSpliceExpr Untyped
                               (tcCheckPolyExpr the_expr meta_exp_ty)
@@ -365,10 +363,10 @@ runRnSplice flavour run_meta ppr_res splice
 
   where
     meta_ty_name = case flavour of
-                       UntypedExpSplice  -> expQTyConName
-                       UntypedPatSplice  -> patQTyConName
-                       UntypedTypeSplice -> typeQTyConName
-                       UntypedDeclSplice -> decsQTyConName
+                       UntypedExpSplice  -> expQTyConOcc
+                       UntypedPatSplice  -> patQTyConOcc
+                       UntypedTypeSplice -> typeQTyConOcc
+                       UntypedDeclSplice -> decsQTyConOcc
     what = case flavour of
                   UntypedExpSplice  -> "expression"
                   UntypedPatSplice  -> "pattern"
@@ -394,19 +392,19 @@ recordPendingSplice _ _ (TcPending _ _ _) = panic "impossible"
 
 ------------------
 mkQuasiQuoteExpr :: UntypedSpliceFlavour -> LIdP GhcRn
-                 -> XRec GhcPs FastString
-                 -> LHsExpr GhcRn
+                 -> XRec GhcPs HText
+                 -> LHsExpr GhcPs
 -- Return the expression (quoter "...quote...")
 -- which is what we must run in a quasi-quote
 mkQuasiQuoteExpr flavour quoter (L q_span' quote)
   = L q_span $ HsApp noExtField (L q_span
              $ HsApp noExtField (L q_span
-                    (mkHsVar (L (l2l q_span) quote_selector)))
+                    (mkHsVar (L (l2l q_span) (Exact (ExactOcc quote_selector)))))
                                 quoterExpr)
                     quoteExpr
   where
     q_span = noAnnSrcSpan (locA q_span')
-    quoterExpr = L (l2l quoter) $! mkHsVar          $! quoter
+    quoterExpr = L (l2l quoter) $! mkHsVar    $! Exact . ExactName <$> quoter
     quoteExpr  = L q_span $! HsLit noExtField $! HsString NoSourceText quote
     quote_selector = case flavour of
                        UntypedExpSplice  -> quoteExpName
@@ -424,7 +422,7 @@ unqualSplice = mkRdrUnqual (mkVarOccFS (fsLit "spn"))
 rnUntypedSplice :: HsUntypedSplice GhcPs
                 -> UntypedSpliceFlavour
                 -> RnM ( HsUntypedSplice GhcRn
-                       , FreeVars)
+                       , FreeNames)
 -- Not exported...used for all
 rnUntypedSplice (HsUntypedSpliceExpr _ expr) flavour
   = do  { (expr', fvs) <- rnLExpr expr
@@ -432,14 +430,15 @@ rnUntypedSplice (HsUntypedSpliceExpr _ expr) flavour
 
 rnUntypedSplice (HsQuasiQuote _ quoter quote) flavour
   = do  { -- Rename the quoter; akin to the HsVar case of rnExpr
-        ; quoter' <- lookupLocatedOccRn WL_TermVariable quoter
+        ; quoter' <- lookupLocatedOccRnGRE WL_TermVariable quoter
         ; let res_name = WithUserRdr (unLoc quoter) <$> quoter'
         ; checkThLocalNameNoLift res_name
-        ; return (HsQuasiQuote (HsQuasiQuoteExt flavour) quoter' quote, unitFV (unLoc quoter')) }
+        ; let loc_name = fmap greName quoter'
+        ; return (HsQuasiQuote (HsQuasiQuoteExt flavour) loc_name quote, unitFN (unLoc loc_name)) }
 
 ---------------------
 rnTypedSplice :: HsTypedSplice GhcPs -- Typed splice expression
-              -> RnM (HsExpr GhcRn, FreeVars)
+              -> RnM (HsExpr GhcRn, FreeNames)
 rnTypedSplice sp@(HsTypedSpliceExpr _ expr)
   = addErrCtxt (TypedSpliceCtxt Nothing sp) $ do
     { level <- getThLevel
@@ -472,14 +471,14 @@ rnTypedSplice sp@(HsTypedSpliceExpr _ expr)
                                             | gre <- globalRdrEnvElts gbl_rdr
                                             , isLocalGRE gre]
                       lcl_names = mkNameSet (localRdrEnvElts lcl_rdr)
-                      fvs2      = lcl_names `plusFV` gbl_names
+                      fvs2      = lcl_names `plusFN` gbl_names
 
-                ; return (HsTypedSplice HsTypedSpliceTop (HsTypedSpliceExpr noExtField result), fvs1 `plusFV` fvs2) } }
+                ; return (HsTypedSplice HsTypedSpliceTop (HsTypedSpliceExpr noExtField result), fvs1 `plusFN` fvs2) } }
   where
-    rn_splice :: RnM (LHsExpr GhcRn, FreeVars)
+    rn_splice :: RnM (LHsExpr GhcRn, FreeNames)
     rn_splice = rnLExpr expr
 
-rnUntypedSpliceExpr :: HsUntypedSplice GhcPs -> RnM (HsExpr GhcRn, FreeVars)
+rnUntypedSpliceExpr :: HsUntypedSplice GhcPs -> RnM (HsExpr GhcRn, FreeNames)
 rnUntypedSpliceExpr splice
   = rnUntypedSpliceGen run_expr_splice pend_expr_splice splice
   where
@@ -663,7 +662,7 @@ References:
 -}
 
 ----------------------
-rnSpliceType :: HsUntypedSplice GhcPs -> RnM (HsType GhcRn, FreeVars)
+rnSpliceType :: HsUntypedSplice GhcPs -> RnM (HsType GhcRn, FreeNames)
 rnSpliceType splice
   = rnUntypedSpliceGen run_type_splice pend_type_splice splice
   where
@@ -671,7 +670,7 @@ rnSpliceType splice
        = ( UntypedTypeSplice
          , \x y -> pure $ HsSpliceTy x y)
 
-    run_type_splice :: HsUntypedSplice GhcRn -> RnM (HsType GhcRn, FreeVars)
+    run_type_splice :: HsUntypedSplice GhcRn -> RnM (HsType GhcRn, FreeNames)
     run_type_splice rn_splice
       = do { traceRn "rnSpliceType: untyped type splice" empty
            ; (hs_ty2, mod_finalizers) <-
@@ -743,7 +742,7 @@ whole signature, instead of as an arbitrary type.
 ----------------------
 -- | Rename a splice pattern. See Note [rnSplicePat]
 rnSplicePat :: HsUntypedSplice GhcPs -> RnM ( (HsUntypedSplice GhcRn, HsUntypedSpliceResult (LPat GhcPs))
-                                            , FreeVars)
+                                            , FreeNames)
 rnSplicePat splice
   = rnUntypedSpliceGen run_pat_splice pend_pat_splice splice
   where
@@ -757,13 +756,13 @@ rnSplicePat splice
                 runRnSplice UntypedPatSplice runMetaP ppr rn_splice
              -- See Note [Delaying modFinalizers in untyped splices].
            ; let p = HsUntypedSpliceTop (ThModFinalizers mod_finalizers) pat
-           ; return ((rn_splice, p), emptyFVs) }
+           ; return ((rn_splice, p), emptyFNs) }
               -- Wrap the result of the quasi-quoter in parens so that we don't
               -- lose the outermost location set by runQuasiQuote (#7918)
 
 -- | Rename a splice type pattern. Much the same as `rnSplicePat`, but works with LHsType instead of LPat
 rnSpliceTyPat :: HsUntypedSplice GhcPs -> RnM ( (HsUntypedSplice GhcRn, HsUntypedSpliceResult (LHsType GhcPs))
-                                            , FreeVars)
+                                            , FreeNames)
 rnSpliceTyPat splice
   = rnUntypedSpliceGen run_ty_pat_splice pend_ty_pat_splice splice
   where
@@ -777,12 +776,12 @@ rnSpliceTyPat splice
                 runRnSplice UntypedTypeSplice runMetaT ppr rn_splice
              -- See Note [Delaying modFinalizers in untyped splices].
            ; let t = HsUntypedSpliceTop (ThModFinalizers mod_finalizers) ty
-           ; return ((rn_splice, t), emptyFVs) }
+           ; return ((rn_splice, t), emptyFNs) }
               -- Wrap the result of the quasi-quoter in parens so that we don't
               -- lose the outermost location set by runQuasiQuote (#7918)
 
 ----------------------
-rnSpliceDecl :: SpliceDecl GhcPs -> RnM (SpliceDecl GhcRn, FreeVars)
+rnSpliceDecl :: SpliceDecl GhcPs -> RnM (SpliceDecl GhcRn, FreeNames)
 rnSpliceDecl (SpliceDecl _ (L loc splice) flg)
   = rnUntypedSpliceGen run_decl_splice pend_decl_splice splice
   where
@@ -792,7 +791,7 @@ rnSpliceDecl (SpliceDecl _ (L loc splice) flg)
 
     run_decl_splice rn_splice  = pprPanic "rnSpliceDecl" (pprUntypedSplice True Nothing rn_splice)
 
-rnTopSpliceDecls :: HsUntypedSplice GhcPs -> RnM ([LHsDecl GhcPs], FreeVars)
+rnTopSpliceDecls :: HsUntypedSplice GhcPs -> RnM ([LHsDecl GhcPs], FreeNames)
 -- Declaration splice at the very top level of the module
 rnTopSpliceDecls splice
    =  do { checkTopSpliceAllowed splice
@@ -908,19 +907,18 @@ traceSplice (SpliceInfo { spliceDescription = sd, spliceSource = mb_src
       = vcat [ text "--" <+> ppr loc <> colon <+> text "Splicing" <+> text sd
              , gen ]
 
-checkThLocalTyName :: Name -> RnM ()
-checkThLocalTyName name
+checkThLocalTyName :: GlobalRdrElt -> RnM ()
+checkThLocalTyName gre
   | isUnboundName name   -- Do not report two errors for
   = return ()            --   $(not_in_scope args)
 
   | otherwise
   = do  { traceRn "checkThLocalTyName" (ppr name)
-        ; mb_local_use <- getCurrentAndBindLevel name
+        ; mb_local_use <- getCurrentAndBindLevel gre
         ; case mb_local_use of {
              Nothing -> return () ;  -- Not a locally-bound thing
              Just (top_lvl, bind_lvl, use_lvl) ->
-    do  { let use_lvl_idx = thLevelIndex use_lvl
-        -- We don't check the well levelledness of name here.
+    do  -- We don't check the well levelledness of name here.
         -- this would break test for #20969
         --
         -- Consequently there is no check&restiction for top level splices.
@@ -929,66 +927,75 @@ checkThLocalTyName name
         -- Therefore checkCrossLevelLiftingTy shouldn't assume anything
         -- about bind_lvl and use_lvl relation.
         --
-        ; traceRn "checkThLocalTyName" (ppr name <+> ppr bind_lvl
+        { traceRn "checkThLocalTyName" (ppr name <+> ppr bind_lvl
                                                  <+> ppr use_lvl
                                                  <+> ppr use_lvl)
         ; dflags <- getDynFlags
-        ; checkCrossLevelLiftingTy dflags top_lvl bind_lvl use_lvl use_lvl_idx name } } }
+        ; checkCrossLevelLiftingTy dflags top_lvl bind_lvl use_lvl name } } }
+  where name = greName gre
 
 -- | Check whether we are allowed to use a Name in this context (for TH purposes)
 -- In the case of a level incorrect program, attempt to fix it by using
 -- a Lift constraint.
-checkThLocalNameWithLift :: LIdOccP GhcRn -> RnM (HsExpr GhcRn)
+checkThLocalNameWithLift :: LocatedN (WithUserRdr GlobalRdrElt) -> RnM (HsExpr GhcRn)
 checkThLocalNameWithLift = checkThLocalName True
 
 -- | Check whether we are allowed to use a Name in this context (for TH purposes)
 -- In the case of a level incorrect program, do not attempt to fix it by using
 -- a Lift constraint.
-checkThLocalNameNoLift :: LIdOccP GhcRn -> RnM ()
-checkThLocalNameNoLift name = checkThLocalName False name >> return ()
+checkThLocalNameNoLift :: LocatedN (WithUserRdr GlobalRdrElt) -> RnM ()
+checkThLocalNameNoLift = void . checkThLocalName False
 
--- | Implemenation of the level checks
+-- | Implementation of the level checks
 -- See Note [Template Haskell levels]
-checkThLocalName :: Bool -> LIdOccP GhcRn -> RnM (HsExpr GhcRn)
-checkThLocalName allow_lifting name_var
+checkThLocalName :: Bool -> LocatedN (WithUserRdr GlobalRdrElt) -> RnM (HsExpr GhcRn)
+checkThLocalName allow_lifting loc_gre
   -- Exact and Orig names are not imported, so presumed available at all levels.
-  | isExact (userRdrName (unLoc name_var)) || isOrig (userRdrName (unLoc name_var))
+  -- whenever the user uses exact names, e.g. say @'mkNameG_v' "" "Foo" "bar"@,
+  -- even though the 'mkNameG_v' here is essentially a quotation, we do not do
+  -- level checks as we assume that the user was trying to bypass the level checks
+  | isExact rdr || isOrig rdr
   = return (HsVar noExtField name_var)
-  | isUnboundName name   -- Do not report two errors for
-  = return (HsVar noExtField name_var)            --   $(not_in_scope args)
+  | isUnboundName name                  -- Do not report two errors for
+  = return (HsVar noExtField name_var)  --   $(not_in_scope args)
   | isWiredInName name
   = return (HsVar noExtField name_var)
   | otherwise
   = do  {
-          mb_local_use <- getCurrentAndBindLevel name
+          mb_local_use <- getCurrentAndBindLevel $ unwrap loc_gre
         ; case mb_local_use of {
              Nothing -> return (HsVar noExtField name_var) ;  -- Not a locally-bound thing
              Just (top_lvl, bind_lvl, use_lvl) ->
-    do  { let use_lvl_idx = thLevelIndex use_lvl
-        ; cur_mod <- extractModule <$> getGblEnv
+    do  { cur_mod <- extractModule <$> getGblEnv
         ; let is_local
                   | Just mod <- nameModule_maybe name = mod == cur_mod
                   | otherwise = True
-        ; traceRn "checkThLocalName" (ppr name <+> ppr bind_lvl <+> ppr use_lvl <+> ppr use_lvl)
         ; dflags <- getDynFlags
-        ; env <- getGlobalRdrEnv
-        ; let mgre = lookupGRE_Name env name
-        ; checkCrossLevelLifting dflags (LevelCheckSplice name mgre) top_lvl is_local allow_lifting bind_lvl use_lvl use_lvl_idx name_var } } }
-  where
-    name = getName name_var
+        ; checkCrossLevelLifting dflags (LevelCheckSplice $ unLoc loc_gre) top_lvl is_local allow_lifting bind_lvl use_lvl name_var } } }
+  where rdr = userRdrName $ unLoc name_var
+        name_var = fmap greName <$> loc_gre
+        name = unwrap name_var
+        unwrap = unwrapUserRdr . unLoc
 
 --------------------------------------
 checkCrossLevelLifting :: DynFlags
                        -> LevelCheckReason
                        -> TopLevelFlag
+                       -- ^ whether or not the identifier is a top level identifier
                        -> Bool
+                       -- ^ the name of the current module is the name of the module
+                       --   of the name that we're examining (if it exists)
                        -> Bool
+                       -- ^ whether or not the compiler is allowed to insert
+                       -- 'lift' to fix a potential staging error
                        -> Set.Set ThLevelIndex
+                       -- ^ the levels at which the identifier is bound
                        -> ThLevel
-                       -> ThLevelIndex
+                       -- ^ the level that the identifier is being used at
                        -> LIdOccP GhcRn
+                       -- ^ the identifier that is being checked
                        -> TcM (HsExpr GhcRn)
-checkCrossLevelLifting dflags reason top_lvl is_local allow_lifting bind_lvl use_lvl use_lvl_idx name_var
+checkCrossLevelLifting dflags reason top_lvl_flg is_local allow_lifting bind_lvl use_lvl name_var
   -- 1. If name is in-scope, at the correct level.
   | use_lvl_idx `Set.member` bind_lvl = return (HsVar noExtField name_var)
   -- 2. Name is imported with -XImplicitStagePersistence
@@ -996,21 +1003,24 @@ checkCrossLevelLifting dflags reason top_lvl is_local allow_lifting bind_lvl use
   , xopt LangExt.ImplicitStagePersistence dflags = return (HsVar noExtField name_var)
   -- 3. Name is top-level, with -XImplicitStagePersistence, and needs
   -- to be persisted into the future.
-  | isTopLevel top_lvl
+  | isTopLevel top_lvl_flg
   , is_local
   , any (use_lvl_idx >=) (Set.toList bind_lvl)
   , xopt LangExt.ImplicitStagePersistence dflags = when (isExternalName name) (keepAlive name) >> return (HsVar noExtField name_var)
   -- 4. Name is in a bracket, and lifting is allowed
+  --    We need to increment at most once because nested brackets are not allowed
   | Brack _ pending <- use_lvl
   , any (\bind_idx -> use_lvl_idx == incThLevelIndex bind_idx) (Set.toList bind_lvl)
   , allow_lifting
   = do
-       let mgre = case reason of
-                   LevelCheckSplice _ gre -> gre
-                   _ -> Nothing
+       let gre
+             | LevelCheckSplice rdr <- reason
+             = Just $! unwrapUserRdr rdr
+             | otherwise
+             = Nothing
        (splice_name :: Name) <- newLocalBndrRn (noLocA unqualSplice)
        let  pend_splice :: HsImplicitLiftSplice
-            pend_splice = HsImplicitLiftSplice bind_lvl use_lvl_idx mgre name_var
+            pend_splice = HsImplicitLiftSplice bind_lvl use_lvl_idx gre name_var
        -- Warning for implicit lift (#17804)
        addDetailedDiagnostic (TcRnImplicitLift name)
 
@@ -1020,10 +1030,11 @@ checkCrossLevelLifting dflags reason top_lvl is_local allow_lifting bind_lvl use
   | otherwise = addErrTc (TcRnBadlyLevelled reason bind_lvl use_lvl_idx Nothing ErrorWithoutFlag ) >> return (HsVar noExtField name_var)
   where
     name = getName name_var
+    use_lvl_idx = thLevelIndex use_lvl
 
-checkCrossLevelLiftingTy :: DynFlags -> TopLevelFlag -> Set.Set ThLevelIndex -> ThLevel -> ThLevelIndex -> Name -> TcM ()
-checkCrossLevelLiftingTy dflags top_lvl bind_lvl _use_lvl use_lvl_idx name
-  | isTopLevel top_lvl
+checkCrossLevelLiftingTy :: DynFlags -> TopLevelFlag -> Set.Set ThLevelIndex -> ThLevel -> Name -> TcM ()
+checkCrossLevelLiftingTy dflags top_lvl_flg bind_lvl use_lvl name
+  | isTopLevel top_lvl_flg
   , xopt LangExt.ImplicitStagePersistence dflags
   = return ()
 
@@ -1038,6 +1049,8 @@ checkCrossLevelLiftingTy dflags top_lvl bind_lvl _use_lvl use_lvl_idx name
 
   | otherwise
   = return ()
+  where
+  use_lvl_idx = thLevelIndex use_lvl
 
 {-
 Note [Keeping things alive for Template Haskell]

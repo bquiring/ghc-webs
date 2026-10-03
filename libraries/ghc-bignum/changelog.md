@@ -1,10 +1,16 @@
 # Changelog for `ghc-bignum` package
 
+## UNRELEASED
+
+- Add `integerSetBit[#]`, `integerClearBit[#]`, `integerComplementBit[#]` (#21176)
+
 ## 1.4
 
 - `ghc-bignum`'s implementation has been merged into `ghc-internal`.
   Downstream users should import `GHC.Num.{Integer,Natural,BigNat}` stable
   modules from `base` instead.
+- Fix bug where `naturalAndNot` was incorrectly truncating results (#26230)
+
 
 ## 1.3
 

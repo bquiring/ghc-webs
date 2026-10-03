@@ -18,6 +18,13 @@
 #if defined(TRACING)
 
 extern bool eventlog_enabled;
+#if defined(HAVE_PREEMPTION)
+// Avoid using this mutex directly if at all possible. It is needed in the
+// implementation of forkProcess.
+//
+// All uses of this mutex must use ACQUIRE_LOCK_ALWAYS/RELEASE_LOCK_ALWAYS.
+extern Mutex eventBufMutex;
+#endif
 
 void initEventLogging(void);
 void restartEventLogging(void);
@@ -27,6 +34,7 @@ void abortEventLogging(void); // #4512 - after fork child needs to abort
 void moreCapEventBufs (uint32_t from, uint32_t to);
 void flushLocalEventsBuf(Capability *cap);
 void flushAllCapsEventsBufs(void);
+void flushAllCapsEventsBufs_(void);
 void flushAllEventsBufs(Capability *cap);
 
 typedef void (*EventlogInitPost)(void);
@@ -173,7 +181,7 @@ void postHeapProfSampleString(const char *label,
                               StgWord64 residency);
 
 #if defined(PROFILING)
-void postHeapProfCostCentre(StgWord32 ccID,
+void postHeapProfCostCentre(StgInt ccID,
                             const char *label,
                             const char *module,
                             const char *srcloc,

@@ -6,15 +6,15 @@ docs:
 '<>', ':=:', 'Bool'
 -}
               identifiers:
-                {HaddockSpanIssueT24378.hs:1:6-9}
-                GHC.Internal.Data.Foldable.elem
-                {HaddockSpanIssueT24378.hs:1:6-9}
-                elem
-                {HaddockSpanIssueT24378.hs:1:14-18}
-                GHC.Internal.System.IO.print
-                {HaddockSpanIssueT24378.hs:3:2-3}
+                {EpAnn EpaSpan HaddockSpanIssueT24378.hs:4:2-3 NameAnnTrailing [] EpaComments []}
                 GHC.Internal.Base.<>
-                {HaddockSpanIssueT24378.hs:3:15-18}
+                {EpAnn EpaSpan HaddockSpanIssueT24378.hs:2:6-9 NameAnnTrailing [] EpaComments []}
+                GHC.Internal.Data.Foldable.elem
+                {EpAnn EpaSpan HaddockSpanIssueT24378.hs:2:14-18 NameAnnTrailing [] EpaComments []}
+                GHC.Internal.System.IO.print
+                {EpAnn EpaSpan HaddockSpanIssueT24378.hs:2:6-9 NameAnnTrailing [] EpaComments []}
+                elem
+                {EpAnn EpaSpan HaddockSpanIssueT24378.hs:4:15-18 NameAnnTrailing [] EpaComments []}
                 GHC.Internal.Types.Bool
        export docs:
          []
@@ -22,9 +22,9 @@ docs:
          [elem -> [text:
                      {-| '()', 'elem'.-}
                    identifiers:
-                     {HaddockSpanIssueT24378.hs:7:12-15}
+                     {EpAnn EpaSpan HaddockSpanIssueT24378.hs:8:12-15 NameAnnTrailing [] EpaComments []}
                      GHC.Internal.Data.Foldable.elem
-                     {HaddockSpanIssueT24378.hs:7:12-15}
+                     {EpAnn EpaSpan HaddockSpanIssueT24378.hs:8:12-15 NameAnnTrailing [] EpaComments []}
                      elem]]
        arg docs:
          []
@@ -34,7 +34,7 @@ docs:
        named chunks:
        haddock options:
        language:
-         Nothing
+         Just GHC2021
        language extensions:
          MonomorphismRestriction
          RelaxedPolyRec

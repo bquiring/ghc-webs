@@ -1,10 +1,4 @@
 {-# OPTIONS_GHC -Wno-orphans      #-} -- Outputable and IEWrappedName
-{-# LANGUAGE DataKinds            #-}
-{-# LANGUAGE StandaloneDeriving   #-}
-{-# LANGUAGE DeriveDataTypeable   #-}
-{-# LANGUAGE FlexibleContexts     #-}
-{-# LANGUAGE FlexibleInstances    #-}
-{-# LANGUAGE TypeApplications     #-}
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
@@ -29,9 +23,11 @@ import Language.Haskell.Syntax.ImpExp
 
 import GHC.Prelude
 
-import GHC.Types.SourceText   ( SourceText(..) )
+import GHC.Types.UnresolvedImport ( ImportDeclOrigin(..), isGeneratedImport )
+import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.SrcLoc
 import GHC.Types.Name
+import GHC.Types.Name.Reader
 import GHC.Types.PkgQual
 
 import GHC.Parser.Annotation
@@ -39,12 +35,13 @@ import GHC.Hs.Extension
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Misc ((<||>))
 
 import GHC.Unit.Module.Warnings
 
 import Data.Data
 import Data.Maybe
-import GHC.Hs.Doc (LHsDoc)
+import Language.Haskell.Syntax.Doc (LHsDoc)
 
 
 {-
@@ -78,20 +75,29 @@ type instance XCImportDecl  GhcRn = XImportDeclPass
 type instance XCImportDecl  GhcTc = DataConCantHappen
 
 data XImportDeclPass = XImportDeclPass
-    { ideclAnn        :: EpAnn EpAnnImportDecl
+    { ideclAnn        :: EpAnnImportDecl
     , ideclSourceText :: SourceText -- Note [Pragma source text] in "GHC.Types.SourceText"
-    , ideclImplicit   :: Bool
-        -- ^ GHC generates an `ImportDecl` to represent the invisible `import Prelude`
-        -- that appears in any file that omits `import Prelude`, setting
-        -- this field to indicate that the import doesn't appear in the
-        -- original source. True => implicit import (of Prelude)
+    , ideclOrigin     :: ImportDeclOrigin -- ^ See Note [Generated imports]
     }
     deriving (Data)
+
+{- Note [Generated imports]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC generates an `ImportDecl` to represent the invisible `import Prelude`
+that appears in any file that omits `import Prelude`, and the invisible import
+of `GHC.Essentials` through which known entities are resolved.
+'ideclOrigin' records that the import doesn't appear in the original source,
+and which generated import it is.
+
+Generating a real `ImportDecl` (rather than recording the dependency out of
+band) ensures they are handled consistently by the rest of the compiler.
+
+Plugins may also introduce generated imports.
+-}
 
 type instance XXImportDecl  (GhcPass _) = DataConCantHappen
 
 type instance Anno ModuleName = SrcSpanAnnA
-type instance Anno [LocatedA (IE (GhcPass p))] = SrcSpanAnnLI
 
 deriving instance Data (IEWrappedName GhcPs)
 deriving instance Data (IEWrappedName GhcRn)
@@ -101,9 +107,19 @@ deriving instance Eq (IEWrappedName GhcPs)
 deriving instance Eq (IEWrappedName GhcRn)
 deriving instance Eq (IEWrappedName GhcTc)
 
+deriving instance Data (NamespaceSpecifier GhcPs)
+deriving instance Data (NamespaceSpecifier GhcRn)
+deriving instance Data (NamespaceSpecifier GhcTc)
+
+deriving instance Eq (NamespaceSpecifier GhcPs)
+deriving instance Eq (NamespaceSpecifier GhcRn)
+deriving instance Eq (NamespaceSpecifier GhcTc)
+
 -- ---------------------------------------------------------------------
 
 -- API Annotations types
+
+type AnnListImportDecl = (EpToken "hiding", EpToken "(", EpToken ")", [EpToken ","])
 
 data EpAnnImportDecl = EpAnnImportDecl
   { importDeclAnnImport    :: EpToken "import" -- ^ The location of the @import@ keyword
@@ -113,11 +129,12 @@ data EpAnnImportDecl = EpAnnImportDecl
   , importDeclAnnQualified :: Maybe (EpToken "qualified") -- ^ The location of the @qualified@ keyword
   , importDeclAnnPackage   :: Maybe EpaLocation -- ^ The location of the package name (when using @-XPackageImports@)
   , importDeclAnnAs        :: Maybe (EpToken "as") -- ^ The location of the @as@ keyword
+  , importDeclImportList   :: AnnListImportDecl
   } deriving (Data)
 
 
 instance NoAnn EpAnnImportDecl where
-  noAnn = EpAnnImportDecl noAnn  Nothing Nothing  noAnn  Nothing  Nothing  Nothing
+  noAnn = EpAnnImportDecl noAnn  Nothing Nothing  noAnn  Nothing  Nothing  Nothing noAnn
 
 data EpAnnLevel = EpAnnLevelSplice (EpToken "splice")
                 | EpAnnLevelQuote (EpToken "quote")
@@ -131,7 +148,7 @@ instance HasLoc EpAnnLevel where
 
 simpleImportDecl :: ModuleName -> ImportDecl GhcPs
 simpleImportDecl mn = ImportDecl {
-      ideclExt        = XImportDeclPass noAnn NoSourceText False,
+      ideclExt        = XImportDeclPass noAnn NoSourceText UserWrittenImport,
       ideclName       = noLocA mn,
       ideclPkgQual    = NoRawPkgQual,
       ideclSource     = NotBoot,
@@ -152,20 +169,20 @@ instance (OutputableBndrId p
                     , ideclLevelSpec = level
                     , ideclQualified = qual
                     , ideclAs = as, ideclImportList = spec })
-      = hang (hsep [text "import", ppr_imp impExt from, pp_implicit impExt,
+      = hang (hsep [text "import", ppr_imp impExt from, pp_generated impExt,
                     pp_level level False, pp_safe safe, pp_qual qual False,
                     ppr pkg, ppr mod',
                     pp_level level True, pp_qual qual True,
                     pp_as as])
              4 (pp_spec spec)
       where
-        pp_implicit ext =
-            let implicit = case ghcPass @p of
-                            GhcPs | XImportDeclPass { ideclImplicit = implicit } <- ext -> implicit
-                            GhcRn | XImportDeclPass { ideclImplicit = implicit } <- ext -> implicit
+        pp_generated ext =
+            let origin = case ghcPass @p of
+                            GhcPs | XImportDeclPass { ideclOrigin = origin } <- ext -> origin
+                            GhcRn | XImportDeclPass { ideclOrigin = origin } <- ext -> origin
                             GhcTc -> dataConCantHappen ext
-            in if implicit then text "(implicit)"
-                           else empty
+            in if isGeneratedImport origin then text "(generated)"
+                                           else empty
 
         pp_qual QualifiedPre False = text "qualified" -- Prepositive qualifier/prepositive position.
         pp_qual QualifiedPost True = text "qualified" -- Postpositive qualifier/postpositive position.
@@ -198,9 +215,9 @@ instance (OutputableBndrId p
                   SourceText src -> ftext src <+> text "#-}"
         ppr_imp _ NotBoot = empty
 
-        pp_spec Nothing             = empty
-        pp_spec (Just (Exactly, (L _ ies))) = ppr_ies ies
-        pp_spec (Just (EverythingBut, (L _ ies))) = text "hiding" <+> ppr_ies ies
+        pp_spec Nothing                     = empty
+        pp_spec (Just (Exactly,       ies)) = ppr_ies ies
+        pp_spec (Just (EverythingBut, ies)) = text "hiding" <+> ppr_ies ies
 
         ppr_ies []  = text "()"
         ppr_ies ies = char '(' <+> interpp'SP ies <+> char ')'
@@ -220,6 +237,11 @@ type instance XIEType    (GhcPass _) = EpToken "type"
 type instance XIEData    (GhcPass _) = EpToken "data"
 type instance XXIEWrappedName (GhcPass _) = DataConCantHappen
 
+type instance XNoNamespaceSpecifier   (GhcPass _) = NoExtField
+type instance XTypeNamespaceSpecifier (GhcPass _) = EpToken "type"
+type instance XDataNamespaceSpecifier (GhcPass _) = EpToken "data"
+type instance XXNamespaceSpecifier    (GhcPass _) = DataConCantHappen
+
 type instance Anno (IEWrappedName (GhcPass _)) = SrcSpanAnnA
 
 type instance Anno (IE (GhcPass p)) = SrcSpanAnnA
@@ -238,12 +260,17 @@ type instance XIEThingAbs  GhcPs = Maybe (LWarningTxt GhcPs)
 type instance XIEThingAbs  GhcRn = Maybe (LWarningTxt GhcRn)
 type instance XIEThingAbs  GhcTc = ()
 
--- The additional field of type 'Maybe (WarningTxt pass)' holds information
--- about export deprecation annotations and is thus set to Nothing when `IE`
--- is used in an import list (since export deprecation can only be used in exports)
-type instance XIEThingAll  GhcPs = (Maybe (LWarningTxt GhcPs), (EpToken "(", EpToken "..", EpToken ")"))
-type instance XIEThingAll  GhcRn = (Maybe (LWarningTxt GhcRn), (EpToken "(", EpToken "..", EpToken ")"))
-type instance XIEThingAll  GhcTc = (EpToken "(", EpToken "..", EpToken ")")
+data IEThingAllExt pass =
+  IEThingAllExt {
+    ieta_warning  :: Maybe (LWarningTxt pass),
+      -- ^ Export deprecation annotation. Always 'Nothing' for import lists,
+      -- since export deprecation can only be used in exports.
+    ieta_tok_lpar :: EpToken "(",
+    ieta_tok_wc   :: EpToken "..",
+    ieta_tok_rpar :: EpToken ")"
+  }
+
+type instance XIEThingAll (GhcPass p) = IEThingAllExt (GhcPass p)
 
 -- The additional field of type 'Maybe (WarningTxt pass)' holds information
 -- about export deprecation annotations and is thus set to Nothing when `IE`
@@ -261,6 +288,17 @@ type instance XIEModuleContents  GhcPs = (Maybe (LWarningTxt GhcPs), EpToken "mo
 type instance XIEModuleContents  GhcRn = Maybe (LWarningTxt GhcRn)
 type instance XIEModuleContents  GhcTc = NoExtField
 
+data IEWholeNamespaceExt pass =
+  IEWholeNamespaceExt {
+    iewn_warning :: Maybe (LWarningTxt pass),
+    iewn_tok_wc  :: EpToken "..",
+    iewn_names   :: [IdP pass]
+      -- ^ The list @[Name]@ stores the names that the @..@ expands to;
+      -- it determines whether to emit @-Wunused-imports@ and/or @-Wdodgy-imports@
+  }
+
+type instance XIEWholeNamespace  (GhcPass p) = IEWholeNamespaceExt (GhcPass p)
+
 type instance XIEGroup           (GhcPass _) = NoExtField
 type instance XIEDoc             (GhcPass _) = NoExtField
 type instance XIEDocNamed        (GhcPass _) = NoExtField
@@ -272,7 +310,7 @@ ieLIEWrappedName :: IE (GhcPass p) -> LIEWrappedName (GhcPass p)
 ieLIEWrappedName (IEVar _ n _)           = n
 ieLIEWrappedName (IEThingAbs  _ n _)     = n
 ieLIEWrappedName (IEThingWith _ n _ _ _) = n
-ieLIEWrappedName (IEThingAll  _ n _)     = n
+ieLIEWrappedName (IEThingAll  _ _ n _)   = n
 ieLIEWrappedName _ = panic "ieLIEWrappedName failed pattern match!"
 
 ieName :: IE (GhcPass p) -> IdP (GhcPass p)
@@ -281,8 +319,9 @@ ieName = lieWrappedName . ieLIEWrappedName
 ieNames :: IE (GhcPass p) -> [IdP (GhcPass p)]
 ieNames (IEVar       _ (L _ n) _)      = [ieWrappedName n]
 ieNames (IEThingAbs  _ (L _ n) _)      = [ieWrappedName n]
-ieNames (IEThingAll  _ (L _ n) _)      = [ieWrappedName n]
+ieNames (IEThingAll  _ _ (L _ n) _)    = [ieWrappedName n]
 ieNames (IEThingWith _ (L _ n) _ ns _) = ieWrappedName n : map (ieWrappedName . unLoc) ns
+ieNames (IEWholeNamespace x _)         = iewn_names x
 ieNames (IEModuleContents {})     = []
 ieNames (IEGroup          {})     = []
 ieNames (IEDoc            {})     = []
@@ -294,12 +333,12 @@ ieDeprecation = fmap unLoc . ie_deprecation (ghcPass @p)
     ie_deprecation :: GhcPass p -> IE (GhcPass p) -> Maybe (LWarningTxt (GhcPass p))
     ie_deprecation GhcPs (IEVar xie _ _) = xie
     ie_deprecation GhcPs (IEThingAbs xie _ _) = xie
-    ie_deprecation GhcPs (IEThingAll (xie, _) _ _) = xie
+    ie_deprecation GhcPs (IEThingAll xie _ _ _) = ieta_warning xie
     ie_deprecation GhcPs (IEThingWith (xie, _) _ _ _ _) = xie
     ie_deprecation GhcPs (IEModuleContents (xie, _) _) = xie
     ie_deprecation GhcRn (IEVar xie _ _) = xie
     ie_deprecation GhcRn (IEThingAbs xie _ _) = xie
-    ie_deprecation GhcRn (IEThingAll (xie, _) _ _) = xie
+    ie_deprecation GhcRn (IEThingAll xie _ _ _) = ieta_warning xie
     ie_deprecation GhcRn (IEThingWith (xie, _) _ _ _ _) = xie
     ie_deprecation GhcRn (IEModuleContents xie _) = xie
     ie_deprecation _ _ = Nothing
@@ -331,7 +370,7 @@ replaceWrappedName (IEData    r (L l _)) n = IEData    r (L l n)
 replaceLWrappedName :: LIEWrappedName GhcPs -> IdP GhcRn -> LIEWrappedName GhcRn
 replaceLWrappedName (L l n) n' = L l (replaceWrappedName n n')
 
-exportDocstring :: LHsDoc pass -> SDoc
+exportDocstring :: LHsDoc (GhcPass p) -> SDoc
 exportDocstring doc = braces (text "docstring: " <> ppr doc)
 
 instance OutputableBndrId p => Outputable (IE (GhcPass p)) where
@@ -345,10 +384,9 @@ instance OutputableBndrId p => Outputable (IE (GhcPass p)) where
                       , Just $ ppr (unLoc thing)
                       , exportDocstring <$> doc
                       ]
-    ppr ie@(IEThingAll  _   thing doc) =
+    ppr ie@(IEThingAll _ ns_spec thing doc) =
       sep $ catMaybes [ ppr <$> ieDeprecation ie
-                      , Just $ hcat [ppr (unLoc thing)
-                      , text "(..)"]
+                      , Just $ ppr (unLoc thing) <> parens (ppr ns_spec <+> text "..")
                       , exportDocstring <$> doc
                       ]
     ppr ie@(IEThingWith _ thing wc withs doc) =
@@ -366,6 +404,7 @@ instance OutputableBndrId p => Outputable (IE (GhcPass p)) where
                 in bs ++ [text ".."] ++ as
     ppr ie@(IEModuleContents _ mod')
         = sep $ catMaybes [ppr <$> ieDeprecation ie, Just $ text "module" <+> ppr mod']
+    ppr (IEWholeNamespace _ ns_spec) = ppr ns_spec <+> text ".."
     ppr (IEGroup _ n _)           = text ("<IEGroup: " ++ show n ++ ">")
     ppr (IEDoc _ doc)             = ppr doc
     ppr (IEDocNamed _ string)     = text ("<IEDocNamed: " ++ string ++ ">")
@@ -391,3 +430,25 @@ pprImpExp name = type_pref <+> pprPrefixOcc name
     occ = occName name
     type_pref | isTcOcc occ && isSymOcc occ = text "type"
               | otherwise                   = empty
+
+-- | Check if namespace specifiers overlap, i.e. if they are equal or
+-- if at least one of them doesn't specify a namespace
+overlappingNamespaceSpecifiers :: NamespaceSpecifier (GhcPass p) -> NamespaceSpecifier (GhcPass p') -> Bool
+overlappingNamespaceSpecifiers NoNamespaceSpecifier{} _ = True
+overlappingNamespaceSpecifiers _ NoNamespaceSpecifier{} = True
+overlappingNamespaceSpecifiers TypeNamespaceSpecifier{} TypeNamespaceSpecifier{} = True
+overlappingNamespaceSpecifiers DataNamespaceSpecifier{} DataNamespaceSpecifier{} = True
+overlappingNamespaceSpecifiers _ _ = False
+
+-- | Check if namespace is covered by a namespace specifier:
+--     * NoNamespaceSpecifier covers both namespaces
+--     * TypeNamespaceSpecifier covers the type namespace only
+--     * DataNamespaceSpecifier covers the data namespace only
+coveredByNamespaceSpecifier :: NamespaceSpecifier (GhcPass p) -> NameSpace -> Bool
+coveredByNamespaceSpecifier NoNamespaceSpecifier{} = const True
+coveredByNamespaceSpecifier TypeNamespaceSpecifier{} = isTcClsNameSpace <||> isTvNameSpace
+coveredByNamespaceSpecifier DataNamespaceSpecifier{} = isValNameSpace
+
+filterByNamespaceSpecifierGREs :: NamespaceSpecifier (GhcPass p) -> [GlobalRdrElt] -> [GlobalRdrElt]
+filterByNamespaceSpecifierGREs NoNamespaceSpecifier{} = id
+filterByNamespaceSpecifierGREs ns_spec = filterByNamespaceGREs (coveredByNamespaceSpecifier ns_spec)

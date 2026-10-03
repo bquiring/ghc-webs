@@ -1,4 +1,3 @@
-
 -- | GHC API debugger module for finding and setting breakpoints.
 --
 -- This module is user facing and is at least used by `GHCi` and `ghc-debugger`
@@ -11,7 +10,7 @@ import Control.Monad.Catch
 import Control.Monad
 import Data.Array
 import Data.Function
-import Data.List
+import qualified Data.List as List
 import Data.Maybe
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Semigroup as S
@@ -51,16 +50,16 @@ findBreakByLine :: Int {-^ Line number -} -> TickArray -> Maybe (BreakTickIndex,
 findBreakByLine line arr
   | not (inRange (bounds arr) line) = Nothing
   | otherwise =
-    listToMaybe (sortBy (leftmostLargestRealSrcSpan `on` snd)  comp)   `mplus`
-    listToMaybe (sortBy (compare `on` snd) incomp) `mplus`
-    listToMaybe (sortBy (flip compare `on` snd) ticks)
+    listToMaybe (List.sortBy (leftmostLargestRealSrcSpan `on` snd)  comp)   `mplus`
+    listToMaybe (List.sortBy (compare `on` snd) incomp) `mplus`
+    listToMaybe (List.sortBy (flip compare `on` snd) ticks)
   where
         ticks = arr ! line
 
         starts_here = [ (ix,pan) | (ix, pan) <- ticks,
                         srcSpanStartLine pan == line ]
 
-        (comp, incomp) = partition ends_here starts_here
+        (comp, incomp) = List.partition ends_here starts_here
             where ends_here (_,pan) = srcSpanEndLine pan == line
 
 -- | Find a breakpoint in the 'TickArray' of a module, given a line number and a column coordinate.
@@ -68,8 +67,8 @@ findBreakByCoord :: (Int, Int) -> TickArray -> Maybe (BreakTickIndex, RealSrcSpa
 findBreakByCoord (line, col) arr
   | not (inRange (bounds arr) line) = Nothing
   | otherwise =
-    listToMaybe (sortBy (flip compare `on` snd) contains ++
-                 sortBy (compare `on` snd) after_here)
+    listToMaybe (List.sortBy (flip compare `on` snd) contains ++
+                 List.sortBy (compare `on` snd) after_here)
   where
         ticks = arr ! line
 
@@ -86,9 +85,10 @@ leftmostLargestRealSrcSpan = on compare realSrcSpanStart S.<> on (flip compare) 
 -- | Returns the span of the largest tick containing the srcspan given
 enclosingTickSpan :: TickArray -> SrcSpan -> RealSrcSpan
 enclosingTickSpan _ (UnhelpfulSpan _) = panic "enclosingTickSpan UnhelpfulSpan"
+enclosingTickSpan _ (GeneratedSrcSpan _) = panic "generatedSrcSpan UnhelpfulSpan"
 enclosingTickSpan ticks (RealSrcSpan src _) =
   assert (inRange (bounds ticks) line) $
-    Data.List.minimumBy leftmostLargestRealSrcSpan $ enclosing_spans
+    List.minimumBy leftmostLargestRealSrcSpan $ enclosing_spans
   where
     line = srcSpanStartLine src
     enclosing_spans = [ pan | (_,pan) <- ticks ! line
@@ -144,7 +144,7 @@ resolveFunctionBreakpoint inp = do
     lookupModuleInGraph mod_str = do
         graph <- getModuleGraph
         let hmods = ms_mod <$> mgModSummaries graph
-        pure $ find ((== mod_str) . moduleNameString . moduleName) hmods
+        pure $ List.find ((== mod_str) . moduleNameString . moduleName) hmods
 
     -- Check validity of an identifier to set a breakpoint:
     --  1. The module of the identifier must exist
@@ -165,7 +165,7 @@ resolveFunctionBreakpoint inp = do
             mb_modbreaks <- getModBreak modl
             let found = case mb_modbreaks of
                   Nothing -> False
-                  Just mb -> fun_str `elem` (intercalate "." <$> elems (modBreaks_decls mb))
+                  Just mb -> fun_str `elem` (List.intercalate "." <$> elems (modBreaks_decls mb))
             if found
               then pure Nothing
               else pure $ Just $ text "No breakpoint found for" <+> quotes (text fun_str)
@@ -177,12 +177,12 @@ resolveFunctionBreakpoint inp = do
 -- for
 --   (a) this binder only (it maybe a top-level or a nested declaration)
 --   (b) that do not have an enclosing breakpoint
-findBreakForBind :: String {-^ Name of bind to break at -} -> ModBreaks -> [(BreakTickIndex, RealSrcSpan)]
+findBreakForBind :: String {-^ Name of bind to break at -} -> ModBreaks -> [(BreakTickIndex, RealSrcSpan)]
 findBreakForBind str_name modbreaks = filter (not . enclosed) ticks
   where
     ticks = [ (index, span)
             | (index, decls) <- assocs (modBreaks_decls modbreaks),
-              str_name == intercalate "." decls,
+              str_name == List.intercalate "." decls,
               RealSrcSpan span _ <- [modBreaks_locs modbreaks ! index] ]
     enclosed (_,sp0) = any subspan ticks
       where subspan (_,sp) = sp /= sp0 &&
@@ -226,7 +226,7 @@ getModBreak m = do
 -- source breakpoint, it means all *ocurrences* of that breakpoint across
 -- modules should be stopped at -- hence we keep a trie from BreakpointId to
 -- the list of internal break ids using it.
--- See also Note [Breakpoint identifiers]
+-- See also Note [Breakpoint identifiers]
 type BreakpointOccurrences = ModuleEnv (IntMap.IntMap [InternalBreakpointId])
 
 -- | Lookup all InternalBreakpointIds matching the given BreakpointId
@@ -253,8 +253,13 @@ mkBreakpointOccurrences = do
       let imod = modBreaks_module $ imodBreaks_modBreaks ibrks
       IntMap.foldrWithKey (\info_ix cgi bmp -> do
           let ibi = InternalBreakpointId imod info_ix
-          let BreakpointId tick_mod tick_ix = cgb_tick_id cgi
-          extendModuleEnvWith (IntMap.unionWith (S.<>)) bmp tick_mod (IntMap.singleton tick_ix [ibi])
+          case cgb_tick_id cgi of
+            Right (BreakpointId tick_mod tick_ix)
+              -> extendModuleEnvWith (IntMap.unionWith (S.<>)) bmp tick_mod (IntMap.singleton tick_ix [ibi])
+            Left _
+              -- Do not include internal breakpoints in the visible breakpoint
+              -- occurrences!
+              -> bmp
         ) bmp0 (imodBreaks_breakInfo ibrks)
 
 --------------------------------------------------------------------------------
@@ -287,7 +292,6 @@ getCurrentBreakModule = do
         Nothing -> pure Nothing
         Just ibi -> do
           brks <- readIModBreaks hug ibi
-          return $ Just $ bi_tick_mod $ getBreakSourceId ibi brks
+          return $ Just $ getBreakSourceMod ibi brks
       ix ->
           Just <$> getHistoryModule hug (resumeHistory r !! (ix-1))
-

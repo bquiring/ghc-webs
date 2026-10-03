@@ -1,5 +1,3 @@
-{-# LANGUAGE FlexibleInstances #-}
-
 -- | Units are library components from Cabal packages compiled and installed in
 -- a database
 module GHC.Unit
@@ -61,16 +59,19 @@ UnitIds are important because they are used to generate internal names
 Wired-in units
 --------------
 
-Certain libraries (ghc-prim, base, etc.) are known to the compiler and to the
-RTS as they provide some basic primitives.  Hence UnitIds of wired-in libraries
-are fixed. Instead of letting Cabal choose the UnitId for these libraries, their
-.cabal file uses the following stanza to force it to a specific value:
+Wired-in names have wired-in modules, which have a wired-in unit-id.
+Wired-in unit-ids, such as ghc-internal and the RTS, must be known to the
+compiler, as they provide some basic primitives.
 
-   ghc-options: -this-unit-id ghc-prim    -- taken from ghc-prim.cabal
+Hence wired-in unit-ids are fixed. Instead of letting Cabal choose
+the UnitId for these libraries, their .cabal file uses the following stanza to
+force it to a specific value:
 
-The RTS also uses entities of wired-in units by directly referring to symbols
-such as "base_GHCziIOziException_heapOverflow_closure" where the prefix is
-the UnitId of "base" unit.
+   ghc-options: -this-unit-id ghc-internal -- taken from ghc-internal.cabal
+
+The RTS also uses entities of wired-in units by referring to symbols such as
+"ghczminternal_GHCziInternalziTopHandler_runIO_closure" where the prefix is the
+UnitId of "ghc-internal" unit (see Note [RTS/ghc-internal interface]).
 
 Unit databases
 --------------
@@ -228,8 +229,8 @@ on-the-fly:
 A 'VirtUnit' may be indefinite or definite, it depends on whether some holes
 remain in the instantiated unit OR in the instantiating units (recursively).
 Having a fully instantiated (i.e. definite) virtual unit can lead to some issues
-if there is a matching compiled unit in the preload closure.  See Note [VirtUnit
-to RealUnit improvement]
+if there is a matching compiled unit in the preload closure.
+See Note [VirtUnit to RealUnit improvement]
 
 Unit database and indefinite units
 ----------------------------------
@@ -316,7 +317,6 @@ field in the SDocContext to pretty-print.
       (i.e. GHC doesn't correctly call `pprWithUnitState` before pretty-printing a
       UnitId), that's what will be shown to the user so it's no big deal.
 
-
 Note [VirtUnit to RealUnit improvement]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -334,6 +334,8 @@ same type-checking session, their names won't match (e.g. "abc:M.X" vs
 As we want them to match we just replace the virtual unit with the installed
 one: for some reason this is called "improvement".
 
+HISTORICAL:
+
 There is one last niggle: improvement based on the unit database means
 that we might end up developing on a unit that is not transitively
 depended upon by the units the user specified directly via command line
@@ -341,6 +343,12 @@ flags.  This could lead to strange and difficult to understand bugs if those
 instantiations are out of date.  The solution is to only improve a
 unit id if the new unit id is part of the 'preloadClosure'; i.e., the
 closure of all the units which were explicitly specified.
+
+NOTE:
+
+The 'preloadClosure' was completely unused, thus we removed it without
+changing any of the tests. It doesn't seem to be necessary any more.
+It is unclear at which exact point this became redundant.
 
 Note [Representation of module/name variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -43,6 +43,7 @@ module GHC.Unit.Home.Graph
 
   -- * Very important queries
   , allInstances
+  , allFamInstances
   , allAnns
   , allCompleteSigs
 
@@ -109,6 +110,10 @@ allInstances hug = foldr go (pure (emptyInstEnv, [])) hug where
   go hue = liftA2 (\(a,b) (a',b') -> (a `unionInstEnv` a', b ++ b'))
                   (hptAllInstances (homeUnitEnv_hpt hue))
 
+allFamInstances :: HomeUnitGraph -> IO (ModuleEnv FamInstEnv)
+allFamInstances hug = foldr go (pure emptyModuleEnv) hug where
+  go hue = liftA2 plusModuleEnv (hptAllFamInstances (homeUnitEnv_hpt hue))
+
 allAnns :: HomeUnitGraph -> IO AnnEnv
 allAnns hug = foldr go (pure emptyAnnEnv) hug where
   go hue = liftA2 plusAnnEnv (hptAllAnnotations (homeUnitEnv_hpt hue))
@@ -122,16 +127,6 @@ type HomeUnitGraph = UnitEnvGraph HomeUnitEnv
 data HomeUnitEnv = HomeUnitEnv
   { homeUnitEnv_units     :: !UnitState
       -- ^ External units
-
-  , homeUnitEnv_unit_dbs :: !(Maybe [UnitDatabase UnitId])
-      -- ^ Stack of unit databases for the target platform.
-      --
-      -- This field is populated with the result of `initUnits`.
-      --
-      -- 'Nothing' means the databases have never been read from disk.
-      --
-      -- Usually we don't reload the databases from disk if they are
-      -- cached, even if the database flags changed!
 
   , homeUnitEnv_dflags :: DynFlags
     -- ^ The dynamic flag settings
@@ -159,10 +154,9 @@ data HomeUnitEnv = HomeUnitEnv
     -- ^ Home-unit
   }
 
-mkHomeUnitEnv :: UnitState -> Maybe [UnitDatabase UnitId] -> DynFlags -> HomePackageTable -> Maybe HomeUnit -> HomeUnitEnv
-mkHomeUnitEnv us dbs dflags hpt home_unit = HomeUnitEnv
+mkHomeUnitEnv :: UnitState -> DynFlags -> HomePackageTable -> Maybe HomeUnit -> HomeUnitEnv
+mkHomeUnitEnv us dflags hpt home_unit = HomeUnitEnv
   { homeUnitEnv_units = us
-  , homeUnitEnv_unit_dbs = dbs
   , homeUnitEnv_dflags = dflags
   , homeUnitEnv_hpt = hpt
   , homeUnitEnv_home_unit = home_unit
@@ -224,15 +218,18 @@ updateUnitFlags uid f = unitEnv_adjust update uid
 -- If the argument unit is not present in the graph returns Nothing.
 transitiveHomeDeps :: UnitId -> HomeUnitGraph -> Maybe [UnitId]
 transitiveHomeDeps uid hug = case lookupHugUnitId uid hug of
-  Nothing -> Nothing
+  Nothing  -> Nothing
   Just hue -> Just $
-    Set.toList (loop (Set.singleton uid) (homeUnitDepends (homeUnitEnv_units hue)))
+              Set.toList $
+              loop (Set.singleton uid)
+                   (Set.toList (homeUnitDepends (homeUnitEnv_units hue)))
     where
       loop acc [] = acc
       loop acc (uid:uids)
         | uid `Set.member` acc = loop acc uids
         | otherwise =
-          let hue = homeUnitDepends
+          let hue = Set.toList
+                    . homeUnitDepends
                     . homeUnitEnv_units
                     . expectJust
                     $ lookupHugUnitId uid hug
@@ -354,7 +351,11 @@ unitEnv_assocs (UnitEnvGraph x) = Map.assocs x
 hugSCCs :: HomeUnitGraph -> [SCC UnitId]
 hugSCCs hug = sccs where
   mkNode :: (UnitId, HomeUnitEnv) -> Node UnitId UnitId
-  mkNode (uid, hue) = DigraphNode uid uid (homeUnitDepends (homeUnitEnv_units hue))
+  mkNode (uid, hue) = DigraphNode
+                          uid
+                          uid
+                          (Set.toList (homeUnitDepends (homeUnitEnv_units hue)))
+
   nodes = map mkNode (Map.toList $ unitEnv_graph hug)
 
   sccs = stronglyConnCompFromEdgedVerticesOrd nodes

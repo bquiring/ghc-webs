@@ -55,13 +55,6 @@ Dumping out compiler intermediate structures
     ``Main.p.dump-simpl`` and ``Main.dump-simpl`` instead of overwriting the
     output of one way with the output of another.
 
-.. ghc-flag:: -ddump-json
-    :shortdesc: *(deprecated)* Use :ghc-flag:`-fdiagnostics-as-json` instead
-    :type: dynamic
-
-    This flag was previously used to generated JSON formatted GHC diagnostics,
-    but has been deprecated. Instead, use :ghc-flag:`-fdiagnostics-as-json`.
-
 .. ghc-flag:: -dshow-passes
     :shortdesc: Print out each pass name as it happens
     :type: dynamic
@@ -566,109 +559,111 @@ These flags dump various phases of GHC's STG pipeline.
 
     Show the output of JavaScript Sinker pass.
 
-C-\\- representation
-~~~~~~~~~~~~~~~~~~~~
+C-\- representation
+~~~~~~~~~~~~~~~~~~~
 
-These flags dump various phases of GHC's C-\\- pipeline.
+These flags dump various phases of GHC's C-\- pipeline.
+
+Dumps of Cmm graphs print the blocks reachable from the entry, in reverse
+post-order. To also show unreachable blocks, which can linger in the graph,
+add :ghc-flag:`-dppr-debug`. These blocks are then listed under a
+``// unreachable blocks:`` heading.
 
 .. ghc-flag:: -ddump-cmm-verbose-by-proc
-    :shortdesc: Show output from main C-\\- pipeline passes (grouped by proc)
+    :shortdesc: Show output from main C-\- pipeline passes (grouped by proc)
     :type: dynamic
 
-    Dump output from main C-\\- pipeline stages. In case of
+    Dump output from main C-\- pipeline stages. In case of
     ``.cmm`` compilation this also dumps the result of
     file parsing. Not included are passes run by
     the chosen backend. Currently only the NCG backends runs
     additional passes ( :ghc-flag:`-ddump-opt-cmm` ).
 
-    Cmm dumps don't include unreachable blocks since we print
-    blocks in reverse post-order.
-
 .. ghc-flag:: -ddump-cmm-verbose
-    :shortdesc: Write output from main C-\\- pipeline passes to files
+    :shortdesc: Write output from main C-\- pipeline passes to files
     :type: dynamic
 
     If used in conjunction with :ghc-flag:`-ddump-to-file`, writes dump
-    output from main C-\\- pipeline stages to files (each stage per file).
+    output from main C-\- pipeline stages to files (each stage per file).
 
 .. ghc-flag:: -ddump-cmm-from-stg
-    :shortdesc: Dump STG-to-C-\\- output
+    :shortdesc: Dump STG-to-C-\- output
     :type: dynamic
 
-    Dump the result of STG-to-C-\\- conversion
+    Dump the result of STG-to-C-\- conversion
 
 .. ghc-flag:: -ddump-cmm-raw
-    :shortdesc: Dump raw C-\\-
+    :shortdesc: Dump raw C-\-
     :type: dynamic
 
-    Dump the “raw” C-\\-.
+    Dump the “raw” C-\-.
 
 .. ghc-flag:: -ddump-cmm-cfg
-    :shortdesc: Dump the results of the C-\\- control flow optimisation pass.
+    :shortdesc: Dump the results of the C-\- control flow optimisation pass.
     :type: dynamic
 
-    Dump the results of the C-\\- control flow optimisation pass.
+    Dump the results of the C-\- control flow optimisation pass.
 
 .. ghc-flag:: -ddump-cmm-thread-sanitizer
-    :shortdesc: Dump the results of the C-\\- ThreadSanitizer elaboration pass.
+    :shortdesc: Dump the results of the C-\- ThreadSanitizer elaboration pass.
     :type: dynamic
 
-    Dump the results of the C-\\- pass responsible for adding instrumentation
+    Dump the results of the C-\- pass responsible for adding instrumentation
     added by :ghc-flag:`-fcmm-thread-sanitizer`.
 
 .. ghc-flag:: -ddump-cmm-cbe
     :shortdesc: Dump the results of common block elimination
     :type: dynamic
 
-    Dump the results of the C-\\- Common Block Elimination (CBE) pass.
+    Dump the results of the C-\- Common Block Elimination (CBE) pass.
 
 .. ghc-flag:: -ddump-cmm-switch
     :shortdesc: Dump the results of switch lowering passes
     :type: dynamic
 
-    Dump the results of the C-\\- switch lowering pass.
+    Dump the results of the C-\- switch lowering pass.
 
 .. ghc-flag:: -ddump-cmm-proc
     :shortdesc: Dump the results of proc-point analysis
     :type: dynamic
 
-    Dump the results of the C-\\- proc-point analysis pass.
+    Dump the results of the C-\- proc-point analysis pass.
 
 .. ghc-flag:: -ddump-cmm-sp
-    :shortdesc: Dump the results of the C-\\- stack layout pass.
+    :shortdesc: Dump the results of the C-\- stack layout pass.
     :type: dynamic
 
-    Dump the results of the C-\\- stack layout pass.
+    Dump the results of the C-\- stack layout pass.
 
 .. ghc-flag:: -ddump-cmm-sink
-    :shortdesc: Dump the results of the C-\\- sinking pass.
+    :shortdesc: Dump the results of the C-\- sinking pass.
     :type: dynamic
 
-    Dump the results of the C-\\- sinking pass.
+    Dump the results of the C-\- sinking pass.
 
 .. ghc-flag:: -ddump-cmm-caf
-    :shortdesc: Dump the results of the C-\\- CAF analysis pass.
+    :shortdesc: Dump the results of the C-\- CAF analysis pass.
     :type: dynamic
 
-    Dump the results of the C-\\- CAF analysis pass.
+    Dump the results of the C-\- CAF analysis pass.
 
 .. ghc-flag:: -ddump-cmm-procmap
-    :shortdesc: Dump the results of the C-\\- proc-point map pass.
+    :shortdesc: Dump the results of the C-\- proc-point map pass.
     :type: dynamic
 
-    Dump the results of the C-\\- proc-point map pass.
+    Dump the results of the C-\- proc-point map pass.
 
 .. ghc-flag:: -ddump-cmm-split
-    :shortdesc: Dump the results of the C-\\- proc-point splitting pass.
+    :shortdesc: Dump the results of the C-\- proc-point splitting pass.
     :type: dynamic
 
-    Dump the results of the C-\\- proc-point splitting pass.
+    Dump the results of the C-\- proc-point splitting pass.
 
 .. ghc-flag:: -ddump-cmm-info
-    :shortdesc: Dump the results of the C-\\- info table augmentation pass.
+    :shortdesc: Dump the results of the C-\- info table augmentation pass.
     :type: dynamic
 
-    Dump the results of the C-\\- info table augmentation pass.
+    Dump the results of the C-\- info table augmentation pass.
 
 .. ghc-flag:: -ddump-cmm-cps
     :shortdesc: Dump the results of the CPS pass
@@ -677,10 +672,10 @@ These flags dump various phases of GHC's C-\\- pipeline.
     Dump the results of the CPS pass.
 
 .. ghc-flag:: -ddump-cmm
-    :shortdesc: Dump the final C-\\- output
+    :shortdesc: Dump the final C-\- output
     :type: dynamic
 
-    Dump the result of the C-\\- pipeline processing
+    Dump the result of the C-\- pipeline processing
 
 .. ghc-flag:: -ddump-cfg-weights
     :shortdesc: Dump the assumed weights of the CFG.
@@ -714,17 +709,17 @@ Native code generator
 ~~~~~~~~~~~~~~~~~~~~~
 
 These flags dump various stages of the :ref:`native code generator's
-<native-code-gen>` pipeline, which starts with C-\\- and produces native
+<native-code-gen>` pipeline, which starts with C-\- and produces native
 assembler.
 
 .. ghc-flag:: -ddump-cmm-opt
-    :shortdesc: Dump the results of C-\\- to C-\\- optimising passes
+    :shortdesc: Dump the results of C-\- to C-\- optimising passes
     :type: dynamic
 
-    Dump the results of C-\\- to C-\\- optimising passes performed by the NCG.
+    Dump the results of C-\- to C-\- optimising passes performed by the NCG.
 
 .. ghc-flag:: -ddump-opt-cmm
-    :shortdesc: Dump the results of C-\\- to C-\\- optimising passes
+    :shortdesc: Dump the results of C-\- to C-\- optimising passes
     :type: dynamic
 
     Alias for :ghc-flag:`-ddump-cmm-opt`
@@ -740,7 +735,7 @@ assembler.
     :shortdesc: Dump initial assembly
     :type: dynamic
 
-    Dump the initial assembler output produced from C-\\-.
+    Dump the initial assembler output produced from C-\-.
 
 .. ghc-flag:: -ddump-asm-liveness
     :shortdesc: Dump assembly augmented with register liveness
@@ -896,14 +891,14 @@ Formatting dumps
     unboxing.
 
 .. ghc-flag:: -dhex-word-literals
-    :shortdesc: Print values of type `Word#` in hexadecimal.
+    :shortdesc: Print values of type ``Word#`` in hexadecimal.
     :type: dynamic
 
-    Print values of type `Word#` and `Word64#` (but not values of
-    type `Int#` and `Int64#`) in hexadecimal instead of decimal.
+    Print values of type ``Word#`` and ``Word64#`` (but not values of
+    type ``Int#`` and ``Int64#``) in hexadecimal instead of decimal.
     The hexadecimal is zero-padded to make the length of the
-    representation a power of two. For example: `0x0A0A##`,
-    `0x000FFFFF##`, `0xC##`. This flag may be helpful when you
+    representation a power of two. For example: ``0x0A0A##``,
+    ``0x000FFFFF##``, ``0xC##``. This flag may be helpful when you
     are producing a bit pattern that to expect to work correctly on a 32-bit
     or a 64-bit architecture. Dumping hexadecimal literals after
     optimizations and constant folding makes it easier to confirm
@@ -958,6 +953,32 @@ parts that you are not interested in.
     differences, so you can realistically apply ``diff``. Once ``diff``
     has shown you where to look, you can try again without
     :ghc-flag:`-dsuppress-uniques`
+
+.. ghc-flag:: -dstable-core-dump-order
+    :shortdesc: Reorder top-level bindings in Core dumps into a stable,
+        diffable order
+    :type: dynamic
+    :reverse: -dno-stable-core-dump-order
+    :category: verbosity
+
+    :since: 10.2.1
+
+    Normally the order of top-level bindings in a Core dump (such as the
+    output of :ghc-flag:`-ddump-simpl`) reflects the compiler's internal
+    processing order, which depends on ``Unique`` values. Those uniques can
+    shift whenever an unrelated upstream module changes, so the bindings get
+    re-ordered and a textual ``diff`` of two dumps fails to line up the real
+    changes.
+
+    This flag is opt-in and reorders the top-level bindings of Core dumps that
+    go through the pass-result printer (e.g. :ghc-flag:`-ddump-simpl`,
+    :ghc-flag:`-ddump-prep`, :ghc-flag:`-ddump-ds`,
+    :ghc-flag:`-ddump-simpl-iterations`) into a stable, source-location-driven
+    order that does not depend on uniques.
+
+    It is intended to be combined with :ghc-flag:`-dsuppress-uniques` when
+    diffing two dumps, but because the ordering does not depend on uniques the
+    output is also more diffable without it.
 
 .. ghc-flag:: -dsuppress-idinfo
     :shortdesc: Suppress extended information about identifiers where they
@@ -1059,7 +1080,7 @@ Checking for consistency
     :shortdesc: Enable several common internal sanity checkers
     :type: dynamic
 
-    :implies: -dcore-lint, -dstg-lint, -dcmm-lint, -dasm-lint, -fllvm-fill-undef-with-garbage, -fcatch-nonexhaustive-cases, -debug
+    :implies: :ghc-flag:`-dcore-lint`, :ghc-flag:`-dstg-lint`, :ghc-flag:`-dcmm-lint`, :ghc-flag:`-dasm-lint`, :ghc-flag:`-fllvm-fill-undef-with-garbage`, :ghc-flag:`-fcatch-nonexhaustive-cases`, :ghc-flag:`-debug`
     :since: 9.4.1
 
     Turn on various heavy-weight intra-pass sanity-checking measures within GHC
@@ -1091,10 +1112,10 @@ Checking for consistency
     Ditto for STG level.
 
 .. ghc-flag:: -dcmm-lint
-    :shortdesc: C-\\- pass sanity checking
+    :shortdesc: C-\- pass sanity checking
     :type: dynamic
 
-    Ditto for C-\\- level.
+    Ditto for C-\- level.
 
 .. ghc-flag:: -dasm-lint
     :shortdesc: ASM pass sanity checking
@@ -1177,7 +1198,7 @@ Checking for consistency
     :type: dynamic
 
     This enables generation of `ThreadSanitizer
-    <https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual>`
+    <https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual>`__
     instrumentation of memory accesses. Requires use of ``-fsanitize=thread``
     or similar when compiling and linking.
 
@@ -1224,6 +1245,18 @@ Other
     is useful when debugging because it gives smaller modules and dumps, but the
     compiler will panic if you try to use Typeable instances of things that you
     built with this flag.
+
+.. ghc-flag:: -dno-builtin-rules
+    :shortdesc: Disable all built-in rewrite rules
+    :type: dynamic
+
+    This disables all the built-in rewrite rules. Mostly useful for debugging.
+
+.. ghc-flag:: -dno-bignum-rules
+    :shortdesc: Disable bignum built-in rewrite rules
+    :type: dynamic
+
+    This disables bignum built-in rewrite rules. Mostly useful for debugging.
 
 .. ghc-flag:: -dtag-inference-checks
     :shortdesc: Affirm tag inference results are correct at runtime.

@@ -55,10 +55,9 @@ changes. Build results are placed into `_build` by default.
 There are many different ways to build a compiler, each way is called a flavour.
 
 * `--flavour=FLAVOUR`: choose a build flavour. The following settings are
-currently supported: `default`, `quick`, `quickest`, `perf`, `prof`, `devel1`
-and `devel2`. As an example, the `quickest` flavour adds `-O0` flag to all GHC
-invocations and builds libraries only in the `vanilla` way, which speeds up
-builds by 3-4x.
+currently supported: `default`, `quick`, `perf`, `prof`, `devel1`
+and `devel2`. As an example, the `quick` flavour builds the GHC binary with `-O0`
+which speeds up builds and rebuilds significantly.
 
 In addition to the overall build flavour there are also "flavour transformers"
 which can slightly modify the build settings for a flavour. Some common flavour
@@ -101,7 +100,9 @@ Stage2 GHC.
 
 * `--skip-depends`: skips rebuilding Haskell module dependency files.
 
-* `--bignum={native,gmp,check-gmp,ffi}`: choose which bignum implementation to use. The default is `gmp`.
+* `--bignum={native,gmp}`: **Deprecated.** Use the `+native_bignum` flavour
+  transformer instead (e.g. `--flavour=default+native_bignum`). When building for the
+  JavaScript target, the native bignum backend is enabled automatically.
 
 * `--color` and `--no-color`: choose whether to use colors when printing build
 progress info. By default, Hadrian tries to determine if the terminal supports
@@ -326,6 +327,18 @@ $ ./configure [--prefix=PATH] && make install
 workflow, for now.
 
 Note: On windows you need to use the `reloc-binary-dist` target.
+
+#### Staged `system.config.*` configuration
+
+There are three `system.config.*` configuration files with different roles:
+
+- `system.config`: Contains general settings that are valid for all stages.
+- `system.config.host`: Contains system settings for the initial stages.
+- `system.config.target`: Contains system settings for the final stages.
+
+The flags of the `./configure` script refer to `system.config.target`.
+`system.config.host` contains only a minimal vanilla configuration. This may
+change if it turns out that specific options are required for the early stages.
 
 #### Relocatable Binary Distribution
 

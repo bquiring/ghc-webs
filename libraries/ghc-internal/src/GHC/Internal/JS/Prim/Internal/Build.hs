@@ -144,11 +144,12 @@ module GHC.Internal.JS.Prim.Internal.Build
   , buildObjectM32
   ) where
 
+import GHC.Internal.Base (($), (.))
 import GHC.Internal.JS.Prim
-import GHC.Internal.Exts
 import GHC.Internal.IO
+import GHC.Internal.Prim (seq)
+import GHC.Internal.Types (Any)
 import GHC.Internal.Unsafe.Coerce
-import GHC.Internal.Base
 
 type O = JSVal -- object
 type K = JSVal -- key

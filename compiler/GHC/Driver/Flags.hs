@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 module GHC.Driver.Flags
    ( DumpFlag(..)
    , getDumpFlagFrom
@@ -66,7 +64,7 @@ data Language = Haskell98 | Haskell2010 | GHC2021 | GHC2024
 -- | The default Language is used if one is not specified explicitly, by both
 -- GHC and GHCi.
 defaultLanguage :: Language
-defaultLanguage = GHC2021
+defaultLanguage = GHC2024
 
 instance Outputable Language where
     ppr = text . show
@@ -99,8 +97,14 @@ data Deprecation = NotDeprecated | Deprecated deriving (Eq, Ord)
 data ExtensionDeprecation
   = ExtensionNotDeprecated
   | ExtensionDeprecatedFor [LangExt.Extension]
+    -- ^ Both turning on and turning off the flag are deprecated, with a message
+    -- suggesting turning on or off the conjunction of the given extensions
+    -- instead.
   | ExtensionFlagDeprecatedCond TurnOnFlag String
+    -- ^ Only one direction is deprecated, as specified by the 'TurnOnFlag'.
   | ExtensionFlagDeprecated String
+    -- ^ Both turning on and turning off the flag are deprecated, with the given
+    -- message when the flag is enabled and a default message when it is disabled.
   deriving Eq
 
 -- | Always returns 'Deprecated' even when the flag is
@@ -111,18 +115,34 @@ deprecation _ = Deprecated
 
 extensionDeprecation :: LangExt.Extension -> ExtensionDeprecation
 extensionDeprecation = \case
-  LangExt.TypeInType           -> ExtensionDeprecatedFor [LangExt.DataKinds, LangExt.PolyKinds]
-  LangExt.NullaryTypeClasses   -> ExtensionDeprecatedFor [LangExt.MultiParamTypeClasses]
-  LangExt.RelaxedPolyRec       -> ExtensionFlagDeprecatedCond turnOff
-                                    "You can't turn off RelaxedPolyRec any more"
-  LangExt.DatatypeContexts     -> ExtensionFlagDeprecatedCond turnOn
-                                    "It was widely considered a misfeature, and has been removed from the Haskell language."
-  LangExt.AutoDeriveTypeable   -> ExtensionFlagDeprecatedCond turnOn
-                                    "Typeable instances are created automatically for all types since GHC 8.2."
-  LangExt.OverlappingInstances -> ExtensionFlagDeprecated
-                                    "instead use per-instance pragmas OVERLAPPING/OVERLAPPABLE/OVERLAPS"
-  _                            -> ExtensionNotDeprecated
+  LangExt.AlternativeLayoutRule             -> ExtensionFlagDeprecated
+                                                 "It has never been fully implemented or adequately documented."
+  LangExt.AlternativeLayoutRuleTransitional -> ExtensionFlagDeprecated
+                                                 "It has never been fully implemented or adequately documented."
+  LangExt.AutoDeriveTypeable                -> ExtensionFlagDeprecatedCond turnOn
+                                                 "Typeable instances are created automatically for all types since GHC 8.2."
+  LangExt.DatatypeContexts                  -> ExtensionFlagDeprecatedCond turnOn
+                                                 "It was widely considered a misfeature, and has been removed from the Haskell language."
+  LangExt.NullaryTypeClasses                -> ExtensionDeprecatedFor [LangExt.MultiParamTypeClasses]
+  LangExt.OverlappingInstances              -> ExtensionFlagDeprecated
+                                                 "instead use per-instance pragmas OVERLAPPING/OVERLAPPABLE/OVERLAPS"
+  LangExt.ParallelArrays                    -> ExtensionDeprecatedFor [LangExt.ParallelListComp]
+  LangExt.RelaxedPolyRec                    -> ExtensionFlagDeprecatedCond turnOff
+                                                 "You can't turn off RelaxedPolyRec any more"
+  LangExt.TypeInType                        -> ExtensionDeprecatedFor [LangExt.DataKinds, LangExt.PolyKinds]
+  _                                         -> ExtensionNotDeprecated
 
+-- | Was this extension known by any other names in the past, which have now
+-- been deprecated? (This does not imply that the main extension itself has been
+-- deprecated. It lists only names that do not correspond to 'LangExt.Extension'
+-- constructors.)
+extensionDeprecatedNames :: LangExt.Extension -> [String]
+extensionDeprecatedNames = \case
+  LangExt.RankNTypes          -> ["Rank2Types", "PolymorphicComponents"]
+  LangExt.RecursiveDo         -> ["DoRec"]
+  LangExt.NamedFieldPuns      -> ["RecordPuns"]
+  LangExt.ScopedTypeVariables -> ["PatternSignatures"]
+  _ -> []
 
 extensionName :: LangExt.Extension -> String
 extensionName = \case
@@ -181,6 +201,7 @@ extensionName = \case
   LangExt.TypeData -> "TypeData"                 -- allow @type data@ definitions
   LangExt.InstanceSigs -> "InstanceSigs"
   LangExt.ApplicativeDo -> "ApplicativeDo"
+  LangExt.Modifiers -> "Modifiers"
   LangExt.LinearTypes -> "LinearTypes"
   LangExt.RequiredTypeArguments -> "RequiredTypeArguments"    -- Visible forall (VDQ) in types of terms
   LangExt.StandaloneDeriving -> "StandaloneDeriving"
@@ -261,20 +282,14 @@ extensionName = \case
   LangExt.MultilineStrings -> "MultilineStrings"
   LangExt.ExplicitLevelImports -> "ExplicitLevelImports"
   LangExt.ImplicitStagePersistence -> "ImplicitStagePersistence"
+  LangExt.QualifiedStrings -> "QualifiedStrings"
+  LangExt.LazyFieldAnnotations -> "LazyFieldAnnotations"
 
 -- | Is this extension known by any other names? For example
 -- -XGeneralizedNewtypeDeriving is accepted
 extensionAlternateNames :: LangExt.Extension -> [String]
 extensionAlternateNames = \case
   LangExt.GeneralizedNewtypeDeriving -> ["GeneralisedNewtypeDeriving"]
-  LangExt.RankNTypes                 -> ["Rank2Types", "PolymorphicComponents"]
-  _ -> []
-
-extensionDeprecatedNames :: LangExt.Extension -> [String]
-extensionDeprecatedNames = \case
-  LangExt.RecursiveDo         -> ["DoRec"]
-  LangExt.NamedFieldPuns      -> ["RecordPuns"]
-  LangExt.ScopedTypeVariables -> ["PatternSignatures"]
   _ -> []
 
 -- | All the names by which an extension is known.
@@ -343,6 +358,7 @@ impliedXFlags
 
     , (LangExt.TemplateHaskell, On LangExt.TemplateHaskellQuotes)
     , (LangExt.Strict, On LangExt.StrictData)
+    , (LangExt.StrictData, On LangExt.LazyFieldAnnotations)
 
     -- Historically only UnboxedTuples was required for unboxed sums to work.
     -- To avoid breaking code, we make UnboxedTuples imply UnboxedSums.
@@ -356,6 +372,7 @@ impliedXFlags
     , (LangExt.LinearTypes, On LangExt.MonoLocalBinds)
 
     , (LangExt.ExplicitLevelImports, Off LangExt.ImplicitStagePersistence)
+    , (LangExt.LinearTypes, On LangExt.Modifiers)
   ]
 
 
@@ -375,9 +392,10 @@ impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)
                 ,(Opt_DoLinearCoreLinting, turnOn, Opt_DoCoreLinting)
                 ,(Opt_Strictness, turnOn, Opt_WorkerWrapper)
                 ,(Opt_WriteIfSimplifiedCore, turnOn, Opt_WriteInterface)
-                ,(Opt_ByteCodeAndObjectCode, turnOn, Opt_WriteIfSimplifiedCore)
+                ,(Opt_ByteCodeAndObjectCode, turnOn, Opt_WriteByteCode)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithStack)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithFallback)
+                ,(Opt_InfoTableMap, turnOn, Opt_Ticky_AP)
                 ] ++ validHoleFitsImpliedGFlags
 
 -- | General flags that are switched on/off when other general flags are switched
@@ -526,7 +544,6 @@ data DumpFlag
    | Opt_D_dump_view_pattern_commoning
    | Opt_D_verbose_core2core
    | Opt_D_dump_debug
-   | Opt_D_dump_json
    | Opt_D_ppr_debug
    | Opt_D_no_debug_output
    | Opt_D_dump_faststrings
@@ -592,8 +609,9 @@ data GeneralFlag
    | Opt_NoLlvmMangler                  -- hidden flag
    | Opt_FastLlvm                       -- hidden flag
    | Opt_NoTypeableBinds
+   | Opt_NoBuiltinRules
+   | Opt_NoBignumRules
 
-   | Opt_DistinctConstructorTables
    | Opt_InfoTableMap
    | Opt_InfoTableMapWithFallback
    | Opt_InfoTableMapWithStack
@@ -704,6 +722,7 @@ data GeneralFlag
    | Opt_ExposeOverloadedUnfoldings
    | Opt_KeepAutoRules -- ^ Keep auto-generated rules even if they seem to have become useless
    | Opt_WriteInterface -- ^ Forces .hi files to be written even with -fno-code
+   | Opt_WriteByteCode -- ^ Forces bytecode files to be written
    | Opt_WriteSelfRecompInfo
    | Opt_WriteSelfRecompFlags -- ^ Include detailed flag information for self-recompilation debugging
    | Opt_WriteHie -- ^ Generate .hie files
@@ -760,6 +779,8 @@ data GeneralFlag
 
    -- | Instruct GHCi to load all targets on startup
    | Opt_GhciDoLoadTargets
+   -- | Instruct GHCi to import all loaded targets on startup
+   | Opt_GhciImportLoadedTargets
 
    | Opt_HelpfulErrors
    | Opt_DeferTypeErrors             -- Since 7.6
@@ -854,8 +875,13 @@ data GeneralFlag
    | Opt_SuppressTimestamps -- ^ Suppress timestamps in dumps
    | Opt_SuppressCoreSizes  -- ^ Suppress per binding Core size stats in dumps
 
+   -- | Reorder top-level bindings in Core dumps into a stable, diffable order.
+   -- See Note [Stable Core dump order] in GHC.Core.Ppr.
+   | Opt_StableCoreDumpOrder
+
    -- Error message suppression
    | Opt_ShowErrorContext
+   | Opt_InteractiveErrorHints
 
    -- Object code determinism
    | Opt_ObjectDeterminism
@@ -886,6 +912,10 @@ data GeneralFlag
 
    | Opt_G_NoStateHack
    | Opt_G_NoOptCoercion
+
+   -- Known names; see Note [Overview of known entities] in GHC.Builtin.
+   | Opt_DefinesKnownKeyNames
+   | Opt_RebindableKnownNames
    deriving (Eq, Show, Enum)
 
 -- | The set of flags which affect optimisation for the purposes of
@@ -907,6 +937,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise
    , Opt_StaticArgumentTransformation
+   , Opt_PolymorphicSpecialisation
    , Opt_CSE
    , Opt_StgCSE
    , Opt_StgLiftLams
@@ -973,6 +1004,8 @@ codeGenFlags = EnumSet.fromList
    , Opt_ExposeAllUnfoldings
    , Opt_ExposeOverloadedUnfoldings
    , Opt_NoTypeableBinds
+   , Opt_NoBuiltinRules
+   , Opt_NoBignumRules
    , Opt_ObjectDeterminism
    , Opt_Haddock
 
@@ -982,7 +1015,6 @@ codeGenFlags = EnumSet.fromList
    , Opt_DoTagInferenceChecks
 
      -- Flags that affect debugging information
-   , Opt_DistinctConstructorTables
    , Opt_InfoTableMap
    , Opt_InfoTableMapWithStack
    , Opt_InfoTableMapWithFallback
@@ -1105,8 +1137,12 @@ data WarningFlag =
        -- ^ @since 9.14, scheduled to be removed in 9.18
        --
        -- See Note [Quantifying over equalities in RULES] in GHC.Tc.Gen.Sig
-   | Opt_WarnUnusableUnpackPragmas                   -- Since 9.14
-   | Opt_WarnPatternNamespaceSpecifier               -- Since 9.14
+   | Opt_WarnUnusableUnpackPragmas                   -- ^ @since 9.14
+   | Opt_WarnPatternNamespaceSpecifier               -- ^ @since 9.14
+   | Opt_WarnUnrecognisedModifiers                   -- ^ @since 10.0
+   | Opt_WarnSemaphoreOpenFailure                   -- Since 10.0.1
+   | Opt_WarnDefaultedCallStack                      -- ^ @since 10.2
+   | Opt_WarnImplicitFieldStrictness                 -- ^ @since 10.2
    deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
@@ -1216,6 +1252,7 @@ warnFlagNames wflag = case wflag of
   Opt_WarnTypeEqualityRequiresOperators           -> "type-equality-requires-operators" :| []
   Opt_WarnMissingRoleAnnotations                  -> "missing-role-annotations" :| []
   Opt_WarnImplicitRhsQuantification               -> "implicit-rhs-quantification" :| []
+  Opt_WarnImplicitFieldStrictness                 -> "implicit-field-strictness" :| []
   Opt_WarnIncompleteExportWarnings                -> "incomplete-export-warnings" :| []
   Opt_WarnIncompleteRecordSelectors               -> "incomplete-record-selectors" :| []
   Opt_WarnBadlyLevelledTypes                      -> "badly-levelled-types" :| []
@@ -1228,6 +1265,9 @@ warnFlagNames wflag = case wflag of
   Opt_WarnRuleLhsEqualities                       -> "rule-lhs-equalities" :| []
   Opt_WarnUnusableUnpackPragmas                   -> "unusable-unpack-pragmas" :| []
   Opt_WarnPatternNamespaceSpecifier               -> "pattern-namespace-specifier" :| []
+  Opt_WarnUnrecognisedModifiers                   -> "unrecognised-modifiers" :| []
+  Opt_WarnSemaphoreOpenFailure                   -> "semaphore-open-failure" :| []
+  Opt_WarnDefaultedCallStack                      -> "defaulted-callstack" :| []
 
 -- -----------------------------------------------------------------------------
 -- Standard sets of warning options
@@ -1368,12 +1408,14 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnTypeEqualityRequiresOperators,
         Opt_WarnInconsistentFlags,
         Opt_WarnTypeEqualityOutOfScope,
-        Opt_WarnImplicitRhsQuantification, -- was in -Wcompat since 9.8, enabled by default since 9.14, to turn into a hard error in 9.16
+        Opt_WarnImplicitRhsQuantification, -- was in -Wcompat since 9.8, enabled by default since 9.14, to turn into a hard error in 10.2 (#25911)
         Opt_WarnViewPatternSignatures,
         Opt_WarnUselessSpecialisations,
         Opt_WarnDeprecatedPragmas,
         Opt_WarnRuleLhsEqualities,
-        Opt_WarnUnusableUnpackPragmas
+        Opt_WarnUnusableUnpackPragmas,
+        Opt_WarnUnrecognisedModifiers,
+        Opt_WarnSemaphoreOpenFailure
       ]
 
 -- | Things you get with @-W@.

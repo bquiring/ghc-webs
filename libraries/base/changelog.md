@@ -1,9 +1,49 @@
 # Changelog for [`base` package](http://hackage.haskell.org/package/base)
 
+## 4.24.0.0 *TBA*
+  * Give `setBit`, `clearBit` and `complementBit` explicit definitions in `instance Bits Integer`, reducing intermediate allocations. ([CLC proposal #423](https://github.com/haskell/core-libraries-committee/issues/423))
+  * Export `GHC.Environment.getFullArgs` from `System.Environment`. ([CLC proposal #431](https://github.com/haskell/core-libraries-committee/issues/431))
+  * Add `Bounded` instances for `Double`, `Float`, `CDouble` and `CFloat`. ([CLC proposal #402](https://github.com/haskell/core-libraries-committee/issues/402))
+  * Add `Data.List.NonEmpty.{zip{3..7},zipWith{3..7},unzip{3..7}}` ([CLC proposal #409)(https://github.com/haskell/core-libraries-committee/issues/409))
+  * Ensure that `Data.List.elem` and `notElem` can be specialized even when no list fusion happens. ([CLC proposal #412)(https://github.com/haskell/core-libraries-committee/issues/412))
+  * Introduce `Data.Double` and `Data.Float` modules. ([CLC proposal #378](https://github.com/haskell/core-libraries-committee/issues/378))
+  * Remove `bitSize` from `MINIMAL` pragma of `class Bits`. ([CLC proposal #440](https://github.com/haskell/core-libraries-committee/issues/440))
+  * Change `Generically a`'s `Monoid` definition to require a `Semigroup` constraint, and define its `mconcat` using `(<>)` from that constraint. ([CLC proposal #413](https://github.com/haskell/core-libraries-committee/issues/413))
+  * Add `withEmptyCallStack` to `GHC.Stack`. ([CLC proposal #428](https://github.com/haskell/core-libraries-committee/issues/428))
+  * Add new `Data.RealFloat` module re-exporting `RealFloat` from `GHC.Float` ([CLC proposal #394](https://github.com/haskell/core-libraries-committee/issues/394))
+  * Add `Infinity`, `NegInfinity`, and `NaN` pattern synonyms to `Data.RealFloat` ([CLC proposal #394](https://github.com/haskell/core-libraries-committee/issues/394))
+
 ## 4.23.0.0 *TBA*
+  * Add `System.IO.hGetNewlineMode`. ([CLC proposal #370](https://github.com/haskell/core-libraries-committee/issues/370))
+  * Add `{-# WARNING in "x-partial" #-}` to `Data.List.{init,last}`.
+    Use `{-# OPTIONS_GHC -Wno-x-partial #-}` to disable it.
+    ([CLC proposal #87](https://github.com/haskell/core-libraries-committee/issues/292))
+  * Remove deprecated, unstable heap representation details from `GHC.Exts` ([CLC proposal #212](https://github.com/haskell/core-libraries-committee/issues/212))
   * Add `Data.List.NonEmpty.mapMaybe`. ([CLC proposal #337](https://github.com/haskell/core-libraries-committee/issues/337))
   * Fix issues with toRational for types capable to represent infinite and not-a-number values ([CLC proposal #338](https://github.com/haskell/core-libraries-committee/issues/338))
+  * Ensure that `rationalToFloat` and `rationalToDouble` always inline in the end. ([CLC proposal #356](https://github.com/haskell/core-libraries-committee/issues/356))
   * Modify the implementation of `Data.List.sortOn` to use `(>)` instead of `compare`. ([CLC proposal #332](https://github.com/haskell/core-libraries-committee/issues/332))
+  * Add `thenA` and `thenM`. ([CLC proposal #351](https://github.com/haskell/core-libraries-committee/issues/351))
+  * Fix bug where `naturalAndNot` was incorrectly truncating results ([CLC proposal #350](github.com/haskell/core-libraries-committee/issues/350))
+  * generalize `deleteBy` and `deleteFirstsBy` ([CLC proposal 372](https://github.com/haskell/core-libraries-committee/issues/372))
+  * GHC.Num.{BigNat, Integer, Natural} are no longer exposed. Users should import them from `ghc-bignum` instead. ([CLC proposal #359](github.com/haskell/core-libraries-committee/issues/359))
+  * Remove extra laziness from `Data.Bifunctor.Bifunctor` instances for all tuples to have the same laziness as their `Data.Functor.Functor` counterparts (i.e. they became more strict than before) ([CLC proposal #339](https://github.com/haskell/core-libraries-committee/issues/339))
+  * Adjust the strictness of `Data.List.iterate'` to be more reasonable: every element of the output list is forced to WHNF when the `(:)` containing it is forced. ([CLC proposal #335)](https://github.com/haskell/core-libraries-committee/issues/335)
+  * GHC internals in `GHC.Num` have been deprecated and will be removed after one major release. ((CLC proposal #360)[https://github.com/haskell/core-libraries-committee/issues/360])
+  * Add `nubOrd` / `nubOrdBy` to `Data.List` and `Data.List.NonEmpty`. ([CLC proposal #336](https://github.com/haskell/core-libraries-committee/issues/336))
+  * Add `Semigroup` and `Monoid` instances for `Control.Monad.ST.Lazy`. ([CLC proposal #374](https://github.com/haskell/core-libraries-committee/issues/374))
+  * `GHC.Conc.throwSTM` and `GHC.Conc.Sync.throwSTM` now carry a `HasCallStack` constraint and attach a `Backtrace` annotation to the thrown exception. ([GHC #25365](https://gitlab.haskell.org/ghc/ghc/-/issues/25365))
+  * `GHC.Conc.catchSTM` and `GHC.Conc.Sync.catchSTM` now attach `WhileHandling` annotation to exceptions thrown from the handler. ([GHC #25365](https://gitlab.haskell.org/ghc/ghc/-/issues/25365))
+  * Remove `GHC.JS.Prim.Internal.Build`, as per [CLC #329](https://github.com/haskell/core-libraries-committee/issues/329)
+  * Export `labelThread` from `Control.Concurrent`.([CLC proposal #376](https://github.com/haskell/core-libraries-committee/issues/376))
+  * Add a new module `System.IO.OS` with operations for obtaining operating-system handles (file descriptors, Windows handles). ([CLC proposal #369](https://github.com/haskell/core-libraries-committee/issues/369))
+  * Evaluate backtraces for "error" exceptions at the moment they are thrown. ([CLC proposal #383](https://github.com/haskell/core-libraries-committee/issues/383))
+  * Show `ExceptionContext` in `displayExceptionAnnotation` implementation of `WhileHandling` ([GHC #27456](https://gitlab.haskell.org/ghc/ghc/-/issues/27456))
+  * Hide implementation details when throwing exceptions in throw and throwSTM. ([CLC proposal #387](https://github.com/haskell/core-libraries-committee/issues/387))
+  * Change `hIsReadable` and `hIsWritable` such that they always throw a respective exception when encountering a closed or semi-closed handle, not just in the case of a file handle. ([CLC proposal #371](github.com/haskell/core-libraries-committee/issues/371))
+  * The implementation of `toException` in `SomeException`'s `Exception` instance no longer drops exception context, in keeping with the behavior originally proposed in [CLC Proposal #200](https://github.com/haskell/core-libraries-committee/issues/200).
+  * Annotate `onException` continuation with `WhileHandling`. ([CLC Proposal #397](https://github.com/haskell/core-libraries-committee/issues/397))
+  * Improve error message for `Data.Char.chr`. ([CLC Proposal #384](https://github.com/haskell/core-libraries-committee/issues/384))
 
 ## 4.22.0.0 *TBA*
   * Shipped with GHC 9.14.1
@@ -30,7 +70,7 @@
       * `GHC.TypeNats.Internal`
       * `GHC.ExecutionStack.Internal`.
   * Deprecate `GHC.JS.Prim.Internal.Build`, as per [CLC #329](https://github.com/haskell/core-libraries-committee/issues/329)
-
+  * `GHC.Exts.IOPort#` and its related operations have been removed  ([CLC #213](https://github.com/haskell/core-libraries-committee/issues/213))
   * Fix incorrect results of `integerPowMod` when the base is 0 and the exponent is negative, and `integerRecipMod` when the modulus is zero ([#26017](https://gitlab.haskell.org/ghc/ghc/-/issues/26017)).
   * Fix the rewrite rule for `scanl'` not being strict in the first element of the output list ([#26143](https://gitlab.haskell.org/ghc/ghc/-/issues/26143)).
 
@@ -734,7 +774,7 @@
   * `Generic1`, as well as the associated datatypes and typeclasses in
     `GHC.Generics`, are now poly-kinded (#10604)
 
-  * `New modules `Data.Bifoldable` and `Data.Bitraversable` (previously defined
+  * New modules `Data.Bifoldable` and `Data.Bitraversable` (previously defined
     in the `bifunctors` package) (#10448)
 
   * `Data.Either` now provides `fromLeft` and `fromRight` (#12402)

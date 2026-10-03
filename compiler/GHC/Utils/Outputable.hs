@@ -1,13 +1,5 @@
-{-# LANGUAGE EmptyCase #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 {-
 (c) The University of Glasgow 2006-2012
@@ -39,14 +31,14 @@ module GHC.Utils.Outputable (
         spaceIfSingleQuote,
         isEmpty, nest,
         ptext,
-        int, intWithCommas, integer, word64, word, float, double, rational, doublePrec,
+        int, intWithCommas, integer, natural, word64, word, float, double, rational, doublePrec,
         parens, cparen, brackets, braces, quotes, quote, quoteIfPunsEnabled,
         doubleQuotes, angleBrackets,
         semi, comma, colon, dcolon, space, equals, dot, vbar,
         arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt,
         lambda,
         lparen, rparen, lbrack, rbrack, lbrace, rbrace, underscore,
-        blankLine, forAllLit, bullet,
+        blankLine, forAllLit, starLit, bullet, ellipsis,
         ($+$),
         cat, fcat,
         hang, hangNotEmpty, punctuate, punctuateFinal,
@@ -103,6 +95,7 @@ module GHC.Utils.Outputable (
         updSDocContext,
         SDocContext (..), sdocWithContext,
         defaultSDocContext, traceSDocContext,
+        defaultSDocDepth, defaultSDocCols,
         getPprStyle, withPprStyle, setStyleColoured,
         pprDeeper, pprDeeperList, pprSetDepth,
         codeStyle, userStyle, dumpStyle,
@@ -116,14 +109,23 @@ module GHC.Utils.Outputable (
         bPutHDoc
     ) where
 
-import Language.Haskell.Syntax.Module.Name ( ModuleName(..) )
-
-import GHC.Prelude.Basic
-
 import {-# SOURCE #-}   GHC.Unit.Types ( Unit, Module, moduleName )
 import {-# SOURCE #-}   GHC.Types.Name.Occurrence( OccName )
 
+import Language.Haskell.Syntax.Basic
+import Language.Haskell.Syntax.Binds.InlinePragma
+import Language.Haskell.Syntax.Decls.Overlap ( OverlapMode(..) )
+import Language.Haskell.Syntax.Doc
+import Language.Haskell.Syntax.ImpExp ( NamespaceSpecifier(..) )
+import Language.Haskell.Syntax.Module.Name ( ModuleName(..) )
+import Language.Haskell.Syntax.Specificity
+import Language.Haskell.Syntax.Text
+import Language.Haskell.Syntax.Type ( PromotionFlag(..) )
+
+import GHC.Prelude.Basic
+
 import GHC.Utils.BufHandle (BufHandle, bPutChar, bPutStr, bPutFS, bPutFZS)
+import GHC.Utils.Encoding ( utf8DecodeByteString )
 import GHC.Data.FastString
 import qualified GHC.Utils.Ppr as Pretty
 import qualified GHC.Utils.Ppr.Colour as Col
@@ -148,8 +150,10 @@ import Data.String
 import Data.Word
 import System.IO        ( Handle )
 import System.FilePath
+import System.OsPath (OsPath, decodeUtf)
 import Text.Printf
 import Numeric (showFFloat)
+import Numeric.Natural (Natural)
 import Data.Graph (SCC(..))
 import Data.List (intersperse)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -400,6 +404,7 @@ data SDocContext = SDC
       -- ^ True if Unicode encoding is supported
       -- and not disabled by GHC_NO_UNICODE environment variable
   , sdocPrintErrIndexLinks          :: !Bool
+  , sdocInteractiveErrorHints       :: !Bool
   , sdocHexWordLiterals             :: !Bool
   , sdocPprDebug                    :: !Bool
   , sdocPrintUnicodeSyntax          :: !Bool
@@ -424,6 +429,7 @@ data SDocContext = SDC
   , sdocSuppressModulePrefixes      :: !Bool
   , sdocSuppressStgExts             :: !Bool
   , sdocSuppressStgReps             :: !Bool
+  , sdocStableCoreDumpOrder         :: !Bool
   , sdocErrorSpans                  :: !Bool
   , sdocStarIsType                  :: !Bool
   , sdocLinearTypes                 :: !Bool
@@ -451,6 +457,12 @@ instance IsString SDoc where
 instance Outputable SDoc where
   ppr = id
 
+defaultSDocDepth :: Int
+defaultSDocDepth = 6
+
+defaultSDocCols :: Int
+defaultSDocCols = 100
+
 -- | Default pretty-printing options
 defaultSDocContext :: SDocContext
 defaultSDocContext = SDC
@@ -458,10 +470,11 @@ defaultSDocContext = SDC
   , sdocColScheme                   = Col.defaultScheme
   , sdocLastColour                  = Col.colReset
   , sdocShouldUseColor              = False
-  , sdocDefaultDepth                = 5
-  , sdocLineLength                  = 100
+  , sdocDefaultDepth                = defaultSDocDepth
+  , sdocLineLength                  = defaultSDocCols
   , sdocCanUseUnicode               = False
   , sdocPrintErrIndexLinks          = False
+  , sdocInteractiveErrorHints       = False
   , sdocHexWordLiterals             = False
   , sdocPprDebug                    = False
   , sdocPrintUnicodeSyntax          = False
@@ -486,6 +499,7 @@ defaultSDocContext = SDC
   , sdocSuppressModulePrefixes      = False
   , sdocSuppressStgExts             = False
   , sdocSuppressStgReps             = True
+  , sdocStableCoreDumpOrder         = False
   , sdocErrorSpans                  = False
   , sdocStarIsType                  = False
   , sdocLinearTypes                 = False
@@ -504,6 +518,7 @@ traceSDocContext = defaultSDocContext
   , sdocPrintExplicitRuntimeReps    = True
   , sdocPrintExplicitForalls        = True
   , sdocPrintEqualityRelations      = True
+  , sdocLinearTypes                 = True
   }
 
 withPprStyle :: PprStyle -> SDoc -> SDoc
@@ -513,7 +528,7 @@ withPprStyle sty d = SDoc $ \ctxt -> runSDoc d ctxt{sdocStyle=sty}
 pprDeeper :: SDoc -> SDoc
 pprDeeper d = SDoc $ \ctx -> case sdocStyle ctx of
   PprUser q depth c ->
-   let deeper 0 = Pretty.text "..."
+   let deeper 0 = Pretty.ellipsis
        deeper n = runSDoc d ctx{sdocStyle = PprUser q (PartWay (n-1)) c}
    in case depth of
          DefaultDepth -> deeper (sdocDefaultDepth ctx)
@@ -522,24 +537,29 @@ pprDeeper d = SDoc $ \ctx -> case sdocStyle ctx of
   _ -> runSDoc d ctx
 
 
--- | Truncate a list that is longer than the current depth.
+-- | Trim the list to the length of the remaining depth count
 pprDeeperList :: ([SDoc] -> SDoc) -> [SDoc] -> SDoc
 pprDeeperList f ds
   | null ds   = f []
   | otherwise = SDoc work
  where
-  work ctx@SDC{sdocStyle=PprUser q depth c}
-   | DefaultDepth <- depth
-   = work (ctx { sdocStyle = PprUser q (PartWay (sdocDefaultDepth ctx)) c })
-   | PartWay 0 <- depth
-   = Pretty.text "..."
-   | PartWay n <- depth
-   = let
-        go _ [] = []
-        go i (d:ds) | i >= n    = [text "...."]
-                    | otherwise = d : go (i+1) ds
-     in runSDoc (f (go 0 ds)) ctx{sdocStyle = PprUser q (PartWay (n-1)) c}
+  work ctx@SDC{ sdocStyle=PprUser q depth c }
+   | Just n_remaining
+        <- case depth of
+              DefaultDepth -> Just (sdocDefaultDepth ctx)
+              PartWay n    -> Just n
+              AllTheWay    -> Nothing
+   = runSDoc (f (trim n_remaining ds))
+                -- Trim the length of the list
+             (ctx { sdocStyle = PprUser q (PartWay (n_remaining - 1)) c  })
+                -- ..and go deeper as we step inside the list elements
+
   work other_ctx = runSDoc (f ds) other_ctx
+
+trim :: Int -> [SDoc] -> [SDoc]
+trim _ []     = []
+trim 0 _      = [ellipsis]
+trim n (d:ds) = d : trim (n-1) ds
 
 pprSetDepth :: Depth -> SDoc -> SDoc
 pprSetDepth depth doc = SDoc $ \ctx ->
@@ -684,6 +704,7 @@ docToSDoc d = SDoc (\_ -> d)
 
 ptext    ::               PtrString  -> SDoc
 int      :: IsLine doc => Int        -> doc
+natural  :: IsLine doc => Natural    -> doc
 integer  :: IsLine doc => Integer    -> doc
 word     ::               Integer    -> SDoc
 word64   :: IsLine doc => Word64     -> doc
@@ -695,6 +716,8 @@ rational ::               Rational   -> SDoc
 ptext s     = docToSDoc $ Pretty.ptext s
 {-# INLINE CONLIKE int #-}
 int n       = text $ show n
+{-# INLINE CONLIKE natural #-}
+natural n   = text $ show n
 {-# INLINE CONLIKE integer #-}
 integer n   = text $ show n
 {-# INLINE CONLIKE float #-}
@@ -757,7 +780,7 @@ quotes d = sdocOption sdocCanUseUnicode $ \case
            | otherwise        -> Pretty.quotes pp_d
 
 blankLine, dcolon, arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt,
-  larrowtt, lambda :: SDoc
+  larrowtt, lambda, ellipsis :: SDoc
 
 blankLine  = docToSDoc Pretty.emptyText
 dcolon     = unicodeSyntax (char '∷') (text "::")
@@ -770,6 +793,7 @@ larrowt    = unicodeSyntax (char '⤙') (text "-<")
 arrowtt    = unicodeSyntax (char '⤜') (text ">>-")
 larrowtt   = unicodeSyntax (char '⤛') (text "-<<")
 lambda     = unicodeSyntax (char 'λ') (char '\\')
+ellipsis   = docToSDoc Pretty.ellipsis
 
 semi, comma, colon, equals, space, underscore, dot, vbar :: IsLine doc => doc
 lparen, rparen, lbrack, rbrack, lbrace, rbrace :: IsLine doc => doc
@@ -790,6 +814,9 @@ rbrace     = char '}'
 
 forAllLit :: SDoc
 forAllLit = unicodeSyntax (char '∀') (text "forall")
+
+starLit :: SDoc
+starLit = unicodeSyntax (char '★') (char '*')
 
 bullet :: SDoc
 bullet = unicode (char '•') (char '*')
@@ -947,6 +974,9 @@ instance Outputable Int64 where
 instance Outputable Int where
     ppr n = int n
 
+instance Outputable Natural where
+    ppr n = natural n
+
 instance Outputable Integer where
     ppr n = integer n
 
@@ -1055,6 +1085,9 @@ instance Outputable FastString where
     ppr fs = ftext fs           -- Prints an unadorned string,
                                 -- no double quotes or anything
 
+instance Outputable HText where
+    ppr = text . unpackHText
+
 deriving newtype instance Outputable NonDetFastString
 deriving newtype instance Outputable LexicalFastString
 
@@ -1080,6 +1113,30 @@ instance Outputable Extension where
 instance Outputable ModuleName where
   ppr = pprModuleName
 
+instance Outputable FieldLabelString where
+  ppr (FieldLabelString l) = ppr l
+
+instance Outputable ForAllTyFlag where
+  ppr Required  = text "[req]"
+  ppr Specified = text "[spec]"
+  ppr Inferred  = text "[infrd]"
+
+instance Outputable HsDocStringDecorator where
+  ppr HsDocStringNext        = text "|"
+  ppr HsDocStringPrevious    = text "^"
+  ppr (HsDocStringNamed n)   = char '$' <> text n
+  ppr (HsDocStringGroup n)   = text (replicate n '*')
+
+instance Outputable HsDocStringChunk where
+  ppr (HsDocStringChunk bs) = text (utf8DecodeByteString bs)
+
+-- | For compatibility with the existing @-ddump-parsed@ output, we only show
+-- the docstring.
+instance Outputable a => Outputable (WithHsDocIdentifiers a pass) where
+  ppr (WithHsDocIdentifiers s _ids) = ppr s
+
+instance Outputable OsPath where
+  ppr p = text $ either show id (decodeUtf p)
 
 pprModuleName :: IsLine doc => ModuleName -> doc
 pprModuleName (ModuleName nm) =
@@ -1299,8 +1356,8 @@ pprHsChar c | c > '\x10ffff' = char '\\' <> text (show (fromIntegral (ord c) :: 
             | otherwise      = text (show c)
 
 -- | Special combinator for showing string literals.
-pprHsString :: FastString -> SDoc
-pprHsString fs = vcat (map text (showMultiLineString (unpackFS fs)))
+pprHsString :: String -> SDoc
+pprHsString fs = vcat (map text (showMultiLineString fs))
 
 -- | Special combinator for showing bytestring literals.
 pprHsBytes :: ByteString -> SDoc
@@ -1982,3 +2039,73 @@ instance IsDoc HDoc where
   {-# INLINE CONLIKE ($$) #-}
   dualDoc _ h = h
   {-# INLINE CONLIKE dualDoc #-}
+
+instance Outputable (ActivationX p) where
+  ppr AlwaysActive     = empty
+  ppr NeverActive      = brackets (text "~")
+  ppr (ActiveBefore n) = brackets (char '~' <> int n)
+  ppr (ActiveAfter  n) = brackets (int n)
+  ppr (XActivation  _) = text "[final]"
+
+instance Outputable InlineSpec where
+  ppr Inline           = text "INLINE"
+  ppr NoInline         = text "NOINLINE"
+  ppr Inlinable        = text "INLINABLE"
+  ppr Opaque           = text "OPAQUE"
+  ppr NoUserInlinePrag = empty
+
+instance Outputable Boxity where
+  ppr Boxed   = text "Boxed"
+  ppr Unboxed = text "Unboxed"
+
+instance Outputable RuleMatchInfo where
+  ppr ConLike = text "CONLIKE"
+  ppr FunLike = text "FUNLIKE"
+
+instance Outputable TopLevelFlag where
+  ppr TopLevel    = text "<TopLevel>"
+  ppr NotTopLevel = text "<NotTopLevel>"
+
+instance Outputable LexicalFixity where
+  ppr Prefix = text "Prefix"
+  ppr Infix  = text "Infix"
+
+instance Outputable FixityDirection where
+  ppr InfixL = text "infixl"
+  ppr InfixR = text "infixr"
+  ppr InfixN = text "infix"
+
+instance Outputable Fixity where
+  ppr (Fixity prec dir) = hcat [ppr dir, space, int prec]
+
+instance Outputable SrcStrictness where
+    ppr SrcLazy     = char '~'
+    ppr SrcStrict   = char '!'
+    ppr NoSrcStrict = empty
+
+instance Outputable SrcUnpackedness where
+    ppr SrcUnpack   = text "{-# UNPACK #-}"
+    ppr SrcNoUnpack = text "{-# NOUNPACK #-}"
+    ppr NoSrcUnpack = empty
+
+instance Outputable PromotionFlag where
+  ppr NotPromoted = text "NotPromoted"
+  ppr IsPromoted  = text "IsPromoted"
+
+instance Outputable Role where
+  ppr = ftext . strFromRole
+
+instance Outputable (OverlapMode p) where
+  ppr (NoOverlap    _) = empty
+  ppr (Overlappable _) = text "[overlappable]"
+  ppr (Overlapping  _) = text "[overlapping]"
+  ppr (Overlaps     _) = text "[overlap ok]"
+  ppr (Incoherent   _) = text "[incoherent]"
+  ppr (NonCanonical _) = text "[noncanonical]"
+  ppr (XOverlapMode _) = text "[user TTG extension]"
+
+instance Outputable (NamespaceSpecifier p) where
+  ppr NoNamespaceSpecifier{}   = empty
+  ppr TypeNamespaceSpecifier{} = text "type"
+  ppr DataNamespaceSpecifier{} = text "data"
+  ppr (XNamespaceSpecifier _)  = text "[user TTG extension]"

@@ -36,8 +36,8 @@ module GHC.Internal.ExecutionStack (
   , showStackTrace
   ) where
 
-import GHC.Internal.Data.Maybe
 import GHC.Internal.Base
+import GHC.Internal.Data.Maybe
 import GHC.Internal.ExecutionStack.Internal
 
 -- | Get a trace of the current execution stack state.

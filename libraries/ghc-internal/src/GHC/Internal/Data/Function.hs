@@ -30,8 +30,8 @@ module GHC.Internal.Data.Function
   , applyWhen
   ) where
 
-import GHC.Internal.Base ( TYPE, ($), (.), id, const, flip )
-import GHC.Internal.Data.Bool ( Bool(..) )
+import GHC.Internal.Base ( Bool(..), ($), (.), id, const, flip )
+import GHC.Internal.Prim ( TYPE )
 
 infixl 0 `on`
 infixl 1 &
@@ -171,7 +171,7 @@ x & f = f x
 -- | 'applyWhen' applies a function to a value if a condition is true,
 -- otherwise, it returns the value unchanged.
 --
--- It is equivalent to @'flip' ('GHC.Internal.Data.Bool.bool' 'id')@.
+-- It is equivalent to @'flip' ('Data.Bool.bool' 'id')@.
 --
 -- ==== __Examples__
 --

@@ -12,6 +12,8 @@ Target
 , tgtUnregisterised = False
 , tgtTablesNextToCode = True
 , tgtUseLibffiForAdjustors = True
+, tgtHasLibm = True
+, tgtRTSWithLibdw = Nothing
 , tgtCCompiler = Cc {ccProgram = Program {prgPath = "@CC_STAGE0@", prgFlags = @CONF_CC_OPTS_STAGE0List@}}
 , tgtCxxCompiler = Cxx {cxxProgram = Program {prgPath = "@CC_STAGE0@", prgFlags = @CONF_CXX_OPTS_STAGE0List@}}
 , tgtCPreprocessor = Cpp {cppProgram = Program {prgPath = "@CPPCmd_STAGE0@", prgFlags = @CONF_CPP_OPTS_STAGE0List@}}
@@ -20,11 +22,12 @@ Target
 , tgtCmmCPreprocessor = CmmCpp {cmmCppProgram = Program {prgPath = "@CmmCPPCmd_STAGE0@", prgFlags = @CmmCPPArgs_STAGE0List@}, cmmCppSupportsG0 = @CmmCPPSupportsG0_STAGE0@}
 , tgtCCompilerLink = CcLink
 { ccLinkProgram = Program {prgPath = "@CC_STAGE0@", prgFlags = @CONF_GCC_LINKER_OPTS_STAGE0List@}
-, ccLinkSupportsNoPie = False
-, ccLinkSupportsCompactUnwind = False
-, ccLinkSupportsFilelist = False
+, ccLinkSupportsNoPie = @CONF_GCC_SUPPORTS_NO_PIE_STAGE0Bool@
+, ccLinkSupportsCompactUnwind = @LdHasNoCompactUnwind_STAGE0Bool@
+, ccLinkSupportsFilelist = @LdHasFilelist_STAGE0Bool@
 , ccLinkSupportsSingleModule = True
-, ccLinkIsGnu = False
+, ccLinkIsGnu = @LdIsGNULd_STAGE0Bool@
+, ccLinkSupportsVerbatimNamespace = False
 }
 
 , tgtAr = Ar
@@ -36,12 +39,13 @@ Target
 }
 
 , tgtRanlib = Nothing
-, tgtNm = Nm {nmProgram = Program {prgPath = "", prgFlags = []}}
+, tgtNm = Nm {nmProgram = Program {prgPath = "@NmCmdStage0@", prgFlags = []}}
 , tgtMergeObjs = Just (MergeObjs {mergeObjsProgram = Program {prgPath = "@LD_STAGE0@", prgFlags = ["-r"]}, mergeObjsSupportsResponseFiles = False})
 , tgtLlc = Nothing
 , tgtOpt = Nothing
 , tgtLlvmAs = Nothing
 , tgtWindres = Nothing
+, tgtDlltool = Nothing
 , tgtOtool = Nothing
 , tgtInstallNameTool = Nothing
 }

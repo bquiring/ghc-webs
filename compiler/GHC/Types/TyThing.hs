@@ -1,9 +1,6 @@
-{-# LANGUAGE LambdaCase #-}
-
 -- | A global typecheckable-thing, essentially anything that has a name.
 module GHC.Types.TyThing
    ( TyThing (..)
-   , MonadThings (..)
    , mkATyCon
    , mkAnId
    , pprShortTyThing
@@ -48,10 +45,6 @@ import GHC.Core.Coercion.Axiom
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-
-import Control.Monad ( liftM )
-import Control.Monad.Trans.Reader
-import Control.Monad.Trans.Class
 
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.List.NonEmpty as NE
@@ -125,7 +118,8 @@ Examples:
     IfaceDecl for the data/newtype.  Ditto class methods.
 
   * Record selectors are *not* implicit, because they get their own
-    free-standing IfaceDecl.
+    free-standing IfaceDecl. See Note [Record selectors] in
+    GHC.Tc.TyCl.Utils.
 
   * Associated data/type families are implicit because they are
     included in the IfaceDecl of the parent class.  (NB: the
@@ -222,8 +216,8 @@ implicitTyConThings tc
 implicitCoTyCon :: TyCon -> [TyThing]
 implicitCoTyCon tc
   | Just co <- newTyConCo_maybe tc = [ACoAxiom $ toBranchedAxiom co]
-  | Just co <- isClosedSynFamilyTyConWithAxiom_maybe tc
-                                   = [ACoAxiom co]
+  | Just ax <- closedFamilyTyConCoAxiom_maybe tc
+                                   = [ACoAxiom ax]
   | otherwise                      = []
 
 -- | Returns @True@ if there should be no interface-file declaration
@@ -266,9 +260,9 @@ tyThingParent_maybe (AnId id)     = case idDetails id of
                                           Just (ATyCon tc)
                                       RecSelId { sel_tycon = RecSelPatSyn ps } ->
                                           Just (AConLike (PatSynCon ps))
-                                      ClassOpId cls _             ->
+                                      ClassOpId cls _  ->
                                           Just (ATyCon (classTyCon cls))
-                                      _other                      -> Nothing
+                                      _other           -> Nothing
 tyThingParent_maybe _other = Nothing
 
 tyThingsTyCoVars :: [TyThing] -> TyCoVarSet
@@ -397,22 +391,3 @@ tyThingId (AnId id)                   = id
 tyThingId (AConLike (RealDataCon dc)) = dataConWrapId dc
 tyThingId other                       = pprPanic "tyThingId" (ppr other)
 
--- | Class that abstracts out the common ability of the monads in GHC
--- to lookup a 'TyThing' in the monadic environment by 'Name'. Provides
--- a number of related convenience functions for accessing particular
--- kinds of 'TyThing'
-class Monad m => MonadThings m where
-        lookupThing :: Name -> m TyThing
-
-        lookupId :: Name -> m Id
-        lookupId = liftM tyThingId . lookupThing
-
-        lookupDataCon :: Name -> m DataCon
-        lookupDataCon = liftM tyThingDataCon . lookupThing
-
-        lookupTyCon :: Name -> m TyCon
-        lookupTyCon = liftM tyThingTyCon . lookupThing
-
--- Instance used in GHC.HsToCore.Quote
-instance MonadThings m => MonadThings (ReaderT s m) where
-  lookupThing = lift . lookupThing

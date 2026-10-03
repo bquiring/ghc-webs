@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-
@@ -21,7 +20,7 @@ module GHC.Tc.TyCl.Utils(
         addTyConsToGblEnv, mkDefaultMethodType,
 
         -- * Record selectors
-        tcRecSelBinds, mkRecSelBinds, mkOneRecordSelector
+        tcRecSelBinds, mkRecSelBinds, mkOneRecordSelector,
     ) where
 
 import GHC.Prelude
@@ -32,7 +31,7 @@ import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Bind( tcValBinds )
 import GHC.Tc.Utils.TcType
 
-import GHC.Builtin.Types( unitTy )
+import GHC.Builtin.WiredIn.Types( unitTy )
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
 
 import GHC.Hs
@@ -52,7 +51,6 @@ import GHC.Core.Coercion ( ltRole )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
-import GHC.Utils.FV as FV
 
 import GHC.Data.Maybe
 import GHC.Data.FastString
@@ -71,13 +69,12 @@ import GHC.Types.Name.Env
 import GHC.Types.Name.Reader ( mkRdrUnqual )
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Set
 import GHC.Types.TyThing
 import qualified GHC.LanguageExtensions as LangExt
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Control.Monad
 
@@ -135,7 +132,7 @@ synonymTyConsOfType ty
      go_co (TyConAppCo _ tc cs) = go_tc tc `plusNameEnv` go_co_s cs
      go_co (AppCo co co')       = go_co co `plusNameEnv` go_co co'
      go_co (ForAllCo { fco_kind = kind_co, fco_body = body_co })
-                                = go_co kind_co `plusNameEnv` go_co body_co
+                                = go_mco kind_co `plusNameEnv` go_co body_co
      go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
                                 = go_co m `plusNameEnv` go_co a `plusNameEnv` go_co r
      go_co (CoVarCo _)          = emptyNameEnv
@@ -626,23 +623,25 @@ irExTyVars orig_tvs thing = go emptyVarSet orig_tvs
 
 markNominal :: TyVarSet   -- local variables
             -> Type -> RoleM ()
-markNominal lcls ty = let nvars = fvVarList (FV.delFVs lcls $ get_ty_vars ty) in
-                      mapM_ (updateRole Nominal) nvars
+markNominal lcls ty = mapM_ (updateRole Nominal) $
+                      nonDetVarSetElems (get_ty_vars ty `minusVarSet` lcls)
   where
      -- get_ty_vars gets all the tyvars (no covars!) from a type *without*
      -- recurring into coercions. Recall: coercions are totally ignored during
      -- role inference. See [Coercions in role inference]
-    get_ty_vars :: Type -> FV
+    get_ty_vars :: Type -> VarSet
     get_ty_vars t                 | Just t' <- coreView t -- #20999
                                   = get_ty_vars t'
-    get_ty_vars (TyVarTy tv)      = unitFV tv
-    get_ty_vars (AppTy t1 t2)     = get_ty_vars t1 `unionFV` get_ty_vars t2
-    get_ty_vars (FunTy _ w t1 t2) = get_ty_vars w `unionFV` get_ty_vars t1 `unionFV` get_ty_vars t2
-    get_ty_vars (TyConApp _ tys)  = mapUnionFV get_ty_vars tys
-    get_ty_vars (ForAllTy tvb ty) = tyCoFVsBndr tvb (get_ty_vars ty)
-    get_ty_vars (LitTy {})        = emptyFV
+    get_ty_vars (TyVarTy tv)      = unitVarSet tv
+    get_ty_vars (AppTy t1 t2)     = get_ty_vars t1 `unionVarSet` get_ty_vars t2
+    get_ty_vars (FunTy _ w t1 t2) = get_ty_vars w `unionVarSet` get_ty_vars t1
+                                                  `unionVarSet` get_ty_vars t2
+    get_ty_vars (TyConApp _ tys)  = mapUnionVarSet get_ty_vars tys
+    get_ty_vars (ForAllTy (Bndr v _) ty) = get_ty_vars (varType v) `unionVarSet`
+                                           (get_ty_vars ty `delVarSet` v)
+    get_ty_vars (LitTy {})        = emptyVarSet
     get_ty_vars (CastTy ty _)     = get_ty_vars ty
-    get_ty_vars (CoercionTy _)    = emptyFV
+    get_ty_vars (CoercionTy _)    = emptyVarSet
 
 -- like lookupRoles, but with Nominal tags at the end for oversaturated TyConApps
 lookupRolesX :: TyCon -> RoleM [Role]
@@ -801,14 +800,6 @@ mkDefaultMethodType cls _   (GenericDM dm_ty) = mkSigmaTy tv_bndrs [pred] dm_ty
      --     (#13998)
 
 {-
-************************************************************************
-*                                                                      *
-                Building record selectors
-*                                                                      *
-************************************************************************
--}
-
-{-
 Note [Default method Ids and Template Haskell]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this (#4169):
@@ -834,13 +825,28 @@ when typechecking the [d| .. |] quote, and typecheck them later.
 ************************************************************************
 -}
 
+{- Note [Record selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Record selectors are injected as ordianry functions definitions, very
+early in the pipeline.
+
+* `mkRecSelBinds` produces /un-typechecked/ bindings, rather like 'deriving'
+   This makes life easier, because the later type checking will add
+   all necessary type abstractions and applications; and handling for
+   UNPACK pragmas etc
+
+* Record selectors are not treated as "implicit".  See
+  See Note [Implicit TyThings] in GHC.Types.TyThing and
+      Note [Injecting implicit bindings] in GHC.CoreToStg.AddImplicitBinds
+-}
+
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
   = tcExtendGlobalValEnv [sel_id | (L _ (XSig (IdSig sel_id))) <- sigs] $
     do { (rec_sel_binds, tcg_env) <- discardWarnings $
                                        -- See Note [Impredicative record selectors]
-                                       setXOptM LangExt.ImpredicativeTypes $
-                                       tcValBinds TopLevel binds sigs getGblEnv
+                                     setXOptM LangExt.ImpredicativeTypes $
+                                     tcValBinds TopLevel binds sigs getGblEnv
        ; return (tcg_env `addTypecheckedBinds` map snd rec_sel_binds) }
   where
     sigs = [ L (noAnnSrcSpan loc) (XSig $ IdSig sel_id)
@@ -849,9 +855,7 @@ tcRecSelBinds sel_bind_prs
     binds = [(NonRecursive, [bind]) | (_, bind) <- sel_bind_prs]
 
 mkRecSelBinds :: [TyCon] -> [(Id, LHsBind GhcRn)]
--- NB We produce *un-typechecked* bindings, rather like 'deriving'
---    This makes life easier, because the later type checking will add
---    all necessary type abstractions and applications
+-- See Note [Record selectors]
 mkRecSelBinds tycons
   = map mkRecSelBind [ (tc,fld) | tc <- tycons
                                 , fld <- tyConFieldLabels tc ]
@@ -894,7 +898,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
 
 
     -- Selector type; Note [Polymorphic selectors]
-    (univ_tvs, _, _, _, req_theta, _, data_ty) = conLikeFullSig con1
+    (_, _, _, _, req_theta, _, data_ty) = conLikeFullSig con1
 
     field_ty     = conLikeFieldType con1 lbl
     field_ty_tvs = tyCoVarsOfType field_ty
@@ -904,17 +908,13 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                    conLikeUserTyVarBinders con1
 
     -- is_naughty: see Note [Naughty record selectors]
-    is_naughty = not ok_scoping || no_selectors
-    ok_scoping = case con1 of
-                   RealDataCon {} -> field_ty_tvs `subVarSet` data_ty_tvs
-                   PatSynCon {}   -> field_ty_tvs `subVarSet` mkVarSet univ_tvs
-       -- In the PatSynCon case, the selector type is (data_ty -> field_ty), but
-       -- fvs(data_ty) are all universals (see Note [Pattern synonym result type] in
-       -- GHC.Core.PatSyn, so no need to check them.
+    is_naughty = isExistentialRecordField field_ty con1 || no_selectors
 
-    no_selectors   = has_sel == NoFieldSelectors  -- No field selectors => all are naughty
-                                                  -- thus suppressing making a binding
-                                                  -- A slight hack!
+    no_selectors   = has_sel == NoFieldSelectors
+      -- For PatternSynonyms with -XNoFieldSelectors, pretend the fields
+      -- are naughty record selectors to suppress making a binding.
+      --
+      -- See Note [NoFieldSelectors and naughty record selectors]
 
     sel_ty | is_naughty = unitTy  -- See Note [Naughty record selectors]
            | otherwise  = mkForAllTys sel_tvbs $
@@ -940,8 +940,8 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                                  (L loc' (mkHsVar (L locn field_var)))
     mk_sel_pat con =
       let con_lname = L locn (noUserRdr (getName con))
-      in ConPat NoExtField con_lname (RecCon rec_fields)
-    rec_fields = HsRecFields { rec_ext = noExtField, rec_flds = [rec_field], rec_dotdot = Nothing }
+      in ConPat NoExtField con_lname (RecCon noAnn rec_fields)
+    rec_fields = HsRecFields { rec_ext = noAnn, rec_flds = [rec_field], rec_dotdot = Nothing }
     rec_field  = noLocA (HsFieldBind
                         { hfbAnn = noAnn
                         , hfbLHS
@@ -977,7 +977,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
         inst_tys = dataConResRepTyArgs dc
 
     unit_rhs = mkLHsTupleExpr [] noExtField
-    msg_lit = HsStringPrim NoSourceText (bytesFS (field_label lbl))
+    msg_lit = HsStringPrim NoSourceText (bytesFS (mkFastStringShortText (field_label lbl)))
 
 {-
 Note [Polymorphic selectors]
@@ -989,7 +989,6 @@ We won't bother rehashing the entire specification in this Note, but the tricky
 part is dealing with GADT constructor fields. Here is an appropriately tricky
 example to illustrate the challenges:
 
-  {-# LANGUAGE PolyKinds #-}
   data T a b where
     MkT :: forall b a x.
            { field1 :: forall c. (Num a, Show c) => (Either a c, Proxy b)

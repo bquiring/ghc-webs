@@ -35,9 +35,11 @@ import GHC.Runtime.Interpreter.Types
 
 import GHC.Rename.Names ( gresFromAvails )
 
-import GHC.Tc.Utils.Monad      ( initTcInteractive, initIfaceTcRn )
+import GHC.Tc.Utils.Monad
+  ( TcMPluginHandling (..)
+  , initTcInteractive, initIfaceTcRn
+  )
 import GHC.Iface.Load          ( loadPluginInterface, cannotFindModule )
-import GHC.Builtin.Names ( pluginTyConName, frontendPluginTyConName )
 
 import GHC.Driver.Env
 import GHCi.RemoteTypes     ( HValue )
@@ -75,6 +77,7 @@ import GHC.Linker.Types
 import Data.List (unzip4)
 import GHC.Iface.Errors.Ppr
 import GHC.Driver.Monad
+import GHC.Builtin.WiredIn.Types (pluginTyConName, frontendPluginTyConName)
 
 {- Note [Timing of plugin initialization]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -153,7 +156,7 @@ initializePlugins hsc_env
       ([]  , _ )  -> False -- some external plugin added
       (p:ps,s:ss) -> check_external_plugin p s && check_external_plugins ps ss
 
-loadPlugins :: HscEnv -> IO ([LoadedPlugin], [Linkable], PkgsLoaded)
+loadPlugins :: HscEnv -> IO ([LoadedPlugin], [LinkableUsage], PkgsLoaded)
 loadPlugins hsc_env
   = do { unless (null to_load) $
            checkExternalInterpreter hsc_env
@@ -172,8 +175,7 @@ loadPlugins hsc_env
                             , opt_mod_nm == mod_nm ]
     loadPlugin = loadPlugin' (mkVarOccFS (fsLit "plugin")) pluginTyConName hsc_env
 
-
-loadFrontendPlugin :: HscEnv -> ModuleName -> IO (FrontendPlugin, [Linkable], PkgsLoaded)
+loadFrontendPlugin :: HscEnv -> ModuleName -> IO (FrontendPlugin, [LinkableUsage], PkgsLoaded)
 loadFrontendPlugin hsc_env mod_name = do
     checkExternalInterpreter hsc_env
     (plugin, _iface, links, pkgs)
@@ -188,7 +190,7 @@ checkExternalInterpreter hsc_env = case interpInstance <$> hsc_interp hsc_env of
     -> throwIO (InstallationError "Plugins require -fno-external-interpreter")
   _ -> pure ()
 
-loadPlugin' :: OccName -> Name -> HscEnv -> ModuleName -> IO (a, ModIface, [Linkable], PkgsLoaded)
+loadPlugin' :: OccName -> Name -> HscEnv -> ModuleName -> IO (a, ModIface, [LinkableUsage], PkgsLoaded)
 loadPlugin' occ_name plugin_name hsc_env mod_name
   = do { let plugin_rdr_name = mkRdrQual mod_name occ_name
              dflags = hsc_dflags hsc_env
@@ -228,7 +230,7 @@ loadPlugin' occ_name plugin_name hsc_env mod_name
 -- for debugging (@-ddump-if-trace@) only: it is shown as the reason why the module is being loaded.
 forceLoadModuleInterfaces :: HscEnv -> SDoc -> [Module] -> IO ()
 forceLoadModuleInterfaces hsc_env doc modules
-    = (initTcInteractive hsc_env $
+    = (initTcInteractive NoTcMPlugins hsc_env $
        initIfaceTcRn $
        mapM_ (loadPluginInterface doc) modules)
       >> return ()
@@ -266,7 +268,7 @@ forceLoadTyCon hsc_env con_name = do
 -- * If the Name does not exist in the module
 -- * If the link failed
 
-getValueSafely :: HscEnv -> Name -> Type -> IO (Either Type (a, [Linkable], PkgsLoaded))
+getValueSafely :: HscEnv -> Name -> Type -> IO (Either Type (a, [LinkableUsage], PkgsLoaded))
 getValueSafely hsc_env val_name expected_type = do
   eith_hval <- case getValueSafelyHook hooks of
     Nothing -> getHValueSafely interp hsc_env val_name expected_type
@@ -281,7 +283,7 @@ getValueSafely hsc_env val_name expected_type = do
     logger = hsc_logger hsc_env
     hooks  = hsc_hooks hsc_env
 
-getHValueSafely :: Interp -> HscEnv -> Name -> Type -> IO (Either Type (HValue, [Linkable], PkgsLoaded))
+getHValueSafely :: Interp -> HscEnv -> Name -> Type -> IO (Either Type (HValue, [LinkableUsage], PkgsLoaded))
 getHValueSafely interp hsc_env val_name expected_type = do
     forceLoadNameModuleInterface hsc_env (text "contains a name used in an invocation of getHValueSafely") val_name
     -- Now look up the names for the value and type constructor in the type environment
@@ -317,7 +319,7 @@ getHValueSafely interp hsc_env val_name expected_type = do
 lessUnsafeCoerce :: Logger -> String -> a -> IO b
 lessUnsafeCoerce logger context what = do
     debugTraceMsg logger 3 $
-        (text "Coercing a value in") <+> (text context) <> (text "...")
+        (text "Coercing a value in") <+> text context <> ellipsis
     output <- evaluate (unsafeCoerce what)
     debugTraceMsg logger 3 (text "Successfully evaluated coercion")
     return output
@@ -347,7 +349,7 @@ lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
     case found_module of
         Found _ mod -> do
             -- Find the exports of the module
-            (_, mb_iface) <- initTcInteractive hsc_env $
+            (_, mb_iface) <- initTcInteractive NoTcMPlugins hsc_env $
                              initIfaceTcRn $
                              loadPluginInterface doc mod
             case mb_iface of

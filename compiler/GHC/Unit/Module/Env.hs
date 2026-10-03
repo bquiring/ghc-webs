@@ -8,8 +8,8 @@ module GHC.Unit.Module.Env
    , lookupWithDefaultModuleEnv, mapModuleEnv, mkModuleEnv, emptyModuleEnv
    , alterModuleEnv
    , partitionModuleEnv
-   , moduleEnvKeys, moduleEnvElts, moduleEnvToList
-   , unitModuleEnv, isEmptyModuleEnv
+   , moduleEnvKeys, nonDetModuleEnvKeys, moduleEnvElts, moduleEnvToList
+   , unitModuleEnv, isEmptyModuleEnv, sizeModuleEnv
    , extendModuleEnvWith, filterModuleEnv, mapMaybeModuleEnv
 
      -- * ModuleName mappings
@@ -157,8 +157,15 @@ mkModuleEnv xs = ModuleEnv (Map.fromList [(NDModule k, v) | (k,v) <- xs])
 emptyModuleEnv :: ModuleEnv a
 emptyModuleEnv = ModuleEnv Map.empty
 
+-- | See Note [ModuleEnv performance and determinism].
+--
+-- If you use this, please provide a justification why it doesn't introduce
+-- nondeterminism.
+nonDetModuleEnvKeys :: ModuleEnv a -> [Module]
+nonDetModuleEnvKeys (ModuleEnv e) = map unNDModule $ Map.keys e
+
 moduleEnvKeys :: ModuleEnv a -> [Module]
-moduleEnvKeys (ModuleEnv e) = sort $ map unNDModule $ Map.keys e
+moduleEnvKeys = sort . nonDetModuleEnvKeys
   -- See Note [ModuleEnv performance and determinism]
 
 moduleEnvElts :: ModuleEnv a -> [a]
@@ -175,6 +182,9 @@ unitModuleEnv m x = ModuleEnv (Map.singleton (NDModule m) x)
 
 isEmptyModuleEnv :: ModuleEnv a -> Bool
 isEmptyModuleEnv (ModuleEnv e) = Map.null e
+
+sizeModuleEnv :: ModuleEnv a -> Int
+sizeModuleEnv (ModuleEnv e) = Map.size e
 
 -- | A set of 'Module's
 type ModuleSet = Set NDModule

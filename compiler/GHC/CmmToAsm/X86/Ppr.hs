@@ -1,7 +1,3 @@
-
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -----------------------------------------------------------------------------
 --
 -- Pretty-printing assembly language
@@ -9,6 +5,9 @@
 -- (c) The University of Glasgow 1993-2005
 --
 -----------------------------------------------------------------------------
+
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE TupleSections #-}
 
 module GHC.CmmToAsm.X86.Ppr (
         pprNatCmmDecl,
@@ -35,9 +34,11 @@ import GHC.Cmm              hiding (topInfoTable)
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
+import GHC.Cmm.InitFini
 import GHC.Cmm.DebugBlock (pprUnwindTable)
 
 import GHC.Types.Basic (Alignment, mkAlignment, alignmentBytes)
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique ( pprUniqueAlways )
 
 import GHC.Utils.Outputable
@@ -45,6 +46,8 @@ import GHC.Utils.Panic
 
 import Data.List ( intersperse )
 import Data.Word
+import GHC.Float (castDoubleToWord64, castFloatToWord32)
+import qualified Data.List.NonEmpty as NE
 
 -- Note [Subsections Via Symbols]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -199,8 +202,12 @@ pprDatas config (_, CmmStaticsRaw alias [CmmStaticLit (CmmLabel lbl), CmmStaticL
         labelInd _ = Nothing
   , Just ind' <- labelInd ind
   , alias `mayRedirectTo` ind'
+  -- See Note [Split sections on COFF objects]
+  , not $ platformOS platform == OSMinGW32 && ncgSplitSections config
   = pprGloblDecl (ncgPlatform config) alias
     $$ line (text ".equiv" <+> pprAsmLabel (ncgPlatform config) alias <> comma <> pprAsmLabel (ncgPlatform config) ind')
+    where
+      platform = ncgPlatform config
 
 pprDatas config (align, (CmmStaticsRaw lbl dats))
  = vcat (pprAlign platform align : pprLabel platform lbl : map (pprData config) dats)
@@ -491,8 +498,8 @@ pprImm platform = \case
    ImmCLbl l           -> pprAsmLabel platform l
    ImmIndex l i        -> pprAsmLabel platform l <> char '+' <> int i
    ImmLit s            -> ftext s
-   ImmFloat f          -> float $ fromRational f
-   ImmDouble d         -> double $ fromRational d
+   ImmFloat f          -> float f
+   ImmDouble d         -> double d
    ImmConstantSum a b  -> pprImm platform a <> char '+' <> pprImm platform b
    ImmConstantDiff a b -> pprImm platform a <> char '-' <> lparen <> pprImm platform b <> rparen
 
@@ -530,11 +537,20 @@ pprAddr platform (AddrBaseIndex base index displacement)
 
 -- | Print section header and appropriate alignment for that section.
 pprSectionAlign :: IsDoc doc => NCGConfig -> Section -> doc
-pprSectionAlign _config (Section (OtherSection _) _) =
-     panic "X86.Ppr.pprSectionAlign: unknown section"
-pprSectionAlign config sec@(Section seg _) =
+pprSectionAlign config sec@(Section seg suffix) =
     line (pprSectionHeader config sec) $$
+    coffSplitSectionComdatKey $$
     pprAlignForSection (ncgPlatform config) seg
+  where
+    platform = ncgPlatform config
+    -- See Note [Split sections on COFF objects]
+    coffSplitSectionComdatKey
+      | OSMinGW32 <- platformOS platform
+      , ncgSplitSections config
+      , Nothing <- isInitOrFiniSection seg
+      = line (pprCOFFComdatKey platform suffix <> colon)
+      | otherwise
+      = empty
 
 -- | Print appropriate alignment for the given section type.
 pprAlignForSection :: IsDoc doc => Platform -> SectionType -> doc
@@ -565,37 +581,62 @@ pprAlignForSection platform seg = line $
 
 pprDataItem :: forall doc. IsDoc doc => NCGConfig -> CmmLit -> doc
 pprDataItem config lit =
-  let (itemFmt, items) = itemFormatAndItems (cmmTypeFormat $ cmmLitType platform lit)
-  in line $ itemFmt <> hsep (punctuate comma (items lit))
+  vcat $ map ppr_one $ NE.groupWith fst $
+    lit_items (cmmTypeFormat $ cmmLitType platform lit) lit
     where
-        platform = ncgPlatform config
+      platform = ncgPlatform config
 
-        pprLitImm, pprII64AsII32x2 :: CmmLit -> [Line doc]
-        pprLitImm = (:[]) . pprImm platform . litToImm
-        pprII64AsII32x2 (CmmInt x _)
-          = [ int (fromIntegral (fromIntegral x :: Word32))
-            , int (fromIntegral (fromIntegral (x `shiftR` 32) :: Word32)) ]
-        pprII64AsII32x2 x
-          = pprPanic "X86 pprDataItem II64" (ppr x)
+      ppr_one :: NE.NonEmpty (Format, Line doc) -> doc
+      ppr_one ((fmt, i1) NE.:| is) =
+        line $ ppr_fmt fmt <> hsep (punctuate comma $ i1 : map snd is)
 
-        itemFormatAndItems :: Format -> (Line doc, CmmLit -> [Line doc])
-        itemFormatAndItems = \case
-          II8  -> ( text "\t.byte\t", pprLitImm )
-          II16 -> ( text "\t.word\t", pprLitImm )
-          II32 -> ( text "\t.long\t", pprLitImm )
-          II64 ->
-            case platformOS platform of
-              OSDarwin
-                | target32Bit platform
-                -> ( text "\t.long\t", pprII64AsII32x2 )
-              _ -> ( text "\t.quad\t", pprLitImm )
-          FF32 -> ( text "\t.float\t", pprLitImm )
-          FF64 -> ( text "\t.double\t", pprLitImm )
-          VecFormat _ sFmt ->
-            let (fmtTxt, pprElt) = itemFormatAndItems (scalarFormatFormat sFmt)
-            in (fmtTxt, \ case { CmmVec elts -> pprElt =<< elts
-                               ; x -> pprPanic "X86 pprDataItem VecFormat" (ppr x)
-                               })
+      pprAsII32x2 :: CmmLit -> [Line doc]
+      pprAsII32x2 (CmmInt x _)
+        = [ int (fromIntegral (fromIntegral x :: Word32))
+          , int (fromIntegral (fromIntegral (x `shiftR` 32) :: Word32)) ]
+      pprAsII32x2 x
+        = pprPanic "X86 pprDataItem II64" (ppr x)
+
+      ppr_lit :: CmmLit -> Line doc
+      ppr_lit = pprImm platform . litToImm
+
+      ppr_fmt :: Format -> Line doc
+      ppr_fmt = \case
+        II8  -> text "\t.byte\t"
+        II16 -> text "\t.word\t"
+        II32 -> text "\t.long\t"
+        II64 -> text "\t.quad\t"
+        FF32 -> text "\t.float\t"
+        FF64 -> text "\t.double\t"
+        _ -> panic "pprDataItem: non-scalar format"
+
+      lit_items :: Format -> CmmLit -> [(Format, Line doc)]
+      lit_items fmt lit = case fmt of
+        II64
+          | OSDarwin <- platformOS platform
+          , target32Bit platform
+          -> (II32, ) <$> pprAsII32x2 lit
+        FF32
+          | CmmFloat f _ <- lit
+          , litFloatingIsNonStandardNaN LitFloat f
+          , let w32 = castFloatToWord32 (litFloatingToHostFloat f)
+          -> [(II32, ppr_lit (CmmInt (fromIntegral w32) W32))]
+        FF64
+          | CmmFloat f _ <- lit
+          , litFloatingIsNonStandardNaN LitDouble f
+          , let w64 = castDoubleToWord64 (litFloatingToHostDouble f)
+                ilit = CmmInt (fromIntegral w64) W64
+          -> if | OSDarwin <- platformOS platform
+                , target32Bit platform
+                -> (II32, ) <$> pprAsII32x2 ilit
+                | otherwise
+                -> [(II64, ppr_lit ilit)]
+        VecFormat _ sFmt
+          | CmmVec elts <- lit
+          -> concatMap (lit_items (scalarFormatFormat sFmt)) elts
+          | otherwise
+          -> pprPanic "X86 pprDataItem VecFormat" (ppr lit)
+        _ -> [(fmt, ppr_lit lit)]
 
 asmComment :: IsLine doc => doc -> doc
 asmComment c = whenPprDebug $ text "# " <> c
@@ -737,8 +778,14 @@ pprInstr platform i = case i of
    AND format src dst
       -> pprFormatOpOp (text "and") format src dst
 
+   VAND format src1 src2 dst
+      -> pprFormatOpRegReg (text "vand") format src1 src2 dst
+
    OR  format src dst
       -> pprFormatOpOp (text "or")  format src dst
+
+   VOR format src1 src2 dst
+      -> pprFormatOpRegReg (text "vor") format src1 src2 dst
 
    XOR FF32 src dst
       -> pprOpOp (text "xorps") FF32 src dst
@@ -753,7 +800,7 @@ pprInstr platform i = case i of
       -> pprFormatOpOp (text "xor") format src dst
 
    VXOR fmt src1 src2 dst
-      -> pprVxor fmt src1 src2 dst
+      -> pprVXor fmt src1 src2 dst
 
    POPCNT format src dst
       -> pprOpOp (text "popcnt") format src (OpReg dst)
@@ -814,6 +861,15 @@ pprInstr platform i = case i of
 
    BT format imm src
       -> pprFormatImmOp (text "bt") format imm src
+
+   BTR format off dst
+      -> pprFormatOpOp (text "btr") format off dst
+
+   BTS format off dst
+      -> pprFormatOpOp (text "bts") format off dst
+
+   BTC format off dst
+      -> pprFormatOpOp (text "btc") format off dst
 
    CMP format src dst
      | isFloatFormat format -> pprFormatOpOp (text "ucomi") format src dst -- SSE2
@@ -889,7 +945,7 @@ pprInstr platform i = case i of
    JMP op _
       -> line $ text "\tjmp *" <> pprOperand platform (archWordFormat (target32Bit platform)) op
 
-   JMP_TBL op _ _ _
+   JMP_TBL op _ _ _ _
       -> pprInstr platform (JMP op [])
 
    CALL (Left imm) _
@@ -996,8 +1052,13 @@ pprInstr platform i = case i of
      -> pprFormatOpReg (text "psub") format src dst
    PMULL format src dst
      -> pprFormatOpReg (text "pmull") format src dst
+   VPMULL format s1 s2 dst
+     -> pprFormatOpRegReg (text "vpmull") format s1 s2 dst
    PMULUDQ format src dst
      -> pprOpReg (text "pmuludq") format src dst
+   PABS format src dst -> pprFormatOpReg (text "pabs") format src dst
+   VPABS format src dst -> pprFormatOpReg (text "vpabs") format src dst
+   VSQRT format src dst -> pprFormatOpReg (text "vsqrt") format src dst
    PCMPGT format src dst
      -> pprFormatOpReg (text "pcmpgt") format src dst
    VBROADCAST format@(VecFormat _ sFmt) from to
@@ -1036,13 +1097,17 @@ pprInstr platform i = case i of
    PXOR format src dst
      -> pprPXor (text "pxor") format src dst
    VPXOR format s1 s2 dst
-     -> pprXor (text "vpxor") format s1 s2 dst
+     -> pprVXor format s1 s2 dst
    PAND format src dst
      -> pprOpReg (text "pand") format src dst
+   VPAND format s1 s2 dst
+     -> pprOpRegReg (text "vpand") format s1 s2 dst
    PANDN format src dst
      -> pprOpReg (text "pandn") format src dst
    POR format src dst
      -> pprOpReg (text "por") format src dst
+   VPOR format s1 s2 dst
+     -> pprOpRegReg (text "vpor") format s1 s2 dst
    VEXTRACT format offset from to
      -> pprFormatImmRegOp (text "vextract") format offset from to
    INSERTPS format offset addr dst
@@ -1083,6 +1148,8 @@ pprInstr platform i = case i of
      -> pprFormatOpReg (text "psrl") format offset dst
    PSRLDQ format offset dst
      -> pprDoubleShift (text "psrldq") format offset dst
+   PSRA format offset dst
+     -> pprFormatOpReg (text "psra") format offset dst
    PALIGNR format offset src dst
      -> pprImmOpReg (text "palignr") format offset src dst
 
@@ -1299,6 +1366,16 @@ pprInstr platform i = case i of
            pprReg platform (archWordFormat (target32Bit platform)) reg
        ]
 
+   pprOpRegReg :: Line doc -> Format -> Operand -> Reg -> Reg -> doc
+   pprOpRegReg name format op1 reg2 reg3
+     = line $ hcat [
+           pprMnemonic_ name,
+           pprOperand platform format op1,
+           comma,
+           pprReg platform (archWordFormat (target32Bit platform)) reg2,
+           comma,
+           pprReg platform (archWordFormat (target32Bit platform)) reg3
+       ]
 
    pprFormatOpReg :: Line doc -> Format -> Operand -> Reg -> doc
    pprFormatOpReg name format op1 reg2
@@ -1397,17 +1474,6 @@ pprInstr platform i = case i of
            pprReg platform vectorFormat dst
        ]
 
-   pprXor :: Line doc -> Format -> Reg -> Reg -> Reg -> doc
-   pprXor name format reg1 reg2 reg3
-     = line $ hcat [
-           pprGenMnemonic name format,
-           pprReg platform format reg1,
-           comma,
-           pprReg platform format reg2,
-           comma,
-           pprReg platform format reg3
-       ]
-
    pprPXor :: Line doc -> Format -> Operand -> Reg -> doc
    pprPXor name format src dst
      = line $ hcat [
@@ -1417,8 +1483,8 @@ pprInstr platform i = case i of
            pprReg platform format dst
        ]
 
-   pprVxor :: Format -> Operand -> Reg -> Reg -> doc
-   pprVxor fmt src1 src2 dst
+   pprVXor :: Format -> Operand -> Reg -> Reg -> doc
+   pprVXor fmt src1 src2 dst
      = line $ hcat [
            pprGenMnemonic mem fmt,
            pprOperand platform fmt src1,
@@ -1433,7 +1499,8 @@ pprInstr platform i = case i of
         FF64 -> text "vxorpd"
         VecFormat _ FmtFloat -> text "vxorps"
         VecFormat _ FmtDouble -> text "vxorpd"
-        _ -> pprPanic "GHC.CmmToAsm.X86.Ppr.pprVxor: element type must be Float or Double"
+        VecFormat _ _ints -> text "vpxor"
+        _ -> pprPanic "GHC.CmmToAsm.X86.Ppr.pprVXor: unexpected format"
               (ppr fmt)
 
    pprInsert :: Line doc -> Format -> Imm -> Operand -> Reg -> doc
@@ -1554,7 +1621,8 @@ pprInstr platform i = case i of
    pprMinMax wantV minOrMax mmTy fmt regs
      = line $ hcat ( instr : intersperse comma ( map ( pprOperand platform fmt ) regs ) )
       where
-        instr =  (if wantV then text "v" else empty)
+        instr =  char '\t'
+              <> (if wantV then text "v" else empty)
               <> (case mmTy of { IntVecMinMax {} -> text "p"; FloatMinMax -> empty })
               <> (case minOrMax of { Min -> text "min"; Max -> text "max" })
               <> (case mmTy of { IntVecMinMax wantSigned -> if wantSigned then text "s" else text "u"; FloatMinMax -> empty })

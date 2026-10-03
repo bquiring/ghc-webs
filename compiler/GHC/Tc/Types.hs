@@ -1,11 +1,4 @@
-
-{-# LANGUAGE DerivingStrategies         #-}
-{-# LANGUAGE ExistentialQuantification  #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE GADTs                      #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE PatternSynonyms            #-}
-
 {-
 (c) The University of Glasgow 2006-2012
 (c) The GRASP Project, Glasgow University, 1992-2002
@@ -41,18 +34,17 @@ module GHC.Tc.Types(
         FrontendResult(..),
 
         -- Renamer types
-        ErrCtxt,
+        HsCtxt,
         ImportAvails(..), emptyImportAvails, plusImportAvails,
         ImportUserSpec(..),
-        ImpUserList(..),
+        ImpUserList(..), isDependOnlyImport,
         mkModDeps,
 
         -- Typechecker types
         TcTypeEnv, TcBinderStack, TcBinder(..),
         TcTyThing(..), tcTyThingTyCon_maybe,
         PromotionErr(..),
-        IdBindingInfo(..), ClosedTypeId, RhsNames,
-        IsGroupClosed(..),
+        IdBindingInfo(..), ClosedTypeId,
         SelfBootInfo(..), bootExports,
         tcTyThingCategory, pprTcTyThingCategory,
         peCategory, pprPECategory,
@@ -87,6 +79,17 @@ module GHC.Tc.Types(
         NameShape(..),
         removeBindingShadowing,
         getPlatform,
+
+        -- 'TcM' plugins
+        TcMPluginsState(..), RunningTcMPlugins(..), emptyRunningTcMPlugins,
+        TcMPluginsRun(..), emptyTcMPluginsRun,
+        TcMPluginsPostTc(..), emptyTcMPluginsPostTc,
+        TcMPluginsShutdown(..), emptyTcMPluginsShutdown,
+
+        runningTcMPlugins,
+        tcMPluginsRunActions,
+        tcMPluginsPostTcActions,
+        tcMPluginsShutdownActions,
 
         -- Constraint solver plugins
         TcPlugin(..),
@@ -171,12 +174,13 @@ import GHC.Unit.Module.Deps
 import GHC.Unit.Module.ModDetails
 
 import GHC.Utils.Error
+import GHC.Utils.Misc ( HasDebugCallStack )
 import GHC.Utils.Outputable
 import GHC.Utils.Fingerprint
 import GHC.Utils.Panic
 import GHC.Utils.Logger
 
-import GHC.Builtin.Names ( isUnboundName )
+import GHC.Builtin ( isUnboundName )
 
 import GHCi.Message
 import GHCi.RemoteTypes
@@ -188,6 +192,7 @@ import Data.Dynamic  ( Dynamic )
 import Data.Map ( Map )
 import Data.Typeable ( TypeRep )
 import Data.Maybe    ( mapMaybe )
+
 
 -- | The import specification as written by the user, including
 -- the list of explicitly imported names. Used in 'ModIface' to
@@ -217,6 +222,21 @@ data ImpUserList
         -- ^ The @T@s in import list items of the form @T(..)@
       }
   | ImpUserEverythingBut !NameSet
+  | ImpUserDependOnly
+    -- ^ The import binds nothing at all, but the importer nevertheless depends
+    -- on the whole export list of the imported module.
+    --
+    -- Used only for the implicit import of 'GHC.Essentials'.
+    -- See Note [Finding GHC.Essentials] in GHC.Builtin.
+
+-- | Is this import only a recorded dependency ('ImpUserDependOnly'), rather
+-- than something the module imports in the ordinary sense?
+isDependOnlyImport :: ImpUserList -> Bool
+isDependOnlyImport = \case
+  ImpUserDependOnly       -> True
+  ImpUserAll              -> False
+  ImpUserExplicit {}      -> False
+  ImpUserEverythingBut {} -> False
 
 -- | A 'NameShape' is a substitution on 'Name's that can be used
 -- to refine the identities of a hole while we are renaming interfaces
@@ -286,6 +306,7 @@ data Env gbl lcl
                              -- BangPattern is to fix leak, see #15111
 
         env_ut   :: {-# UNPACK #-} !Char,   -- Tag for Uniques
+                                            -- See Note [Performance implications of UniqueTag]
 
         env_gbl  :: gbl,     -- Info about things defined at the top level
                              -- of the module being compiled
@@ -334,7 +355,7 @@ data RewriteEnv
           -- ^ At what role are we rewriting?
           -- See Note [Rewriter EqRels] in GHC.Tc.Solver.Rewrite
 
-       , re_rewriters :: !(TcRef RewriterSet)  -- ^ See Note [Wanteds rewrite Wanteds]
+       , re_rewriters :: !(TcRef CoHoleSet)  -- ^ See Note [Wanteds rewrite Wanteds: rewriter-sets]
        }
 -- RewriteEnv is mostly used in @GHC.Tc.Solver.Rewrite@, but it is defined
 -- here so that it can also be passed to rewriting plugins.
@@ -355,16 +376,16 @@ data IfGblEnv
         -- Some information about where this environment came from;
         -- useful for debugging.
         if_doc :: SDoc,
+
         -- The type environment for the module being compiled,
         -- in case the interface refers back to it via a reference that
         -- was originally a hi-boot file.
         -- We need the module name so we can test when it's appropriate
         -- to look in this env.
         -- See Note [Tying the knot] in GHC.IfaceToCore
-        if_rec_types :: (KnotVars (IfG TypeEnv))
+        if_rec_types :: KnotVars (IfG TypeEnv)
                 -- Allows a read effect, so it can be in a mutable
                 -- variable; c.f. handling the external package type env
-                -- Nothing => interactive stuff, no loops possible
     }
 
 data IfLclEnv
@@ -494,11 +515,14 @@ data TcGblEnv
           -- NB: for what "things in this module" means, see
           -- Note [The interactive package] in "GHC.Runtime.Context"
 
-        tcg_type_env_var :: KnotVars (IORef TypeEnv),
+        tcg_knot_vars :: KnotVars (IORef TypeEnv),
                 -- Used only to initialise the interface-file
                 -- typechecker in initIfaceTcRn, so that it can see stuff
                 -- bound in this module when dealing with hi-boot recursions
                 -- Updated at intervals (e.g. after dealing with types and classes)
+
+        tcg_known_key_maps :: TcRef (Maybe KnownKeyNameMaps),
+          -- ^ Cache of the known entities that we looked up from 'GHC.Essentials'.
 
         tcg_inst_env     :: !InstEnv,
           -- ^ Instance envt for all /home-package/ modules;
@@ -568,7 +592,7 @@ data TcGblEnv
           -- is implicit rather than explicit, so we have to zap a
           -- mutable variable.
 
-        tcg_th_needed_deps :: TcRef ([Linkable], PkgsLoaded),
+        tcg_th_needed_deps :: TcRef ([LinkableUsage], PkgsLoaded),
           -- ^ The set of runtime dependencies required by this module
           -- See Note [Object File Dependencies]
 
@@ -576,8 +600,8 @@ data TcGblEnv
           -- ^ Allows us to choose unique DFun names.
 
         tcg_zany_n :: TcRef Integer,
-          -- ^ A source of unique identities for ZonkAny instances
-          -- See Note [Any types] in GHC.Builtin.Types, wrinkle (Any4)
+          -- ^ A source of unique identities for UnusedType instances
+          -- See Note [The types Any and UnusedType] in GHC.Builtin.WiredIn.Types, wrinkle (Any6)
 
         tcg_merged :: [(Module, Fingerprint)],
           -- ^ The requirements we merged with; we always have to recompile
@@ -603,6 +627,7 @@ data TcGblEnv
           -- decls.
 
         tcg_dependent_files :: TcRef [FilePath], -- ^ dependencies from addDependentFile
+        tcg_dependent_dirs  :: TcRef [FilePath], -- ^ dependencies from addDependentDirectory
 
         tcg_th_topdecls :: TcRef [LHsDecl GhcPs],
         -- ^ Top-level declarations from addTopDecls
@@ -672,25 +697,12 @@ data TcGblEnv
         -- are supplied (#19714), or if those reasons have already been
         -- reported by GHC.Driver.Main.markUnsafeInfer
 
-        tcg_tc_plugin_solvers :: [TcPluginSolver],
-        -- ^ A list of user-defined type-checking plugins for constraint solving.
-
-        tcg_tc_plugin_rewriters :: UniqFM TyCon [TcPluginRewriter],
-        -- ^ A collection of all the user-defined type-checking plugins for rewriting
-        -- type family applications, collated by their type family 'TyCon's.
-
-        tcg_defaulting_plugins :: [FillDefaulting],
-        -- ^ A list of user-defined plugins for type defaulting plugins.
-
-        tcg_hf_plugins :: [HoleFitPlugin],
-        -- ^ A list of user-defined plugins for hole fit suggestions.
+        tcg_plugins :: TcRef TcMPluginsState,
+        -- ^ All 'TcM' plugins (solver/rewriter/defaulting/hole-fit).
 
         tcg_top_loc :: RealSrcSpan,
         -- ^ The RealSrcSpan this module came from
 
-        tcg_static_wc :: TcRef WantedConstraints,
-          -- ^ Wanted constraints of static forms.
-        -- See Note [Constraints in static forms].
         tcg_complete_matches :: !CompleteMatches,
         -- ^ Complete matches defined in this module.
 
@@ -704,27 +716,6 @@ data TcGblEnv
 -- NB: topModIdentity, not topModSemantic!
 -- Definition sites of orphan identities will be identity modules, not semantic
 -- modules.
-
--- Note [Constraints in static forms]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- When a static form produces constraints like
---
--- f :: StaticPtr (Bool -> String)
--- f = static show
---
--- we collect them in tcg_static_wc and resolve them at the end
--- of type checking. They need to be resolved separately because
--- we don't want to resolve them in the context of the enclosing
--- expression. Consider
---
--- g :: Show a => StaticPtr (a -> String)
--- g = static show
---
--- If the @Show a0@ constraint that the body of the static form produces was
--- resolved in the context of the enclosing expression, then the body of the
--- static form wouldn't be closed because the Show dictionary would come from
--- g's context instead of coming from the top level.
 
 tcVisibleOrphanMods :: TcGblEnv -> ModuleSet
 tcVisibleOrphanMods tcg_env
@@ -1021,7 +1012,7 @@ unsafeTcPluginTcM = TcPluginM
 
 data TcPlugin = forall s. TcPlugin
   { tcPluginInit :: TcPluginM s
-    -- ^ Initialize plugin, when entering type-checker.
+    -- ^ Initialize plugin, once per module, when starting the type-checker.
 
   , tcPluginSolve :: s -> TcPluginSolver
     -- ^ Solve some constraints.
@@ -1050,8 +1041,18 @@ data TcPlugin = forall s. TcPlugin
     --
     -- Use @ \\ _ -> emptyUFM @ if your plugin does not provide this functionality.
 
-  , tcPluginStop :: s -> TcPluginM ()
-   -- ^ Clean up after the plugin, when exiting the type-checker.
+  , tcPluginPostTc :: s -> TcPluginM ()
+    -- ^ Action to run at the end of typechecking a module, e.g. to intercept
+    -- the final 'TcGblEnv'/'TcLclEnv' at the end of typechecking, possibly
+    -- modifying mutable fields.
+    --
+    -- Should not terminate the plugin, as the plugin may continue to be invoked
+    -- when desugaring the module (as the pattern-match checker may invoke the
+    -- constraint solver).
+
+  , tcPluginShutdown :: s -> IO ()
+    -- ^ Clean up after the plugin, when GHC is done processing the given
+    -- module (e.g. after desugaring).
   }
 
 -- | The plugin found a contradiction.
@@ -1137,11 +1138,13 @@ type FillDefaulting
 -- | A plugin for controlling defaulting.
 data DefaultingPlugin = forall s. DefaultingPlugin
   { dePluginInit :: TcPluginM s
-    -- ^ Initialize plugin, when entering type-checker.
+    -- ^ Initialize plugin, when beginning to typecheck a module.
   , dePluginRun :: s -> FillDefaulting
-    -- ^ Default some types
-  , dePluginStop :: s -> TcPluginM ()
-   -- ^ Clean up after the plugin, when exiting the type-checker.
+    -- ^ Type defaulting action.
+  , dePluginPostTc :: s -> TcPluginM ()
+    -- ^ Action to run at the end of typechecking a module.
+  , dePluginShutdown :: s -> IO ()
+    -- ^ Clean up after the plugin, once done processing a module.
   }
 
 {- *********************************************************************
@@ -1197,3 +1200,122 @@ data DocLoc = DeclDoc Name
 -- | The current collection of docs that Template Haskell has built up via
 -- putDoc.
 type THDocs = Map DocLoc (HsDoc GhcRn)
+
+{- *********************************************************************
+*                                                                      *
+                          TcM plugins
+*                                                                      *
+********************************************************************* -}
+
+-- | "run" actions for already-started 'TcM' plugins (meaning that we have
+-- initialised them and not yet stopped them).
+--
+-- Includes typechecker plugins, defaulting plugins, and hole fit plugins.
+data TcMPluginsRun = TcMPluginsRun
+  { tcmp_solvers    :: [TcPluginSolver]
+    -- ^ Running constraint solver plugins.
+  , tcmp_rewriters  :: UniqFM TyCon [TcPluginRewriter]
+    -- ^ Running type-family rewriting plugins.
+  , tcmp_defaulters :: [FillDefaulting]
+    -- ^ Running defaulting plugins.
+  , tcmp_hole_fits  :: [HoleFitPlugin]
+    -- ^ Running hole-fit plugins.
+  }
+
+emptyTcMPluginsRun :: TcMPluginsRun
+emptyTcMPluginsRun = TcMPluginsRun
+  { tcmp_solvers    = []
+  , tcmp_rewriters  = emptyUFM
+  , tcmp_defaulters = []
+  , tcmp_hole_fits  = []
+  }
+
+-- | The "post-tc" actions for 'TcM' plugins.
+--
+-- Includes typechecker plugins, defaulting plugins and hole fit plugins.
+data TcMPluginsPostTc =
+  TcMPluginsPostTc
+  { tcpt_tc_plugins         :: [TcPluginM ()]
+  , tcpt_defaulting_plugins :: [TcPluginM ()]
+  , tcpt_hole_fit_plugins   :: [TcM ()]
+  }
+
+emptyTcMPluginsPostTc :: TcMPluginsPostTc
+emptyTcMPluginsPostTc = TcMPluginsPostTc
+  { tcpt_tc_plugins         = []
+  , tcpt_defaulting_plugins = []
+  , tcpt_hole_fit_plugins   = []
+  }
+
+-- | The "shutdown" actions for 'TcM' plugins.
+--
+-- Includes typechecker plugins and defaulting plugins.
+data TcMPluginsShutdown =
+  TcMPluginsShutdown
+  { tcps_tc_plugins         :: [IO ()]
+  , tcps_defaulting_plugins :: [IO ()]
+  }
+
+emptyTcMPluginsShutdown :: TcMPluginsShutdown
+emptyTcMPluginsShutdown = TcMPluginsShutdown
+  { tcps_tc_plugins         = []
+  , tcps_defaulting_plugins = []
+  }
+
+-- | Plugins that run in the typechecker.
+--
+-- May be uninitialised or already stopped.
+data TcMPluginsState
+  -- | The 'TcM' plugins have not been started.
+  = TcMPluginsUninitialised
+  -- | The 'TcM' plugins have been initialised and not yet stopped,
+  -- or there were no 'TcM' plugins to start with.
+  --
+  -- We may be in the middle of typechecker, or have finished typechecking
+  -- and be in the middle of desugaring.
+  | TcMPluginsRunning !RunningTcMPlugins
+  -- | There were 'TcM' plugins that were running, but they have been stopped.
+  | TcMPluginsStopped
+
+-- | A (possibly empty) collection of 'TcM' plugin @run@, @post-tc@ and
+-- @shutdown@ actions.
+data RunningTcMPlugins =
+  RunningTcMPlugins
+    { rtcmp_run      :: TcMPluginsRun
+    , rtcmp_post_tc  :: TcMPluginsPostTc
+    , rtcmp_shutdown :: TcMPluginsShutdown
+    }
+
+emptyRunningTcMPlugins :: RunningTcMPlugins
+emptyRunningTcMPlugins =
+  RunningTcMPlugins
+    emptyTcMPluginsRun
+    emptyTcMPluginsPostTc
+    emptyTcMPluginsShutdown
+
+tcMPluginsRunActions :: RunningTcMPlugins -> TcMPluginsRun
+tcMPluginsRunActions = rtcmp_run
+tcMPluginsPostTcActions :: RunningTcMPlugins -> TcMPluginsPostTc
+tcMPluginsPostTcActions = rtcmp_post_tc
+tcMPluginsShutdownActions :: RunningTcMPlugins -> TcMPluginsShutdown
+tcMPluginsShutdownActions = rtcmp_shutdown
+
+-- | Retrieve the 'TcM' plugins from a 'TcMPluginsState'.
+--
+-- Assumes the plugins (if any) have been already started and not yet stopped.
+runningTcMPlugins
+   :: HasDebugCallStack
+   => TcMPluginsState -> RunningTcMPlugins
+runningTcMPlugins = \case
+  TcMPluginsUninitialised ->
+    pprPanic "TcM plugins have not been started" $
+      vcat [ text "If you are a GHC API user, make sure to use an appropriate 'TcMPluginHandling'"
+           , text "to ensure that TcM plugins (if any) are initialised before typechecking."
+           ]
+  TcMPluginsStopped ->
+    pprPanic "TcM plugins already stopped" $
+      vcat [ text "If you are a GHC API user and want to proceed to desugaring after typechecking,"
+           , text "make sure you are not using the 'StartAndStopTcMPlugins' 'TcMPluginHandling',"
+           , text "as that stops TcM plugins after typechecking."
+           ]
+  TcMPluginsRunning plugins -> plugins

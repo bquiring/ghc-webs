@@ -2,7 +2,6 @@ module Rules.CabalReinstall where
 
 import Context
 import Expression
-import Oracles.Flag
 import Packages
 import Settings
 import Target
@@ -11,6 +10,7 @@ import qualified System.Directory.Extra as IO
 import Data.Either
 import Rules.BinaryDist
 import Oracles.Setting
+import BindistConfig
 
 {-
 Note [Testing reinstallable GHC]
@@ -38,7 +38,7 @@ cabalBuildRules = do
         withVerbosity Diagnostic $
           buildWithCmdOptions [] $
             target (vanillaContext Stage2 pkg) (Cabal Install Stage2) [] []
-      liftIO $ writeFile outpath "done"
+      writeFileAtomic outpath "done"
 
     phony "build-cabal" $ need [root -/- "stage-cabal" -/- "bin" -/- ".stamp"]
 
@@ -47,10 +47,8 @@ cabalBuildRules = do
     priority 2.0 $ root -/- "stage-cabal" -/- "bin" -/- ".stamp" %> \stamp -> do
         -- We 'need' all binaries and libraries
         all_pkgs <- stagePackages Stage1
-        (lib_targets, bin_targets) <- partitionEithers <$> mapM pkgTarget all_pkgs
-        cross <- flag CrossCompiling
-        iserv_targets <- if cross then pure [] else iservBins
-        need (lib_targets ++ (map (\(_, p) -> p) (bin_targets ++ iserv_targets)))
+        (lib_targets, bin_targets) <- partitionEithers <$> mapM (pkgTarget normalBindist) all_pkgs
+        need (map snd (lib_targets ++ bin_targets))
 
         distDir        <- Context.distDir (vanillaContext Stage1 rts)
         let rtsIncludeDir    = distDir -/- "include"
@@ -69,13 +67,13 @@ cabalBuildRules = do
 
         let cabal_package_db = cwd -/- root -/- "stage-cabal" -/- "dist-newstyle" -/- "packagedb" -/- "ghc-" ++ version
 
-        forM_ (filter ((/= iserv) . fst) bin_targets) $ \(bin_pkg,_bin_path) -> do
+        forM_ bin_targets $ \(bin_pkg,_bin_path) -> do
             let pgmName pkg
                   | pkg == ghc    = "ghc"
                   | pkg == hpcBin = "hpc"
                   | otherwise     = pkgName pkg
             let cabal_bin_out = work_dir -/- "cabal-bin" -/- (pgmName bin_pkg)
-            needed_wrappers <- pkgToWrappers bin_pkg
+            needed_wrappers <- pkgToWrappers Stage2 bin_pkg
             forM_ needed_wrappers $ \wrapper_name -> do
               let wrapper_prefix = unlines
                     ["#!/usr/bin/env sh"
@@ -87,19 +85,9 @@ cabalBuildRules = do
                     ,"export GHC_PACKAGE_PATH="++show cabal_package_db++":"
                     ]
                   output_file = outputDir -/- wrapper_name
-              wrapper_content <- wrapper wrapper_name
-              writeFile' output_file (wrapper_prefix ++ wrapper_content)
+              wrapper_content <- wrapper Stage2 wrapper_name
+              writeFileAtomic output_file (wrapper_prefix ++ wrapper_content)
               makeExecutable output_file
               pure ()
 
-        -- Just symlink these for now
-        -- TODO: build these with cabal as well
-        forM_ iserv_targets $ \(_bin_pkg,bin_path') -> do
-            bin_path <- liftIO $ makeAbsolute bin_path'
-            let orig_filename = takeFileName bin_path
-                output_file = outputDir -/- orig_filename
-            liftIO $ do
-              IO.removeFile output_file <|> pure ()
-              IO.createFileLink bin_path output_file
-            pure ()
-        writeFile' stamp "OK"
+        writeFileAtomic stamp "OK"

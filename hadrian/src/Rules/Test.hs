@@ -7,7 +7,6 @@ import Expression
 import Flavour
 import Hadrian.Haskell.Cabal.Type (packageDependencies)
 import Hadrian.Oracles.Cabal (readPackageData)
-import Hadrian.Oracles.Path (fixAbsolutePathOnWindows)
 import Oracles.Setting
 import Oracles.TestSettings
 import Oracles.Flag
@@ -17,7 +16,6 @@ import Settings.Builders.RunTest
 import Settings.Program (programContext)
 import Target
 import Utilities
-import Context.Type
 import qualified System.Directory as IO
 
 import GHC.Toolchain as Toolchain
@@ -65,6 +63,12 @@ whitespaceLinterSourcePath = "linters/lint-whitespace/Main.hs"
 whitespaceLinterExtra :: [String]
 whitespaceLinterExtra = ["-ilinters/lint-whitespace", "-ilinters/linters-common"]
 
+changelogDProgPath, changelogDSourcePath :: FilePath
+changelogDProgPath = "test/bin/changelog-d" <.> exe
+changelogDSourcePath = "utils/changelog-d/ChangelogD.hs"
+changelogDExtra :: [String]
+changelogDExtra = ["-iutils/changelog-d"]
+
 data CheckProgram =
         CheckProgram { cp_target :: String -- ^ Name for the hadrian target
                      , cp_exe_path :: FilePath -- ^ Path to resulting executable
@@ -84,6 +88,9 @@ checkPrograms =
     , CheckProgram "lint:notes" noteLinterProgPath  noteLinterSourcePath  noteLinterExtra  lintNotes  (const stage0Boot)  id
     , CheckProgram "lint:codes" codeLinterProgPath  codeLinterSourcePath  codeLinterExtra  lintCodes  id id
     , CheckProgram "lint:whitespace"  whitespaceLinterProgPath  whitespaceLinterSourcePath  whitespaceLinterExtra  lintWhitespace  (const stage0Boot)  (filter (/= lintersCommon))
+    -- N.B. The lint:changelog build is replicated by lint_changelog in
+    -- .gitlab/ci.sh. Keep its package dependencies in sync with this target.
+    , CheckProgram "lint:changelog"  changelogDProgPath  changelogDSourcePath  changelogDExtra  changelogD  (const stage0Boot)  id
     ]
 
 inTreeOutTree :: (Stage -> Action b) -> Action b -> Action b
@@ -103,6 +110,11 @@ testsuiteDeps = do
   "test:ghc" ~> inTreeOutTree
                     (\stg -> do
                       needTestsuitePackages stg
+                      -- For cross builds, the test compiler (Stage1 binary) uses
+                      -- target libraries from Stage2; build those too.
+                      cross <- flag CrossCompiling
+                      when (cross && stg == Stage1) $
+                        needTestsuiteLibs Stage2
                       need [(root -/- ghcConfigPath)]
                       -- This is here because it's the one place we know that GHC is
                       -- up-to-date. Later when we compute the in/out tree arguments
@@ -147,7 +159,8 @@ testRules = do
                 bindir <- getBinaryDirectory testGhc
                 test_args <- outOfTreeCompilerArgs
                 let dynPrograms = hasDynamic test_args
-                cmd [bindir </> "ghc" <.> exe] $
+                ghcProg <- exeSpawnPath (bindir </> "ghc" <.> exe)
+                cmdExe ghcProg $
                     concatMap (\p -> ["-package", pkgName p]) depsPkgs ++
                     ["-o", top -/- path, top -/- sourcePath] ++
                     mextra ++
@@ -164,7 +177,8 @@ testRules = do
         ghcConfigProgPath <- programPath =<< programContext stage0InTree ghcConfig
         cwd <- liftIO $ IO.getCurrentDirectory
         need [makeRelative cwd ghcPath, ghcConfigProgPath]
-        cmd [FileStdout $ root -/- ghcConfigPath] ghcConfigProgPath [ghcPath]
+        ghcConfigProg <- exeSpawnPath ghcConfigProgPath
+        cmdExe ghcConfigProg [FileStdout $ root -/- ghcConfigPath] [ghcPath]
 
     root -/- timeoutPath %> \_ -> timeoutProgBuilder
 
@@ -187,25 +201,33 @@ testRules = do
         -- force stage0 program building for cross
         cross <- flag CrossCompiling
         when cross $ mapM (relativePathStage (Stage0 InTreeLibs)) [hpc, haddock, runGhc] >>= need
+        -- For cross builds, the test compiler (Stage1 binary) uses
+        -- target libraries from Stage2; build those too.
+        when (cross && stg == Stage1) $
+          needTestsuiteLibs Stage2
 
         -- Set environment variables for test's Makefile.
-        env <- testEnv
+        env <- testEnv stg
 
         -- Execute the test target.
         -- We override the verbosity setting to make sure the user can see
         -- the test output: https://gitlab.haskell.org/ghc/ghc/issues/15951.
         withVerbosity Diagnostic $ buildWithCmdOptions [AddEnv k v | (k,v) <- env] $ test_target RunTest
 
-testEnv :: Action [(String, String)]
-testEnv = do
-    cross           <- flag CrossCompiling
+testEnv :: Stage -> Action [(String, String)]
+testEnv stg = do
+
+    testGhc <- testCompiler <$> userSetting defaultTestArgs
+
+    cross <- getTestCross testGhc
+
+    prog_ghc_pkg     <- getTestExePath testGhc ghcPkg
+    prog_hsc2hs      <- getTestExePath testGhc hsc2hs
+    prog_hp2ps       <- getTestExePath testGhc hp2ps
+    prog_haddock     <- getTestExePath testGhc haddock
+    prog_hpc         <- getTestExePath testGhc hpc
+    prog_runghc      <- getTestExePath testGhc runGhc
     makePath        <- builderPath $ Make ""
-    prog_ghc_pkg    <- absolutePathStage Stage1 ghcPkg
-    prog_hsc2hs     <- absolutePathStage Stage1 hsc2hs
-    prog_hp2ps      <- absolutePathStage Stage1 hp2ps
-    prog_haddock    <- absolutePathStage (Stage0 InTreeLibs) haddock
-    prog_hpc        <- absolutePathStage (Stage0 InTreeLibs) hpc
-    prog_runghc     <- absolutePathStage (Stage0 InTreeLibs) runGhc
 
     root <- buildRoot
     args <- userSetting defaultTestArgs
@@ -214,9 +236,10 @@ testEnv = do
 
     top             <- topDirectory
     pythonPath      <- builderPath Python
-    ccPath          <- queryTargetTarget (Toolchain.prgPath . Toolchain.ccProgram . Toolchain.tgtCCompiler)
-    ccFlags         <- queryTargetTarget (unwords . Toolchain.prgFlags . Toolchain.ccProgram . Toolchain.tgtCCompiler)
-    ghcFlags        <- runTestGhcFlags
+    -- MP: TODO wrong, should use the ccPath and ccFlags from the bindist we are testing.
+    ccPath          <- queryTargetTarget stg (Toolchain.prgPath . Toolchain.ccProgram . Toolchain.tgtCCompiler)
+    ccFlags         <- queryTargetTarget stg (unwords . Toolchain.prgFlags . Toolchain.ccProgram . Toolchain.tgtCCompiler)
+    ghcFlags        <- runTestGhcFlags stg
     let ghciFlags = ghcFlags ++ unwords
           [ "--interactive", "-v0", "-ignore-dot-ghci"
           , "-fno-ghci-history", "-fprint-error-index-links=never"
@@ -240,6 +263,7 @@ testEnv = do
       , "LINT_NOTES" .= (top -/- root -/- noteLinterProgPath)
       , "LINT_CODES" .= (top -/- root -/- codeLinterProgPath)
       , "LINT_WHITESPACE" .= (top -/- root -/- whitespaceLinterProgPath)
+      , "CHANGELOG_D" .= (top -/- root -/- changelogDProgPath)
       -- This lets us bypass the need to generate a config
       -- through Make, which happens in testsuite/mk/boilerplate.mk
       -- which is in turn included by all test 'Makefile's.
@@ -269,11 +293,7 @@ relativePathStage s p = programPath =<< programContext s p
 
 absolutePathStage :: Stage -> Package -> Action FilePath
 absolutePathStage s p =
-    relativePathStage s p >>= make_absolute
-  where
-    make_absolute rel_path = do
-      abs_path <- liftIO (makeAbsolute rel_path)
-      fixAbsolutePathOnWindows abs_path
+    liftIO . makeAbsolute =<< relativePathStage s p
 
 -- | Given a test compiler and a hadrian dependency (target), check if we
 -- can build the target with the compiler
@@ -305,26 +325,31 @@ timeoutProgBuilder = do
             let script = unlines
                     [ "#!/bin/sh"
                     , "exec " ++ python ++ " $0.py \"$@\"" ]
-            writeFile' (root -/- timeoutPath) script
+            writeFileAtomic (root -/- timeoutPath) script
             makeExecutable (root -/- timeoutPath)
 
 -- | Build extra programs and libraries required by testsuite
 needTestsuitePackages :: Stage -> Action ()
 needTestsuitePackages stg = do
   allpkgs <- packages <$> flavour
-  -- We need the libraries of the successor stage
-  libpkgs <- map (Stage1,) . filter isLibrary <$> allpkgs (succStage stg)
+  libpkgs <- filter isLibrary <$> allpkgs stg
   -- And the executables of the current stage
-  exepkgs <- map (stg,) . filter isProgram <$> allpkgs stg
+  exepkgs <- filter isProgram <$> allpkgs stg
   -- Don't require lib:ghc or lib:cabal when testing the stage1 compiler
   -- This is a hack, but a major usecase for testing the stage1 compiler is
   -- so that we can use it even if ghc stage2 fails to build
   -- Unfortunately, we still need the liba
-  let pkgs = filter (\(_,p) -> not $ "iserv" `isInfixOf` pkgName p || ((pkgName p `elem` ["ghc", "Cabal"]) && isStage0 stg))
-                    (libpkgs ++ exepkgs ++ [ (stg,timeout) | windowsHost ])
-  need =<< mapM (uncurry pkgFile) pkgs
-  cross <- flag CrossCompiling
-  when (not cross) $ needIservBins stg
+  let pkgs = filter (\p -> not $ (pkgName p `elem` ["ghc", "Cabal"]) && isStage0 stg)
+                    (libpkgs ++ exepkgs ++ [ timeout | windowsHost ])
+  need =<< mapM (pkgFile stg) pkgs
+
+-- | Build only the libraries for the given stage (no executables).
+-- Used for cross Stage2 target libraries, which cannot run on the host.
+needTestsuiteLibs :: Stage -> Action ()
+needTestsuiteLibs stg = do
+  allpkgs <- packages <$> flavour
+  libpkgs <- filter isLibrary <$> allpkgs stg
+  need =<< mapM (pkgFile stg) libpkgs
 
 -- stage 1 ghc lives under stage0/bin,
 -- stage 2 ghc lives under stage1/bin, etc
@@ -333,28 +358,6 @@ stageOf "stage1" = Just stage0InTree
 stageOf "stage2" = Just Stage1
 stageOf "stage3" = Just Stage2
 stageOf _ = Nothing
-
-needIservBins :: Stage -> Action ()
-needIservBins stg = do
-  let ws = [vanilla, profiling, dynamic]
-  progs <- catMaybes <$> mapM (canBuild stg) ws
-  need progs
-  where
-    -- Only build iserv binaries if all dependencies are built the right
-    -- way already. In particular this fixes the case of no_profiled_libs
-    -- not working with the testsuite, see #19624
-    canBuild (Stage0 {}) _ = pure Nothing
-    canBuild stg w = do
-      contextDeps <- contextDependencies (Context stg iserv w Final)
-      ws <- forM contextDeps $ \c ->
-              interpretInContext c (getLibraryWays <>
-                                    if Context.Type.package c == rts
-                                      then getRtsWays
-                                      else mempty)
-      if (all (w `elem`) ws)
-        then Just <$> programPath (Context stg iserv w Final)
-        else return Nothing
-
 
 pkgFile :: Stage -> Package -> Action FilePath
 pkgFile stage pkg

@@ -4,6 +4,7 @@
 
 module GHC.Internal.Environment (getFullArgs) where
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.C.String
 import GHC.Internal.Foreign.C.String.Encoding as GHC
@@ -11,7 +12,6 @@ import GHC.Internal.Foreign.Marshal.Alloc
 import GHC.Internal.Foreign.Marshal.Array
 import GHC.Internal.Foreign.Storable
 import GHC.Internal.Ptr
-import GHC.Internal.Base
 import GHC.Internal.Real ( fromIntegral )
 import GHC.Internal.IO.Encoding
 

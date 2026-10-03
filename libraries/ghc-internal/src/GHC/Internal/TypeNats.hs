@@ -18,6 +18,8 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE RoleAnnotations #-}
 {-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 
 {-| This module is an internal GHC module.  It declares the constants used
 in the implementation of type-level natural numbers.  The programmer interface
@@ -45,6 +47,8 @@ module GHC.Internal.TypeNats
   , withSomeSNat
   , withKnownNat
   , unsafeWithSNatCo
+    -- * Type-level list indexing
+  , type (!!)
 
     -- * Functions on type literals
   , type (<=), type (<=?), type (+), type (*), type (^), type (-)
@@ -54,9 +58,9 @@ module GHC.Internal.TypeNats
 
   ) where
 
-import GHC.Internal.Base( Eq(..), Functor(..), Ord(..), WithDict(..), (.), otherwise
-               , Void, errorWithoutStackTrace, (++))
-import GHC.Internal.Types
+import GHC.Internal.Base
+import GHC.Internal.Err(errorWithoutStackTrace)
+import GHC.Internal.Magic.Dict(WithDict(..))
 import GHC.Internal.Bignum.Natural(Natural)
 import GHC.Internal.Show(Show(..), appPrec, appPrec1, showParen, showString)
 import GHC.Internal.Read(Read(..))
@@ -68,7 +72,6 @@ import GHC.Internal.Data.Type.Coercion (Coercion(..), TestCoercion(..))
 import GHC.Internal.Data.Type.Equality((:~:)(Refl), TestEquality(..))
 import GHC.Internal.Data.Type.Ord(OrderingI(..), type (<=), type (<=?))
 import GHC.Internal.Unsafe.Coerce(unsafeCoerce)
-
 import GHC.Internal.TypeNats.Internal(CmpNat)
 
 -- | A type synonym for 'Natural'.
@@ -400,6 +403,12 @@ bypass our role annotation on ``SNat``, but /only within its argument/:
 The above reasoning applies identically for the other singleton types
 'SChar' and 'SSymbol' as well.
 -}
+
+-- | Type-level list indexing (starting from 0).
+type (!!) :: forall k. [k] -> Nat -> k
+type family xs !! n where
+  -- Wired-in (GHC.Builtin.WiredIn.Types.Box.axListIndex).
+infixl 9 !!
 
 
 -- | A explicitly bidirectional pattern synonym relating an 'SNat' to a

@@ -11,13 +11,8 @@ ToDo:
 -}
 
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -optc-DNON_POSIX_SOURCE #-}
@@ -36,19 +31,20 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Float
 
-import GHC.Types.Id.Make ( unboxedUnitExpr )
+import GHC.Builtin.WiredIn.Ids ( unboxedUnitExpr )
 import GHC.Types.Id
 import GHC.Types.Literal
+import GHC.Types.Literal.Floating
 import GHC.Types.Name.Occurrence ( occNameFS )
 import GHC.Types.Tickish
-import GHC.Types.Name ( Name, nameOccName )
+import GHC.Types.Name ( Name, KnownKey, nameUnique, nameOccName )
 import GHC.Types.Basic
 
 import GHC.Core
 import GHC.Core.Make
 import GHC.Core.SimpleOpt (  exprIsConApp_maybe, exprIsLiteral_maybe )
 import GHC.Core.DataCon ( DataCon,dataConTagZ, dataConTyCon, dataConWrapId, dataConWorkId )
-import GHC.Core.Utils  ( cheapEqExpr, exprIsHNF
+import GHC.Core.Utils  ( cheapEqExpr, exprIsHNF, isDefaultAlt
                        , stripTicksTop, stripTicksTopT, mkTicks )
 import GHC.Core.Multiplicity
 import GHC.Core.Rules.Config
@@ -58,12 +54,13 @@ import GHC.Core.TyCon
    ( TyCon, tyConDataCons_maybe, tyConDataCons, tyConSingleDataCon, tyConFamilySize
    , isEnumerationTyCon, isValidDTT2TyCon, isNewTyCon )
 import GHC.Core.Map.Expr ( eqCoreExpr )
+import GHC.Core.Opt.Range
 
 import GHC.Builtin.PrimOps ( PrimOp(..), tagToEnumKey )
 import GHC.Builtin.PrimOps.Ids (primOpId)
-import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.KnownKeys
 
 import GHC.Cmm.MachOp ( FMASign(..) )
 import GHC.Cmm.Type ( Width(..) )
@@ -80,6 +77,7 @@ import Data.Functor (($>))
 import qualified Data.ByteString as BS
 import Data.Ratio
 import Data.Word
+import Data.Char (ord)
 import Data.Maybe (fromMaybe, fromJust)
 
 {-
@@ -661,9 +659,7 @@ primOpRules nm = \case
       [ unaryLit $ \_env -> \case
          LitNumber _ n
              | v <- castWord64ToDouble (fromInteger n)
-             -- we can't represent those float literals in Core until #18897 is fixed
-             , not (isNaN v || isInfinite v || isNegativeZero v)
-             -> Just (mkDoubleLitDouble v)
+             -> Just (Lit $ LitFloating LitDouble $ doubleToLitFloating v)
          _   -> Nothing
       ]
 
@@ -671,21 +667,19 @@ primOpRules nm = \case
       [ unaryLit $ \_env -> \case
           LitNumber _ n
               | v <- castWord32ToFloat (fromInteger n)
-              -- we can't represent those float literals in Core until #18897 is fixed
-              , not (isNaN v || isInfinite v || isNegativeZero v)
-              -> Just (mkFloatLitFloat v)
+              -> Just (Lit $ LitFloating LitFloat $ floatToLitFloating v)
           _   -> Nothing
       ]
 
    CastDoubleToWord64Op -> mkPrimOpRule nm 1
       [ unaryLit $ \_env -> \case
-         LitDouble n -> Just (mkWord64LitWord64 (castDoubleToWord64 (fromRational n)))
+         LitFloating LitDouble n -> Just (mkWord64LitWord64 (castDoubleToWord64 (litFloatingToHostDouble n)))
          _           -> Nothing
       ]
 
    CastFloatToWord32Op -> mkPrimOpRule nm 1
       [ unaryLit $ \_env -> \case
-          LitFloat n -> Just (mkWord32LitWord32 (castFloatToWord32 (fromRational n)))
+          LitFloating LitFloat n -> Just (mkWord32LitWord32 (castFloatToWord32 (litFloatingToHostFloat n)))
           _          -> Nothing
       ]
 
@@ -695,40 +689,40 @@ primOpRules nm = \case
                                             guard (litFitsInChar lit)
                                             liftLit intToCharLit
                                        , semiInversePrimOp OrdOp ]
-   FloatToIntOp    -> mkPrimOpRule nm 1 [ liftLit floatToIntLit ]
-   IntToFloatOp    -> mkPrimOpRule nm 1 [ liftLit intToFloatLit ]
-   DoubleToIntOp   -> mkPrimOpRule nm 1 [ liftLit doubleToIntLit ]
-   IntToDoubleOp   -> mkPrimOpRule nm 1 [ liftLit intToDoubleLit ]
+   FloatToIntOp    -> mkPrimOpRule nm 1 [ unaryLit floatingTruncateOp ]
+   IntToFloatOp    -> mkPrimOpRule nm 1 [ liftLit (intToFloatingOp LitFloat) ]
+   DoubleToIntOp   -> mkPrimOpRule nm 1 [ unaryLit floatingTruncateOp ]
+   IntToDoubleOp   -> mkPrimOpRule nm 1 [ liftLit (intToFloatingOp LitDouble) ]
    -- SUP: Not sure what the standard says about precision in the following 2 cases
-   FloatToDoubleOp -> mkPrimOpRule nm 1 [ liftLit floatToDoubleLit ]
-   DoubleToFloatOp -> mkPrimOpRule nm 1 [ liftLit doubleToFloatLit ]
+   FloatToDoubleOp -> mkPrimOpRule nm 1 [ unaryLit (floatingResizeOp LitDouble)]
+   DoubleToFloatOp -> mkPrimOpRule nm 1 [ unaryLit (floatingResizeOp LitFloat)]
 
    -- Float
-   FloatAddOp        -> mkPrimOpRule nm 2 [ binaryLit (floatOp2 (+))
-                                          , identity zerof ]
-   FloatSubOp        -> mkPrimOpRule nm 2 [ binaryLit (floatOp2 (-))
+   FloatAddOp        -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (+))
+                                          , identity negzerof ] -- identity for addition is -0.0 (#21227)
+   FloatSubOp        -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (-))
                                           , rightIdentity zerof ]
-   FloatMulOp        -> mkPrimOpRule nm 2 [ binaryLit (floatOp2 (*))
+   FloatMulOp        -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (*))
                                           , identity onef
-                                          , strengthReduction twof FloatAddOp  ]
+                                          , strengthReduction twof FloatAddOp ]
    FloatFMAdd        -> mkPrimOpRule nm 3 (fmaRules FMAdd  W32)
    FloatFMSub        -> mkPrimOpRule nm 3 (fmaRules FMSub  W32)
    FloatFNMAdd       -> mkPrimOpRule nm 3 (fmaRules FNMAdd W32)
    FloatFNMSub       -> mkPrimOpRule nm 3 (fmaRules FNMSub W32)
 
              -- zeroElem zerof doesn't hold because of NaN
-   FloatDivOp        -> mkPrimOpRule nm 2 [ guardFloatDiv >> binaryLit (floatOp2 (/))
+   FloatDivOp        -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (/))
                                           , rightIdentity onef ]
    FloatNegOp        -> mkPrimOpRule nm 1 [ unaryLit negOp
                                           , semiInversePrimOp FloatNegOp ]
-   FloatDecode_IntOp -> mkPrimOpRule nm 1 [ unaryLit floatDecodeOp ]
+   FloatDecode_IntOp -> mkPrimOpRule nm 1 [ unaryLit floatingDecodeOp ]
 
    -- Double
-   DoubleAddOp          -> mkPrimOpRule nm 2 [ binaryLit (doubleOp2 (+))
-                                             , identity zerod ]
-   DoubleSubOp          -> mkPrimOpRule nm 2 [ binaryLit (doubleOp2 (-))
+   DoubleAddOp          -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (+))
+                                             , identity negzerod ] -- identity for addition is -0.0 (#21227)
+   DoubleSubOp          -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (-))
                                              , rightIdentity zerod ]
-   DoubleMulOp          -> mkPrimOpRule nm 2 [ binaryLit (doubleOp2 (*))
+   DoubleMulOp          -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (*))
                                              , identity oned
                                              , strengthReduction twod DoubleAddOp  ]
    DoubleFMAdd          -> mkPrimOpRule nm 3 (fmaRules FMAdd  W64)
@@ -736,11 +730,11 @@ primOpRules nm = \case
    DoubleFNMAdd         -> mkPrimOpRule nm 3 (fmaRules FNMAdd W64)
    DoubleFNMSub         -> mkPrimOpRule nm 3 (fmaRules FNMSub W64)
               -- zeroElem zerod doesn't hold because of NaN
-   DoubleDivOp          -> mkPrimOpRule nm 2 [ guardDoubleDiv >> binaryLit (doubleOp2 (/))
+   DoubleDivOp          -> mkPrimOpRule nm 2 [ binaryLit (floatingOp2 (/))
                                              , rightIdentity oned ]
    DoubleNegOp          -> mkPrimOpRule nm 1 [ unaryLit negOp
                                              , semiInversePrimOp DoubleNegOp ]
-   DoubleDecode_Int64Op -> mkPrimOpRule nm 1 [ unaryLit doubleDecodeOp ]
+   DoubleDecode_Int64Op -> mkPrimOpRule nm 1 [ unaryLit floatingDecodeOp ]
 
    -- Relational operators, equality
 
@@ -785,60 +779,60 @@ primOpRules nm = \case
 
    -- Relational operators, ordering
 
-   Int8GtOp   -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Int8GeOp   -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Int8LeOp   -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Int8LtOp   -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Int8GtOp   -> mkRelOpRule nm (>)  [ boundsCmp (const rangeInt8) Gt ]
+   Int8GeOp   -> mkRelOpRule nm (>=) [ boundsCmp (const rangeInt8) Ge ]
+   Int8LeOp   -> mkRelOpRule nm (<=) [ boundsCmp (const rangeInt8) Le ]
+   Int8LtOp   -> mkRelOpRule nm (<)  [ boundsCmp (const rangeInt8) Lt ]
 
-   Int16GtOp  -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Int16GeOp  -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Int16LeOp  -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Int16LtOp  -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Int16GtOp  -> mkRelOpRule nm (>)  [ boundsCmp (const rangeInt16) Gt ]
+   Int16GeOp  -> mkRelOpRule nm (>=) [ boundsCmp (const rangeInt16) Ge ]
+   Int16LeOp  -> mkRelOpRule nm (<=) [ boundsCmp (const rangeInt16) Le ]
+   Int16LtOp  -> mkRelOpRule nm (<)  [ boundsCmp (const rangeInt16) Lt ]
 
-   Int32GtOp  -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Int32GeOp  -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Int32LeOp  -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Int32LtOp  -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Int32GtOp  -> mkRelOpRule nm (>)  [ boundsCmp (const rangeInt32) Gt ]
+   Int32GeOp  -> mkRelOpRule nm (>=) [ boundsCmp (const rangeInt32) Ge ]
+   Int32LeOp  -> mkRelOpRule nm (<=) [ boundsCmp (const rangeInt32) Le ]
+   Int32LtOp  -> mkRelOpRule nm (<)  [ boundsCmp (const rangeInt32) Lt ]
 
-   Int64GtOp  -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Int64GeOp  -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Int64LeOp  -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Int64LtOp  -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Int64GtOp  -> mkRelOpRule nm (>)  [ boundsCmp (const rangeInt64) Gt ]
+   Int64GeOp  -> mkRelOpRule nm (>=) [ boundsCmp (const rangeInt64) Ge ]
+   Int64LeOp  -> mkRelOpRule nm (<=) [ boundsCmp (const rangeInt64) Le ]
+   Int64LtOp  -> mkRelOpRule nm (<)  [ boundsCmp (const rangeInt64) Lt ]
 
-   IntGtOp    -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   IntGeOp    -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   IntLeOp    -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   IntLtOp    -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   IntGtOp    -> mkRelOpRule nm (>)  [ boundsCmp rangeInt Gt ]
+   IntGeOp    -> mkRelOpRule nm (>=) [ boundsCmp rangeInt Ge ]
+   IntLeOp    -> mkRelOpRule nm (<=) [ boundsCmp rangeInt Le ]
+   IntLtOp    -> mkRelOpRule nm (<)  [ boundsCmp rangeInt Lt ]
 
-   Word8GtOp  -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Word8GeOp  -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Word8LeOp  -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Word8LtOp  -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Word8GtOp  -> mkRelOpRule nm (>)  [ boundsCmp (const rangeWord8) Gt ]
+   Word8GeOp  -> mkRelOpRule nm (>=) [ boundsCmp (const rangeWord8) Ge ]
+   Word8LeOp  -> mkRelOpRule nm (<=) [ boundsCmp (const rangeWord8) Le ]
+   Word8LtOp  -> mkRelOpRule nm (<)  [ boundsCmp (const rangeWord8) Lt ]
 
-   Word16GtOp -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Word16GeOp -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Word16LeOp -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Word16LtOp -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Word16GtOp -> mkRelOpRule nm (>)  [ boundsCmp (const rangeWord16) Gt ]
+   Word16GeOp -> mkRelOpRule nm (>=) [ boundsCmp (const rangeWord16) Ge ]
+   Word16LeOp -> mkRelOpRule nm (<=) [ boundsCmp (const rangeWord16) Le ]
+   Word16LtOp -> mkRelOpRule nm (<)  [ boundsCmp (const rangeWord16) Lt ]
 
-   Word32GtOp -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Word32GeOp -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Word32LeOp -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Word32LtOp -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Word32GtOp -> mkRelOpRule nm (>)  [ boundsCmp (const rangeWord32) Gt ]
+   Word32GeOp -> mkRelOpRule nm (>=) [ boundsCmp (const rangeWord32) Ge ]
+   Word32LeOp -> mkRelOpRule nm (<=) [ boundsCmp (const rangeWord32) Le ]
+   Word32LtOp -> mkRelOpRule nm (<)  [ boundsCmp (const rangeWord32) Lt ]
 
-   Word64GtOp -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   Word64GeOp -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   Word64LeOp -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   Word64LtOp -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   Word64GtOp -> mkRelOpRule nm (>)  [ boundsCmp (const rangeWord64) Gt ]
+   Word64GeOp -> mkRelOpRule nm (>=) [ boundsCmp (const rangeWord64) Ge ]
+   Word64LeOp -> mkRelOpRule nm (<=) [ boundsCmp (const rangeWord64) Le ]
+   Word64LtOp -> mkRelOpRule nm (<)  [ boundsCmp (const rangeWord64) Lt ]
 
-   WordGtOp   -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   WordGeOp   -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   WordLeOp   -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   WordLtOp   -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   WordGtOp   -> mkRelOpRule nm (>)  [ boundsCmp rangeWord Gt ]
+   WordGeOp   -> mkRelOpRule nm (>=) [ boundsCmp rangeWord Ge ]
+   WordLeOp   -> mkRelOpRule nm (<=) [ boundsCmp rangeWord Le ]
+   WordLtOp   -> mkRelOpRule nm (<)  [ boundsCmp rangeWord Lt ]
 
-   CharGtOp   -> mkRelOpRule nm (>)  [ boundsCmp Gt ]
-   CharGeOp   -> mkRelOpRule nm (>=) [ boundsCmp Ge ]
-   CharLeOp   -> mkRelOpRule nm (<=) [ boundsCmp Le ]
-   CharLtOp   -> mkRelOpRule nm (<)  [ boundsCmp Lt ]
+   CharGtOp   -> mkRelOpRule nm (>)  [ boundsCmp rangeChar Gt ]
+   CharGeOp   -> mkRelOpRule nm (>=) [ boundsCmp rangeChar Ge ]
+   CharLeOp   -> mkRelOpRule nm (<=) [ boundsCmp rangeChar Le ]
+   CharLtOp   -> mkRelOpRule nm (<)  [ boundsCmp rangeChar Lt ]
 
    FloatGtOp  -> mkFloatingRelOpRule nm (>)
    FloatGeOp  -> mkFloatingRelOpRule nm (>=)
@@ -851,6 +845,14 @@ primOpRules nm = \case
    DoubleLtOp -> mkFloatingRelOpRule nm (<)
 
    -- Misc
+
+   -- See Note [Constant folding for Addr# equality]
+   AddrEqOp   -> mkPrimOpRule nm 2 [ equalArgs >> (trueValInt <$> getPlatform)
+                                   , match_litAddr_eq True
+                                   ]
+   AddrNeOp   -> mkPrimOpRule nm 2 [ equalArgs >> (falseValInt <$> getPlatform)
+                                   , match_litAddr_eq False
+                                   ]
 
    AddrAddOp  -> mkPrimOpRule nm 2 [ rightIdentityPlatform zeroi ]
 
@@ -868,7 +870,7 @@ primOpRules nm = \case
 
 -- useful shorthands
 mkPrimOpRule :: Name -> Int -> [RuleM CoreExpr] -> Maybe CoreRule
-mkPrimOpRule nm arity rules = Just $ mkBasicRule nm arity (msum rules)
+mkPrimOpRule nm arity rules = Just $ mkBasicRule1 nm arity (msum rules)
 
 mkRelOpRule :: Name -> (forall a . Ord a => a -> a -> Bool)
             -> [RuleM CoreExpr] -> Maybe CoreRule
@@ -888,7 +890,7 @@ mkRelOpRule nm cmp extra
 {- Note [Rules for floating-point comparisons]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We need different rules for floating-point values because for floats
-it is not true that x = x (for NaNs); so we do not want the equal_rule
+it is not true that x == x (for NaNs); so we do not want the equal_rule
 rule that mkRelOpRule uses.
 
 Note also that, in the case of equality/inequality, we do /not/
@@ -948,25 +950,28 @@ oneI64  = mkLitInt64  1
 zeroW64 = mkLitWord64 0
 oneW64  = mkLitWord64 1
 
-zerof, onef, twof, zerod, oned, twod :: Literal
+zerof, onef, twof, zerod, oned, twod, negzerof, negzerod :: Literal
 zerof = mkLitFloat 0.0
 onef  = mkLitFloat 1.0
 twof  = mkLitFloat 2.0
 zerod = mkLitDouble 0.0
 oned  = mkLitDouble 1.0
 twod  = mkLitDouble 2.0
+negzerof = LitFloating LitFloat  $ floatToLitFloating (-0.0)
+negzerod = LitFloating LitDouble $ doubleToLitFloating (-0.0)
 
-cmpOp :: Platform -> (forall a . Ord a => a -> a -> Bool)
+cmpOp :: (forall a . Ord a => a -> a -> Bool) -> RuleOpts
       -> Literal -> Literal -> Maybe CoreExpr
-cmpOp platform cmp = go
+cmpOp cmp env = go
   where
-    done True  = Just $ trueValInt  platform
-    done False = Just $ falseValInt platform
+    done True  = Just $ trueValInt  (roPlatform env)
+    done False = Just $ falseValInt (roPlatform env)
 
     -- These compares are at different types
     go (LitChar i1)   (LitChar i2)   = done (i1 `cmp` i2)
-    go (LitFloat i1)  (LitFloat i2)  = done (i1 `cmp` i2)
-    go (LitDouble i1) (LitDouble i2) = done (i1 `cmp` i2)
+    go (LitFloating lft1 i1) (LitFloating lft2 i2)
+      | lft1 == lft2
+      = done (litFloatingComparisonOp (roCFPrecision lft1 env) cmp i1 i2)
     go (LitNumber nt1 i1) (LitNumber nt2 i2)
       | nt1 /= nt2 = Nothing
       | otherwise  = done (i1 `cmp` i2)
@@ -974,12 +979,43 @@ cmpOp platform cmp = go
 
 --------------------------
 
+-- Note [Constant folding for Addr# equality]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- We constant-fold (eqAddr# "foo"# "bar"#) when both arguments are string
+-- literals with *different* byte content.  Because the bytes differ, the two
+-- literals cannot reside at the same address, so the result is definitely
+-- False (or True for neAddr#).
+--
+-- We use exprIsLiteral_maybe (via isLiteral) rather than binaryLit/cmpOp,
+-- because string literals are frequently floated out to the top level as CAF
+-- bindings.  That turns them into variables, and we must look through those
+-- variable unfoldings to recover the underlying LitString.
+--
+-- When both literals have the *same* byte content we do NOT fold to True.
+-- Two distinct literal occurrences in the source may end up at different
+-- addresses in the object file (the linker is not required to merge them),
+-- so pointer equality is not guaranteed by equal content alone.  The
+-- equalArgs already handles the case where both arguments are the *same*
+-- expression (provably the same pointer).
+
+match_litAddr_eq :: Bool  -- ^ True  <=> eqAddr#  (fold different-content to False)
+                          --   False <=> neAddr#  (fold different-content to True)
+                 -> RuleM CoreExpr
+-- See Note [Constant folding for Addr# equality]
+match_litAddr_eq is_eq = do
+  platform  <- getPlatform
+  [e1, e2]  <- getArgs
+  LitString s1 <- isLiteral e1
+  LitString s2 <- isLiteral e2
+  guard (s1 /= s2)
+  return $ if is_eq then falseValInt platform else trueValInt platform
+
+--------------------------
+
 negOp :: RuleOpts -> Literal -> Maybe CoreExpr  -- Negate
-negOp env = \case
-   (LitFloat 0.0)  -> Nothing  -- can't represent -0.0 as a Rational
-   (LitFloat f)    -> Just (mkFloatVal env (-f))
-   (LitDouble 0.0) -> Nothing
-   (LitDouble d)   -> Just (mkDoubleVal env (-d))
+negOp env lit = case  lit  of
+   (LitFloating prec f) -> Just $ Lit $ LitFloating prec $
+          litFloatingUnaryOp (roCFPrecision prec env) negate f
    (LitNumber nt i)
       | litNumIsSigned nt -> Just (Lit (mkLitNumberWrap (roPlatform env) nt (-i)))
    _ -> Nothing
@@ -1147,37 +1183,48 @@ shiftRule lit_num_ty shift_op = do
     _ -> mzero
 
 --------------------------
-floatOp2 :: (Rational -> Rational -> Rational)
-         -> RuleOpts -> Literal -> Literal
-         -> Maybe (Expr CoreBndr)
-floatOp2 op env (LitFloat f1) (LitFloat f2)
-  = Just (mkFloatVal env (f1 `op` f2))
-floatOp2 _ _ _ _ = Nothing
+floatingOp2 :: (forall t. Fractional t => t -> t -> t)
+            -> RuleOpts -> Literal -> Literal
+            -> Maybe (Expr CoreBndr)
+floatingOp2 op env (LitFloating lft1 v1) (LitFloating lft2 v2)
+  | lft1 == lft2
+  , prec <- roCFPrecision lft1 env
+  = Just (Lit (LitFloating lft1 (litFloatingBinaryOp prec op v1 v2)))
+floatingOp2 _ _ _ _ = Nothing
+
+floatingTruncateOp :: RuleOpts -> Literal -> Maybe CoreExpr
+floatingTruncateOp env (LitFloating lft f)
+  = Just (mkIntLitWrap platform (truncateLitFloating precision f))
+  where  platform  = roPlatform env
+         precision = roCFPrecision lft env
+floatingTruncateOp _ _ = Nothing
+
+floatingResizeOp :: LitFloatingType -> RuleOpts -> Literal -> Maybe CoreExpr
+floatingResizeOp tarTy env (LitFloating _srcTy f)
+  = Just (Lit (LitFloating tarTy (litFloatingUnaryOp precision id f)))
+  where  precision = roCFPrecision tarTy env
+floatingResizeOp _ _ _ = Nothing
+
+intToFloatingOp :: LitFloatingType -> Literal -> Literal
+intToFloatingOp LitFloat  (LitNumber _ i) = mkLitFloat  (toRational i)
+intToFloatingOp LitDouble (LitNumber _ i) = mkLitDouble (toRational i)
+intToFloatingOp _ lit = pprPanic "intToFloatingOp: bad literal" (ppr lit)
 
 --------------------------
-floatDecodeOp :: RuleOpts -> Literal -> Maybe CoreExpr
-floatDecodeOp env (LitFloat ((decodeFloat . fromRational @Float) -> (m, e)))
-  = Just $ mkCoreUnboxedTuple [ mkIntVal (roPlatform env) (toInteger m)
-                              , mkIntVal (roPlatform env) (toInteger e) ]
-floatDecodeOp _   _
-  = Nothing
-
---------------------------
-doubleOp2 :: (Rational -> Rational -> Rational)
-          -> RuleOpts -> Literal -> Literal
-          -> Maybe (Expr CoreBndr)
-doubleOp2 op env (LitDouble f1) (LitDouble f2)
-  = Just (mkDoubleVal env (f1 `op` f2))
-doubleOp2 _ _ _ _ = Nothing
-
---------------------------
-doubleDecodeOp :: RuleOpts -> Literal -> Maybe CoreExpr
-doubleDecodeOp env (LitDouble ((decodeFloat . fromRational @Double) -> (m, e)))
-  = Just $ mkCoreUnboxedTuple [ Lit (mkLitInt64Wrap (toInteger m))
-                              , mkIntVal platform (toInteger e) ]
+floatingDecodeOp :: RuleOpts -> Literal -> Maybe CoreExpr
+floatingDecodeOp env (LitFloating srcTy f)
+  = Just $ mkCoreUnboxedTuple
+              [ Lit (mkLitMant m)
+              , mkIntVal platform (toInteger e) ]
   where
     platform = roPlatform env
-doubleDecodeOp _   _
+    (m, e) = decodeLitFloating srcTy platform f
+    mkLitMant
+      | LitFloat  <- srcTy
+      = mkLitIntWrap platform
+      | LitDouble <- srcTy
+      = mkLitInt64Wrap
+floatingDecodeOp _   _
   = Nothing
 
 --------------------------
@@ -1185,63 +1232,48 @@ doubleDecodeOp _   _
 -- | Constant folding rules for fused multiply-add operations.
 fmaRules :: FMASign -> Width -> [RuleM CoreExpr]
 fmaRules signs width =
-     [ fmaLit signs width
-     , fmaZero_z signs width
-     , fmaOne signs width ]
+  [ fmaLit    signs width
+  , fmaZero_z signs width
+  , fmaOne    signs width ]
 
 -- | Compute @a * b + c@ when @a@, @b@, @c@ are all literals.
 fmaLit :: FMASign -> Width -> RuleM CoreExpr
 fmaLit signs width = do
   env <- getRuleOpts
   [Lit l1, Lit l2, Lit l3] <- getArgs
-  liftMaybe $
-    op env
-      (convFloating env l1)
-      (convFloating env l2)
-      (convFloating env l3)
+  liftMaybe $ op env l1 l2 l3
 
   where
-    op env l1 l2 l3 =
-      case width of
-        W32
-          | LitFloat x <- l1
-          , LitFloat y <- l2
-          , LitFloat z <- l3
-          -> Just $ mkFloatVal env $
-            case signs of
-              FMAdd  -> x * y + z
-              FMSub  -> x * y - z
-              FNMAdd -> negate ( x * y ) + z
-              FNMSub -> negate ( x * y ) - z
-        W64
-          | LitDouble x <- l1
-          , LitDouble y <- l2
-          , LitDouble z <- l3
-          -> Just $ mkDoubleVal env $
-            case signs of
-              FMAdd  -> x * y + z
-              FMSub  -> x * y - z
-              FNMAdd -> negate ( x * y ) + z
-              FNMSub -> negate ( x * y ) - z
-        _ -> Nothing
+    fty = case width of { W32 -> LitFloat; W64 -> LitDouble; _ -> panic "fmaLit: non float" }
+    op env l1 l2 l3
+      | LitFloating _ l1' <- l1
+      , LitFloating _ l2' <- l2
+      , LitFloating _ l3' <- l3
+      = Just $ Lit $ LitFloating fty $
+        litFloatingTernaryOp (roCFPrecision fty env) fn l1' l2' l3'
+      | otherwise
+      = Nothing
+    fn :: Fractional t => t -> t -> t -> t
+    fn x y z =
+      case signs of
+        FMAdd  -> x * y + z
+        FMSub  -> x * y - z
+        FNMAdd -> negate ( x * y ) + z
+        FNMSub -> negate ( x * y ) - z
 
 -- | @x * y + 0 = x * y@.
 fmaZero_z :: FMASign -> Width -> RuleM CoreExpr
 fmaZero_z signs width = do
   [x, y, Lit z] <- getArgs
   let
-    -- TODO: we should additionally check the sign of z.
-    -- FMAdd, FNMAdd: should be -0.0.
-    -- FMSub, FNMSub: should be +0.0.
-    ok =
-      case width of
-        W32
-          | LitFloat 0 <- z
-          -> True
-        W64
-          | LitDouble 0 <- z
-          -> True
-        _ -> False
+    ok
+      | LitFloating _ zf <- z
+      , isZeroLF zf
+      = if signs `elem` [ FMAdd, FNMAdd ]
+        then not $ isPositiveZeroLF zf
+        else isPositiveZeroLF zf
+      | otherwise
+      = False
     neg = case width of
       W32 ->  FloatNegOp
       W64 -> DoubleNegOp
@@ -1263,28 +1295,30 @@ fmaOne :: FMASign -> Width -> RuleM CoreExpr
 fmaOne signs width = do
   [x, y, z] <- getArgs
   let
-    posNegOne_maybe :: Rational -> Maybe Bool
+    posNegOne_maybe :: LitFloating -> Maybe Bool
     posNegOne_maybe i
-      | i == 1
+      | i == rationalToLitFloating 1
       = Just False
-      | i == -1
+      | i == rationalToLitFloating (-1)
       = Just True
       | otherwise
       = Nothing
     ok =
       case width of
         W32
-          | Lit (LitFloat i) <- x
+          | Lit (LitFloating LitFloat i) <- x
           , Just sgn <- posNegOne_maybe i
           -> Just (sgn, y)
-          | Lit (LitFloat i) <- y
+          | Lit (LitFloating LitFloat i) <- y
           , Just sgn <- posNegOne_maybe i
           -> Just (sgn, x)
         W64
-          | Lit (LitDouble i) <- x
+          | Lit (LitFloating LitDouble i) <- x
+          , isFiniteLF i
           , Just sgn <- posNegOne_maybe i
           -> Just (sgn, y)
-          | Lit (LitDouble i) <- y
+          | Lit (LitFloating LitDouble i) <- y
+          , isFiniteLF i
           , Just sgn <- posNegOne_maybe i
           -> Just (sgn, x)
         _ -> Nothing
@@ -1369,27 +1403,27 @@ litEq is_eq = msum
                    | otherwise = trueValInt  platform
 
 
--- | Check if there is comparison with minBound or maxBound, that is
--- always true or false. For instance, an Int cannot be smaller than its
--- minBound, so we can replace such comparison with False.
-boundsCmp :: Comparison -> RuleM CoreExpr
-boundsCmp op = do
+-- | Perform value range analysis to check if can determine the result
+-- of a comparison statically. For instance, a Word8 converted into a Word is
+-- always smaller than 256.
+boundsCmp :: (Platform -> Range) -> Comparison -> RuleM CoreExpr
+boundsCmp mk_range op = do
   platform <- getPlatform
   [a, b] <- getArgs
-  liftMaybe $ mkRuleFn platform op a b
+  let ty_range = mk_range platform
+  liftMaybe $ value_range_cmp platform op ty_range a b
 
-data Comparison = Gt | Ge | Lt | Le
-
-mkRuleFn :: Platform -> Comparison -> CoreExpr -> CoreExpr -> Maybe CoreExpr
-mkRuleFn platform Gt (Lit lit) _ | isMinBound platform lit = Just $ falseValInt platform
-mkRuleFn platform Le (Lit lit) _ | isMinBound platform lit = Just $ trueValInt  platform
-mkRuleFn platform Ge _ (Lit lit) | isMinBound platform lit = Just $ trueValInt  platform
-mkRuleFn platform Lt _ (Lit lit) | isMinBound platform lit = Just $ falseValInt platform
-mkRuleFn platform Ge (Lit lit) _ | isMaxBound platform lit = Just $ trueValInt  platform
-mkRuleFn platform Lt (Lit lit) _ | isMaxBound platform lit = Just $ falseValInt platform
-mkRuleFn platform Gt _ (Lit lit) | isMaxBound platform lit = Just $ falseValInt platform
-mkRuleFn platform Le _ (Lit lit) | isMaxBound platform lit = Just $ trueValInt  platform
-mkRuleFn _ _ _ _                                           = Nothing
+-- | See Note [Value range analysis] in GHC.Core.Opt.Range
+value_range_cmp :: Platform -> Comparison -> Range -> CoreExpr -> CoreExpr -> Maybe CoreExpr
+value_range_cmp platform cmp ty_range x y =
+  let rx = ty_range `rangeIntersect` valueRange platform x
+      ry = ty_range `rangeIntersect` valueRange platform y
+      to_bool = \case
+        Nothing    -> Nothing
+        Just True  -> Just (trueValInt platform)
+        Just False -> Just (falseValInt platform)
+      res = rangeCmp cmp rx ry
+  in to_bool res
 
 -- | Create an Int literal expression while ensuring the given Integer is in the
 -- target Int range
@@ -1645,16 +1679,35 @@ but that is only a historical accident.
 ************************************************************************
 -}
 
-mkBasicRule :: Name -> Int -> RuleM CoreExpr -> CoreRule
+mkBasicRule1 :: Name -> Int -> RuleM CoreExpr -> CoreRule
 -- Gives the Rule the same name as the primop itself
-mkBasicRule op_name n_args rm
-  = BuiltinRule { ru_name  = occNameFS (nameOccName op_name),
-                  ru_fn    = op_name,
-                  ru_nargs = n_args,
-                  ru_try   = runRuleM rm }
+mkBasicRule1 op_name n_args rm
+  = mkBasicRule (occNameFS (nameOccName op_name)) (nameUnique op_name) n_args rm
 
-newtype RuleM r = RuleM
-  { runRuleM :: RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe r }
+mkBasicRule :: RuleName -> KnownKey -> Int -> RuleM CoreExpr -> CoreRule
+-- The Builtin rules in this module all produce an expression
+-- with no args; hence rm_args = [].  The `rm_rhs` is the complete
+-- result of the rule rewrite.  This is OK because it's always
+-- small (I think).
+mkBasicRule rule_name op_key n_args rm
+  = rule
+  where
+    rule = BuiltinRule { ru_name  = rule_name
+                       , ru_key   = op_key
+                       , ru_nargs = n_args
+                       , ru_try   = try }
+
+    try opts in_scope fn args
+      = case runRuleM rm opts in_scope fn args of
+          Nothing  -> Nothing
+          Just rhs -> Just (RM { rm_rule = rule
+                               , rm_rhs  = rhs
+                               , rm_args = []
+                               , rm_floats = emptyFloatBinds })
+
+type CFRuleFun r = RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe r
+
+newtype RuleM r = RuleM { runRuleM :: CFRuleFun r }
   deriving (Functor)
 
 instance Applicative RuleM where
@@ -1686,6 +1739,12 @@ getWordSize = platformWordSize <$> getPlatform
 
 getRuleOpts :: RuleM RuleOpts
 getRuleOpts = RuleM $ \rule_opts _ _ _ -> Just rule_opts
+
+roCFPrecision :: LitFloatingType -> RuleOpts -> ConstantFoldingPrecision
+roCFPrecision ty opts
+  | roExcessRationalPrecision opts = ExcessPrecision
+  | LitFloat  <- ty = FloatPrecision
+  | LitDouble <- ty = DoublePrecision
 
 liftMaybe :: Maybe a -> RuleM a
 liftMaybe Nothing = mzero
@@ -1784,18 +1843,16 @@ unaryLit :: (RuleOpts -> Literal -> Maybe CoreExpr) -> RuleM CoreExpr
 unaryLit op = do
   env <- getRuleOpts
   [Lit l] <- getArgs
-  liftMaybe $ op env (convFloating env l)
+  liftMaybe $ op env l
 
 binaryLit :: (RuleOpts -> Literal -> Literal -> Maybe CoreExpr) -> RuleM CoreExpr
 binaryLit op = do
   env <- getRuleOpts
   [Lit l1, Lit l2] <- getArgs
-  liftMaybe $ op env (convFloating env l1) (convFloating env l2)
+  liftMaybe $ op env l1 l2
 
 binaryCmpLit :: (forall a . Ord a => a -> a -> Bool) -> RuleM CoreExpr
-binaryCmpLit op = do
-  platform <- getPlatform
-  binaryLit (\_ -> cmpOp platform op)
+binaryCmpLit op = binaryLit (cmpOp op)
 
 leftIdentity :: Literal -> RuleM CoreExpr
 leftIdentity id_lit = leftIdentityPlatform (const id_lit)
@@ -1891,34 +1948,6 @@ ctz = lift_bits_op @a (fromIntegral . countTrailingZeros)
 clz :: forall a. (Num a, FiniteBits a) => RuleM CoreExpr
 clz = lift_bits_op @a (fromIntegral . countLeadingZeros)
 
--- When excess precision is not requested, cut down the precision of the
--- Rational value to that of Float/Double. We confuse host architecture
--- and target architecture here, but it's convenient (and wrong :-).
-convFloating :: RuleOpts -> Literal -> Literal
-convFloating env (LitFloat  f) | not (roExcessRationalPrecision env) =
-   LitFloat  (toRational (fromRational f :: Float ))
-convFloating env (LitDouble d) | not (roExcessRationalPrecision env) =
-   LitDouble (toRational (fromRational d :: Double))
-convFloating _ l = l
-
-guardFloatDiv :: RuleM ()
-guardFloatDiv = do
-  [Lit (LitFloat f1), Lit (LitFloat f2)] <- getArgs
-  guard $ (f1 /=0 || f2 > 0) -- see Note [negative zero]
-       && f2 /= 0            -- avoid NaN and Infinity/-Infinity
-
-guardDoubleDiv :: RuleM ()
-guardDoubleDiv = do
-  [Lit (LitDouble d1), Lit (LitDouble d2)] <- getArgs
-  guard $ (d1 /=0 || d2 > 0) -- see Note [negative zero]
-       && d2 /= 0            -- avoid NaN and Infinity/-Infinity
--- Note [negative zero]
--- ~~~~~~~~~~~~~~~~~~~~
--- Avoid (0 / -d), otherwise 0/(-1) reduces to
--- zero, but we might want to preserve the negative zero here which
--- is representable in Float/Double but not in (normalised)
--- Rational. (#3676) Perhaps we should generate (0 :% (-1)) instead?
-
 strengthReduction :: Literal -> PrimOp -> RuleM CoreExpr
 strengthReduction two_lit add_op = do -- Note [Strength reduction]
   arg <- msum [ do [arg, Lit mult_lit] <- getArgs
@@ -1959,10 +1988,6 @@ gtVal = Var ordGTDataConId
 
 mkIntVal :: Platform -> Integer -> Expr CoreBndr
 mkIntVal platform i = Lit (mkLitInt platform i)
-mkFloatVal :: RuleOpts -> Rational -> Expr CoreBndr
-mkFloatVal env f = Lit (convFloating env (LitFloat  f))
-mkDoubleVal :: RuleOpts -> Rational -> Expr CoreBndr
-mkDoubleVal env d = Lit (convFloating env (LitDouble d))
 
 matchPrimOpId :: PrimOp -> Id -> RuleM ()
 matchPrimOpId op id = do
@@ -2056,6 +2081,30 @@ dataToTagRule = a `mplus` b
 
 {- *********************************************************************
 *                                                                      *
+             div and mod
+*                                                                      *
+********************************************************************* -}
+
+divIntRule :: RuleM CoreExpr
+divIntRule = msum [ nonZeroLit 1 >> binaryLit (intOp2 div)
+                  , leftZero
+                  , do { [arg, Lit (LitNumber LitNumInt d)] <- getArgs
+                       ; Just n <- return $ exactLog2 d
+                       ; platform <- getPlatform
+                       ; return $ Var (primOpId IntSraOp)
+                                  `App` arg `App` mkIntVal platform n } ]
+
+modIntRule :: RuleM CoreExpr
+modIntRule = msum [ nonZeroLit 1 >> binaryLit (intOp2 mod)
+                  , leftZero
+                  , do { [arg, Lit (LitNumber LitNumInt d)] <- getArgs
+                       ; Just _ <- return $ exactLog2 d
+                       ; platform <- getPlatform
+                       ; return $ Var (primOpId IntAndOp)
+                                  `App` arg `App` mkIntVal platform (d-1) } ]
+
+{- *********************************************************************
+*                                                                      *
              unsafeEqualityProof
 *                                                                      *
 ********************************************************************* -}
@@ -2126,104 +2175,127 @@ is fine.
 builtinRules :: [CoreRule]
 -- Rules for non-primops that can't be expressed using a RULE pragma
 builtinRules
-  = [BuiltinRule { ru_name = fsLit "CStringFoldrLit",
-                   ru_fn = unpackCStringFoldrName,
-                   ru_nargs = 4, ru_try = match_cstring_foldr_lit_C },
-     BuiltinRule { ru_name = fsLit "CStringFoldrLitUtf8",
-                   ru_fn = unpackCStringFoldrUtf8Name,
-                   ru_nargs = 4, ru_try = match_cstring_foldr_lit_utf8 },
-     BuiltinRule { ru_name = fsLit "CStringAppendLit",
-                   ru_fn = unpackCStringAppendName,
-                   ru_nargs = 2, ru_try = match_cstring_append_lit_C },
-     BuiltinRule { ru_name = fsLit "CStringAppendLitUtf8",
-                   ru_fn = unpackCStringAppendUtf8Name,
-                   ru_nargs = 2, ru_try = match_cstring_append_lit_utf8 },
-     BuiltinRule { ru_name = fsLit "EqString", ru_fn = eqStringName,
-                   ru_nargs = 2, ru_try = match_eq_string },
-     BuiltinRule { ru_name = fsLit "CStringLength", ru_fn = cstringLengthName,
-                   ru_nargs = 1, ru_try = match_cstring_length },
-     BuiltinRule { ru_name = fsLit "Inline", ru_fn = inlineIdName,
-                   ru_nargs = 2, ru_try = \_ _ _ -> match_inline },
-
-     mkBasicRule unsafeEqualityProofName 3 unsafeEqualityProofRule,
-
-     mkBasicRule divIntName 2 $ msum
-        [ nonZeroLit 1 >> binaryLit (intOp2 div)
-        , leftZero
-        , do
-          [arg, Lit (LitNumber LitNumInt d)] <- getArgs
-          Just n <- return $ exactLog2 d
-          platform <- getPlatform
-          return $ Var (primOpId IntSraOp) `App` arg `App` mkIntVal platform n
-        ],
-
-     mkBasicRule modIntName 2 $ msum
-        [ nonZeroLit 1 >> binaryLit (intOp2 mod)
-        , leftZero
-        , do
-          [arg, Lit (LitNumber LitNumInt d)] <- getArgs
-          Just _ <- return $ exactLog2 d
-          platform <- getPlatform
-          return $ Var (primOpId IntAndOp)
-            `App` arg `App` mkIntVal platform (d - 1)
-        ]
-     ]
+  = [ mkBasicRule (fsLit "CStringFoldrLit")
+                  unpackCStringFoldrIdKey 4
+                  (RuleM match_cstring_foldr_lit_C)
+    , mkBasicRule (fsLit "CStringFoldrLitUtf8")
+                  unpackCStringFoldrUtf8IdKey 4
+                  (RuleM match_cstring_foldr_lit_utf8)
+    , mkBasicRule (fsLit "CStringAppendLit")
+                  unpackCStringAppendIdKey 2
+                  (RuleM match_cstring_append_lit_C)
+    , mkBasicRule (fsLit "CStringAppendLitUtf8")
+                  unpackCStringAppendUtf8IdKey 2
+                  (RuleM match_cstring_append_lit_utf8)
+    , mkBasicRule (fsLit "EqString")
+                  eqStringIdKey 2
+                  (RuleM match_eq_string)
+    , mkBasicRule (fsLit "CStringLength")
+                  cstringLengthIdKey 1
+                  (RuleM match_cstring_length)
+    , mkBasicRule (fsLit "Inline")
+                  inlineIdKey 2
+                  (RuleM match_inline)
+    , mkBasicRule (fsLit "unsafeEqualityProof")
+                  unsafeEqualityProofIdKey 3
+                  unsafeEqualityProofRule
+    , mkBasicRule (fsLit "divInt#")
+                  divIntIdKey 2 divIntRule
+    , mkBasicRule (fsLit "modInt#")
+                  modIntIdKey 2 modIntRule
+    ]
  ++ builtinBignumRules
 {-# NOINLINE builtinRules #-}
--- there is no benefit to inlining these yet, despite this, GHC produces
+-- There is no benefit to inlining these yet, despite this, GHC produces
 -- unfoldings for this regardless since the floated list entries look small.
 
+
+{- Note [Built-in bignum rules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We have some built-in rules for operations on bignum types (Integer, Natural,
+BigNat). These rules implement the same kind of constant folding as we have for
+Int#/Word#/etc. primops. See builtinBignumRules.
+
+These rules are built-in because they can't be expressed as regular rules for
+now. The reason is that due to the let-can-float invariant (see Note [Core
+let-can-float invariant] in GHC.Core), GHC is too conservative with some bignum
+operations and they don't match rules. For example:
+
+  case integerAdd 1 x of r { _ -> integerAdd 1 r }
+
+doesn't constant-fold into `integerAdd 2 x` with a regular rule. That's because
+GHC never floats in `integerAdd 1 x` to form `integerAdd 1 (integerAdd 1 x)`
+because of the let-can-float invariant (it doesn't know if `integerAdd`
+terminates).
+
+In the built-in rule for `integerAdd` we can access the unfolding of `r` and we
+can perform the appropriate substitution.
+
+To support constant-folding, Bignum operations are not allowed to inline. As a
+consequence, some codes that would benefit from inlining of bignum operations
+don't. An idea to fix this was to only have built-in rules for BigNat#
+operations and to allow Integer and Natural operations to inline. However these
+operations are often too big to inline and we end up with broken
+constant-folding and still no inlining. This issue is tracked in #20361
+
+Bignum built-in rules can be disabled independently of other built-in rules by
+passing the -dno-bignum-rules flag or programmatically with the `roBignumRules` field of
+RuleOpts.
+
+-}
+
+-- | Built-in bignum rules (see Note [Built-in bignum rules])
 builtinBignumRules :: [CoreRule]
 builtinBignumRules =
   [ -- conversions
-    lit_to_integer "Word# -> Integer"   integerFromWordName
-  , lit_to_integer "Int64# -> Integer"  integerFromInt64Name
-  , lit_to_integer "Word64# -> Integer" integerFromWord64Name
-  , lit_to_integer "Natural -> Integer" integerFromNaturalName
+    lit_to_integer "Word# -> Integer"   integerFromWordIdKey
+  , lit_to_integer "Int64# -> Integer"  integerFromInt64IdKey
+  , lit_to_integer "Word64# -> Integer" integerFromWord64IdKey
+  , lit_to_integer "Natural -> Integer" integerFromNaturalIdKey
 
-  , integer_to_lit "Integer -> Word# (wrap)"   integerToWordName   mkWordLitWrap
-  , integer_to_lit "Integer -> Int# (wrap)"    integerToIntName    mkIntLitWrap
-  , integer_to_lit "Integer -> Word64# (wrap)" integerToWord64Name (\_ -> mkWord64LitWord64 . fromInteger)
-  , integer_to_lit "Integer -> Int64# (wrap)"  integerToInt64Name  (\_ -> mkInt64LitInt64 . fromInteger)
-  , integer_to_lit "Integer -> Float#"         integerToFloatName  (\_ -> mkFloatLitFloat . fromInteger)
-  , integer_to_lit "Integer -> Double#"        integerToDoubleName (\_ -> mkDoubleLitDouble . fromInteger)
+  , integer_to_lit "Integer -> Word# (wrap)"   integerToWordIdKey   mkWordLitWrap
+  , integer_to_lit "Integer -> Int# (wrap)"    integerToIntIdKey    mkIntLitWrap
+  , integer_to_lit "Integer -> Word64# (wrap)" integerToWord64IdKey (\_ -> mkWord64LitWord64 . fromInteger)
+  , integer_to_lit "Integer -> Int64# (wrap)"  integerToInt64IdKey  (\_ -> mkInt64LitInt64 . fromInteger)
+  , integer_to_lit "Integer -> Float#"         integerToFloatIdKey  (\_ -> mkFloatLit  . fromInteger)
+  , integer_to_lit "Integer -> Double#"        integerToDoubleIdKey (\_ -> mkDoubleLit . fromInteger)
 
-  , integer_to_natural "Integer -> Natural (clamp)" integerToNaturalClampName False True
-  , integer_to_natural "Integer -> Natural (wrap)"  integerToNaturalName      False False
-  , integer_to_natural "Integer -> Natural (throw)" integerToNaturalThrowName True False
+  , integer_to_natural "Integer -> Natural (clamp)" integerToNaturalClampIdKey False True
+  , integer_to_natural "Integer -> Natural (wrap)"  integerToNaturalIdKey      False False
+  , integer_to_natural "Integer -> Natural (throw)" integerToNaturalThrowIdKey True False
 
-  , natural_to_word "Natural -> Word# (wrap)"  naturalToWordName
+  , natural_to_word "Natural -> Word# (wrap)"  naturalToWordIdKey
 
     -- comparisons (return an unlifted Int#)
-  , bignum_bin_pred "bigNatEq#"  bignatEqName (==)
+  , bignum_bin_pred "bigNatEq#"  bignatEqIdKey (==)
 
     -- comparisons (return an Ordering)
-  , bignum_compare "bignatCompare"      bignatCompareName
-  , bignum_compare "bignatCompareWord#" bignatCompareWordName
+  , bignum_compare "bignatCompare"      bignatCompareIdKey
+  , bignum_compare "bignatCompareWord#" bignatCompareWordIdKey
 
     -- binary operations
-  , integer_binop "integerAdd" integerAddName (+)
-  , integer_binop "integerSub" integerSubName (-)
-  , integer_binop "integerMul" integerMulName (*)
-  , integer_binop "integerGcd" integerGcdName gcd
-  , integer_binop "integerLcm" integerLcmName lcm
-  , integer_binop "integerAnd" integerAndName (.&.)
-  , integer_binop "integerOr"  integerOrName  (.|.)
-  , integer_binop "integerXor" integerXorName xor
+  , integer_binop "integerAdd" integerAddIdKey (+)
+  , integer_binop "integerSub" integerSubIdKey (-)
+  , integer_binop "integerMul" integerMulIdKey (*)
+  , integer_binop "integerGcd" integerGcdIdKey gcd
+  , integer_binop "integerLcm" integerLcmIdKey lcm
+  , integer_binop "integerAnd" integerAndIdKey (.&.)
+  , integer_binop "integerOr"  integerOrIdKey  (.|.)
+  , integer_binop "integerXor" integerXorIdKey xor
 
-  , natural_binop "naturalAdd" naturalAddName (+)
-  , natural_binop "naturalMul" naturalMulName (*)
-  , natural_binop "naturalGcd" naturalGcdName gcd
-  , natural_binop "naturalLcm" naturalLcmName lcm
-  , natural_binop "naturalAnd" naturalAndName (.&.)
-  , natural_binop "naturalOr"  naturalOrName  (.|.)
-  , natural_binop "naturalXor" naturalXorName xor
+  , natural_binop "naturalAdd" naturalAddIdKey (+)
+  , natural_binop "naturalMul" naturalMulIdKey (*)
+  , natural_binop "naturalGcd" naturalGcdIdKey gcd
+  , natural_binop "naturalLcm" naturalLcmIdKey lcm
+  , natural_binop "naturalAnd" naturalAndIdKey (.&.)
+  , natural_binop "naturalOr"  naturalOrIdKey  (.|.)
+  , natural_binop "naturalXor" naturalXorIdKey xor
 
     -- Natural subtraction: it's a binop but it can fail because of underflow so
     -- we have several primitives to handle here.
-  , natural_sub "naturalSubUnsafe" naturalSubUnsafeName
-  , natural_sub "naturalSubThrow"  naturalSubThrowName
-  , mkRule "naturalSub" naturalSubName 2 $ do
+  , natural_sub "naturalSubUnsafe" naturalSubUnsafeIdKey
+  , natural_sub "naturalSubThrow"  naturalSubThrowIdKey
+  , mkRule "naturalSub" naturalSubIdKey 2 $ do
         [a0,a1] <- getArgs
         x <- isNaturalLiteral a0
         y <- isNaturalLiteral a1
@@ -2235,57 +2307,53 @@ builtinBignumRules =
             else ret 2 $ mkNaturalExpr platform (x - y)
 
     -- unary operations
-  , bignum_unop "integerNegate"     integerNegateName     mkIntegerExpr negate
-  , bignum_unop "integerAbs"        integerAbsName        mkIntegerExpr abs
-  , bignum_unop "integerComplement" integerComplementName mkIntegerExpr complement
+  , bignum_unop "integerNegate"     integerNegateIdKey     mkIntegerExpr negate
+  , bignum_unop "integerAbs"        integerAbsIdKey        mkIntegerExpr abs
+  , bignum_unop "integerComplement" integerComplementIdKey mkIntegerExpr complement
 
-  , bignum_popcount "integerPopCount" integerPopCountName mkLitIntWrap
-  , bignum_popcount "naturalPopCount" naturalPopCountName mkLitWordWrap
+  , bignum_popcount "integerPopCount" integerPopCountIdKey mkLitIntWrap
+  , bignum_popcount "naturalPopCount" naturalPopCountIdKey mkLitWordWrap
 
     -- Bits.bit
-  , bignum_bit "integerBit" integerBitName mkIntegerExpr
-  , bignum_bit "naturalBit" naturalBitName mkNaturalExpr
+  , bignum_bit "integerBit" integerBitIdKey mkIntegerExpr
+  , bignum_bit "naturalBit" naturalBitIdKey mkNaturalExpr
 
     -- Bits.testBit
-  , bignum_testbit "integerTestBit" integerTestBitName
-  , bignum_testbit "naturalTestBit" naturalTestBitName
+  , bignum_testbit "integerTestBit" integerTestBitIdKey
+  , bignum_testbit "naturalTestBit" naturalTestBitIdKey
 
     -- Bits.shift
-  , bignum_shift "integerShiftL" integerShiftLName shiftL mkIntegerExpr
-  , bignum_shift "integerShiftR" integerShiftRName shiftR mkIntegerExpr
-  , bignum_shift "naturalShiftL" naturalShiftLName shiftL mkNaturalExpr
-  , bignum_shift "naturalShiftR" naturalShiftRName shiftR mkNaturalExpr
+  , bignum_shift "integerShiftL" integerShiftLIdKey shiftL mkIntegerExpr
+  , bignum_shift "integerShiftR" integerShiftRIdKey shiftR mkIntegerExpr
+  , bignum_shift "naturalShiftL" naturalShiftLIdKey shiftL mkNaturalExpr
+  , bignum_shift "naturalShiftR" naturalShiftRIdKey shiftR mkNaturalExpr
 
     -- division
-  , divop_one  "integerQuot"    integerQuotName    quot    mkIntegerExpr
-  , divop_one  "integerRem"     integerRemName     rem     mkIntegerExpr
-  , divop_one  "integerDiv"     integerDivName     div     mkIntegerExpr
-  , divop_one  "integerMod"     integerModName     mod     mkIntegerExpr
-  , divop_both "integerDivMod"  integerDivModName  divMod  mkIntegerExpr
-  , divop_both "integerQuotRem" integerQuotRemName quotRem mkIntegerExpr
+  , divop_one  "integerQuot"    integerQuotIdKey    quot    mkIntegerExpr
+  , divop_one  "integerRem"     integerRemIdKey     rem     mkIntegerExpr
+  , divop_one  "integerDiv"     integerDivIdKey     div     mkIntegerExpr
+  , divop_one  "integerMod"     integerModIdKey     mod     mkIntegerExpr
+  , divop_both "integerDivMod"  integerDivModIdKey  divMod  mkIntegerExpr
+  , divop_both "integerQuotRem" integerQuotRemIdKey quotRem mkIntegerExpr
 
-  , divop_one  "naturalQuot"    naturalQuotName    quot    mkNaturalExpr
-  , divop_one  "naturalRem"     naturalRemName     rem     mkNaturalExpr
-  , divop_both "naturalQuotRem" naturalQuotRemName quotRem mkNaturalExpr
+  , divop_one  "naturalQuot"    naturalQuotIdKey    quot    mkNaturalExpr
+  , divop_one  "naturalRem"     naturalRemIdKey     rem     mkNaturalExpr
+  , divop_both "naturalQuotRem" naturalQuotRemIdKey quotRem mkNaturalExpr
 
     -- conversions from Rational for Float/Double literals
-  , rational_to "rationalToFloat"  rationalToFloatName  mkFloatExpr
-  , rational_to "rationalToDouble" rationalToDoubleName mkDoubleExpr
+  , rational_to "rationalToFloat#"  rationalToFloatIdKey  LitFloat
+  , rational_to "rationalToDouble#" rationalToDoubleIdKey LitDouble
 
     -- conversions from Integer for Float/Double literals
-  , integer_encode_float "integerEncodeFloat"  integerEncodeFloatName  mkFloatLitFloat
-  , integer_encode_float "integerEncodeDouble" integerEncodeDoubleName mkDoubleLitDouble
+  , integer_encode_float "integerEncodeFloat"  integerEncodeFloatIdKey
+      encodeLitFloat  LitFloat
+  , integer_encode_float "integerEncodeDouble" integerEncodeDoubleIdKey
+      encodeLitDouble LitDouble
   ]
   where
-    mkRule str name nargs f = BuiltinRule
-      { ru_name = fsLit str
-      , ru_fn = name
-      , ru_nargs = nargs
-      , ru_try = runRuleM $ do
-          env <- getRuleOpts
-          guard (roBignumRules env)
-          f
-      }
+    mkRule str key nargs f = mkBasicRule (fsLit str) key nargs rm
+      where
+        rm = do { env <- getRuleOpts; guard (roBignumRules env); f }
 
     integer_to_lit str name convert = mkRule str name 1 $ do
       [a0] <- getArgs
@@ -2425,27 +2493,31 @@ builtinBignumRules =
       platform <- getPlatform
       pure $ mkCoreUnboxedTuple [mk_lit platform r, mk_lit platform s]
 
-    integer_encode_float :: RealFloat a => String -> Name -> (a -> CoreExpr) -> CoreRule
-    integer_encode_float str name mk_lit = mkRule str name 2 $ do
+    integer_encode_float :: String -> KnownKey
+                         -> (Integer -> Int -> LitFloating) -> LitFloatingType -> CoreRule
+    integer_encode_float str name encode_fun destType = mkRule str name 2 $ do
       [a0,a1] <- getArgs
       x <- isIntegerLiteral a0
       y <- isNumberLiteral a1
       -- check that y (a target Int) is in the host Int range
-      guard (y <= fromIntegral (maxBound :: Int))
-      pure (mk_lit $ encodeFloat x (fromInteger y))
+      yInt <- liftMaybe (toIntegralSized y :: Maybe Int)
+      pure $ Lit $ LitFloating destType $ encode_fun x yInt
 
-    rational_to :: RealFloat a => String -> Name -> (a -> CoreExpr) -> CoreRule
-    rational_to str name mk_lit = mkRule str name 2 $ do
-      -- This turns `rationalToFloat n d` where `n` and `d` are literals into
-      -- a literal Float (and similarly for Double).
+    rational_to :: String -> KnownKey -> LitFloatingType -> CoreRule
+    rational_to str name destType = mkRule str name 2 $ do
+      -- This turns `rationalToFloat# n d` where `n` and `d` are literals into
+      -- a literal Float# (and similarly for Double#).
       [a0,a1] <- getArgs
       n <- isIntegerLiteral a0
       d <- isIntegerLiteral a1
-      -- it's important to not match d == 0, because that may represent a
-      -- literal "0/0" or similar, and we can't produce a literal value for
-      -- NaN or +-Inf
-      guard (d /= 0)
-      pure $ mk_lit (fromRational (n % d))
+      env <- getRuleOpts
+      pure $ Lit $ LitFloating destType $
+        if d /= 0
+        then rationalToLitFloating (n % d)
+        else
+          let n' = rationalToLitFloating (fromInteger $ signum n)
+              d' = rationalToLitFloating 0
+          in litFloatingBinaryOp (roCFPrecision destType env) (/) n' d'
 
 
 ---------------------------------------------------
@@ -2458,15 +2530,15 @@ builtinBignumRules =
 --
 
 -- CString version
-match_cstring_append_lit_C :: RuleFun
+match_cstring_append_lit_C :: CFRuleFun CoreExpr
 match_cstring_append_lit_C = match_cstring_append_lit unpackCStringAppendIdKey unpackCStringIdKey
 
 -- CStringUTF8 version
-match_cstring_append_lit_utf8 :: RuleFun
+match_cstring_append_lit_utf8 :: CFRuleFun CoreExpr
 match_cstring_append_lit_utf8 = match_cstring_append_lit unpackCStringAppendUtf8IdKey unpackCStringUtf8IdKey
 
 {-# INLINE match_cstring_append_lit #-}
-match_cstring_append_lit :: Unique -> Unique -> RuleFun
+match_cstring_append_lit :: Unique -> Unique -> CFRuleFun CoreExpr
 match_cstring_append_lit append_key unpack_key _ env _ [lit1, e2]
   | Just (LitString s1) <- exprIsLiteral_maybe env lit1
   , (strTicks, Var unpk `App` lit2) <- stripStrTopTicks env e2
@@ -2492,15 +2564,15 @@ match_cstring_append_lit _ _ _ _ _ _ = Nothing
 -- See also Note [String literals in GHC] in CString.hs
 
 -- CString version
-match_cstring_foldr_lit_C :: RuleFun
+match_cstring_foldr_lit_C :: CFRuleFun CoreExpr
 match_cstring_foldr_lit_C = match_cstring_foldr_lit unpackCStringFoldrIdKey
 
 -- CStringUTF8 version
-match_cstring_foldr_lit_utf8 :: RuleFun
+match_cstring_foldr_lit_utf8 :: CFRuleFun CoreExpr
 match_cstring_foldr_lit_utf8 = match_cstring_foldr_lit unpackCStringFoldrUtf8IdKey
 
 {-# INLINE match_cstring_foldr_lit #-}
-match_cstring_foldr_lit :: Unique -> RuleFun
+match_cstring_foldr_lit :: Unique -> CFRuleFun CoreExpr
 match_cstring_foldr_lit foldVariant _ env _
         [ Type ty1
         , lit1
@@ -2547,7 +2619,7 @@ stripStrTopTicksT e = stripTicksTopT tickishFloatable e
 --      eqString (unpackCString# (Lit s1)) (unpackCString# (Lit s2)) = s1==s2
 -- Also  matches unpackCStringUtf8#
 
-match_eq_string :: RuleFun
+match_eq_string :: CFRuleFun CoreExpr
 match_eq_string _ env _ [e1, e2]
   | (ticks1, Var unpk1 `App` lit1) <- stripStrTopTicks env e1
   , (ticks2, Var unpk2 `App` lit2) <- stripStrTopTicks env e2
@@ -2580,7 +2652,7 @@ match_eq_string _ _ _ _ = Nothing
 -- helpful when using OverloadedStrings to create a ByteString since the
 -- function computing the length of such ByteStrings can often be constant
 -- folded.
-match_cstring_length :: RuleFun
+match_cstring_length :: CFRuleFun CoreExpr
 match_cstring_length rule_env env _ [lit1]
   | Just (LitString str) <- exprIsLiteral_maybe env lit1
     -- If elemIndex returns Just, it has the index of the first embedded NUL
@@ -2628,8 +2700,8 @@ The moving parts are simple:
   Also, don't forget about 'inline's type argument!
 -}
 
-match_inline :: [Expr CoreBndr] -> Maybe (Expr CoreBndr)
-match_inline (Type _ : e : _) = go e
+match_inline :: CFRuleFun CoreExpr
+match_inline _ _ _ (Type _ : e : _) = go e
   -- Maybe Monad ahead:
   where
     go (Var f)      = -- Ignore the IdUnfoldingFun here!
@@ -2641,7 +2713,7 @@ match_inline (Type _ : e : _) = go e
     go (Tick t e)   = do { app <- go e; pure (Tick t app) }
     go _            = Nothing
 
-match_inline _ = Nothing
+match_inline _ _ _ _ = Nothing
 
 --------------------------------------------------------
 -- Note [Constant folding through nested expressions]
@@ -3142,8 +3214,8 @@ is_binop op e = case e of
 
 is_op :: PrimOp -> CoreExpr -> Maybe (Arg CoreBndr)
 is_op op e = case e of
- App (OpVal op') x | op == op' -> Just x
- _                             -> Nothing
+ App (PrimOpVar op') x | op == op' -> Just x
+ _                                 -> Nothing
 
 is_add, is_sub, is_mul, is_and, is_or, is_div :: NumOps -> CoreExpr -> Maybe (CoreArg, CoreArg)
 is_add num_ops e = is_binop (numAdd num_ops) e
@@ -3203,12 +3275,12 @@ is_expr_mul num_ops x e = if
 
 -- | Match the application of a binary primop
 pattern BinOpApp :: Arg CoreBndr -> PrimOp -> Arg CoreBndr -> CoreExpr
-pattern BinOpApp x op y = OpVal op `App` x `App` y
+pattern BinOpApp x op y = PrimOpVar op `App` x `App` y
 
 -- | Match a primop
-pattern OpVal:: PrimOp  -> Arg CoreBndr
-pattern OpVal op <- Var (isPrimOpId_maybe -> Just op) where
-   OpVal op = Var (primOpId op)
+pattern PrimOpVar:: PrimOp -> Arg CoreBndr
+pattern PrimOpVar op <- Var (isPrimOpId_maybe -> Just op) where
+   PrimOpVar op = Var (primOpId op)
 
 -- | Match a literal
 pattern L :: Integer -> Arg CoreBndr
@@ -3432,11 +3504,12 @@ caseRules _ _ = Nothing
 --
 -- It's important that occurrence info are present, hence the use of In* types.
 caseRules2
-   :: InExpr  -- ^ Scutinee
-   -> InId    -- ^ Case-binder
-   -> [InAlt] -- ^ Alternatives in standard (increasing) order
+   :: Platform  -- ^ Target platform
+   -> InExpr    -- ^ Scrutinee
+   -> InId      -- ^ Case-binder
+   -> [InAlt]   -- ^ Alternatives in standard (increasing) order
    -> Maybe (InExpr, InId, [InAlt])
-caseRules2 scrut bndr alts
+caseRules2 platform scrut bndr alts
 
   -- case quotRem# x y of
   --    (# q, _ #) -> body
@@ -3460,6 +3533,46 @@ caseRules2 scrut bndr alts
       | dead_q    -> Just $ (BinOpApp x rem  y, r, [Alt DEFAULT [] body])
       | dead_r    -> Just $ (BinOpApp x quot y, q, [Alt DEFAULT [] body])
       | otherwise -> Nothing
+
+  -- filter alternatives that are not in the scrutinee's inferred range
+  -- See (VRA1) in Note [Value range analysis] in GHC.Core.Opt.Range
+  | Just CaseUnlifted <- altsLevity alts
+  , range <- valueRange platform scrut
+  , range /= noRange
+  = let
+      -- filters alternatives that aren't in range
+      alt_in_range = \case
+          Alt DEFAULT _ _                  -> True
+          Alt (LitAlt (LitNumber _ n)) _ _ -> n `inRange` range
+          Alt (LitAlt (LitChar c)) _ _     -> fromIntegral (ord c) `inRange` range
+          Alt (LitAlt LitNullAddr) _ _     -> 0 `inRange` range
+          Alt _ _ _                        -> True -- defaults to True to be safe
+
+      rebuild_alts alt (b,n,alts')
+        -- `n` is the number of remaining alternatives, hence alternatives which
+        -- are in range. If there are as many alternatives in range as the range
+        -- size, it means we can remove the DEFAULT one (it is dead code).
+        --
+        -- Note that this works as written because we use `foldr` below and the
+        -- DEFAULT alternative is always at the head of the list of alternatives
+        -- when it is present (invariant).
+        | isDefaultAlt alt
+        , Just sz <- rangeSize range
+        , n == sz
+        = (True,n,alts')
+
+        -- filter alternatives that aren't in range
+        | not (alt_in_range alt)
+        = (True,n,alts')
+
+        | otherwise
+        = (b,n+1,alt:alts')
+
+      (alts_changed,_nalts,final_alts) = foldr rebuild_alts (False,0,[]) alts
+
+    in case alts_changed of
+        True  -> Just (scrut,bndr,final_alts)
+        False -> Nothing
 
   | otherwise
   = Nothing
@@ -3632,3 +3745,5 @@ an alternative that is unreachable.
 
 You may wonder how this can happen: check out #15436.
 -}
+
+

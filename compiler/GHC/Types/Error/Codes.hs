@@ -1,13 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MagicHash #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE StandaloneKindSignatures #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -269,12 +261,13 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrLazyPatWithoutSpace"                      = 27207
   GhcDiagnosticCode "PsErrBangPatWithoutSpace"                      = 95644
   GhcDiagnosticCode "PsErrInvalidInfixHole"                         = 45106
-  GhcDiagnosticCode "PsErrExpectedHyphen"                           = 44524
+  GhcDiagnosticCode "PsErrExpectedHyphen"                           = Outdated 44524
   GhcDiagnosticCode "PsErrSpaceInSCC"                               = 76176
   GhcDiagnosticCode "PsErrEmptyDoubleQuotes"                        = 11861
   GhcDiagnosticCode "PsErrLambdaCase"                               = 51179
   GhcDiagnosticCode "PsErrEmptyLambda"                              = 71614
   GhcDiagnosticCode "PsErrLinearFunction"                           = 31574
+  GhcDiagnosticCode "PsErrModifierSyntax"                           = 61252
   GhcDiagnosticCode "PsErrMultiWayIf"                               = 28985
   GhcDiagnosticCode "PsErrOverloadedRecordUpdateNotEnabled"         = 82135
   GhcDiagnosticCode "PsErrNumUnderscores"                           = 62330
@@ -284,6 +277,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrOverloadedRecordUpdateNoQualifiedFields"  = 94863
   GhcDiagnosticCode "PsErrExplicitForall"                           = 25955
   GhcDiagnosticCode "PsErrIllegalQualifiedDo"                       = 40280
+  GhcDiagnosticCode "PsErrIllegalMultilineStrings"                  = 47920
   GhcDiagnosticCode "PsErrQualifiedDoInCmd"                         = 54089
   GhcDiagnosticCode "PsErrRecordSyntaxInPatSynDecl"                 = 28021
   GhcDiagnosticCode "PsErrEmptyWhereInPatSynDecl"                   = 13248
@@ -292,6 +286,9 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrDeclSpliceNotAtTopLevel"                  = 08451
   GhcDiagnosticCode "PsErrMultipleNamesInStandaloneKindSignature"   = 42569
   GhcDiagnosticCode "PsErrIllegalExplicitNamespace"                 = 47007
+  GhcDiagnosticCode "PsErrUnsupportedExplicitNamespace"             = 04611
+  GhcDiagnosticCode "PsErrPlainWildcardImport"                      = 96821
+  GhcDiagnosticCode "PsErrPlainWildcardExport"                      = 96822
   GhcDiagnosticCode "PsErrUnallowedPragma"                          = 85314
   GhcDiagnosticCode "PsErrImportPostQualified"                      = 87491
   GhcDiagnosticCode "PsErrImportQualifiedTwice"                     = 05661
@@ -361,7 +358,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrUnexpectedTypeInDecl"                     = 77878
   GhcDiagnosticCode "PsErrInvalidPackageName"                       = 21926
   GhcDiagnosticCode "PsErrParseRightOpSectionInPat"                 = 72516
-  GhcDiagnosticCode "PsErrIllegalGadtRecordMultiplicity"            = 37475
+  GhcDiagnosticCode "PsErrIllegalGadtRecordModifier"                = 37475
   GhcDiagnosticCode "PsErrInvalidCApiImport"                        = 72744
   GhcDiagnosticCode "PsErrMultipleConForNewtype"                    = 05380
   GhcDiagnosticCode "PsErrUnicodeCharLooksLike"                     = 31623
@@ -405,6 +402,8 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "DriverModuleGraphCycle"                        = 92213
   GhcDiagnosticCode "DriverInstantiationNodeInDependencyGeneration" = 74284
   GhcDiagnosticCode "DriverNoConfiguredLLVMToolchain"               = 66599
+  GhcDiagnosticCode "DriverMissingLinkableForModule"                = 47338
+  GhcDiagnosticCode "DriverSemaphoreOpenFailure"                    = 19877
 
   -- Constraint solver diagnostic codes
   GhcDiagnosticCode "BadTelescope"                                  = 97739
@@ -429,7 +428,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "OccursCheck"                                   = 27958
   GhcDiagnosticCode "SkolemEscape"                                  = 46956
   GhcDiagnosticCode "DifferentTyVars"                               = 25897
-  GhcDiagnosticCode "RepresentationalEq"                            = 10283
+  GhcDiagnosticCode "RepresentationalEq"                            = Outdated 10283
 
   -- Typechecker/renamer diagnostic codes
   GhcDiagnosticCode "TcRnSolverDepthError"                          = 40404
@@ -439,7 +438,6 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnTypeDoesNotHaveFixedRuntimeRep"            = 18478
   GhcDiagnosticCode "TcRnImplicitLift"                              = 00846
   GhcDiagnosticCode "TcRnUnusedPatternBinds"                        = 61367
-  GhcDiagnosticCode "TcRnDodgyExports"                              = 75356
   GhcDiagnosticCode "TcRnMissingImportList"                         = 77037
   GhcDiagnosticCode "TcRnUnsafeDueToPlugin"                         = 01687
   GhcDiagnosticCode "TcRnModMissingRealSrcSpan"                     = 84170
@@ -502,14 +500,15 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnPatSynBundledWithNonDataCon"               = 66775
   GhcDiagnosticCode "TcRnPatSynBundledWithWrongType"                = 66025
   GhcDiagnosticCode "TcRnDupeModuleExport"                          = 51876
+  GhcDiagnosticCode "TcRnDupeWildcardExport"                        = 34992
   GhcDiagnosticCode "TcRnExportedModNotImported"                    = 90973
-  GhcDiagnosticCode "TcRnNullExportedModule"                        = 64649
   GhcDiagnosticCode "TcRnMissingExportList"                         = 85401
-  GhcDiagnosticCode "TcRnExportHiddenComponents"                    = 94558
+  GhcDiagnosticCode "TcRnExportHiddenComponents"                    = Outdated 94558
   GhcDiagnosticCode "TcRnExportHiddenDefault"                       = 74775
   GhcDiagnosticCode "TcRnDuplicateExport"                           = 47854
   GhcDiagnosticCode "TcRnDuplicateNamedDefaultExport"               = 31584
   GhcDiagnosticCode "TcRnExportedParentChildMismatch"               = 88993
+  GhcDiagnosticCode "TcRnExportedSubordinateNotFound"               = 11592
   GhcDiagnosticCode "TcRnConflictingExports"                        = 69158
   GhcDiagnosticCode "TcRnDuplicateFieldExport"                      = 97219
   GhcDiagnosticCode "TcRnAmbiguousFieldInUpdate"                    = 56428
@@ -543,6 +542,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnNegativeNumTypeLiteral"                    = 93632
   GhcDiagnosticCode "TcRnUnusedQuantifiedTypeVar"                   = 54180
   GhcDiagnosticCode "TcRnMissingRoleAnnotation"                     = 65490
+  GhcDiagnosticCode "TcRnImplicitFieldStrictness"                   = 47032
 
   GhcDiagnosticCode "TcRnUntickedPromotedThing"                     = 49957
   GhcDiagnosticCode "TcRnIllegalBuiltinSyntax"                      = 39716
@@ -579,7 +579,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnOrPatBindsVariables"                       = 81303
   GhcDiagnosticCode "TcRnIllegalKind"                               = 64861
   GhcDiagnosticCode "TcRnUnexpectedPatSigType"                      = 74097
-  GhcDiagnosticCode "TcRnIllegalKindSignature"                      = 91382
+  GhcDiagnosticCode "TcRnIllegalKindSignature"                      = Outdated 91382   -- superseded by TcRnKindSignaturesDisabled
   GhcDiagnosticCode "TcRnDataKindsError"                            = 68567
 
   GhcDiagnosticCode "TcRnIllegalHsigDefaultMethods"                 = 93006
@@ -677,6 +677,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "NonCanonicalMonoid"                            = 50928
   GhcDiagnosticCode "NonCanonicalMonad"                             = 22705
   GhcDiagnosticCode "TcRnDefaultedExceptionContext"                 = 46235
+  GhcDiagnosticCode "TcRnDefaultedCallStack"                        = 39361
   GhcDiagnosticCode "TcRnImplicitImportOfPrelude"                   = 20540
   GhcDiagnosticCode "TcRnMissingMain"                               = 67120
   GhcDiagnosticCode "TcRnGhciUnliftedBind"                          = 17999
@@ -699,6 +700,10 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnIllegalTypeExpr"                           = 35499
   GhcDiagnosticCode "TcRnUnexpectedTypeSyntaxInTerms"               = 31244
   GhcDiagnosticCode "TcRnTypeApplicationsDisabled"                  = 23482
+  GhcDiagnosticCode "TcRnUnpromotableLit"                           = 51819
+  GhcDiagnosticCode "TcRnUnrecognisedModifier"                      = 49969
+  GhcDiagnosticCode "TcRnUnknownModifierKind"                       = 38026
+  GhcDiagnosticCode "TcRnTooManyMultiplicities"                     = 65505
 
   -- TcRnIllegalInvisibleTypePattern
   GhcDiagnosticCode "InvisPatWithoutFlag"                           = 78249
@@ -765,6 +770,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   -- TcRnPragmaWarning
   GhcDiagnosticCode "WarningTxt"                                    = 63394
   GhcDiagnosticCode "DeprecatedTxt"                                 = 68441
+  GhcDiagnosticCode "XWarningTxt"                                   = 68077
 
   -- TcRnRunSliceFailure/ConversionFail
   GhcDiagnosticCode "IllegalOccName"                                = 55017
@@ -794,11 +800,17 @@ type family GhcDiagnosticCode c = n | n -> c where
 
   -- TcRnDodgyImports/DodgyImportsReason
   GhcDiagnosticCode "DodgyImportsEmptyParent"                       = 99623
+  GhcDiagnosticCode "DodgyImportsWildcard"                          = 52986
+
+  -- TcRnDodgyExports/DodgyExportsReason
+  GhcDiagnosticCode "DodgyExportsEmptyParent"                       = 75356
+  GhcDiagnosticCode "DodgyExportsNullModule"                        = 64649
+  GhcDiagnosticCode "DodgyExportsWildcard"                          = 09224
 
   -- TcRnImportLookup/ImportLookupReason
   GhcDiagnosticCode "ImportLookupQualified"                         = 48795
   GhcDiagnosticCode "ImportLookupIllegal"                           = 14752
-  GhcDiagnosticCode "ImportLookupAmbiguous"                         = 92057
+  GhcDiagnosticCode "ImportLookupAmbiguous"                         = Outdated 92057
 
   -- TcRnUnusedImport/UnusedImportReason
   GhcDiagnosticCode "UnusedImportNone"                              = 66111
@@ -880,6 +892,11 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "CircularImport"                                = 75429
   GhcDiagnosticCode "HiModuleNameMismatchWarn"                      = 53693
   GhcDiagnosticCode "ExceptionOccurred"                             = 47808
+  GhcDiagnosticCode "MissingKnownKey1"                              = 74926
+  GhcDiagnosticCode "MissingKnownKey2"                              = 71344
+  GhcDiagnosticCode "MissingKnownKey3"                              = 71345
+  GhcDiagnosticCode "KnownKeyScopeError"                            = 99040
+  GhcDiagnosticCode "CantFindEssentials"                            = 49917
 
   -- Out of scope errors
   GhcDiagnosticCode "NotInScope"                                    = 76037
@@ -1090,6 +1107,7 @@ type family ConRecursInto con where
   ConRecursInto "TcRnClassExtensionDisabled" = 'Just DisabledClassExtension
   ConRecursInto "TcRnTyFamsDisabled"       = 'Just TyFamsDisabledReason
   ConRecursInto "TcRnDodgyImports"         = 'Just DodgyImportsReason
+  ConRecursInto "TcRnDodgyExports"         = 'Just DodgyExportsReason
   ConRecursInto "DodgyImportsHiding"       = 'Just ImportLookupReason
   ConRecursInto "TcRnImportLookup"         = 'Just ImportLookupReason
   ConRecursInto "TcRnUnusedImport"         = 'Just UnusedImportReason

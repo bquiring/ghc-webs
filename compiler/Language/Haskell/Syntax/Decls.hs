@@ -1,15 +1,4 @@
-
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
 {-# LANGUAGE ViewPatterns #-}
@@ -24,12 +13,12 @@
 -- | Abstract syntax of global declarations.
 --
 -- Definitions for: @SynDecl@ and @ConDecl@, @ClassDecl@,
--- @InstDecl@, @DefaultDecl@ and @ForeignDecl@.
+-- @InstDecl@, @DefaultDecl@.
 module Language.Haskell.Syntax.Decls (
   -- * Toplevel declarations
   HsDecl(..), LHsDecl, HsDataDefn(..), HsDeriving, LHsFunDep, FunDep(..),
   HsDerivingClause(..), LHsDerivingClause, DerivClauseTys(..), LDerivClauseTys,
-  NewOrData(..), DataDefnCons(..), dataDefnConsNewOrData,
+  DataDefnCons(..),
   isTypeDataDefnCons, firstDataDefnCon,
   StandaloneKindSig(..), LStandaloneKindSig,
 
@@ -42,7 +31,7 @@ module Language.Haskell.Syntax.Decls (
   FamilyDecl(..), LFamilyDecl,
 
   -- ** Instance declarations
-  InstDecl(..), LInstDecl, FamilyInfo(..), familyInfoTyConFlavour,
+  InstDecl(..), LInstDecl, FamilyInfo(..),
   TyFamInstDecl(..), LTyFamInstDecl,
   TyFamDefltDecl, LTyFamDefltDecl,
   DataFamInstDecl(..), LDataFamInstDecl,
@@ -64,7 +53,7 @@ module Language.Haskell.Syntax.Decls (
   SpliceDecl(..), LSpliceDecl,
   -- ** Foreign function interface declarations
   ForeignDecl(..), LForeignDecl, ForeignImport(..), ForeignExport(..),
-  CImportSpec(..),
+  CCallConv(..), CCallTarget(..), CExportSpec(..), CImportSpec(..), CLabelString,
   -- ** Data-constructor declarations
   ConDecl(..), LConDecl,
   HsConDeclH98Details,
@@ -83,40 +72,54 @@ module Language.Haskell.Syntax.Decls (
   FamilyResultSig(..), LFamilyResultSig, InjectivityAnn(..), LInjectivityAnn,
 
   -- * Grouping
-  HsGroup(..)
+  HsGroup(..),
+
+  -- * Warnings
+  WarningTxt(..),
+  WarningCategory(..),
+  mkWarningCategory,
+  InWarningCategory(..),
+  -- ** Extension
+  XDeprecatedTxt,
+  XWarningTxt,
+  XXWarningTxt,
+  XInWarningCategory,
     ) where
 
 -- friends:
 import {-# SOURCE #-} Language.Haskell.Syntax.Expr
-  ( HsExpr, HsUntypedSplice )
+  (HsExpr, HsUntypedSplice)
         -- Because Expr imports Decls via HsBracket
 
+import Language.Haskell.Syntax.Basic
+  (LexicalFixity, Role, TopLevelFlag)
 import Language.Haskell.Syntax.Binds
+import Language.Haskell.Syntax.Decls.Foreign
+import Language.Haskell.Syntax.Binds.InlinePragma (Activation)
+import Language.Haskell.Syntax.Decls.Overlap (OverlapMode)
+import Language.Haskell.Syntax.Doc (LHsDoc, WithHsDocIdentifiers)
 import Language.Haskell.Syntax.Extension
-import Language.Haskell.Syntax.Type
-import Language.Haskell.Syntax.Basic (Role, LexicalFixity)
+import Language.Haskell.Syntax.Lit (StringLiteral)
 import Language.Haskell.Syntax.Specificity (Specificity)
+import Language.Haskell.Syntax.Text
+import Language.Haskell.Syntax.Type
+import Language.Haskell.Syntax.ImpExp (NamespaceSpecifier)
 
-import GHC.Types.Basic (TopLevelFlag, OverlapMode, RuleName, Activation
-                       ,TyConFlavour(..), TypeOrData(..), NewOrData(..))
-import GHC.Types.ForeignCall (CType, CCallConv, Safety, Header, CLabelString, CCallTarget, CExportSpec)
 
-import GHC.Unit.Module.Warnings (WarningTxt)
-
-import GHC.Hs.Doc (LHsDoc) -- ROMES:TODO Discuss in #21592 whether this is parsed AST or base AST
-
+import Control.DeepSeq
 import Control.Monad
-import Control.Exception (assert)
 import Data.Data        hiding (TyCon, Fixity, Infix)
 import Data.Maybe
 import Data.String
 import Data.Eq
 import Data.Int
 import Data.Bool
-import Prelude (Show)
+import Prelude (Show, Ord)
 import Data.Foldable
 import Data.Traversable
 import Data.List.NonEmpty (NonEmpty (..))
+import GHC.Generics (Generic)
+
 
 {-
 ************************************************************************
@@ -405,23 +408,23 @@ data TyClDecl pass
 
   | -- | @data@ declaration
     DataDecl { tcdDExt     :: XDataDecl pass       -- ^ Post renamer, CUSK flag, FVs
-             , tcdLName    :: LIdP pass             -- ^ Type constructor
+             , tcdModifiers :: [LHsModifier pass]  -- ^ Modifiers
+             , tcdLName    :: LIdP pass            -- ^ Type constructor
              , tcdTyVars   :: LHsQTyVars pass      -- ^ Type variables
                               -- See Note [TyVar binders for associated decls]
              , tcdFixity   :: LexicalFixity        -- ^ Fixity used in the declaration
              , tcdDataDefn :: HsDataDefn pass }
 
   | ClassDecl { tcdCExt    :: XClassDecl pass,         -- ^ Post renamer, FVs
+                tcdModifiers :: [LHsModifier pass],    -- ^ Modifiers
                 tcdCtxt    :: Maybe (LHsContext pass), -- ^ Context...
                 tcdLName   :: LIdP pass,               -- ^ Name of the class
                 tcdTyVars  :: LHsQTyVars pass,         -- ^ Class type variables
                 tcdFixity  :: LexicalFixity, -- ^ Fixity used in the declaration
                 tcdFDs     :: [LHsFunDep pass],         -- ^ Functional deps
-                tcdSigs    :: [LSig pass],              -- ^ Methods' signatures
-                tcdMeths   :: LHsBinds pass,            -- ^ Default methods
-                tcdATs     :: [LFamilyDecl pass],       -- ^ Associated types;
-                tcdATDefs  :: [LTyFamDefltDecl pass],   -- ^ Associated type defaults
-                tcdDocs    :: [LDocDecl pass]           -- ^ Haddock docs
+                tcdDecls   :: [LHsDecl pass] -- ^ Class declarations.
+                                             -- only SigD, ValD, TyClD _ FamDecl, InstD _ TyFamInstD,
+                                             -- InstD _ DataFamInstD and DocD
     }
   | XTyClDecl !(XXTyClDecl pass)
 
@@ -774,18 +777,6 @@ data FamilyInfo pass
      -- said "type family Foo x where .."
   | ClosedTypeFamily (Maybe [LTyFamInstEqn pass])
 
-familyInfoTyConFlavour
-  :: Maybe tc    -- ^ Just cls <=> this is an associated family of class cls
-  -> FamilyInfo pass
-  -> TyConFlavour tc
-familyInfoTyConFlavour mb_parent_tycon info =
-  case info of
-    DataFamily         -> OpenFamilyFlavour (IAmData DataType) mb_parent_tycon
-    OpenTypeFamily     -> OpenFamilyFlavour IAmType mb_parent_tycon
-    ClosedTypeFamily _ -> assert (isNothing mb_parent_tycon)
-                          -- See Note [Closed type family mb_parent_tycon]
-                          ClosedTypeFamilyFlavour
-
 {- Note [Closed type family mb_parent_tycon]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There's no way to write a closed type family inside a class declaration:
@@ -814,7 +805,7 @@ data HsDataDefn pass   -- The payload of a data type defn
     -- @
     HsDataDefn { dd_ext    :: XCHsDataDefn pass,
                  dd_ctxt   :: Maybe (LHsContext pass), -- ^ Context
-                 dd_cType  :: Maybe (XRec pass CType),
+                 dd_cType  :: Maybe (XRec pass (CType pass)),
                  dd_kindSig:: Maybe (LHsKind pass),
                      -- ^ Optional kind signature.
                      --
@@ -927,11 +918,6 @@ data DataDefnCons a
       [a]    -- The (possibly empty) list of data constructors
   deriving ( Eq, Data, Foldable, Functor, Traversable )                -- Needed because Demand derives Eq
 
-dataDefnConsNewOrData :: DataDefnCons a -> NewOrData
-dataDefnConsNewOrData = \ case
-    NewTypeCon   {} -> NewType
-    DataTypeCons {} -> DataType
-
 -- | Are the constructors within a @type data@ declaration?
 -- See Note [Type data declarations] in GHC.Rename.Module.
 isTypeDataDefnCons :: DataDefnCons a -> Bool
@@ -966,6 +952,7 @@ type LConDecl pass = XRec pass (ConDecl pass)
 data ConDecl pass
   = ConDeclGADT
       { con_g_ext   :: XConDeclGADT pass
+      , con_modifiers :: [LHsModifier pass]
       , con_names   :: NonEmpty (LIdP pass)
       -- The following fields describe the type after the '::'
       -- See Note [GADT abstract syntax]
@@ -974,8 +961,9 @@ data ConDecl pass
         --   cf. HsSigType that also stores the outermost sig_bndrs separately
         --   from the forall telescopes in sig_body.
         --   See Note [Representing type signatures] in Language.Haskell.Syntax.Type
-      , con_inner_bndrs :: [HsForAllTelescope pass]
-        -- ^ The forall telescopes other than the outermost invisible forall.
+      , con_inner_bndrs :: [LHsGadtTelescope pass]
+        -- ^ The forall telescopes other than the outermost invisible forall,
+        --   interleaved with the parentheses that enclose them.
       , con_mb_cxt  :: Maybe (LHsContext pass)   -- ^ User-written context (if any)
       , con_g_args  :: HsConDeclGADTDetails pass -- ^ Arguments; never infix
       , con_res_ty  :: LHsType pass              -- ^ Result type
@@ -986,6 +974,7 @@ data ConDecl pass
 
   | ConDeclH98
       { con_ext     :: XConDeclH98 pass
+      , con_modifiers :: [LHsModifier pass]
       , con_name    :: LIdP pass
 
       , con_forall  :: Bool
@@ -1086,22 +1075,21 @@ the GADT type, in precisely that order. For instance:
     MkT5 :: forall a. Int -> Eq a => a -> T
       -- Rejected, `Eq a` is nested
     MkT6 :: (forall a. a -> T)
-      -- Rejected, `forall a` is nested due to the surrounding parentheses
-    MkT7 :: (Eq a => a -> t)
-      -- Rejected, `Eq a` is nested due to the surrounding parentheses
+      -- OK, the parentheses are recorded in con_inner_bndrs.
+    MkT7 :: (Eq a => a -> T)
+      -- OK, ditto
 
 For the full details, see the "Formal syntax for GADTs" section of the GHC
 User's Guide. GHC enforces that GADT constructors do not have nested `forall`s
-or contexts in two parts:
+or contexts in a single place:
 
-1. GHC, in the process of splitting apart a GADT's type,
-   extracts out the leading `forall` and context (if they are provided). To
-   accomplish this splitting, the renamer uses the
-   GHC.Hs.Type.splitLHsGADTPrefixTy function, which is careful not to remove
-   parentheses surrounding the leading `forall` or context (as these
-   parentheses can be syntactically significant). If the third result returned
-   by splitLHsGADTPrefixTy contains any `forall`s or contexts, then they must
-   be nested, so they will be rejected.
+   GHC, in the process of splitting apart a GADT's type,
+   extracts out the leading `forall`s and context (if they are provided). To
+   accomplish this splitting, the parser uses the GHC.Hs.Type.splitLHsGadtTy
+   function, which records the parentheses that surround the leading `forall`s
+   in con_inner_bndrs (as these parentheses are syntactically significant).
+   If the body returned by splitLHsGadtTy still contains any `forall`s or
+   contexts, then they must be nested, so they will be rejected.
 
    Note that this step applies to both prefix and record GADTs alike, as they
    both have syntax which permits `forall`s and contexts. The difference is
@@ -1110,18 +1098,11 @@ or contexts in two parts:
    * For prefix GADTs, this happens in the renamer (in rnConDecl), as we cannot
      split until after the type operator fixities have been resolved.
    * For record GADTs, this happens in the parser (in mkGadtDecl).
-2. If the GADT type is prefix, the renamer (in the ConDeclGADTPrefixPs case of
-   rnConDecl) will then check for nested `forall`s/contexts in the body of a
-   prefix GADT type, after it has determined what all of the argument types are.
-   This step is necessary to catch examples like MkT4 above, where the nested
-   quantification occurs after a visible argument type.
 -}
 
 -- | The arguments in a Haskell98-style data constructor.
 type HsConDeclH98Details pass
-   = HsConDetails (HsConDeclField pass) (XRec pass [LHsConDeclRecField pass])
--- The Void argument to HsConDetails here is a reflection of the fact that
--- type applications are not allowed in data constructor declarations.
+   = HsConDetails pass (HsConDeclField pass) (XRec pass [LHsConDeclRecField pass])
 
 -- | The arguments in a GADT constructor. Unlike Haskell98-style constructors,
 -- GADT constructors cannot be declared with infix syntax. As a result, we do
@@ -1269,14 +1250,13 @@ type LClsInstDecl pass = XRec pass (ClsInstDecl pass)
 data ClsInstDecl pass
   = ClsInstDecl
       { cid_ext     :: XCClsInstDecl pass
-      , cid_poly_ty :: LHsSigType pass    -- Context => Class Instance-type
-                                          -- Using a polytype means that the renamer conveniently
-                                          -- figures out the quantified type variables for us.
-      , cid_binds         :: LHsBinds pass       -- Class methods
-      , cid_sigs          :: [LSig pass]         -- User-supplied pragmatic info
-      , cid_tyfam_insts   :: [LTyFamInstDecl pass]   -- Type family instances
-      , cid_datafam_insts :: [LDataFamInstDecl pass] -- Data family instances
-      , cid_overlap_mode  :: Maybe (XRec pass OverlapMode)
+      , cid_modifiers :: [LHsModifier pass] -- Modifiers
+      , cid_poly_ty :: LHsSigType pass      -- Context => Class Instance-type
+                                            -- Using a polytype means that the renamer conveniently
+                                            -- figures out the quantified type variables for us.
+      , cid_decls   :: [LHsDecl pass]       -- ^ Class instance declarations.
+                                            -- only SigD, ValD, InstD _ TyFamInstD or InstD _ DataFamInstD
+      , cid_overlap_mode  :: Maybe (XRec pass (OverlapMode pass))
       }
   | XClsInstDecl !(XXClsInstDecl pass)
 
@@ -1325,7 +1305,7 @@ data DerivDecl pass = DerivDecl
           -- See Note [Inferring the instance context] in GHC.Tc.Deriv.Infer.
 
         , deriv_strategy     :: Maybe (LDerivStrategy pass)
-        , deriv_overlap_mode :: Maybe (XRec pass OverlapMode)
+        , deriv_overlap_mode :: Maybe (XRec pass (OverlapMode pass))
         }
   | XDerivDecl !(XXDerivDecl pass)
 
@@ -1371,89 +1351,10 @@ type LDefaultDecl pass = XRec pass (DefaultDecl pass)
 data DefaultDecl pass
   = DefaultDecl
       { defd_ext      :: XCDefaultDecl pass
+      , defd_modifiers :: [LHsModifier pass]
       , defd_class    :: Maybe (LIdP pass)  -- Nothing in absence of NamedDefaults
       , defd_defaults :: [LHsType pass] }
   | XDefaultDecl !(XXDefaultDecl pass)
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Foreign function interface declaration}
-*                                                                      *
-************************************************************************
--}
-
--- foreign declarations are distinguished as to whether they define or use a
--- Haskell name
---
---  * the Boolean value indicates whether the pre-standard deprecated syntax
---   has been used
-
--- | Located Foreign Declaration
-type LForeignDecl pass = XRec pass (ForeignDecl pass)
-
--- | Foreign Declaration
-data ForeignDecl pass
-  = ForeignImport
-      { fd_i_ext  :: XForeignImport pass   -- Post typechecker, rep_ty ~ sig_ty
-      , fd_name   :: LIdP pass             -- defines this name
-      , fd_sig_ty :: LHsSigType pass       -- sig_ty
-      , fd_fi     :: ForeignImport pass }
-
-  | ForeignExport
-      { fd_e_ext  :: XForeignExport pass   -- Post typechecker, rep_ty ~ sig_ty
-      , fd_name   :: LIdP pass             -- uses this name
-      , fd_sig_ty :: LHsSigType pass       -- sig_ty
-      , fd_fe     :: ForeignExport pass }
-  | XForeignDecl !(XXForeignDecl pass)
-
-{-
-    In both ForeignImport and ForeignExport:
-        sig_ty is the type given in the Haskell code
-        rep_ty is the representation for this type, i.e. with newtypes
-               coerced away and type functions evaluated.
-    Thus if the declaration is valid, then rep_ty will only use types
-    such as Int and IO that we know how to make foreign calls with.
--}
-
--- Specification Of an imported external entity in dependence on the calling
--- convention
---
-data ForeignImport pass = -- import of a C entity
-                          --
-                          --  * the two strings specifying a header file or library
-                          --   may be empty, which indicates the absence of a
-                          --   header or object specification (both are not used
-                          --   in the case of `CWrapper' and when `CFunction'
-                          --   has a dynamic target)
-                          --
-                          --  * the calling convention is irrelevant for code
-                          --   generation in the case of `CLabel', but is needed
-                          --   for pretty printing
-                          --
-                          --  * `Safety' is irrelevant for `CLabel' and `CWrapper'
-                          --
-                          CImport  (XCImport pass)
-                                   (XRec pass CCallConv) -- ccall
-                                   (XRec pass Safety)  -- interruptible, safe or unsafe
-                                   (Maybe Header)       -- name of C header
-                                   CImportSpec          -- details of the C entity
-                        | XForeignImport !(XXForeignImport pass)
-
--- details of an external C entity
---
-data CImportSpec = CLabel    CLabelString     -- import address of a C label
-                 | CFunction CCallTarget      -- static or dynamic function
-                 | CWrapper                   -- wrapper to expose closures
-                                              -- (former f.e.d.)
-  deriving Data
-
--- specification of an externally exported entity in dependence on the calling
--- convention
---
-data ForeignExport pass = CExport  (XCExport pass) (XRec pass CExportSpec) -- contains the calling convention
-                        | XForeignExport !(XXForeignExport pass)
-
 
 {-
 ************************************************************************
@@ -1479,9 +1380,8 @@ data RuleDecl pass
   = HsRule -- Source rule
        { rd_ext  :: XHsRule pass
            -- ^ After renamer, free-vars from the LHS and RHS
-       , rd_name :: XRec pass RuleName
-           -- ^ Note [Pragma source text] in "GHC.Types.SourceText"
-       , rd_act   :: Activation
+       , rd_name :: XRec pass HText
+       , rd_act   :: Activation pass
        , rd_bndrs :: RuleBndrs pass
        , rd_lhs   :: XRec pass (HsExpr pass)
        , rd_rhs   :: XRec pass (HsExpr pass)
@@ -1506,7 +1406,7 @@ data DocDecl pass
   | DocCommentNamed String (LHsDoc pass)
   | DocGroup Int (LHsDoc pass)
 
-deriving instance (Data pass, Data (IdP pass)) => Data (DocDecl pass)
+deriving instance (Data pass, Data (IdP pass), Data (LHsDoc pass)) => Data (DocDecl pass)
 
 docDeclDoc :: DocDecl pass -> LHsDoc pass
 docDeclDoc (DocCommentNext d) = d
@@ -1537,7 +1437,7 @@ data WarnDecls pass = Warnings { wd_ext      :: XWarnings pass
 type LWarnDecl pass = XRec pass (WarnDecl pass)
 
 -- | Warning pragma Declaration
-data WarnDecl pass = Warning (XWarning pass) [LIdP pass] (WarningTxt pass)
+data WarnDecl pass = Warning (XWarning pass) (NamespaceSpecifier pass) [LIdP pass] (WarningTxt pass)
                    | XWarnDecl !(XXWarnDecl pass)
 
 
@@ -1591,3 +1491,85 @@ data RoleAnnotDecl pass
                   (LIdP pass)              -- type constructor
                   [XRec pass (Maybe Role)] -- optional annotations
   | XRoleAnnotDecl !(XXRoleAnnotDecl pass)
+
+{-
+************************************************************************
+*                                                                      *
+\subsection[WarnAnnot]{Warning annotations}
+*                                                                      *
+************************************************************************
+-}
+
+-- | Warning Text
+--
+-- reason/explanation from a WARNING or DEPRECATED pragma
+data WarningTxt pass
+   = DeprecatedTxt
+      (XDeprecatedTxt pass)
+      [XRec pass (WithHsDocIdentifiers (StringLiteral pass) pass)]
+   | WarningTxt
+       (XWarningTxt pass)
+       (Maybe (XRec pass (InWarningCategory pass)))
+           -- ^ Warning category attached to this WARNING pragma, if any;
+           -- see Note [Warning categories]
+       [XRec pass (WithHsDocIdentifiers (StringLiteral pass) pass)]
+   | XWarningTxt !(XXWarningTxt pass)
+  deriving Generic
+
+{-
+Note [Warning categories]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+See GHC Proposal 541 for the design of the warning categories feature:
+https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0541-warning-pragmas-with-categories.rst
+
+A WARNING pragma may be annotated with a category such as "x-partial" written
+after the 'in' keyword, like this:
+
+    {-# WARNING in "x-partial" head "This function is partial..." #-}
+
+This is represented by the 'Maybe (Located WarningCategory)' field in
+'WarningTxt'.  The parser will accept an arbitrary string as the category name,
+then the renamer (in 'rnWarningTxt') will check it contains only valid
+characters, so we can generate a nicer error message than a parse error.
+
+The corresponding warnings can then be controlled with the -Wx-partial,
+-Wno-x-partial, -Werror=x-partial and -Wwarn=x-partial flags.  Such a flag is
+distinguished from an 'unrecognisedWarning' by the flag parser testing
+'validWarningCategory'.  The 'x-' prefix means we can still usually report an
+unrecognised warning where the user has made a mistake.
+
+A DEPRECATED pragma may not have a user-defined category, and is always treated
+as belonging to the special category 'deprecations'.  Similarly, a WARNING
+pragma without a category belongs to the 'deprecations' category.
+Thus the '-Wdeprecations' flag will enable all of the following:
+
+    {-# WARNING in "deprecations" foo "This function is deprecated..." #-}
+    {-# WARNING foo "This function is deprecated..." #-}
+    {-# DEPRECATED foo "This function is deprecated..." #-}
+The '-Wwarnings-deprecations' flag is supported for backwards compatibility
+purposes as being equivalent to '-Wdeprecations'.
+
+The '-Wextended-warnings' warning group collects together all warnings with
+user-defined categories, so they can be enabled or disabled
+collectively. Moreover they are treated as being part of other warning groups
+such as '-Wdefault' (see 'warningGroupIncludesExtendedWarnings').
+
+'DynFlags' and 'DiagOpts' each contain a set of enabled and a set of fatal
+warning categories, just as they do for the finite enumeration of 'WarningFlag's
+built in to GHC.  These are represented as 'WarningCategorySet's to allow for
+the possibility of them being infinite.
+
+-}
+data InWarningCategory pass
+  = InWarningCategory
+    { iwc_st :: (XInWarningCategory pass),
+      iwc_wc :: (XRec pass WarningCategory)
+    }
+  | XInWarningCategory !(XXInWarningCategory pass)
+
+newtype WarningCategory = WarningCategory HText
+  deriving stock (Data)
+  deriving newtype (Eq, Ord, Show, NFData)
+
+mkWarningCategory :: HText -> WarningCategory
+mkWarningCategory = WarningCategory

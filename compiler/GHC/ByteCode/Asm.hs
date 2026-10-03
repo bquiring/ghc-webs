@@ -1,10 +1,10 @@
 {-# LANGUAGE CPP             #-}
-{-# LANGUAGE DeriveFunctor   #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE MagicHash       #-}
 {-# LANGUAGE UnboxedTuples   #-}
 {-# LANGUAGE PatternSynonyms   #-}
 {-# OPTIONS_GHC -optc-DNON_POSIX_SOURCE #-}
+{-# LANGUAGE LambdaCase #-}
 --
 --
 --  (c) The University of Glasgow 2002-2006
@@ -22,8 +22,10 @@ module GHC.ByteCode.Asm (
         assembleBCO
   ) where
 
-import GHC.Prelude hiding ( any )
+import GHC.Prelude hiding ( any, words )
 
+import Data.Maybe
+import qualified GHC.Data.Strict as Strict
 
 import GHC.ByteCode.Instr
 import GHC.ByteCode.InfoTable
@@ -33,14 +35,18 @@ import GHC.Runtime.Heap.Layout ( fromStgWord, StgWord )
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Literal
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique.DSet
 import GHC.Types.SptEntry
 import GHC.Types.Unique.FM
 import GHC.Unit.Types
 
-import GHC.Utils.Outputable
+import GHC.Utils.Outputable ( Outputable(..), text, (<+>), vcat )
 import GHC.Utils.Panic
 
+import GHC.Builtin.WiredIn.Prim ( addrPrimTy )
+import GHC.Core.Type          ( isUnliftedType )
+import GHC.Core.TyCo.Compare  ( eqType )
 import GHC.Core.TyCon
 import GHC.Data.SizedSeq
 import GHC.Data.SmallArray
@@ -67,11 +73,15 @@ import Data.Array.Base  ( unsafeWrite )
 import Foreign hiding (shiftL, shiftR)
 import Data.ByteString (ByteString)
 import Data.Char  (ord)
-import Data.Maybe (fromMaybe)
 import GHC.Float (castFloatToWord32, castDoubleToWord64)
 
 import qualified Data.List as List ( any )
 import GHC.Exts
+import GHC.Core.DataCon
+import GHC.Data.FlatBag
+import GHC.Types.Id
+import Data.List (unfoldr)
+import GHC.Types.RepType (typePrimRepU)
 
 
 -- -----------------------------------------------------------------------------
@@ -84,14 +94,23 @@ import GHC.Exts
 -- defined by this group of BCOs themselves
 bcoFreeNames :: UnlinkedBCO -> UniqDSet Name
 bcoFreeNames bco
-  = bco_refs bco `uniqDSetMinusUniqSet` mkNameSet [unlinkedBCOName bco]
+  = bco_refs bco
   where
-    bco_refs (UnlinkedBCO _ _ _ _ nonptrs ptrs)
+    bco_refs UnlinkedBCO{unlinkedBCOName, unlinkedBCOLits, unlinkedBCOPtrs}
         = unionManyUniqDSets (
-             mkUniqDSet [ n | BCOPtrName n <- elemsFlatBag ptrs ] :
-             mkUniqDSet [ n | BCONPtrItbl n <- elemsFlatBag nonptrs ] :
-             map bco_refs [ bco | BCOPtrBCO bco <- elemsFlatBag ptrs ]
+             mkUniqDSet [ n | BCOPtrName n <- elemsFlatBag unlinkedBCOPtrs ] :
+             mkUniqDSet [ n | BCONPtrItbl n <- elemsFlatBag unlinkedBCOLits ] :
+             map bco_refs [ bco | BCOPtrBCO bco <- elemsFlatBag unlinkedBCOPtrs ]
+          ) `uniqDSetMinusUniqSet` mkNameSet [unlinkedBCOName]
+    bco_refs UnlinkedStaticCon{ unlinkedStaticConName, unlinkedStaticConDataConName
+                              , unlinkedStaticConLits, unlinkedStaticConPtrs }
+        = unionManyUniqDSets (
+             mkUniqDSet [ unlinkedStaticConDataConName ] :
+             mkUniqDSet [ n | BCOPtrName n <- elemsFlatBag unlinkedStaticConPtrs ] :
+             mkUniqDSet [ n | BCONPtrItbl n <- elemsFlatBag unlinkedStaticConLits ] :
+             map bco_refs [ bco | BCOPtrBCO bco <- elemsFlatBag unlinkedStaticConPtrs ]
           )
+          `uniqDSetMinusUniqSet` mkNameSet [ unlinkedStaticConName ]
 
 -- -----------------------------------------------------------------------------
 -- The bytecode assembler
@@ -106,13 +125,14 @@ bcoFreeNames bco
 -- Top level assembler fn.
 assembleBCOs
   :: Profile
-  -> FlatBag (ProtoBCO Name)
+  -> FlatBag ProtoBCO
   -> [TyCon]
   -> [(Name, ByteString)]
   -> Maybe InternalModBreaks
   -> [SptEntry]
+  -> Strict.Maybe ByteCodeHpcInfo
   -> IO CompiledByteCode
-assembleBCOs profile proto_bcos tycons top_strs modbreaks spt_entries = do
+assembleBCOs profile proto_bcos tycons top_strs modbreaks spt_entries use_hpc = do
   -- TODO: the profile should be bundled with the interpreter: the rts ways are
   -- fixed for an interpreter
   let itbls = mkITbls profile tycons
@@ -123,6 +143,7 @@ assembleBCOs profile proto_bcos tycons top_strs modbreaks spt_entries = do
     , bc_strs = top_strs
     , bc_breaks = modbreaks
     , bc_spt_entries = spt_entries
+    , bc_hpc_info = use_hpc
     }
 
 -- Note [Allocating string literals]
@@ -148,9 +169,9 @@ assembleBCOs profile proto_bcos tycons top_strs modbreaks spt_entries = do
 --
 
 data RunAsmReader = RunAsmReader { isn_array :: {-# UNPACK #-} !(Array.IOUArray Int Word16)
-                                  , ptr_array :: {-# UNPACK #-} !(SmallMutableArrayIO BCOPtr)
-                                  , lit_array :: {-# UNPACK #-} !(SmallMutableArrayIO BCONPtr )
-                                  }
+                                 , ptr_array :: {-# UNPACK #-} !(SmallMutableArrayIO BCOPtr)
+                                 , lit_array :: {-# UNPACK #-} !(SmallMutableArrayIO BCONPtr)
+                                 }
 
 data RunAsmResult = RunAsmResult { final_isn_array :: !(Array.UArray Int Word16)
                                  , final_ptr_array :: !(SmallArray BCOPtr)
@@ -195,7 +216,42 @@ assembleRunAsm p i = assembleI @RunAsm p i
 assembleInspectAsm :: Platform -> BCInstr -> InspectAsm ()
 assembleInspectAsm p i = assembleI @InspectAsm p i
 
-assembleBCO :: Platform -> ProtoBCO Name -> IO UnlinkedBCO
+assembleBCO :: Platform -> ProtoBCO -> IO UnlinkedBCO
+assembleBCO platform
+            (ProtoStaticCon { protoStaticConName
+                            , protoStaticCon = dc
+                            , protoStaticConData = args
+                            }) = do
+  let fullword_args = packSubwordArgs platform args
+  let ptrs    = foldr mappendFlatBag emptyFlatBag (mapMaybe idBCOArg fullword_args)
+  let nonptrs = foldr mappendFlatBag emptyFlatBag (mapMaybe litBCOArg fullword_args)
+  pure UnlinkedStaticCon
+    { unlinkedStaticConName = protoStaticConName
+    , unlinkedStaticConDataConName = dataConName dc
+    , unlinkedStaticConLits = nonptrs
+    , unlinkedStaticConPtrs = ptrs
+    , unlinkedStaticConIsUnlifted = isUnliftedType (idType (dataConWrapId dc))
+    }
+  where
+    litBCOArg (Left l) = Just $ case l of
+      OnlyOne np -> unitFlatBag np
+      OnlyTwo np1 np2 -> TupleFlatBag np1 np2
+    litBCOArg (Right var)
+      -- Addr# literals are non-pointers
+      | idType var `eqType` addrPrimTy
+      = Just $ unitFlatBag (BCONPtrAddr (getName var))
+      | otherwise
+      = Nothing
+
+    idBCOArg (Left _) = Nothing
+    idBCOArg (Right var)
+      | idType var `eqType` addrPrimTy
+      = Nothing
+      | Just prim <- isPrimOpId_maybe var
+      = Just $ unitFlatBag (BCOPtrPrimOp prim)
+      | otherwise
+      = Just $ unitFlatBag (BCOPtrName (getName var))
+
 assembleBCO platform
             (ProtoBCO { protoBCOName       = nm
                       , protoBCOInstrs     = instrs
@@ -245,6 +301,69 @@ assembleBCO platform
   -- when (notNull malloced) (addFinalizer ul_bco (mapM_ zonk malloced))
 
   return ul_bco
+
+-- | Pack sub-word literals (which should appear contiguously in the argument
+-- list) into full words, and leave full-word-sized arguments alone.
+packSubwordArgs :: Platform -> [Either Literal Id] -> [Either (OneOrTwo BCONPtr) Id]
+packSubwordArgs platform = map packWord . groupWords
+  where
+    -- Assumes packed sub-words are always ordered from largest to smallest literal
+    packWord :: Either [Literal] Id -> Either (OneOrTwo BCONPtr) Id
+    packWord (Right v)    = Right v -- already word size
+    packWord (Left [lit]) = Left $ literal platform lit -- single >=word_size literal
+    packWord (Left lits)  = Left $ OnlyOne (BCONPtrWord packedWord)
+      where
+        packedWord = go 0 lits
+
+        go :: Int -> [Literal] -> Word
+        go _      []     = 0
+        go offset (l:ls) =
+          (subwordLiteral l `shiftBy` offset) .|. go (offset + litBits l) ls
+
+        shiftBy :: Word -> Int -> Word
+        shiftBy w offset = case platformByteOrder platform of
+          LittleEndian -> w `unsafeShiftL` offset
+          BigEndian    -> w `unsafeShiftR` offset
+
+        subwordLiteral :: Literal -> Word
+        subwordLiteral l = case literal platform l of
+          OnlyOne (BCONPtrWord w) -> w
+          _ -> pprPanic "packSubwordArgs: expected a subword literal to lower to one BCONPtrWord" (ppr l)
+
+        litBits :: Literal -> Int
+        litBits l = litBytes l * 8
+
+    -- Group literals into lists of literals making up a full word, where in
+    -- singleton lists the literal may be larger than a word
+    -- (e.g. Word64 in 32bit platform)
+    groupWords :: [Either Literal Id] -> [Either [Literal] Id]
+    groupWords = unfoldr step
+      where
+        step [] = Nothing
+        step (Right v:xs) = Just (Right v, xs)
+        step (Left l:xs) =
+          let (chunk, rest) = takeWord [] (Left l:xs)
+          in Just (Left chunk, rest)
+
+        -- take subwords from list until a full-word is accumulated
+        takeWord acc rest
+          -- reached a full word in the accumulator; exit!
+          | sum (map litBytes acc) == ws
+          = (reverse acc, rest)
+        takeWord [sing] rest
+          -- a larger than word single lit in the accumulator; exit!
+          | litBytes sing > ws
+          = ([sing], rest)
+        takeWord acc (Left l:ls)
+          -- contiguous lits should be sub-words of right size to form full
+          -- word; else, the exit condition is never reached.
+          = takeWord (l:acc) ls
+        takeWord acc _
+          = pprPanic "packSubwordArgs: Reached Ptr or end of list before forming a full word from contiguous literals."
+                     (text "acc:" <+> ppr acc)
+
+    litBytes = primRepSizeB platform . typePrimRepU . literalType
+    ws = platformWordSizeInBytes platform
 
 -- | Construct a word-array containing an @StgLargeBitmap@.
 mkBitmapArray :: Word -> [StgWord] -> UArray Int Word
@@ -562,9 +681,9 @@ oneTwoLength (OnlyTwo {}) = 2
 
 class Monad m => MonadAssembler m where
   ioptr :: IO BCOPtr -> m Word
-  lit :: OneOrTwo BCONPtr -> m Word
+  lit   :: OneOrTwo BCONPtr -> m Word
   label :: LocalLabel -> m ()
-  emit :: PlatformWordSize -> Word16 -> [Operand] -> m ()
+  emit  :: PlatformWordSize -> Word16 -> [Operand] -> m ()
 
 lit1 :: MonadAssembler m => BCONPtr -> m Word
 lit1 p = lit (OnlyOne p)
@@ -604,20 +723,20 @@ assembleI platform i = case i of
                                                                 tuple_proto
                                  p <- ioptr (liftM BCOPtrBCO ul_bco)
                                  p_tup <- ioptr (liftM BCOPtrBCO ul_tuple_bco)
-                                 info <- word (fromIntegral $
-                                              mkNativeCallInfoSig platform call_info)
+                                 info <- lit $ word $ fromIntegral $
+                                              mkNativeCallInfoSig platform call_info
                                  emit_ bci_PUSH_ALTS_T
                                       [Op p, Op info, Op p_tup]
   PUSH_PAD8                -> emit_ bci_PUSH_PAD8 []
   PUSH_PAD16               -> emit_ bci_PUSH_PAD16 []
   PUSH_PAD32               -> emit_ bci_PUSH_PAD32 []
-  PUSH_UBX8 lit            -> do np <- literal lit
+  PUSH_UBX8 litv           -> do np <- lit $ literal platform litv
                                  emit_ bci_PUSH_UBX8 [Op np]
-  PUSH_UBX16 lit           -> do np <- literal lit
+  PUSH_UBX16 litv          -> do np <- lit $ literal platform litv
                                  emit_ bci_PUSH_UBX16 [Op np]
-  PUSH_UBX32 lit           -> do np <- literal lit
+  PUSH_UBX32 litv          -> do np <- lit $ literal platform litv
                                  emit_ bci_PUSH_UBX32 [Op np]
-  PUSH_UBX lit nws         -> do np <- literal lit
+  PUSH_UBX litv nws        -> do np <- lit $ literal platform litv
                                  emit_ bci_PUSH_UBX [Op np, wOp nws]
   -- see Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode
   PUSH_ADDR nm             -> do np <- lit1 (BCONPtrAddr nm)
@@ -645,53 +764,53 @@ assembleI platform i = case i of
   PACK      dcon sz        -> do itbl_no <- lit1 (BCONPtrItbl (getName dcon))
                                  emit_ bci_PACK [Op itbl_no, wOp sz]
   LABEL     lbl            -> label lbl
-  TESTLT_I  i l            -> do np <- int i
+  TESTLT_I  i l            -> do np <- lit $ int i
                                  emit_ bci_TESTLT_I [Op np, LabelOp l]
-  TESTEQ_I  i l            -> do np <- int i
+  TESTEQ_I  i l            -> do np <- lit $ int i
                                  emit_ bci_TESTEQ_I [Op np, LabelOp l]
-  TESTLT_W  w l            -> do np <- word w
+  TESTLT_W  w l            -> do np <- lit $ word w
                                  emit_ bci_TESTLT_W [Op np, LabelOp l]
-  TESTEQ_W  w l            -> do np <- word w
+  TESTEQ_W  w l            -> do np <- lit $ word w
                                  emit_ bci_TESTEQ_W [Op np, LabelOp l]
-  TESTLT_I64  i l          -> do np <- word64 (fromIntegral i)
+  TESTLT_I64  i l          -> do np <- lit $ word64 platform (fromIntegral i)
                                  emit_ bci_TESTLT_I64 [Op np, LabelOp l]
-  TESTEQ_I64  i l          -> do np <- word64 (fromIntegral i)
+  TESTEQ_I64  i l          -> do np <- lit $ word64 platform (fromIntegral i)
                                  emit_ bci_TESTEQ_I64 [Op np, LabelOp l]
-  TESTLT_I32  i l          -> do np <- word (fromIntegral i)
+  TESTLT_I32  i l          -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTLT_I32 [Op np, LabelOp l]
-  TESTEQ_I32 i l           -> do np <- word (fromIntegral i)
+  TESTEQ_I32 i l           -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTEQ_I32 [Op np, LabelOp l]
-  TESTLT_I16  i l          -> do np <- word (fromIntegral i)
+  TESTLT_I16  i l          -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTLT_I16 [Op np, LabelOp l]
-  TESTEQ_I16 i l           -> do np <- word (fromIntegral i)
+  TESTEQ_I16 i l           -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTEQ_I16 [Op np, LabelOp l]
-  TESTLT_I8  i l           -> do np <- word (fromIntegral i)
+  TESTLT_I8  i l           -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTLT_I8 [Op np, LabelOp l]
-  TESTEQ_I8 i l            -> do np <- word (fromIntegral i)
+  TESTEQ_I8 i l            -> do np <- lit $ word (fromIntegral i)
                                  emit_ bci_TESTEQ_I8 [Op np, LabelOp l]
-  TESTLT_W64  w l          -> do np <- word64 w
+  TESTLT_W64  w l          -> do np <- lit $ word64 platform w
                                  emit_ bci_TESTLT_W64 [Op np, LabelOp l]
-  TESTEQ_W64  w l          -> do np <- word64 w
+  TESTEQ_W64  w l          -> do np <- lit $ word64 platform w
                                  emit_ bci_TESTEQ_W64 [Op np, LabelOp l]
-  TESTLT_W32  w l          -> do np <- word (fromIntegral w)
+  TESTLT_W32  w l          -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTLT_W32 [Op np, LabelOp l]
-  TESTEQ_W32  w l          -> do np <- word (fromIntegral w)
+  TESTEQ_W32  w l          -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTEQ_W32 [Op np, LabelOp l]
-  TESTLT_W16  w l          -> do np <- word (fromIntegral w)
+  TESTLT_W16  w l          -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTLT_W16 [Op np, LabelOp l]
-  TESTEQ_W16  w l          -> do np <- word (fromIntegral w)
+  TESTEQ_W16  w l          -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTEQ_W16 [Op np, LabelOp l]
-  TESTLT_W8  w l           -> do np <- word (fromIntegral w)
+  TESTLT_W8  w l           -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTLT_W8 [Op np, LabelOp l]
-  TESTEQ_W8  w l           -> do np <- word (fromIntegral w)
+  TESTEQ_W8  w l           -> do np <- lit $ word (fromIntegral w)
                                  emit_ bci_TESTEQ_W8 [Op np, LabelOp l]
-  TESTLT_F  f l            -> do np <- float f
+  TESTLT_F  f l            -> do np <- lit $ float platform f
                                  emit_ bci_TESTLT_F [Op np, LabelOp l]
-  TESTEQ_F  f l            -> do np <- float f
+  TESTEQ_F  f l            -> do np <- lit $ float platform f
                                  emit_ bci_TESTEQ_F [Op np, LabelOp l]
-  TESTLT_D  d l            -> do np <- double d
+  TESTLT_D  d l            -> do np <- lit $ double platform d
                                  emit_ bci_TESTLT_D [Op np, LabelOp l]
-  TESTEQ_D  d l            -> do np <- double d
+  TESTEQ_D  d l            -> do np <- lit $ double platform d
                                  emit_ bci_TESTEQ_D [Op np, LabelOp l]
   TESTLT_P  i l            -> emit_ bci_TESTLT_P [SmallOp i, LabelOp l]
   TESTEQ_P  i l            -> emit_ bci_TESTEQ_P [SmallOp i, LabelOp l]
@@ -843,18 +962,24 @@ assembleI platform i = case i of
 
   BRK_FUN ibi@(InternalBreakpointId info_mod infox) -> do
     p1 <- ptr $ BCOPtrBreakArray info_mod
-    let -- cast that checks that round-tripping through Word16 doesn't change the value
-        toW16 x = let r = fromIntegral x :: Word16
-                  in if fromIntegral r == x
+    let -- cast that checks that round-tripping through Word32 doesn't change the value
+        infoW32 = let r = fromIntegral infox :: Word32
+                   in if fromIntegral r == infox
                     then r
-                    else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr x)
+                    else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr infox)
+        ix_hi = fromIntegral (infoW32 `shiftR` 16)
+        ix_lo = fromIntegral (infoW32 .&. 0xffff)
     info_addr        <- lit1 $ BCONPtrFS $ moduleNameFS $ moduleName info_mod
     info_unitid_addr <- lit1 $ BCONPtrFS $ unitIdFS     $ moduleUnitId info_mod
     np               <- lit1 $ BCONPtrCostCentre ibi
     emit_ bci_BRK_FUN [ Op p1, Op info_addr, Op info_unitid_addr
-                      , SmallOp (toW16 infox), Op np ]
+                      , SmallOp ix_hi, SmallOp ix_lo, Op np ]
 
-  BRK_ALTS active -> emit_ bci_BRK_ALTS [SmallOp (if active then 1 else 0)]
+  HPC_TICK lbl ix -> do
+    p <- lit1 (BCONPtrLbl lbl)
+    let ix_hi = fromIntegral (ix `shiftR` 16)
+        ix_lo = fromIntegral (ix .&. 0xffff)
+    emit_ bci_HPC_TICK [Op p, SmallOp ix_hi, SmallOp ix_lo]
 
 #if MIN_VERSION_rts(1,0,3)
   BCO_NAME name            -> do np <- lit1 (BCONPtrStr name)
@@ -865,84 +990,86 @@ assembleI platform i = case i of
 
   where
     unsupported_width = panic "GHC.ByteCode.Asm: Unsupported Width"
-    emit_ = emit word_size
+    emit_ = emit (platformWordSize platform)
 
-    literal :: Literal -> m Word
-    literal (LitLabel fs _)   = litlabel fs
-    literal LitNullAddr       = word 0
-    literal (LitFloat r)      = float (fromRational r)
-    literal (LitDouble r)     = double (fromRational r)
-    literal (LitChar c)       = int (ord c)
-    literal (LitString bs)    = lit1 (BCONPtrStr bs)
-       -- LitString requires a zero-terminator when emitted
-    literal (LitNumber nt i) = case nt of
-      LitNumInt     -> word (fromIntegral i)
-      LitNumWord    -> word (fromIntegral i)
-      LitNumInt8    -> word8 (fromIntegral i)
-      LitNumWord8   -> word8 (fromIntegral i)
-      LitNumInt16   -> word16 (fromIntegral i)
-      LitNumWord16  -> word16 (fromIntegral i)
-      LitNumInt32   -> word32 (fromIntegral i)
-      LitNumWord32  -> word32 (fromIntegral i)
-      LitNumInt64   -> word64 (fromIntegral i)
-      LitNumWord64  -> word64 (fromIntegral i)
-      LitNumBigNat  -> panic "GHC.ByteCode.Asm.literal: LitNumBigNat"
+literal :: Platform -> Literal -> OneOrTwo BCONPtr
+literal platform = \case
+  LitLabel fs _  -> OnlyOne (BCONPtrLbl fs)
+  LitNullAddr    -> word 0
+  LitFloating LitFloat  x -> float platform (litFloatingToHostFloat x)
+  LitFloating LitDouble x -> double platform (litFloatingToHostDouble x)
+  LitChar c      -> int (ord c)
+  LitString bs   -> OnlyOne (BCONPtrStr bs)
+   -- LitString requires a zero-terminator when emitted
+  LitNumber nt i -> case nt of
+    LitNumInt     -> word (fromIntegral i)
+    LitNumWord    -> word (fromIntegral i)
+    LitNumInt8    -> word8  platform (fromIntegral i)
+    LitNumWord8   -> word8  platform (fromIntegral i)
+    LitNumInt16   -> word16 platform (fromIntegral i)
+    LitNumWord16  -> word16 platform (fromIntegral i)
+    LitNumInt32   -> word32 platform (fromIntegral i)
+    LitNumWord32  -> word32 platform (fromIntegral i)
+    LitNumInt64   -> word64 platform (fromIntegral i)
+    LitNumWord64  -> word64 platform (fromIntegral i)
+    LitNumBigNat  -> panic "GHC.ByteCode.Asm.literal: LitNumBigNat"
 
     -- We can lower 'LitRubbish' to an arbitrary constant, but @NULL@ is most
     -- likely to elicit a crash (rather than corrupt memory) in case absence
     -- analysis messed up.
-    literal (LitRubbish {}) = word 0
+  LitRubbish {} -> word 0
 
-    litlabel fs = lit1 (BCONPtrLbl fs)
-    words ws = lit (fmap BCONPtrWord ws)
-    word w = words (OnlyOne w)
-    word2 w1 w2 = words (OnlyTwo w1 w2)
-    word_size  = platformWordSize platform
-    word_size_bits = platformWordSizeInBits platform
+words :: OneOrTwo Word -> OneOrTwo BCONPtr
+words ws = fmap BCONPtrWord ws
 
-    -- Make lists of host-sized words for literals, so that when the
-    -- words are placed in memory at increasing addresses, the
-    -- bit pattern is correct for the host's word size and endianness.
-    --
-    -- Note that we only support host endianness == target endianness for now,
-    -- even with the external interpreter. This would need to be fixed to
-    -- support host endianness /= target endianness
-    int :: Int -> m Word
-    int  i = word (fromIntegral i)
+word :: Word -> OneOrTwo BCONPtr
+word w = words (OnlyOne w)
 
-    float :: Float -> m Word
-    float f = word32 (castFloatToWord32 f)
+word2 :: Word -> Word -> OneOrTwo BCONPtr
+word2 w1 w2 = words (OnlyTwo w1 w2)
 
-    double :: Double -> m Word
-    double d = word64 (castDoubleToWord64 d)
+-- Make lists of host-sized words for literals, so that when the
+-- words are placed in memory at increasing addresses, the
+-- bit pattern is correct for the host's word size and endianness.
+--
+-- Note that we only support host endianness == target endianness for now,
+-- even with the external interpreter. This would need to be fixed to
+-- support host endianness /= target endianness
+int :: Int -> OneOrTwo BCONPtr
+int i = word (fromIntegral i)
 
-    word64 :: Word64 -> m Word
-    word64 ww = case word_size of
-       PW4 ->
-        let !wl = fromIntegral ww
-            !wh = fromIntegral (ww `unsafeShiftR` 32)
-        in case platformByteOrder platform of
-            LittleEndian -> word2 wl wh
-            BigEndian    -> word2 wh wl
-       PW8 -> word (fromIntegral ww)
+float :: Platform -> Float -> OneOrTwo BCONPtr
+float platform f = word32 platform (castFloatToWord32 f)
 
-    word8 :: Word8 -> m Word
-    word8  x = case platformByteOrder platform of
-      LittleEndian -> word (fromIntegral x)
-      BigEndian    -> word (fromIntegral x `unsafeShiftL` (word_size_bits - 8))
+double :: Platform -> Double -> OneOrTwo BCONPtr
+double p d = word64 p (castDoubleToWord64 d)
 
-    word16 :: Word16 -> m Word
-    word16 x = case platformByteOrder platform of
-      LittleEndian -> word (fromIntegral x)
-      BigEndian    -> word (fromIntegral x `unsafeShiftL` (word_size_bits - 16))
+word64 :: Platform -> Word64 -> OneOrTwo BCONPtr
+word64 platform ww = case platformWordSize platform of
+   PW4 ->
+    let !wl = fromIntegral ww
+        !wh = fromIntegral (ww `unsafeShiftR` 32)
+    in case platformByteOrder platform of
+        LittleEndian -> word2 wl wh
+        BigEndian    -> word2 wh wl
+   PW8 -> word (fromIntegral ww)
 
-    word32 :: Word32 -> m Word
-    word32 x = case platformByteOrder platform of
-      LittleEndian -> word (fromIntegral x)
-      BigEndian    -> case word_size of
-        PW4 -> word (fromIntegral x)
-        PW8 -> word (fromIntegral x `unsafeShiftL` 32)
+word8 :: Platform -> Word8 -> OneOrTwo BCONPtr
+word8 platform x = case platformByteOrder platform of
+  LittleEndian -> word (fromIntegral x)
+  BigEndian    -> word (fromIntegral x `unsafeShiftL` (platformWordSizeInBits platform - 8))
 
+word16 :: Platform -> Word16 -> OneOrTwo BCONPtr
+word16 platform x = case platformByteOrder platform of
+  LittleEndian -> word (fromIntegral x)
+  BigEndian    -> word (fromIntegral x `unsafeShiftL` (platformWordSizeInBits platform - 16))
+
+word32 :: Platform -> Word32 -> OneOrTwo BCONPtr
+word32 platform x = case platformByteOrder platform of
+  LittleEndian -> word (fromIntegral x)
+  BigEndian    -> case platformWordSize platform of
+    PW4 -> word (fromIntegral x)
+    PW8 -> word (fromIntegral x `unsafeShiftL` 32)
 
 isLargeW :: Word -> Bool
 isLargeW n = n > 65535
@@ -973,13 +1100,16 @@ return_non_tuple V32 = error "return_non_tuple: vector"
 return_non_tuple V64 = error "return_non_tuple: vector"
 
 {-
-  we can only handle up to a fixed number of words on the stack,
-  because we need a stg_ctoi_tN stack frame for each size N. See
-  Note [unboxed tuple bytecodes and tuple_BCO].
+  The maximum number of words that can be spilled on the stack for
+  a tuple return. This is limited by the encoding of the stack
+  spill size in the call_info word (used by stg_ret_t):
 
-  If needed, you can support larger tuples by adding more in
-  Jumps.cmm, StgMiscClosures.cmm, Interpreter.c and MiscClosures.h and
-  raising this limit.
+    - On 32-bit platforms: 8-bit  (bits 24-31), max 255
+    - On 64-bit platforms: 40-bit (bits 24-63)
+
+  The stg_ctoi_t frame itself has no size limit since it reads the
+  spill count from the TSO's ctoi_tuple_spill_words field. See
+  Note [GHCi unboxed tuples stack spills] in StgMiscClosures.cmm.
 
   Note that the limit is the number of words passed on the stack.
   If the calling convention passes part of the tuple in registers, the
@@ -987,8 +1117,10 @@ return_non_tuple V64 = error "return_non_tuple: vector"
   take multiple words on the stack (for example Double# on a 32 bit
   platform).
  -}
-maxTupleReturnNativeStackSize :: WordOff
-maxTupleReturnNativeStackSize = 62
+maxTupleReturnNativeStackSize :: Platform -> WordOff
+maxTupleReturnNativeStackSize platform = case platformWordSize platform of
+  PW4 -> 255
+  PW8 -> 1099511627775
 
 {-
   Construct the call_info word that stg_ctoi_t, stg_ret_t and stg_primcall
@@ -997,9 +1129,10 @@ maxTupleReturnNativeStackSize = 62
 
   See Note [GHCi and native call registers] for more information.
  -}
-mkNativeCallInfoSig :: Platform -> NativeCallInfo -> Word32
+mkNativeCallInfoSig :: Platform -> NativeCallInfo -> Word64
 mkNativeCallInfoSig platform NativeCallInfo{..}
-  | nativeCallType == NativeTupleReturn && nativeCallStackSpillSize > maxTupleReturnNativeStackSize
+  | nativeCallType == NativeTupleReturn
+  && nativeCallStackSpillSize > maxTupleReturnNativeStackSize platform
   = pprPanic "mkNativeCallInfoSig: tuple too big for the bytecode compiler"
              (ppr nativeCallStackSpillSize <+> text "stack words." <+>
               text "Use -fobject-code to get around this limit"
@@ -1008,8 +1141,9 @@ mkNativeCallInfoSig platform NativeCallInfo{..}
   = -- 24 bits for register bitmap
     assertPpr (length argRegs <= 24) (text "too many registers for bitmap:" <+> ppr (length argRegs))
 
-    -- 8 bits for continuation offset (only for NativeTupleReturn)
-    assertPpr (cont_offset < 255) (text "continuation offset too large:" <+> ppr cont_offset)
+    -- continuation offset must fit in available bits above the bitmap
+    assertPpr (cont_offset <= fromIntegral (maxTupleReturnNativeStackSize platform))
+              (text "continuation offset too large:" <+> ppr cont_offset)
 
     -- all regs accounted for
     assertPpr (all (`elem` (map fst argRegs)) (regSetToList nativeCallRegs))
@@ -1023,12 +1157,12 @@ mkNativeCallInfoSig platform NativeCallInfo{..}
 
     foldl' reg_bit 0 argRegs .|. (cont_offset `shiftL` 24)
   where
-    cont_offset :: Word32
+    cont_offset :: Word64
     cont_offset
       | nativeCallType == NativeTupleReturn = fromIntegral nativeCallStackSpillSize
       | otherwise                           = 0 -- there is no continuation for primcalls
 
-    reg_bit :: Word32 -> (GlobalReg, Int) -> Word32
+    reg_bit :: Word64 -> (GlobalReg, Int) -> Word64
     reg_bit x (r, n)
       | r `elemRegSet` nativeCallRegs = x .|. 1 `shiftL` n
       | otherwise                     = x

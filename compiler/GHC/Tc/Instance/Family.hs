@@ -1,11 +1,11 @@
-{-# LANGUAGE GADTs, ViewPatterns, LambdaCase #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | The @FamInst@ type: family instance heads
 module GHC.Tc.Instance.Family (
         FamInstEnvs, tcGetFamInstEnvs,
         checkFamInstConsistency, tcExtendLocalFamInstEnv,
         tcLookupDataFamInst, tcLookupDataFamInst_maybe,
-        tcInstNewTyCon_maybe, tcTopNormaliseNewTypeTF_maybe,
+        tcUnwrapNewtype_maybe,
 
         -- * Injectivity
         reportInjectivityErrors, reportConflictingInjectivityErrs
@@ -27,6 +27,7 @@ import GHC.Core.TyCo.FVs
 import GHC.Iface.Load
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.Types.CtLoc (CtExplanations, stuckDataFamApp, outOfScopeNT)
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
@@ -44,9 +45,7 @@ import GHC.Types.Var.Set
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.FV
 
-import GHC.Data.Bag( Bag, unionBags, unitBag )
 import GHC.Data.Maybe
 
 import Control.Monad
@@ -57,6 +56,7 @@ import Data.Function ( on )
 import qualified GHC.LanguageExtensions  as LangExt
 import Data.List (sortOn)
 import qualified GHC.Unit.Home.Graph as HUG
+
 
 {- Note [The type family instance consistency story]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -286,8 +286,8 @@ why we still do redundant checks.
 -- We don't need to check the current module, this is done in
 -- tcExtendLocalFamInstEnv.
 -- See Note [The type family instance consistency story].
-checkFamInstConsistency :: ModuleEnv FamInstEnv -> [Module] -> TcM ()
-checkFamInstConsistency hpt_fam_insts directlyImpMods
+checkFamInstConsistency :: [Module] -> TcM ()
+checkFamInstConsistency directlyImpMods
   = do { (eps, hug) <- getEpsAndHug
        ; traceTc "checkFamInstConsistency" (ppr directlyImpMods)
        ; let { -- Fetch the iface of a given module.  Must succeed as
@@ -317,6 +317,7 @@ checkFamInstConsistency hpt_fam_insts directlyImpMods
              -- See Note [Order of type family consistency checks]
              }
 
+       ; hpt_fam_insts <- liftIO $ HUG.allFamInstances hug
        ; debug_consistent_set <- mapM (\x -> (\y -> (x, length y)) <$> modConsistent x) directlyImpMods
        ; traceTc "init_consistent_set" (ppr debug_consistent_set)
        ; let init_consistent_set = map fst (reverse (sortOn snd debug_consistent_set))
@@ -419,15 +420,6 @@ getFamInsts hpt_fam_insts mod
 
 -}
 
--- | If @co :: T ts ~ rep_ty@ then:
---
--- > instNewTyCon_maybe T ts = Just (rep_ty, co)
---
--- Checks for a newtype, and for being saturated
--- Just like Coercion.instNewTyCon_maybe, but returns a TcCoercion
-tcInstNewTyCon_maybe :: TyCon -> [TcType] -> Maybe (TcType, TcCoercion)
-tcInstNewTyCon_maybe = instNewTyCon_maybe
-
 -- | Like 'tcLookupDataFamInst_maybe', but returns the arguments back if
 -- there is no data family to unwrap.
 -- Returns a Representational coercion
@@ -454,64 +446,77 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
   , let rep_tc = dataFamInstRepTyCon rep_fam
         co     = mkUnbranchedAxInstCo Representational ax rep_args
                                       (mkCoVarCos cvs)
-  = assert (null rep_cos) $ -- See Note [Constrained family instances] in ??? (renamed?)
+  = assert (null rep_cos) $ -- See Note [Constrained family instances] in GHC.Core.FamInstEnv
     Just (rep_tc, rep_args, co)
 
   | otherwise
   = Nothing
 
--- | 'tcTopNormaliseNewTypeTF_maybe' gets rid of top-level newtypes,
--- potentially looking through newtype /instances/ and type synonyms.
+-- | 'tcUnwrapNewtype_maybe' gets rid of /one layer/ of top-level newtypes
 --
 -- It is only used by the type inference engine (specifically, when
 -- solving representational equality), and hence it is careful to unwrap
 -- only if the relevant data constructor is in scope.  That's why
--- it gets a GlobalRdrEnv argument.
+-- it gets a 'GlobalRdrEnv' argument.
 --
--- It is careful not to unwrap data/newtype instances nor synonyms
--- if it can't continue unwrapping.  Such care is necessary for proper
--- error messages.
+-- It is capable of unwrapping a newtype /instance/.  E.g
+--    data D a
+--    newtype instance D Int = MkD Bool
+-- Then `tcUnwrapNewtype_maybe (D Int)` will unwrap to give the `Bool` inside.
+-- However, it is careful not to unwrap data/newtype instances if it can't
+-- unwrap the newtype inside it; that might in the example if `MkD` was
+-- not in scope.  Such care is necessary for proper error messages.
 --
 -- It does not look through type families.
--- It does not normalise arguments to a tycon.
+-- It does not normalise arguments to the tycon.
 --
--- If the result is Just ((gres, co), rep_ty), then
---    co : ty ~R rep_ty
---    gres are the GREs for the data constructors that
---                          had to be in scope
-tcTopNormaliseNewTypeTF_maybe :: FamInstEnvs
-                              -> GlobalRdrEnv
-                              -> Type
-                              -> Maybe ((Bag GlobalRdrElt, TcCoercion), Type)
-tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
--- cf. FamInstEnv.topNormaliseType_maybe and Coercion.topNormaliseNewType_maybe
-  = topNormaliseTypeX stepper plus ty
+-- If the result is Right (gre, co, rep_ty), then:
+--
+--    - co : ty ~R rep_ty
+--    - gre is the GRE for the data constructor that had to be in scope
+--
+-- If the result is Left explns, then we failed to unwrap, and @explns@ stores
+-- any information we would like to report to the user about why we failed to
+-- unwrap (e.g. failed to unwrap because the newtype constructor was out of scope).
+-- See Note [CtExplanations] in GHC.Tc.Types.CtLoc.
+-- This might be empty (e.g. if the type is not a newtype at all).
+tcUnwrapNewtype_maybe :: FamInstEnvs
+                      -> GlobalRdrEnv
+                      -> Type
+                      -> Either CtExplanations (GlobalRdrElt, TcCoercion, Type)
+tcUnwrapNewtype_maybe faminsts rdr_env ty
+  | Just (tc,tys) <- tcSplitTyConApp_maybe ty
+  = firstRight [ try_nt_unwrap tc tys, try_fam_unwrap tc tys ]
+  | otherwise
+  = Left mempty
   where
-    plus :: (Bag GlobalRdrElt, TcCoercion) -> (Bag GlobalRdrElt, TcCoercion)
-         -> (Bag GlobalRdrElt, TcCoercion)
-    plus (gres1, co1) (gres2, co2) = ( gres1 `unionBags` gres2
-                                     , co1 `mkTransCo` co2 )
-
-    stepper :: NormaliseStepper (Bag GlobalRdrElt, TcCoercion)
-    stepper = unwrap_newtype `composeSteppers` unwrap_newtype_instance
-
-    -- For newtype instances we take a double step or nothing, so that
+    -- For newtype /instances/ we take a double step or nothing, so that
     -- we don't return the representation type of the newtype instance,
     -- which would lead to terrible error messages
-    unwrap_newtype_instance rec_nts tc tys
-      | Just (tc', tys', co) <- tcLookupDataFamInst_maybe faminsts tc tys
-      = fmap (mkTransCo co) <$> unwrap_newtype rec_nts tc' tys'
-      | otherwise = NS_Done
-
-    unwrap_newtype rec_nts tc tys
-      | Just con <- newTyConDataCon_maybe tc
-      , Just gre <- lookupGRE_Name rdr_env (dataConName con)
-           -- This is where we check that the
-           -- data constructor is in scope
-      = (,) (unitBag gre) <$> unwrapNewTypeStepper rec_nts tc tys
-
+    try_fam_unwrap tc tys
+      | Just (tc', tys', fam_co) <- tcLookupDataFamInst_maybe faminsts tc tys
+      = case try_nt_unwrap tc' tys' of
+          Right (gre, nt_co, ty') ->
+            Right (gre, mkTransCo fam_co nt_co, ty')
+          Left expln -> Left expln
       | otherwise
-      = NS_Done
+      = Left $ if isDataFamilyTyCon tc
+               then stuckDataFamApp tc tys
+               else mempty
+
+    try_nt_unwrap tc tys
+      | Just con <- newTyConDataCon_maybe tc
+      , Just (ty', co) <- instNewTyCon_maybe tc tys
+
+      -- Now check whether the data constructor is in scope.
+      -- If not, store it in the 'CtExplanations' field for error messages.
+      = case lookupGRE_Name rdr_env (dataConName con) of
+          Nothing ->
+            Left $ outOfScopeNT con
+          Just gre ->
+            Right (gre, co, ty')
+      | otherwise
+      = Left mempty
 
 {-
 ************************************************************************
@@ -866,18 +871,18 @@ unusedInjTvsInRHS dflags tycon@(tyConInjectivityInfo -> Injective inj_list) lhs 
       inj_lhs = filterByList inj_list lhs
       lhs_vars = tyCoVarsOfTypes inj_lhs
 
-      rhs_inj_vars = fvVarSet $ injectiveVarsOfType undec_inst rhs
+      rhs_inj_vars = injectiveVarsOfType undec_inst rhs
 
       bad_vars = lhs_vars `minusVarSet` rhs_inj_vars
 
       any_bad = not $ isEmptyVarSet bad_vars
 
-      invis_vars = fvVarSet $ invisibleVarsOfTypes [mkTyConApp tycon lhs, rhs]
+      invis_vars = invisibleVarsOfTypes [mkTyConApp tycon lhs, rhs]
 
       any_invisible = any_bad && (bad_vars `intersectsVarSet` invis_vars)
       suggest_undec = any_bad &&
                       not undec_inst &&
-                      (lhs_vars `subVarSet` fvVarSet (injectiveVarsOfType True rhs))
+                      (lhs_vars `subVarSet` injectiveVarsOfType True rhs)
 
 -- When the type family is not injective in any arguments
 unusedInjTvsInRHS _ _ _ _ = (emptyVarSet, NoHasKinds, NoSuggestUndecidableInstaces)

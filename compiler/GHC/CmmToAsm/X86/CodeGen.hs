@@ -1,9 +1,6 @@
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ParallelListComp #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NondecreasingIndentation #-}
 
 -----------------------------------------------------------------------------
@@ -57,7 +54,9 @@ import GHC.CmmToAsm.CFG
 import GHC.CmmToAsm.Format
 import GHC.CmmToAsm.Config
 import GHC.Platform.Reg
+import GHC.CmmToAsm.Reg.Target (targetClassOfReg)
 import GHC.Platform
+import GHC.Platform.Reg.Class.Unified (RegClass(..))
 
 -- Our intermediate code:
 import GHC.Types.Basic
@@ -76,6 +75,7 @@ import GHC.Types.SrcLoc  ( srcSpanFile, srcSpanStartLine, srcSpanStartCol )
 -- The rest:
 import GHC.Data.Maybe ( expectJust )
 import GHC.Types.ForeignCall ( CCallConv(..) )
+import GHC.Types.Literal.Floating
 import GHC.Data.OrdList
 import GHC.Utils.Outputable
 import GHC.Utils.Constants (debugIsOn)
@@ -104,30 +104,38 @@ is32BitPlatform = do
     platform <- getPlatform
     return $ target32Bit platform
 
+-- These flags may be implied by other flags like -mfma or -mavx512f.
+-- See Note [Implications between X86 CPU feature flags] for details.
 ssse3Enabled :: NatM Bool
 ssse3Enabled = do
   config <- getConfig
-  return (ncgSseVersion config >= Just SSSE3)
+  return (ncgSseAvxVersion config >= Just SSSE3)
 
 sse4_1Enabled :: NatM Bool
 sse4_1Enabled = do
   config <- getConfig
-  return (ncgSseVersion config >= Just SSE4)
+  return (ncgSseAvxVersion config >= Just SSE4)
 
 sse4_2Enabled :: NatM Bool
 sse4_2Enabled = do
   config <- getConfig
-  return (ncgSseVersion config >= Just SSE42)
+  return (ncgSseAvxVersion config >= Just SSE42)
 
 avxEnabled :: NatM Bool
 avxEnabled = do
   config <- getConfig
-  return (ncgAvxEnabled config)
+  return (ncgSseAvxVersion config >= Just AVX1)
 
 avx2Enabled :: NatM Bool
 avx2Enabled = do
   config <- getConfig
-  return (ncgAvx2Enabled config)
+  return (ncgSseAvxVersion config >= Just AVX2)
+
+avx512vlEnabled :: NatM Bool
+avx512vlEnabled = ncgAvx512vlEnabled <$> getConfig
+
+avx512dqEnabled :: NatM Bool
+avx512dqEnabled = ncgAvx512dqEnabled <$> getConfig
 
 cmmTopCodeGen
         :: RawCmmDecl
@@ -374,7 +382,7 @@ stmtToInstrs bid stmt = do
       --We try to arrange blocks such that the likely branch is the fallthrough
       --in GHC.Cmm.ContFlowOpt. So we can assume the condition is likely false here.
       CmmCondBranch arg true false _ -> genCondBranch bid true false arg
-      CmmSwitch arg ids -> genSwitch arg ids
+      CmmSwitch arg ids -> genSwitch arg ids bid
       CmmCall { cml_target = arg
               , cml_args_regs = gregs } -> genJump arg (jumpRegs platform gregs)
       _ ->
@@ -485,13 +493,6 @@ See also: the documentation for GCC's `-mcmodel=small` flag.
 is32BitInteger :: Integer -> Bool
 is32BitInteger i = i64 <= 0x7fffffff && i64 >= -0x80000000
   where i64 = fromIntegral i :: Int64
-
-
--- | Convert a BlockId to some CmmStatic data
-jumpTableEntry :: NCGConfig -> Maybe BlockId -> CmmStatic
-jumpTableEntry config Nothing = CmmStaticLit (CmmInt 0 (ncgWordWidth config))
-jumpTableEntry _ (Just blockid) = CmmStaticLit (CmmLabel blockLabel)
-    where blockLabel = blockLbl blockid
 
 
 -- -----------------------------------------------------------------------------
@@ -975,8 +976,11 @@ getRegister' _ _ (CmmMachOp mop []) =
   pprPanic "getRegister(x86): nullary MachOp" (text $ show mop)
 
 getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
-    avx    <- avxEnabled
-    avx2   <- avx2Enabled
+    sse42   <- sse4_2Enabled
+    ssse3    <- ssse3Enabled
+    avx     <- avxEnabled
+    avx2    <- avx2Enabled
+    avx512vl <- avx512vlEnabled
     case mop of
       MO_F_Neg w  -> sse2NegCode w x
 
@@ -1069,6 +1073,23 @@ getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
       MO_VS_Neg l w -> getRegister' platform is32Bit (CmmMachOp (MO_V_Sub l w) [zero_vec, x])
         where zero_vec = CmmLit $ CmmVec $ replicate l $ CmmInt 0 w
 
+      MO_VF_Abs l w ->     vector_float_abs      l w x
+
+      MO_VS_Abs l w
+        -- PABS[B|W|D] require SSSE3
+        | w `elem` [W8, W16, W32] && ssse3 -> vector_int_abs_ssse3 l w x
+        | w `elem` [W8, W16, W32] -> vector_int_abs_sse2 l w x
+      MO_VS_Abs l w@W64
+        -- VPABSQ for 128-bit vectors requires AVX-512VL
+        | avx512vl  -> vector_int64_abs_avx512 l w x
+        | sse42     -> vector_int64_abs_sse42 l w x
+        | otherwise -> vector_int64_abs_sse2 l w x
+      MO_VS_Abs {} -> pprPanic "Unsupported integer vector operation for: " (pdoc platform x)
+
+      MO_VF_Sqrt l w
+        | avx -> vector_float_sqrt_avx l w x
+        | otherwise -> vector_float_sqrt l w x
+
       MO_VF_Broadcast l w
         | avx
         -> vector_float_broadcast_avx l w x
@@ -1135,6 +1156,13 @@ getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
       MO_VF_Min {}  -> incorrectOperands
       MO_VF_Max {}  -> incorrectOperands
 
+      MO_V_And {}         -> incorrectOperands
+      MO_V_Or {}          -> incorrectOperands
+      MO_V_Xor {}         -> incorrectOperands
+      MO_VF_And {}         -> incorrectOperands
+      MO_VF_Or {}          -> incorrectOperands
+      MO_VF_Xor {}         -> incorrectOperands
+
       MO_VF_Extract {}    -> incorrectOperands
       MO_VF_Add {}        -> incorrectOperands
       MO_VF_Sub {}        -> incorrectOperands
@@ -1192,10 +1220,11 @@ getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
         vector_float_negate_avx l w expr = do
           let fmt :: Format
               mask :: CmmLit
-              (fmt, mask) = case w of
-                       W32 -> (VecFormat l FmtFloat , CmmInt (bit 31) w) -- TODO: these should be negative 0 floating point literals,
-                       W64 -> (VecFormat l FmtDouble, CmmInt (bit 63) w) -- but we don't currently have those in Cmm.
-                       _ -> panic "AVX floating-point negation: elements must be FF32 or FF64"
+              (fmt, mask) =
+                case w of
+                  W32 -> (VecFormat l FmtFloat , CmmFloat ( floatToLitFloating (-0)) LitFloat)
+                  W64 -> (VecFormat l FmtDouble, CmmFloat (doubleToLitFloating (-0)) LitDouble)
+                  _ -> panic "AVX floating-point negation: elements must be FF32 or FF64"
           (maskReg, maskCode) <- getSomeReg (CmmLit $ CmmVec $ replicate l mask)
           (reg, exp) <- getSomeReg expr
           let code dst = maskCode `appOL`
@@ -1208,16 +1237,124 @@ getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
         vector_float_negate_sse l w expr = do
           let fmt :: Format
               mask :: CmmLit
-              (fmt, mask) = case w of
-                       W32 -> (VecFormat l FmtFloat , CmmInt (bit 31) w) -- Same comment as for vector_float_negate_avx,
-                       W64 -> (VecFormat l FmtDouble, CmmInt (bit 63) w) -- these should be -0.0 CmmFloat values.
-                       _ -> panic "SSE floating-point negation: elements must be FF32 or FF64"
+              (fmt, mask) =
+                case w of
+                  W32 -> (VecFormat l FmtFloat , CmmFloat ( floatToLitFloating (-0)) LitFloat)
+                  W64 -> (VecFormat l FmtDouble, CmmFloat (doubleToLitFloating (-0)) LitDouble)
+                  _ -> panic "SSE floating-point negation: elements must be FF32 or FF64"
           (maskReg, maskCode) <- getSomeReg (CmmLit $ CmmVec $ replicate l mask)
           (reg, exp) <- getSomeReg expr
           let code dst = maskCode `appOL`
                          exp `snocOL`
                          (MOVU fmt (OpReg reg) (OpReg dst)) `snocOL`
                          (XOR  fmt (OpReg maskReg) (OpReg dst))
+          return (Any fmt code)
+
+        vector_float_abs :: Length -> Width -> CmmExpr -> NatM Register
+        vector_float_abs len w expr = do
+          exp <- getAnyReg expr
+
+          let fmt = VecFormat len (floatScalarFormat w)
+              mask = case w of
+                W32 -> CmmInt (complement $ bit 31) w
+                W64 -> CmmInt (complement $ bit 63) w
+                _ -> panic "SSE floating-point absolute value: elements must be FF32 or FF64"
+
+          Amode mem memCode <- memConstant (mkAlignment 16) (CmmVec $ replicate len mask)
+
+          let code dst =
+                  exp dst `appOL`
+                  memCode `snocOL`
+                  AND fmt (OpAddr mem) (OpReg dst)
+
+          return (Any fmt code)
+
+        vector_int_abs_ssse3 :: Length -> Width -> CmmExpr -> NatM Register
+        vector_int_abs_ssse3 len w expr = do
+          (reg, exp) <- getSomeReg expr
+          let fmt = VecFormat len (intScalarFormat w)
+              code dst = exp `snocOL` PABS fmt (OpReg reg) dst
+
+          return (Any fmt code)
+
+        vector_int_abs_sse2 :: Length -> Width -> CmmExpr -> NatM Register
+        vector_int_abs_sse2 len w expr = do
+          -- SSE2 fallback: Compute a mask of 0s/1s using PCMPGT. Then
+          -- abs x = (x `xor` mask) - mask, where mask is -1 is x is negative and 0
+          -- otherwise.
+          (reg, exp) <- getSomeReg expr
+          (maskReg, maskCode) <- getSomeReg . CmmLit . CmmVec $ replicate 2 (CmmInt 0 W64)
+          let fmt = VecFormat len (intScalarFormat w)
+              code dst = exp `appOL`
+                         maskCode `snocOL`
+                         MOVDQU fmt (OpReg reg) (OpReg dst) `snocOL` -- dst <- reg
+                         PCMPGT fmt (OpReg reg) maskReg `snocOL`     -- maskReg <- if reg > - then 0 else -1
+                         PXOR fmt (OpReg maskReg) dst `snocOL`       -- dst <- if maskReg then ~dst else dst
+                         PSUB fmt (OpReg maskReg) dst                -- dist <- dst - maskReg
+
+          return (Any fmt code)
+
+        vector_int64_abs_avx512 len w expr = do
+          (reg, exp) <- getSomeReg expr
+          let fmt = VecFormat len (intScalarFormat w)
+              code dst = exp `snocOL` VPABS fmt (OpReg reg) dst
+
+          return (Any fmt code)
+
+        vector_int64_abs_sse42 len w expr = do
+          -- SSE4.2 fallback: Compute a mask of 0s/1s using PCMPGT. Then
+          -- abs x = (x `xor` mask) - mask, where mask is -1 is x is negative and 0
+          -- otherwise.
+          let fmt = VecFormat len (intScalarFormat w)
+          (reg, exp) <- getSomeReg expr
+          (maskReg, maskCode) <- getSomeReg . CmmLit . CmmVec $ replicate 2 (CmmInt 0 W64)
+
+          let code dst =
+                exp `appOL`
+                maskCode `snocOL`
+                MOVDQU fmt (OpReg reg) (OpReg dst) `snocOL` -- dst <- reg
+                PCMPGT fmt (OpReg reg) maskReg `snocOL`     -- maskReg <- if reg > 0 then 0 else -1
+                PXOR fmt (OpReg maskReg) dst `snocOL`       -- dst <- if maskReg then ~dst else dst
+                PSUB fmt (OpReg maskReg) dst                -- dst <- dst - maskReg
+
+          return (Any fmt code)
+
+        vector_int64_abs_sse2 len w expr = do
+          -- SSE2 fallback: Compute a mask by broadcasting the sign bit to all the lower
+          -- bits. The rest is the same as the SSE4.2 implementation.
+          let fmt = VecFormat len (intScalarFormat w)
+              i32Fmt = VecFormat len FmtInt32
+          (reg, exp) <- getSomeReg expr
+          (maskReg, maskCode) <- getSomeReg . CmmLit . CmmVec $ replicate 2 (CmmInt 0 W64)
+
+          let code dst =
+                exp `appOL`
+                maskCode `snocOL`
+                MOVDQU fmt (OpReg reg) (OpReg dst) `snocOL` -- dst <- reg
+                -- Copy the high order double words to the low order double words
+                PSHUFD i32Fmt (ImmInt 0b11_11_01_01) (OpReg reg) maskReg `snocOL`
+                PSRA i32Fmt (OpImm $ ImmInt 31) maskReg `snocOL` -- maskReg <- if sign bit = 1 then -1 else 0
+                PXOR fmt (OpReg maskReg) dst `snocOL`            -- dst <- if maskReg then ~dst else dst
+                PSUB fmt (OpReg maskReg) dst                     -- dst <- dst - maskReg
+
+          return (Any fmt code)
+
+        vector_float_sqrt_avx :: Length -> Width -> CmmExpr -> NatM Register
+        vector_float_sqrt_avx len w expr = do
+          (reg, exp) <- getSomeReg expr
+
+          let fmt = VecFormat len (floatScalarFormat w)
+              code dst = exp `snocOL` VSQRT fmt (OpReg reg) dst
+
+          return (Any fmt code)
+
+        vector_float_sqrt :: Length -> Width -> CmmExpr -> NatM Register
+        vector_float_sqrt len w expr = do
+          (reg, exp) <- getSomeReg expr
+
+          let fmt = VecFormat len (floatScalarFormat w)
+              code dst = exp `snocOL` SQRT fmt (OpReg reg) dst
+
           return (Any fmt code)
 
         -----------------------
@@ -1305,10 +1442,28 @@ getRegister' platform is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
                                     (PUNPCKLQDQ fmt (OpReg dst) dst)
                                     )
 
+-- Use the bit-test instructions btr/bts/btc for clearing, setting and
+-- complementing a single bit: e.g. x .&. complement (1 `shiftL` i) is btr.
+-- See Note [Bit-test instructions].
+getRegister' platform is32Bit (CmmMachOp (MO_And w) [x, y])
+  | bitTestOpWidthOK is32Bit w
+  , Just (opnd, ix) <- clearBitArgs_maybe platform w x y
+  = genBitTestCode (intFormat w) BTR opnd ix
+getRegister' platform is32Bit (CmmMachOp (MO_Or w) [x, y])
+  | bitTestOpWidthOK is32Bit w
+  , Just (opnd, ix) <- setBitArgs_maybe platform w x y
+  = genBitTestCode (intFormat w) BTS opnd ix
+getRegister' platform is32Bit (CmmMachOp (MO_Xor w) [x, y])
+  | bitTestOpWidthOK is32Bit w
+  , Just (opnd, ix) <- setBitArgs_maybe platform w x y
+  = genBitTestCode (intFormat w) BTC opnd ix
+
 getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
   sse4_1 <- sse4_1Enabled
   sse4_2 <- sse4_2Enabled
   avx <- avxEnabled
+  avx512vl <- avx512vlEnabled
+  avx512dq <- avx512dqEnabled
   case mop of
       MO_F_Eq _ -> condFltReg is32Bit EQQ x y
       MO_F_Ne _ -> condFltReg is32Bit NE  x y
@@ -1402,6 +1557,20 @@ getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
       MO_VF_Max l w         | avx       -> vector_float_op_avx (VMINMAX Max FloatMinMax) l w x y
                             | otherwise -> vector_float_op_sse (MINMAX Max FloatMinMax) l w x y
 
+      MO_V_And l w          | avx       -> vector_int_op_avx VPAND l w x y
+                            | otherwise -> vector_int_op_sse PAND l w x y
+      MO_V_Or l w           | avx       -> vector_int_op_avx VPOR l w x y
+                            | otherwise -> vector_int_op_sse POR l w x y
+      MO_V_Xor l w          | avx       -> vector_int_op_avx VPXOR l w x y
+                            | otherwise -> vector_int_op_sse PXOR l w x y
+
+      MO_VF_And l w         | avx       -> vector_float_op_avx VAND l w x y
+                            | otherwise -> vector_float_op_sse (\fmt op2 -> AND fmt op2 . OpReg) l w x y
+      MO_VF_Or l w          | avx       -> vector_float_op_avx VOR l w x y
+                            | otherwise -> vector_float_op_sse (\fmt op2 -> OR fmt op2 . OpReg) l w x y
+      MO_VF_Xor l w         | avx       -> vector_float_op_avx VXOR l w x y
+                            | otherwise -> vector_float_op_sse (\fmt op2 -> XOR fmt op2 . OpReg) l w x y
+
       -- SIMD NCG TODO: 256/512-bit integer vector operations
       MO_V_Shuffle 16 W8 is | not is32Bit -> vector_shuffle_int8x16 sse4_1 x y is
       MO_V_Shuffle 8 W16 is -> vector_shuffle_int16x8 sse4_1 x y is
@@ -1413,57 +1582,76 @@ getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
       MO_V_Sub l w | l * widthInBits w == 128 -> vector_int_op_sse PSUB l w x y
                    | otherwise -> needLlvm mop
       MO_V_Mul 16 W8 -> vector_int8x16_mul_sse2 x y
-      MO_V_Mul l@8 w@W16 -> vector_int_op_sse PMULL l w x y -- PMULLW (SSE2)
-      MO_V_Mul l@4 w@W32 | sse4_1 -> vector_int_op_sse PMULL l w x y -- PMULLD (SSE4.1)
+      MO_V_Mul l@8 w@W16 | avx -> vector_int_op_avx VPMULL l w x y -- VPMULLW (AVX)
+                         | otherwise -> vector_int_op_sse PMULL l w x y -- PMULLW (SSE2)
+      MO_V_Mul l@4 w@W32 | avx -> vector_int_op_avx VPMULL l w x y -- VPMULLD (AVX)
+                         | sse4_1 -> vector_int_op_sse PMULL l w x y -- PMULLD (SSE4.1)
                          | otherwise -> vector_int32x4_mul_sse2 x y
-      MO_V_Mul 2 W64 -> vector_int64x2_mul_sse2 x y
+      MO_V_Mul l@2 w@W64 | avx512dq && avx512vl -> vector_int_op_avx VPMULL l w x y -- VPMULLQ (AVX512DQ+VL)
+                         | otherwise -> vector_int64x2_mul_sse2 x y
       MO_V_Mul {} -> needLlvm mop
 
       MO_VU_Min l@16 w@W8
-                    -> vector_int_op_sse (MINMAX Min (IntVecMinMax False)) l w x y -- PMINUB (SSE2)
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax False)) l w x y -- VPMINUB (AVX)
+        | otherwise -> vector_int_op_sse (MINMAX Min (IntVecMinMax False)) l w x y -- PMINUB (SSE2)
       MO_VU_Min l@8 w@W16
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax False)) l w x y -- VPMINUW (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Min (IntVecMinMax False)) l w x y -- PMINUW (SSE4.1)
         | otherwise -> vector_word_minmax_sse Min l w x y
       MO_VU_Min l@4 w@W32
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax False)) l w x y -- VPMINUD (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Min (IntVecMinMax False)) l w x y -- PMINUD (SSE4.1)
         | otherwise -> vector_word_minmax_sse Min l w x y
       MO_VU_Min l@2 w@W64
+        | avx512vl  -> vector_int_op_avx (VMINMAX Min (IntVecMinMax False)) l w x y -- VPMINUQ (AVX512F+VL)
         | sse4_2    -> vector_word_minmax_sse Min l w x y -- PCMPGTQ requires SSE4.2
         -- The SSE2 version is implemented as a C call (MO_W64X2_Min)
       MO_VU_Min {} -> needLlvm mop
       MO_VU_Max l@16 w@W8
-                    -> vector_int_op_sse (MINMAX Max (IntVecMinMax False)) l w x y -- PMAXUB (SSE2)
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax False)) l w x y -- VPMAXUB (AVX)
+        | otherwise -> vector_int_op_sse (MINMAX Max (IntVecMinMax False)) l w x y -- PMAXUB (SSE2)
       MO_VU_Max l@8 w@W16
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax False)) l w x y -- VPMAXUW (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Max (IntVecMinMax False)) l w x y -- PMAXUW (SSE4.1)
         | otherwise -> vector_word_minmax_sse Max l w x y
       MO_VU_Max l@4 w@W32
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax False)) l w x y -- VPMAXUD (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Max (IntVecMinMax False)) l w x y -- PMAXUD (SSE4.1)
         | otherwise -> vector_word_minmax_sse Max l w x y
       MO_VU_Max l@2 w@W64
+        | avx512vl  -> vector_int_op_avx (VMINMAX Max (IntVecMinMax False)) l w x y -- VPMAXUQ (AVX512F+VL)
         | sse4_2    -> vector_word_minmax_sse Max l w x y -- PCMPGTQ requires SSE4.2
         -- The SSE2 version is implemented as a C call (MO_W64X2_Max)
       MO_VU_Max {} -> needLlvm mop
       MO_VS_Min l@16 w@W8
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax True)) l w x y -- VPMINSB (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Min (IntVecMinMax True)) l w x y -- PMINSB (SSE4.1)
         | otherwise -> vector_int_minmax_sse Min l w x y
       MO_VS_Min l@8 w@W16
-                    -> vector_int_op_sse (MINMAX Min (IntVecMinMax True)) l w x y -- PMINSW (SSE2)
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax True)) l w x y -- VPMINSW (AVX)
+        | otherwise -> vector_int_op_sse (MINMAX Min (IntVecMinMax True)) l w x y -- PMINSW (SSE2)
       MO_VS_Min l@4 w@W32
+        | avx       -> vector_int_op_avx (VMINMAX Min (IntVecMinMax True)) l w x y -- VPMINSD (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Min (IntVecMinMax True)) l w x y -- PMINSD (SSE4.1)
         | otherwise -> vector_int_minmax_sse Min l w x y
       MO_VS_Min l@2 w@W64
+        | avx512vl  -> vector_int_op_avx (VMINMAX Min (IntVecMinMax True)) l w x y -- VPMINSQ (AVX512F+VL)
         | sse4_2    -> vector_int_minmax_sse Min l w x y -- PCMPGTQ requires SSE4.2
         -- The SSE2 version is implemented as a C call (MO_I64X2_Min)
       MO_VS_Min {} -> needLlvm mop
       MO_VS_Max l@16 w@W8
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax True)) l w x y -- VPMAXSB (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Max (IntVecMinMax True)) l w x y -- PMAXSB (SSE4.1)
         | otherwise -> vector_int_minmax_sse Max l w x y
       MO_VS_Max l@8 w@W16
-                    -> vector_int_op_sse (MINMAX Max (IntVecMinMax True)) l w x y -- PMAXSW (SSE2)
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax True)) l w x y -- VPMAXSW (AVX)
+        | otherwise -> vector_int_op_sse (MINMAX Max (IntVecMinMax True)) l w x y -- PMAXSW (SSE2)
       MO_VS_Max l@4 w@W32
+        | avx       -> vector_int_op_avx (VMINMAX Max (IntVecMinMax True)) l w x y -- VPMAXSD (AVX)
         | sse4_1    -> vector_int_op_sse (MINMAX Max (IntVecMinMax True)) l w x y -- PMAXSD (SSE4.1)
         | otherwise -> vector_int_minmax_sse Max l w x y
       MO_VS_Max l@2 w@W64
+        | avx512vl  -> vector_int_op_avx (VMINMAX Max (IntVecMinMax True)) l w x y -- VPMAXSQ (AVX512F+VL)
         | sse4_2    -> vector_int_minmax_sse Max l w x y -- PCMPGTQ requires SSE4.2
         -- The SSE2 version is implemented as a C call (MO_I64X2_Max)
       MO_VS_Max {} -> needLlvm mop
@@ -1484,6 +1672,9 @@ getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
       MO_AlignmentCheck {} -> incorrectOperands
       MO_VS_Neg {} -> incorrectOperands
       MO_VF_Neg {} -> incorrectOperands
+      MO_VS_Abs {} -> incorrectOperands
+      MO_VF_Abs {} -> incorrectOperands
+      MO_VF_Sqrt {} -> incorrectOperands
       MO_V_Broadcast {} -> incorrectOperands
       MO_VF_Broadcast {} -> incorrectOperands
 
@@ -1678,6 +1869,21 @@ getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
 
     -----------------------
     -- Vector operations---
+    vector_int_op_avx :: (Format -> Operand -> Reg -> Reg -> Instr)
+                        -> Length
+                        -> Width
+                        -> CmmExpr
+                        -> CmmExpr
+                        -> NatM Register
+    vector_int_op_avx instr l w = vector_op_avx_reg (\fmt -> instr fmt . OpReg) format
+      where format = case w of
+                       W8 -> VecFormat l FmtInt8
+                       W16 -> VecFormat l FmtInt16
+                       W32 -> VecFormat l FmtInt32
+                       W64 -> VecFormat l FmtInt64
+                       _ -> pprPanic "Integer AVX vector operation not supported at this width"
+                              (text "width:" <+> ppr w)
+
     vector_float_op_avx :: (Format -> Operand -> Reg -> Reg -> Instr)
                         -> Length
                         -> Width
@@ -1941,7 +2147,6 @@ getRegister' platform is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
                      (PUNPCKLDQ format (OpReg tmpOdd1) dst)                                  -- dst <- (dst[0],tmpOdd1[0],dst[1],tmpOdd1[1])
       return (Any format code)
 
-    -- TODO: We could use `VPMULLQ` if AVX-512 or AVX10.1 is available.
     vector_int64x2_mul_sse2 :: CmmExpr -> CmmExpr -> NatM Register
     vector_int64x2_mul_sse2 expr1 expr2 = do
       -- implement 64 bit multiplication using 32-bit PMULUDQ multiplication instructions
@@ -3133,10 +3338,6 @@ getRegister' platform is32Bit (CmmLit lit) = do
   -- which means that we assume that loading a literal into a register
   -- will not clobber any other registers.
 
-  -- TODO: this function mishandles floating-point negative zero,
-  -- because -0.0 == 0.0 returns True and because we represent CmmFloat as
-  -- Rational, which can't properly represent negative zero.
-
   if
     -- Zero: use XOR.
     | isZeroLit lit
@@ -3155,7 +3356,7 @@ getRegister' platform is32Bit (CmmLit lit) = do
              | avx
              = if float_or_floatvec
                then unitOL (VXOR fmt (OpReg dst) dst dst)
-               else unitOL (VPXOR fmt dst dst dst)
+               else unitOL (VPXOR fmt (OpReg dst) dst dst)
              | otherwise
              = if float_or_floatvec
                then unitOL (XOR fmt (OpReg dst) (OpReg dst))
@@ -3200,7 +3401,7 @@ getRegister' platform is32Bit (CmmLit lit) = do
       fmt = cmmTypeFormat cmmTy
       float_or_floatvec = isFloatOrFloatVecFormat fmt
       isZeroLit (CmmInt i _) = i == 0
-      isZeroLit (CmmFloat f _) = f == 0 -- TODO: mishandles negative zero
+      isZeroLit (CmmFloat f _) = isPositiveZeroLF f
       isZeroLit (CmmVec fs) = all isZeroLit fs
       isZeroLit _ = False
 
@@ -3553,7 +3754,8 @@ isSuitableFloatingPointLit :: CmmLit -> Bool
 isSuitableFloatingPointLit = isJust . isSuitableFloatingPointLit_maybe
 
 isSuitableFloatingPointLit_maybe :: CmmLit -> Maybe Width
-isSuitableFloatingPointLit_maybe (CmmFloat f w) = w <$ guard (f /= 0.0)
+isSuitableFloatingPointLit_maybe (CmmFloat f fty) =
+  litFloatingTypeWidth fty <$ guard (not (isPositiveZeroLF f))
 isSuitableFloatingPointLit_maybe _ = Nothing
 
 getRegOrMem :: CmmExpr -> NatM (Operand, InstrBlock)
@@ -4669,7 +4871,14 @@ genCCall64 addr conv dest_regs args = do
         -- It's not safe to omit this assignment, even if the number
         -- of SSE2 regs in use is zero.  If %al is larger than 8
         -- on entry to a varargs function, seg faults ensue.
-        nb_sse_regs_used = count (isFloatFormat . regWithFormat_format) arg_regs_used
+        is_sse_reg (RegWithFormat r _) =
+          -- NB: use 'targetClassOfRealReg' to compute whether this is an SSE
+          -- register or not, as we may have decided to e.g. store a 64-bit
+          -- integer in an xmm register.
+          case targetClassOfReg platform r of
+            RcFloatOrVector -> True
+            RcInteger       -> False
+        nb_sse_regs_used = count is_sse_reg arg_regs_used
         assign_eax_sse_regs
           = unitOL (MOV II32 (OpImm (ImmInt nb_sse_regs_used)) (OpReg eax))
           -- Note: we do this on Windows as well. It's not entirely clear why
@@ -5337,11 +5546,52 @@ index (1),
     indexExpr    = UU_Conv(indexOffset); // == 1::I64
 
 See #21186.
+
+Note [Jump tables]
+~~~~~~~~~~~~~~~~~~
+The x86 backend has a virtual JMP_TBL instruction which payload can be used to
+generate both the jump instruction and the jump table contents. `genSwitch` is
+responsible for generating these JMP_TBL instructions.
+
+Depending on `-fPIC` flag and on the architecture, we generate the following
+jump table variants:
+
+  | Variant |  Arch  | Table's contents                       | Reference to the table |
+  |---------|--------|----------------------------------------|------------------------|
+  |     PIC |  Both  | Relative offset: target_lbl - base_lbl | PIC                    |
+  | Non-PIC | 64-bit | Absolute: target_lbl                   | Non-PIC (rip-relative) |
+  | Non-PIC | 32-bit | Absolute: target_lbl                   | Non-PIC (absolute)     |
+
+For the PIC variant, we store relative entries (`target_lbl - base_lbl`) in the
+jump table. Using absolute entries with PIC would require target_lbl symbols to
+be resolved at link time, hence to be global labels (currently they are local
+labels).
+
+We use the block_id of the code containing the jump as `base_lbl`. It ensures
+that target_lbl and base_lbl are close enough to each others, avoiding
+overflows.
+
+Historical note: in the past we used the table label `table_lbl` as base_lbl. It
+allowed the jumping code to only compute one global address (table_lbl) both to
+read the table and to compute the target address. However:
+
+ * the table could be too far from the jump and on Windows which only
+   has 32-bit relative relocations (IMAGE_REL_AMD64_REL64 doesn't exist),
+   `dest_lbl - table_lbl` overflowed (see #24016)
+
+ * Mac OS X/x86-64 linker was unable to handle `.quad L1 - L0`
+   relocations if L0 wasn't preceded by a non-anonymous label in its
+   section (which was the case with table_lbl). Hence we used to put the
+   jump table in the .text section in this case.
+
+
 -}
 
-genSwitch :: CmmExpr -> SwitchTargets -> NatM InstrBlock
-
-genSwitch expr targets = do
+-- | Generate a JMP_TBL instruction
+--
+-- See Note [Jump tables]
+genSwitch :: CmmExpr -> SwitchTargets -> BlockId -> NatM InstrBlock
+genSwitch expr targets bid = do
   config <- getConfig
   let platform = ncgPlatform config
       expr_w = cmmExprWidth platform expr
@@ -5352,79 +5602,76 @@ genSwitch expr targets = do
       indexExpr = CmmMachOp
         (MO_UU_Conv expr_w (platformWordWidth platform))
         [indexExpr0]
-  if ncgPIC config
-  then do
-        (reg,e_code) <- getNonClobberedReg indexExpr
-           -- getNonClobberedReg because it needs to survive across t_code
-        lbl <- getNewLabelNat
-        let is32bit = target32Bit platform
-            os = platformOS platform
-            -- Might want to use .rodata.<function we're in> instead, but as
-            -- long as it's something unique it'll work out since the
-            -- references to the jump table are in the appropriate section.
-            rosection = case os of
-              -- on Mac OS X/x86_64, put the jump table in the text section to
-              -- work around a limitation of the linker.
-              -- ld64 is unable to handle the relocations for
-              --     .quad L1 - L0
-              -- if L0 is not preceded by a non-anonymous label in its section.
-              OSDarwin | not is32bit -> Section Text lbl
-              _ -> Section ReadOnlyData lbl
-        dynRef <- cmmMakeDynamicReference config DataReference lbl
-        (tableReg,t_code) <- getSomeReg $ dynRef
-        let op = OpAddr (AddrBaseIndex (EABaseReg tableReg)
-                                       (EAIndex reg (platformWordSizeInBytes platform)) (ImmInt 0))
 
-        return $ e_code `appOL` t_code `appOL` toOL [
-                                ADD (intFormat (platformWordWidth platform)) op (OpReg tableReg),
-                                JMP_TBL (OpReg tableReg) ids rosection lbl
-                       ]
-  else do
-        (reg,e_code) <- getSomeReg indexExpr
-        lbl <- getNewLabelNat
-        let is32bit = target32Bit platform
-        if is32bit
-          then let op = OpAddr (AddrBaseIndex EABaseNone (EAIndex reg (platformWordSizeInBytes platform)) (ImmCLbl lbl))
-                   jmp_code = JMP_TBL op ids (Section ReadOnlyData lbl) lbl
-               in return $ e_code `appOL` unitOL jmp_code
-          else do
+      (offset, blockIds) = switchTargetsToTable targets
+      ids = map (fmap DestBlockId) blockIds
+
+      is32bit = target32Bit platform
+      fmt = archWordFormat is32bit
+
+  table_lbl <- getNewLabelNat
+  let bid_lbl = blockLbl bid
+  let table_section = Section ReadOnlyData table_lbl
+
+  -- see Note [Jump tables] for a description of the following 3 variants.
+  if
+    | ncgPIC config -> do
+      -- PIC support: store relative offsets in the jump table to allow the code
+      -- to be relocated without updating the table. The table itself and the
+      -- block label used to make the relative labels absolute are read in a PIC
+      -- way (via cmmMakeDynamicReference).
+      (reg,e_code) <- getNonClobberedReg indexExpr -- getNonClobberedReg because it needs to survive across t_code and j_code
+      (tableReg,t_code) <- getNonClobberedReg =<< cmmMakeDynamicReference config DataReference table_lbl
+      (targetReg,j_code) <- getSomeReg =<< cmmMakeDynamicReference config DataReference bid_lbl
+      pure $ e_code `appOL` t_code `appOL` j_code `appOL` toOL
+            [ ADD fmt (OpAddr (AddrBaseIndex (EABaseReg tableReg) (EAIndex reg (platformWordSizeInBytes platform)) (ImmInt 0)))
+                      (OpReg targetReg)
+            , JMP_TBL (OpReg targetReg) ids table_section table_lbl (Just bid_lbl)
+            ]
+
+    | not is32bit -> do
+      -- 64-bit non-PIC code
+      (reg,e_code) <- getSomeReg indexExpr
+      tableReg <- getNewRegNat (intFormat (platformWordWidth platform))
+      targetReg <- getNewRegNat (intFormat (platformWordWidth platform))
+      pure $ e_code `appOL` toOL
             -- See Note [%rip-relative addressing on x86-64].
-            tableReg <- getNewRegNat (intFormat (platformWordWidth platform))
-            targetReg <- getNewRegNat (intFormat (platformWordWidth platform))
-            let op = OpAddr (AddrBaseIndex (EABaseReg tableReg) (EAIndex reg (platformWordSizeInBytes platform)) (ImmInt 0))
-                fmt = archWordFormat is32bit
-                code = e_code `appOL` toOL
-                    [ LEA fmt (OpAddr (AddrBaseIndex EABaseRip EAIndexNone (ImmCLbl lbl))) (OpReg tableReg)
-                    , MOV fmt op (OpReg targetReg)
-                    , JMP_TBL (OpReg targetReg) ids (Section ReadOnlyData lbl) lbl
-                    ]
-            return code
-  where
-    (offset, blockIds) = switchTargetsToTable targets
-    ids = map (fmap DestBlockId) blockIds
+            [ LEA fmt (OpAddr (AddrBaseIndex EABaseRip EAIndexNone (ImmCLbl table_lbl))) (OpReg tableReg)
+            , MOV fmt (OpAddr (AddrBaseIndex (EABaseReg tableReg) (EAIndex reg (platformWordSizeInBytes platform)) (ImmInt 0)))
+                      (OpReg targetReg)
+            , JMP_TBL (OpReg targetReg) ids table_section table_lbl Nothing
+            ]
+
+    | otherwise -> do
+      -- 32-bit non-PIC code is a straightforward jump to &table[entry].
+      (reg,e_code) <- getSomeReg indexExpr
+      pure $ e_code `appOL` unitOL
+            ( JMP_TBL (OpAddr (AddrBaseIndex EABaseNone (EAIndex reg (platformWordSizeInBytes platform)) (ImmCLbl table_lbl)))
+                      ids table_section table_lbl Nothing
+            )
 
 generateJumpTableForInstr :: NCGConfig -> Instr -> Maybe (NatCmmDecl (Alignment, RawCmmStatics) Instr)
-generateJumpTableForInstr config (JMP_TBL _ ids section lbl)
-    = let getBlockId (DestBlockId id) = id
-          getBlockId _ = panic "Non-Label target in Jump Table"
-          blockIds = map (fmap getBlockId) ids
-      in Just (createJumpTable config blockIds section lbl)
-generateJumpTableForInstr _ _ = Nothing
+generateJumpTableForInstr config = \case
+  JMP_TBL _ ids section table_lbl mrel_lbl ->
+    let getBlockId (DestBlockId id) = id
+        getBlockId _ = panic "Non-Label target in Jump Table"
+        block_ids = map (fmap getBlockId) ids
 
-createJumpTable :: NCGConfig -> [Maybe BlockId] -> Section -> CLabel
-                -> GenCmmDecl (Alignment, RawCmmStatics) h g
-createJumpTable config ids section lbl
-    = let jumpTable
-            | ncgPIC config =
-                  let ww = ncgWordWidth config
-                      jumpTableEntryRel Nothing
-                          = CmmStaticLit (CmmInt 0 ww)
-                      jumpTableEntryRel (Just blockid)
-                          = CmmStaticLit (CmmLabelDiffOff blockLabel lbl 0 ww)
-                          where blockLabel = blockLbl blockid
-                  in map jumpTableEntryRel ids
-            | otherwise = map (jumpTableEntry config) ids
-      in CmmData section (mkAlignment 1, CmmStaticsRaw lbl jumpTable)
+        jumpTable = case mrel_lbl of
+          Nothing      -> map mk_absolute block_ids           -- absolute entries
+          Just rel_lbl -> map (mk_relative rel_lbl) block_ids -- offsets relative to rel_lbl
+
+        mk_absolute = \case
+          Nothing      -> CmmStaticLit (CmmInt 0 (ncgWordWidth config))
+          Just blockid -> CmmStaticLit (CmmLabel (blockLbl blockid))
+
+        mk_relative rel_lbl = \case
+          Nothing      -> CmmStaticLit (CmmInt 0 (ncgWordWidth config))
+          Just blockid -> CmmStaticLit (CmmLabelDiffOff (blockLbl blockid) rel_lbl 0 (ncgWordWidth config))
+
+    in Just (CmmData section (mkAlignment 1, CmmStaticsRaw table_lbl jumpTable))
+
+  _ -> Nothing
 
 extractUnwindPoints :: [Instr] -> [UnwindPoint]
 extractUnwindPoints instrs =
@@ -5650,6 +5897,138 @@ genTrivialCode rep instr a b = do
                 b_code `appOL`
                 a_code dst `snocOL`
                 instr b_op dst
+  return (Any rep code)
+
+{- Note [Bit-test instructions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+x86 has dedicated instructions for clearing (btr), setting (bts) and
+complementing (btc) a single bit whose index is given in a register.  We use
+them for Cmm patterns such as
+
+  x & ~(1 << i)     ==>     btr i, x       (#25233)
+
+replacing a mov/shl/not/and sequence with a single instruction.  The
+shift-count register operand of shl is masked modulo the operand width, and
+the bit-offset register operand of btr/bts/btc is masked the same way, so
+the replacement is faithful even for out-of-range i (where the Cmm shift is
+in any case undefined).
+
+The bit-offset operand of these instructions must be an immediate or a
+register.  When the bit index is a literal, no shift reaches the NCG:
+constant folding has already turned the whole mask into a literal.  If that
+mask fits in an imm32, we keep the ordinary and/or/xor with an immediate:
+it has the same latency and better throughput (more execution ports) than
+the bit-test instructions,  and at worst two bytes of extra code size for bit
+indices 7..30.
+But a W64 mask touching the upper bits, e.g. ~(1 << 40), would have to be moved
+into a register first.  For such masks we recognise the folded literal itself
+(exactly one bit clear resp. set) and emit btr/bts/btc with an immediate
+bit offset.
+
+We restrict the pattern to W32 and native-width W64: the instructions do not
+exist at width 8, and sub-word Cmm operations at W8/W16 are rare enough that
+they are not worth the extra care.
+-}
+
+-- | Match @1 << i@, returning @i@.
+--
+-- The returned expression is always at word width ('machOpArgReps' fixes
+-- shift amounts at 'wordWidth'). See Note [Bit-test instructions].
+singleBit_maybe :: CmmExpr -> Maybe CmmExpr
+singleBit_maybe (CmmMachOp (MO_Shl _) [CmmLit (CmmInt 1 _), i]) = Just i
+singleBit_maybe _ = Nothing
+
+-- | If exactly one bit of @m@, taken at width @w@, is set, return its index.
+--
+-- See Note [Bit-test instructions].
+setBitLit_maybe :: Width -> Integer -> Maybe Int
+setBitLit_maybe w m
+  | popCount m' == 1 = Just (countTrailingZeros m')
+  | otherwise        = Nothing
+  where
+    -- w <= W64 in this X86-specific code, so a Word64 suffices.
+    m' = fromInteger (narrowU w m) :: Word64
+
+-- | If exactly one bit of @m@, taken at width @w@, is clear, return its
+-- index.
+--
+-- See Note [Bit-test instructions].
+clearBitLit_maybe :: Width -> Integer -> Maybe Int
+clearBitLit_maybe w m = setBitLit_maybe w (complement m)
+
+bitTestOpWidthOK :: Bool -> Width -> Bool
+bitTestOpWidthOK is32Bit w = w == W32 || (w == W64 && not is32Bit)
+
+-- | The bit-offset operand of a bit-test instruction (btr/bts/btc).
+data BitIndex
+  = BitIndexReg CmmExpr  -- ^ variable index, computed into a register
+  | BitIndexImm Int      -- ^ literal index, emitted as an immediate
+
+-- | Match the operands of a single-bit set or complement operation: one
+-- operand is a mask @1 << i@, or a literal with exactly one bit set that
+-- does not fit in an imm32. Returns the other operand and the bit index.
+--
+-- Both operand orders are matched, e.g. @x | (1 << i)@ and @(1 << i) | x@.
+--
+-- See Note [Bit-test instructions].
+setBitArgs_maybe :: Platform -> Width -> CmmExpr -> CmmExpr
+                 -> Maybe (CmmExpr, BitIndex)
+setBitArgs_maybe platform w x y = go x y `mplus` go y x
+  where
+    go opnd mask
+      | Just i <- singleBit_maybe mask
+      = Just (opnd, BitIndexReg i)
+      | CmmLit lit@(CmmInt m _) <- mask
+      , Just i <- setBitLit_maybe w m
+      , not (is32BitLit platform lit)
+      = Just (opnd, BitIndexImm i)
+      | otherwise
+      = Nothing
+
+-- | As 'setBitArgs_maybe', for a single-bit clear operation: the mask is
+-- @~(1 << i)@, or a literal with exactly one bit clear.
+clearBitArgs_maybe :: Platform -> Width -> CmmExpr -> CmmExpr
+                   -> Maybe (CmmExpr, BitIndex)
+clearBitArgs_maybe platform w x y = go x y `mplus` go y x
+  where
+    go opnd mask
+      | CmmMachOp (MO_Not _) [b] <- mask
+      , Just i <- singleBit_maybe b
+      = Just (opnd, BitIndexReg i)
+      | CmmLit lit@(CmmInt m _) <- mask
+      , Just i <- clearBitLit_maybe w m
+      , not (is32BitLit platform lit)
+      = Just (opnd, BitIndexImm i)
+      | otherwise
+      = Nothing
+
+-- | Generate code for @dst := x@ followed by a bit-test instruction
+-- (btr/bts/btc).
+--
+-- See Note [Bit-test instructions].
+genBitTestCode :: Format -> (Format -> Operand -> Operand -> Instr)
+               -> CmmExpr -> BitIndex -> NatM Register
+genBitTestCode rep instr x (BitIndexImm i) = do
+  x_code <- getAnyReg x
+  let code dst = x_code dst `snocOL` instr rep (OpImm (ImmInt i)) (OpReg dst)
+  return (Any rep code)
+genBitTestCode rep instr x (BitIndexReg i) = do
+  (i_reg, i_code) <- getNonClobberedReg i
+  x_code <- getAnyReg x
+  tmp <- getNewRegNat rep
+  let
+     -- As in genTrivialCode, 'i' must stay alive across the computation of
+     -- 'x' into dst, so save it in a temporary if dst holds 'i'.
+     code dst
+        | dst == i_reg =
+                i_code `appOL`
+                unitOL (MOV rep (OpReg i_reg) (OpReg tmp)) `appOL`
+                x_code dst `snocOL`
+                instr rep (OpReg tmp) (OpReg dst)
+        | otherwise =
+                i_code `appOL`
+                x_code dst `snocOL`
+                instr rep (OpReg i_reg) (OpReg dst)
   return (Any rep code)
 
 regClashesWithOp :: Reg -> Operand -> Bool
@@ -6482,10 +6861,172 @@ genClz bid width dst src = do
                        -- W8/W16 cases because the 'MOV' insn already
                        -- took care of implicitly clearing the upper bits
 
+{-
+Note [Word-to-float conversion on x86-64]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+CVTSI2SD/CVTSI2SS treat their source as a *signed* integer, so an
+unsigned Word with the MSB set would yield a negative float.
+
+We use a halve-and-double trick:
+  1. If src < 2^63 (MSB clear): convert directly; the signed and
+     unsigned interpretations agree.
+  2. If src >= 2^63 (MSB set):
+     (a) Compute  tmp = (src `shiftR` 1) .|. (src .&. 1)
+         which halves src while preserving the LSB as a "round bit".
+     (b) Convert tmp as a signed integer (its MSB is now clear).
+     (c) Double the float result.
+
+The round bit in step (a) is crucial for correct rounding.  Without
+it, adjacent even and odd large values would produce the same float.
+With it, the conversion in step (b) sees the correct rounding
+information, and doubling in step (c) scales back to the right range.
+
+Example (Float64, src = 2^64 - 1 = 0xFFFF_FFFF_FFFF_FFFF):
+  tmp = 0x7FFF_FFFF_FFFF_FFFF | 1 = 0x7FFF_FFFF_FFFF_FFFF
+  float64(tmp) rounds to 2^63   ≈ 9.2234e18
+  2 × 9.2234e18 = 1.8447e19   (= float64(2^64 - 1)) ✓
+
+Note [Word-to-float64 conversion on i386]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On 32-bit x86, StgWord is 32 bits.  CVTSI2SD converts a *signed*
+32-bit integer, so inputs with the MSB set look negative.
+
+Trick: add 2^31 to flip the MSB, convert as signed, then add back 2^31 as a
+Float64 constant.
+
+Let src' = src + 2^31 (mod 2^32):
+  src in [0, 2^31):   src' in [2^31, 2^32), signed value = src - 2^31.
+                      CVTSI2SD gives src - 2^31. + 2^31.0  →  src ✓
+  src = 2^31:         src' = 0 (wraps). CVTSI2SD gives 0.0. + 2^31.0 → 2^31 ✓
+  src in (2^31, 2^32): src' = src - 2^31 ∈ (0, 2^31), positive.
+                       CVTSI2SD gives src - 2^31. + 2^31.0  →  src ✓
+
+The constant 2^31 is materialised without a memory load: 0x4F000000
+is the IEEE 754 float32 bit-pattern for 2^31; a MOVD + CVTSS2SD
+gives the exact float64 value.
+
+Note [Word-to-float32 conversion on i386]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On 32-bit x86, StgWord is 32 bits.  CVTSI2SS converts a *signed*
+32-bit integer, so values >= 2^31 would convert incorrectly.
+
+We split the 32-bit unsigned value into its high and low 16-bit halves
+and convert each separately:
+  result = float32(high16) × 65536.0 + float32(low16)
+
+Both halves are in [0, 65535], within float32's exact integer range
+(24-bit mantissa covers integers up to 2^24 = 16777216 > 65535).
+Multiplying by 65536.0 = 2^16 is exact (no mantissa bits consumed).
+The final addition rounds to the nearest float32, matching a direct
+uint32→float32 conversion.
+
+The constant 65536.0 (= 0x47800000 in float32 bit-pattern) is loaded
+via a MOV + MOVD, avoiding a memory load.
+-}
+
 genWordToFloat :: BlockId -> Width -> CmmFormal -> CmmActual -> NatM InstrBlock
-genWordToFloat bid width dst src =
-  -- TODO: generate assembly instead
-  genPrimCCall bid (word2FloatLabel width) [dst] [src]
+genWordToFloat bid width dst src = do
+  is32Bit <- is32BitPlatform
+  platform <- getPlatform
+
+  let srcFormat = intFormat $ cmmExprWidth platform src
+  let dst_r = getLocalRegReg dst
+  let conv = case width of
+              W64 -> CVTSI2SD
+              W32 -> CVTSI2SS
+              _ -> pprPanic "genWordToFloat: unsupported width" (ppr width)
+  let dstFormat = floatFormat width
+
+  (src_r, code_src)  <- getSomeReg src
+
+  if is32Bit
+    then case (srcFormat, width) of
+      (II32, W64) -> do
+        -- See Note [Word-to-float64 conversion on i386]
+        cst_r  <- getNewRegNat srcFormat
+        cst_v  <- getNewRegNat dstFormat
+        flip_r <- getNewRegNat srcFormat
+        return $ code_src `appOL` toOL
+          [ MOV srcFormat (OpImm (ImmInt 0x4F000000)) (OpReg cst_r)         -- load the constant
+          , MOVD srcFormat (floatFormat W32) (OpReg cst_r) (OpReg cst_v)
+          , CVTSS2SD cst_v cst_v
+          , MOV srcFormat (OpReg src_r) (OpReg flip_r)                        -- copy src (modified below)
+          , ADD srcFormat (OpImm $ ImmInteger 0x80000000) (OpReg flip_r)      -- flip_r = flip MSB(src)
+          -- XOR dst_r with itself to avoid a false dependency: CVTSI2SD
+          -- (SSE2) only writes the lower 64 bits of the destination XMM
+          -- register, leaving the upper bits unchanged. That creates a
+          -- dependency on the old value of dst_r. Zeroing it first breaks
+          -- the dependency chain.
+          , XOR dstFormat (OpReg dst_r) (OpReg dst_r)
+          , conv srcFormat (OpReg flip_r) dst_r
+          , ADD dstFormat (OpReg cst_v) (OpReg dst_r) -- +2147483648.0
+          ]
+      (II32, W32) -> do
+        -- See Note [Word-to-float32 conversion on i386]
+        tmp_v  <- getNewRegNat dstFormat
+        cst_v  <- getNewRegNat dstFormat
+        cst_r  <- getNewRegNat srcFormat
+        high_r <- getNewRegNat srcFormat
+        low_r  <- getNewRegNat srcFormat
+        return $ code_src `appOL` toOL
+          [ MOV srcFormat (OpImm (ImmInt 0x47800000)) (OpReg cst_r) -- load the constant
+          , MOVD srcFormat dstFormat (OpReg cst_r) (OpReg cst_v)
+          , MOVZxL II16 (OpReg src_r) (OpReg low_r)                  -- low_r   = low 16 bits
+          , MOV srcFormat (OpReg src_r) (OpReg high_r)               -- copy src (modified below)
+          , SHR srcFormat (OpImm $ ImmInt 16) (OpReg high_r)         -- high_r  = high 16 bits
+          , conv srcFormat (OpReg high_r) dst_r                      -- dst_r = float(high)
+          , MUL dstFormat (OpReg cst_v) (OpReg dst_r)                -- dst_r = float(high) * 65536.0
+          -- XOR tmp_v to avoid a false dependency on its previous value
+          -- before the CVTSI2SS below (same reasoning as in the W64 case).
+          , XOR dstFormat (OpReg tmp_v) (OpReg tmp_v)
+          , conv srcFormat (OpReg low_r) tmp_v               -- tmp_v = float(low)
+          , ADD dstFormat (OpReg tmp_v) (OpReg dst_r)        -- dst_r = float(high)*65536.0 + float(low)
+          ]
+      _           -> panic ("genWordToFloat: unsupported source operand format: " ++ show srcFormat)
+    else do
+      -- See Note [Word-to-float conversion on x86-64]
+      half_r  <- getNewRegNat srcFormat
+      round_r <- getNewRegNat srcFormat
+
+      lblLarge  <- getBlockIdNat
+      lblSmall  <- getBlockIdNat
+      lblAfter  <- getBlockIdNat
+
+      -- We're building a diamond CFG:
+      --   bid -> lblSmall -> lblAfter -> origSucc
+      --       \-> lblLarge ->/
+      -- addImmediateSuccessorNat moves bid's original successor to lblAfter,
+      -- then we fix up the other edges.
+      addImmediateSuccessorNat bid lblAfter
+      -- Small values (MSB clear, i.e. < 2^63) are assumed more common in
+      -- practice, hence the higher weight on the lblSmall edge.
+      updateCfgNat ( addWeightEdge bid     lblSmall  100
+                   . addWeightEdge bid     lblLarge   50
+                   . addWeightEdge lblSmall lblAfter   1
+                   . addWeightEdge lblLarge lblAfter   1
+                   . delEdge bid lblAfter )
+
+      return $ appOL (code_src)
+        $ toOL
+        [ TEST srcFormat (OpReg src_r) (OpReg src_r)
+        , JXX NEG lblLarge
+        -- Adding this label to allow optimizations to either invert condition or just eliminate
+        , JXX ALWAYS lblSmall
+        , NEWBLOCK lblSmall
+        , conv srcFormat (OpReg src_r) dst_r  -- direct conversion for src < 2^63
+        , JXX ALWAYS lblAfter
+        , NEWBLOCK lblLarge
+        -- Halve src, preserving the LSB as a round bit, then convert and double.
+        , MOV srcFormat (OpReg src_r) (OpReg half_r)
+        , SHR srcFormat (OpImm $ ImmInt 1) (OpReg half_r)  -- half_r     = src >> 1
+        , MOV srcFormat (OpReg src_r) (OpReg round_r)      -- copy src (modified below)
+        , AND srcFormat (OpImm $ ImmInt 1) (OpReg round_r) -- round_r = src & 1  (round bit)
+        , OR  srcFormat (OpReg round_r) (OpReg half_r)     -- half_r  = (src >> 1) | (src & 1)
+        , conv srcFormat (OpReg half_r) dst_r
+        , ADD dstFormat (OpReg dst_r) (OpReg dst_r)        -- double the result
+        , JXX ALWAYS lblAfter
+        , NEWBLOCK lblAfter
+        ]
 
 genAtomicRead :: Width -> MemoryOrdering -> LocalReg -> CmmExpr -> NatM InstrBlock
 genAtomicRead width _mord dst addr = do

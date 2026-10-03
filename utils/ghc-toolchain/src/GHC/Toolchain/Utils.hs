@@ -8,11 +8,14 @@ module GHC.Toolchain.Utils
     , oneOf
     , oneOf'
     , isSuccess
+    , lastLine
+    , findM
     ) where
 
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import Data.List (unsnoc)
 import System.Directory
 import System.FilePath
 import System.IO.Error
@@ -65,3 +68,12 @@ isSuccess = \case
   ExitSuccess -> True
   ExitFailure _ -> False
 
+lastLine :: String -> String
+lastLine = maybe "" snd . unsnoc . lines
+
+findM :: Monad m => (a -> m Bool) -> [a] -> m (Maybe a)
+findM f = \case
+  [] -> return Nothing
+  a:as -> do
+    found <- f a
+    if found then return (Just a) else findM f as

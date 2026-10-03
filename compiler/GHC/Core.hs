@@ -4,6 +4,7 @@
 -}
 
 {-# LANGUAGE NoPolyKinds #-}
+{-# LANGUAGE LambdaCase #-}
 
 -- | GHC.Core holds all the main data types for use by for the Glasgow Haskell Compiler midsection
 module GHC.Core (
@@ -16,7 +17,7 @@ module GHC.Core (
         InId, InBind, InExpr, InAlt, InArg, InType, InKind,
                InBndr, InVar, InCoercion, InTyVar, InCoVar, InTyCoVar,
         OutId, OutBind, OutExpr, OutAlt, OutArg, OutType, OutKind,
-               OutBndr, OutVar, OutCoercion, OutTyVar, OutCoVar,
+               OutBndr, OutVar, OutCoercion, OutCoercionR, OutTyVar, OutCoVar,
                OutTyCoVar, MOutCoercion,
 
         -- ** 'Expr' construction
@@ -28,15 +29,15 @@ module GHC.Core (
         mkWord8Lit,
         mkWord32LitWord32, mkWord64LitWord64, mkInt64LitInt64,
         mkCharLit, mkStringLit,
-        mkFloatLit, mkFloatLitFloat,
-        mkDoubleLit, mkDoubleLitDouble,
+        mkFloatLit,
+        mkDoubleLit,
 
         mkConApp, mkConApp2, mkTyBind, mkCoBind,
         varToCoreExpr, varsToCoreExprs,
 
         mkBinds,
 
-        isId, cmpAltCon, cmpAlt, ltAlt,
+        isId, cmpAltCon, cmpAlt, ltAlt, altsLevity, CaseLevity(..),
 
         -- ** Simple 'Expr' access functions and predicates
         bindersOf, bindersOfBinds, rhssOfBind, rhssOfBinds, rhssOfAlts,
@@ -60,7 +61,7 @@ module GHC.Core (
         unSaturatedOk, needSaturated, boringCxtOk, boringCxtNotOk,
 
         -- ** Predicates and deconstruction on 'Unfolding'
-        expandUnfolding_maybe,
+        expandUnfolding_maybe, expandUnfolding_always,
         maybeUnfoldingTemplate, otherCons,
         isValueUnfolding, isEvaldUnfolding, isCheapUnfolding,
         isExpandableUnfolding, isConLikeUnfolding, isCompulsoryUnfolding,
@@ -83,11 +84,15 @@ module GHC.Core (
         IsOrphan(..), isOrphan, notOrphan, chooseOrphanAnchor,
 
         -- * Core rule data types
-        CoreRule(..),
+        CoreRule(..), RuleMatch(..),
         RuleName, RuleFun, IdUnfoldingFun, InScopeEnv(..), RuleOpts,
 
+        -- * Floats
+        FloatBind(..), FloatBinds, emptyFloatBinds, isEmptyFloatBinds,
+        floatBinders, floatsBinders,
+
         -- ** Operations on 'CoreRule's
-        ruleArity, ruleName, ruleIdName, ruleActivation,
+        ruleArity, ruleName, ruleKey, ruleActivation,
         setRuleIdName, ruleModule,
         isBuiltinRule, isLocalRule, isAutoRule,
     ) where
@@ -95,24 +100,29 @@ module GHC.Core (
 import GHC.Prelude
 import GHC.Platform
 
-import GHC.Types.Var.Env( InScopeSet )
-import GHC.Types.Var
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Core.Rules.Config ( RuleOpts )
-import GHC.Types.Name
-import GHC.Types.Name.Set
-import GHC.Types.Literal
-import GHC.Types.Tickish
 import GHC.Core.DataCon
 import GHC.Unit.Module
+
+import GHC.Types.InlinePragma
+import GHC.Types.Name
+import GHC.Types.Name.Set
+import GHC.Types.Var.Env( InScopeSet )
+import GHC.Types.Var
+import GHC.Types.Literal
+import GHC.Types.Tickish
 import GHC.Types.Basic
+import GHC.Types.Unique
 import GHC.Types.Unique.Set
 
 import GHC.Utils.Binary
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+
+import GHC.Data.OrdList
 
 import Data.Data hiding (TyCon)
 import Data.Int
@@ -284,7 +294,9 @@ data Alt b
 -- See Note [GHC Formalism] in GHC.Core.Lint
 data AltCon
   = DataAlt DataCon   --  ^ A plain data constructor: @case e of { Foo x -> ... }@.
-                      -- Invariant: the 'DataCon' is always from a @data@ type, and never from a @newtype@
+                      -- Invariant: the 'DataCon' is always from a @data@ type,
+                      -- and never from a @newtype@ or a unary class.
+                      -- See Note [DataAlt restrictions]
 
   | LitAlt  Literal   -- ^ A literal: @case e of { 1 -> ... }@
                       -- Invariant: always an *unlifted* literal
@@ -328,6 +340,63 @@ mkBinds Recursive binds = [Rec binds]
 mkBinds NonRecursive binds = map (uncurry NonRec) binds
 
 {-
+Note [DataAlt restrictions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The DataCon in a DataAlt is subject to three restrictions:
+
+(DALT1) It is never from a newtype.
+
+  Newtypes are always represented via coercions, never by pattern matching
+  on their data constructor. We can still have a case expression over a
+  newtype scrutinee if we are just doing an eval:
+
+      case x of { DEFAULT -> e }
+
+  but we must not match on the newtype constructor.
+
+(DALT2) It is never from a `type data` declaration.
+
+  The constructors of a `type data` declaration (see
+  Note [Type data declarations] in GHC.Rename.Module) exist only at the
+  type level and have no value-level representation. Nevertheless, it is
+  possible to strictly evaluate a value whose type is a `type data`
+  declaration. For example (from test type-data/should_compile/T2294b.hs):
+
+      type data T a where
+        A :: T Int
+
+      f :: T a -> ()
+      f !x = ()
+
+  We want to generate the following Core for f:
+
+      f = \(@a) (x :: T a) ->
+          case x of { __DEFAULT -> () }
+
+  Namely we do _not_ want to match on `A`, as it doesn't exist at the value
+  level! See wrinkle (W2b) in Note [Type data declarations] in
+  GHC.Rename.Module.
+
+(DALT3) It is never from a unary class (#27071).
+
+  Unary class constructors are erased at runtime: the dictionary IS the
+  single method (or superclass), with no wrapper. Matching on the dictionary
+  constructor is therefore illegal in Core; case expressions over unary
+  class dictionaries must use DEFAULT. For example, given
+
+      class C a where { op :: a -> a }
+
+  a case on a C dictionary looks like:
+
+      case d of bndr { DEFAULT -> ...bndr... }
+  not:
+      case d of { C:C op -> ...op... }    -- WRONG
+
+  See (UCM13) in Note [Unary class magic] in GHC.Core.TyCon.
+
+All three restrictions are checked by Core Lint, and they each give rise
+to a special case in `GHC.Core.Utils.refineDefaultAlt`.
+
 Note [Literal alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Literal alternatives (LitAlt lit) are always for *un-lifted* literals.
@@ -364,33 +433,88 @@ Note [Shadowing in Core]
 You might wonder if there is an invariant that a Core expression has no
 "shadowing".  For example, is this illegal?
      \x. \x. blah     -- x is shadowed
-Answer; no!  Core does /not/ have a no-shadowing invariant.
 
-Neither the simplifier nor any other pass GUARANTEES that shadowing is
-avoided. Thus, all passes SHOULD work fine even in the presence of
-arbitrary shadowing in their inputs.
+Answer:
+* No!  Core does /not/ have a no-shadowing invariant;
+  That is, we allow (\x. (x, \x. x))
+  See the rest of this note
 
-So the Unique in a Var is not really unique at all.  Still, it's very
-useful to give a constant-time equality/ordering for Vars, and to give
-a key that can be used to make sets of Vars (VarSet), or mappings from
-Vars to other things (VarEnv).   Moreover, if you do want to eliminate
-shadowing, you can give a new Unique to an Id without changing its
-printable name, which makes debugging easier.
+* But Core /does/ have a no-type-shadowing invariant;
+  See Note [No type-shadowing in Core]
 
 It would in many ways be easier to have a no-shadowing invariant.  And the
 Simplifier does its best to clone variables that are shadowed.  But it is
 extremely difficult to GUARANTEE it:
 
-* We use `GHC.Types.Id.mkTemplateLocal` to make up local binders, with uniques
-  that are locally-unique (enough for the purpose) but not globally unique.
-  It is convenient not to have to plumb a unique supply to these functions.
+  * We use `GHC.Types.Id.mkTemplateLocal` to make up local binders, with uniques
+    that are locally-unique (enough for the purpose) but not globally unique.
+    It is convenient not to have to plumb a unique supply to these functions.
 
-* It is very difficult for the Simplifier to gurantee a no-shadowing result.
-  See Note [Shadowing in the Simplifier] in GHC.Core.Opt.Simplify.Iteration.
+  * It is very difficult for the Simplifier to gurantee a no-shadowing result.
+    See Note [Shadowing in the Simplifier] in GHC.Core.Opt.Simplify.Iteration.
 
-* See Note [Shadowing in CSE] in GHC.Core.Opt.CSE
+  * See Note [Shadowing in CSE] in GHC.Core.Opt.CSE
 
-* See Note [Shadowing in SpecConstr] in GHC.Core.Opt.SpecContr
+  * See Note [Shadowing in SpecConstr] in GHC.Core.Opt.SpecContr
+
+TL;DR: neither the simplifier nor any other pass GUARANTEES that shadowing is
+avoided. Thus, all passes MUST work fine even in the presence of arbitrary
+shadowing in their inputs.
+
+So the Unique in a Var is not really unique at all.  Still, it's very useful to
+give a constant-time equality/ordering for Vars, and to give a key that can be
+used to make sets of Vars (VarSet), or mappings from Vars to other things
+(VarEnv).  Moreover, if you do want to eliminate shadowing, you can give a new
+Unique to an Id without changing its printable name, which makes debugging
+easier.
+
+Note [No type-shadowing in Core]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider applying `exprType` to this term:
+
+       /\ a. \(x :: a). /\a. x
+
+where we have genuine shadowing: both lambdas bind the same a.  Remember: every
+occurrence of `x` is just a copy of the binder (x::a).
+
+Now what does `exprType` return for that term?  It will return the incorrect type
+        forall a. a -> forall a. a
+whereas the correct type is:
+        forall a. a -> forall b. a
+where we rename the inner forall.
+
+A similar problem occurs for types.  consider
+   forall (a :: RuntimeRep). Int -> forall (x :: TYPE a).
+                                    forall (a :: RuntimeRep). x
+This is a well-kinded type, in an environment-based scheme.  But `typeKind`
+will panic, because the kind of the body of a forall must not mention
+the forall'd variable (and the inner forall's body appears to do so).
+
+It might be possible to make `exprType` and `typeKind`` more complicated, so that
+they do renaming on the fly.  But instead we impose
+
+INVARIANT (NoTypeShadowing):
+  In every Core term (Expr) and core type (Type),
+  the variable free in a binder's type must be in scope
+  at every /occurrence/ of that variable.  In type-system terms:
+
+        fv(t) are not bound in G2
+        -------------------------
+        G1, x:t, G2 |- x : t
+
+How do we guarantee (NoTypeShadowing)?  The main thing that might
+disturb it is /substitution/.  When substituting in a term or type we
+need to ensure that the in-scope set includes:
+
+* The /deep/ free vars of the range of the substitution
+  E.g.  When substituting  [y :-> x::a->a] into
+         /\a. ..y...
+  we should have an InScopeSet that includes `a` so that we clone the `/\a`.
+
+* The /deep/ free vars of the term/type in which we are substituting
+  E.g when substituting [x :-> blah] into `e`, we must ensure that if we
+  clone a binder in `e`, we don't accidentally choose a new binder that
+  shadows a deep free var of `e`.
 
 Note [Core letrec invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -524,7 +648,9 @@ Note [NON-BOTTOM-DICTS invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 It is a global invariant (not checkable by Lint) that
 
-     every non-newtype dictionary-typed expression is non-bottom.
+  Every dictionary-typed expression is non-bottom
+  /except/: a unary class with a single field, either a single method,
+            or a single superclass: see (NBD1).
 
 These conditions are captured by GHC.Core.Type.isTerminatingType.
 
@@ -535,7 +661,7 @@ How are we so sure about this?  Dictionaries are built by GHC in only two ways:
   See DFunUnfolding in GHC.Core.  So the result of a call to a DFun is always
   non-bottom.
 
-  Exception: newtype dictionaries.
+  Exception: unary dictionaries: see (NBD1) below.
 
   Plus: see the Very Nasty Wrinkle in Note [Speculative evaluation]
   in GHC.CoreToStg.Prep
@@ -558,6 +684,35 @@ Why is it useful to know that dictionaries are non-bottom?
    can be discarded by the Simplifier.  See these Notes:
    Note [exprOkForSpeculation and type classes] in GHC.Core.Utils
    Note[Speculative evaluation] in GHC.CoreToStg.Prep
+
+Wrinkle (NBD1)
+  A unary dictionary with a single method can be non-bottom:
+     class UC a where { meth :: a -> a }
+  because we could say
+     instance UC Int where { meth = error "urk" }
+  See Note [Unary class magic] in GHC.Core.TyCon
+
+  A unary class has a single /superclass/ (rather than method) looks as if it
+  will always terminate, because the superclass does:
+    class C a => UC a where {}
+  So we could try to be more clever, and say that a unary class constraint
+  always terminates if has a single superclass.
+
+  But maybe that is too clever!  Note [Recursive superclasses] and
+  Note [Solving superclass constraints] are very subtle, so it seems safer to
+  say that /all/ unary-class constraints might diverge.  Remember, almost all
+  classes are non-unary, and thus definitely non-bottom.
+
+Wrinkle (NBD2)
+  A class declared in an hs-boot file is an AbstractTyCon inside the module
+  loop:
+      module Callee where { class UC (a :: Type) }                -- Callee.hs-boot
+      module Callee where { class UC a where { ucm :: a -> a } }  -- Callee.hs
+  isUnaryClassTyCon returns False for it, but compiling the real declaration
+  may reveal a UnaryClassTyCon, whose dictionary is `ucm` and can be bottom.
+
+  Speculating a superclass selection from such a dictionary crashes (#27704).
+  So we must treat an AbstractTyCon as possibly unary.
 
 Note [Case expression invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1034,6 +1189,143 @@ tail position: A cast changes the type, but the type must be the same. But
 operationally, casts are vacuous, so this is a bit unfortunate! See #14610 for
 ideas how to fix this.
 
+Note [Join points, casts, and ticks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Point (1) of Note [Invariants on join points] says that a join point
+must always be tail called.  But what precisely does "tail called" mean
+in the presence of (a) casts and (b) ticks?
+
+Example (CAST)
+  let j x = rhs in
+  case y of { True -> j 1 |> co; False -> j 2 }
+
+Example (TICK)
+  let j x = rhs in
+  case y of { True -> <tick t> (j 1); False -> j 2 }
+
+Answer: in Core:
+
+  (JCT1) A tail call cannot be under a cast.
+
+    Thus, in (CAST), `j` is not a join point.
+
+  (JCT2) A tail call cannot be under a cost-centre-scoped tick.
+
+    Thus, in  (TICK), `j` is a join point only if tick `t` has soft scope
+    (as per Note [Scoping ticks and counting ticks] in GHC.Tickish).
+
+The Big Reason for these choices is that the Simplifier moves the continuation
+into the RHS of a join point, as explained in Note [Join points and case-of-case]
+in GHC.Core.Opt.Simplify.Iteration:
+
+   K[ join j x = rhs in body ]  -->  join j x = K[rhs] in K[body]
+
+and K then evaporates when it encounters the tail call:
+
+   K[jump j v]  -->  jump j v
+
+These transformations:
+  * Are ill-typed if the tail is under a cast, hence (JCT1)
+  * Change cost semantics if the tick has cost-centre scope, hence (JCT2)
+
+The occurrence analyser is careful not to treat an occurrence as a tail call if
+it falls under (JCT1) or (JCT2), by using 'markAllNonTail'.
+
+However, during /code generation/ the key thing about a join point is that
+  * The binding does no allocation
+  * A tail call can be implemented by "adjust stack pointer and jump".
+
+This code-gen strategy works fine even if the "tail call" occurs under
+/arbitrary/ ticks and casts.  Hence:
+
+(JCT3) In CorePrep, the occurrence analyser is called with a special flag that
+   /does/ treat `j` as tail-called in Example (CAST) and Example (TICK).
+   Core Prep then uses 'joinPointBinding_maybe', which turns always-tail-called
+   let bindings into join points, thus recovering join-point-hood.
+
+See also Note [Linting join points with casts or ticks] in GHC.Core.Lint.
+
+Examples
+========
+
+  Join point jumps under ticks (#14242, #26157, #26642, #26693)
+  ============================
+  In #26693 we had:
+
+    join { j :: Bool -> Int -> IO (); j _ = guts }
+    in case b of
+      False -> scc<foo> jump j True
+      True  ->          jump j False
+
+  If we try to push the application to an argument 'arg :: Int' into this
+  expression, we first get:
+
+    join { j :: Bool -> IO (); j _ = guts arg ] }
+    in case b of
+      False -> (scc<foo> jump j True) arg
+      True  ->           jump j False arg
+
+  We then rely on 'trimJoinCont' to remove the argument. In this case, this fails
+  for the first branch, because 'trimJoinCont' doesn't look through profiling
+  ticks. Were we to address this, it's still not clear what code we would want to
+  end up with, as we don't want to misattribute profiling costs.
+  We could plausibly transform to the following:
+
+    join { j :: Bool -> IO (); j scc_or_null _ = (setSCC# scc_or_null guts) arg ] }
+    in case b of
+      False -> jump j <foo> True
+      True  -> jump j null  False
+
+  where `setSCC#` is a new primop that would set the current cost centre pointer
+  (or no-op if the given pointer is null). However:
+    - this primop doesn't exist today,
+    - it requires adding an argument to the join point (hence changing its arity)
+
+  Note that soft scope ticks are floated out by the simplifier (see the
+  'tickishHasSoftScope' guard in 'GHC.Core.Opt.Simplify.Iteration.simplTick'),
+  so don't suffer from the same problem.
+
+  Join point jumps under casts (#14610, #21716, #26422)
+  ============================
+  Consider:
+
+    newtype Age = MkAge Int   -- axAge :: Age ~ Int
+    f :: Int -> ...
+
+    f (join j :: Bool -> Age
+            j x = (rhs1 :: Age)
+       in case v of
+           Just x  -> ((j x) |> axAge) :: Int
+           Nothing -> rhs2)
+
+  If we try to use the case of case transformation to push 'f' inwards, we would
+  get:
+
+     join j' x = f (rhs1 :: Age)
+     in case v of
+        Just x  -> (j' x |> axAge)
+        Nothing -> f rhs2
+
+  which is utterly bogus, as we are now passing an argument of type 'Age' to
+  'f', which expects an 'Int'.
+
+  The alternative would be to implement a transformation of the form
+
+      join { j x = blah }
+      in case e of
+        False -> j True  |> co1
+        True  -> j False |> co2
+
+    ====>
+
+      join { j x co = blah |> co }
+      in case e of
+        False -> j True  co1
+        True  -> j False co2
+
+  by adding a coercion argument to the join point. We don't do this currently.
+
+
 Note [Strict fields in Core]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In Core, evaluating a data constructor worker evaluates its strict fields.
@@ -1121,14 +1413,15 @@ type InArg      = CoreArg
 type InCoercion = Coercion
 
 -- Post-cloning or substitution
-type OutBndr     = CoreBndr
-type OutType     = Type
-type OutKind     = Kind
-type OutCoercion = Coercion
-type OutBind     = CoreBind
-type OutExpr     = CoreExpr
-type OutAlt      = CoreAlt
-type OutArg      = CoreArg
+type OutBndr      = CoreBndr
+type OutType      = Type
+type OutKind      = Kind
+type OutCoercion  = Coercion
+type OutCoercionR = CoercionR
+type OutBind      = CoreBind
+type OutExpr      = CoreExpr
+type OutAlt       = CoreAlt
+type OutArg       = CoreArg
 type MOutCoercion = MCoercion
 
 
@@ -1265,7 +1558,7 @@ representation.
 data CoreRule
   = Rule {
         ru_name :: RuleName,            -- ^ Name of the rule, for communication with the user
-        ru_act  :: Activation,          -- ^ When the rule is active
+        ru_act  :: ActivationGhc,    -- ^ When the rule is active
 
         -- Rough-matching stuff
         -- see comments with InstEnv.ClsInst( is_cls, is_rough )
@@ -1309,18 +1602,55 @@ data CoreRule
   -- A built-in rule is always visible (there is no such thing as
   -- an orphan built-in rule.)
   | BuiltinRule {
-        ru_name  :: RuleName,   -- ^ As above
-        ru_fn    :: Name,       -- ^ As above
+        ru_name  :: RuleName,            -- ^ As above
+        ru_key   :: KnownKey,     -- ^ Identifies the function
+                                         -- Not its Name because BuiltInRules are constants
+                                         -- and GHC doesn't know the defining module
+                                         -- See Note [Overview of known entities]
         ru_nargs :: Int,        -- ^ Number of arguments that 'ru_try' consumes,
                                 -- if it fires, including type arguments
         ru_try   :: RuleFun
                 -- ^ This function does the rewrite.  It given too many
                 -- arguments, it simply discards them; the returned 'CoreExpr'
-                -- is just the rewrite of 'ru_fn' applied to the first 'ru_nargs' args
+                -- is just the rewrite of function applied to the first 'ru_nargs' args
     }
                 -- See Note [Extra args in the target] in GHC.Core.Rules
 
-type RuleFun = RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe CoreExpr
+type RuleFun = RuleOpts -> InScopeEnv
+               -> Id -> [CoreExpr]   -- Function applied to these arguments
+               -> Maybe RuleMatch
+
+data RuleMatch -- See Note [data RuleMatch]
+  = RM { rm_rule   :: CoreRule
+       , rm_rhs    :: CoreExpr      -- Rhs of the rule
+       , rm_args   :: [CoreExpr]    -- The args of the RHS
+       , rm_floats :: FloatBinds    -- Floated let-bindings
+                                    -- See Note [Matching lets]
+       }
+
+{- Note [data RuleMatch]
+~~~~~~~~~~~~~~~~~~~~~~~
+A `RuleMatch` returns the result of a successful attempt to match a RULE
+against a target.  For example, suppose we have
+     RULE forall x,y. f (Just (y,x)) = g x y True
+and we match it againt a target
+     f (let v = ev in Just (ey, ex)) ez
+Then we get the RuleMatch
+     RM { rm_rule   = r
+        , rm_rhs    = \xy. g x y True
+        , rm_args   = [ex, ey]
+        , rm_floats = Let v=ev }
+
+Note that:
+
+* The `rm_rule` is the `CoreRule` that matched.
+* The `rm_rhs` comes entirely from the RULE
+* The `rm_args` are fragments of the original target.
+* The `rm_floats` are bindings in the target that got floated out
+* The leftover `ez` is not returned; the caller is responsible for
+  counting (ruleArity r) arguments.  See Note [Extra args in the target]
+-}
+
 
 -- | The 'InScopeSet' in the 'InScopeEnv' is a /superset/ of variables that are
 -- currently in scope. See Note [The InScopeSet invariant].
@@ -1339,7 +1669,7 @@ isAutoRule :: CoreRule -> Bool
 isAutoRule (BuiltinRule {}) = False
 isAutoRule (Rule { ru_auto = is_auto }) = is_auto
 
--- | The number of arguments the 'ru_fn' must be applied
+-- | The number of arguments the function must be applied
 -- to before the rule can match on it
 ruleArity :: CoreRule -> FullArgCount
 ruleArity (BuiltinRule {ru_nargs = n}) = n
@@ -1352,21 +1682,56 @@ ruleModule :: CoreRule -> Maybe Module
 ruleModule Rule { ru_origin } = Just ru_origin
 ruleModule BuiltinRule {} = Nothing
 
-ruleActivation :: CoreRule -> Activation
+ruleActivation :: CoreRule -> ActivationGhc
 ruleActivation (BuiltinRule { })       = AlwaysActive
 ruleActivation (Rule { ru_act = act }) = act
-
--- | The 'Name' of the 'GHC.Types.Id.Id' at the head of the rule left hand side
-ruleIdName :: CoreRule -> Name
-ruleIdName = ru_fn
 
 isLocalRule :: CoreRule -> Bool
 isLocalRule (BuiltinRule {})               = False
 isLocalRule (Rule { ru_local = is_local }) = is_local
 
+-- | The 'Unique' of the function at the head of the rule left hand side
+ruleKey :: CoreRule -> Unique
+ruleKey (Rule { ru_fn = name })        = nameUnique name
+ruleKey (BuiltinRule { ru_key = key }) = key
+
 -- | Set the 'Name' of the 'GHC.Types.Id.Id' at the head of the rule left hand side
 setRuleIdName :: Name -> CoreRule -> CoreRule
-setRuleIdName nm ru = ru { ru_fn = nm }
+setRuleIdName nm rule
+  = case rule of
+      Rule {}        -> rule { ru_fn = nm }
+      BuiltinRule {} -> rule { ru_key = nameUnique nm }
+
+{-
+************************************************************************
+*                                                                      *
+                Floats
+*                                                                      *
+************************************************************************
+-}
+
+type FloatBinds = OrdList FloatBind
+
+emptyFloatBinds :: FloatBinds
+emptyFloatBinds = nilOL
+
+isEmptyFloatBinds :: FloatBinds -> Bool
+isEmptyFloatBinds = isNilOL
+
+data FloatBind
+  = FloatLet  CoreBind
+  | FloatCase CoreExpr CoreBndr AltCon [CoreBndr]
+      -- case e of y { C ys -> ... }
+      -- See Note [Floating single-alternative cases] in GHC.Core.Opt.SetLevels
+  | FloatTick CoreTickish
+
+floatsBinders :: FloatBinds -> [Var]
+floatsBinders fs = foldr ((++) . floatBinders) [] fs
+
+floatBinders :: FloatBind -> [Var]
+floatBinders (FloatLet bnd)       = bindersOf bnd
+floatBinders (FloatCase _ b _ bs) = b:bs
+floatBinders (FloatTick {})       = []
 
 {-
 ************************************************************************
@@ -1648,6 +2013,11 @@ expandUnfolding_maybe (CoreUnfolding { uf_cache = cache, uf_tmpl = rhs })
     = Just rhs
 expandUnfolding_maybe _ = Nothing
 
+-- Expand an unfolding, ignoring if it is expandable or not
+expandUnfolding_always :: Unfolding -> Maybe CoreExpr
+expandUnfolding_always (CoreUnfolding { uf_tmpl = rhs }) = Just rhs
+expandUnfolding_always _ = Nothing
+
 isCompulsoryUnfolding :: Unfolding -> Bool
 isCompulsoryUnfolding (CoreUnfolding { uf_src = src }) = isCompulsorySource src
 isCompulsoryUnfolding _                                = False
@@ -1799,7 +2169,7 @@ Note [OccInfo in unfoldings and rules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In unfoldings and rules, we guarantee that the template is occ-analysed, so
 that the occurrence info on the binders is correct. That way, when the
-Simplifier inlines an unfolding, it doesn't need to occ-analysis it first.
+Simplifier inlines an unfolding, it doesn't need to occ-analyse it first.
 (The Simplifier is designed to simplify occ-analysed expressions.)
 
 Given this decision it's vital that we do *always* do it.
@@ -1828,6 +2198,19 @@ Given this decision it's vital that we do *always* do it.
   may inline g entirely in body, dropping its binding, and leaving the
   occurrence in f out of scope. This happened in #8892, where the unfolding
   in question was a DFun unfolding.
+
+Wrinkles
+
+(OUR1) For a RULE (as opposed to an unfolding), say,
+          RULE "foo" forall x y z. f (x,y,z) = x+y
+  we occ-analyse the binder wrt the RHS /only/, not the LHS.  So we'll mark
+  x,y as used-once, and z as dead:
+          RULE "foo" forall x[Once] y[Once] z[Dead]. f (x,y,z) = x+y
+
+  This is good when we apply the rule: we transform the call thus:
+      f (e1, e2, e3)   -->    (\xyz. x+y) e1 e2 e3
+  Now we immediately do beta-reduction and drop the z=e3 binding.  Note
+  that it's irrelevant (for this purpose) that `z` is used on the LHS!
 
 
 ************************************************************************
@@ -1866,6 +2249,25 @@ cmpAltCon (LitAlt  l1) (LitAlt  l2) = l1 `compare` l2
 cmpAltCon (LitAlt _)   DEFAULT      = GT
 
 cmpAltCon con1 con2 = pprPanic "cmpAltCon" (ppr con1 $$ ppr con2)
+
+data CaseLevity
+  = CaseUnlifted
+  | CaseLifted
+  deriving (Eq)
+
+altCon :: Alt a -> AltCon
+altCon (Alt con _ _) = con
+
+-- | Try to determine the levity of a case-expression (unlifted, lifted) from
+-- its alternatives
+altsLevity :: [Alt a] -> Maybe CaseLevity
+altsLevity = alts_levity . fmap altCon
+  where
+    alts_levity = \case
+      []              -> Nothing
+      (DEFAULT:xs)    -> alts_levity xs
+      (LitAlt {}:_)   -> Just CaseUnlifted
+      (DataAlt {}:_)  -> Just CaseLifted
 
 {-
 ************************************************************************
@@ -2034,22 +2436,12 @@ mkStringLit s = Lit (mkLitString s)
 -- | Create a machine single precision literal expression of type @Float#@ from a @Rational@.
 -- If you want an expression of type @Float@ use 'GHC.Core.Make.mkFloatExpr'
 mkFloatLit :: Rational -> Expr b
--- | Create a machine single precision literal expression of type @Float#@ from a @Float@.
--- If you want an expression of type @Float@ use 'GHC.Core.Make.mkFloatExpr'
-mkFloatLitFloat :: Float -> Expr b
-
-mkFloatLit      f = Lit (mkLitFloat f)
-mkFloatLitFloat f = Lit (mkLitFloat (toRational f))
+mkFloatLit f = Lit (mkLitFloat f)
 
 -- | Create a machine double precision literal expression of type @Double#@ from a @Rational@.
 -- If you want an expression of type @Double@ use 'GHC.Core.Make.mkDoubleExpr'
 mkDoubleLit :: Rational -> Expr b
--- | Create a machine double precision literal expression of type @Double#@ from a @Double@.
--- If you want an expression of type @Double@ use 'GHC.Core.Make.mkDoubleExpr'
-mkDoubleLitDouble :: Double -> Expr b
-
-mkDoubleLit       d = Lit (mkLitDouble d)
-mkDoubleLitDouble d = Lit (mkLitDouble (toRational d))
+mkDoubleLit d = Lit (mkLitDouble d)
 
 -- | Bind all supplied binding groups over an expression in a nested let expression. Assumes
 -- that the rhs satisfies the let-can-float invariant.  Prefer to use

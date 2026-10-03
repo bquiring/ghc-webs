@@ -498,7 +498,7 @@ evacuate_static_object (StgClosure **link_field, StgClosure *q)
     // See Note [STATIC_LINK fields] for how the link field bits work
     if (((link & STATIC_BITS) | prev_static_flag) != 3) {
         StgWord new_list_head = (StgWord)q | static_flag;
-#if !defined(THREADED_RTS)
+#if !defined(PARALLEL_GC)
         *link_field = gct->static_objects;
         gct->static_objects = (StgClosure *)new_list_head;
 #else
@@ -850,18 +850,15 @@ loop:
       goto loop;
 
   // For ints and chars of low value, save space by replacing references to
-  //    these with closures with references to common, shared ones in the RTS.
+  // these with closures with references to common, shared ones in the RTS.
   //
-  // * Except when compiling into Windows DLLs which don't support cross-package
-  //    data references very well.
-  //
+  // Besides 'data Int = I# Int#' and 'data Char = C# Char#', this also applies
+  // to the boxing constructor 'BoxInt', but not to 'BoxWord'.
+  // See [Boxing IntRep/WordRep] in Note [Boxing constructors] in GHC.Builtin.WiredIn.Types.Box.
   case CONSTR_0_1:
   {
-#if defined(COMPILING_WINDOWS_DLL)
-      copy_tag_nolock(p,info,q,sizeofW(StgHeader)+1,gen_no,tag);
-#else
       StgWord w = (StgWord)q->payload[0];
-      if (info == Czh_con_info &&
+      if ((info == Czh_con_info) &&
           // unsigned, so always true:  (StgChar)w >= MIN_CHARLIKE &&
           (StgChar)w <= MAX_CHARLIKE) {
           RELAXED_STORE(p, \
@@ -869,7 +866,7 @@ loop:
                                     (StgClosure *)CHARLIKE_CLOSURE((StgChar)w)
                                    ));
       }
-      else if (info == Izh_con_info &&
+      else if ((info == Izh_con_info || info == BoxInt_con_info) &&
           (StgInt)w >= MIN_INTLIKE && (StgInt)w <= MAX_INTLIKE) {
           RELAXED_STORE(p, \
                         TAG_CLOSURE(tag, \
@@ -879,7 +876,6 @@ loop:
       else {
           copy_tag_nolock(p,info,q,sizeofW(StgHeader)+1,gen_no,tag);
       }
-#endif
       return;
   }
 
@@ -996,6 +992,7 @@ loop:
   case CATCH_STM_FRAME:
   case CATCH_RETRY_FRAME:
   case ATOMICALLY_FRAME:
+  case ANN_FRAME:
     // shouldn't see these
     barf("evacuate: stack frame at %p\n", q);
 
@@ -1364,7 +1361,11 @@ selector_loop:
     // from-space during marking, for example.  We rely on the property
     // that evacuate() doesn't mind if it gets passed a to-space pointer.
 
-    info = RELAXED_LOAD((StgInfoTable**) &selectee->header.info);
+    // NB. this load must be ordered: the selectee may be updated
+    // concurrently by another GC thread's unchain_thunk_selectors(),
+    // which publishes an indirection by writing the indirectee and
+    // then RELEASE-storing the info pointer. See #27477.
+    info = ACQUIRE_LOAD((StgInfoTable**) &selectee->header.info);
 
     if (IS_FORWARDING_PTR(info)) {
         // We don't follow pointers into to-space; the constructor

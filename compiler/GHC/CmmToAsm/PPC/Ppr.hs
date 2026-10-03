@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 -----------------------------------------------------------------------------
 --
 -- Pretty-printing assembly language
@@ -35,6 +33,7 @@ import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 
 import GHC.Types.Unique ( pprUniqueAlways, getUnique )
+import GHC.Types.Literal.Floating
 import GHC.Platform
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -240,8 +239,8 @@ pprImm platform = \case
    ImmCLbl l      -> pprAsmLabel platform l
    ImmIndex l i   -> pprAsmLabel platform l <> char '+' <> int i
    ImmLit s       -> ftext s
-   ImmFloat f     -> float $ fromRational f
-   ImmDouble d    -> double $ fromRational d
+   ImmFloat f     -> float f
+   ImmDouble d    -> double d
    ImmConstantSum a b   -> pprImm platform a <> char '+' <> pprImm platform b
    ImmConstantDiff a b  -> pprImm platform a <> char '-' <> lparen <> pprImm platform b <> rparen
    LO (ImmInt i)        -> pprImm platform (LO (ImmInteger (toInteger i)))
@@ -285,6 +284,9 @@ pprAlignForSection platform seg = line $
        Data
         | ppc64          -> text ".align 3"
         | otherwise      -> text ".align 2"
+       IPE
+        | ppc64          -> text ".align 3"
+        | otherwise      -> text ".align 2"
        ReadOnlyData
         | ppc64          -> text ".align 3"
         | otherwise      -> text ".align 2"
@@ -301,7 +303,6 @@ pprAlignForSection platform seg = line $
        CString
         | ppc64          -> text ".align 3"
         | otherwise      -> text ".align 2"
-       OtherSection _    -> panic "PprMach.pprSectionAlign: unknown section"
 
 pprDataItem :: IsDoc doc => Platform -> CmmLit -> doc
 pprDataItem platform lit
@@ -324,9 +325,18 @@ pprDataItem platform lit
                  text "\t.long\t"
                     <> int (fromIntegral (fromIntegral x :: Word32))]
 
-
-        ppr_item FF32 _ = [text "\t.float\t" <> pprImm platform imm]
-        ppr_item FF64 _ = [text "\t.double\t" <> pprImm platform imm]
+        ppr_item FF32 (CmmFloat f _)
+          | litFloatingIsNonStandardNaN LitFloat f
+          = let bs = floatToBytes (litFloatingToHostFloat f)
+             in map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
+          | otherwise
+          = [text "\t.float\t" <> pprImm platform imm]
+        ppr_item FF64 (CmmFloat f _)
+          | litFloatingIsNonStandardNaN LitDouble f
+          = let bs = doubleToBytes (litFloatingToHostDouble f)
+             in map (\b -> text "\t.byte\t" <> int (fromIntegral b)) bs
+          | otherwise
+          = [text "\t.double\t" <> pprImm platform imm]
 
         ppr_item _ _
                 = panic "PPC.Ppr.pprDataItem: no match"

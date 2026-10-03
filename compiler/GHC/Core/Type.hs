@@ -3,7 +3,7 @@
 --
 -- Type - public interface
 
-{-# LANGUAGE FlexibleContexts, PatternSynonyms, ViewPatterns, MultiWayIf, RankNTypes #-}
+{-# LANGUAGE PatternSynonyms, ViewPatterns, MultiWayIf #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- | Main functions for manipulating types and type-related things
@@ -74,8 +74,7 @@ module GHC.Core.Type (
 
         mkCastTy, mkCoercionTy, splitCastTy_maybe,
 
-        ErrorMsgType,
-        userTypeError_maybe, deepUserTypeError_maybe, pprUserTypeErrorTy,
+        ErrorMsgType, pprUserTypeErrorTy,
 
         coAxNthLHS,
         stripCoercionTy,
@@ -132,7 +131,7 @@ module GHC.Core.Type (
         kindBoxedRepLevity_maybe,
         mightBeLiftedType, mightBeUnliftedType,
         definitelyLiftedType, definitelyUnliftedType,
-        isAlgType, isDataFamilyAppType,
+        isAlgType, isDataFamilyApp, isSatTyFamApp,
         isPrimitiveType, isStrictType, isTerminatingType,
         isLevityTy, isLevityVar,
         isRuntimeRepTy, isRuntimeRepVar, isRuntimeRepKindedTy,
@@ -160,11 +159,8 @@ module GHC.Core.Type (
         liftedTypeKind, unliftedTypeKind,
 
         -- * Type free variables
-        tyCoFVsOfType, tyCoFVsBndr, tyCoFVsVarBndr, tyCoFVsVarBndrs,
-        tyCoVarsOfType, tyCoVarsOfTypes,
-        tyCoVarsOfTypeDSet,
-        coVarsOfType,
-        coVarsOfTypes,
+        tyCoVarsOfType, tyCoVarsOfTypes, tyCoVarsOfTypeDSet,
+        coVarsOfType, coVarsOfTypes,
 
         anyFreeVarsOfType, anyFreeVarsOfTypes,
         noFreeVarsOfType,
@@ -172,7 +168,7 @@ module GHC.Core.Type (
         typeSize, occCheckExpand,
 
         -- ** Closing over kinds
-        closeOverKindsDSet, closeOverKindsList,
+        closeOverKindsDSet,
         closeOverKinds,
 
         -- * Forcing evaluation of types
@@ -210,7 +206,7 @@ module GHC.Core.Type (
         substTyAddInScope,
         substTyUnchecked, substTysUnchecked, substScaledTyUnchecked, substScaledTysUnchecked,
         substThetaUnchecked, substTyWithUnchecked,
-        substCo, substCoUnchecked, substCoWithUnchecked,
+        substCo, substCoWithInScope,
         substTyVarBndr, substTyVarBndrs, substTyVar, substTyVars,
         substVarBndr, substVarBndrs,
         substTyCoBndr, substTyVarToTyVar,
@@ -232,24 +228,7 @@ import GHC.Types.Basic
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Subst
 import GHC.Core.TyCo.FVs
-
--- friends:
-import GHC.Types.Var
-import GHC.Types.Var.Env
-import GHC.Types.Var.Set
-
 import GHC.Core.TyCon
-import GHC.Builtin.Types.Prim
-
-import {-# SOURCE #-} GHC.Builtin.Types
-   ( charTy, naturalTy
-   , typeSymbolKind, liftedTypeKind, unliftedTypeKind
-   , constraintKind, zeroBitTypeKind
-   , manyDataConTy, oneDataConTy
-   , liftedRepTy, unliftedRepTy, zeroBitRepTy )
-
-import GHC.Types.Name( Name )
-import GHC.Builtin.Names
 import GHC.Core.Coercion.Axiom
 
 import {-# SOURCE #-} GHC.Core.Coercion
@@ -263,16 +242,33 @@ import {-# SOURCE #-} GHC.Core.Coercion
    , isReflexiveCo, seqCo
    , topNormaliseNewType_maybe
    )
+
+-- friends:
+import GHC.Types.Var
+import GHC.Types.Var.Env
+import GHC.Types.Var.Set
+
+import GHC.Builtin.WiredIn.Prim
+
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
+   ( charTy, naturalTy
+   , typeSymbolKind, liftedTypeKind, unliftedTypeKind
+   , constraintKind, zeroBitTypeKind
+   , manyDataConTy, oneDataConTy
+   , liftedRepTy, unliftedRepTy, zeroBitRepTy )
+
+import GHC.Types.Name( Name, hasKnownKey )
+import GHC.Builtin.KnownKeys
+
 import {-# SOURCE #-} GHC.Tc.Utils.TcType ( isConcreteTyVar )
 
 -- others
 import GHC.Utils.Misc
-import GHC.Utils.FV
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Data.FastString
 
-import GHC.Data.Maybe   ( orElse, isJust, firstJust )
+import GHC.Data.Maybe   ( orElse, isJust )
 import GHC.List (build)
 
 -- $type_classification
@@ -433,7 +429,7 @@ expand_syn tvs rhs arg_tys
   | otherwise     = go empty_subst tvs arg_tys
   where
     empty_subst = mkEmptySubst in_scope
-    in_scope = mkInScopeSet $ shallowTyCoVarsOfTypes $ arg_tys
+    in_scope = mkInScopeSet $ tyCoVarsOfTypes $ arg_tys
       -- The free vars of 'rhs' should all be bound by 'tenv',
       -- so we only need the free vars of tys
       -- See also Note [The substitution invariant] in GHC.Core.TyCo.Subst.
@@ -530,10 +526,13 @@ expandTypeSynonyms ty
       = mkTyConAppCo r tc (map (go_co subst) args)
     go_co subst (AppCo co arg)
       = mkAppCo (go_co subst co) (go_co subst arg)
-    go_co subst (ForAllCo { fco_tcv = tv, fco_visL = visL, fco_visR = visR
+    go_co subst (ForAllCo { fco_tcv = tcv, fco_visL = visL, fco_visR = visR
                           , fco_kind = kind_co, fco_body = co })
-      = let (subst', tv', kind_co') = go_cobndr subst tv kind_co in
-        mkForAllCo tv' visL visR kind_co' (go_co subst' co)
+      = mkForAllCo tcv' visL visR
+                   (go_mco subst kind_co)
+                   (go_co subst' co)
+      where
+        (subst', tcv') = substVarBndr subst tcv
     go_co subst (FunCo r afl afr w co1 co2)
       = mkFunCo2 r afl afr (go_co subst w) (go_co subst co1) (go_co subst co2)
     go_co subst (CoVarCo cv)
@@ -558,12 +557,6 @@ expandTypeSynonyms ty
       = mkSubCo (go_co subst co)
     go_co _ (HoleCo h)
       = pprPanic "expandTypeSynonyms hit a hole" (ppr h)
-
-      -- the "False" and "const" are to accommodate the type of
-      -- substForAllCoBndrUsing, which is general enough to
-      -- handle coercion optimization (which sometimes swaps the
-      -- order of a coercion)
-    go_cobndr subst = substForAllCoBndrUsing NotSwapped (go_co subst) subst
 
 {- Notes on type synonyms
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -618,7 +611,7 @@ kindRep_maybe kind
   | otherwise                            = Nothing
 
 -- | Returns True if the argument is (lifted) Type or Constraint
--- See Note [TYPE and CONSTRAINT] in GHC.Builtin.Types.Prim
+-- See Note [TYPE and CONSTRAINT] in GHC.Builtin.WiredIn.Prim
 isLiftedTypeKind :: Kind -> Bool
 isLiftedTypeKind kind
   = case kindRep_maybe kind of
@@ -975,7 +968,7 @@ mapTyCoX (TyCoMapper { tcm_tyvar = tyvar
       = mkTyConAppCo r tc <$> go_cos env cos
     go_co !env (ForAllCo { fco_tcv = tv, fco_visL = visL, fco_visR = visR
                          , fco_kind = kind_co, fco_body = co })
-      = do { kind_co' <- go_co env kind_co
+      = do { kind_co' <- go_mco env kind_co
            ; tycobinder env tv visL $ \env' tv' ->  do
            ; co' <- go_co env' co
            ; return $ mkForAllCo tv' visL visR kind_co' co' }
@@ -1115,7 +1108,7 @@ splitAppTy ty = splitAppTy_maybe ty `orElse` pprPanic "splitAppTy" (ppr ty)
 -------------
 splitAppTyNoView_maybe :: HasDebugCallStack => Type -> Maybe (Type,Type)
 -- ^ Does the AppTy split as in 'splitAppTy_maybe', but assumes that
--- any coreView stuff is already done
+-- any 'coreView' stuff is already done.
 splitAppTyNoView_maybe (AppTy ty1 ty2)
   = Just (ty1, ty2)
 
@@ -1132,7 +1125,8 @@ splitAppTyNoView_maybe (TyConApp tc tys)
 splitAppTyNoView_maybe _other = Nothing
 
 tcSplitAppTyNoView_maybe :: Type -> Maybe (Type,Type)
--- ^ Just like splitAppTyNoView_maybe, but does not split (c => t)
+-- ^ Just like 'splitAppTyNoView_maybe', but does not split @(c => t)@.
+--
 -- See Note [Decomposing fat arrow c=>t]
 tcSplitAppTyNoView_maybe ty
   | FunTy { ft_af = af } <- ty
@@ -1226,45 +1220,6 @@ isLitTy ty
 -- | A type of kind 'ErrorMessage' (from the 'GHC.TypeError' module).
 type ErrorMsgType = Type
 
--- | Is this type a custom user error?
--- If so, give us the error message.
-userTypeError_maybe :: Type -> Maybe ErrorMsgType
-userTypeError_maybe ty
-  | Just ty' <- coreView ty = userTypeError_maybe ty'
-userTypeError_maybe (TyConApp tc (_kind : msg : _))
-  | tyConName tc == errorMessageTypeErrorFamName
-          -- There may be more than 2 arguments, if the type error is
-          -- used as a type constructor (e.g. at kind `Type -> Type`).
-  = Just msg
-userTypeError_maybe _
-  = Nothing
-
-deepUserTypeError_maybe :: Type -> Maybe ErrorMsgType
--- Look for custom user error, deeply inside the type
-deepUserTypeError_maybe ty
-  | Just ty' <- coreView ty = userTypeError_maybe ty'
-deepUserTypeError_maybe (TyConApp tc tys)
-  | tyConName tc == errorMessageTypeErrorFamName
-  , _kind : msg : _ <- tys
-          -- There may be more than 2 arguments, if the type error is
-          -- used as a type constructor (e.g. at kind `Type -> Type`).
-  = Just msg
-
-  | tyConMustBeSaturated tc  -- Don't go looking for user type errors
-                             -- inside type family arguments (see #20241).
-  = foldr (firstJust . deepUserTypeError_maybe) Nothing (drop (tyConArity tc) tys)
-  | otherwise
-  = foldr (firstJust . deepUserTypeError_maybe) Nothing tys
-deepUserTypeError_maybe (ForAllTy _ ty) = deepUserTypeError_maybe ty
-deepUserTypeError_maybe (FunTy { ft_arg = arg, ft_res = res })
-  = deepUserTypeError_maybe arg `firstJust` deepUserTypeError_maybe res
-deepUserTypeError_maybe (AppTy t1 t2)
-  = deepUserTypeError_maybe t1 `firstJust` deepUserTypeError_maybe t2
-deepUserTypeError_maybe (CastTy ty _)
-  = deepUserTypeError_maybe ty
-deepUserTypeError_maybe _   -- TyVarTy, CoercionTy, LitTy
-  = Nothing
-
 -- | Render a type corresponding to a user type error into a SDoc.
 pprUserTypeErrorTy :: ErrorMsgType -> SDoc
 pprUserTypeErrorTy ty =
@@ -1272,21 +1227,21 @@ pprUserTypeErrorTy ty =
 
     -- Text "Something"
     Just (tc,[txt])
-      | tyConName tc == typeErrorTextDataConName
+      | tc `hasKnownKey` typeErrorTextDataConKey
       , Just str <- isStrLitTy txt -> ftext str
 
     -- ShowType t
     Just (tc,[_k,t])
-      | tyConName tc == typeErrorShowTypeDataConName -> ppr t
+      | tc `hasKnownKey` typeErrorShowTypeDataConKey -> ppr t
 
     -- t1 :<>: t2
     Just (tc,[t1,t2])
-      | tyConName tc == typeErrorAppendDataConName ->
+      | tc `hasKnownKey` typeErrorAppendDataConKey ->
         pprUserTypeErrorTy t1 <> pprUserTypeErrorTy t2
 
     -- t1 :$$: t2
     Just (tc,[t1,t2])
-      | tyConName tc == typeErrorVAppendDataConName ->
+      | tc `hasKnownKey` typeErrorVAppendDataConKey ->
         pprUserTypeErrorTy t1 $$ pprUserTypeErrorTy t2
 
     -- An unevaluated type function
@@ -1464,8 +1419,6 @@ piResultTy ty arg = case piResultTy_maybe ty arg of
                       Nothing  -> pprPanic "piResultTy" (ppr ty $$ ppr arg)
 
 piResultTy_maybe :: Type -> Type -> Maybe Type
--- We don't need a 'tc' version, because
--- this function behaves the same for Type and Constraint
 piResultTy_maybe ty arg = case coreFullView ty of
   FunTy { ft_res = res } -> Just res
 
@@ -1952,16 +1905,31 @@ isForAllTy_co ty
 
   | otherwise = False
 
--- | Is this a function or forall?
+-- | Is this type a @FunTy@ or a @ForAllTy@, after expanding type synonyms?
+--
+-- Does not look through newtypes nor reduce type family applications.
 isPiTy :: Type -> Bool
 isPiTy ty = case coreFullView ty of
   ForAllTy {} -> True
   FunTy {}    -> True
   _           -> False
 
--- | Is this a function?
--- Note: `forall {b}. Show b => b -> IO b` will not be considered a function by this function.
---       It would merely be a forall wrapping a function type.
+-- | Is this type a function type (e.g. @X -> Y@ or @X => Y@),
+-- after expanding type synonyms?
+--
+-- Note:
+--
+--  - Does not look through newtypes, so 'isFunTy' is 'False' for @IO ()@,
+--    despite the latter being operationally a function (after expanding newtypes).
+--  - Does not reduce type family applications, so 'isFunTy' is 'False' for
+--    @Id (Int -> Bool)@ (where 'Id' is the identity type family).
+--  - Does not consider @ForAllTy@ to be a function type (even when the argument
+--    is a required argument), nor does it look through foralls.
+--    Hence both 'isFunTy' is 'False' for both @forall b. Show b => b -> b@
+--    and for @forall a -> Int@.
+--
+-- See also 'mightBeFunTy', when you want to know whether something could
+-- be a function (taking a value argument) at runtime.
 isFunTy :: Type -> Bool
 isFunTy ty
   | FunTy {} <- coreFullView ty = True
@@ -2270,7 +2238,7 @@ mkFamilyTyConApp :: TyCon -> [Type] -> Type
 --
 -- > mkFamilyTyConApp :RTL Int  =  T (Maybe Int)
 mkFamilyTyConApp tc tys
-  | Just (fam_tc, fam_tys) <- tyConFamInst_maybe tc
+  | Just (fam_tc, fam_tys) <- tyConDataFamInst_maybe tc
   , let tvs = tyConTyVars tc
         fam_subst = assertPpr (tvs `equalLength` tys) (ppr tc <+> ppr tys) $
                     zipTvSubst tvs tys
@@ -2295,12 +2263,30 @@ isFamFreeTy (ForAllTy _ ty)   = isFamFreeTy ty
 isFamFreeTy (CastTy ty _)     = isFamFreeTy ty
 isFamFreeTy (CoercionTy _)    = False  -- Not sure about this
 
-buildSynTyCon :: Name -> [KnotTied TyConBinder] -> Kind   -- ^ /result/ kind
+-- | Check whether a type is a data family type
+isDataFamilyApp :: Type -> Bool
+isDataFamilyApp ty = case tyConAppTyCon_maybe ty of
+                           Just tc -> isDataFamilyTyCon tc
+                           _       -> False
+
+isSatTyFamApp :: Type -> Maybe (TyCon, [Type])
+-- Return the argument if we have a saturated type family application
+-- Why saturated?  See (ATF4) in Note [Apartness and type families]
+isSatTyFamApp (TyConApp tc tys)
+  |  isTypeFamilyTyCon tc
+  && not (tys `lengthExceeds` tyConArity tc)  -- Not over-saturated
+  = Just (tc, tys)
+isSatTyFamApp _ = Nothing
+
+buildSynTyCon :: Name
+              -> KnotTied Kind
+              -> [KnotTied TyConBinder]
+              -> Kind   -- ^ /result/ kind
               -> [Role] -> KnotTied Type -> TyCon
 -- This function is here because here is where we have
 --   isFamFree and isTauTy
-buildSynTyCon name binders res_kind roles rhs
-  = mkSynonymTyCon name binders res_kind roles rhs
+buildSynTyCon name kind binders res_kind roles rhs
+  = mkSynonymTyCon name kind binders res_kind roles rhs
                    is_tau is_fam_free is_forgetful is_concrete
   where
     qtvs         = mkVarSet (map binderVar binders)
@@ -2462,12 +2448,6 @@ isAlgType ty
                             isAlgTyCon tc
       _other             -> False
 
--- | Check whether a type is a data family type
-isDataFamilyAppType :: Type -> Bool
-isDataFamilyAppType ty = case tyConAppTyCon_maybe ty of
-                           Just tc -> isDataFamilyTyCon tc
-                           _       -> False
-
 -- | Computes whether an argument (or let right hand side) should
 -- be computed strictly or lazily, based only on its type.
 -- Currently, it's just 'isUnliftedType'.
@@ -2482,7 +2462,7 @@ isTerminatingType :: HasDebugCallStack => Type -> Bool
 -- NB: unlifted types are not terminating types!
 --     e.g. you can write a term (loop 1)::Int# that diverges.
 isTerminatingType ty = case tyConAppTyCon_maybe ty of
-    Just tc -> isClassTyCon tc && not (isNewTyCon tc)
+    Just tc -> isTerminatingTyCon tc
     _       -> False
 
 isPrimitiveType :: Type -> Bool
@@ -2602,7 +2582,7 @@ Here are the key kinding rules for types
           t1 -> t2 : torc2 LiftedRep
           -- In fact the arrow varies with torc1/torc2
           -- See Note [Function type constructors and FunTy]
-          -- in GHC.Builtin.Types.Prim
+          -- in GHC.Builtin.WiredIn.Prim
 
           torc is TYPE or CONSTRAINT
           ty : body_torc rep
@@ -2731,9 +2711,11 @@ sORTKind_maybe (TyConApp tc tys)
 sORTKind_maybe _ = Nothing
 
 typeTypeOrConstraint :: HasDebugCallStack => Type -> TypeOrConstraint
--- Precondition: expects a type that classifies values.
--- Returns whether it is TypeLike or ConstraintLike.
--- Equivalent to calling sORTKind_maybe, but faster in the FunTy case
+-- ^ Returns whether the given type is 'TypeLike' or 'ConstraintLike'.
+--
+-- Equivalent to calling 'sORTKind_maybe', but faster in the 'FunTy' case.
+--
+-- __Precondition__: expects a type that classifies values.
 typeTypeOrConstraint ty
    = case coreFullView ty of
        FunTy { ft_af = af } -> funTyFlagResultTypeOrConstraint af
@@ -2900,7 +2882,7 @@ Most pretty-printing is either in GHC.Core.TyCo.Rep or GHC.Iface.Type.
 tyConAppNeedsKindSig
   :: Bool  -- ^ Should specified binders count towards injective positions in
            --   the kind of the TyCon? (If you're using visible kind
-           --   applications, then you want True here.
+           --   applications, then you want True here.)
   -> TyCon
   -> Int   -- ^ The number of args the 'TyCon' is applied to.
   -> Bool  -- ^ Does @T t_1 ... t_n@ need a kind signature? (Where @n@ is the
@@ -2913,8 +2895,7 @@ tyConAppNeedsKindSig spec_inj_pos tc n_args
           = splitAt n_args tc_binders
         result_kind  = mkTyConKind remaining_binders tc_res_kind
         result_vars  = tyCoVarsOfType result_kind
-        dropped_vars = fvVarSet $
-                       mapUnionFV injective_vars_of_binder dropped_binders
+        dropped_vars = mapUnionVarSet injective_vars_of_binder dropped_binders
 
     in not (subVarSet result_vars dropped_vars)
   where
@@ -2924,15 +2905,15 @@ tyConAppNeedsKindSig spec_inj_pos tc n_args
     -- Returns the variables that would be fixed by knowing a TyConBinder. See
     -- Note [When does a tycon application need an explicit kind signature?]
     -- for a more detailed explanation of what this function does.
-    injective_vars_of_binder :: TyConBinder -> FV
+    injective_vars_of_binder :: TyConBinder -> VarSet
     injective_vars_of_binder (Bndr tv vis) =
       case vis of
         AnonTCB        -> injectiveVarsOfType False -- conservative choice
                                               (varType tv)
         NamedTCB argf  | source_of_injectivity argf
-                       -> unitFV tv `unionFV`
+                       -> unitVarSet tv `unionVarSet`
                           injectiveVarsOfType False (varType tv)
-        _              -> emptyFV
+        _              -> emptyVarSet
 
     source_of_injectivity Required  = True
     source_of_injectivity Specified = spec_inj_pos
@@ -3286,7 +3267,7 @@ e.g., during comparison.
 
  3. We have a single, statically allocated top-level binding to
     represent `TyConApp GHC.Types.Type []` (namely
-    'GHC.Builtin.Types.Prim.liftedTypeKind'), ensuring that we don't
+    'GHC.Builtin.WiredIn.Prim.liftedTypeKind'), ensuring that we don't
     need to allocate such types (goal (a)).  See functions
     mkTYPEapp and mkBoxedRepApp
 
@@ -3366,7 +3347,7 @@ mkTYPEapp_maybe :: RuntimeRepType -> Maybe Type
 --     because those inner types should already have been rewritten
 --     to LiftedRep and UnliftedRep respectively, by mkTyConApp
 --
--- see Note [TYPE and CONSTRAINT] in GHC.Builtin.Types.Prim.
+-- see Note [TYPE and CONSTRAINT] in GHC.Builtin.WiredIn.Prim.
 -- See Note [Using synonyms to compress types] in GHC.Core.Type
 {-# NOINLINE mkTYPEapp_maybe #-}
 mkTYPEapp_maybe (TyConApp tc args)
@@ -3399,7 +3380,7 @@ mkBoxedRepApp_maybe :: LevityType -> Maybe Type
 -- On the fly, rewrite
 --      BoxedRep Lifted     -->   liftedRepTy    (a synonym)
 --      BoxedRep Unlifted   -->   unliftedRepTy  (ditto)
--- See Note [TYPE and CONSTRAINT] in GHC.Builtin.Types.Prim.
+-- See Note [TYPE and CONSTRAINT] in GHC.Builtin.WiredIn.Prim.
 -- See Note [Using synonyms to compress types] in GHC.Core.Type
 {-# NOINLINE mkBoxedRepApp_maybe #-}
 mkBoxedRepApp_maybe (TyConApp tc args)
@@ -3413,7 +3394,7 @@ mkTupleRepApp_maybe :: Type -> Maybe Type
 -- ^ Given a `[RuntimeRep]`, apply `TupleRep` to it
 -- On the fly, rewrite
 --      TupleRep [] -> zeroBitRepTy   (a synonym)
--- See Note [TYPE and CONSTRAINT] in GHC.Builtin.Types.Prim.
+-- See Note [TYPE and CONSTRAINT] in GHC.Builtin.WiredIn.Prim.
 -- See Note [Using synonyms to compress types] in GHC.Core.Type
 {-# NOINLINE mkTupleRepApp_maybe #-}
 mkTupleRepApp_maybe (TyConApp tc args)

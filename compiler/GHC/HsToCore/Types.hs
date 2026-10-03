@@ -7,7 +7,7 @@
 
 -- | Various types used during desugaring.
 module GHC.HsToCore.Types (
-        DsM, DsLclEnv(..), DsGblEnv(..),
+        DsM, DsLclEnv(..), DsGblEnv(..), LdiNablas(..),
         DsMetaEnv, DsMetaVal(..), CompleteMatches
     ) where
 
@@ -17,7 +17,9 @@ import Data.IORef
 
 import GHC.Types.CostCentre.State
 import GHC.Types.Error
+import GHC.Types.Name( KnownKeyNameMaps )
 import GHC.Types.Name.Env
+import GHC.Types.TypeEnv( TypeEnv )
 import GHC.Types.SrcLoc
 import GHC.Types.Var
 import GHC.Types.Var.Set
@@ -25,7 +27,7 @@ import GHC.Types.Name.Reader (GlobalRdrEnv)
 
 import GHC.Hs (LForeignDecl, HsExpr, GhcTc)
 
-import GHC.Tc.Types (TcRnIf, IfGblEnv, IfLclEnv)
+import GHC.Tc.Types (TcRnIf, IfGblEnv, IfLclEnv, TcMPluginsRun)
 
 import GHC.HsToCore.Pmc.Types (Nablas)
 import GHC.HsToCore.Errors.Types
@@ -59,32 +61,63 @@ presumably include source-file location information:
 data DsGblEnv
   = DsGblEnv
   { ds_mod          :: Module             -- For SCC profiling
+  , ds_gbl_rdr_env  :: GlobalRdrEnv
+        -- The GlobalRdrEnv is needed for the following reasons:
+        --    - to know what newtype constructors are in scope
+        --    - to check whether all members of a COMPLETE pragma are in scope
+        --    - when looking up know-key names
+  , ds_type_env     :: TypeEnv            -- Like tcg_type_enb
   , ds_fam_inst_env :: FamInstEnv         -- Like tcg_fam_inst_env
-  , ds_gbl_rdr_env  :: GlobalRdrEnv       -- needed only for the following reasons:
-                                          --    - to know what newtype constructors are in scope
-                                          --    - to check whether all members of a COMPLETE pragma are in scope
+  , ds_tcm_plugins :: TcMPluginsRun
+      -- ^ 'TcM' plugins, stored here so that we can invoke the typechecker
+      -- without having to repeatedly re-initialise them.
+      --
+      -- See Note [Stop TcM plugins after desugaring] in GHC.Driver.Main.
+
   , ds_name_ppr_ctx :: NamePprCtx
   , ds_msgs    :: IORef (Messages DsMessage) -- Diagnostic messages
   , ds_if_env  :: (IfGblEnv, IfLclEnv)    -- Used for looking up global,
                                           -- possibly-imported things
+
   , ds_complete_matches :: DsCompleteMatches
      -- Additional complete pattern matches
+
   , ds_cc_st   :: IORef CostCentreState
      -- Tracking indices for cost centre annotations
+
   , ds_next_wrapper_num :: IORef (ModuleEnv Int)
     -- ^ See Note [Generating fresh names for FFI wrappers]
+
+  , ds_static_binds :: IORef (OrdList (Id,CoreExpr))
+    -- ^ Static bindings
+    -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
+
+  , ds_known_key_maps :: IORef (Maybe KnownKeyNameMaps)
+    -- ^ Cache of the looked-up 'KnownKeyNameMaps'.
+    --
+    -- See also 'GHC.Tc.Types.tcg_known_key_maps'.
   }
 
 instance ContainsModule DsGblEnv where
   extractModule = ds_mod
+
+data LdiNablas
+  = NoPmc        -- Do desugaring only, no pattern-match checking
+                 --   See (DPM1) in Note [Desugaring HsExpr during pattern-match checking]
+  | Ldi Nablas   -- Do pattern match checking; here are "reaching values" Nablas
+
+instance Outputable LdiNablas where
+  ppr NoPmc    = text "NoPmc"
+  ppr (Ldi ns) = text "Ldi" <> braces (ppr ns)
 
 -- | Local state of the desugarer, extended as we lexically descend
 data DsLclEnv
   = DsLclEnv
   { dsl_meta    :: DsMetaEnv   -- ^ Template Haskell bindings
   , dsl_loc     :: RealSrcSpan -- ^ To put in pattern-matching error msgs
-  , dsl_nablas  :: Nablas
-  -- ^ See Note [Long-distance information] in "GHC.HsToCore.Pmc".
+
+  , dsl_nablas  :: LdiNablas
+  -- ^ See Note [Desugaring HsExpr during pattern-match checking], esp (DPM1)
   -- The set of reaching values Nablas is augmented as we walk inwards, refined
   -- through each pattern match in turn
 

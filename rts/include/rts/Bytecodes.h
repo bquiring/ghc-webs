@@ -23,6 +23,11 @@
    I hope that's clear :-)
 */
 
+/*
+   Make sure to update jumptable in rts/Interpreter.c when modifying
+   bytecodes! See Note [Instruction dispatch in the bytecode interpreter]
+   for details.
+*/
 #define bci_STKCHECK                    1
 #define bci_PUSH_L                      2
 #define bci_PUSH_LL                     3
@@ -113,6 +118,7 @@
 #define bci_PRIMCALL                    87
 
 #define bci_BCO_NAME                    88
+#define bci_HPC_TICK                    89
 
 #define bci_OP_ADD_64                   90
 #define bci_OP_SUB_64                   91
@@ -214,8 +220,6 @@
 #define bci_OP_INDEX_ADDR_32           242
 #define bci_OP_INDEX_ADDR_64           243
 
-#define bci_BRK_ALTS                   244
-
 
 /* If you need to go past 255 then you will run into the flags */
 
@@ -228,5 +232,11 @@
    rendering an explicit check unnecessary in the majority of
    cases. */
 #define INTERP_STACK_CHECK_THRESH 50
+
+/* Maximum nativeCallStackSpillSize for which we use a small stg_ctoi_tN
+   frame (no old_spill slot, no TSO access) instead of the generic
+   stg_ctoi_t frame.  Must match the stg_ctoi_tN definitions in
+   StgMiscClosures.cmm. */
+#define MAX_SMALL_TUPLE_CTOI    8
 
 /*-------------------------------------------------------------------------*/

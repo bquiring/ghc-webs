@@ -11,7 +11,7 @@ terminates = delay 1 >> pure "terminates"
 delay s = threadDelay (1000000 * s)
 
 async :: IO a -> IO (STM a)
-async a = do 
+async a = do
   var <- atomically (newTVar Nothing)
   forkIO (a >>= atomically . writeTVar var . Just)
   pure (readTVar var >>= maybe retry pure)

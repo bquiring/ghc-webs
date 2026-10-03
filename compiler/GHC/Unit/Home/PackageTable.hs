@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 -- | The 'HomePackageTable' (HPT) contains information about all modules that are part
 -- of a home package. At its core, the information for each module is a
 -- 'HomeModInfo'.
@@ -41,12 +40,12 @@ module GHC.Unit.Home.PackageTable
     -- * Queries about home modules
   , hptCompleteSigs
   , hptAllInstances
+  , hptAllFamInstances
   , hptAllAnnotations
 
     -- ** More Traversal-based queries
   , hptCollectDependencies
-  , hptCollectObjects
-  , hptCollectModules
+  , hptCollectHomeModInfo
 
     -- ** Memory dangerous queries
   , concatHpt
@@ -74,7 +73,6 @@ module GHC.Unit.Home.PackageTable
   ) where
 
 import GHC.Prelude
-import GHC.Data.Maybe
 
 import Data.IORef
 import Control.Monad ((<$!>))
@@ -82,7 +80,6 @@ import qualified Data.Set as Set
 
 import GHC.Core.FamInstEnv
 import GHC.Core.InstEnv
-import GHC.Linker.Types
 import GHC.Types.Annotations
 import GHC.Types.CompleteMatch
 import GHC.Types.Unique.DFM
@@ -207,6 +204,14 @@ hptAllInstances hpt = do
   let (insts, famInsts) = unzip hits
   return (foldl' unionInstEnv emptyInstEnv insts, concat famInsts)
 
+-- | Find all the family instance declarations from the HPT
+hptAllFamInstances :: HomePackageTable -> IO (ModuleEnv FamInstEnv)
+hptAllFamInstances = fmap mkModuleEnv . concatHpt (\hmi -> [(hmiModule hmi, hmiFamInstEnv hmi)])
+  where
+    hmiModule     = mi_module . hm_iface
+    hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
+                      . md_fam_insts . hm_details
+
 -- | All annotations from the HPT
 hptAllAnnotations :: HomePackageTable -> IO AnnEnv
 hptAllAnnotations = fmap mkAnnEnv . concatHpt (md_anns . hm_details)
@@ -233,20 +238,11 @@ hptCollectDependencies HPT{table} = do
 -- The linkable objects are given by @'homeModInfoObject'@.
 --
 -- $O(n)$ in the number of modules in the HPT.
-hptCollectObjects :: HomePackageTable -> IO [Linkable]
-hptCollectObjects HPT{table} = do
+hptCollectHomeModInfo :: HomePackageTable -> IO [HomeModInfo]
+hptCollectHomeModInfo HPT{table} = do
   hpt <- readIORef table
   return $
-    foldr ((:) . expectJust . homeModInfoObject) [] hpt
-
--- | Collect all module ifaces in the HPT
---
--- $O(n)$ in the number of modules in the HPT.
-hptCollectModules :: HomePackageTable -> IO [Module]
-hptCollectModules HPT{table} = do
-  hpt <- readIORef table
-  return $
-    foldr ((:) . mi_module . hm_iface) [] hpt
+    foldr (:) [] hpt
 
 --------------------------------------------------------------------------------
 -- * Utilities

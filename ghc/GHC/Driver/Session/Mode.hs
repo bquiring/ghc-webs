@@ -1,7 +1,5 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE TupleSections #-}
 module GHC.Driver.Session.Mode where
 
 import GHC.Driver.CmdLine
@@ -79,6 +77,7 @@ isShowGhciUsageMode _ = False
 
 data PostLoadMode
   = ShowInterface FilePath  -- ghc --show-iface
+  | ShowByteCode FilePath   -- ghc --show-byte-code
   | DoMkDependHS            -- ghc -M
   | StopBefore StopPhase    -- ghc -E | -C | -S
                             -- StopBefore StopLn is the default
@@ -102,6 +101,9 @@ showUnitsMode = mkPostLoadMode ShowPackages
 
 showInterfaceMode :: FilePath -> Mode
 showInterfaceMode fp = mkPostLoadMode (ShowInterface fp)
+
+showByteCodeMode :: FilePath -> Mode
+showByteCodeMode fp = mkPostLoadMode (ShowByteCode fp)
 
 stopBeforeMode :: StopPhase -> Mode
 stopBeforeMode phase = mkPostLoadMode (StopBefore phase)
@@ -134,7 +136,7 @@ isDoEvalMode :: Mode -> Bool
 isDoEvalMode (Right (Right (DoEval _))) = True
 isDoEvalMode _ = False
 
-#if defined(HAVE_INTERNAL_INTERPRETER)
+#if defined(HAVE_INTERPRETER)
 isInteractiveMode :: PostLoadMode -> Bool
 isInteractiveMode DoInteractive = True
 isInteractiveMode _             = False
@@ -178,7 +180,7 @@ parseModeFlags :: [Located String]
                       [Warn])
 parseModeFlags args = do
   ((leftover, errs1, warns), (mModeFlag, units, errs2, flags')) <-
-        processCmdLineP mode_flags (Nothing, [], [], []) args
+        processCmdLineP mode_flags_trie (Nothing, [], [], []) args
   let mode = case mModeFlag of
              Nothing     -> doMakeMode
              Just (m, _) -> m
@@ -189,9 +191,13 @@ parseModeFlags args = do
 
   return (mode, units, flags' ++ leftover, warns)
 
-type ModeM = CmdLineP (Maybe (Mode, String), [String], [String], [Located String])
+type ModeMS = (Maybe (Mode, String), [String], [String], [Located String])
+type ModeM = CmdLineP ModeMS
   -- mode flags sometimes give rise to new DynFlags (eg. -C, see below)
   -- so we collect the new ones and return them.
+
+mode_flags_trie :: FlagSpecTrie ModeMS
+mode_flags_trie = mkFlagSpecTrie mode_flags
 
 mode_flags :: [Flag ModeM]
 mode_flags =
@@ -233,9 +239,11 @@ mode_flags =
         replaceSpace ' ' = '-'
         replaceSpace c   = c
   ] ++
-      ------- interfaces ----------------------------------------------------
-  [ defFlag "-show-iface"  (HasArg (\f -> setMode (showInterfaceMode f)
+      ------- textual output of generated data -----------------------------
+  [ defFlag "-show-iface"     (HasArg (\f -> setMode (showInterfaceMode f)
                                                "--show-iface"))
+  , defFlag "-show-byte-code" (HasArg (\f -> setMode (showByteCodeMode  f)
+                                               "--show-byte-code"))
 
       ------- primary modes ------------------------------------------------
   , defFlag "c"            (PassFlag (\f -> do setMode (stopBeforeMode NoStop) f

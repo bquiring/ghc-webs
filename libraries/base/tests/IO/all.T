@@ -182,7 +182,19 @@ test('T17414',
      compile_and_run, [''])
 test('T17510', expect_broken(17510), compile_and_run, [''])
 test('bytestringread001', extra_run_opts('test.data'), compile_and_run, [''])
-test('T17912', [only_ways(['threaded1']), when(opsys('mingw32'),expect_broken(1))], compile_and_run, [''])
+test('T17912', [only_ways(['threaded1']), when(opsys('mingw32'),fragile(24739))], compile_and_run, [''])
 test('T18832', only_ways(['threaded1']), compile_and_run, [''])
 
 test('mkdirExists', [exit_code(1), when(opsys('mingw32'), ignore_stderr)], compile_and_run, [''])
+
+test('osHandles001FileDescriptors', omit_ways(['winio', 'winio_threaded']), compile_and_run, [''])
+test('osHandles001WindowsHandles', only_ways(['winio', 'winio_threaded']), compile_and_run, [''])
+test('osHandles002FileDescriptors', [when(opsys('mingw32'), skip), when(arch('javascript'), skip)], compile_and_run, [''])
+test('osHandles002WindowsHandles', only_ways(['winio', 'winio_threaded']), compile_and_run, [''])
+# It would be good to let `osHandles002FileDescriptors` run also on
+# Windows with the file-descriptor-based I/O manager. However, this
+# test, as it is currently implemented, requires the `unix` package.
+# That said, `UCRT.DLL`, which is used by GHC-generated Windows
+# executables, emulates part of POSIX, enough for this test. As a
+# result, this test could be generalized to also supporting Windows, but
+# this would likely involve creating bindings to C code.

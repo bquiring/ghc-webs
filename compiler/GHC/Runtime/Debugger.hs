@@ -30,6 +30,8 @@ import GHC.Runtime.Heap.Inspect
 import GHC.Runtime.Interpreter
 import GHC.Runtime.Context
 
+import GHC.Builtin.WiredIn.Ids (ghcPrimIds)
+
 import GHC.Iface.Syntax ( showToHeader )
 import GHC.Iface.Env    ( newInteractiveBinder )
 import GHC.Core.Type
@@ -42,7 +44,6 @@ import GHC.Utils.Exception
 import GHC.Utils.Logger
 
 import GHC.Types.Id
-import GHC.Types.Id.Make (ghcPrimIds)
 import GHC.Types.Name
 import GHC.Types.Var hiding ( varName )
 import GHC.Types.Var.Set
@@ -56,6 +57,7 @@ import Data.List ( partition )
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Data.IORef
+import GHC.Linker.Types
 
 -------------------------------------
 -- | The :print & friends commands
@@ -161,7 +163,7 @@ bindSuspensions t = do
                 | (name,ty) <- zip names tys]
           new_ic = extendInteractiveContextWithIds ictxt ids
           interp = hscInterp hsc_env
-      liftIO $ extendLoadedEnv interp (zip names fhvs)
+      liftIO $ extendLoadedEnv interp modifyHomePackageBytecodeState (zip names fhvs)
       setSession hsc_env {hsc_IC = new_ic }
       return t'
      where

@@ -34,6 +34,7 @@ module GHC.Internal.Data.IORef
 import GHC.Internal.Base
 import GHC.Internal.STRef
 import GHC.Internal.IORef
+import GHC.Internal.Prim (mkWeak#, seq)
 import GHC.Internal.Weak
 
 -- |Make a 'Weak' pointer to an 'IORef', using the second argument as a finalizer

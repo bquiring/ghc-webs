@@ -1,6 +1,7 @@
-{-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE RecordWildCards #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-x-internalDebugPprMsgEnvelope #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -11,7 +12,7 @@
 -- getters...).
 module GHC.Tc.Utils.Monad(
   -- * Initialisation
-  initTc, initTcWithGbl, initTcInteractive, initTcRnIf,
+  initTc, initTcInteractive, initTcRnIf,
 
   -- * Simple accessors
   discardResult,
@@ -30,6 +31,11 @@ module GHC.Tc.Utils.Monad(
   getEps,
   updateEps, updateEps_,
   getHpt, getEpsAndHug,
+
+  -- * Initialising TcM plugins
+  TcMPluginHandling(..),
+  withTcMPlugins, shutdownTcMPluginsIO,
+  rewriterTcMPlugins, holeFitTcMPlugins, defaultingTcMPlugins, solverTcMPlugins,
 
   -- * Arrow scopes
   newArrowScope, escapeArrowScope,
@@ -50,16 +56,16 @@ module GHC.Tc.Utils.Monad(
   debugTc,
 
   -- * Typechecker global environment
-  getIsGHCi, getGHCiMonad, getInteractivePrintName,
+  getIsGHCi,
   tcHscSource, tcIsHsBootOrSig, tcIsHsig, tcSelfBootInfo, getGlobalRdrEnv,
   getRdrEnvs, getImports,
   getFixityEnv, extendFixityEnv,
   getDeclaredDefaultTys,
-  addDependentFiles,
+  addDependentFiles, addDependentDirectories,
 
   -- * Error management
-  getSrcSpanM, setSrcSpan, setSrcSpanA, addLocM,
-  inGeneratedCode, setInGeneratedCode,
+  getSrcSpanM, getRealSrcSpanM, setSrcSpan, setSrcSpanA, addLocM,
+  inGeneratedCode,
   wrapLocM, wrapLocFstM, wrapLocFstMA, wrapLocSndM, wrapLocSndMA, wrapLocM_,
   wrapLocMA_,wrapLocMA,
   getErrsVar, setErrsVar,
@@ -83,8 +89,9 @@ module GHC.Tc.Utils.Monad(
   ifErrsM, failIfErrsM,
 
   -- * Context management for the type checker
-  getErrCtxt, setErrCtxt, addErrCtxt, addErrCtxtM, addLandmarkErrCtxt,
-  addLandmarkErrCtxtM, popErrCtxt, getCtLocM, setCtLocM, mkCtLocEnv,
+  getErrCtxt, setErrCtxt, addErrCtxt,
+  addExprCtxt,
+  popErrCtxt, getCtLocM, setCtLocM, mkCtLocEnv,
 
   -- * Diagnostic message generation (type checker)
   addErrTc,
@@ -93,7 +100,7 @@ module GHC.Tc.Utils.Monad(
   checkTc, checkTcM,
   checkJustTc, checkJustTcM,
   failIfTc, failIfTcM,
-  mkErrCtxt,
+  tidyErrCtxt,
   addTcRnDiagnostic, addDetailedDiagnostic,
   mkTcRnMessage, reportDiagnostic, reportDiagnostics,
   warnIf, diagnosticTc, diagnosticTcM,
@@ -101,11 +108,12 @@ module GHC.Tc.Utils.Monad(
 
   -- * Type constraints
   newTcEvBinds, newNoTcEvBinds, cloneEvBindsVar,
-  addTcEvBind, addTcEvBinds, addTopEvBinds,
-  getTcEvBindsMap, setTcEvBindsMap, updTcEvBinds,
-  getTcEvTyCoVars, chooseUniqueOccTc,
+  addTcEvCoBind, addTcEvBind,
+  getTcEvBindsMap, getTcEvBindsState,
+  setTcEvBindsMap, combineTcEvBinds, addNeededEvIds,
+  chooseUniqueOccTc,
   getConstraintVar, setConstraintVar,
-  emitConstraints, emitStaticConstraints, emitSimple, emitSimples,
+  emitConstraints, emitSimple, emitSimples,
   emitImplication, emitImplications, ensureReflMultiplicityCo,
   emitDelayedErrors, emitHole, emitHoles, emitNotConcreteError,
   discardConstraints, captureConstraints, tryCaptureConstraints,
@@ -115,6 +123,7 @@ module GHC.Tc.Utils.Monad(
   getLclTypeEnv, setLclTypeEnv,
   traceTcConstraints,
   emitNamedTypeHole, IsExtraConstraint(..), emitAnonTypeHole,
+  fillCoercionHole,
 
   -- * Template Haskell context
   recordThUse, recordThNeededRuntimeDeps,
@@ -146,7 +155,7 @@ module GHC.Tc.Utils.Monad(
   getCCIndexM, getCCIndexTcM,
 
   -- * Zonking
-  liftZonkM, newZonkAnyType,
+  liftZonkM, newUnusedType,
 
   -- * Complete matches
   localAndImportedCompleteMatches, getCompleteMatchesTcM,
@@ -159,14 +168,16 @@ module GHC.Tc.Utils.Monad(
 import GHC.Prelude
 
 
-import GHC.Builtin.Names
-import GHC.Builtin.Types( zonkAnyTyCon )
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Types( unusedTypeTyCon )
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.Errors.Hole.Plugin ( HoleFitPlugin, HoleFitPluginR (..) )
 import GHC.Tc.Types     -- Re-export all
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Types.ErrCtxt
 import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.TcRef
@@ -183,13 +194,18 @@ import GHC.Unit.Module.Warnings
 import GHC.Unit.Home.PackageTable
 
 import GHC.Core.UsageEnv
+import GHC.Core.Coercion ( isReflCo )
 import GHC.Core.Multiplicity
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Core.Type( mkNumLitTy )
+import GHC.Core.Type( mkStrLitTy )
+import GHC.Core.TyCo.Rep( CoercionHole(..) )
+import GHC.Core.TyCo.FVs( coVarsOfCo )
+import GHC.Core.TyCon ( TyCon )
 
 import GHC.Driver.Env
 import GHC.Driver.Env.KnotVars
+import GHC.Driver.Plugins ( Plugin(..), mapPlugins )
 import GHC.Driver.Session
 import GHC.Driver.Config.Diagnostic
 
@@ -207,6 +223,7 @@ import GHC.Data.Maybe
 
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Error
+import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
@@ -222,26 +239,28 @@ import GHC.Types.SafeHaskell
 import GHC.Types.Id
 import GHC.Types.TypeEnv
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
 import GHC.Types.SrcLoc
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Name.Ppr
-import GHC.Types.Unique.FM ( emptyUFM )
+import GHC.Types.Unique.FM ( UniqFM, emptyUFM, sequenceUFMList )
 import GHC.Types.Unique.DFM
 import GHC.Types.Unique.Supply
+import GHC.Types.Unique (uniqueTag)
 import GHC.Types.Annotations
-import GHC.Types.Basic( TopLevelFlag(..), TypeOrKind(..) )
+import GHC.Types.Basic( TypeOrKind(..) )
 import GHC.Types.CostCentre.State
 import GHC.Types.SourceFile
 
 import qualified GHC.LanguageExtensions as LangExt
 
-import Data.IORef
+import Control.Exception ( throwIO )
 import Control.Monad
-
+import Control.Monad.Catch ( bracket_, finally, onException, mask, mask_, MonadCatch )
+import Data.Foldable (traverse_)
+import Data.IORef
 import qualified Data.Map as Map
-import GHC.Core.Coercion (isReflCo)
-
 
 {-
 ************************************************************************
@@ -251,138 +270,194 @@ import GHC.Core.Coercion (isReflCo)
 ************************************************************************
 -}
 
--- | Setup the initial typechecking environment
-initTc :: HscEnv
-       -> HscSource
-       -> Bool          -- True <=> retain renamed syntax trees
-       -> Module
-       -> RealSrcSpan
-       -> TcM r
-       -> IO (Messages TcRnMessage, Maybe r)
-                -- Nothing => error thrown by the thing inside
-                -- (error messages should have been printed already)
+-- | How should 'TcM' plugins be handled when initialising of the
+-- typechecker? See Note [Stop TcM plugins after desugaring].
+--
+-- Usage:
+--
+--  1. If you want to typecheck then desugar, use 'StartAndKeepRunningTcMPlugins'.
+--     This will ensure 'TcM' plugins are kept running for the benefit of the
+--     pattern-match checker, and shut down after desugaring.
+--  2. If you only want to typecheck and not desugar, use 'StartAndStopTcMPlugins'.
+--  3. If a prior operation has started 'TcM' plugins, you can use 'UseRunningTcMPlugins'
+--     to avoid re-initialising the plugins, for example in 'initTc'.
+--  4. If you don't care about 'TcM' plugins at all, you can use 'NoTcMPlugins'.
+data TcMPluginHandling
+  -- | Start 'TcM' plugins, run the inner action, then shut down all 'TcM' plugins.
+  --
+  -- Use this if you only need to run the typechecker, and do not intend to
+  -- proceed to desugaring (in which case you should use 'StartAndKeepRunningTcMPlugins').
+  = StartAndStopTcMPlugins
+  -- | Start 'TcM' plugins, run the inner action, then run the "post-tc"
+  -- actions of the plugins, but keep the 'TcM' plugins running.
+  --
+  -- Use this when you intend to proceed to desugaring, as the desugarer wants
+  -- 'TcM' plugins to be running (for solver invocations via the pattern match checker).
+  -- The desugarer will then shut down all 'TcM' plugins.
+  --
+  -- If you only intend to typecheck, without desugaring, you should use
+  -- 'StartAndStopTcMPlugins'.
+  | StartAndKeepRunningTcMPlugins
+  -- | Use the 'TcM' plugins that are already running.
+  --
+  -- Use this when a prior operation has already initialised 'TcM' plugins
+  -- in order to avoid re-initialising them.
+  --
+  -- NB: this will cause a crash if the plugins are not running (either not
+  -- started or already stopped).
+  | UseRunningTcMPlugins
 
-initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
- = do { keep_var     <- newIORef emptyNameSet ;
-        used_gre_var <- newIORef [] ;
-        th_var       <- newIORef False ;
-        infer_var    <- newIORef True ;
-        infer_reasons_var <- newIORef emptyMessages ;
-        dfun_n_var   <- newIORef emptyOccSet ;
-        zany_n_var   <- newIORef 0 ;
-        let { type_env_var = hsc_type_env_vars hsc_env };
+  -- | Don't use any 'TcM' plugins.
+  | NoTcMPlugins
 
-        dependent_files_var <- newIORef [] ;
-        static_wc_var       <- newIORef emptyWC ;
-        cc_st_var           <- newIORef newCostCentreState ;
-        th_topdecls_var      <- newIORef [] ;
-        th_foreign_files_var <- newIORef [] ;
-        th_topnames_var      <- newIORef emptyNameSet ;
-        th_modfinalizers_var <- newIORef [] ;
-        th_coreplugins_var <- newIORef [] ;
-        th_state_var         <- newIORef Map.empty ;
-        th_remote_state_var  <- newIORef Nothing ;
-        th_docs_var          <- newIORef Map.empty ;
-        th_needed_deps_var   <- newIORef ([], emptyUDFM) ;
-        next_wrapper_num     <- newIORef emptyModuleEnv ;
-        let {
-             -- bangs to avoid leaking the env (#19356)
-             !dflags = hsc_dflags hsc_env ;
-             !mhome_unit = hsc_home_unit_maybe hsc_env;
-             !logger = hsc_logger hsc_env ;
+-- | Set up the typechecking environment.
+initTc
+  :: TcMPluginHandling
+  -> HscEnv
+  -> HscSource
+  -> Bool      -- True <=> retain renamed syntax trees
+  -> Module
+  -> RealSrcSpan
+  -> TcM r
+  -> IO (Messages TcRnMessage, Maybe r)
+initTc plugin_handling hsc_env hsc_src keep_rn_syntax mod loc do_this
+  = do { gbl_env <- initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc
+       ; initTcWithGbl hsc_env gbl_env loc $
+           case plugin_handling of
+             StartAndStopTcMPlugins ->
+               withTcMPlugins hsc_env do_this
+             StartAndKeepRunningTcMPlugins -> mask $ \restore -> do
+               -- Initialise the plugins
+               restore $ initTcMPlugins hsc_env
 
-             maybe_rn_syntax :: forall a. a -> Maybe a ;
-             maybe_rn_syntax empty_val
-                | logHasDumpFlag logger Opt_D_dump_rn_ast = Just empty_val
+               -- Run the inner action and then the "post-tc" action.
+               (restore do_this `finally` tcMPluginsPostTc)
+                 `onException` shutdownTcMPluginsTcM
+                 -- If an uncaught exception escapes TcM, ensure TcM plugins are
+                 -- shut down, because we won't progress to desugaring (which
+                 -- would otherwise be responsible for shutting down plugins).
+             UseRunningTcMPlugins -> do
+               do_this
+             NoTcMPlugins -> do
+               withoutTcMPlugins do_this
+        }
 
-                | gopt Opt_WriteHie dflags       = Just empty_val
 
-                  -- We want to serialize the documentation in the .hi-files,
-                  -- and need to extract it from the renamed syntax first.
-                  -- See 'GHC.HsToCore.Docs.extractDocs'.
-                | gopt Opt_Haddock dflags       = Just empty_val
+-- | Create an empty 'TcGblEnv'.
+initTcGblEnv :: HscEnv -> HscSource -> Bool -> Module -> RealSrcSpan -> IO TcGblEnv
+initTcGblEnv hsc_env hsc_src keep_rn_syntax mod loc =
+  do { keep_var             <- newIORef emptyNameSet
+     ; used_gre_var         <- newIORef []
+     ; th_var               <- newIORef False
+     ; infer_var            <- newIORef True
+     ; infer_reasons_var    <- newIORef emptyMessages
+     ; dfun_n_var           <- newIORef emptyOccSet
+     ; zany_n_var           <- newIORef 0
+     ; dependent_files_var  <- newIORef []
+     ; dependent_dirs_var   <- newIORef []
+     ; cc_st_var            <- newIORef newCostCentreState
+     ; th_topdecls_var      <- newIORef []
+     ; th_foreign_files_var <- newIORef []
+     ; th_topnames_var      <- newIORef emptyNameSet
+     ; th_modfinalizers_var <- newIORef []
+     ; th_coreplugins_var   <- newIORef []
+     ; th_state_var         <- newIORef Map.empty
+     ; th_remote_state_var  <- newIORef Nothing
+     ; th_docs_var          <- newIORef Map.empty
+     ; th_needed_deps_var   <- newIORef ([], emptyUDFM)
+     ; tcm_plugins_var      <- newIORef TcMPluginsUninitialised
+     ; next_wrapper_num     <- newIORef emptyModuleEnv
+     ; known_key_maps_var   <- newIORef Nothing
+     ; let
+        -- bangs to avoid leaking the env (#19356)
+        !dflags = hsc_dflags hsc_env
+        !mhome_unit = hsc_home_unit_maybe hsc_env
+        !logger = hsc_logger hsc_env
 
-                | keep_rn_syntax                = Just empty_val
-                | otherwise                     = Nothing ;
+        maybe_rn_syntax :: forall a. a -> Maybe a ;
+        maybe_rn_syntax empty_val
+           | logHasDumpFlag logger Opt_D_dump_rn_ast = Just empty_val
 
-             gbl_env = TcGblEnv {
-                tcg_th_topdecls      = th_topdecls_var,
-                tcg_th_foreign_files = th_foreign_files_var,
-                tcg_th_topnames      = th_topnames_var,
-                tcg_th_modfinalizers = th_modfinalizers_var,
-                tcg_th_coreplugins = th_coreplugins_var,
-                tcg_th_state         = th_state_var,
-                tcg_th_remote_state  = th_remote_state_var,
-                tcg_th_docs          = th_docs_var,
+           | gopt Opt_WriteHie dflags       = Just empty_val
 
-                tcg_mod            = mod,
-                tcg_semantic_mod   = homeModuleInstantiation mhome_unit mod,
-                tcg_src            = hsc_src,
-                tcg_rdr_env        = emptyGlobalRdrEnv,
-                tcg_fix_env        = emptyNameEnv,
-                tcg_default        = emptyDefaultEnv,
-                tcg_default_exports = emptyDefaultEnv,
-                tcg_type_env       = emptyNameEnv,
-                tcg_type_env_var   = type_env_var,
-                tcg_inst_env       = emptyInstEnv,
-                tcg_fam_inst_env   = emptyFamInstEnv,
-                tcg_ann_env        = emptyAnnEnv,
-                tcg_complete_match_env = [],
-                tcg_th_used        = th_var,
-                tcg_th_needed_deps = th_needed_deps_var,
-                tcg_exports        = [],
-                tcg_imports        = emptyImportAvails,
-                tcg_import_decls   = [],
-                tcg_used_gres     = used_gre_var,
-                tcg_dus            = emptyDUs,
+             -- We want to serialize the documentation in the .hi-files,
+             -- and need to extract it from the renamed syntax first.
+             -- See 'GHC.HsToCore.Docs.extractDocs'.
+           | gopt Opt_Haddock dflags       = Just empty_val
 
-                tcg_rn_imports     = [],
-                tcg_rn_exports     =
-                    if hsc_src == HsigFile
-                        -- Always retain renamed syntax, so that we can give
-                        -- better errors.  (TODO: how?)
-                        then Just []
-                        else maybe_rn_syntax [],
-                tcg_rn_decls       = maybe_rn_syntax emptyRnGroup,
-                tcg_tr_module      = Nothing,
-                tcg_binds          = emptyLHsBinds,
-                tcg_imp_specs      = [],
-                tcg_sigs           = emptyNameSet,
-                tcg_ksigs          = emptyNameSet,
-                tcg_ev_binds       = emptyBag,
-                tcg_warns          = emptyWarn,
-                tcg_anns           = [],
-                tcg_tcs            = [],
-                tcg_insts          = [],
-                tcg_fam_insts      = [],
-                tcg_rules          = [],
-                tcg_fords          = [],
-                tcg_patsyns        = [],
-                tcg_merged         = [],
-                tcg_dfun_n         = dfun_n_var,
-                tcg_zany_n         = zany_n_var,
-                tcg_keep           = keep_var,
-                tcg_hdr_info        = (Nothing,Nothing),
-                tcg_main           = Nothing,
-                tcg_self_boot      = NoSelfBoot,
-                tcg_safe_infer     = infer_var,
-                tcg_safe_infer_reasons = infer_reasons_var,
-                tcg_dependent_files = dependent_files_var,
-                tcg_tc_plugin_solvers   = [],
-                tcg_tc_plugin_rewriters = emptyUFM,
-                tcg_defaulting_plugins  = [],
-                tcg_hf_plugins     = [],
-                tcg_top_loc        = loc,
-                tcg_static_wc      = static_wc_var,
-                tcg_complete_matches = [],
-                tcg_cc_st          = cc_st_var,
-                tcg_next_wrapper_num = next_wrapper_num
-             } ;
-        } ;
+           | keep_rn_syntax                = Just empty_val
+           | otherwise                     = Nothing ;
 
-        -- OK, here's the business end!
-        initTcWithGbl hsc_env gbl_env loc do_this
-    }
+      ; return $ TcGblEnv
+          { tcg_th_topdecls        = th_topdecls_var
+          , tcg_th_foreign_files   = th_foreign_files_var
+          , tcg_th_topnames        = th_topnames_var
+          , tcg_th_modfinalizers   = th_modfinalizers_var
+          , tcg_th_coreplugins     = th_coreplugins_var
+          , tcg_th_state           = th_state_var
+          , tcg_th_remote_state    = th_remote_state_var
+          , tcg_th_docs            = th_docs_var
+
+          , tcg_mod                = mod
+          , tcg_semantic_mod       = homeModuleInstantiation mhome_unit mod
+          , tcg_src                = hsc_src
+          , tcg_rdr_env            = emptyGlobalRdrEnv
+          , tcg_fix_env            = emptyNameEnv
+          , tcg_default            = emptyDefaultEnv
+          , tcg_default_exports    = emptyDefaultEnv
+          , tcg_type_env           = emptyNameEnv
+          , tcg_knot_vars          = hsc_type_env_vars hsc_env
+          , tcg_known_key_maps     = known_key_maps_var
+          , tcg_inst_env           = emptyInstEnv
+          , tcg_fam_inst_env       = emptyFamInstEnv
+          , tcg_ann_env            = emptyAnnEnv
+          , tcg_complete_match_env = []
+          , tcg_th_used            = th_var
+          , tcg_th_needed_deps     = th_needed_deps_var
+          , tcg_exports            = []
+          , tcg_imports            = emptyImportAvails
+          , tcg_import_decls       = []
+          , tcg_used_gres          = used_gre_var
+          , tcg_dus                = emptyDUs
+
+          , tcg_rn_imports = []
+          , tcg_rn_exports = if hsc_src == HsigFile
+                             -- Always retain renamed syntax, so that we can give
+                             -- better errors.  (TODO: how?)
+                             then Just []
+                             else maybe_rn_syntax []
+          , tcg_rn_decls            = maybe_rn_syntax emptyRnGroup
+          , tcg_tr_module           = Nothing
+          , tcg_binds               = emptyLHsBinds
+          , tcg_imp_specs           = []
+          , tcg_sigs                = emptyNameSet
+          , tcg_ksigs               = emptyNameSet
+          , tcg_ev_binds            = emptyBag
+          , tcg_warns               = emptyWarn
+          , tcg_anns                = []
+          , tcg_tcs                 = []
+          , tcg_insts               = []
+          , tcg_fam_insts           = []
+          , tcg_rules               = []
+          , tcg_fords               = []
+          , tcg_patsyns             = []
+          , tcg_merged              = []
+          , tcg_dfun_n              = dfun_n_var
+          , tcg_zany_n              = zany_n_var
+          , tcg_keep                = keep_var
+          , tcg_hdr_info            = (Nothing,Nothing)
+          , tcg_main                = Nothing
+          , tcg_self_boot           = NoSelfBoot
+          , tcg_safe_infer          = infer_var
+          , tcg_safe_infer_reasons  = infer_reasons_var
+          , tcg_dependent_files     = dependent_files_var
+          , tcg_dependent_dirs      = dependent_dirs_var
+          , tcg_plugins             = tcm_plugins_var
+          , tcg_top_loc             = loc
+          , tcg_complete_matches    = []
+          , tcg_cc_st               = cc_st_var
+          , tcg_next_wrapper_num    = next_wrapper_num
+      } }
 
 -- | Run a 'TcM' action in the context of an existing 'GblEnv'.
 initTcWithGbl :: HscEnv
@@ -399,7 +474,7 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_loc        = loc,
                 -- tcl_loc should be over-ridden very soon!
                 tcl_in_gen_code = False,
-                tcl_ctxt       = [],
+                tcl_err_ctxt   = [],
                 tcl_rdr        = emptyLocalRdrEnv,
                 tcl_th_ctxt    = topLevel,
                 tcl_th_bndrs   = emptyNameEnv,
@@ -413,7 +488,7 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_errs       = errs_var
                 }
 
-      ; maybe_res <- initTcRnIf 'a' hsc_env gbl_env lcl_env $
+      ; maybe_res <- initTcRnIf TcTag hsc_env gbl_env lcl_env $
                      do { r <- tryM do_this
                         ; case r of
                           Right res -> return (Just res)
@@ -437,24 +512,28 @@ initTcWithGbl hsc_env gbl_env loc do_this
       ; return (msgs, final_res)
       }
 
-initTcInteractive :: HscEnv -> TcM a -> IO (Messages TcRnMessage, Maybe a)
--- Initialise the type checker monad for use in GHCi
-initTcInteractive hsc_env thing_inside
-  = initTc hsc_env HsSrcFile False
+-- | Initialise the type checker monad for use in GHCi.
+initTcInteractive
+  :: TcMPluginHandling
+  -> HscEnv
+  -> TcM a
+  -> IO (Messages TcRnMessage, Maybe a)
+initTcInteractive tcm_plugin_handling hsc_env thing_inside
+  = initTc tcm_plugin_handling hsc_env HsSrcFile False
            (icInteractiveModule (hsc_IC hsc_env))
            (realSrcLocSpan interactive_src_loc)
            thing_inside
   where
     interactive_src_loc = mkRealSrcLoc (fsLit "<interactive>") 1 1
 
-initTcRnIf :: Char              -- ^ Tag for unique supply
+initTcRnIf :: UniqueTag              -- ^ Tag for unique supply
            -> HscEnv
            -> gbl -> lcl
            -> TcRnIf gbl lcl a
            -> IO a
 initTcRnIf uniq_tag hsc_env gbl_env lcl_env thing_inside
    = do { let { env = Env { env_top = hsc_env,
-                            env_ut  = uniq_tag,
+                            env_ut  = uniqueTag uniq_tag,
                             env_gbl = gbl_env,
                             env_lcl = lcl_env} }
 
@@ -502,7 +581,7 @@ updLclEnv upd = updEnv (\ env@(Env { env_lcl = lcl }) ->
                           env { env_lcl = upd lcl })
 
 updLclCtxt :: (TcLclCtxt -> TcLclCtxt) -> TcRnIf gbl TcLclEnv a -> TcRnIf gbl TcLclEnv a
-updLclCtxt upd = updLclEnv (modifyLclCtxt upd)
+updLclCtxt = updLclEnv . modifyLclCtxt
 
 setLclEnv :: lcl' -> TcRnIf gbl lcl' a -> TcRnIf gbl lcl a
 setLclEnv lcl_env = updEnv (\ env -> env { env_lcl = lcl_env })
@@ -687,6 +766,208 @@ withIfaceErr ctx do_this = do
 {-
 ************************************************************************
 *                                                                      *
+                 Initialising plugins for TcM
+*                                                                      *
+************************************************************************
+-}
+
+-- | Initialise all 'TcM' plugins, run the inner action, then run
+-- both their "post-tc" and "shutdown" actions.
+withTcMPlugins :: HasDebugCallStack => HscEnv -> TcM a -> TcM a
+withTcMPlugins hsc_env thing_inside
+  = do { eitherRes <-
+           -- Using 'bracket_' ensures the plugins are always stopped.
+           bracket_ (initTcMPlugins hsc_env) stopTcMPluginsTcM $
+             tryM thing_inside
+       ; case eitherRes of
+           Left  ex  -> liftIO $ throwIO ex
+           Right res -> return res
+       }
+
+-- | Run the inner action without any 'TcM' plugins.
+withoutTcMPlugins :: TcM a -> TcM a
+withoutTcMPlugins thing_inside = do
+  bracket_ setup teardown thing_inside
+  where
+    setup = do
+      tcg_env <- getGblEnv
+      writeTcRef (tcg_plugins tcg_env) $
+        TcMPluginsRunning emptyRunningTcMPlugins
+    teardown =
+      -- Don't set 'tcg_plugins' to 'TcMPluginsStopped', as that should only
+      -- be used when there were 'TcM' plugins to start with (#27273).
+      return ()
+
+-- | Initialise 'TcM' plugins.
+initTcMPlugins :: HscEnv -> TcM ()
+initTcMPlugins hsc_env = mask $ \ restore -> do
+  (solvers, rewritersUniqFM, tc_post_tcs, tc_shutdowns) <- restore $ start_tc_plugins hsc_env
+  (defaulters, dflt_post_tcs, dflt_shutdowns) <-
+    restore (start_defaulting_plugins hsc_env)
+      `onException` liftIO (runPluginShutdowns tc_shutdowns)
+  (hf_plugins, hf_stops) <-
+    restore (start_holefit_plugins hsc_env)
+      `onException` liftIO (runPluginShutdowns (tc_shutdowns ++ dflt_shutdowns))
+  let runs =
+        TcMPluginsRun
+          { tcmp_solvers    = solvers
+          , tcmp_rewriters  = rewritersUniqFM
+          , tcmp_defaulters = defaulters
+          , tcmp_hole_fits  = hf_plugins
+          }
+      post_tcs =
+        TcMPluginsPostTc
+           { tcpt_tc_plugins         = tc_post_tcs
+           , tcpt_defaulting_plugins = dflt_post_tcs
+           , tcpt_hole_fit_plugins   = hf_stops
+           }
+      shutdowns =
+        TcMPluginsShutdown
+          { tcps_tc_plugins         = tc_shutdowns
+          , tcps_defaulting_plugins = dflt_shutdowns
+          }
+  set_TcMPlugins_initialised $
+    RunningTcMPlugins runs post_tcs shutdowns
+
+set_TcMPlugins_initialised :: RunningTcMPlugins -> TcM ()
+set_TcMPlugins_initialised plugins = do
+  tcg_env <- getGblEnv
+  writeTcRef (tcg_plugins tcg_env) (TcMPluginsRunning plugins)
+
+-- | Run all plugin shutdown actions, using 'finally' to ensure all run even
+-- if one throws.
+runPluginShutdowns :: [IO ()] -> IO ()
+runPluginShutdowns = foldr finally (return ())
+
+-- | Like 'traverse', but threads accumulated cleanup actions as state,
+-- so that if starting one plugin fails, we run the cleanup actions of
+-- previously started plugins.
+startPluginsWithCleanup
+  :: MonadCatch m
+  => ([c] -> m ())   -- ^ cleanup action
+  -> (a -> m (r, c)) -- ^ start one
+  -> [a]
+  -> m ([r], [c])
+startPluginsWithCleanup runCleanups start xs = do
+  (cs, rs) <- mapAccumLM step [] xs
+  return (rs, reverse cs)
+  where
+    step cs x = do
+      (r, c) <- start x `onException` runCleanups cs
+      return (c : cs, r)
+
+start_tc_plugins :: HscEnv -> TcM ([TcPluginSolver], UniqFM TyCon [TcPluginRewriter], [TcPluginM ()], [IO ()])
+start_tc_plugins hsc_env =
+  case catMaybes $ mapPlugins (hsc_plugins hsc_env) tcPlugin of
+    []      -> return ([], emptyUFM, [], [])
+    plugins -> do
+      (triples, shutdowns) <-
+        startPluginsWithCleanup (liftIO . runPluginShutdowns) start_plugin plugins
+      let (solvers, rewriters, stops) = unzip3 triples
+          !rewritersUniqFM = sequenceUFMList rewriters
+      return (solvers, rewritersUniqFM, stops, shutdowns)
+  where
+    start_plugin (TcPlugin start solve rewrite post_tc shutdown) = do
+      s <- runTcPluginM start
+      return ((solve s, rewrite s, post_tc s), shutdown s)
+
+start_defaulting_plugins :: HscEnv -> TcM ([FillDefaulting], [TcPluginM ()], [IO ()])
+start_defaulting_plugins hsc_env =
+  case catMaybes $ mapPlugins (hsc_plugins hsc_env) defaultingPlugin of
+    []      -> return ([], [], [])
+    plugins -> do
+      (pairs, shutdowns) <-
+        startPluginsWithCleanup (liftIO . runPluginShutdowns) start_plugin plugins
+      let (fillers, post_tcs) = unzip pairs
+      return (fillers, post_tcs, shutdowns)
+  where
+    start_plugin (DefaultingPlugin start fill post_tc shutdown) = do
+      s <- runTcPluginM start
+      return ((fill s, post_tc s), shutdown s)
+
+start_holefit_plugins :: HscEnv -> TcM ([HoleFitPlugin], [TcM ()])
+start_holefit_plugins hsc_env =
+  case catMaybes $ mapPlugins (hsc_plugins hsc_env) holeFitPlugin of
+    []      -> return ([], [])
+    plugins ->
+      startPluginsWithCleanup sequence_ start_plugin plugins
+  where
+    start_plugin (HoleFitPluginR init plugin stop) = do
+      ref <- init
+      return (plugin ref, stop ref)
+
+-- | Run the "post-tc" actions of all 'TcM' plugins, at the end of typechecking.
+tcMPluginsPostTc :: HasDebugCallStack => TcM ()
+tcMPluginsPostTc = do
+  tcm_plugins_ref <- tcg_plugins <$> getGblEnv
+  tcm_plugins <- readTcRef tcm_plugins_ref
+  case tcm_plugins of
+    TcMPluginsUninitialised ->
+      pprPanic "tcMPluginsPostTc" $ text "TcM plugins not initialised"
+    TcMPluginsStopped ->
+      pprPanic "tcMPluginsPostTc" $ text "TcM plugins already stopped"
+    TcMPluginsRunning
+      (RunningTcMPlugins { rtcmp_post_tc = post_tcs }) ->
+        do_post_tcs post_tcs
+  where
+    do_post_tcs (TcMPluginsPostTc tcs defs hfs) = do
+      traverse_ runTcPluginM tcs
+      traverse_ runTcPluginM defs
+      sequence_ hfs
+
+-- | Runs both the "post-tc" and "shutdown" actions of all 'TcM' plugins.
+stopTcMPluginsTcM :: TcM ()
+stopTcMPluginsTcM =
+  tcMPluginsPostTc `finally` shutdownTcMPluginsTcM
+
+-- | Runs the "shutdown" actions of all 'TcM' plugins.
+shutdownTcMPluginsTcM :: TcM ()
+shutdownTcMPluginsTcM = mask_ $ do
+  tcg_env <- getGblEnv
+  tcm_plugins_ref <- tcg_plugins <$> getGblEnv
+  tcm_plugins <- readTcRef tcm_plugins_ref
+  liftIO $ shutdownTcMPlugins tcm_plugins
+  writeTcRef (tcg_plugins tcg_env) TcMPluginsStopped
+
+shutdownTcMPluginsIO :: TcRef TcMPluginsState -> IO ()
+shutdownTcMPluginsIO plugins_ref = mask_ $ do
+  tcm_plugins <- readTcRef plugins_ref
+  shutdownTcMPlugins tcm_plugins
+  writeIORef plugins_ref TcMPluginsStopped
+
+-- | Shutdown all 'TcM' plugins.
+--
+-- Precondition: async exceptions are masked.
+shutdownTcMPlugins :: TcMPluginsState -> IO ()
+shutdownTcMPlugins = \case
+  TcMPluginsUninitialised -> return ()
+  TcMPluginsStopped -> return ()
+  TcMPluginsRunning
+    (RunningTcMPlugins { rtcmp_shutdown = stops }) ->
+      do_stop stops
+  where
+    do_stop (TcMPluginsShutdown tcs defs) =
+      runPluginShutdowns (tcs ++ defs)
+
+solverTcMPlugins :: HasDebugCallStack => TcMPluginsState -> [TcPluginSolver]
+solverTcMPlugins =
+  tcmp_solvers . tcMPluginsRunActions . runningTcMPlugins
+
+rewriterTcMPlugins :: HasDebugCallStack => TcMPluginsState -> UniqFM TyCon [TcPluginRewriter]
+rewriterTcMPlugins =
+  tcmp_rewriters . tcMPluginsRunActions . runningTcMPlugins
+
+defaultingTcMPlugins :: HasDebugCallStack => TcMPluginsState -> [FillDefaulting]
+defaultingTcMPlugins =
+  tcmp_defaulters . tcMPluginsRunActions . runningTcMPlugins
+
+holeFitTcMPlugins :: HasDebugCallStack => TcMPluginsState -> [HoleFitPlugin]
+holeFitTcMPlugins =
+  tcmp_hole_fits . tcMPluginsRunActions . runningTcMPlugins
+
+{-
+************************************************************************
+*                                                                      *
                 Arrow scopes
 *                                                                      *
 ************************************************************************
@@ -719,13 +1000,13 @@ newUnique :: TcRnIf gbl lcl Unique
 newUnique
  = do { env <- getEnv
       ; let tag = env_ut env
-      ; liftIO $! uniqFromTag tag }
+      ; liftIO $! uniqFromTagGrimily tag }
 
 newUniqueSupply :: TcRnIf gbl lcl UniqSupply
 newUniqueSupply
  = do { env <- getEnv
       ; let tag = env_ut env
-      ; liftIO $! mkSplitUniqSupply tag }
+      ; liftIO $! mkSplitUniqSupplyGrimily tag }
 
 cloneLocalName :: Name -> TcM Name
 -- Make a fresh Internal name with the same OccName and SrcSpan
@@ -912,12 +1193,6 @@ getIsGHCi :: TcRn Bool
 getIsGHCi = do { mod <- getModule
                ; return (isInteractiveModule mod) }
 
-getGHCiMonad :: TcRn Name
-getGHCiMonad = do { hsc <- getTopEnv; return (ic_monad $ hsc_IC hsc) }
-
-getInteractivePrintName :: TcRn Name
-getInteractivePrintName = do { hsc <- getTopEnv; return (ic_int_print $ hsc_IC hsc) }
-
 tcIsHsBootOrSig :: TcRn Bool
 tcIsHsBootOrSig = isHsBootOrSig <$> tcHscSource
 
@@ -956,6 +1231,12 @@ addDependentFiles fs = do
   dep_files <- readTcRef ref
   writeTcRef ref (fs ++ dep_files)
 
+addDependentDirectories :: [FilePath] -> TcRn ()
+addDependentDirectories ds = do
+  ref <- fmap tcg_dependent_dirs getGblEnv
+  dep_dirs <- readTcRef ref
+  writeTcRef ref (ds ++ dep_dirs)
+
 {-
 ************************************************************************
 *                                                                      *
@@ -968,30 +1249,32 @@ getSrcSpanM :: TcRn SrcSpan
         -- Avoid clash with Name.getSrcLoc
 getSrcSpanM = do { env <- getLclEnv; return (RealSrcSpan (getLclEnvLoc env) Strict.Nothing) }
 
+getRealSrcSpanM :: TcRn RealSrcSpan
+        -- Avoid clash with Name.getSrcLoc
+getRealSrcSpanM = do { env <- getLclEnv; return $ getLclEnvLoc env }
+
+
 -- See Note [Error contexts in generated code]
 inGeneratedCode :: TcRn Bool
 inGeneratedCode = lclEnvInGeneratedCode <$> getLclEnv
 
 setSrcSpan :: SrcSpan -> TcRn a -> TcRn a
 -- See Note [Error contexts in generated code]
--- for the tcl_in_gen_code manipulation
+-- When entering a node decorated with a /user/ span:
+--   * Record that span in `tcl_loc`
+--   * Set `tcl_in_gen_code` to False, to record that we
+--     are in user code.
+-- When entering a node decorated with a /generated/ span:
+--   * Do not touch `tcl_loc`, so that `tcl_loc` always records
+--     the innermost user span.
+-- NB: This is the only place where `tcl_loc` and `tcl_in_gen_code`
+--     are modified
 setSrcSpan (RealSrcSpan loc _) thing_inside
-  = updLclCtxt (\env -> env { tcl_loc = loc, tcl_in_gen_code = False })
-              thing_inside
-
-setSrcSpan loc@(UnhelpfulSpan _) thing_inside
-  | isGeneratedSrcSpan loc
-  = setInGeneratedCode thing_inside
-
-  | otherwise
+  = updLclCtxt (\ctxt -> ctxt {tcl_loc = loc, tcl_in_gen_code = False}) thing_inside
+setSrcSpan (GeneratedSrcSpan{}) thing_inside
+  = updLclCtxt (\ctxt -> ctxt {tcl_in_gen_code = True}) thing_inside
+setSrcSpan _ thing_inside
   = thing_inside
-
--- | Mark the inner computation as being done inside generated code.
---
--- See Note [Error contexts in generated code]
-setInGeneratedCode :: TcRn a -> TcRn a
-setInGeneratedCode thing_inside =
-  updLclCtxt (\env -> env { tcl_in_gen_code = True }) thing_inside
 
 setSrcSpanA :: EpAnn ann -> TcRn a -> TcRn a
 setSrcSpanA l = setSrcSpan (locA l)
@@ -1073,7 +1356,7 @@ addErrAt :: SrcSpan -> TcRnMessage -> TcRn ()
 -- work doesn't matter
 addErrAt loc msg = do { ctxt <- getErrCtxt
                       ; tidy_env <- liftZonkM $ tcInitTidyEnv
-                      ; err_ctxt <- mkErrCtxt tidy_env ctxt
+                      ; err_ctxt <- tidyErrCtxt tidy_env ctxt
                       ; let detailed_msg = mkDetailedMessage (ErrInfo err_ctxt Nothing noHints) msg
                       ; add_long_err_at loc detailed_msg }
 
@@ -1146,7 +1429,7 @@ reportDiagnostics = mapM_ reportDiagnostic
 
 reportDiagnostic :: MsgEnvelope TcRnMessage -> TcRn ()
 reportDiagnostic msg
-  = do { traceTc "Adding diagnostic:" (pprLocMsgEnvelopeDefault msg) ;
+  = do { traceTc "Adding diagnostic:" (internalDebugPprMsgEnvelope msg) ;
          errs_var <- getErrsVar ;
          msgs     <- readTcRef errs_var ;
          writeTcRef errs_var (msg `addMessage` msgs) }
@@ -1210,61 +1493,61 @@ problem.
 
 Note [Error contexts in generated code]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* setSrcSpan sets tcl_in_gen_code to True if the SrcSpan is GeneratedSrcSpan,
-  and back to False when we get a useful SrcSpan
+* setSrcSpan is the only place that modifies `tcl_loc` and `tcl_in_gen_code`
 
-* When tcl_in_gen_code is True, addErrCtxt becomes a no-op.
+* `addExprCtxt` updates updates the HsCtxt stored in LclEnv with the following logic
+  - If `tcl_in_gen_code` is true, do nothing
+  - Otherwise push a suitable HsCtxt onto the ErrCtxtStack
 
-So typically it's better to do setSrcSpan /before/ addErrCtxt.
+This ensures that the error messages do not leak compiler generated expressions which can
+be confusing to the users as they never appear in the original source code
 
-See Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr for
-more discussion of this fancy footwork, as well as
-Note [Generated code and pattern-match checking] in GHC.Types.Basic for the
-relation with pattern-match checks.
+- See Note [Rebindable syntax and XXExprGhcRn] in `GHC.Hs.Expr` for
+  more discussion of this fancy footwork
+- See Note [Generated code and pattern-match checking] in `GHC.Types.Basic` for the
+  relation with pattern-match checks
 -}
 
-getErrCtxt :: TcM [ErrCtxt]
+-- See Note [Error contexts in generated code]
+addExprCtxt :: HsExpr GhcRn -> TcRn a -> TcRn a
+addExprCtxt e thing_inside
+  = do { igc <- inGeneratedCode
+       ; if igc -- In generated code; so addExprCtxt is a no-op
+         then thing_inside
+         else case e of
+                -- The HsHole special case addresses situations like
+                --    f x = _
+                -- when we don't want to say "In the expression: _",
+                -- because it is mentioned in the error message itself
+                HsHole{} -> thing_inside
+
+              -- There is a special case for expressions with signatures to avoid having
+              -- too verbose error context. c.f. RecordDotSyntaxFail9
+              -- Add the original HsCtxt if we are typechecking an expanded expression
+                ExprWithTySig _ (L _ e') _
+                  | XExpr (ExpandedThingRn (HSE o _)) <- e' -> addErrCtxt o thing_inside
+
+                XExpr (ExpandedThingRn (HSE o _)) -> addErrCtxt o thing_inside
+
+                _ -> addErrCtxt (ExprCtxt e) thing_inside
+       }
+
+getErrCtxt :: TcM ErrCtxtStack
 getErrCtxt = do { env <- getLclEnv; return (getLclEnvErrCtxt env) }
 
-setErrCtxt :: [ErrCtxt] -> TcM a -> TcM a
+setErrCtxt :: ErrCtxtStack -> TcM a -> TcM a
 {-# INLINE setErrCtxt #-}   -- Note [Inlining addErrCtxt]
 setErrCtxt ctxt = updLclEnv (setLclEnvErrCtxt ctxt)
 
--- | Add a fixed message to the error context. This message should not
--- do any tidying.
-addErrCtxt :: ErrCtxtMsg -> TcM a -> TcM a
-{-# INLINE addErrCtxt #-}   -- Note [Inlining addErrCtxt]
-addErrCtxt msg = addErrCtxtM (\env -> return (env, msg))
+--   See Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr
+addErrCtxt :: HsCtxt -> TcM a -> TcM a
+{-# INLINE addErrCtxt #-}  -- Note [Inlining addErrCtxt]
+addErrCtxt ctxt = pushCtxt ctxt
 
--- | Add a message to the error context. This message may do tidying.
-addErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)) -> TcM a -> TcM a
-{-# INLINE addErrCtxtM #-}  -- Note [Inlining addErrCtxt]
-addErrCtxtM ctxt = pushCtxt (False, ctxt)
-
--- | Add a fixed landmark message to the error context. A landmark
--- message is always sure to be reported, even if there is a lot of
--- context. It also doesn't count toward the maximum number of contexts
--- reported.
-addLandmarkErrCtxt :: ErrCtxtMsg -> TcM a -> TcM a
-{-# INLINE addLandmarkErrCtxt #-}  -- Note [Inlining addErrCtxt]
-addLandmarkErrCtxt msg = addLandmarkErrCtxtM (\env -> return (env, msg))
-
--- | Variant of 'addLandmarkErrCtxt' that allows for monadic operations
--- and tidying.
-addLandmarkErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)) -> TcM a -> TcM a
-{-# INLINE addLandmarkErrCtxtM #-}  -- Note [Inlining addErrCtxt]
-addLandmarkErrCtxtM ctxt = pushCtxt (True, ctxt)
-
-pushCtxt :: ErrCtxt -> TcM a -> TcM a
-{-# INLINE pushCtxt #-} -- Note [Inlining addErrCtxt]
-pushCtxt ctxt = updLclEnv (updCtxt ctxt)
-
-updCtxt :: ErrCtxt -> TcLclEnv -> TcLclEnv
--- Do not update the context if we are in generated code
 -- See Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr
-updCtxt ctxt env
-  | lclEnvInGeneratedCode env = env
-  | otherwise = addLclEnvErrCtxt ctxt env
+pushCtxt :: HsCtxt -> TcM a -> TcM a
+{-# INLINE pushCtxt #-} -- Note [Inlining addErrCtxt]
+pushCtxt ctxt = updLclEnv (addLclEnvErrCtxt ctxt)
 
 popErrCtxt :: TcM a -> TcM a
 popErrCtxt thing_inside = updLclEnv (\env -> setLclEnvErrCtxt (pop $ getLclEnvErrCtxt env) env) $
@@ -1279,6 +1562,7 @@ getCtLocM origin t_or_k
        ; return (CtLoc { ctl_origin   = origin
                        , ctl_env      = mkCtLocEnv env
                        , ctl_t_or_k   = t_or_k
+                       , ctl_expln    = mempty -- start off with no explanations
                        , ctl_depth    = initialSubGoalDepth }) }
 
 mkCtLocEnv :: TcLclEnv -> CtLocEnv
@@ -1560,6 +1844,105 @@ tryTcDiscardingErrs' validate recover_invalid recover_error thing_inside
                  recover_error
         }
 
+{- Note [Constraints and errors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this (#12124):
+
+  foo :: Maybe Int
+  foo = return (case Left 3 of
+                  Left -> 1  -- Hard error here!
+                  _    -> 0)
+
+The call to 'return' will generate a (Monad m) wanted constraint; but
+then there'll be "hard error" (i.e. an exception in the TcM monad), from
+the unsaturated Left constructor pattern.
+
+We'll recover in tcPolyBinds, using recoverM.  But then the final
+tcSimplifyTop will see that (Monad m) constraint, with 'm' utterly
+un-filled-in, and will emit a misleading error message.
+
+The underlying problem is that an exception interrupts the constraint
+gathering process. Bottom line: if we have an exception, it's best
+simply to discard any gathered constraints.  Hence in 'attemptM' we
+capture the constraints in a fresh variable, and only emit them into
+the surrounding context if we exit normally.  If an exception is
+raised, simply discard the collected constraints... we have a hard
+error to report.  So this capture-the-emit dance isn't as stupid as it
+looks :-).
+
+However suppose we throw an exception inside an invocation of
+captureConstraints, and discard all the constraints. Some of those
+constraints might be "variable out of scope" Hole constraints, and that
+might have been the actual original cause of the exception!  For
+example (#12529):
+   f = p @ Int
+Here 'p' is out of scope, so we get an insoluble Hole constraint. But
+the visible type application fails in the monad (throws an exception).
+We must not discard the out-of-scope error.
+
+It's distressingly delicate though:
+
+* If we discard too /many/ constraints we may fail to report the error
+  that led us to interrupt the constraint gathering process.
+
+  One particular example "variable out of scope" Hole constraints. For
+  example (#12529):
+   f = p @ Int
+  Here 'p' is out of scope, so we get an insoluble Hole constraint. But
+  the visible type application fails in the monad (throws an exception).
+  We must not discard the out-of-scope error.
+
+  Also GHC.Tc.Solver.simplifyAndEmitFlatConstraints may fail having
+  emitted some constraints with skolem-escape problems.
+
+* If we discard too /few/ constraints, we may get the misleading
+  class constraints mentioned above.
+
+  We may /also/ end up taking constraints built at some inner level, and
+  emitting them (via the exception catching in `tryCaptureConstraints`) at some
+  outer level, and then breaking the TcLevel invariants See Note [TcLevel
+  invariants] in GHC.Tc.Utils.TcType
+
+So `dropMisleading` has a horridly ad-hoc structure:
+
+* It keeps only /insoluble/ flat constraints (which are unlikely to very visibly
+  trip up on the TcLevel invariant)
+
+* But it keeps all /implication/ constraints (except the class constraints
+  inside them).  The implication constraints are OK because they set the ambient
+  level before attempting to solve any inner constraints.
+
+Ugh! I hate this. But it seems to work.
+
+Other wrinkles
+
+(CERR1) Note that freshly-generated constraints like (Int ~ Bool), or
+    ((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
+    insoluble.  The constraint solver does that.  So they'll be discarded.
+    That's probably ok; but see th/5358 as a not-so-good example:
+       t1 :: Int
+       t1 x = x   -- Manifestly wrong
+
+       foo = $(...raises exception...)
+    We report the exception, but not the bug in t1.  Oh well.  Possible
+    solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
+
+(CERR2) In #26015 I found that from the constraints
+           [W] alpha ~ Int      -- A class constraint
+           [W] F alpha ~# Bool  -- An equality constraint
+  we were dropping the first (because it's a class constraint) but not the
+  second, and then getting a misleading error message from the second.  As
+  #25607 shows, we can get not just one but a zillion bogus messages, which
+  conceal the one genuine error.  Boo.
+
+  For now I have added an even more ad-hoc "drop class constraints except
+  equality classes (~) and (~~)"; see `dropMisleading`.  That just kicks the can
+  down the road; but this problem seems somewhat rare anyway.  The code in
+  `dropMisleading` hasn't changed for years.
+
+It would be great to have a more systematic solution to this entire mess.
+-}
+
 {-
 ************************************************************************
 *                                                                      *
@@ -1656,20 +2039,20 @@ addDiagnosticTc msg
 addDiagnosticTcM :: (TidyEnv, TcRnMessage) -> TcM ()
 addDiagnosticTcM (env0, msg)
  = do { ctxt <- getErrCtxt
-      ; extra <- mkErrCtxt env0 ctxt
+      ; extra <- tidyErrCtxt env0 ctxt
       ; let detailed_msg = mkDetailedMessage (ErrInfo extra Nothing noHints) msg
       ; add_diagnostic detailed_msg }
 
 -- | A variation of 'addDiagnostic' that takes a function to produce a 'TcRnDsMessage'
 -- given some additional context about the diagnostic.
-addDetailedDiagnostic :: ([ErrCtxtMsg] -> TcRnMessage) -> TcM ()
+addDetailedDiagnostic :: ([HsCtxt] -> TcRnMessage) -> TcM ()
 addDetailedDiagnostic mkMsg = do
   loc <- getSrcSpanM
   name_ppr_ctx <- getNamePprCtx
   !diag_opts  <- initDiagOpts <$> getDynFlags
   env0 <- liftZonkM tcInitTidyEnv
   ctxt <- getErrCtxt
-  err_info <- mkErrCtxt env0 ctxt
+  err_info <- tidyErrCtxt env0 ctxt
   reportDiagnostic $
     mkMsgEnvelope diag_opts loc name_ppr_ctx $
       mkMsg err_info
@@ -1706,33 +2089,42 @@ add_diagnostic msg
 -}
 
 add_err_tcm :: TidyEnv -> TcRnMessage -> SrcSpan
-            -> [ErrCtxt]
+            -> ErrCtxtStack
             -> TcM ()
 add_err_tcm tidy_env msg loc ctxt
- = do { err_ctxt <- mkErrCtxt tidy_env ctxt
+ = do { err_ctxt <- tidyErrCtxt tidy_env ctxt
       ; add_long_err_at loc $
           mkDetailedMessage (ErrInfo err_ctxt Nothing noHints) msg }
 
-mkErrCtxt :: TidyEnv -> [ErrCtxt] -> TcM [ErrCtxtMsg]
--- Tidy the error info, trimming excessive contexts
-mkErrCtxt env ctxts
+tidyErrCtxt :: TidyEnv -> ErrCtxtStack -> TcM ErrCtxtStack
+-- Do the following
+--   * Zonk each HsCtxt in the ErrCtxtStack
+--   * Tidy each using TidyEnv
+--   * Trim excessive contexts
+tidyErrCtxt env ctxts
 --  = do
 --       dbg <- hasPprDebug <$> getDynFlags
 --       if dbg                -- In -dppr-debug style the output
 --          then return empty  -- just becomes too voluminous
 --          else go dbg 0 env ctxts
- = go False 0 env ctxts
+ = go False 0 env ctxts -- regular error ctx
  where
-   go :: Bool -> Int -> TidyEnv -> [ErrCtxt] -> TcM [ErrCtxtMsg]
-   go _ _ _   [] = return []
-   go dbg n env ((is_landmark, ctxt) : ctxts)
-     | is_landmark || n < mAX_CONTEXTS -- Too verbose || dbg
-     = do { (env', msg) <- liftZonkM $ ctxt env
-          ; let n' = if is_landmark then n else n+1
-          ; rest <- go dbg n' env' ctxts
+   go :: Bool -> Int -> TidyEnv -> ErrCtxtStack -> TcM ErrCtxtStack
+   go _ _ _ [] = return []
+   go dbg n env (ctxt : ctxts)
+     | isHsCtxtLandmark ctxt
+     = do { (env', msg) <- liftZonkM $ zonkTidyHsCtxt env ctxt
+          ; rest <- go dbg n env' ctxts
           ; return (msg : rest) }
-     | otherwise
-     = go dbg n env ctxts
+     | n < mAX_CONTEXTS -- Too verbose || dbg
+     = do { (env', msg) <- liftZonkM $ zonkTidyHsCtxt env ctxt
+          ; rest <- go dbg (n+1) env' ctxts
+          ; return (msg : rest) }
+     | otherwise  -- need to compute this for zonking
+     = do { (env', _) <- liftZonkM $ zonkTidyHsCtxt env ctxt
+          ; go dbg n env' ctxts
+          }
+
 
 mAX_CONTEXTS :: Int     -- No more than this number of non-landmark contexts
 mAX_CONTEXTS = 3
@@ -1752,105 +2144,107 @@ debugTc thing
 ************************************************************************
 -}
 
-addTopEvBinds :: Bag EvBind -> TcM a -> TcM a
-addTopEvBinds new_ev_binds thing_inside
-  =updGblEnv upd_env thing_inside
-  where
-    upd_env tcg_env = tcg_env { tcg_ev_binds = tcg_ev_binds tcg_env
-                                               `unionBags` new_ev_binds }
-
 newTcEvBinds :: TcM EvBindsVar
-newTcEvBinds = do { binds_ref <- newTcRef emptyEvBindMap
-                  ; tcvs_ref  <- newTcRef []
+newTcEvBinds = do { binds_ref <- newTcRef emptyEvBindsState
                   ; uniq <- newUnique
                   ; traceTc "newTcEvBinds" (text "unique =" <+> ppr uniq)
                   ; return (EvBindsVar { ebv_binds = binds_ref
-                                       , ebv_tcvs = tcvs_ref
                                        , ebv_uniq = uniq }) }
 
 -- | Creates an EvBindsVar incapable of holding any bindings. It still
--- tracks covar usages (see comments on ebv_tcvs in "GHC.Tc.Types.Evidence"), thus
+-- tracks covar usages (see comments on ebv_needs in "GHC.Tc.Types.Evidence"), thus
 -- must be made monadically
 newNoTcEvBinds :: TcM EvBindsVar
 newNoTcEvBinds
-  = do { tcvs_ref  <- newTcRef []
+  = do { tcvs_ref  <- newTcRef emptyVarSet
        ; uniq <- newUnique
        ; traceTc "newNoTcEvBinds" (text "unique =" <+> ppr uniq)
-       ; return (CoEvBindsVar { ebv_tcvs = tcvs_ref
-                              , ebv_uniq = uniq }) }
+       ; return (CoEvBindsVar { ebv_needs = tcvs_ref
+                              , ebv_uniq  = uniq }) }
 
 cloneEvBindsVar :: EvBindsVar -> TcM EvBindsVar
 -- Clone the refs, so that any binding created when
 -- solving don't pollute the original
 cloneEvBindsVar ebv@(EvBindsVar {})
-  = do { binds_ref <- newTcRef emptyEvBindMap
-       ; tcvs_ref  <- newTcRef []
-       ; return (ebv { ebv_binds = binds_ref
-                     , ebv_tcvs = tcvs_ref }) }
+  = do { binds_ref <- newTcRef emptyEvBindsState
+       ; uniq <- newUnique
+       ; return (ebv { ebv_uniq = uniq
+                     , ebv_binds = binds_ref }) }
 cloneEvBindsVar ebv@(CoEvBindsVar {})
-  = do { tcvs_ref  <- newTcRef []
-       ; return (ebv { ebv_tcvs = tcvs_ref }) }
+  = do { tcvs_ref  <- newTcRef emptyVarSet
+       ; return (ebv { ebv_needs = tcvs_ref }) }
 
-getTcEvTyCoVars :: EvBindsVar -> TcM [TcCoercion]
-getTcEvTyCoVars ev_binds_var
-  = readTcRef (ebv_tcvs ev_binds_var)
+getTcEvBindsMap :: EvBindsVar -> TcM EvBindsMap
+getTcEvBindsMap ebv = do { EBS { ebs_binds = bs } <- getTcEvBindsState ebv
+                         ; return bs }
 
-getTcEvBindsMap :: EvBindsVar -> TcM EvBindMap
-getTcEvBindsMap (EvBindsVar { ebv_binds = ev_ref })
+getTcEvBindsState :: EvBindsVar -> TcM EvBindsState
+getTcEvBindsState (EvBindsVar { ebv_binds = ev_ref })
   = readTcRef ev_ref
-getTcEvBindsMap (CoEvBindsVar {})
-  = return emptyEvBindMap
+getTcEvBindsState (CoEvBindsVar { ebv_needs = needs_ref })
+  = do { needs <- readTcRef needs_ref
+       ; return (EBS { ebs_binds = emptyEvBindsMap, ebs_needs = needs }) }
 
-setTcEvBindsMap :: EvBindsVar -> EvBindMap -> TcM ()
-setTcEvBindsMap (EvBindsVar { ebv_binds = ev_ref }) binds
-  = writeTcRef ev_ref binds
-setTcEvBindsMap v@(CoEvBindsVar {}) ev_binds
-  | isEmptyEvBindMap ev_binds
-  = return ()
-  | otherwise
-  = pprPanic "setTcEvBindsMap" (ppr v $$ ppr ev_binds)
+setTcEvBindsMap :: EvBindsVar -> EvBindsMap -> TcM ()
+setTcEvBindsMap (EvBindsVar { ebv_binds = ev_ref }) ev_binds
+  = updTcRef ev_ref (\ebs -> ebs { ebs_binds = ev_binds })
+setTcEvBindsMap (CoEvBindsVar {}) ev_binds
+  = assertPpr (isEmptyEvBindsMap ev_binds) (ppr ev_binds) $
+    return ()
 
-updTcEvBinds :: EvBindsVar -> EvBindsVar -> TcM ()
-updTcEvBinds (EvBindsVar { ebv_binds = old_ebv_ref, ebv_tcvs = old_tcv_ref })
-             (EvBindsVar { ebv_binds = new_ebv_ref, ebv_tcvs = new_tcv_ref })
+combineTcEvBinds :: EvBindsVar -> EvBindsVar -> TcM ()
+combineTcEvBinds (EvBindsVar { ebv_binds = old_ebv_ref })
+                 (EvBindsVar { ebv_binds = new_ebv_ref })
   = do { new_ebvs <- readTcRef new_ebv_ref
-       ; updTcRef old_ebv_ref (`unionEvBindMap` new_ebvs)
-       ; new_tcvs <- readTcRef new_tcv_ref
-       ; updTcRef old_tcv_ref (new_tcvs ++) }
-updTcEvBinds (EvBindsVar { ebv_tcvs = old_tcv_ref })
-             (CoEvBindsVar { ebv_tcvs = new_tcv_ref })
+       ; updTcRef old_ebv_ref (`unionEvBindsState` new_ebvs) }
+combineTcEvBinds (EvBindsVar { ebv_binds = old_tcv_ref })
+                 (CoEvBindsVar { ebv_needs = new_tcv_ref })
   = do { new_tcvs <- readTcRef new_tcv_ref
-       ; updTcRef old_tcv_ref (new_tcvs ++) }
-updTcEvBinds (CoEvBindsVar { ebv_tcvs = old_tcv_ref })
-             (CoEvBindsVar { ebv_tcvs = new_tcv_ref })
+       ; updTcRef old_tcv_ref (addNeededEvIdsEBS new_tcvs) }
+combineTcEvBinds (CoEvBindsVar { ebv_needs = old_tcv_ref })
+                 (CoEvBindsVar { ebv_needs = new_tcv_ref })
   = do { new_tcvs <- readTcRef new_tcv_ref
-       ; updTcRef old_tcv_ref (new_tcvs ++) }
-updTcEvBinds old_var new_var
-  = pprPanic "updTcEvBinds" (ppr old_var $$ ppr new_var)
+       ; updTcRef old_tcv_ref (unionVarSet new_tcvs) }
+combineTcEvBinds old_var new_var
+  = pprPanic "combineTcEvBinds" (ppr old_var $$ ppr new_var)
     -- Terms inside types, no good
+
+addNeededEvIds :: EvBindsVar -> NeededEvIds -> TcM ()
+addNeededEvIds (EvBindsVar { ebv_binds = bs_ref }) needed
+  = updTcRef bs_ref (addNeededEvIdsEBS needed)
+addNeededEvIds (CoEvBindsVar { ebv_needs = need_ref }) needed
+  = updTcRef need_ref (unionVarSet needed)
+
+addTcEvCoBind :: EvBindsVar -> CoercionHole -> CoercionPlusHoles -> TcM ()
+addTcEvCoBind ebv hole co_plus_holes@(CPH { cph_co = co })
+  = do { fillCoercionHole hole co_plus_holes
+         -- Record usage of the free vars of this coercion
+       ; addNeededEvIds ebv (coVarsOfCo co) }
 
 addTcEvBind :: EvBindsVar -> EvBind -> TcM ()
 -- Add a binding to the TcEvBinds by side effect
-addTcEvBind (EvBindsVar { ebv_binds = ev_ref, ebv_uniq = u }) ev_bind
-  = do { traceTc "addTcEvBind" $ ppr u $$
-                                 ppr ev_bind
-       ; bnds <- readTcRef ev_ref
-       ; writeTcRef ev_ref (extendEvBinds bnds ev_bind) }
+addTcEvBind (EvBindsVar { ebv_binds = ev_ref, ebv_uniq = u })
+            ev_bind@(EvBind { eb_info = info, eb_rhs = rhs })
+  = do { EBS { ebs_binds = bnds, ebs_needs = needs } <- readTcRef ev_ref
+       ; let bnds'  = extendEvBinds bnds ev_bind
+             needs' = case info of
+                        EvBindWanted {} -> nestedEvIdsOfTerm rhs
+                                           `unionVarSet` needs
+                        EvBindGiven {} -> needs
+
+       ; traceTc "addTcEvBind" $
+         vcat [ text "EvBindsVar:" <+> ppr u
+              , text "ev_bind:" <+> ppr ev_bind
+              , text "bnds:" <+> ppr bnds
+              , text "bnds':" <+> ppr bnds'
+              , text "needs" <+> ppr needs
+              , text "needs'" <+> ppr needs' ]
+
+       ; writeTcRef ev_ref $
+         EBS { ebs_binds = bnds', ebs_needs = needs' } }
+
 addTcEvBind (CoEvBindsVar { ebv_uniq = u }) ev_bind
   = pprPanic "addTcEvBind CoEvBindsVar" (ppr ev_bind $$ ppr u)
-
-addTcEvBinds :: EvBindsVar -> EvBindMap -> TcM ()
--- ^ Add a collection of binding to the TcEvBinds by side effect
-addTcEvBinds _ new_ev_binds
-  | isEmptyEvBindMap new_ev_binds
-  = return ()
-addTcEvBinds (EvBindsVar { ebv_binds = ev_ref, ebv_uniq = u }) new_ev_binds
-  = do { traceTc "addTcEvBinds" $ ppr u $$
-                                  ppr new_ev_binds
-       ; old_bnds <- readTcRef ev_ref
-       ; writeTcRef ev_ref (old_bnds `unionEvBindMap` new_ev_binds) }
-addTcEvBinds (CoEvBindsVar { ebv_uniq = u }) new_ev_binds
-  = pprPanic "addTcEvBinds CoEvBindsVar" (ppr new_ev_binds $$ ppr u)
 
 chooseUniqueOccTc :: (OccSet -> OccName) -> TcM OccName
 chooseUniqueOccTc fn =
@@ -1861,28 +2255,30 @@ chooseUniqueOccTc fn =
      ; writeTcRef dfun_n_var (extendOccSet set occ)
      ; return occ }
 
-newZonkAnyType :: Kind -> TcM Type
--- Return a type (ZonkAny @k n), where n is fresh
--- Recall  ZonkAny :: forall k. Natural -> k
--- See Note [Any types] in GHC.Builtin.Types, wrinkle (Any4)
-newZonkAnyType kind
+newUnusedType :: Name -> Kind -> TcM Type
+-- Return a type (UnusedType @k sym_n), where sym
+-- is a name and n is a fresh Integer.
+-- Recall  UnusedType :: forall k. Symbol -> k
+-- See Note [The types Any and UnusedType] in GHC.Builtin.WiredIn.Types, wrinkle (Any6)
+newUnusedType name kind
   = do { env <- getGblEnv
        ; let zany_n_var = tcg_zany_n env
        ; i <- readTcRef zany_n_var
        ; let !i2 = i+1
        ; writeTcRef zany_n_var i2
-       ; return (mkTyConApp zonkAnyTyCon [kind, mkNumLitTy i]) }
+       -- Mind that the "_" here is load-bearing:
+       -- name foo1 with zany_n_var = 1 musn't be equal to
+       -- name foo with zany_n_var = 11 b/c that way the Pmc
+       -- would consider them equal. Using "_" suffices because
+       -- numbers never start with _ and so (legal) identfiers like
+       -- foo_ would become foo__1 which is distinct from e.g. foo_1
+       ; return (mkTyConApp unusedTypeTyCon [kind, mkStrLitTy $ getOccFS name `appendFS` fsLit "_" `appendFS` fsLit (show i) ]) }
 
 getConstraintVar :: TcM (TcRef WantedConstraints)
 getConstraintVar = do { env <- getLclEnv; return (tcl_lie env) }
 
 setConstraintVar :: TcRef WantedConstraints -> TcM a -> TcM a
 setConstraintVar lie_var = updLclEnv (\ env -> env { tcl_lie = lie_var })
-
-emitStaticConstraints :: WantedConstraints -> TcM ()
-emitStaticConstraints static_lie
-  = do { gbl_env <- getGblEnv
-       ; updTcRef (tcg_static_wc gbl_env) (`andWC` static_lie) }
 
 emitConstraints :: WantedConstraints -> TcM ()
 emitConstraints ct
@@ -1899,6 +2295,9 @@ emitSimple ct
 
 emitSimples :: Cts -> TcM ()
 emitSimples cts
+  | null cts
+  = return ()
+  | otherwise
   = do { lie_var <- getConstraintVar ;
          updTcRef lie_var (`addSimples` cts) }
 
@@ -2035,116 +2434,27 @@ emitNamedTypeHole (name, tv)
   where
     occ       = nameOccName name
 
-{- Note [Constraints and errors]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider this (#12124):
-
-  foo :: Maybe Int
-  foo = return (case Left 3 of
-                  Left -> 1  -- Hard error here!
-                  _    -> 0)
-
-The call to 'return' will generate a (Monad m) wanted constraint; but
-then there'll be "hard error" (i.e. an exception in the TcM monad), from
-the unsaturated Left constructor pattern.
-
-We'll recover in tcPolyBinds, using recoverM.  But then the final
-tcSimplifyTop will see that (Monad m) constraint, with 'm' utterly
-un-filled-in, and will emit a misleading error message.
-
-The underlying problem is that an exception interrupts the constraint
-gathering process. Bottom line: if we have an exception, it's best
-simply to discard any gathered constraints.  Hence in 'attemptM' we
-capture the constraints in a fresh variable, and only emit them into
-the surrounding context if we exit normally.  If an exception is
-raised, simply discard the collected constraints... we have a hard
-error to report.  So this capture-the-emit dance isn't as stupid as it
-looks :-).
-
-However suppose we throw an exception inside an invocation of
-captureConstraints, and discard all the constraints. Some of those
-constraints might be "variable out of scope" Hole constraints, and that
-might have been the actual original cause of the exception!  For
-example (#12529):
-   f = p @ Int
-Here 'p' is out of scope, so we get an insoluble Hole constraint. But
-the visible type application fails in the monad (throws an exception).
-We must not discard the out-of-scope error.
-
-It's distressingly delicate though:
-
-* If we discard too /many/ constraints we may fail to report the error
-  that led us to interrupt the constraint gathering process.
-
-  One particular example "variable out of scope" Hole constraints. For
-  example (#12529):
-   f = p @ Int
-  Here 'p' is out of scope, so we get an insoluble Hole constraint. But
-  the visible type application fails in the monad (throws an exception).
-  We must not discard the out-of-scope error.
-
-  Also GHC.Tc.Solver.simplifyAndEmitFlatConstraints may fail having
-  emitted some constraints with skolem-escape problems.
-
-* If we discard too /few/ constraints, we may get the misleading
-  class constraints mentioned above.
-
-  We may /also/ end up taking constraints built at some inner level, and
-  emitting them (via the exception catching in `tryCaptureConstraints` at some
-  outer level, and then breaking the TcLevel invariants See Note [TcLevel
-  invariants] in GHC.Tc.Utils.TcType
-
-So `dropMisleading` has a horridly ad-hoc structure:
-
-* It keeps only /insoluble/ flat constraints (which are unlikely to very visibly
-  trip up on the TcLevel invariant
-
-* But it keeps all /implication/ constraints (except the class constraints
-  inside them).  The implication constraints are OK because they set the ambient
-  level before attempting to solve any inner constraints.
-
-Ugh! I hate this. But it seems to work.
-
-Other wrinkles
-
-(CERR1) Note that freshly-generated constraints like (Int ~ Bool), or
-    ((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
-    insoluble.  The constraint solver does that.  So they'll be discarded.
-    That's probably ok; but see th/5358 as a not-so-good example:
-       t1 :: Int
-       t1 x = x   -- Manifestly wrong
-
-       foo = $(...raises exception...)
-    We report the exception, but not the bug in t1.  Oh well.  Possible
-    solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
-
-(CERR2) In #26015 I found that from the constraints
-           [W] alpha ~ Int      -- A class constraint
-           [W] F alpha ~# Bool  -- An equality constraint
-  we were dropping the first (becuase it's a class constraint) but not the
-  second, and then getting a misleading error message from the second.  As
-  #25607 shows, we can get not just one but a zillion bogus messages, which
-  conceal the one genuine error.  Boo.
-
-  For now I have added an even more ad-hoc "drop class constraints except
-  equality classes (~) and (~~)"; see `dropMisleading`.  That just kicks the can
-  down the road; but this problem seems somewhat rare anyway.  The code in
-  `dropMisleading` hasn't changed for years.
-
-It would be great to have a more systematic solution to this entire mess.
+-- | Put a value in a coercion hole
+fillCoercionHole :: CoercionHole -> CoercionPlusHoles -> TcM ()
+fillCoercionHole (CH { ch_ref = ref, ch_co_var = cv }) co
+  = do { when debugIsOn $
+         do { cts <- readTcRef ref
+            ; whenIsJust cts $ \old_co ->
+              pprPanic "Filling a filled coercion hole" (ppr cv $$ ppr co $$ ppr old_co) }
+       ; traceTc "Filling coercion hole" (ppr cv <+> text ":=" <+> ppr co)
+       ; writeTcRef ref (Just co) }
 
 
-************************************************************************
+{- *********************************************************************
 *                                                                      *
              Template Haskell context
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 recordThUse :: TcM ()
 recordThUse = do { env <- getGblEnv; writeTcRef (tcg_th_used env) True }
 
-recordThNeededRuntimeDeps :: [Linkable] -> PkgsLoaded -> TcM ()
+recordThNeededRuntimeDeps :: [LinkableUsage] -> PkgsLoaded -> TcM ()
 recordThNeededRuntimeDeps new_links new_pkgs
   = do { env <- getGblEnv
        ; updTcRef (tcg_th_needed_deps env) $ \(needed_links, needed_pkgs) ->
@@ -2162,32 +2472,22 @@ keepAlive name
 getThLevel :: TcM ThLevel
 getThLevel = do { env <- getLclEnv; return (getLclEnvThLevel env) }
 
-getCurrentAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, Set.Set ThLevelIndex, ThLevel))
-getCurrentAndBindLevel name
+getCurrentAndBindLevel :: GlobalRdrElt -> TcRn (Maybe (TopLevelFlag, Set.Set ThLevelIndex, ThLevel))
+getCurrentAndBindLevel gre
   = do { env <- getLclEnv;
-       ; case lookupNameEnv (getLclEnvThBndrs env) name of
-           Nothing                  -> do
-              lvls <- getExternalBindLvl name
-              if Set.empty == lvls
-                -- This case happens when code is generated for identifiers which are not
-                -- in scope.
-                --
-                -- TODO: What happens if someone generates [|| GHC.Magic.dataToTag# ||]
-                then do
-                  return Nothing
-                else return (Just (TopLevel, lvls, getLclEnvThLevel env))
-           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, Set.singleton bind_lvl, getLclEnvThLevel env)) }
+       ; return $ case lookupNameEnv (getLclEnvThBndrs env) $ greName gre  of
+           Nothing
+             | Set.null lvls  -> Nothing
+             -- This case happens when code is generated for identifiers which are not
+             -- in scope.
+             --
+             -- TODO: What happens if someone generates [|| GHC.Magic.dataToTag# ||]
+             | otherwise -> Just (TopLevel, lvls, getLclEnvThLevel env)
+           Just (top_lvl, bind_lvl) -> Just (top_lvl, Set.singleton bind_lvl, getLclEnvThLevel env) }
+  where lvls = getExternalBindLvl gre
 
-getExternalBindLvl :: Name -> TcRn (Set.Set ThLevelIndex)
-getExternalBindLvl name = do
-  env <- getGlobalRdrEnv
-  mod <- getModule
-  case lookupGRE_Name env name of
-    Just gre -> return $ (Set.map thLevelIndexFromImportLevel (greLevels gre))
-    Nothing ->
-      if nameIsLocalOrFrom mod name
-        then return $ Set.singleton topLevelIndex
-        else return Set.empty
+getExternalBindLvl :: GlobalRdrElt -> Set.Set ThLevelIndex
+getExternalBindLvl gre = Set.map thLevelIndexFromImportLevel (greLevels gre)
 
 setThLevel :: ThLevel -> TcM a -> TcRn a
 setThLevel l = updLclEnv (setLclEnvThLevel l)
@@ -2275,18 +2575,16 @@ initIfaceTcRn thing_inside
         ; hsc_env <- getTopEnv
           -- bangs to avoid leaking the envs (#19356)
         ; let !mhome_unit = hsc_home_unit_maybe hsc_env
-              !knot_vars = tcg_type_env_var tcg_env
-              -- When we are instantiating a signature, we DEFINITELY
-              -- do not want to knot tie.
+              !knot_vars = tcg_knot_vars tcg_env
+              -- When we are instantiating a signature,
+              -- we DEFINITELY do not want to knot tie.
               is_instantiate = fromMaybe False (isHomeUnitInstantiating <$> mhome_unit)
-        ; let { if_env = IfGblEnv {
-                            if_doc = text "initIfaceTcRn",
-                            if_rec_types =
-                                if is_instantiate
-                                    then emptyKnotVars
-                                    else readTcRef <$> knot_vars
-                            }
-                         }
+
+              if_env = IfGblEnv { if_doc = text "initIfaceTcRn"
+                                , if_rec_types = if is_instantiate
+                                                 then emptyKnotVars
+                                                 else readTcRef <$> knot_vars }
+
         ; setEnvs (if_env, ()) thing_inside }
 
 -- | 'initIfaceLoad' can be used when there's no chance that the action will
@@ -2297,7 +2595,7 @@ initIfaceLoad hsc_env do_this
                         if_doc = text "initIfaceLoad",
                         if_rec_types = emptyKnotVars
                     }
-      initTcRnIf 'i' (hsc_env { hsc_type_env_vars = emptyKnotVars }) gbl_env () do_this
+      initTcRnIf IfaceTag (hsc_env { hsc_type_env_vars = emptyKnotVars }) gbl_env () do_this
 
 -- | This is used when we are doing to call 'typecheckModule' on an 'ModIface',
 -- if it's part of a loop with some other modules then we need to use their
@@ -2308,7 +2606,7 @@ initIfaceLoadModule hsc_env this_mod do_this
                         if_doc = text "initIfaceLoadModule",
                         if_rec_types = readTcRef <$> knotVarsWithout this_mod (hsc_type_env_vars hsc_env)
                     }
-      initTcRnIf 'i' hsc_env gbl_env () do_this
+      initTcRnIf IfaceTag hsc_env gbl_env () do_this
 
 initIfaceCheck :: SDoc -> HscEnv -> IfG a -> IO a
 -- Used when checking the up-to-date-ness of the old Iface
@@ -2318,7 +2616,7 @@ initIfaceCheck doc hsc_env do_this
                         if_doc = text "initIfaceCheck" <+> doc,
                         if_rec_types = readTcRef <$> hsc_type_env_vars hsc_env
                     }
-      initTcRnIf 'i' hsc_env gbl_env () do_this
+      initTcRnIf IfaceTag hsc_env gbl_env () do_this
 
 initIfaceLcl :: Module -> SDoc -> IsBootInterface -> IfL a -> IfM lcl a
 initIfaceLcl mod loc_doc hi_boot_file thing_inside
@@ -2335,7 +2633,7 @@ getIfModule :: IfL Module
 getIfModule = do { env <- getLclEnv; return (if_mod env) }
 
 --------------------
-failIfM :: SDoc -> IfL a
+failIfM :: HasDebugCallStack => SDoc -> IfL a
 -- The Iface monad doesn't have a place to accumulate errors, so we
 -- just fall over fast if one happens; it "shouldn't happen".
 -- We use IfL here so that we can get context info out of the local env
@@ -2343,8 +2641,7 @@ failIfM msg = do
     env <- getLclEnv
     let full_msg = (if_loc env <> colon) $$ nest 2 msg
     logger <- getLogger
-    liftIO (logMsg logger MCFatal
-             noSrcSpan $ withPprStyle defaultErrStyle full_msg)
+    liftIO $ fatalErrorMsg logger full_msg
     failM
 
 --------------------
@@ -2376,10 +2673,7 @@ forkM doc thing_inside
                       logger <- getLogger
                       let msg = hang (text "forkM failed:" <+> doc)
                                    2 (text (show exn))
-                      liftIO $ logMsg logger
-                                         MCFatal
-                                         noSrcSpan
-                                         $ withPprStyle defaultErrStyle msg
+                      liftIO $ fatalErrorMsg logger msg
                 ; traceIf (text "} ending fork (badly)" <+> doc)
                 ; pgmError "Cannot continue after interface file error" }
     }

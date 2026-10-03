@@ -44,7 +44,7 @@ import GHC.Types.Id.Info( CafInfo( NoCafRefs ) )
 import GHC.Types.Name (isInternalName)
 import GHC.Types.RepType (countConRepArgs)
 import GHC.Types.Literal
-import GHC.Builtin.Utils
+import GHC.Builtin
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 import GHC.Utils.Monad (mapMaybeM)
@@ -100,23 +100,7 @@ cgTopRhsCon cfg id con mn args
              nv_args_w_offsets) =
                  mkVirtHeapOffsetsWithPadding profile StdHeader (addArgReps args)
 
-        ; let
-            -- Decompose padding into units of length 8, 4, 2, or 1 bytes to
-            -- allow the implementation of mk_payload to use widthFromBytes,
-            -- which only handles these cases.
-            fix_padding (x@(Padding n off) : rest)
-              | n == 0                 = fix_padding rest
-              | n `elem` [1,2,4,8]     = x : fix_padding rest
-              | n > 8                  = add_pad 8
-              | n > 4                  = add_pad 4
-              | n > 2                  = add_pad 2
-              | otherwise              = add_pad 1
-              where add_pad m = Padding m off : fix_padding (Padding (n-m) (off+m) : rest)
-            fix_padding (x : rest)     = x : fix_padding rest
-            fix_padding []             = []
-
-            mk_payload (Padding len _) = return (CmmInt 0 (widthFromBytes len))
-            mk_payload (FieldOff arg _) = do
+            mk_payload arg = do
                 amode <- getArgAmode arg
                 case amode of
                   CmmLit lit -> return lit
@@ -129,8 +113,7 @@ cgTopRhsCon cfg id con mn args
              -- needs to poke around inside it.
             info_tbl = mkDataConInfoTable profile con (addModuleLoc this_mod mn) True ptr_wds nonptr_wds
 
-
-        ; payload <- mapM mk_payload (fix_padding nv_args_w_offsets)
+        ; payload <- mapM mk_payload (litsWithPaddingToLits nv_args_w_offsets)
                 -- NB1: nv_args_w_offsets is sorted into ptrs then non-ptrs
                 -- NB2: all the amodes should be Lits!
                 --      TODO (osa): Why?

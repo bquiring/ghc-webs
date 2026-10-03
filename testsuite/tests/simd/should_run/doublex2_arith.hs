@@ -30,7 +30,7 @@ input2 = [-2.1274469530639664,-7.177109378829002,-98.24323405063399,-26.03855917
 
 run :: (DoubleX2# -> DoubleX2# -> DoubleX2#) -> UArray Int Double -> Ptr Double -> IO [Double]
 run f a b = allocaArray 64 $ \result -> do
-  forM_ [0,4..63] $ \i -> do
+  forM_ [0,2..63] $ \i -> do
     let v = indexAsDoubleX2 a i
     DoubleX2 w <- readAsDoubleX2 b i
     writeAsDoubleX2 result i (f v w)
@@ -39,7 +39,7 @@ run f a b = allocaArray 64 $ \result -> do
 
 runN :: (DoubleX2# -> DoubleX2# -> DoubleX2#) -> UArray Int Double -> Ptr Double -> IO [Double]
 runN f a b = allocaArray 64 $ \result -> do
-  forM_ [0,4..63] $ \i -> do
+  forM_ [0,2..63] $ \i -> do
     let v = indexAsDoubleX2 a i
     DoubleX2 w <- readAsDoubleX2 b i
     writeAsDoubleX2 result i (f v w)
@@ -59,6 +59,8 @@ main = do
     run minDoubleX2# arr1 arr2 >>= print
     run maxDoubleX2# arr1 arr2 >>= print
     runN (\x _ -> negateDoubleX2# x) arr1 arr2 >>= print
+    runN (\x _ -> absDoubleX2# x) arr1 arr2 >>= print
+    runN (\x _ -> sqrtDoubleX2# x) arr1 arr2 >>= print
     runN plusDoubleX2# arr1 arr2 >>= print
     runN minusDoubleX2# arr1 arr2 >>= print
     runN timesDoubleX2# arr1 arr2 >>= print
@@ -66,6 +68,8 @@ main = do
     runN minDoubleX2# arr1 arr2 >>= print
     runN maxDoubleX2# arr1 arr2 >>= print
     runN (\_ y -> negateDoubleX2# y) arr1 arr2 >>= print
+    runN (\_ y -> absDoubleX2# y) arr1 arr2 >>= print
+    runN (\_ y -> sqrtDoubleX2# y) arr1 arr2 >>= print
     runN (\x y -> plusDoubleX2# y x) arr1 arr2 >>= print
     runN (\x y -> minusDoubleX2# y x) arr1 arr2 >>= print
     runN (\x y -> timesDoubleX2# y x) arr1 arr2 >>= print

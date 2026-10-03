@@ -6,20 +6,23 @@ module GHC.Parser.HaddockLex (lexHsDoc, lexStringLiteral) where
 import GHC.Prelude
 
 import GHC.Data.FastString
-import GHC.Hs.Doc
+import GHC.Hs.DocString (docStringChunks)
 import GHC.Parser.Lexer
 import GHC.Parser.Lexer.Interface (adjustChar)
 import GHC.Parser.Annotation
 import GHC.Types.SrcLoc
-import GHC.Types.SourceText
 import GHC.Data.StringBuffer
 import qualified GHC.Data.Strict as Strict
 import GHC.Types.Name.Reader
-import GHC.Utils.Error
 import GHC.Utils.Encoding
+import GHC.Utils.Error
 import GHC.Hs.Extension
+import GHC.Hs.Lit
 
 import qualified GHC.Data.EnumSet as EnumSet
+
+import Language.Haskell.Syntax.Doc
+import Language.Haskell.Syntax.Extension (LIdP)
 
 import Data.Maybe
 import Data.Word
@@ -28,6 +31,7 @@ import Data.ByteString ( ByteString )
 import qualified Data.ByteString as BS
 
 import qualified GHC.LanguageExtensions as LangExt
+import Language.Haskell.Syntax.Text
 }
 
 -- -----------------------------------------------------------------------------
@@ -132,12 +136,12 @@ advanceSrcLocBS !loc bs = case utf8UnconsByteString bs of
 
 -- | Lex 'StringLiteral' for warning messages
 lexStringLiteral :: P (LocatedN RdrName) -- ^ A precise identifier parser
-                 -> Located StringLiteral
-                 -> Located (WithHsDocIdentifiers StringLiteral GhcPs)
-lexStringLiteral identParser (L l sl@(StringLiteral _ fs _))
+                 -> Located (StringLiteral GhcPs)
+                 -> Located (WithHsDocIdentifiers (StringLiteral GhcPs) GhcPs)
+lexStringLiteral identParser (L l sl)
   = L l (WithHsDocIdentifiers sl idents)
   where
-    bs = bytesFS fs
+    bs = bytesHText (sl_fs sl)
 
     idents = mapMaybe (uncurry (validateIdentWith identParser)) plausibleIdents
 
@@ -145,12 +149,13 @@ lexStringLiteral identParser (L l sl@(StringLiteral _ fs _))
     plausibleIdents = case l of
       RealSrcSpan span _ -> [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) bs]
       UnhelpfulSpan reason -> [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc bs]
+      GeneratedSrcSpan span -> [(GeneratedSrcSpan span, tok) | (_, tok) <- alexScanTokens fakeLoc bs]
 
     fakeLoc = mkRealSrcLoc nilFS 0 0
 
 -- | Lex identifiers from a docstring.
 lexHsDoc :: P (LocatedN RdrName)      -- ^ A precise identifier parser
-         -> HsDocString
+         -> HsDocString GhcPs
          -> HsDoc GhcPs
 lexHsDoc identParser doc =
     WithHsDocIdentifiers doc idents
@@ -158,18 +163,20 @@ lexHsDoc identParser doc =
     docStrings = docStringChunks doc
     idents = concat [mapMaybe maybeDocIdentifier (plausibleIdents doc) | doc <- docStrings]
 
-    maybeDocIdentifier :: (SrcSpan, ByteString) -> Maybe (Located RdrName)
+    maybeDocIdentifier :: (SrcSpan, ByteString) -> Maybe (LIdP GhcPs)
     maybeDocIdentifier = uncurry (validateIdentWith identParser)
 
-    plausibleIdents :: LHsDocStringChunk -> [(SrcSpan,ByteString)]
-    plausibleIdents (L (RealSrcSpan span _) (HsDocStringChunk s))
-      = [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) s]
-    plausibleIdents (L (UnhelpfulSpan reason) (HsDocStringChunk s))
-      = [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc s] -- preserve the original reason
+    plausibleIdents :: LHsDocStringChunk GhcPs -> [(SrcSpan,ByteString)]
+    plausibleIdents (L (RealSrcSpan span _) (HsDocStringChunk bs))
+      = [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) bs]
+    plausibleIdents (L (UnhelpfulSpan reason) (HsDocStringChunk bs))
+      = [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc bs] -- preserve the original reason
+    plausibleIdents (L (GeneratedSrcSpan span) (HsDocStringChunk bs))
+      = [(GeneratedSrcSpan span, tok) | (_, tok) <- alexScanTokens fakeLoc bs] -- preserve the original reason
 
     fakeLoc = mkRealSrcLoc nilFS 0 0
 
-validateIdentWith :: P (LocatedN RdrName) -> SrcSpan -> ByteString -> Maybe (Located RdrName)
+validateIdentWith :: P (LocatedN RdrName) -> SrcSpan -> ByteString -> Maybe (LIdP GhcPs)
 validateIdentWith identParser mloc str0 =
   let -- These ParserFlags should be as "inclusive" as possible, allowing
       -- identifiers defined with any language extension.
@@ -181,11 +188,13 @@ validateIdentWith identParser mloc str0 =
       buffer = stringBufferFromByteString str0
       realSrcLc = case mloc of
         RealSrcSpan loc _ -> realSrcSpanStart loc
-        UnhelpfulSpan _ -> mkRealSrcLoc nilFS 0 0
+        GeneratedSrcSpan{} -> mkRealSrcLoc nilFS 0 0
+        UnhelpfulSpan{} -> mkRealSrcLoc nilFS 0 0
       pstate = initParserState pflags buffer realSrcLc
   in case unP identParser pstate of
     POk _ name -> Just $ case mloc of
-       RealSrcSpan _ _ -> reLoc name
-       UnhelpfulSpan _ -> L mloc (unLoc name) -- Preserve the original reason
+       RealSrcSpan _ _ -> name
+       GeneratedSrcSpan{} -> L (noAnnSrcSpan mloc) (unLoc name) -- Preserve the original reason
+       UnhelpfulSpan{} -> L (noAnnSrcSpan mloc) (unLoc name) -- Preserve the original reason
     _ -> Nothing
 }

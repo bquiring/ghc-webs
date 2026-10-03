@@ -74,8 +74,10 @@ module GHC.Internal.Text.ParserCombinators.ReadP
 
 import GHC.Internal.Unicode ( isSpace )
 import GHC.Internal.List ( replicate, null )
-import GHC.Internal.Base hiding ( NonEmpty (..), many )
-import GHC.Internal.Data.NonEmpty ( NonEmpty (..) )
+import GHC.Internal.Base hiding( many )
+import GHC.Internal.Err ( errorWithoutStackTrace )
+import GHC.Internal.Prim ( (+#), (-#) )
+import GHC.Internal.Data.NonEmpty()  -- instance Functor NonEmpty
 
 import GHC.Internal.Control.Monad.Fail
 

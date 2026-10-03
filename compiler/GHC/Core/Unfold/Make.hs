@@ -30,6 +30,7 @@ import GHC.Core.Utils
 import GHC.Types.Basic
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma
 import GHC.Types.Demand ( DmdSig, isDeadEndSig )
 
 import GHC.Utils.Outputable
@@ -84,6 +85,16 @@ mkSimpleUnfolding !opts rhs
 
 mkDFunUnfolding :: [Var] -> DataCon -> [CoreExpr] -> Unfolding
 mkDFunUnfolding bndrs con ops
+  | isUnaryClassDataCon con
+  = -- See (UCM5) in Note [Unary class magic] in GHC.Core.TyCon
+    mkDataConUnfolding $
+    mkLams bndrs  $
+    mkApps (Var (dataConWrapId con)) ops
+                -- This application will satisfy the Core invariants
+                -- from Note [Representation polymorphism invariants] in GHC.Core,
+                -- because typeclass method types are never unlifted.
+
+  | otherwise
   = DFunUnfolding { df_bndrs = bndrs
                   , df_con = con
                   , df_args = map occurAnalyseExpr ops }
@@ -237,12 +248,11 @@ specUnfolding to specialise its unfolding.  Some important points:
     f_spec :: [Int] -> Int
     f_spec xs = case wgo xs of { r -> I# r }
 
-  and we clearly want to inline f_spec at call sites.  But if we still
-  have the big, un-optimised of f (albeit specialised) captured in the
-  stable unfolding for f_spec, we won't get that optimisation.
-
-  This happens with Control.Monad.liftM3, and can cause a lot more
-  allocation as a result (nofib n-body shows this).
+  If we keep the big, un-optimised of f (albeit specialised) captured in the
+  stable unfolding for f_spec, it probably won't inline.  But if we use the
+  now-tiny RHS of `f_spec`, it probably will.  This actually happened with
+  Control.Monad.liftM3, and can cause a lot more allocation as a result (nofib
+  n-body shows this).
 
   Moreover, keeping the stable unfolding isn't much help, because
   the specialised function (probably) isn't overloaded any more.

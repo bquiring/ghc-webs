@@ -403,7 +403,7 @@ it can be *instantiated* to ``IO a``. For example
 
 .. code-block:: none
 
-    ghci> return True
+    ghci> pure True
     True
 
 Furthermore, GHCi will print the result of the I/O action if (and only
@@ -419,7 +419,7 @@ For example, remembering that ``putStrLn :: String -> IO ()``:
 
     ghci> putStrLn "hello"
     hello
-    ghci> do { putStrLn "hello"; return "yes" }
+    ghci> do { putStrLn "hello"; pure "yes" }
     hello
     "yes"
 
@@ -443,12 +443,12 @@ prompt must be in the ``IO`` monad.
 
 .. code-block:: none
 
-    ghci> x <- return 42
+    ghci> x <- pure 42
     ghci> print x
     42
     ghci>
 
-The statement ``x <- return 42`` means “execute ``return 42`` in the
+The statement ``x <- pure 42`` means “execute ``pure 42`` in the
 ``IO`` monad, and bind the result to ``x``\ ”. We can then use ``x`` in
 future statements, for example to print it as we did above.
 
@@ -1215,10 +1215,6 @@ Stack Traces in GHCi
 
 .. index::
   simple: stack trace; in GHCi
-
-[ This is an experimental feature enabled by the new
-``-fexternal-interpreter`` flag that was introduced in GHC 8.0.1.  It
-is currently not supported on Windows.]
 
 GHCi can use the profiling system to collect stack trace information
 when running interpreted code.  To gain access to stack traces, start
@@ -2098,7 +2094,46 @@ mostly obvious.
 
     Compile all targets on GHCi startup.
     By disabling this flag you can speed up the initial start time of GHCi.
-    When targets are needed, they can be loaded by using the :ghci-cmd:`:reload`.
+    After startup, targets can be loaded and unloaded from the GHCi session
+    by using :ghci-cmd:`:reload`.
+
+.. ghc-flag:: -fimport-loaded-targets
+    :shortdesc: Add loaded modules to interactive context.
+    :type: dynamic
+    :reverse: -fno-import-loaded-targets
+    :category:
+
+    :default: off
+    :since: 9.14.2
+
+    Add all modules to the interactive context of the GHCi session after loading targets.
+    This is equivalent to calling :ghci-cmd:`:add` ``+ *⟨module⟩`` for all targets.
+
+    Note, that adding all modules to the interactive context can increase
+    memory usage noticably.
+    If disabled, only the target given last on the command line interface will be
+    added to interactive context of the GHCi session.
+
+.. ghc-flag:: -finteractive-error-hints
+    :shortdesc: Print GHCi specific error hints.
+    :type: dynamic
+    :reverse: -fno-interactive-error-hints
+    :category:
+
+    :default: on
+    :since: 10.2.1
+
+    By default, GHCi extends error hints with GHCi specific instructions.
+
+    Example:
+
+    .. code-block:: none
+
+        Perhaps you intended to use the ‘BlockArguments’ extension
+        You may enable this language extension in GHCi with:
+          :set -XBlockArguments
+
+    This can be disabled with `-fno-interactive-error-hints`.
 
 Packages
 ~~~~~~~~
@@ -2389,7 +2424,7 @@ commonly used commands.
 
     .. code-block:: none
 
-        ghci> let date _ = Data.Time.getZonedTime >>= print >> return ""
+        ghci> let date _ = Data.Time.getZonedTime >>= print >> pure ""
         ghci> :def date date
         ghci> :date
         2017-04-10 12:34:56.93213581 UTC
@@ -2399,16 +2434,16 @@ commonly used commands.
 
     .. code-block:: none
 
-        ghci> let mycd d = System.Directory.setCurrentDirectory d >> return ""
+        ghci> let mycd d = System.Directory.setCurrentDirectory d >> pure ""
         ghci> :def mycd mycd
         ghci> :mycd ..
 
-    Or I could define a simple way to invoke "``ghc --make Main``"
+    Or we could define a simple way to invoke "``ghc --make Main``"
     in the current directory:
 
     .. code-block:: none
 
-        ghci> :def make (\_ -> return ":! ghc --make Main")
+        ghci> :def make (\_ -> pure ":! ghc --make Main")
 
     We can define a command that reads GHCi input from a file. This
     might be useful for creating a set of bindings that we want to
@@ -2429,6 +2464,15 @@ commonly used commands.
     the old command can still be used by preceding the command name with
     a double colon (eg ``::load``).
     It's not possible to redefine the commands ``:{``, ``:}`` and ``:!``.
+
+    For historical reasons, ``:m`` in ghci is shorthand for ``:module``.
+    If we want to override that to mean ``:main``, in a way that also
+    works when the implicit Prelude is deactivated, we can do it like
+    this using ``:def!``:
+
+    .. code-block:: none
+
+        ghci> :def! m \_ -> Prelude.pure ":main"
 
 .. ghci-cmd:: :delete; * | ⟨num⟩ ...
 
@@ -2912,7 +2956,7 @@ commonly used commands.
 
     .. code-block:: none
 
-        *ghci> :def cond \expr -> return (":cmd if (" ++ expr ++ ") then return \"\" else return \":continue\"")
+        *ghci> :def cond \expr -> pure (":cmd if (" ++ expr ++ ") then pure \"\" else pure \":continue\"")
         *ghci> :set stop 0 :cond (x < 3)
 
     To ignore breakpoints for a specified number of iterations use
@@ -3135,6 +3179,10 @@ commonly used commands.
 
     The :ghci-cmd:`:uses` command requires :ghci-cmd:`:set +c` to be set.
 
+.. ghci-cmd:: :version
+
+    Display the current GHC version.
+
 .. ghci-cmd:: :where
 
    Show the current evaluation stack while stopped at a breakpoint.
@@ -3151,6 +3199,13 @@ commonly used commands.
        single: shell commands; in GHCi
 
     Executes the shell command ⟨command⟩.
+
+.. ghci-cmd:: :shell ⟨command⟩
+
+    Executes ⟨command⟩ via ``sh -c`` using ``callProcess``.
+    On Windows this invokes the MSYS2 POSIX shell rather than ``cmd.exe``,
+    providing consistent POSIX shell semantics. Behaves like ``:!``
+    with respect to success/failure and output.
 
 
 .. _ghci-set:
@@ -3548,15 +3603,18 @@ default in future releases.
 Building an external interpreter
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The source code for the external interpreter program is in `utils/iserv`. It is
-very simple because most of the heavy lifting code is from the `ghci` library.
+When :ghc-flag:`-fexternal-interpreter` is enabled, GHC builds a small external
+interpreter executable on demand using the installed `ghci` library and runs it
+directly. There is no longer a dedicated `utils/iserv` program in the tree.
 
 It is sometimes desirable to customize the external interpreter program. For
 example, it is possible to add symbols to the RTS linker used by the external
 interpreter. This is done simply at link time by linking an additional `.o` that
 defines a `rtsExtraSyms` function returning the extra symbols. Doing it this way
 avoids the need to recompile the RTS with symbols added to its built-in list.
-A typical C file would look like this:
+Build your custom interpreter (using `ghci:GHCi.Server.defaultServer` as the
+entry point) and point :ghc-flag:`-pgmi ⟨cmd⟩` at it. A typical C file would
+look like this:
 
 .. code:: C
 

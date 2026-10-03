@@ -190,9 +190,9 @@
  * frame is encountered, it checks the info table of the updatee and:
  *
  *  - if it is `BLACKHOLE`, then the thunk has already been claimed for evaluation
- *    by another thread, and the yielding thread is instead added to the
- *    `BLACKHOLE`'s blocking queue (see Note [suspend duplicate work] in
- *    `ThreadPaused.c`).
+ *    by some thread. If that's not the yielding thread itself, the yielding thread
+ *    is added to the `BLACKHOLE`'s blocking queue (see Note [suspend duplicate
+ *    work] in `ThreadPaused.c`).
  *
  *  - if not, then it blackholes the thunk as done in eager blackholing (but
  *    using the `BLACKHOLE_info` info table instead of `EAGER_BLACKHOLE_info`).
@@ -333,6 +333,10 @@
  * `AP_STACK` closure recording the aborted execution state.
  * See `RaiseAsync.c:raiseAsync` for details.
  *
+ * This can combine with indirection shortcutting during GC to replace a BLACKHOLE
+ * with a fresh THUNK. We should be very careful here since the THUNK will have an
+ * undefined value in the indirectee field. Looking at the indirectee field can then
+ * lead to a segfault such as #26205.
  *
  * CAFs
  * ----

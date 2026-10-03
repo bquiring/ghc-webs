@@ -38,6 +38,7 @@ import GHC.Internal.Types ()
 
 #else
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.C.String (withCAString, peekCAString)
 import GHC.Internal.Foreign.C.String.Encoding
@@ -47,7 +48,6 @@ import GHC.Internal.Foreign.C.Error
 import GHC.Internal.Bits
 import GHC.Internal.Ptr
 import GHC.Internal.Data.Maybe
-import GHC.Internal.Base
 import GHC.Internal.IO.Buffer
 import GHC.Internal.IO.Encoding.Failure
 import GHC.Internal.IO.Encoding.Types

@@ -1,4 +1,4 @@
-cabal-version:  3.0
+cabal-version:  3.8
 -- WARNING: ghc-internal.cabal is automatically generated from ghc-internal.cabal.in by
 -- the top-level ./configure script. Make sure you are editing ghc-internal.cabal.in, not ghc-internal.cabal.
 name:           ghc-internal
@@ -43,6 +43,7 @@ extra-source-files:
     include/winio_structs.h
     include/WordSize.h
     include/HsIntegerGmp.h.in
+    include/RtsIfaceSymbols.h
     install-sh
 
 source-repository head
@@ -55,18 +56,8 @@ Flag bignum-native
     Manual: True
     Default: False
 
-Flag bignum-ffi
-    Description: Enable FFI bignum backend
-    Manual: True
-    Default: False
-
 Flag bignum-gmp
     Description: Enable GMP bignum backend
-    Manual: True
-    Default: False
-
-Flag bignum-check
-    Description: Validate results of the enabled backend against native backend.
     Manual: True
     Default: False
 
@@ -101,7 +92,7 @@ Library
         NegativeLiterals
         NondecreasingIndentation
         OverloadedStrings
-        ParallelArrays
+        ParallelListComp
         PolyKinds
         RankNTypes
         RecordWildCards
@@ -139,12 +130,10 @@ Library
         GHC.Internal.Control.Monad.ST.Imp
         GHC.Internal.Control.Monad.ST.Lazy.Imp
         GHC.Internal.Data.Bits
-        GHC.Internal.Data.Bool
         GHC.Internal.Data.Coerce
         GHC.Internal.Data.Data
         GHC.Internal.Data.Dynamic
         GHC.Internal.Data.Either
-        GHC.Internal.Data.Eq
         GHC.Internal.Data.Foldable
         GHC.Internal.Data.Function
         GHC.Internal.Data.Functor
@@ -152,7 +141,6 @@ Library
         GHC.Internal.Data.Functor.Identity
         GHC.Internal.Data.Functor.Utils
         GHC.Internal.Data.IORef
-        GHC.Internal.Data.Ix
         GHC.Internal.Data.List
         GHC.Internal.Data.List.NonEmpty
         GHC.Internal.Data.Maybe
@@ -172,6 +160,9 @@ Library
         GHC.Internal.Data.Type.Equality
         GHC.Internal.Data.Type.Ord
         GHC.Internal.Data.Typeable
+        GHC.Internal.Data.Typeable.Internal
+            -- GHC.Internal.Data.Typeable.Internal is exposed
+            -- so that base:GHC.KnownKeynames can see it
         GHC.Internal.Data.Unique
         GHC.Internal.Data.Version
         GHC.Internal.Data.Void
@@ -200,6 +191,7 @@ Library
         GHC.Internal.ArrayArray
         GHC.Internal.Base
         GHC.Internal.Bits
+        GHC.Internal.Box
         GHC.Internal.ByteOrder
         GHC.Internal.Char
         GHC.Internal.Clock
@@ -231,6 +223,12 @@ Library
         GHC.Internal.GHCi
         GHC.Internal.GHCi.Helpers
         GHC.Internal.Generics
+        GHC.Internal.Heap.Closures
+        GHC.Internal.Heap.Constants
+        GHC.Internal.Heap.InfoTable
+        GHC.Internal.Heap.InfoTable.Types
+        GHC.Internal.Heap.InfoTableProf
+        GHC.Internal.Heap.ProfInfo.Types
         GHC.Internal.InfoProv
         GHC.Internal.InfoProv.Types
         GHC.Internal.IO
@@ -279,25 +277,30 @@ Library
         GHC.Internal.Read
         GHC.Internal.Real
         GHC.Internal.Records
-        GHC.Internal.ResponseFile
         GHC.Internal.RTS.Flags
         GHC.Internal.RTS.Flags.Test
         GHC.Internal.ST
-        GHC.Internal.Stack.CloneStack
         GHC.Internal.StaticPtr
+        GHC.Internal.StaticPtr.Internal
         GHC.Internal.STRef
         GHC.Internal.Show
+        GHC.Internal.STM
         GHC.Internal.Stable
         GHC.Internal.StableName
         GHC.Internal.Stack
+        GHC.Internal.Stack.Annotation
         GHC.Internal.Stack.CCS
+        GHC.Internal.Stack.CloneStack
+        GHC.Internal.Stack.Constants
+        GHC.Internal.Stack.ConstantsProf
+        GHC.Internal.Stack.Decode
         GHC.Internal.Stack.Types
         GHC.Internal.Stats
         GHC.Internal.Storable
         GHC.Internal.TH.Syntax
         GHC.Internal.TH.Lib
         GHC.Internal.TH.Lift
-        GHC.Internal.TH.Quote
+        GHC.Internal.TH.Monad
         GHC.Internal.TopHandler
         GHC.Internal.TypeError
         GHC.Internal.TypeLits
@@ -305,6 +308,7 @@ Library
         GHC.Internal.TypeNats
         GHC.Internal.TypeNats.Internal
         GHC.Internal.Unicode
+        GHC.Internal.Unicode.Version
         GHC.Internal.Weak
         GHC.Internal.Weak.Finalize
         GHC.Internal.Word
@@ -312,7 +316,6 @@ Library
         GHC.Internal.Numeric.Natural
         GHC.Internal.System.Environment
         GHC.Internal.System.Environment.Blank
-        GHC.Internal.System.Exit
         GHC.Internal.System.IO
         GHC.Internal.System.IO.Error
         GHC.Internal.System.Mem
@@ -321,17 +324,15 @@ Library
         GHC.Internal.System.Posix.Types
         GHC.Internal.Text.ParserCombinators.ReadP
         GHC.Internal.Text.ParserCombinators.ReadPrec
-        GHC.Internal.Text.Read
         GHC.Internal.Text.Read.Lex
         GHC.Internal.Text.Show
         GHC.Internal.Type.Reflection
         GHC.Internal.Type.Reflection.Unsafe
         GHC.Internal.Unsafe.Coerce
-        -- TODO: remove
-        GHC.Internal.IOPort
 
         GHC.Internal.CString
         GHC.Internal.Classes
+        GHC.Internal.Classes.IP
         GHC.Internal.Debug
         GHC.Internal.Magic
         GHC.Internal.Magic.Dict
@@ -345,17 +346,14 @@ Library
         GHC.Internal.Types
 
     autogen-modules:
-        GHC.Internal.Prim
         GHC.Internal.PrimopWrappers
 
     other-modules:
-        GHC.Internal.Data.Typeable.Internal
         GHC.Internal.IO.Handle.Lock.Common
         GHC.Internal.IO.Handle.Lock.Flock
         GHC.Internal.IO.Handle.Lock.LinuxOFD
         GHC.Internal.IO.Handle.Lock.NoOp
         GHC.Internal.IO.Handle.Lock.Windows
-        GHC.Internal.StaticPtr.Internal
         GHC.Internal.Event.Arr
         GHC.Internal.Event.Array
         GHC.Internal.Event.Internal
@@ -364,14 +362,12 @@ Library
         GHC.Internal.Event.IntVar
         GHC.Internal.Event.PSQ
         GHC.Internal.Event.Unique
-        -- GHC.Internal.IOPort -- TODO: hide again after debug
         GHC.Internal.Unicode.Bits
         GHC.Internal.Unicode.Char.DerivedCoreProperties
         GHC.Internal.Unicode.Char.UnicodeData.GeneralCategory
         GHC.Internal.Unicode.Char.UnicodeData.SimpleLowerCaseMapping
         GHC.Internal.Unicode.Char.UnicodeData.SimpleTitleCaseMapping
         GHC.Internal.Unicode.Char.UnicodeData.SimpleUpperCaseMapping
-        GHC.Internal.Unicode.Version
         GHC.Internal.System.Environment.ExecutablePath
 
 
@@ -379,13 +375,11 @@ Library
     -- Bignum configuration
     ----------------------------------------
     -- check that at least one backend is enabled
-    if !flag(bignum-native) && !flag(bignum-gmp) && !flag(bignum-ffi)
+    if !flag(bignum-native) && !flag(bignum-gmp)
       buildable: False
 
     -- check that at most one flag is set
-    if flag(bignum-native) && (flag(bignum-gmp) || flag(bignum-ffi))
-      buildable: False
-    if flag(bignum-gmp) && flag(bignum-ffi)
+    if flag(bignum-native) && flag(bignum-gmp)
       buildable: False
 
     if flag(bignum-gmp)
@@ -395,25 +389,14 @@ Library
         c-sources:
            cbits/gmp_wrappers.c
 
-    if flag(bignum-ffi)
-        cpp-options: -DBIGNUM_FFI
-        other-modules:
-           GHC.Internal.Bignum.Backend.FFI
-
     if flag(bignum-native)
         cpp-options: -DBIGNUM_NATIVE
-
-    if flag(bignum-check)
-        cpp-options: -DBIGNUM_CHECK
-        other-modules:
-           GHC.Internal.Bignum.Backend.Check
 
     exposed-modules:
       GHC.Internal.Bignum.Primitives
       GHC.Internal.Bignum.WordArray
       GHC.Internal.Bignum.BigNat
       GHC.Internal.Bignum.Backend
-      GHC.Internal.Bignum.Backend.Selected
       GHC.Internal.Bignum.Backend.Native
       GHC.Internal.Bignum.Natural
       GHC.Internal.Bignum.Integer
@@ -435,23 +418,14 @@ Library
           cbits/sysconf.c
           cbits/fs.c
           cbits/strerror.c
-          cbits/atomic.c
-          cbits/bswap.c
-          cbits/bitrev.c
-          cbits/clz.c
-          cbits/ctz.c
           cbits/debug.c
-          cbits/int64x2minmax.c
-          cbits/longlong.c
-          cbits/mulIntMayOflo.c
-          cbits/pdep.c
-          cbits/pext.c
-          cbits/popcnt.c
-          cbits/vectorQuotRem.c
-          cbits/word2float.c
+          cbits/Stack_c.c
+          cbits/RtsIface.c
 
       cmm-sources:
           cbits/StackCloningDecoding.cmm
+          cbits/Stack.cmm
+          cbits/HeapPrim.cmm
 
     if arch(javascript)
       js-sources:
@@ -472,7 +446,7 @@ Library
     if flag(need-atomic)
         -- for 64-bit atomic ops on armel (#20549)
         extra-libraries: atomic
-
+        extra-libraries-static: atomic
     -- OS Specific
     if os(windows)
         -- Windows requires some extra libraries for linking because the RTS
@@ -493,6 +467,9 @@ Library
         -- user32: provides access to apis to modify user components (UI etc)
         --         on Windows. Required because of mingw32.
         extra-libraries:
+            wsock32, user32, shell32, mingw32, kernel32, advapi32,
+            mingwex, ws2_32, shlwapi, ole32, rpcrt4, ntdll, ucrt
+        extra-libraries-static:
             wsock32, user32, shell32, mingw32, kernel32, advapi32,
             mingwex, ws2_32, shlwapi, ole32, rpcrt4, ntdll, ucrt
         -- Minimum supported Windows version.
@@ -541,6 +518,7 @@ Library
         -- we need libm, but for musl and other's we might need libc, as libm
         -- is just an empty shell.
         extra-libraries: c, m
+        extra-libraries-static: c, m
 
     -- The Ports framework always passes this flag when building software that
     -- uses iconv to make iconv from Ports compatible with iconv from the base system
@@ -569,6 +547,10 @@ Library
     -- We need to set the unit id to ghc-internal (without a version number)
     -- as it's magic.
     ghc-options: -this-unit-id ghc-internal
+
+    -- Set -frebindable-known-names,
+    -- since GHC.Essentials isn't available yet
+    ghc-options: -frebindable-known-names
 
     -- Make sure we don't accidentally regress into anti-patterns
     ghc-options: -Wcompat -Wnoncanonical-monad-instances

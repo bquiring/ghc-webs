@@ -1,8 +1,17 @@
+## 0.14.0
+
+- Shipped with GHC 10.0.1
+
+- New and/or/xor SIMD primops for bitwise logical operations, such as andDoubleX4#, orWord32X4#, xorInt8X16#, etc.
+  These are supported by the LLVM backend and by the X86_64 NCG backend (for the latter, only for 128-wide vectors).
+
 ## 0.13.1
 
 - Shipped with GHC 9.14.1
 
 - `ghc-prim`'s implementation has been merged into `ghc-internal`; `ghc-prim` is now deprecated.
+
+- `IOPort#` and its related operations have been removed ([CLC #213](https://github.com/haskell/core-libraries-committee/issues/213))
 
 ## 0.13.0
 

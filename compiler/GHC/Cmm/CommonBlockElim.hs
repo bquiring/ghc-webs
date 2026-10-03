@@ -1,5 +1,3 @@
-{-# LANGUAGE GADTs #-}
-
 module GHC.Cmm.CommonBlockElim
   ( elimCommonBlocks
   )
@@ -21,11 +19,14 @@ import Data.Functor.Classes (liftEq)
 import Data.Maybe (mapMaybe)
 import qualified Data.List as List
 import Data.Word
+import GHC.Float (castFloatToWord32)
 import qualified Data.Map as M
 import qualified GHC.Data.TrieMap as TM
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique.FM
 import GHC.Types.Unique
 import GHC.Utils.Word64 (truncateWord64ToWord32)
+import GHC.Utils.Panic.Plain (assert)
 import Control.Arrow (first, second)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
@@ -60,15 +61,30 @@ import qualified Data.List.NonEmpty as NE
 
 -- TODO: Use optimization fuel
 elimCommonBlocks :: CmmGraph -> CmmGraph
-elimCommonBlocks g = replaceLabels env $ copyTicks env g
+elimCommonBlocks g =
+    assert (g_entry g == g_entry g') g'
   where
+     g' = replaceLabels env $ copyTicks env g
      env = iterate mapEmpty blocks_with_key
      -- The order of blocks doesn't matter here. While we could use
      -- revPostorder which drops unreachable blocks this is done in
      -- ContFlowOpt already which runs before this pass. So we use
      -- toBlockList since it is faster.
-     groups = groupByInt hash_block (toBlockList g) :: [[CmmBlock]]
+     -- One exception: The entry block most come first or we risk eliminating it
+     -- in favour of another block. See Note [Retain entry block during common block elimination.]
+     groups = groupByInt hash_block (toBlockListEntryFirst g) :: [[CmmBlock]]
      blocks_with_key = [ [ (successors b, [b]) | b <- bs] | bs <- groups]
+
+-- Note [Retain entry block during common block elimination.]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- At the stage we run common block elimination (CBE) we only have one info
+-- table for the entry label. Which means we can get away without applying the
+-- block label substitution to the info table *as long as we keep the first block*.
+-- When combining blocks the first block in the list of blocks is kept, and the later
+-- one eliminated, so we can achieve this by simply using toBlockListEntryFirst.
+--
+-- If we don't we end up with #27722 where the entry block was eliminated in favour
+-- of another block.
 
 -- Invariant: The blocks in the list are pairwise distinct
 -- (so avoid comparing them again)
@@ -167,7 +183,9 @@ hash_block block =
 
         hash_lit :: CmmLit -> Word32
         hash_lit (CmmInt i _) = fromInteger i
-        hash_lit (CmmFloat r _) = truncate r
+        hash_lit (CmmFloat r _) =
+          -- NB: don't use 'truncate' as this fails on NaN/Infinity (#26229)
+          castFloatToWord32 $ litFloatingToHostFloat r
         hash_lit (CmmVec ls) = hash_list hash_lit ls
         hash_lit (CmmLabel _) = 119 -- ugh
         hash_lit (CmmLabelOff _ i) = cvt $ 199 + i
@@ -182,7 +200,7 @@ hash_block block =
 
         cvt = fromInteger . toInteger
 
-        -- Since we are hashing, we can savely downcast Word64 to Word32 here.
+        -- Since we are hashing, we can safely downcast Word64 to Word32 here.
         -- Although a different hashing function may be more effective.
         hash_unique :: Uniquable a => a -> Word32
         hash_unique = truncateWord64ToWord32 . getKey . getUnique
@@ -305,6 +323,6 @@ groupByInt :: (a -> Int) -> [a] -> [[a]]
 groupByInt f xs = nonDetEltsUFM $ List.foldl' go emptyUFM xs
    -- See Note [Unique Determinism and code generation]
   where
-    go m x = alterUFM addEntry m (f x)
+    go m x = strictUpsertUFM addEntry m (f x)
       where
-        addEntry xs = Just $! maybe [x] (x:) xs
+        addEntry = maybe [x] (x:)

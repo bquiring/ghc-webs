@@ -1,6 +1,3 @@
-{-# LANGUAGE GADTs         #-}
-{-# LANGUAGE TupleSections #-}
-
 module GHC.Driver.GenerateCgIPEStub (generateCgIPEStub, lookupEstimatedTicks) where
 
 import Data.Map.Strict (Map)
@@ -31,7 +28,8 @@ import GHC.StgToCmm.Utils
 import GHC.StgToCmm.CgUtils (CgStream)
 import GHC.Types.IPE (InfoTableProvMap (provInfoTables), IpeSourceLocation)
 import GHC.Types.Name.Set (NonCaffySet)
-import GHC.Types.Tickish (GenTickish (SourceNote))
+import GHC.Data.FastString (FastString)
+import GHC.Types.Tickish (bestSourceNote)
 import GHC.Unit.Types (Module, moduleName)
 import GHC.Unit.Module (moduleNameString)
 import qualified GHC.Utils.Logger as Logger
@@ -65,7 +63,7 @@ looking up source locations for stack info tables in the map generated during th
 
 The rest of this note will document exactly how the first pass generates the map from labels to
 estimated source positions. The algorithms are different depending on whether tables-next-to-code
-is on or off. Both algorithms have in common that we are looking for a `CmmNode.CmmTick`
+is on or off. Both algorithms have in common that we are looking for a `GHC.Cmm.Node.CmmTick`
 (containing a `SourceNote`) that is near what we estimate to be the label of a return stack frame.
 
 With tables-next-to-code
@@ -115,14 +113,14 @@ open or closed on exit (one can fallthrough from them to the next node).
 Please refer to the paper "Hoopl: A Modular, Reusable Library for Dataflow Analysis and Transformation"
 for a detailed explanation.
 
-Here we use the fact, that calls (represented by `CmmNode.CmmCall`) are always closed on exit
+Here we use the fact, that calls (represented by `GHC.Cmm.Node.CmmCall`) are always closed on exit
 (`CmmNode O C`, `O` means open, `C` closed). In other words, they are always at the end of a block.
 
 So, given a `CmmGraph`:
-  - Look at the end of every block: If it is a `CmmNode.CmmCall` returning to some label, lookup
-    the nearest `CmmNode.CmmTick` by traversing the middle part of the block backwards (from end to
+  - Look at the end of every block: If it is a `GHC.Cmm.Node.CmmCall` returning to some label, lookup
+    the nearest `GHC.Cmm.Node.CmmTick` by traversing the middle part of the block backwards (from end to
     beginning).
-  - Take the first `CmmNode.CmmTick` that contains a `Tickish.SourceNote` and map the label we
+  - Take the first `GHC.Cmm.Node.CmmTick` that contains a `Tickish.SourceNote` and map the label we
     found to it's payload as an `IpeSourceLocation`. (There are other `Tickish` constructors like
     `ProfNote` or `HpcTick`, these are ignored.)
 
@@ -260,11 +258,12 @@ generateCgIPEStub hsc_env this_mod denv (nonCaffySet, moduleLFInfos, infoTablesW
 -- performance suffered considerably as a result (see #23103).
 lookupEstimatedTicks
   :: HscEnv
+  -> FastString -- ^ the source file of the module being compiled
   -> Map CmmInfoTable (Maybe IpeSourceLocation)
   -> IPEStats
   -> CmmGroupSRTs
   -> IO (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
-lookupEstimatedTicks hsc_env ipes stats cmm_group_srts =
+lookupEstimatedTicks hsc_env this_file ipes stats cmm_group_srts =
     -- Pass 2: Create an entry in the IPE map for every info table listed in
     -- this CmmGroupSRTs. If the info table is a stack info table and
     -- -finfo-table-map-with-stack is enabled, look up its estimated source
@@ -289,9 +288,9 @@ lookupEstimatedTicks hsc_env ipes stats cmm_group_srts =
     labelsToSources :: Map CLabel IpeSourceLocation
     labelsToSources =
       if platformTablesNextToCode platform then
-        foldl' labelsToSourcesWithTNTC Map.empty cmm_group_srts
+        foldl' (labelsToSourcesWithTNTC this_file) Map.empty cmm_group_srts
       else
-        foldl' labelsToSourcesSansTNTC Map.empty cmm_group_srts
+        foldl' (labelsToSourcesSansTNTC this_file) Map.empty cmm_group_srts
 
     collectInfoTables
       :: (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
@@ -334,15 +333,16 @@ lookupEstimatedTicks hsc_env ipes stats cmm_group_srts =
 
 -- | See Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
 labelsToSourcesWithTNTC
-  :: Map CLabel IpeSourceLocation
+  :: FastString -- ^ the source file of the module being compiled
+  -> Map CLabel IpeSourceLocation
   -> GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
   -> Map CLabel IpeSourceLocation
-labelsToSourcesWithTNTC acc (CmmProc _ _ _ cmm_graph) =
+labelsToSourcesWithTNTC this_file acc (CmmProc _ _ _ cmm_graph) =
     foldl' go acc (toBlockList cmm_graph)
   where
     go :: Map CLabel IpeSourceLocation -> CmmBlock -> Map CLabel IpeSourceLocation
     go acc block =
-        case (,) <$> returnFrameLabel <*> lastTickInBlock of
+        case (,) <$> returnFrameLabel <*> nearestTickInBlock of
           Just (clabel, src_loc) -> Map.insert clabel src_loc acc
           Nothing -> acc
       where
@@ -354,20 +354,20 @@ labelsToSourcesWithTNTC acc (CmmProc _ _ _ cmm_graph) =
             (CmmCall _ (Just l) _ _ _ _) -> Just $ mkAsmTempLabel l
             _ -> Nothing
 
-        lastTickInBlock = foldr maybeTick Nothing (blockToList middleBlock)
-
-        maybeTick :: CmmNode O O -> Maybe IpeSourceLocation -> Maybe IpeSourceLocation
-        maybeTick _ s@(Just _) = s
-        maybeTick (CmmTick (SourceNote span name)) Nothing = Just (span, name)
-        maybeTick _ _ = Nothing
-labelsToSourcesWithTNTC acc _ = acc
+        -- The ticks enclosing the call, innermost first.
+        -- NB: the innermost tick may not be from the current module, due to inlining.
+        nearestTickInBlock =
+          bestSourceNote False this_file
+            [ t | CmmTick t <- reverse (blockToList middleBlock) ]
+labelsToSourcesWithTNTC _ acc _ = acc
 
 -- | See Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
 labelsToSourcesSansTNTC
-  :: Map CLabel IpeSourceLocation
+  :: FastString -- ^ the source file of the module being compiled
+  -> Map CLabel IpeSourceLocation
   -> GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
   -> Map CLabel IpeSourceLocation
-labelsToSourcesSansTNTC acc (CmmProc _ _ _ cmm_graph) =
+labelsToSourcesSansTNTC this_file acc (CmmProc _ _ _ cmm_graph) =
     foldl' go acc (toBlockList cmm_graph)
   where
     go :: Map CLabel IpeSourceLocation -> CmmBlock -> Map CLabel IpeSourceLocation
@@ -383,7 +383,9 @@ labelsToSourcesSansTNTC acc (CmmProc _ _ _ cmm_graph) =
           case (b, lastTick) of
             (CmmStore _ (CmmLit (CmmLabel l)) _, Just src_loc) ->
               (Map.insert l src_loc acc, Nothing)
-            (CmmTick (SourceNote span name), _) ->
-              (acc, Just (span, name))
+            (CmmTick t, _)
+              -- Pick the innermost source note tick from the current file.
+              | Just src_loc <- bestSourceNote False this_file [t] ->
+              (acc, Just src_loc)
             _ -> (acc, lastTick)
-labelsToSourcesSansTNTC acc _ = acc
+labelsToSourcesSansTNTC _ acc _ = acc

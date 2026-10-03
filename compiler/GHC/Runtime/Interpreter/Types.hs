@@ -1,5 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -- | Types used by the runtime interpreter
@@ -48,6 +47,7 @@ import GHC.Linker.Types
 import GHCi.RemoteTypes
 import GHCi.Message         ( Pipe )
 
+import GHC.Data.FastString.Env
 import GHC.Platform
 #if defined(HAVE_INTERNAL_INTERPRETER)
 import GHC.Platform.Ways
@@ -76,6 +76,9 @@ data Interp = Interp
 
   , interpSymbolCache :: !InterpSymbolCache
       -- ^ LookupSymbol cache
+
+  , interpStringCache :: !(MVar (FastStringEnv (RemotePtr ())))
+      -- ^ MallocStrings cache
   }
 
 data InterpInstance
@@ -214,13 +217,14 @@ data JSInterpConfig = JSInterpConfig
 
 data WasmInterpConfig = WasmInterpConfig
   { wasmInterpDyLD           :: !FilePath  -- ^ Location of dyld.mjs script
-  , wasmInterpLibDir         ::  FilePath  -- ^ wasi-sdk sysroot libdir containing libc.so, etc
+  , wasmInterpLibDir         :: !FilePath  -- ^ wasi-sdk sysroot libdir containing libc.so, etc
   , wasmInterpOpts           :: ![String]  -- ^ Additional command line arguments for iserv
 
   -- wasm ghci browser mode
   , wasmInterpBrowser                      :: !Bool
   , wasmInterpBrowserHost                  :: !String
   , wasmInterpBrowserPort                  :: !Int
+  , wasmInterpBrowserAssetsDir             :: !(Maybe FilePath)
   , wasmInterpBrowserRedirectWasiConsole   :: !Bool
   , wasmInterpBrowserPuppeteerLaunchOpts   :: !(Maybe String)
   , wasmInterpBrowserPlaywrightBrowserType :: !(Maybe String)

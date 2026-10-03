@@ -1,19 +1,11 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE StandaloneDeriving #-}
-
 module GHC.Parser.Annotation (
   -- * Core Exact Print Annotation types
-  EpToken(..), EpUniToken(..),
+  EpToken(..), noEpTok, EpUniToken(..), noEpUniTok,
   getEpTokenSrcSpan,
   getEpTokenBufSpan,
-  getEpTokenLocs, getEpTokenLoc, getEpUniTokenLoc,
-  TokDcolon, TokDarrow, TokRarrow, TokForall,
-  EpLayout(..),
+  getEpTokenLoc, getEpUniTokenLoc,
+  TokDcolon, TokDarrow, TokRarrow, TokForall, TokStar,
+  EpLayout(..), getEpaLocationCol,
   EpaComment(..), EpaCommentTok(..),
   IsUnicodeSyntax(..),
   HasE(..),
@@ -35,26 +27,23 @@ module GHC.Parser.Annotation (
   EpAnnCO,
 
   -- ** Annotations in 'GenLocated'
-  LocatedA, LocatedL, LocatedC, LocatedN, LocatedAn, LocatedP,
-  LocatedLC, LocatedLS, LocatedLW, LocatedLI,
-  SrcSpanAnnA, SrcSpanAnnL, SrcSpanAnnP, SrcSpanAnnC, SrcSpanAnnN,
-  SrcSpanAnnLC, SrcSpanAnnLW, SrcSpanAnnLS, SrcSpanAnnLI,
-  LocatedE,
+  LocatedA, LocatedN, LocatedAn,
+  SrcSpanAnnA, SrcSpanAnnN,
 
   -- ** Annotation data types used in 'GenLocated'
-
-  AnnListItem(..), AnnList(..), AnnListBrackets(..),
-  AnnParen(..),
-  AnnPragma(..),
-  AnnContext(..),
   NameAnn(..), NameAdornment(..),
   NoEpAnns(..),
-  AnnSortKey(..), DeclTag(..), BindTag(..),
 
   -- ** Trailing annotations in lists
   TrailingAnn(..), ta_location,
-  addTrailingAnnToA, addTrailingAnnToL, addTrailingCommaToN,
+  addTrailingAnnToA, addTrailingCommaToN,
   noTrailingN,
+
+  -- ** Annotation data types used in TTG extension points
+
+  AnnList(..), AnnListBrackets(..), AnnListLayout(..),
+  AnnParen(..),
+  AnnCType(..),AnnWarningTxt(..),AnnOverlap(..),AnnAnnDecl(..),AnnPragSCC(..),
 
   -- ** Utilities for converting between different 'GenLocated' when
   -- ** we do not care about the annotations.
@@ -106,7 +95,9 @@ import GHC.Data.FastString
 import GHC.TypeLits (Symbol, KnownSymbol, symbolVal)
 import GHC.Types.Name
 import GHC.Types.SrcLoc
-import GHC.Hs.DocString
+import GHC.Hs.DocString () -- Required for Data, Eq, Show instances
+import GHC.Hs.Extension.Pass (GhcPs)
+import Language.Haskell.Syntax.Doc
 import GHC.Utils.Misc
 import GHC.Utils.Outputable hiding ( (<>) )
 import GHC.Utils.Panic
@@ -223,9 +214,11 @@ data HasE = HasE | NoE
 -- let-expression, we store @EpToken "let"@ and @EpToken "in"@.
 -- The locations of those tokens can be used to faithfully reproduce
 -- (exactprint) the original program text.
-data EpToken (tok :: Symbol)
-  = NoEpTok
-  | EpTok !EpaLocation
+newtype EpToken (tok :: Symbol)
+  = EpTok EpaLocation
+
+noEpTok :: EpToken tok
+noEpTok = EpTok (EpaSpan noSrcSpan)
 
 instance KnownSymbol tok => Outputable (EpToken tok) where
   ppr _ = text (symbolVal (Proxy @tok))
@@ -235,8 +228,10 @@ instance KnownSymbol tok => Outputable (EpToken tok) where
 -- recorded in order to exactprint such tokens, so instead of @EpToken "->"@ we
 -- introduce @EpUniToken "->" "→"@.
 data EpUniToken (tok :: Symbol) (utok :: Symbol)
-  = NoEpUniTok
-  | EpUniTok !EpaLocation !IsUnicodeSyntax
+  = EpUniTok !EpaLocation !IsUnicodeSyntax
+
+noEpUniTok :: EpUniToken tok utok
+noEpUniTok = EpUniTok (EpaSpan noSrcSpan) NormalSyntax
 
 deriving instance Eq (EpToken tok)
 deriving instance Eq (EpUniToken tok utok)
@@ -244,32 +239,22 @@ deriving instance KnownSymbol tok => Data (EpToken tok)
 deriving instance (KnownSymbol tok, KnownSymbol utok) => Data (EpUniToken tok utok)
 
 instance (KnownSymbol tok, KnownSymbol utok) => Outputable (EpUniToken tok utok) where
-  ppr NoEpUniTok                 = text $ symbolVal (Proxy @tok)
   ppr (EpUniTok _ NormalSyntax)  = text $ symbolVal (Proxy @tok)
   ppr (EpUniTok _ UnicodeSyntax) = text $ symbolVal (Proxy @utok)
 
 getEpTokenSrcSpan :: EpToken tok -> SrcSpan
-getEpTokenSrcSpan NoEpTok = noSrcSpan
 getEpTokenSrcSpan (EpTok EpaDelta{}) = noSrcSpan
 getEpTokenSrcSpan (EpTok (EpaSpan span)) = span
 
 getEpTokenBufSpan :: EpToken tok -> Strict.Maybe BufSpan
-getEpTokenBufSpan NoEpTok = Strict.Nothing
 getEpTokenBufSpan (EpTok EpaDelta{}) = Strict.Nothing
+getEpTokenBufSpan (EpTok (EpaSpan ( UnhelpfulSpan _))) = Strict.Nothing
 getEpTokenBufSpan (EpTok (EpaSpan span)) = getBufSpan span
 
-getEpTokenLocs :: [EpToken tok] -> [EpaLocation]
-getEpTokenLocs ls = concatMap go ls
-  where
-    go NoEpTok   = []
-    go (EpTok l) = [l]
-
 getEpTokenLoc :: EpToken tok -> EpaLocation
-getEpTokenLoc NoEpTok   = noAnn
 getEpTokenLoc (EpTok l) = l
 
 getEpUniTokenLoc :: EpUniToken tok toku -> EpaLocation
-getEpUniTokenLoc NoEpUniTok     = noAnn
 getEpUniTokenLoc (EpUniTok l _) = l
 
 -- TODO:AZ: check we have all of the unicode tokens
@@ -277,6 +262,7 @@ type TokDcolon = EpUniToken "::" "∷"
 type TokDarrow = EpUniToken "=>"  "⇒"
 type TokRarrow = EpUniToken "->" "→"
 type TokForall = EpUniToken "forall" "∀"
+type TokStar   = EpUniToken "*" "★"
 
 -- | Layout information for declarations.
 data EpLayout =
@@ -296,13 +282,23 @@ data EpLayout =
     --   bar :: a
     -- @
     EpVirtualBraces
-      !Int -- ^ Layout column (indentation level, begins at 1)
+      !EpaLocation -- ^ Layout column (indentation level, begins at 1)
+                   -- We keep this as an 'EpaLocation' so exact printing
+                   -- can use it too.
   |
     -- | Empty or compiler-generated blocks do not have layout information
     -- associated with them.
     EpNoLayout
 
 deriving instance Data EpLayout
+
+-- | Used in 'GHC.Parser.Haddock' to get layout column. It assumes
+-- | there is a RealSrcSpan in it, falling back to zero otherwise
+getEpaLocationCol :: EpaLocation -> Int
+getEpaLocationCol loc
+  = case loc of
+      EpaSpan (RealSrcSpan l _) -> srcSpanStartCol l
+      _ -> leftmostColumn -- should never happen in Parser output
 
 -- ---------------------------------------------------------------------
 
@@ -320,7 +316,7 @@ data EpaComment =
 
 data EpaCommentTok =
   -- Documentation annotations
-    EpaDocComment      HsDocString -- ^ a docstring that can be pretty printed using pprHsDocString
+    EpaDocComment      (HsDocString GhcPs) -- ^ a docstring that can be pretty printed using pprHsDocString
   | EpaDocOptions      String     -- ^ doc options (prune, ignore-exports, etc)
   | EpaLineComment     String     -- ^ comment starting by "--"
   | EpaBlockComment    String     -- ^ comment in {- -}
@@ -373,11 +369,11 @@ epaLocationRealSrcSpan _ = panic "epaLocationRealSrcSpan"
 -- print annotation elements.  For example
 --
 -- @
--- type SrcSpannAnnA = EpAnn AnnListItem
+-- type SrcSpannAnnA = EpAnn [TrailingAnn]
 -- @
 --
 -- is a commonly used type alias that specializes the 'ann' type parameter to
--- 'AnnListItem'.
+-- '[TrailingAnn]'.
 --
 -- The spacing between the items under the scope of a given EpAnn is
 -- normally derived from the original 'Anchor'.  But if a sub-element
@@ -436,26 +432,13 @@ emptyComments = EpaComments []
 type LocatedA = GenLocated SrcSpanAnnA
 type LocatedN = GenLocated SrcSpanAnnN
 
-type LocatedL = GenLocated SrcSpanAnnL
-type LocatedLC = GenLocated SrcSpanAnnLC
-type LocatedLS = GenLocated SrcSpanAnnLS
-type LocatedLW = GenLocated SrcSpanAnnLW
-type LocatedLI = GenLocated SrcSpanAnnLI
-type LocatedP = GenLocated SrcSpanAnnP
-type LocatedC = GenLocated SrcSpanAnnC
+-- | Annotation for items appearing in a list. They can have one or
+-- more trailing punctuations items, such as commas or semicolons.
+type SrcSpanAnnA = EpAnn [TrailingAnn]
 
-type SrcSpanAnnA = EpAnn AnnListItem
+-- | Annotation for a RdrName / Name. They can have adornments depending
+-- on the context, such as backticks.
 type SrcSpanAnnN = EpAnn NameAnn
-
-type SrcSpanAnnL = EpAnn (AnnList ())
-type SrcSpanAnnLC = EpAnn (AnnList [EpToken ","])
-type SrcSpanAnnLS = EpAnn (AnnList ())
-type SrcSpanAnnLW = EpAnn (AnnList (EpToken "where"))
-type SrcSpanAnnLI = EpAnn (AnnList (EpToken "hiding", [EpToken ","]))
-type SrcSpanAnnP = EpAnn AnnPragma
-type SrcSpanAnnC = EpAnn AnnContext
-
-type LocatedE = GenLocated EpaLocation
 
 -- | General representation of a 'GenLocated' type carrying a
 -- parameterised annotation type.
@@ -484,14 +467,24 @@ The Anno type family maps to the specific EpAnn variant for a given
 item.
 
 So
+  data EpAnn ann
+      = EpAnn { entry    :: !EpaLocation
+              , anns     :: !ann
+              , comments :: !EpAnnComments }
 
   type instance XRec (GhcPass p) a = XRecGhc a
   type XRecGhc a = GenLocated (Anno a) a
 
-  type instance Anno RdrName = SrcSpanAnnN
-  type LocatedN = GenLocated SrcSpanAnnN
+  type instance Anno RdrName              = SrcSpanAnnN
+  type instance Anno (HsExpr (GhcPass p)) = SrcSpanAnnA
+    ...setc for other types
 
-meaning we can have type LocatedN RdrName
+  type SrcSpanAnnA = EpAnn AnnListItem
+
+So
+* A (LHsExpr (GhcPass p)) is decorated with a (Anno (HsExpr (GhcPass p)))
+* ...which is a SrcSpanAnnA
+* ...which is an EpAnn with an `anns` field of `AnnListItem` (for some strange reason)
 
 -}
 
@@ -521,14 +514,6 @@ instance Outputable TrailingAnn where
   ppr (AddVbarAnn tok)    = text "AddVbarAnn"    <+> ppr tok
   ppr (AddDarrowAnn tok)  = text "AddDarrowAnn"  <+> ppr tok
 
--- | Annotation for items appearing in a list. They can have one or
--- more trailing punctuations items, such as commas or semicolons.
-data AnnListItem
-  = AnnListItem {
-      lann_trailing  :: [TrailingAnn]
-      }
-  deriving (Data, Eq)
-
 -- ---------------------------------------------------------------------
 -- Annotations for the context of a list of items
 -- ---------------------------------------------------------------------
@@ -536,48 +521,42 @@ data AnnListItem
 -- | Annotation for the "container" of a list. This captures
 -- surrounding items such as braces if present, and introductory
 -- keywords such as 'where'.
-data AnnList a
+
+-- AZ: goal: only used when there is layout, so vertical alignment matters
+data AnnList
   = AnnList {
-      al_anchor    :: !(Maybe EpaLocation), -- ^ start point of a list having layout
+      al_layout    :: !AnnListLayout,
       al_brackets  :: !AnnListBrackets,
-      al_semis     :: [EpToken ";"], -- decls
-      al_rest      :: !a,
-      al_trailing  :: ![TrailingAnn] -- ^ items appearing after the
-                                     -- list, such as '=>' for a
-                                     -- context
+      al_semis     :: [EpToken ";"] -- decls
       } deriving (Data,Eq)
 
 data AnnListBrackets
-  = ListParens (EpToken "(")         (EpToken ")")
-  | ListBraces (EpToken "{")         (EpToken "}")
-  | ListSquare (EpToken "[")         (EpToken "]")
-  | ListBanana (EpUniToken "(|" "⦇") (EpUniToken "|)"  "⦈")
+  = ListBraces (EpToken "{") (EpToken "}")
   | ListNone
   deriving (Data,Eq)
+
+-- | How the extent of a list was delimited in the source.
+data AnnListLayout
+  = AnnListBraces   -- ^ Explicit @{ ; }@ written by the user. The tokens
+                    --   live in 'al_brackets' and 'al_semis'.
+  | AnnListLayout !EpaLocation
+                    -- ^ The lexer opened an implicit layout context.
+                    --   The 'EpaLocation' is the @vocurly@ token (or, for
+                    --   MultiWayIf, the leading @|@), whose start column is
+                    --   the layout column chosen by 'new_layout_context'.
+  | AnnListNoLayout -- ^ Neither: an Empty or compiler-generated list.
+  deriving (Data, Eq)
 
 -- ---------------------------------------------------------------------
 -- Annotations for parenthesised elements, such as tuples, lists
 -- ---------------------------------------------------------------------
 
--- | exact print annotation for an item having surrounding "brackets", such as
--- tuples or lists
+-- | exact print annotation for an item having parentheses, with or without
+-- the hash symbol, e.g. tuples, unboxed tuples, unboxed sums
 data AnnParen
   = AnnParens       (EpToken "(")  (EpToken ")")  -- ^ '(', ')'
   | AnnParensHash   (EpToken "(#") (EpToken "#)") -- ^ '(#', '#)'
-  | AnnParensSquare (EpToken "[")  (EpToken "]")  -- ^ '[', ']'
   deriving Data
-
--- ---------------------------------------------------------------------
-
--- | Exact print annotation for the 'Context' data type.
-data AnnContext
-  = AnnContext {
-      ac_darrow    :: Maybe TokDarrow,
-                      -- ^ location of the '=>', if present.
-      ac_open      :: [EpToken "("], -- ^ zero or more opening parentheses.
-      ac_close     :: [EpToken ")"]  -- ^ zero or more closing parentheses.
-      } deriving (Data)
-
 
 -- ---------------------------------------------------------------------
 -- Annotations for names
@@ -586,6 +565,7 @@ data AnnContext
 -- | exact print annotations for a 'RdrName'.  There are many kinds of
 -- adornment that can be attached to a given 'RdrName'. This type
 -- captures them, as detailed on the individual constructors.
+-- Similar to SrcSpanAnnA, they also carry '[TrailingAnn]'.
 data NameAnn
   -- | Used for a name with an adornment, so '`foo`', '(bar)'
   = NameAnn {
@@ -647,152 +627,52 @@ data NameAdornment
 
 -- | exact print annotation used for capturing the locations of
 -- annotations in pragmas.
-data AnnPragma
-  = AnnPragma {
-      apr_open      :: EpaLocation,
-      apr_close     :: EpToken "#-}",
-      apr_squares   :: (EpToken "[", EpToken "]"),
-      apr_loc1      :: EpaLocation,
-      apr_loc2      :: EpaLocation,
-      apr_type      :: EpToken "type",
-      apr_module    :: EpToken "module"
+data AnnCType
+  = AnnCType {
+      ac_open      :: EpaLocation,
+      ac_close     :: EpToken "#-}",
+      ac_loc1      :: EpaLocation,
+      ac_loc2      :: EpaLocation
+      } deriving (Data,Eq)
+
+data AnnWarningTxt
+  = AnnWarningTxt {
+      awt_open      :: EpaLocation,
+      awt_close     :: EpToken "#-}",
+      awt_squares   :: (EpToken "[", EpToken "]")
+      } deriving (Data,Eq)
+
+data AnnOverlap
+  = AnnOverlap {
+      ao_open      :: EpaLocation,
+      ao_close     :: EpToken "#-}"
+      } deriving (Data,Eq)
+
+data AnnAnnDecl
+  = AnnAnnDecl {
+      ad_open      :: EpaLocation,
+      ad_close     :: EpToken "#-}",
+      ad_type      :: EpToken "type",
+      ad_module    :: EpToken "module"
+      } deriving (Data,Eq)
+
+data AnnPragSCC
+  = AnnPragSCC {
+      aps_open      :: EpaLocation,
+      aps_close     :: EpToken "#-}",
+      aps_loc1      :: EpaLocation
       } deriving (Data,Eq)
 
 -- ---------------------------------------------------------------------
 
--- | Captures the sort order of sub elements for `ValBinds`,
--- `ClassDecl`, `ClsInstDecl`
-data AnnSortKey tag
-  -- See Note [AnnSortKey] below
-  = NoAnnSortKey
-  | AnnSortKey [tag]
-  deriving (Data, Eq)
-
--- | Used to track of interleaving of binds and signatures for ValBind
-data BindTag
-  -- See Note [AnnSortKey] below
-  = BindTag
-  | SigDTag
-  deriving (Eq,Data,Ord,Show)
-
--- | Used to track interleaving of class methods, class signatures,
--- associated types and associate type defaults in `ClassDecl` and
--- `ClsInstDecl`.
-data DeclTag
-  -- See Note [AnnSortKey] below
-  = ClsMethodTag
-  | ClsSigTag
-  | ClsAtTag
-  | ClsAtdTag
-  deriving (Eq,Data,Ord,Show)
-
-{-
-Note [AnnSortKey]
-~~~~~~~~~~~~~~~~~
-
-For some constructs in the ParsedSource we have mixed lists of items
-that can be freely intermingled.
-
-An example is the binds in a where clause, captured in
-
-    ValBinds
-        (XValBinds idL idR)
-        (LHsBindsLR idL idR) [LSig idR]
-
-This keeps separate ordered collections of LHsBind GhcPs and LSig GhcPs.
-
-But there is no constraint on the original source code as to how these
-should appear, so they can have all the signatures first, then their
-binds, or grouped with a signature preceding each bind.
-
-   fa :: Int
-   fa = 1
-
-   fb :: Char
-   fb = 'c'
-
-Or
-
-   fa :: Int
-   fb :: Char
-
-   fb = 'c'
-   fa = 1
-
-When exact printing these, we need to restore the original order. As
-initially parsed we have the SrcSpan, and can sort on those. But if we
-have modified the AST prior to printing, we cannot rely on the
-SrcSpans for order any more.
-
-The bag of LHsBind GhcPs is physically ordered, as is the list of LSig
-GhcPs. So in effect we have a list of binds in the order we care
-about, and a list of sigs in the order we care about. The only problem
-is to know how to merge the lists.
-
-This is where AnnSortKey comes in, which we store in the TTG extension
-point for ValBinds.
-
-    data AnnSortKey tag
-      = NoAnnSortKey
-      | AnnSortKey [tag]
-
-When originally parsed, with SrcSpans we can rely on, we do not need
-any extra information, so we tag it with NoAnnSortKey.
-
-If the binds and signatures are updated in any way, such that we can
-no longer rely on their SrcSpans (e.g. they are copied from elsewhere,
-parsed from scratch for insertion, have a fake SrcSpan), we use
-`AnnSortKey [BindTag]` to keep track.
-
-    data BindTag
-      = BindTag
-      | SigDTag
-
-We use it as a merge selector, and have one entry for each bind and
-signature.
-
-So for the first example we have
-
-  binds: fa = 1 , fb = 'c'
-  sigs:  fa :: Int, fb :: Char
-  tags: SigDTag, BindTag, SigDTag, BindTag
-
-so we draw first from the signatures, then the binds, and same again.
-
-For the second example we have
-
-  binds: fb = 'c', fa = 1
-  sigs:  fa :: Int, fb :: Char
-  tags: SigDTag, SigDTag, BindTag, BindTag
-
-so we draw two signatures, then two binds.
-
-We do similar for ClassDecl and ClsInstDecl, but we have four
-different lists we must manage. For this we use DeclTag.
-
--}
-
--- ---------------------------------------------------------------------
-
--- | Helper function used in the parser to add a 'TrailingAnn' items
--- to an existing annotation.
-addTrailingAnnToL :: TrailingAnn -> EpAnnComments
-                  -> EpAnn (AnnList a) -> EpAnn (AnnList a)
-addTrailingAnnToL t cs n = n { anns = addTrailing (anns n)
-                               , comments = comments n <> cs }
-  where
-    -- See Note [list append in addTrailing*]
-    addTrailing n = n { al_trailing = al_trailing n ++ [t]}
-
 -- | Helper function used in the parser to add a 'TrailingAnn' items
 -- to an existing annotation.
 addTrailingAnnToA :: TrailingAnn -> EpAnnComments
-                  -> EpAnn AnnListItem -> EpAnn AnnListItem
-addTrailingAnnToA t cs n = n { anns = addTrailing (anns n)
-                               , comments = comments n <> cs }
-  where
-    -- See Note [list append in addTrailing*]
-    addTrailing n = n { lann_trailing = lann_trailing n ++ [t] }
+                  -> EpAnn [TrailingAnn] -> EpAnn [TrailingAnn]
+
+addTrailingAnnToA t cs n = n { -- See Note [list append in addTrailing*]
+                               anns = anns n <> [t]
+                             , comments = comments n <> cs }
 
 -- | Helper function used in the parser to add a comma location to an
 -- existing annotation.
@@ -809,7 +689,7 @@ noTrailingN s = s { anns = (anns s) { nann_trailing = [] } }
 {-
 Note [list append in addTrailing*]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The addTrailingAnnToL, addTrailingAnnToA and addTrailingCommaToN
+The addTrailingAnnToA and addTrailingCommaToN
 functions are used to add a separator for an item when it occurs in a
 list.  So they are used to capture a comma, vbar, semicolon and similar.
 
@@ -902,7 +782,6 @@ instance HasLoc (EpToken tok) where
   getHasLoc = getEpTokenSrcSpan
 
 instance HasLoc (EpUniToken tok utok) where
-  getHasLoc NoEpUniTok = noSrcSpan
   getHasLoc (EpUniTok l _) = getHasLoc l
 
 getHasLocList :: HasLoc a => [a] -> SrcSpan
@@ -926,7 +805,7 @@ getLocAnn (L l _) = noAnnSrcSpan l
 -- AZ:TODO use widenSpan here too
 addAnnsA :: SrcSpanAnnA -> [TrailingAnn] -> EpAnnComments -> SrcSpanAnnA
 addAnnsA (EpAnn l as1 cs) as2 cs2
-  = EpAnn l (AnnListItem (lann_trailing as1 ++ as2)) (cs <> cs2)
+  = EpAnn l (as1 <> as2) (cs <> cs2)
 
 -- | The annotations need to all come after the anchor.  Make sure
 -- this is the case.
@@ -940,10 +819,9 @@ widenSpanL s as = foldl combineSrcSpans s (go as)
 
 widenSpanT :: SrcSpan -> EpToken tok -> SrcSpan
 widenSpanT l (EpTok loc) = widenSpanL l [loc]
-widenSpanT l NoEpTok = l
 
-listLocation :: [LocatedAn an a] -> EpaLocation
-listLocation as = EpaSpan (go noSrcSpan as)
+listLocation :: [LocatedAn an a] -> SrcSpanAnnA
+listLocation as = EpAnn (EpaSpan (go noSrcSpan as)) noAnn emptyComments
   where
     combine l r = combineSrcSpans l r
 
@@ -1101,17 +979,6 @@ instance Semigroup EpAnnComments where
   EpaCommentsBalanced cs1 as1 <> EpaComments cs2 = EpaCommentsBalanced (cs1 ++ cs2) as1
   EpaCommentsBalanced cs1 as1 <> EpaCommentsBalanced cs2 as2 = EpaCommentsBalanced (cs1 ++ cs2) (as1++as2)
 
-instance Semigroup AnnListItem where
-  (AnnListItem l1) <> (AnnListItem l2) = AnnListItem (l1 <> l2)
-
-instance Semigroup (AnnSortKey tag) where
-  NoAnnSortKey <> x = x
-  x <> NoAnnSortKey = x
-  AnnSortKey ls1 <> AnnSortKey ls2 = AnnSortKey (ls1 <> ls2)
-
-instance Monoid (AnnSortKey tag) where
-  mempty = NoAnnSortKey
-
 -- ---------------------------------------------------------------------
 -- NoAnn instances
 -- ---------------------------------------------------------------------
@@ -1149,29 +1016,38 @@ instance (NoAnn ann) => NoAnn (EpAnn ann) where
 instance NoAnn NoEpAnns where
   noAnn = NoEpAnns
 
-instance NoAnn AnnListItem where
-  noAnn = AnnListItem []
+instance NoAnn AnnList where
+  noAnn = AnnList noAnn ListNone noAnn
 
-instance NoAnn AnnContext where
-  noAnn = AnnContext Nothing [] []
-
-instance NoAnn a => NoAnn (AnnList a) where
-  noAnn = AnnList Nothing ListNone noAnn noAnn []
+instance NoAnn AnnListLayout where
+  noAnn = AnnListNoLayout
 
 instance NoAnn NameAnn where
   noAnn = NameAnnTrailing []
 
-instance NoAnn AnnPragma where
-  noAnn = AnnPragma noAnn noAnn noAnn noAnn noAnn noAnn noAnn
+instance NoAnn AnnCType where
+  noAnn = AnnCType noAnn noAnn noAnn noAnn
+
+instance NoAnn AnnWarningTxt where
+  noAnn = AnnWarningTxt noAnn noAnn noAnn
+
+instance NoAnn AnnOverlap where
+  noAnn = AnnOverlap noAnn noAnn
+
+instance NoAnn AnnAnnDecl where
+  noAnn = AnnAnnDecl noAnn noAnn noAnn noAnn
+
+instance NoAnn AnnPragSCC where
+  noAnn = AnnPragSCC noAnn noAnn noAnn
 
 instance NoAnn AnnParen where
   noAnn = AnnParens noAnn noAnn
 
 instance NoAnn (EpToken s) where
-  noAnn = NoEpTok
+  noAnn = noEpTok
 
 instance NoAnn (EpUniToken s t) where
-  noAnn = NoEpUniTok
+  noAnn = noEpUniTok
 
 instance NoAnn SourceText where
   noAnn = NoSourceText
@@ -1194,19 +1070,6 @@ instance Outputable EpAnnComments where
 instance (NamedThing (Located a)) => NamedThing (LocatedAn an a) where
   getName (L l a) = getName (L (locA l) a)
 
-instance Outputable AnnContext where
-  ppr (AnnContext a o c) = text "AnnContext" <+> ppr a <+> ppr o <+> ppr c
-
-instance Outputable BindTag where
-  ppr tag = text $ show tag
-
-instance Outputable DeclTag where
-  ppr tag = text $ show tag
-
-instance Outputable tag => Outputable (AnnSortKey tag) where
-  ppr NoAnnSortKey    = text "NoAnnSortKey"
-  ppr (AnnSortKey ls) = text "AnnSortKey" <+> ppr ls
-
 instance Outputable IsUnicodeSyntax where
   ppr = text . show
 
@@ -1226,10 +1089,6 @@ instance (Outputable e)
 instance Outputable AnnParen where
   ppr (AnnParens       o c) = text "AnnParens" <+> ppr o <+> ppr c
   ppr (AnnParensHash   o c) = text "AnnParensHash" <+> ppr o <+> ppr c
-  ppr (AnnParensSquare o c) = text "AnnParensSquare" <+> ppr o <+> ppr c
-
-instance Outputable AnnListItem where
-  ppr (AnnListItem ts) = text "AnnListItem" <+> ppr ts
 
 instance Outputable NameAdornment where
   ppr (NameParens     o c) = text "NameParens" <+> ppr o <+> ppr c
@@ -1254,18 +1113,36 @@ instance Outputable NameAnn where
   ppr (NameAnnTrailing t)
     = text "NameAnnTrailing" <+> ppr t
 
-instance (Outputable a) => Outputable (AnnList a) where
-  ppr (AnnList anc p s a t)
-    = text "AnnList" <+> ppr anc <+> ppr p <+> ppr s <+> ppr a <+> ppr t
+instance Outputable AnnList where
+  ppr (AnnList l p s)
+    = text "AnnList" <+> ppr l <+> ppr p <+> ppr s
 
 instance Outputable AnnListBrackets where
-  ppr (ListParens o c) = text "ListParens" <+> ppr o <+> ppr c
   ppr (ListBraces o c) = text "ListBraces" <+> ppr o <+> ppr c
-  ppr (ListSquare o c) = text "ListSquare" <+> ppr o <+> ppr c
-  ppr (ListBanana o c) = text "ListBanana" <+> ppr o <+> ppr c
   ppr ListNone         = text "ListNone"
 
-instance Outputable AnnPragma where
-  ppr (AnnPragma o c s l ca t m)
-    = text "AnnPragma" <+> ppr o <+> ppr c <+> ppr s <+> ppr l
-                       <+> ppr ca <+> ppr ca <+> ppr t <+> ppr m
+instance Outputable AnnListLayout where
+  ppr AnnListBraces     = text "AnnListBraces"
+  ppr (AnnListLayout l) = text "AnnListLayout" <+> ppr l
+  ppr AnnListNoLayout   = text "AnnListNoLayout"
+
+instance Outputable AnnCType where
+  ppr (AnnCType o c l ca)
+    = text "AnnCType" <+> ppr o <+> ppr c <+> ppr l
+                       <+> ppr ca <+> ppr ca
+
+instance Outputable AnnWarningTxt where
+  ppr (AnnWarningTxt o c s)
+    = text "AnnWarningTxt" <+> ppr o <+> ppr c <+> ppr s
+
+instance Outputable AnnOverlap where
+  ppr (AnnOverlap o c)
+    = text "AnnOverlap" <+> ppr o <+> ppr c
+
+instance Outputable AnnAnnDecl where
+  ppr (AnnAnnDecl o c t m)
+    = text "AnnAnnDecl" <+> ppr o <+> ppr c <+> ppr t <+> ppr m
+
+instance Outputable AnnPragSCC where
+  ppr (AnnPragSCC o c l)
+    = text "AnnPragSCC" <+> ppr o <+> ppr c <+> ppr l

@@ -1,27 +1,24 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module GHC.Types.Tickish (
   GenTickish(..),
   CoreTickish, StgTickish, CmmTickish,
   XTickishId,
   tickishCounts,
-  TickishScoping(..),
-  tickishScoped,
-  tickishScopesLike,
+  tickishHasNoScope,
+  tickishHasSoftScope,
   tickishFloatable,
   tickishCanSplit,
   mkNoCount,
   mkNoScope,
   tickishIsCode,
-  isProfTick,
   TickishPlacement(..),
   tickishPlace,
   tickishContains,
+  combineTickish_maybe,
+  tickishCommutable,
+  bestSourceNote,
 
   -- * Breakpoint tick identifiers
   BreakpointId(..), BreakTickIndex
@@ -36,7 +33,7 @@ import GHC.Core.Type
 import GHC.Unit.Module
 
 import GHC.Types.CostCentre
-import GHC.Types.SrcLoc ( RealSrcSpan, containsSpan )
+import GHC.Types.SrcLoc ( RealSrcSpan, containsSpan, srcSpanFile )
 import GHC.Types.Var
 
 import GHC.Utils.Panic
@@ -44,6 +41,9 @@ import GHC.Utils.Panic
 import Language.Haskell.Syntax.Extension ( NoExtField )
 
 import Data.Data
+import Data.List ( partition )
+import Data.Maybe ( listToMaybe, mapMaybe )
+import GHC.Utils.Binary
 import GHC.Utils.Outputable (Outputable (ppr), text, (<+>))
 
 {- *********************************************************************
@@ -144,20 +144,7 @@ data GenTickish pass =
 
   -- | A source note.
   --
-  -- Source notes are pure annotations: Their presence should neither
-  -- influence compilation nor execution. The semantics are given by
-  -- causality: The presence of a source note means that a local
-  -- change in the referenced source code span will possibly provoke
-  -- the generated code to change. On the flip-side, the functionality
-  -- of annotated code *must* be invariant against changes to all
-  -- source code *except* the spans referenced in the source notes
-  -- (see "Causality of optimized Haskell" paper for details).
-  --
-  -- Therefore extending the scope of any given source note is always
-  -- valid. Note that it is still undesirable though, as this reduces
-  -- their usefulness for debugging and profiling. Therefore we will
-  -- generally try only to make use of this property where it is
-  -- necessary to enable optimizations.
+  -- See Note [Source notes and debug information]
   | SourceNote
     { sourceSpan :: RealSrcSpan -- ^ Source covered
     , sourceName :: LexicalFastString  -- ^ Name for source location
@@ -173,6 +160,70 @@ deriving instance Data (GenTickish 'TickishPassStg)
 deriving instance Eq (GenTickish 'TickishPassCmm)
 deriving instance Ord (GenTickish 'TickishPassCmm)
 deriving instance Data (GenTickish 'TickishPassCmm)
+
+{- Note [Source notes and debug information]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Source notes are used to generate debug information, in the form of DWARF
+directives in the generated assembly:
+
+  # At the top of the assembly file
+
+  .file 1 "MyModule.hs"
+  .file 2 "OtherModule.hs"
+
+  ...
+
+  # Generated assembly for a particular piece of code
+
+  #   - The DWARF debug information
+  #     This is not an instruction; it's information for the debugger.
+  .loc 1 1287 8  # MyModule.hs, line 1287, column 8
+
+  #   - The actual assembly instructions
+  movq 16(%rbx), %rax
+  addq $1, %rax
+  movq %rax, 16(%rbx)
+
+This functionality is enabled by using the -g flag (DWARF debug information).
+Source notes ticks are also enabled by the -finfo-table-map and
+-fprof-late-overloaded-calls flags; see GHC.Driver.Session.needSourceNotes.
+
+Source notes are pure annotations: their presence should neither influence
+compilation nor execution.
+The semantics are given by causality: the presence of a source note means that
+a local change in the referenced source code span will possibly provoke the
+generated code to change.
+On the flip-side, the functionality of annotated code *must* be invariant
+against changes to all source code *except* the spans referenced in the source
+notes (see "Causality of optimized Haskell" paper for details).
+This means that it is valid to extend the scope of any given source note, but
+it is undesirable as this reduces its usefulness for debugging and profiling.
+Therefore, we will generally try only to make use of this property where it is
+necessary to enable optimizations.
+
+Note [Ordering of source notes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ordering of source notes is important:
+
+  - inner ticks represent the original, most immediate source location of the
+    syntax tree node they wrap (the definition site),
+  - outer ticks represent the lexical or execution context into which that
+    expression was placed or inlined (the use site).
+
+We thus try to avoid commuting source note ticks past eachother in order to
+preserve this ordering. However, we must still cancel out duplicate source
+notes, e.g.:
+
+  mkTick src<loc2> (mkTick src<loc1>) (src<loc3> src<loc2> src<loc1> e)
+
+    ==>
+
+  src<loc3> src<loc2> src<loc1> e
+
+To do this, 'combineTickishs_maybe' peeks at the rest of the stack to expose
+cancellation opportunities, but 'mkTick' otherwise takes care not to
+commute source notes.
+-}
 
 --------------------------------------------------------------------------------
 -- Tick breakpoint index
@@ -202,105 +253,243 @@ instance NFData BreakpointId where
   rnf BreakpointId{bi_tick_mod, bi_tick_index} =
     rnf bi_tick_mod `seq` rnf bi_tick_index
 
+instance Binary BreakpointId where
+  get bh = BreakpointId <$> get bh <*> get bh
+
+  put_ bh BreakpointId {..} = put_ bh bi_tick_mod *> put_ bh bi_tick_index
+
 --------------------------------------------------------------------------------
 
--- | A "counting tick" (where tickishCounts is True) is one that
+-- | A "counting tick" (for which 'tickishCounts' is True) is one that
 -- counts evaluations in some way.  We cannot discard a counting tick,
--- and the compiler should preserve the number of counting ticks as
--- far as possible.
+-- and the compiler should preserve the number of counting ticks (as
+-- far as possible).
 --
--- However, we still allow the simplifier to increase or decrease
--- sharing, so in practice the actual number of ticks may vary, except
--- that we never change the value from zero to non-zero or vice versa.
+-- See Note [Counting ticks]
 tickishCounts :: GenTickish pass -> Bool
-tickishCounts n@ProfNote{} = profNoteCount n
-tickishCounts HpcTick{}    = True
-tickishCounts Breakpoint{} = True
-tickishCounts _            = False
+tickishCounts = \case
+  ProfNote { profNoteCount = counts } -> counts
+  HpcTick {}                          -> True
+  Breakpoint {}                       -> True
+  SourceNote {}                       -> False
 
+-- | Is this a non-scoping tick, for which we don't care about precisely
+-- the extent of code that the tick encompasses?
+--
+-- See Note [Scoped ticks]
+tickishHasNoScope :: GenTickish pass -> Bool
+tickishHasNoScope = \case
+  ProfNote { profNoteScope = scopes } -> not scopes
+  HpcTick {}                          -> True
+  Breakpoint {}                       -> False
+  SourceNote {}                       -> False
 
--- | Specifies the scoping behaviour of ticks. This governs the
--- behaviour of ticks that care about the covered code and the cost
--- associated with it. Important for ticks relating to profiling.
-data TickishScoping =
-    -- | No scoping: The tick does not care about what code it
-    -- covers. Transformations can freely move code inside as well as
-    -- outside without any additional annotation obligations
-    NoScope
+-- | A "tick with soft scoping" (for which 'tickishHasSoftScope' is True) is
+-- one that either does not scope at all (for which 'tickishHasNoScope' is True),
+-- or that has a "soft" scope: we allow new code to be floated into to the scope,
+-- as long as all code that was covered remains covered.
+--
+-- See Note [Scoped ticks]
+tickishHasSoftScope :: GenTickish pass -> Bool
+tickishHasSoftScope = \case
+  ProfNote { profNoteScope = scopes } -> not scopes
+  HpcTick {}                          -> True
+  Breakpoint {}                       -> False
+  SourceNote {}                       -> True
 
-    -- | Soft scoping: We want all code that is covered to stay
-    -- covered.  Note that this scope type does not forbid
-    -- transformations from happening, as long as all results of
-    -- the transformations are still covered by this tick or a copy of
-    -- it. For example
-    --
-    --   let x = tick<...> (let y = foo in bar) in baz
-    --     ===>
-    --   let x = tick<...> bar; y = tick<...> foo in baz
-    --
-    -- Is a valid transformation as far as "bar" and "foo" is
-    -- concerned, because both still are scoped over by the tick.
-    --
-    -- Note though that one might object to the "let" not being
-    -- covered by the tick any more. However, we are generally lax
-    -- with this - constant costs don't matter too much, and given
-    -- that the "let" was effectively merged we can view it as having
-    -- lost its identity anyway.
-    --
-    -- Also note that this scoping behaviour allows floating a tick
-    -- "upwards" in pretty much any situation. For example:
-    --
-    --   case foo of x -> tick<...> bar
-    --     ==>
-    --   tick<...> case foo of x -> bar
-    --
-    -- While this is always legal, we want to make a best effort to
-    -- only make us of this where it exposes transformation
-    -- opportunities.
-  | SoftScope
+{- Note [Scoping ticks and counting ticks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ticks have two independent attributes:
 
-    -- | Cost centre scoping: We don't want any costs to move to other
-    -- cost-centre stacks. This means we not only want no code or cost
-    -- to get moved out of their cost centres, but we also object to
-    -- code getting associated with new cost-centre ticks - or
-    -- changing the order in which they get applied.
-    --
-    -- A rule of thumb is that we don't want any code to gain new
-    -- annotations. However, there are notable exceptions, for
-    -- example:
-    --
-    --   let f = \y -> foo in tick<...> ... (f x) ...
-    --     ==>
-    --   tick<...> ... foo[x/y] ...
-    --
-    -- In-lining lambdas like this is always legal, because inlining a
-    -- function does not change the cost-centre stack when the
-    -- function is called.
-  | CostCentreScope
+  * Whether the tick /counts/.
+    Counting ticks are used when we want a counter to be bumped, e.g. counting
+    how many times a function is called.
 
-  deriving (Eq)
+    See Note [Counting ticks]
 
--- | Returns the intended scoping rule for a Tickish
-tickishScoped :: GenTickish pass -> TickishScoping
-tickishScoped n@ProfNote{}
-  | profNoteScope n        = CostCentreScope
-  | otherwise              = NoScope
-tickishScoped HpcTick{}    = NoScope
-tickishScoped Breakpoint{} = CostCentreScope
-   -- Breakpoints are scoped: eventually we're going to do call
-   -- stacks, but also this helps prevent the simplifier from moving
-   -- breakpoints around and changing their result type (see #1531).
-tickishScoped SourceNote{} = SoftScope
+  * What kind of /scope/ the tick has:
+     * Cost-centre scope: you cannot move a redex into the scope of the tick,
+                          nor can you float a redex out.
+     * Soft scope: you can move a redex /into/ the scope of a tick,
+                   but you cannot float a redex /out/
+     * No scope: there are no restrictions on floating in or out.
 
--- | Returns whether the tick scoping rule is at least as permissive
--- as the given scoping rule.
-tickishScopesLike :: GenTickish pass -> TickishScoping -> Bool
-tickishScopesLike t scope = tickishScoped t `like` scope
-  where NoScope         `like` _               = True
-        _               `like` NoScope         = False
-        SoftScope       `like` _               = True
-        _               `like` SoftScope       = False
-        CostCentreScope `like` _               = True
+     See Note [Scoped ticks]
+
+Note that profiling notes which both count and scope can be split into two
+separate ticks, one that counts and doesn't scope and one that scopes and doesn't
+count; see 'tickishCanSplit', 'mkNoCount' and 'mkNoScope'.
+
+Note [Counting ticks]
+~~~~~~~~~~~~~~~~~~~~~
+The following ticks count:
+  - ProfNote ticks with profNoteCounts = True
+  - HPC ticks
+  - Breakpoints
+
+Going past a counting tick implies bumping a counter.
+Generally, the simplifier attempts to preserve counts when transforming
+programs and moving ticks, for example by transforming:
+
+  case <tick> e of
+    alt1 -> rhs1
+    alt2 -> rhs2
+
+to
+
+  case e of
+    alt1 -> <tick> rhs1
+    alt2 -> <tick> rhs2
+
+which preserves the total count (as exactly one branch of the case
+will be taken).
+
+However, we still allow the simplifier to increase or decrease
+sharing, so in practice the actual number of ticks may vary, except
+that we never change the value from zero to non-zero or vice-versa.
+
+Note [Scoped ticks]
+~~~~~~~~~~~~~~~~~~~
+The following ticks are scoped:
+  - ProfNote ticks with profNoteScope = True
+  - Breakpoints
+  - Source notes
+
+A scoped tick is one that scopes over a portion of code. For example,
+an SCC anotation sets the cost centre for the code within; any allocations
+within that piece of code should get attributed to that cost centre.
+
+When the simplifier deals with a scoping tick, it ensures that all code that
+was covered remains covered. For example
+
+  let x = tick<...> (let y = foo in bar) in baz
+    ===>
+  let x = tick<...> bar; y = tick<...> foo in baz
+
+is a valid transformation as far as "bar" and "foo" are concerned, because
+both still are scoped over by the tick. One might object to the "let" not
+being covered by the tick any more. However, we are generally lax with this;
+constant costs don't matter too much, and given that the "let" was effectively
+merged we can view it as having lost its identity anyway.
+
+Perhaps surprisingly, breakpoints are considered to be scoped, because we
+don't want the simplifier to move them around, changing their result type (see #1531).
+
+We specifically forbid floating code outside of a scoping tick, as cost
+associated with the floated-out code would no longer be attributed to the
+appropriate scope.
+
+Whether we are allowed to float in additional cost depends on the tick:
+
+  Cost-centre scope ticks
+    - ProfNote with profNoteScope = True
+    - Breakpoints
+
+    A tick with cost-centre scope is one for which we can neither move
+    redexes into or move redexes outside of the tick. For example, we don't
+    want profiling costs to move to other cost-centre stacks.
+    Morever, we also object to changing the order in which such ticks
+    are applied.
+
+    A rule of thumb is that we don't want any code to gain new
+    lexically-enclosing ticks. For example, we should not transform:
+
+      f (scctick<foo> a)  ==>  scctick<foo> (f a)
+
+    as this would attribute the cost of evaluating the application 'f a'
+    to the cost centre 'foo'.
+
+    However, there are notable exceptions, for example:
+
+      let f = \y -> foo in tick<...> ... (f x) ...
+        ==>
+      tick<...> ... foo[x/y] ...
+
+    Inlining lambdas like this is always legal, because inlining a function
+    does not change the cost-centre stack when the function is called.
+
+  Soft scope ticks
+    - Source notes
+
+    A tick with soft scope is one for which we can move redexes inside the
+    tick, but cannot float redexes outside the tick. This is a slightly more
+    lenient notion of scoping than cost-centres, and is used only for source
+    note ticks (they are used to provide DWARF debug symbols, and for those
+    it matters less if code from outside gets moved under the tick).
+
+    Examples:
+
+      - FloatIn (GHC.Core.Opt.FloatIn.fiExpr)
+
+          let x = rhs in <tick> body
+            ==>
+          <tick> (let x = rhs in body)
+
+      - Moving a tick outside of a case or of an application
+        (GHC.Core.Opt.Simplify.Iteration.simplTick)
+
+          case <tick> e of alts  ==>  <tick> case e of alts
+
+          (<tick> e1) e2         ==>  <tick> (e1 e2)
+
+    While these transformations are legal, we want to make a best effort to
+    only make use of them where it exposes transformation opportunities.
+
+Note [Tickish placement]
+~~~~~~~~~~~~~~~~~~~~~~~~
+The placement behaviour of ticks (i.e. which nodes we want the tick to be placed
+around in the AST) is governed by 'TickishPlacement'.
+From most restrictive to least restrictive placement rules:
+
+  - PlaceRuntime: counting ticks.
+
+    Ticks with 'PlaceRuntime' placement want to be placed around run-time
+    expressions. They can be moved through pure compile-time constructs such as
+    other type arguments, casts, or type lambdas:
+
+      tick <t> (f @ty)    ==>   (tick <t> f) @ty
+      tick <t> (e |> co)  ==>   (tick <t> e) |> co
+      tick <t> (/\a. e)   ==>   /\a. tick <t> e
+
+    This is the most restrictive placement rule for ticks, as all tickishs have
+    in common that they want to track runtime behaviour.
+
+    Any tick that counts (see Note [Counting ticks]) has 'PlaceRuntime' placement.
+
+  - PlaceNonLam: source notes.
+
+    Like PlaceRuntime, but we can also float the tick through value lambdas:
+
+      tick <t> (\x. e)   ==>   \x. tick <t> e
+
+    This makes sense where there is little difference between annotating the
+    lambda and annotating the lambda's code.
+
+  - PlaceCostCentre: non-counting profiling ticks.
+
+    In addition to floating through lambdas, cost-centre style tickishs can be
+    pushed into (saturated) constructor applications, and can be eliminated when
+    placed around non-function variables:
+
+      tick <t> (C e1 e2)   ==>  C (tick <t> e1) (tick <t> e2)
+
+      tick <t> (x :: Int)  ==>  (x :: Int)
+
+    Neither the constructor application nor the variable 'x' are likely to have
+    any cost worth mentioning.
+
+We generally try to push ticks inwards until they end up placed around a Core
+expression that is appropriate for their placement rule, as described above.
+This gives us the opportunity to eliminate the tick, either by combining it with
+another tick (see 'combineTickish_maybe') or by dropping it altogether. For
+example, a (non-counting) SCC around a non-function variable can be dropped, as
+there is no cost to scope over.
+
+After the tick has been placed by 'mkTick', the simplifier may later (during
+simplification) decide to float it outwards (see e.g. GHC.Core.Opt.Simplify.Iteration.simplTick).
+The story here is not fully worked out, as the simplifier calls 'mkTick', which
+might push the tick inwards again.
+-}
 
 -- | Returns @True@ for ticks that can be floated upwards easily even
 -- where it might change execution counts, such as:
@@ -309,12 +498,11 @@ tickishScopesLike t scope = tickishScoped t `like` scope
 --     ==>
 --   tick<...> (Just foo)
 --
--- This is a combination of @tickishSoftScope@ and
--- @tickishCounts@. Note that in principle splittable ticks can become
--- floatable using @mkNoTick@ -- even though there's currently no
--- tickish for which that is the case.
+-- This is a combination of @tickishHasSoftScope@ and @tickishCounts@.
+-- Note that in principle splittable ticks can become floatable using @mkNoTick@,
+-- even though there's currently no tickish for which that is the case.
 tickishFloatable :: GenTickish pass -> Bool
-tickishFloatable t = t `tickishScopesLike` SoftScope && not (tickishCounts t)
+tickishFloatable t = tickishHasSoftScope t && not (tickishCounts t)
 
 -- | Returns @True@ for a tick that is both counting /and/ scoping and
 -- can be split into its (tick, scope) parts using 'mkNoScope' and
@@ -332,7 +520,7 @@ mkNoCount n@ProfNote{}                = let n' = n {profNoteCount = False}
 mkNoCount _                           = panic "mkNoCount: Undefined split!"
 
 mkNoScope :: GenTickish pass -> GenTickish pass
-mkNoScope n | tickishScoped n == NoScope  = n
+mkNoScope n | tickishHasNoScope n         = n
             | not (tickishCanSplit n)     = panic "mkNoScope: Cannot split!"
 mkNoScope n@ProfNote{}                    = let n' = n {profNoteScope = False}
                                             in assert (profNoteCount n) n'
@@ -355,45 +543,27 @@ mkNoScope _                               = panic "mkNoScope: Undefined split!"
 -- translate the code as if it found the latter.
 tickishIsCode :: GenTickish pass -> Bool
 tickishIsCode SourceNote{} = False
-tickishIsCode _tickish     = True  -- all the rest for now
-
-isProfTick :: GenTickish pass -> Bool
-isProfTick ProfNote{} = True
-isProfTick _          = False
+tickishIsCode ProfNote{}   = True
+tickishIsCode Breakpoint{} = True
+tickishIsCode HpcTick{}    = True
 
 -- | Governs the kind of expression that the tick gets placed on when
 -- annotating for example using @mkTick@. If we find that we want to
 -- put a tickish on an expression ruled out here, we try to float it
 -- inwards until we find a suitable expression.
+--
+-- See Note [Tickish placement].
 data TickishPlacement =
 
-    -- | Place ticks exactly on run-time expressions. We can still
-    -- move the tick through pure compile-time constructs such as
-    -- other ticks, casts or type lambdas. This is the most
-    -- restrictive placement rule for ticks, as all tickishs have in
-    -- common that they want to track runtime processes. The only
-    -- legal placement rule for counting ticks.
-    -- NB: We generally try to move these as close to the relevant
-    -- runtime expression as possible. This means they get pushed through
-    -- tyoe arguments. E.g. we create `(tick f) @Bool` instead of `tick (f @Bool)`.
+    -- | Place ticks exactly on run-time expressions, moving them through pure
+    -- compile-time constructs such as other ticks, casts or type lambdas.
     PlaceRuntime
 
-    -- | As @PlaceRuntime@, but we float the tick through all
-    -- lambdas. This makes sense where there is little difference
-    -- between annotating the lambda and annotating the lambda's code.
+    -- | As @PlaceRuntime@, but also allow to float the tick through all lambdas.
   | PlaceNonLam
 
-    -- | In addition to floating through lambdas, cost-centre style
-    -- tickishs can also be moved from constructors, non-function
-    -- variables and literals. For example:
-    --
-    --   let x = scc<...> C (scc<...> y) (scc<...> 3) in ...
-    --
-    -- Neither the constructor application, the variable or the
-    -- literal are likely to have any cost worth mentioning. And even
-    -- if y names a thunk, the call would not care about the
-    -- evaluation context. Therefore removing all annotations in the
-    -- above example is safe.
+    -- | As 'PlaceNonLam', but also float through constructors, non-function
+    -- variables and literals.
   | PlaceCostCentre
 
   deriving (Eq,Show)
@@ -401,7 +571,9 @@ data TickishPlacement =
 instance Outputable TickishPlacement where
   ppr = text . show
 
--- | Placement behaviour we want for the ticks
+-- | Placement behaviour we want for the ticks.
+--
+-- See Note [Tickish placement].
 tickishPlace :: GenTickish pass -> TickishPlacement
 tickishPlace n@ProfNote{}
   | profNoteCount n        = PlaceRuntime
@@ -409,6 +581,63 @@ tickishPlace n@ProfNote{}
 tickishPlace HpcTick{}     = PlaceRuntime
 tickishPlace Breakpoint{}  = PlaceRuntime
 tickishPlace SourceNote{}  = PlaceNonLam
+
+-- | Merge two ticks into one, if that is possible.
+--
+-- Examples:
+--
+--  - combine two source note ticks if one contains the other,
+--  - combine a non-counting profiling tick with a non-scoping profiling tick
+--    for the same cost centre
+--  - combine two equal breakpoint ticks or HPC ticks
+combineTickish_maybe :: Eq (GenTickish pass)
+                     => GenTickish pass -> GenTickish pass -> Maybe (GenTickish pass)
+combineTickish_maybe
+  (ProfNote { profNoteCC = cc1, profNoteCount = cnt1, profNoteScope = scope1 })
+  (ProfNote { profNoteCC = cc2, profNoteCount = cnt2, profNoteScope = scope2 })
+    | cc1 == cc2
+    , not cnt1 || not cnt2
+    = Just $ ProfNote { profNoteCC    = cc1
+                      , profNoteCount = cnt1 || cnt2
+                      , profNoteScope = scope1 || scope2
+                      }
+combineTickish_maybe t1@(SourceNote sp1 n1) t2@(SourceNote sp2 n2)
+  | n1 == n2
+  , sp1 `containsSpan` sp2
+  = Just t1
+  | n1 == n2
+  , sp2 `containsSpan` sp1
+  = Just t2
+  -- NB: it would be possible to use 'combineRealSrcSpans' instead,
+  -- but that has the risk of combining many source note ticks into a single
+  -- tick with a huge source span.
+combineTickish_maybe t1@(HpcTick {}) t2@(HpcTick {})
+  | t1 == t2
+  = Just t1
+combineTickish_maybe t1@(Breakpoint {}) t2@(Breakpoint {})
+  | t1 == t2
+  = Just t1
+combineTickish_maybe _ _ = Nothing
+
+-- | Can these two ticks be commuted (moved past eachother)?
+tickishCommutable :: GenTickish pass -> GenTickish pass -> Bool
+tickishCommutable
+  -- Profiling ticks for different cost centres should never be re-ordered
+  -- relative to each other.
+  (ProfNote { profNoteCC = cc1 }) (ProfNote { profNoteCC = cc2 })
+  = cc1 == cc2
+
+tickishCommutable t1 t2
+  -- Ticks of different placements float through each other, so that each
+  -- tick can be floated into its expected position in the AST.
+  -- See Note [Tickish placement]
+  | tickishPlace t1 /= tickishPlace t2
+  = True
+
+  -- Don't commute other ticks. In particular, don't commute two SourceNote
+  -- ticks, as per Note [Ordering of source notes] in GHC.Types.Tickish.
+  | otherwise
+  = False
 
 -- | Returns whether one tick "contains" the other one, therefore
 -- making the second tick redundant.
@@ -419,3 +648,25 @@ tickishContains (SourceNote sp1 n1) (SourceNote sp2 n2)
     -- compare the String last
 tickishContains t1 t2
   = t1 == t2
+
+-- | Choose the "best" source note in the given candidate list of ticks,
+-- preferring source notes that are local to the source file being consdiered.
+bestSourceNote
+  :: Bool
+      -- ^ accept a location in another module if there are none in the
+      -- current module?
+  -> FastString        -- ^ the "local" source file
+  -> [GenTickish pass] -- ^ candidates (best first)
+  -> Maybe (RealSrcSpan, LexicalFastString)
+bestSourceNote accept_outside_loc this_file ticks
+  = listToMaybe $
+      if accept_outside_loc
+      then here ++ elsewhere
+      else here
+  where
+    (here, elsewhere)
+      = partition ((this_file ==) . srcSpanFile . fst)
+      $ mapMaybe source_location ticks
+
+    source_location (SourceNote span name) = Just (span, name)
+    source_location _                      = Nothing

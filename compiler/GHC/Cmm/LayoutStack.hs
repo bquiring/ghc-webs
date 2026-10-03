@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, GADTs #-}
+{-# LANGUAGE RecordWildCards #-}
 module GHC.Cmm.LayoutStack (
        cmmLayoutStack, setInfoTableStackMap
   ) where
@@ -408,6 +408,8 @@ procMiddle stackmaps node sm
         where loc = getStackLoc area off stackmaps
      CmmAssign (CmmLocal r) _other
        -> sm { sm_regs = delFromUFM (sm_regs sm) r }
+     CmmUnsafeForeignCall _ results _
+       -> sm { sm_regs = delListFromUFM (sm_regs sm) results }
      _other
        -> sm
 
@@ -927,7 +929,7 @@ areaToSp platform sp_old _sp_hwm area_off (CmmStackSlot area n)
     -- Replace (CmmStackSlot area n) with an offset from Sp
 
 areaToSp platform _ sp_hwm _ (CmmLit CmmHighStackMark)
-  = mkIntExpr platform sp_hwm
+  = mkIntExpr platform (toTargetInt sp_hwm)
     -- Replace CmmHighStackMark with the number of bytes of stack used,
     -- the sp_hwm.   See Note [Stack usage] in GHC.StgToCmm.Heap
 
@@ -1199,7 +1201,7 @@ lowerSafeForeignCall profile block
 callSuspendThread :: Platform -> LocalReg -> Bool -> CmmNode O O
 callSuspendThread platform id intrbl =
   CmmUnsafeForeignCall (PrimTarget MO_SuspendThread)
-       [id] [baseExpr platform, mkIntExpr platform (fromEnum intrbl)]
+       [id] [baseExpr platform, mkIntExpr platform (toTargetInt (fromEnum intrbl))]
 
 callResumeThread :: LocalReg -> LocalReg -> CmmNode O O
 callResumeThread new_base id =

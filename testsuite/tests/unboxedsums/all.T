@@ -8,6 +8,7 @@ test('unboxedsums1',  normal, compile_and_run, [''])
 test('unboxedsums2',  normal, compile_and_run, [''])
 test('unboxedsums3',  normal, compile_and_run, [''])
 test('unboxedsums4',  normal, compile_fail, [''])
+test('unboxedsums4p', normal, compile_fail, [''])
 test('unboxedsums5',  normal, compile, [''])
 test('unboxedsums6',  normal, compile_and_run, [''])
 test('unboxedsums7',  normal, compile_and_run, [''])
@@ -62,3 +63,5 @@ test('ManyUbxSums',
      ['ManyUbxSums',
         [('ManyUbxSums_Addr.hs','')]
         , '-v0 -dstg-lint -dcmm-lint'])
+
+test('UbxSumUnpackedSize', [js_broken(22374)], compile_and_run, ['-O'])

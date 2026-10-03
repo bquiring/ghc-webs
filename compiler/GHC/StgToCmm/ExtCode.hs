@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE TupleSections #-}
 -- | Our extended FCode monad.
 
 -- We add a mapping from names to CmmExpr, to support local variable names in
@@ -203,7 +201,7 @@ lookupLabel name = do
   return $
      case lookupUFM env name of
         Just (LabelN l) -> l
-        _other          -> mkBlockId (newTagUnique (getUnique name) 'L')
+        _other          -> mkBlockId (newTagUnique (getUnique name) BlockIdTag)
 
 
 -- | Lookup the location of a named variable.

@@ -1,11 +1,8 @@
-{-# LANGUAGE LambdaCase #-}
-
 {-
    these are needed for the Outputable instance for GenTickish,
    since we need XTickishId to be Outputable. This should immediately
    resolve to something like Id.
  -}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -22,6 +19,7 @@ module GHC.Core.Ppr (
         pprCoreExpr, pprParendExpr,
         pprCoreBinding, pprCoreBindings, pprCoreAlt,
         pprCoreBindingWithSize, pprCoreBindingsWithSize,
+        sortCoreBindingsForDump,
         pprCoreBinder, pprCoreBinders, pprId, pprIds,
         pprRule, pprRules, pprOptCo,
         pprOcc, pprOccWithTick
@@ -30,13 +28,16 @@ module GHC.Core.Ppr (
 import GHC.Prelude
 
 import GHC.Core
-import GHC.Core.Stats (exprStats)
+import GHC.Core.Stats (CoreStats(..), exprStats)
+import GHC.Data.FastString (LexicalFastString(..), fastStringToShortByteString)
+
 import GHC.Types.Fixity (LexicalFixity(..))
-import GHC.Types.Literal( pprLiteral )
-import GHC.Types.Name( pprInfixName, pprPrefixName )
+import GHC.Types.Literal( Literal, pprLiteral )
+import GHC.Types.Name( getOccFS, getSrcSpan, pprInfixName, pprPrefixName, pprKnownKey )
 import GHC.Types.Var
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.InlinePragma
 import GHC.Types.Demand
 import GHC.Types.Cpr
 import GHC.Core.DataCon
@@ -46,8 +47,14 @@ import GHC.Core.Coercion
 import GHC.Types.Basic
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
-import GHC.Types.SrcLoc ( pprUserRealSpan )
+import GHC.Utils.Panic (panic)
+import GHC.Types.SrcLoc ( SrcSpan(..), pprUserRealSpan, srcSpanStartCol
+                        , srcSpanStartLine )
 import GHC.Types.Tickish
+
+import Data.List ( sortOn )
+import Data.Char ( ord )
+import qualified Data.ByteString.Short as SBS
 
 {-
 ************************************************************************
@@ -73,6 +80,117 @@ pprCoreBindingWithSize  :: CoreBind  -> SDoc
 pprCoreBindingsWithSize = pprTopBinds sizeAnn
 pprCoreBindingWithSize = pprTopBind sizeAnn
 
+{- Note [Stable Core dump order]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The order of top-level bindings in a Core dump (-ddump-simpl etc.) is the
+compiler's internal processing order, which is sensitive to Uniques. Uniques
+can shift whenever an unrelated upstream module changes, so the bindings get
+re-ordered and a textual diff of two dumps fails to line up the real changes
+(#27296).
+
+With -dstable-core-dump-order we reorder the top-level bindings at dump time into
+a stable order. 'sortCoreBindingsForDump' sorts by a key that is *independent of
+Uniques*, so two dumps line up across rebuilds. The sort key is:
+
+  1. the binder's source span (real spans in source order; noSrcSpan last).
+     Workers and specialisations inherit their origin's source span (see
+     'mkWorkerId' and 'newSpecIdSM'), so they cluster next to the binding they
+     come from.
+  2. a "$-rank" so that within one source span the compiler-derived binders sort
+     *before* the origin they come from (e.g. @$wfoo@ before @foo@), mirroring
+     GHC's default dependency order (the wrapper calls the worker, so the worker
+     comes first; specialisations likewise precede their origin). We rank by
+     whether the OccName *contains* a '$', which marks a derived binder: a worker
+     is @$wfoo@, but a call-site specialisation is tidied to @bar_$sfoo@ (no
+     leading '$'), so a leading-'$' test would miss it.
+  3. the OccName string, as a lexical, deterministic tie-break.
+  4. a content-based tie-break on the right-hand side ('rhsKey'): the floated
+     literal, if any, then the RHS size statistics. This matters for the
+     anonymous floats: 'newLvlVar' builds them all with OccName "lvl" and
+     noSrcSpan, so keys 1-3 are identical and without it their order would fall
+     back to the Unique-driven input order -- the churn we set out to remove.
+     (Tidied dumps like -ddump-simpl give the floats distinct names lvl,
+     lvl1, ...; this additionally stabilises untidied dumps such as
+     -ddump-simpl-iterations.) It is only a best-effort tie-break -- RHSs
+     agreeing on both components keep their input order -- and Unique-independent
+     for the numeric CAFs we target (a rubbish literal is the exception: its
+     'cmpLit' falls back to the Unique-dependent 'nonDetCmpType').
+
+Recursive groups are never split: a 'Rec' is one 'CoreBind', placed as a unit by
+its earliest-source member, with its members sorted by the same key.
+
+Only *top-level* bindings (and the members of a top-level 'Rec') are reordered.
+Bindings nested inside a right-hand side (a 'let'/'letrec' within an expression)
+are left in their original order: their position in the dump is fixed by the
+surrounding expression rather than chosen by a Unique-keyed sort, so they don't
+suffer the cross-module churn this flag addresses.
+
+-dstable-core-dump-order is opt-in; the default order is retained because it is
+useful for debugging the compiler itself.
+-}
+
+-- | The sort key for one top-level binder. The trailing 'RhsKey' is a
+-- content-based tiebreak, used only when two binders agree on everything
+-- before it. See Note [Stable Core dump order].
+type DumpSortKey =
+  ( Int     -- source-span bucket: 0 = real span, 1 = noSrcSpan (sorts last)
+  , Int     -- source-span start line
+  , Int     -- source-span start column
+  , Int     -- dollar-rank: 0 = derived ($w/$s) binder, 1 = its origin
+  , LexicalFastString  -- the OccName, compared lexically
+  , RhsKey  -- content-based tiebreak (see 'rhsKey')
+  )
+
+-- | Reorder a 'CoreProgram' into a stable, source-location-driven order for
+-- dumping. See Note [Stable Core dump order]. Used by 'dumpPassResult' when
+-- -dstable-core-dump-order is enabled.
+sortCoreBindingsForDump :: CoreProgram -> CoreProgram
+sortCoreBindingsForDump = sortOn bindKey . map sortRecMembers
+  where
+    sortRecMembers (Rec prs) = Rec (sortOn (uncurry elemKey) prs)
+    sortRecMembers b         = b
+
+    -- 'sortRecMembers' runs first, so a 'Rec' is already sorted by 'elemKey'
+    -- when 'bindKey' sees it; its first member is therefore the minimum key.
+    bindKey :: CoreBind -> DumpSortKey
+    bindKey (NonRec b rhs)     = elemKey b rhs
+    bindKey (Rec ((b,rhs):_))  = elemKey b rhs
+    bindKey (Rec [])           = panic "sortCoreBindingsForDump: empty Rec"
+
+    elemKey :: CoreBndr -> CoreExpr -> DumpSortKey
+    elemKey b rhs = (bucket, line, col, dollar_rank, LexicalFastString nm, rhsKey rhs)
+      where
+        nm = getOccFS b
+        (bucket, line, col) = case getSrcSpan b of
+          RealSrcSpan rs _ -> (0, srcSpanStartLine rs, srcSpanStartCol rs)
+          _                -> (1, 0, 0)  -- noSrcSpan: sort last
+        -- A '$' anywhere in a tidied top-level OccName marks a compiler-derived
+        -- binder ($wfoo, but also call-site specialisations tidied to
+        -- bar_$sfoo); rank those before their origin within a shared source span,
+        -- mirroring GHC's default dependency order (the wrapper calls the worker,
+        -- so the worker comes first).
+        dollar_rank | dollarByte `SBS.elem` fastStringToShortByteString nm = 0
+                    | otherwise                                            = 1
+
+    dollarByte = fromIntegral (ord '$')
+
+-- | A content-based tie-break on a binder's right-hand side: see point 4 of
+-- Note [Stable Core dump order].
+type RhsKey =
+  ( Maybe Literal              -- the floated literal, if any (Nothing sorts first)
+  , (Int, Int, Int, Int, Int)  -- exprStats counts: terms, types, coercions, value binds, join binds
+  )
+
+rhsKey :: CoreExpr -> RhsKey
+rhsKey rhs = (litOf rhs, statsTuple (exprStats rhs))
+  where
+    statsTuple (CS tm ty co vb jb) = (tm, ty, co, vb, jb)
+    litOf (Lit l)    = Just l
+    litOf (App f a)  = case a of { Lit l -> Just l; _ -> litOf f }
+    litOf (Cast e _) = litOf e
+    litOf (Tick _ e) = litOf e
+    litOf _          = Nothing
+
 instance OutputableBndr b => Outputable (Bind b) where
     ppr bind = ppr_bind noAnn bind
 
@@ -81,6 +199,12 @@ instance OutputableBndr b => Outputable (Expr b) where
 
 instance OutputableBndr b => Outputable (Alt b) where
     ppr expr = pprCoreAlt expr
+
+instance Outputable FloatBind where
+  ppr (FloatTick t) = text "TICK" <+> ppr t
+  ppr (FloatLet b)  = text "LET" <+> ppr b
+  ppr (FloatCase e b c bs) = hang (text "CASE" <+> ppr e <+> text "of" <+> ppr b)
+                                2 (ppr c <+> ppr bs)
 
 {-
 ************************************************************************
@@ -169,14 +293,14 @@ noParens :: SDoc -> SDoc
 noParens pp = pp
 
 pprOptCo :: Coercion -> SDoc
--- Print a coercion optionally; i.e. honouring -dsuppress-coercions
-pprOptCo co = sdocOption sdocSuppressCoercions $ \case
-              True  -> angleBrackets (text "Co:" <> int (coercionSize co)) <+> dcolon <+> co_type
-              False -> parens $ sep [ppr co, dcolon <+> co_type]
-    where
-      co_type = sdocOption sdocSuppressCoercionTypes $ \case
-          True -> text "..."
-          False -> ppr (coercionType co)
+-- Print a coercion with its type (unless suppressed by -dsuppress-coercion-types)
+-- Honour -dsuppress-coercions
+-- Placed here because it needs GHC.Core.Coercion.coercionType
+pprOptCo co = sdocOption sdocSuppressCoercionTypes $ \case
+               True  -> pprParendCo co
+               False -> parens (sep [pprCo co, dcolon <+> pp_co_type])
+  where
+    pp_co_type = ppr (coercionType co)
 
 ppr_id_occ :: (SDoc -> SDoc) -> Id -> SDoc
 ppr_id_occ add_par id
@@ -432,19 +556,20 @@ pprTypedLamBinder bind_site debug_on var
   = sdocOption sdocSuppressTypeSignatures $ \suppress_sigs ->
     case () of
     _
-      | not debug_on            -- Show case-bound wild binders only if debug is on
-      , CaseBind <- bind_site
-      , isDeadBinder var        -> empty
-
-      | not debug_on            -- Even dead binders can be one-shot
-      , isDeadBinder var        -> char '_' <+> ppWhen (isId var)
-                                                (pprIdBndrInfo (idInfo var))
-
-      | not debug_on            -- No parens, no kind info
-      , CaseBind <- bind_site   -> pprUntypedBinder var
-
+      -- Show case-bound wild binders only if debug is on
       | not debug_on
-      , CasePatBind <- bind_site    -> pprUntypedBinder var
+      , CaseBind <- bind_site
+      -> if isDeadBinder var
+         then empty
+         else pprUntypedBinder var
+
+      -- Show binders as "_" in case patterns
+      -- (but not in RULES or let)
+      | not debug_on            -- Even dead binders can be one-shot
+      , CasePatBind <- bind_site
+      -> if (isDeadBinder var)
+         then char '_' <+> ppWhen (isId var) (pprIdBndrInfo (idInfo var))
+         else pprUntypedBinder var
 
       | suppress_sigs -> pprUntypedBinder var
 
@@ -670,13 +795,13 @@ pprRules :: [CoreRule] -> SDoc
 pprRules rules = vcat (map pprRule rules)
 
 pprRule :: CoreRule -> SDoc
-pprRule (BuiltinRule { ru_fn = fn, ru_name = name})
-  = text "Built in rule for" <+> ppr fn <> colon <+> doubleQuotes (ftext name)
+pprRule (BuiltinRule { ru_key = key, ru_name = name})
+  = text "Built in rule for" <+> pprKnownKey key <> colon <+> doubleQuotes (ppr name)
 
 pprRule (Rule { ru_name = name, ru_act = act, ru_fn = fn,
                 ru_bndrs = tpl_vars, ru_args = tpl_args,
                 ru_rhs = rhs })
-  = hang (doubleQuotes (ftext name) <+> ppr act)
+  = hang (doubleQuotes (ppr name) <+> ppr act)
        4 (sep [text "forall" <+> pprCoreBinders tpl_vars <> dot,
                nest 2 (ppr fn <+> sep (map pprArg tpl_args)),
                nest 2 (text "=" <+> pprCoreExpr rhs)

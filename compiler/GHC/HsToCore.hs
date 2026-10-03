@@ -39,8 +39,12 @@ import GHC.HsToCore.Coverage
 import GHC.HsToCore.Docs
 
 import GHC.Tc.Types
-import GHC.Tc.Types.Origin ( Position(..) )
-import GHC.Tc.Utils.Monad  ( finalSafeMode, fixSafeInstances )
+import GHC.Tc.Types.Origin ( Position(..), mkArgPos )
+import GHC.Tc.Utils.Monad
+  ( TcMPluginHandling(..)
+  , finalSafeMode, fixSafeInstances
+  , getGblEnv, setEnvs
+  )
 import GHC.Tc.Module ( runTcInteractive )
 
 import GHC.Core.Type
@@ -48,7 +52,7 @@ import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCon       ( tyConDataCons )
 import GHC.Core
 import GHC.Core.FVs       ( exprsSomeFreeVarsList, exprFreeVars )
-import GHC.Core.SimpleOpt ( simpleOptPgm, simpleOptExpr )
+import GHC.Core.SimpleOpt ( simpleOptExpr )
 import GHC.Core.Utils
 import GHC.Core.Unfold.Make
 import GHC.Core.Coercion
@@ -59,13 +63,22 @@ import GHC.Core.Rules
 import GHC.Core.Opt.Pipeline.Types ( CoreToDo(..) )
 import GHC.Core.Ppr
 
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Ids ( mkRepPolyIdConcreteTyVars )
 
-import GHC.Data.Maybe    ( expectJust )
+import GHC.Data.Maybe    ( expectJust, MaybeErr (..) )
 import GHC.Data.OrdList
 import GHC.Data.SizedSeq ( sizeSS )
+import GHC.Data.FastString (mkFastStringShortText)
+
+import GHC.HsToCore.Types (DsGblEnv(..))
+
+import GHC.Iface.Load (KnownEntitySource(..), lookupKnownKeyName)
+import GHC.Iface.Make (mkRecompUsageInfo)
+
+import GHC.Runtime.Interpreter (interpreterProfiled)
 
 import GHC.Utils.Error
 import GHC.Utils.Outputable
@@ -76,19 +89,18 @@ import GHC.Utils.Logger
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Id.Make ( mkRepPolyIdConcreteTyVars )
+import GHC.Types.InlinePragma ( alwaysInlinePragma, competesWith )
 import GHC.Types.ForeignStubs
 import GHC.Types.Avail
-import GHC.Types.Basic
 import GHC.Types.Var.Set
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
 import GHC.Types.TypeEnv
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Types.Name.Env
 import GHC.Types.Name.Ppr
 import GHC.Types.HpcInfo
+import GHC.Types.Unique.FM
 
 import GHC.Unit
 import GHC.Unit.Module.ModGuts
@@ -97,8 +109,6 @@ import GHC.Unit.Module.Deps
 
 import Data.List (partition)
 import Data.IORef
-import GHC.Iface.Make (mkRecompUsageInfo)
-import GHC.Runtime.Interpreter (interpreterProfiled)
 
 {-
 ************************************************************************
@@ -163,20 +173,20 @@ deSugar hsc_env
                                        export_set (typeEnvTyCons type_env) binds
                               else return (binds, Nothing)
         ; let modBreaks
-                | Just (_, specs) <- m_tickInfo
+                | Just (_, _, breakpointSpecs) <- m_tickInfo
                 , breakpointsAllowed dflags
-                = Just $ mkModBreaks (interpreterProfiled $ hscInterp hsc_env) mod specs
+                = Just $ mkModBreaks (interpreterProfiled $ hscInterp hsc_env) mod breakpointSpecs
                 | otherwise
                 = Nothing
 
         ; ds_hpc_info <- case m_tickInfo of
-            Just (orig_file2, ticks)
+            Just (orig_file2, hpcTicks, _)
               | gopt Opt_Hpc $ hsc_dflags hsc_env
               -> do
               hashNo <- if gopt Opt_Hpc $ hsc_dflags hsc_env
-                then writeMixEntries (hpcDir dflags) mod ticks orig_file2
+                then writeMixEntries (hpcDir dflags) mod hpcTicks orig_file2
                 else return 0 -- dummy hash when none are written
-              pure $ HpcInfo (fromIntegral $ sizeSS ticks) hashNo
+              pure $ HpcInfo (fromIntegral $ sizeSS hpcTicks) hashNo
             _ -> pure $ emptyHpcInfo
 
         ; (msgs, mb_res) <- initDs hsc_env tcg_env $
@@ -186,11 +196,15 @@ deSugar hsc_env
                           ; (spec_prs, spec_rules) <- dsImpSpecs imp_specs
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
                           ; ds_rules <- mapMaybeM dsRule rules
+                          ; static_prs <- getStaticBinds
                           ; let hpc_init
                                   | gopt Opt_Hpc dflags = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
                                   | otherwise = mempty
                           ; return ( ds_ev_binds
-                                   , foreign_prs `appOL` core_prs `appOL` spec_prs
+                                   , static_prs
+                                     `appOL` foreign_prs
+                                     `appOL` core_prs
+                                     `appOL` spec_prs
                                    , spec_rules ++ ds_rules
                                    , ds_fords `appendStubC` hpc_init) } }
 
@@ -200,30 +214,21 @@ deSugar hsc_env
 
      do {       -- Add export flags to bindings
           keep_alive <- readIORef keep_var
-        ; let (rules_for_locals, rules_for_imps) = partition isLocalRule all_rules
+        ; let (rules_for_locals, ds_rules_for_imps) = partition isLocalRule all_rules
               final_prs = addExportFlagsAndRules bcknd export_set keep_alive
                                                  rules_for_locals (fromOL all_prs)
 
-              final_pgm = combineEvBinds ds_ev_binds final_prs
+              ds_binds = combineEvBinds ds_ev_binds final_prs
         -- Notice that we put the whole lot in a big Rec, even the foreign binds
         -- When compiling PrelFloat, which defines data Float = F# Float#
         -- we want F# to be in scope in the foreign marshalling code!
         -- You might think it doesn't matter, but the simplifier brings all top-level
         -- things into the in-scope set before simplifying; so we get no unfolding for F#!
 
-        ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugar final_pgm rules_for_imps
-        ; let simpl_opts = initSimpleOpts dflags
-        ; let (ds_binds, ds_rules_for_imps, occ_anald_binds)
-                = simpleOptPgm simpl_opts mod final_pgm rules_for_imps
-                         -- The simpleOptPgm gets rid of type
-                         -- bindings plus any stupid dead code
-        ; putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
-            FormatCore (pprCoreBindings occ_anald_binds $$ pprRules ds_rules_for_imps )
-
-        ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugarOpt ds_binds ds_rules_for_imps
+        ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugar ds_binds ds_rules_for_imps
 
         ; let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
-              home_unit = hsc_home_unit hsc_env
+              home_unit     = hsc_home_unit hsc_env
         ; let deps = mkDependencies home_unit
                                     (tcg_mod tcg_env)
                                     (tcg_imports tcg_env)
@@ -306,7 +311,7 @@ deSugarExpr hsc_env tc_expr = do
     showPass logger "Desugar"
 
     -- Do desugaring
-    (tc_msgs, mb_result) <- runTcInteractive hsc_env $
+    (tc_msgs, mb_result) <- runTcInteractive NoTcMPlugins hsc_env $
                             initDsTc $
                             dsLExpr tc_expr
 
@@ -453,7 +458,7 @@ dsRule (L loc (HsRule { rd_name = name
               fn_name   = idName fn_id
               simpl_opts = initSimpleOpts dflags
               final_rhs = simpleOptExpr simpl_opts rhs''    -- De-crap it
-              rule_name = unLoc name
+              rule_name = mkFastStringShortText (unLoc name)
               rule = mkRule this_mod False is_local rule_name rule_act
                             fn_name final_bndrs args final_rhs
         ; dsWarnOrphanRule rule
@@ -596,7 +601,7 @@ subsequent transformations could fire.
 Note [Patching magic definitions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We sometimes need to have access to defined Ids in pure contexts. Usually, we
-simply "wire in" these entities, as we do for types in GHC.Builtin.Types and for Ids
+simply "wire in" these entities, as we do for types in GHC.Builtin.WiredIn.Types and for Ids
 in GHC.Types.Id.Make. See Note [Wired-in Ids] in GHC.Types.Id.Make.
 
 However, it is sometimes *much* easier to define entities in Haskell,
@@ -604,6 +609,8 @@ even if we need pure access; note that wiring-in an Id requires all
 entities used in its definition *also* to be wired in, transitively
 and recursively.  This can be a huge pain.  The little trick
 documented here allows us to have the best of both worlds.
+(This has been improved with the new known-occ/keys work.
+ See Note [Overview of known entities] in GHC.Builtin.)
 
 Motivating example: unsafeCoerce#. See [Wiring in unsafeCoerce#] for the
 details.
@@ -637,8 +644,8 @@ Here are the moving parts:
 
 - magicDefnsEnv allows for quick access to magicDefns.
 
-- magicDefnModules, built also from magicDefns, contains the modules that
-  need careful attention.
+- moduleHasMagicDefn, determines if the module being compiled has any
+  magicDefns (if so, needs careful attention).
 
 Note [Wiring in unsafeCoerce#]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -688,14 +695,14 @@ patchMagicDefns :: OrdList (Id,CoreExpr)
 patchMagicDefns pairs
   -- optimization: check whether we're in a magic module before looking
   -- at all the ids
-  = do { this_mod <- getModule
-       ; if this_mod `elemModuleSet` magicDefnModules
+  = do { is_magic_mod <- moduleHasMagicDefn
+       ; if is_magic_mod
          then traverse patchMagicDefn pairs
          else return pairs }
 
 patchMagicDefn :: (Id, CoreExpr) -> DsM (Id, CoreExpr)
 patchMagicDefn orig_pair@(orig_id, orig_rhs)
-  | Just mk_magic_pair <- lookupNameEnv magicDefnsEnv (getName orig_id)
+  | Just mk_magic_pair <- lookupUFM magicDefnsEnv (getUnique orig_id)
   = do { magic_pair@(magic_id, _) <- mk_magic_pair orig_id orig_rhs
 
        -- Patching should not change the Name or the type of the Id
@@ -706,22 +713,41 @@ patchMagicDefn orig_pair@(orig_id, orig_rhs)
   | otherwise
   = return orig_pair
 
-magicDefns :: [(Name,    Id -> CoreExpr     -- old Id and RHS
+magicDefns :: [(KnownKey,    Id -> CoreExpr     -- old Id and RHS
                       -> DsM (Id, CoreExpr) -- new Id and RHS
                )]
-magicDefns = [ (unsafeCoercePrimName, mkUnsafeCoercePrimPair) ]
+magicDefns = [ (unsafeCoercePrimIdKey, mkUnsafeCoercePrimPair) ]
 
-magicDefnsEnv :: NameEnv (Id -> CoreExpr -> DsM (Id, CoreExpr))
-magicDefnsEnv = mkNameEnv magicDefns
+magicDefnsEnv :: UniqFM KnownKey (Id -> CoreExpr -> DsM (Id, CoreExpr))
+magicDefnsEnv = listToUFM magicDefns
 
-magicDefnModules :: ModuleSet
-magicDefnModules = mkModuleSet $ map (nameModule . getName . fst) magicDefns
+-- | Find if the current module defines any magic names
+moduleHasMagicDefn :: DsM Bool
+moduleHasMagicDefn = do
+  env      <- getGblEnv
+  this_mod <- getModule
+  -- If module -fdefines-known-key-names, look for the magic names in scope and
+  -- check if this module is the magic name's module. If module doesn't
+  -- -fdefines-known-key-names, it certainly doesn't define magic names.
+  kksource <- dsGetKnownKeySource
+  case kksource of
+    KES_FromModule {} -> return False
+    kes@KES_InScope{} -> do
+      let definesMagicName magicKey = do
+            mb_res <- lookupKnownKeyName magicKey kes
+            case mb_res of
+              Succeeded name -> return (nameModule name == this_mod)
+              Failed _ -> return False
+      dfns_magic <- setEnvs (ds_if_env env) $
+        mapM (definesMagicName . fst) magicDefns
+      pure $ any id dfns_magic
 
 mkUnsafeCoercePrimPair :: Id -> CoreExpr -> DsM (Id, CoreExpr)
 -- See Note [Wiring in unsafeCoerce#] for the defn we are creating here
 mkUnsafeCoercePrimPair _old_id old_expr
-  = do { unsafe_equality_proof_id <- dsLookupGlobalId unsafeEqualityProofName
-       ; unsafe_equality_tc       <- dsLookupTyCon unsafeEqualityTyConName
+  = do { unsafe_equality_proof_id <- dsLookupKnownKeyId unsafeEqualityProofIdKey
+       ; unsafe_equality_tc       <- dsLookupKnownKeyTyCon unsafeEqualityTyConKey
+       ; unsafeCoercePrimName     <- dsLookupKnownKeyName unsafeCoercePrimIdKey
 
        ; let [unsafe_refl_data_con] = tyConDataCons unsafe_equality_tc
 
@@ -780,7 +806,7 @@ mkUnsafeCoercePrimPair _old_id old_expr
              arity = 1
 
              concs = mkRepPolyIdConcreteTyVars
-                     [((mkTyVarTy openAlphaTyVar, Argument 1 Top), runtimeRep1TyVar)]
+                     [((mkTyVarTy openAlphaTyVar, mkArgPos 1 Top), runtimeRep1TyVar)]
                      unsafeCoercePrimName
 
              id   = mkExportedLocalId (RepPolyId concs) unsafeCoercePrimName ty `setIdInfo` info

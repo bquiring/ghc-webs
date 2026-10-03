@@ -42,8 +42,17 @@ module GHC.Internal.Encoding.UTF8
     ) where
 
 import GHC.Internal.Types
-import GHC.Internal.Base
+import GHC.Internal.Base (Monad(..), String, ord, otherwise, ($))
+import GHC.Internal.Classes (Ord(..), (&&))
 import GHC.Internal.IO
+import GHC.Internal.Magic (runRW#)
+import GHC.Internal.Prim (
+    Addr#, ByteArray#, Char#, Int#, State#, Word#, Word8#, andI#, chr#, gtWord#,
+    indexWord8Array#, indexWord8OffAddr#, ltWord#, newByteArray#, orI#,
+    plusAddr#, sizeofByteArray#, uncheckedIShiftL#, unsafeFreezeByteArray#,
+    writeWord8Array#, writeWord8OffAddr#, word2Int#, word8ToWord#, wordToWord8#,
+    (+#), (-#), (<#), (<=#), (>=#),
+  )
 import GHC.Internal.ST
 import GHC.Internal.Word
 import GHC.Internal.ForeignPtr
@@ -65,7 +74,7 @@ a. the implementation used by GHC in `ghc-boot:GHC.Utils.Encoding`; this can be
 b. the copy of the `ghc-boot` definition now exported by `base:GHC.Encoding.UTF8`.
    This can be used at `Addr#`, `Ptr`, `ByteArray#`, and `ForeignPtr`.
 
-c. the decoder used by `unpackCStringUtf8#` in `ghc-internal:GHC.Internal.CString`; this is
+c. the decoder used by `unpackCStringUtf8#` in `ghc-internal:GHC.Internal.Types`; this is
    specialised at `Addr#`.
 
 d. the codec used by the IO subsystem in `base:GHC.IO.Encoding.UTF8`; this is

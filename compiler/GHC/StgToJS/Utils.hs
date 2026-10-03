@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase        #-}
 
 module GHC.StgToJS.Utils
   ( assignCoerce1
@@ -61,7 +60,8 @@ import GHC.Stg.Syntax
 
 import GHC.Tc.Utils.TcType
 
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.Modules( gHC_PRIM )
 import GHC.Builtin.PrimOps (primOpIsReallyInline)
 
 import GHC.Types.RepType

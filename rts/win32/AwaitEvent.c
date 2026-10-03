@@ -28,17 +28,21 @@
 // Protected by sched_mutex.
 static bool workerWaitingForRequests = false;
 
-void
+bool
 awaitCompletedTimeoutsOrIOWin32(Capability *cap, bool wait)
 {
+  bool interrupt = false;
   do {
     /* Try to de-queue completed IO requests
      */
     workerWaitingForRequests = true;
     if (is_io_mng_native_p())
       awaitAsyncRequests(wait);
+      /* FIXME: no support yet for interrupting in WinIO I/O manager
+       * See issue #27403
+       */
     else
-      awaitRequests(wait);
+      interrupt = !awaitRequests(wait);
     workerWaitingForRequests = false;
 
     // If a signal was raised, we need to service it
@@ -47,11 +51,12 @@ awaitCompletedTimeoutsOrIOWin32(Capability *cap, bool wait)
     // does it and I'm feeling too paranoid to refactor it today --SDM
     if (stg_pending_events != 0) {
         startSignalHandlers(cap);
-        return;
+        // This will normally cause emptyRunQueue to become false and
+        // thus we will drop out of the loop.
     }
 
-    // The return value from awaitRequests() is a red herring: ignore
-    // it.  Return to the scheduler if !wait, or
+    // The return value from awaitRequests() reports if it was interrupted by
+    // abandonRequestWait(). Return to the scheduler if !wait, or
     //
     //  - we were interrupted
     //  - the run-queue is now non- empty
@@ -59,6 +64,8 @@ awaitCompletedTimeoutsOrIOWin32(Capability *cap, bool wait)
   } while (wait
            && getSchedState() == SCHED_RUNNING
            && emptyRunQueue(cap)
+           && !interrupt
       );
+  return !interrupt;
 }
 #endif

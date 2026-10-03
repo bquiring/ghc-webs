@@ -1,11 +1,29 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NamedFieldPuns #-}
-module GHC.Toolchain.Target where
+{-# LANGUAGE MultiWayIf #-}
+module GHC.Toolchain.Target
+  (
+    -- * A Toolchain Target
+    Target(..), targetPlatformTriple
 
+  , WordSize(..), wordSize2Bytes
+
+    -- ** Queries
+  , tgtSupportsSMP, tgtRTSLinkerOnlySupportsSharedLibs
+
+    -- ** Lenses
+  , _tgtCC, _tgtCxx, _tgtCpp, _tgtHsCpp
+
+    -- * Re-exports
+  , ByteOrder(..)
+  ) where
+
+import GHC.ByteOrder
 import GHC.Platform.ArchOS
 
 import GHC.Toolchain.Prelude
 import GHC.Toolchain.Program
+import GHC.Toolchain.Library
 
 import GHC.Toolchain.Tools.Cc
 import GHC.Toolchain.Tools.Cxx
@@ -17,9 +35,6 @@ import GHC.Toolchain.Tools.Nm
 import GHC.Toolchain.Tools.MergeObjs
 
 data WordSize = WS4 | WS8
-    deriving (Show, Read, Eq, Ord)
-
-data Endianness = LittleEndian | BigEndian
     deriving (Show, Read, Eq, Ord)
 
 -- | A 'Target' consists of:
@@ -36,7 +51,7 @@ data Target = Target
     , tgtSupportsSubsectionsViaSymbols :: Bool
     , tgtSupportsIdentDirective :: Bool
     , tgtWordSize :: WordSize
-    , tgtEndianness :: Endianness
+    , tgtEndianness :: ByteOrder
     , tgtSymbolsHaveLeadingUnderscore :: Bool
     , tgtLlvmTarget :: String
 
@@ -46,6 +61,13 @@ data Target = Target
     -- , tgtHasThreadedRts :: Bool -- We likely just need this when bootstrapping
     , tgtUseLibffiForAdjustors :: Bool
     -- ^ We need to know whether or not to include libffi headers, and generate additional code for it
+    , tgtHasLibm :: Bool
+    -- ^ Does this target have a libm library that should always be linked against?
+
+    -- RTS capabilities
+    , tgtRTSWithLibdw :: Maybe Library
+    -- ^ Whether this target RTS is built with libdw support (for DWARF
+    -- unwinding), and if yes, the 'Library' configuration.
 
       -- C toolchain
     , tgtCCompiler :: Cc
@@ -71,6 +93,7 @@ data Target = Target
 
       -- Windows-specific tools
     , tgtWindres :: Maybe Program
+    , tgtDlltool :: Maybe Program
 
       -- Darwin-specific tools
     , tgtOtool   :: Maybe Program
@@ -111,6 +134,8 @@ instance Show Target where
     , ", tgtUnregisterised = " ++ show tgtUnregisterised
     , ", tgtTablesNextToCode = " ++ show tgtTablesNextToCode
     , ", tgtUseLibffiForAdjustors = " ++ show tgtUseLibffiForAdjustors
+    , ", tgtHasLibm = " ++ show tgtHasLibm
+    , ", tgtRTSWithLibdw = " ++ show tgtRTSWithLibdw
     , ", tgtCCompiler = " ++ show tgtCCompiler
     , ", tgtCxxCompiler = " ++ show tgtCxxCompiler
     , ", tgtCPreprocessor = " ++ show tgtCPreprocessor
@@ -126,7 +151,82 @@ instance Show Target where
     , ", tgtOpt = " ++ show tgtOpt
     , ", tgtLlvmAs = " ++ show tgtLlvmAs
     , ", tgtWindres = " ++ show tgtWindres
+    , ", tgtDlltool = " ++ show tgtDlltool
     , ", tgtOtool = " ++ show tgtOtool
     , ", tgtInstallNameTool = " ++ show tgtInstallNameTool
     , "}"
     ]
+
+--------------------------------------------------------------------------------
+-- Queries
+--------------------------------------------------------------------------------
+
+tgtSupportsSMP :: Target -> Bool
+tgtSupportsSMP Target{..} = do
+  let goodArch =
+        isARM (archOS_arch tgtArchOs)
+          || archOS_arch tgtArchOs `elem`
+              [ ArchX86
+              , ArchX86_64
+              , ArchPPC
+              , ArchPPC_64 ELF_V1
+              , ArchPPC_64 ELF_V2
+              , ArchAArch64
+              , ArchS390X
+              , ArchRISCV64
+              , ArchLoongArch64 ]
+
+  if   -- The THREADED_RTS requires `BaseReg` to be in a register and the
+       -- Unregisterised mode doesn't allow that.
+     | tgtUnregisterised    -> False
+       -- We don't support load/store barriers pre-ARMv7. See #10433.
+     | ArchARM ver _ _ <- archOS_arch tgtArchOs
+     , ver < ARMv7          -> False
+     | goodArch             -> True
+     | otherwise            -> False
+
+-- | Does the target RTS linker only support loading shared libraries?
+-- If true, this has several implications:
+-- 1. The GHC driver must not do loadArchive/loadObj etc and must
+--    always do loadDLL, regardless of whether host GHC is dynamic or
+--    not.
+-- 2. The GHC driver will always enable -dynamic-too when compiling
+--    vanilla way with TH codegen requirement.
+-- 3. ghci will always enforce dynamic ways even if -dynamic or
+--    -dynamic-too is not explicitly passed.
+-- 4. Cabal must not build ghci objects since it's not supported by
+--    the target.
+-- 5. The testsuite driver will use dyn way for TH/ghci tests even
+--    when host GHC is static.
+-- 6. TH/ghci doesn't work if stage1 is built without shared libraries
+--    (e.g. no_dynamic_libs/fully_static).
+tgtRTSLinkerOnlySupportsSharedLibs :: Target -> Bool
+tgtRTSLinkerOnlySupportsSharedLibs Target{tgtArchOs} =
+  archOS_arch tgtArchOs `elem`
+    [ ArchWasm32 ]
+
+--------------------------------------------------------------------------------
+-- Lenses
+--------------------------------------------------------------------------------
+
+_tgtCC :: Lens Target Cc
+_tgtCC = Lens tgtCCompiler (\x o -> o {tgtCCompiler = x})
+
+_tgtCxx :: Lens Target Cxx
+_tgtCxx = Lens tgtCxxCompiler (\x o -> o {tgtCxxCompiler = x})
+
+_tgtCpp :: Lens Target Cpp
+_tgtCpp = Lens tgtCPreprocessor (\x o -> o {tgtCPreprocessor = x})
+
+_tgtHsCpp :: Lens Target HsCpp
+_tgtHsCpp = Lens tgtHsCPreprocessor (\x o -> o {tgtHsCPreprocessor = x})
+
+_tgtJsCpp :: Lens Target (Maybe JsCpp)
+_tgtJsCpp = Lens tgtJsCPreprocessor (\x o -> o {tgtJsCPreprocessor = x})
+
+_tgtCmmCpp :: Lens Target CmmCpp
+_tgtCmmCpp = Lens tgtCmmCPreprocessor (\x o -> o {tgtCmmCPreprocessor = x})
+
+_tgtMergeObjs :: Lens Target (Maybe MergeObjs)
+_tgtMergeObjs = Lens tgtMergeObjs (\x o -> o {tgtMergeObjs = x})
+

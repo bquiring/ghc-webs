@@ -14,6 +14,46 @@
 
 #pragma once
 
+/* Note [Threads and preemption]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   All full-fat OSs that GHC works on have OS threads, and we use them even in
+   the non-threaded RTS for a few features:
+    * Haskell thread preemption;
+    * sample-based profiling;
+    * idle GC;
+    * periodic eventlog flushing.
+
+   We use defined(HAVE_PREEMPTION) to decide if these features are implemented
+   via OS threads.
+
+   On platforms like WASM/js we do not have OS threads in any conventional
+   sense, and the features above are either not available or are implemented
+   differently. See Note [No timer on wasm32].
+
+   In future if GHC is ported to platforms like bare-metal micro-controllers,
+   RTOSs or to run directly under hypervisors then such platforms may also not
+   have threads available and they should not define HAVE_PREEMPTION here. Or
+   for some micro-controller RTOSs like Zeypher one may have a choice about
+   whether to use threads or not (at a size cost). Here would be the right
+   place to control whether the feature list above is supported.
+ */
+#if defined(wasm32_HOST_ARCH)
+  // See Note [No timer on wasm32]
+  // To confuse matters, WASM _does_ have pthread.h but it doesnt work.
+#elif defined(HAVE_PTHREAD_H) || defined(HAVE_WINDOWS_H)
+#define HAVE_PREEMPTION
+#else
+#error Decide if this platform has threads and pre-emption or not.
+#endif
+// And JS does all of this differently, without using this bit of the RTS.
+
+// Configuration sanity check
+#if defined(THREADED_RTS) && !defined(HAVE_PREEMPTION)
+//TODO we would like to be able to assert this:
+// #error Configuration error: THREADED_RTS should imply HAVE_PREEMPTION
+// however at the moment we cannot due to issue #27346.
+#endif
+
 #if defined(HAVE_PTHREAD_H) && !defined(mingw32_HOST_OS)
 
 #if defined(CMINUSMINUS)
@@ -40,7 +80,6 @@ typedef struct {
 } Condition;
 typedef pthread_mutex_t Mutex;
 typedef pthread_t       OSThreadId;
-typedef pthread_key_t   ThreadLocalKey;
 
 #define OSThreadProcAttr /* nothing */
 
@@ -107,7 +146,6 @@ typedef CONDITION_VARIABLE Condition;
 typedef DWORD OSThreadId;
 // don't be tempted to use HANDLE as the OSThreadId: there can be
 // many HANDLES to a given thread, so comparison would not work.
-typedef DWORD ThreadLocalKey;
 
 #define OSThreadProcAttr
 
@@ -168,7 +206,6 @@ typedef SRWLOCK Mutex;
 typedef void* Condition;
 typedef void* Mutex;
 typedef void* OSThreadId;
-typedef void* ThreadLocalKey;
 
 #define OSThreadProcAttr
 
@@ -213,16 +250,28 @@ extern bool timedWaitCondition    ( Condition* pCond, Mutex* pMut, Time timeout)
 //
 // Mutexes
 //
+// Even in the non-threaded RTS we use threads and mutexes! In particular the
+// timer/ticker is implemented using a thread. And using threads needs locks.
+// In particular we need locks for the data shared between the timer/ticker
+// thread and the thread running the main capability.
+#if defined(HAVE_PREEMPTION)
 extern void initMutex             ( Mutex* pMut );
 extern void closeMutex            ( Mutex* pMut );
 
-//
-// Thread-local storage
-//
-void  newThreadLocalKey (ThreadLocalKey *key);
-void *getThreadLocalVar (ThreadLocalKey *key);
-void  setThreadLocalVar (ThreadLocalKey *key, void *value);
-void  freeThreadLocalKey (ThreadLocalKey *key);
+// The "always" variants do locking in the threaded and non-threaded RTS.
+// The normal variants below are no-ops in the non-threaded RTS.
+#define ACQUIRE_LOCK_ALWAYS(l) OS_ACQUIRE_LOCK(l)
+#define TRY_ACQUIRE_LOCK_ALWAYS(l) OS_TRY_ACQUIRE_LOCK(l)
+#define RELEASE_LOCK_ALWAYS(l) OS_RELEASE_LOCK(l)
+#define ASSERT_LOCK_HELD_ALWAYS(l) OS_ASSERT_LOCK_HELD(l)
+#else
+// And just to be a bit confusing, the always variants are still no-ops when we
+// do not HAVE_PREEMPTION, since then we don't have threads or mutexes at all.
+#define ACQUIRE_LOCK_ALWAYS(l)
+#define TRY_ACQUIRE_LOCK_ALWAYS(l) 0
+#define RELEASE_LOCK_ALWAYS(l)
+#define ASSERT_LOCK_HELD_ALWAYS(l)
+#endif
 
 // Processors and affinity
 void setThreadAffinity (uint32_t n, uint32_t m);
@@ -239,6 +288,7 @@ void releaseThreadNode (void);
 
 #else
 
+// No-ops in the non-threaded RTS. See also the _ALWAYS variants above.
 #define ACQUIRE_LOCK(l)
 #define TRY_ACQUIRE_LOCK(l) 0
 #define RELEASE_LOCK(l)

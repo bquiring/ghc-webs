@@ -30,7 +30,7 @@ module GHC.Internal.System.Mem
         , disableAllocationLimit
        ) where
 
-import GHC.Internal.Base
+import GHC.Internal.Types
 import GHC.Internal.Conc.Sync
 
 -- | Triggers an immediate major garbage collection.

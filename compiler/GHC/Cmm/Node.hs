@@ -1,7 +1,5 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE LambdaCase #-}
 
 -- CmmNode type for representation using Hoopl graphs.
 
@@ -419,8 +417,8 @@ instance NonLocal CmmNode where
 --------------------------------------------------
 -- Various helper types
 
-type CmmActual = CmmExpr
-type CmmFormal = LocalReg
+type CmmActual = CmmExpr  -- ^ Usually used to refer to arguments
+type CmmFormal = LocalReg -- ^ Usually used to refer to result registers.
 
 type UpdFrameOffset = ByteOff
 
@@ -821,8 +819,8 @@ data CmmTickScope
 
   | SubScope !U.Unique CmmTickScope
     -- ^ Constructs a new sub-scope to an existing scope. This allows
-    -- us to translate Core-style scoping rules (see @tickishScoped@)
-    -- into the Cmm world. Suppose the following code:
+    -- us to translate Core-style scoping rules (see Note [Scoping ticks and counting ticks]
+    -- in GHC.Types.Tickish) into the Cmm world. Suppose the following code:
     --
     --   tick<1> case ... of
     --             A -> tick<2> ...

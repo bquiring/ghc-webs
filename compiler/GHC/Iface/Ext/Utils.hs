@@ -1,9 +1,5 @@
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE DeriveFunctor #-}
 module GHC.Iface.Ext.Utils where
 
 import GHC.Prelude
@@ -316,17 +312,21 @@ getNameScopeAndBinding
   -> M.Map HiePath (HieAST a)
   -> Maybe ([Scope], Maybe Span)
 getNameScopeAndBinding n asts = case nameSrcSpan n of
-  RealSrcSpan sp _ -> do -- @Maybe
-    ast <- M.lookup (HiePath (srcSpanFile sp)) asts
-    defNode <- selectLargestContainedBy sp ast
-    getFirst $ foldMap First $ do -- @[]
-      node <- flattenAst defNode
-      dets <- maybeToList
-        $ M.lookup (Right n) $ sourcedNodeIdents $ sourcedNodeInfo node
-      scopes <- maybeToList $ foldMap getScopeFromContext (identInfo dets)
-      let binding = foldMap (First . getBindSiteFromContext) (identInfo dets)
-      return $ Just (scopes, getFirst binding)
-  _ -> Nothing
+  RealSrcSpan sp _ -> go sp
+  GeneratedSrcSpan (OrigSpan sp) -> go sp
+  GeneratedSrcSpan{} -> Nothing
+  UnhelpfulSpan{} -> Nothing
+  where
+    go sp = do -- @Maybe
+      ast <- M.lookup (HiePath (srcSpanFile sp)) asts
+      defNode <- selectLargestContainedBy sp ast
+      getFirst $ foldMap First $ do -- @[]
+        node <- flattenAst defNode
+        dets <- maybeToList
+          $ M.lookup (Right n) $ sourcedNodeIdents $ sourcedNodeInfo node
+        scopes <- maybeToList $ foldMap getScopeFromContext (identInfo dets)
+        let binding = foldMap (First . getBindSiteFromContext) (identInfo dets)
+        return $ Just (scopes, getFirst binding)
 
 getScopeFromContext :: ContextInfo -> Maybe [Scope]
 getScopeFromContext (ValBind _ sc _) = Just [sc]
@@ -381,6 +381,7 @@ selectSmallestContaining sp node
 definedInAsts :: M.Map HiePath (HieAST a) -> Name -> Bool
 definedInAsts asts n = case nameSrcSpan n of
   RealSrcSpan sp _ -> M.member (HiePath (srcSpanFile sp)) asts
+  GeneratedSrcSpan (OrigSpan sp) -> M.member (HiePath (srcSpanFile sp)) asts
   _ -> False
 
 getEvidenceBindDeps :: ContextInfo -> [Name]
@@ -465,11 +466,11 @@ in which @foozball@ and @quuuuuux@ have overlapping spans:
 @
 module Baz where
 
-# line 3 "Baz.hs"
+# \line 3 "Baz.hs"
 foozball :: Int
 foozball = 0
 
-# line 3 "Baz.hs"
+# \line 3 "Baz.hs"
 bar, quuuuuux :: Int
 bar = 1
 quuuuuux = 2
@@ -527,11 +528,14 @@ simpleNodeInfo :: FastString -> FastString -> NodeInfo a
 simpleNodeInfo cons typ = NodeInfo (S.singleton (NodeAnnotation cons typ)) [] M.empty
 
 locOnly :: Monad m => SrcSpan -> ReaderT NodeOrigin m [HieAST a]
-locOnly (RealSrcSpan span _) = do
-  org <- ask
-  let e = mkSourcedNodeInfo org $ emptyNodeInfo
-  pure [Node e span []]
-locOnly _ = pure []
+locOnly s | (RealSrcSpan span _) <- s = mk_node span
+          | (GeneratedSrcSpan (OrigSpan span)) <- s = mk_node span
+          | otherwise = pure []
+  where
+    mk_node span = do
+      org <- ask
+      let e = mkSourcedNodeInfo org $ emptyNodeInfo
+      pure [Node e span []]
 
 locOnlyE :: Monad m => EpaLocation -> ReaderT NodeOrigin m [HieAST a]
 locOnlyE (EpaSpan s) = locOnly s
@@ -539,8 +543,10 @@ locOnlyE _ = pure []
 
 mkScope :: (HasLoc a) => a -> Scope
 mkScope a = case getHasLoc a of
-              (RealSrcSpan sp _) -> LocalScope sp
-              _ -> NoScope
+              RealSrcSpan sp _ -> LocalScope sp
+              GeneratedSrcSpan (OrigSpan sp) -> LocalScope sp
+              GeneratedSrcSpan{} -> NoScope
+              UnhelpfulSpan{} -> NoScope
 
 combineScopes :: Scope -> Scope -> Scope
 combineScopes ModuleScope _ = ModuleScope
@@ -570,11 +576,14 @@ makeNode
 makeNode x spn = do
   org <- ask
   pure $ case spn of
-    RealSrcSpan span _ -> [Node (mkSourcedNodeInfo org $ simpleNodeInfo cons typ) span []]
-    _ -> []
+    RealSrcSpan span _ -> mk_node span org
+    GeneratedSrcSpan (OrigSpan span) -> mk_node span org
+    GeneratedSrcSpan{} -> []
+    UnhelpfulSpan{} -> []
   where
     cons = mkFastString . show . toConstr $ x
     typ = mkFastString . show . typeRepTyCon . typeOf $ x
+    mk_node span org = [Node (mkSourcedNodeInfo org $ simpleNodeInfo cons typ) span []]
 
 {-# INLINEABLE makeTypeNodeA #-}
 makeTypeNodeA
@@ -595,9 +604,11 @@ makeTypeNode
 makeTypeNode x spn etyp = do
   org <- ask
   pure $ case spn of
-    RealSrcSpan span _ ->
-      [Node (mkSourcedNodeInfo org $ NodeInfo (S.singleton (NodeAnnotation cons typ)) [etyp] M.empty) span []]
-    _ -> []
+    RealSrcSpan span _ -> mk_node span org
+    GeneratedSrcSpan (OrigSpan span) -> mk_node span org
+    GeneratedSrcSpan{} -> []
+    UnhelpfulSpan{} -> []
   where
     cons = mkFastString . show . toConstr $ x
     typ = mkFastString . show . typeRepTyCon . typeOf $ x
+    mk_node span org = [Node (mkSourcedNodeInfo org $ NodeInfo (S.singleton (NodeAnnotation cons typ)) [etyp] M.empty) span []]

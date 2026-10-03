@@ -3,7 +3,7 @@
 
 module GHC.Internal.IO.Exception where
 
-import GHC.Internal.Base
+import GHC.Internal.Base as Rebindable
 import {-# SOURCE #-} GHC.Internal.Exception.Type
 
 data IOException

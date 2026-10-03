@@ -20,6 +20,7 @@ import ReleaseSRWLockExclusives;
 #if !defined(UnregisterisedCompiler)
 import CLOSURE g0;
 import CLOSURE large_alloc_lim;
+import CLOSURE ghc_hs_iface;
 import CLOSURE stg_MSG_THROWTO_info;
 import CLOSURE stg_MVAR_DIRTY_info;
 import CLOSURE stg_WHITEHOLE_info;
@@ -40,6 +41,8 @@ import CLOSURE stg_ret_l_info;
 import CLOSURE stg_ret_n_info;
 import CLOSURE stg_ret_p_info;
 import CLOSURE stg_stack_save_entries;
+import CLOSURE stg_block_io_unit_info;
+import CLOSURE stg_block_io_int_info;
 #endif
 
 /* Stack/Heap Check Failure
@@ -373,8 +376,6 @@ stg_gc_l1 return (L_ l)
     jump stg_gc_noregs (stg_ret_l_info, l) ();
 }
 
-/*-- Unboxed tuples with multiple pointers -------------------------------- */
-
 stg_gc_pp return (P_ arg1, P_ arg2)
 {
     call stg_gc_noregs();
@@ -391,6 +392,36 @@ stg_gc_pppp return (P_ arg1, P_ arg2, P_ arg3, P_ arg4)
 {
     call stg_gc_noregs();
     return (arg1,arg2,arg3,arg4);
+}
+
+stg_gc_ppppp return (P_ arg1, P_ arg2, P_ arg3, P_ arg4, P_ arg5)
+{
+    call stg_gc_noregs();
+    return (arg1,arg2,arg3,arg4,arg5);
+}
+
+stg_gc_ip return (W_ arg1, P_ arg2)
+{
+    call stg_gc_noregs();
+    return (arg1,arg2);
+}
+
+stg_gc_pi return (P_ arg1, W_ arg2)
+{
+    call stg_gc_noregs();
+    return (arg1,arg2);
+}
+
+stg_gc_ii return (W_ arg1, W_ arg2)
+{
+    call stg_gc_noregs();
+    return (arg1,arg2);
+}
+
+stg_gc_bpp return (I8 arg1, P_ arg2, P_ arg3)
+{
+    call stg_gc_noregs();
+    return (arg1,arg2,arg3);
 }
 
 /* -----------------------------------------------------------------------------
@@ -666,6 +697,37 @@ stg_block_putmvar (P_ mvar, P_ val)
    }
 }
 
+
+/* -----------------------------------------------------------------------------
+   STM-specific waiting
+   -------------------------------------------------------------------------- */
+
+stg_block_stmwait
+{
+    // When blocking on an MVar we have to be careful to only release
+    // the lock on the MVar at the very last moment (using
+    // BLOCK_BUT_FIRST()), since when we release the lock another
+    // Capability can wake up the thread, which modifies its stack and
+    // other state.  This is not a problem for STM, because STM
+    // wakeups are non-destructive; the waker simply calls
+    // tryWakeupThread() which sends a message to the owner
+    // Capability.  So the moment we release this lock we might start
+    // getting wakeup messages, but that's perfectly harmless.
+    //
+    // Furthermore, we *must* release these locks, just in case an
+    // exception is raised in this thread by
+    // maybePerformBlockedException() while exiting to the scheduler,
+    // which will abort the transaction, which needs to obtain a lock
+    // on all the TVars to remove the thread from the queues.
+    //
+    ccall stmWaitUnlock(MyCapability() "ptr", R3 "ptr");
+    BLOCK_GENERIC;
+}
+
+/* -----------------------------------------------------------------------------
+   Blocks for blackholes and throwto
+   -------------------------------------------------------------------------- */
+
 stg_block_blackhole (P_ node)
 {
     Sp_adj(-2);
@@ -702,67 +764,199 @@ stg_block_throwto (P_ tso, P_ exception)
     }
 }
 
+/* -----------------------------------------------------------------------------
+   Thread blocking for I/O primops
+   -------------------------------------------------------------------------- */
+
+/* Thread blocking for primops used only by the win32-legacy I/O manager:
+ * asyncRead, asyncWrite and asyncDoProc.
+ */
 #if defined(mingw32_HOST_OS)
-INFO_TABLE_RET ( stg_block_async, RET_SMALL, W_ info_ptr, W_ ares )
+INFO_TABLE_RET ( stg_block_async, RET_SMALL, W_ info_ptr, W_ len, W_ errCode )
     return ()
 {
-    W_ len, errC;
-
-    len = TO_W_(StgAsyncIOResult_len(ares));
-    errC = TO_W_(StgAsyncIOResult_errCode(ares));
-    ccall free(ares "ptr");
-    return (len, errC);
+    return (len, errCode);
 }
 
 stg_block_async
 {
-    Sp_adj(-2);
+    W_ eintr;
+    (eintr) = ccall rts_EINTR();
+
+    // Fill the stack frame with values that indicate that the operation
+    // has been interrupted. The IO manager will overwrite these with the
+    // actual results if the async operation completes.
+    Sp_adj(-3);
     Sp(0) = stg_block_async_info;
+    Sp(1) = -1;                    // len:     -1 indicates error
+    Sp(2) = eintr;                 // errCode: interrupted
     BLOCK_GENERIC;
 }
-
-/* Used by threadDelay implementation; it would be desirable to get rid of
- * this free()'ing void return continuation.
- */
-INFO_TABLE_RET ( stg_block_async_void, RET_SMALL, W_ info_ptr, W_ ares )
-    return ()
-{
-    ccall free(ares "ptr");
-    return ();
-}
-
-stg_block_async_void
-{
-    Sp_adj(-2);
-    Sp(0) = stg_block_async_void_info;
-    BLOCK_GENERIC;
-}
-
 #endif
 
+/* Note [Thread blocking for new I/O primops]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/* -----------------------------------------------------------------------------
-   STM-specific waiting
-   -------------------------------------------------------------------------- */
+The classic I/O primops are:
 
-stg_block_stmwait
+  waitRead#, waitWrite# :: Int# -> State# s -> State# s
+
+Note that they have no result, with wrapper types returning IO (). Each one
+simply suspends the calling thread until a condition occurs (I/O or time).
+
+Despite this external simplicity, internally there is more complexity with a
+number of cases to handle:
+
+At submission time:
+ - synchronous failure, e.g. bad fd
+ - synchronous success, e.g. waiting on a regular file, which is always ready
+ - proceed asynchronously: block thread, return to scheduler
+
+Later, at I/O completion, I/O error, or async exception time:
+ - reported failure, e.g. stale fd
+ - success
+
+The waitRead/Write# also have non-reported failures, such as I/O errors,
+but these are treated as the success case since these primops are defined to
+wait for I/O or an error. We only report failures, via exceptions, for cases
+where it would be unsafe to proceed with a subsequent I/O operation on the
+same fd. In particular this includes when the fd was closed while a thread was
+waiting on the fd (since it's very unsafe to read/write an fd that is closed or
+worse: has been recycled to refer to a different file).
+
+The synchronous success and failure cases are handled by the initiating
+primops. In the blocking case, it relies on one of these stg_block_ functions,
+stack frames, and stack frame info table entry code. The key bits of the
+mechanism are:
+
+ - The stg_block_ cmm function sets up the stack frame for the blocked thread.
+ - The stack frame entries can be overwritten by the I/O manager, e.g. upon I/O
+   completion or error.
+ - The stack frame's info table entry code is invoked when the thread is
+   resumed.
+ - The entries in the stack frame become arguments to the info table entry code.
+ - The result(s) returned by the info table entry code _are_ the result(s) of
+   the I/O primop.
+
+It is important to keep clear the distinction between the stack frame entries
+and the final primop result(s): the stack frame's info table entry code
+transforms the former into the latter.
+
+The convention we follow is that the stack frame contains two fields:
+ - an outcome, using IOOpOutcome values: in-flight, success, failed, cancelled.
+ - a result or error code. For outcome success it is a result. For failed it is
+   the error code (using posix errno codes), while for cancelled and in-flight
+   outcomes there is no result.
+
+This outcome+result/failure encoding is exactly the same as the corresponding
+fields in the StgAsyncIOOp. One day we might just use the StgAsyncIOOp itself,
+once all I/O managers use them.
+
+The waitRead/waitWrite# primops do not use a result, but later I/O primops will
+do. In particular read/write on files return a length, and other I/O primitives
+also have a single result.
+
+So this gives us two block functions and corresponding info tables:
+
+ 1. stg_block_io_unit: with a stack frame containing outcome+result/failure.
+    On resume, throw exception on failure and otherwise return no args.
+    This is for primops with result IO ().
+
+ 2. stg_block_io_int: with a stack frame containing outcome+result/failure.
+    On resume, throw exception on failure and otherwise return result.
+    This is for primops with result IO Int or IO Word.
+
+ 3. stg_block_io_aiop: in future if we add async I/O primitives that return an
+    StgAsyncIOOp we would also need versions that return that (since even
+    submitting async I/O can block if there's too much I/O in flight).
+
+The stack frame layout used is:
+ Sp[0]   stg_block_io_unit_info or stg_block_io_int_info
+ Sp[1]   outcome
+ Sp[2]   result or error
+
+C code should use setTsoIOOpOutcome to set this. But update this if the layout
+changes!
+
+
+Note [Calling convention for raisePrimIOException]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In cases 1 & 2 we check the outcome and, on failure, we throw an exception. Our
+approach is to use a helper function implemeted in generated Haskell code, in
+ghc-internal. We need to perform a tail call to this helper function:
+
+    raisePrimIOException :: Int# -> State# s -> (# State# s, a #)
+
+The calling convention for top-level generated Haskell function like this uses
+R2 because it has two arguments -- the Int# and State# -- but the State#
+argument has a zero-width repesentation. The cmm call uses R1, R2, ... etc so
+to pass in R2 we have to use a dummy first argument which will be passed in R1
+(and ignored).
+*/
+
+/* stg_block_io_unit_info : the return info table for stg_block_io_unit */
+INFO_TABLE_RET ( stg_block_io_unit, RET_SMALL, W_ info_ptr,
+                 W_ outcome, W_ result )
+    return ()
 {
-    // When blocking on an MVar we have to be careful to only release
-    // the lock on the MVar at the very last moment (using
-    // BLOCK_BUT_FIRST()), since when we release the lock another
-    // Capability can wake up the thread, which modifies its stack and
-    // other state.  This is not a problem for STM, because STM
-    // wakeups are non-destructive; the waker simply calls
-    // tryWakeupThread() which sends a message to the owner
-    // Capability.  So the moment we release this lock we might start
-    // getting wakeup messages, but that's perfectly harmless.
-    //
-    // Furthermore, we *must* release these locks, just in case an
-    // exception is raised in this thread by
-    // maybePerformBlockedException() while exiting to the scheduler,
-    // which will abort the transaction, which needs to obtain a lock
-    // on all the TVars to remove the thread from the queues.
-    //
-    ccall stmWaitUnlock(MyCapability() "ptr", R3 "ptr");
+    if (outcome == 2 :: W_ /*IOOpOutcomeFailed*/) (likely: False) {
+        /* See Note [Calling convention for raisePrimIOException] */
+        W_ dummyR1;
+        dummyR1 = 0;
+        jump %ENTRY_CODE(HsIface_raisePrimIOException_info(W_[ghc_hs_iface]))
+             (dummyR1, result);
+    } else {
+        /* success or cancelled outcomes */
+        return ();
+    }
+}
+
+/* Blocking for I/O primops with result IO ().
+ * See Note [Thread blocking for new I/O primops].
+ */
+stg_block_io_unit
+{
+    /* Fill out the stack frame with dummy values. The IO manager will
+     * overwrite these with the actual results when the I/O operation
+     * completes, fails, or is cancelled.
+     */
+    Sp_adj(-3);
+    Sp(0) = stg_block_io_unit_info;
+    Sp(1) = 0;                    // outcome: 0 indicates IOOpOutcomeInFlight
+    Sp(2) = 0;                    // result/errno
+    BLOCK_GENERIC;
+}
+
+/* stg_block_io_int_info : the return info table for stg_block_io_int */
+INFO_TABLE_RET ( stg_block_io_int, RET_SMALL, W_ info_ptr,
+                 W_ outcome, W_ result )
+    return ()
+{
+    if (outcome == 2 :: W_ /*IOOpOutcomeFailed*/) (likely: False) {
+        /* See Note [Calling convention for raisePrimIOException] */
+        W_ dummyR1;
+        dummyR1 = 0;
+        jump %ENTRY_CODE(HsIface_raisePrimIOException_info(W_[ghc_hs_iface]))
+             (dummyR1, result);
+    } else {
+        /* success or cancelled outcomes */
+        return (result);
+    }
+}
+
+/* Blocking for I/O primops with result IO Int or Word (or rather Int#/Word#).
+ * See Note [Thread blocking for new I/O primops].
+ */
+stg_block_io_int
+{
+    /* Fill out the stack frame with dummy values. The IO manager will
+     * overwrite these with the actual results when the I/O operation
+     * completes, fails, or is cancelled.
+     */
+    Sp_adj(-3);
+    Sp(0) = stg_block_io_int_info;
+    Sp(1) = 0;                    // outcome: 0 indicates IOOpOutcomeInFlight
+    Sp(2) = 0;                    // result/errno
     BLOCK_GENERIC;
 }

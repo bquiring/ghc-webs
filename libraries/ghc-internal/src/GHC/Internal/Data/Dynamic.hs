@@ -45,13 +45,17 @@ module GHC.Internal.Data.Dynamic
   ) where
 
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Type.Equality
-import GHC.Internal.Type.Reflection
+import GHC.Internal.Type.Reflection as R
 import GHC.Internal.Data.Maybe
 
-import GHC.Internal.Base
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Show
 import GHC.Internal.Exception
+
+import GHC.Internal.Data.Typeable.Internal as Rebindable
+import GHC.Internal.Num as Rebindable( fromInteger )
 
 -------------------------------------------------------------
 --
@@ -70,7 +74,7 @@ import GHC.Internal.Exception
   of the object\'s type; useful for debugging.
 -}
 data Dynamic where
-    Dynamic :: forall a. TypeRep a -> a -> Dynamic
+    Dynamic :: forall a. R.TypeRep a -> a -> Dynamic
 
 -- | @since base-2.01
 instance Show Dynamic where
@@ -94,7 +98,7 @@ instance Exception Dynamic
 -- >    toDyn (id :: Int -> Int)
 --
 toDyn :: Typeable a => a -> Dynamic
-toDyn v = Dynamic typeRep v
+toDyn v = Dynamic R.typeRep v
 
 -- | Converts a 'Dynamic' object back into an ordinary Haskell value of
 -- the correct type.  See also 'fromDynamic'.
@@ -105,8 +109,8 @@ fromDyn :: Typeable a
                         -- it has the correct type, otherwise the value of
                         -- the second argument.
 fromDyn (Dynamic t v) def
-  | Just HRefl <- t `eqTypeRep` typeOf def = v
-  | otherwise                              = def
+  | Just HRefl <- t `eqTypeRep` R.typeOf def = v
+  | otherwise                                = def
 
 -- | Converts a 'Dynamic' object back into an ordinary Haskell value of
 -- the correct type.  See also 'fromDyn'.

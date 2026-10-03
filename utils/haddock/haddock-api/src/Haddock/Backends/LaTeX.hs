@@ -27,9 +27,11 @@ import Data.List (sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map as Map
 import qualified Data.Maybe as Maybe
+import qualified Data.Text as T
 import GHC hiding (HsTypeGhcPsExt (..), fromMaybeContext)
 import GHC.Core.Type (Specificity (..))
 import GHC.Data.FastString (unpackFS)
+import Language.Haskell.Syntax.Text (unpackHText)
 import GHC.Types.Name (getOccString, nameOccName, tidyNameOcc)
 import GHC.Types.Name.Occurrence
 import GHC.Types.Name.Reader (rdrNameOcc)
@@ -238,7 +240,7 @@ isSimpleSig
       ( RnExportD
           { rnExpDExpD =
             ExportD
-              { expDDecl = L _ (SigD _ (TypeSig _ lnames t))
+              { expDDecl = L _ (SigD _ (TypeSig _ _ lnames t))
               , expDMbDoc = (Documentation Nothing Nothing, argDocs)
               }
           }
@@ -281,10 +283,10 @@ declNames
      )
 declNames (L _ decl) = case decl of
   TyClD _ d -> (empty, [tcdNameI d])
-  SigD _ (TypeSig _ lnames _) -> (empty, map unLoc lnames)
+  SigD _ (TypeSig _ _ lnames _) -> (empty, map unLoc lnames)
   SigD _ (PatSynSig _ lnames _) -> (text "pattern", map unLoc lnames)
-  ForD _ (ForeignImport _ (L _ n) _ _) -> (empty, [n])
-  ForD _ (ForeignExport _ (L _ n) _ _) -> (empty, [n])
+  ForD _ (ForeignImport _ _ (L _ n) _ _) -> (empty, [n])
+  ForD _ (ForeignExport _ _ (L _ n) _ _) -> (empty, [n])
   _ -> error "declaration not supported by declNames"
 
 forSummary :: (ExportItem DocNameI) -> Bool
@@ -327,7 +329,7 @@ ppDecl decl pats (doc, fnArgsDoc) instances subdocs _fxts = case unLoc decl of
   TyClD _ d@DataDecl{} -> ppDataDecl pats instances subdocs (Just doc) d unicode
   TyClD _ d@SynDecl{} -> ppTySyn (doc, fnArgsDoc) d unicode
   TyClD _ d@ClassDecl{} -> ppClassDecl instances doc subdocs d unicode
-  SigD _ (TypeSig _ lnames ty) -> ppFunSig Nothing (doc, fnArgsDoc) (map unLoc lnames) (dropWildCardsI ty) unicode
+  SigD _ (TypeSig _ _ lnames ty) -> ppFunSig Nothing (doc, fnArgsDoc) (map unLoc lnames) (dropWildCardsI ty) unicode
   SigD _ (PatSynSig _ lnames ty) -> ppLPatSig (doc, fnArgsDoc) (map unLoc lnames) ty unicode
   ForD _ d -> ppFor (doc, fnArgsDoc) d unicode
   InstD _ _ -> empty
@@ -337,7 +339,7 @@ ppDecl decl pats (doc, fnArgsDoc) instances subdocs _fxts = case unLoc decl of
     unicode = False
 
 ppFor :: DocForDecl DocName -> ForeignDecl DocNameI -> Bool -> LaTeX
-ppFor doc (ForeignImport _ (L _ name) typ _) unicode =
+ppFor doc (ForeignImport _ _ (L _ name) typ _) unicode =
   ppFunSig Nothing doc [name] typ unicode
 ppFor _ _ _ = error "ppFor error in Haddock.Backends.LaTeX"
 
@@ -435,7 +437,7 @@ ppFamHeader
         | associated = id
         | otherwise = (<+> keyword "family")
 
-      famName = ppAppDocNameTyVarBndrs unicode name (hsq_explicit tvs)
+      famName = ppAppDocNameTyVarBndrs unicode name (hsQTvExplicitBinders tvs)
 
       famSig = case result of
         NoSig _ -> empty
@@ -644,7 +646,7 @@ ppTyVars :: RenderableBndrFlag flag => Bool -> [LHsTyVarBndr flag DocNameI] -> [
 ppTyVars unicode tvs = map (ppHsTyVarBndr unicode . unLoc) tvs
 
 tyvarNames :: LHsQTyVars DocNameI -> [Maybe Name]
-tyvarNames = map (fmap getName . hsLTyVarNameI) . hsQTvExplicit
+tyvarNames = map (fmap getName . hsLTyVarNameI) . hsQTvExplicitBinders
 
 declWithDoc :: LaTeX -> Maybe LaTeX -> LaTeX
 declWithDoc decl doc =
@@ -691,7 +693,7 @@ rDoc = maybeDoc . fmap latexStripTrailingWhitespace
 
 ppClassHdr
   :: Bool
-  -> Maybe (LocatedC [LHsType DocNameI])
+  -> Maybe (LHsContext DocNameI)
   -> DocName
   -> LHsQTyVars DocNameI
   -> [LHsFunDep DocNameI]
@@ -699,7 +701,7 @@ ppClassHdr
   -> LaTeX
 ppClassHdr summ lctxt n tvs fds unicode =
   keyword "class"
-    <+> (if not (null $ fromMaybeContext lctxt) then ppLContext lctxt unicode else empty)
+    <+> (if not (null $ hsc_ctxt $ fromMaybeContext lctxt) then ppLContext lctxt unicode else empty)
     <+> ppAppDocNameNames summ n (tyvarNames tvs)
     <+> ppFds fds unicode
 
@@ -733,9 +735,9 @@ ppClassDecl
       , tcdLName = lname
       , tcdTyVars = ltyvars
       , tcdFDs = lfds
-      , tcdSigs = lsigs
-      , tcdATs = ats
-      , tcdATDefs = at_defs
+      , tcdCExt = (HsNestedGroup { ng_sigs = lsigs
+                                 , ng_ats = ats
+                                 , ng_tyfam_insts = at_defs }, _)
       }
     )
   unicode =
@@ -919,7 +921,7 @@ ppConstrHdr forall_ tvs ctxt unicode = ppForall <> ppCtxt
       | otherwise = ppHsForAllTelescope (mkHsForAllInvisTeleI tvs) unicode
 
     ppCtxt
-      | null ctxt = empty
+      | null (hsc_ctxt ctxt) = empty
       | otherwise = ppContextNoArrow ctxt unicode <+> darrow unicode <> space
 
 -- | Pretty-print a constructor
@@ -962,7 +964,7 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
               header_ = ppConstrHdr forall_ tyVars context unicode
            in case det of
                 -- Prefix constructor, e.g. 'Just a'
-                PrefixCon args
+                PrefixCon _ args
                   | hasArgDocs -> header_ <+> ppOcc
                   | otherwise ->
                       hsep
@@ -971,9 +973,9 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
                         , hsep (map (ppLParendType unicode . hsConDeclFieldToHsTypeNoMult) args)
                         ]
                 -- Record constructor, e.g. 'Identity { runIdentity :: a }'
-                RecCon _ -> header_ <+> ppOcc
+                RecCon _ _ -> header_ <+> ppOcc
                 -- Infix constructor, e.g. 'a :| [a]'
-                InfixCon arg1 arg2
+                InfixCon _ arg1 arg2
                   | hasArgDocs -> header_ <+> ppOcc
                   | otherwise ->
                       hsep
@@ -1001,11 +1003,11 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
         _ -> empty
       ConDeclH98{con_args = con_args'} -> case con_args' of
         -- H98 record declarations
-        RecCon (L _ fields) -> doRecordFields fields
+        RecCon _ (L _ fields) -> doRecordFields fields
         -- H98 prefix data constructors
-        PrefixCon args | hasArgDocs -> doConstrArgsWithDocs (map hsConDeclFieldToHsTypeNoMult args)
+        PrefixCon _ args | hasArgDocs -> doConstrArgsWithDocs (map hsConDeclFieldToHsTypeNoMult args)
         -- H98 infix data constructor
-        InfixCon arg1 arg2 | hasArgDocs -> doConstrArgsWithDocs (map hsConDeclFieldToHsTypeNoMult [arg1, arg2])
+        InfixCon _ arg1 arg2 | hasArgDocs -> doConstrArgsWithDocs (map hsConDeclFieldToHsTypeNoMult [arg1, arg2])
         _ -> empty
 
     doRecordFields fields =
@@ -1053,10 +1055,10 @@ ppSideBySideField subdocs unicode (HsConDeclRecField _ names ltype) =
 -- don't use cdf_doc for same reason we don't use con_doc above
 -- Where there is more than one name, they all have the same documentation
 ppRecFieldMultAnn :: Bool -> HsConDeclField DocNameI -> LaTeX
-ppRecFieldMultAnn unicode (CDF { cdf_multiplicity = ann }) = case ann of
-  HsUnannotated _ -> empty
-  HsLinearAnn _ -> text "%1"
-  HsExplicitMult _ mult -> multAnnotation <> ppr_mono_lty mult unicode
+ppRecFieldMultAnn unicode (CDF { cdf_multiplicity = ann }) = case arr of
+  HsStandardArr _ -> ppr_modifiers mods unicode
+  HsLinearArr _ -> text "%1" <+> ppr_modifiers mods unicode
+  where HsModifiedFunArr _ mods arr = ann
 
 -- | Pretty-print a bundled pattern synonym
 ppSideBySidePat
@@ -1183,7 +1185,7 @@ ppContextNoLocsMaybe cxt unicode = Just $ pp_hs_context cxt unicode
 ppContextNoArrow :: HsContext DocNameI -> Bool -> LaTeX
 ppContextNoArrow cxt unicode =
   Maybe.fromMaybe empty $
-    ppContextNoLocsMaybe (map unLoc cxt) unicode
+    ppContextNoLocsMaybe (map unLoc (hsc_ctxt cxt)) unicode
 
 ppContextNoLocs :: [HsType DocNameI] -> Bool -> LaTeX
 ppContextNoLocs cxt unicode =
@@ -1191,7 +1193,7 @@ ppContextNoLocs cxt unicode =
     ppContextNoLocsMaybe cxt unicode
 
 ppContext :: HsContext DocNameI -> Bool -> LaTeX
-ppContext cxt unicode = ppContextNoLocs (map unLoc cxt) unicode
+ppContext cxt unicode = ppContextNoLocs (map unLoc (hsc_ctxt cxt)) unicode
 
 pp_hs_context :: [HsType DocNameI] -> Bool -> LaTeX
 pp_hs_context [] _ = empty
@@ -1315,16 +1317,15 @@ ppr_mono_ty (HsQualTy _ ctxt ty) unicode =
     [ ppLContext (Just ctxt) unicode
     , ppr_mono_lty ty unicode
     ]
-ppr_mono_ty (HsFunTy _ mult ty1 ty2) u =
+ppr_mono_ty (HsFunTy _ (HsModifiedFunArr _ mods arr) ty1 ty2) u =
   sep
     [ ppr_mono_lty ty1 u
-    , arr <+> ppr_mono_lty ty2 u
+    , ppr_modifiers mods u <+> arr' <+> ppr_mono_lty ty2 u
     ]
   where
-    arr = case mult of
-      HsLinearAnn _ -> lollipop u
-      HsUnannotated _ -> arrow u
-      HsExplicitMult _ m -> multAnnotation <> ppr_mono_lty m u <+> arrow u
+    arr' = case arr of
+      HsStandardArr _ -> arrow u
+      HsLinearArr _ -> lollipop u
 ppr_mono_ty (HsTyVar _ NotPromoted (L _ name)) _ = ppDocName name
 ppr_mono_ty (HsTyVar _ IsPromoted (L _ name)) _ = char '\'' <> ppDocName name
 ppr_mono_ty (HsTupleTy _ con tys) u = tupleParens con (map (ppLType u) tys)
@@ -1344,17 +1345,15 @@ ppr_mono_ty (HsAppTy _ fun_ty arg_ty) unicode =
   hsep [ppr_mono_lty fun_ty unicode, ppr_mono_lty arg_ty unicode]
 ppr_mono_ty (HsAppKindTy _ fun_ty arg_ki) unicode =
   hsep [ppr_mono_lty fun_ty unicode, atSign <> ppr_mono_lty arg_ki unicode]
-ppr_mono_ty (HsOpTy _ prom ty1 op ty2) unicode =
-  ppr_mono_lty ty1 unicode <+> ppr_op_prom <+> ppr_mono_lty ty2 unicode
+ppr_mono_ty (HsOpTy _ ty1 tyop ty2) unicode
+  | Just pp_op <- ppr_infix_ty tyop
+  = pp_ty1 <+> pp_op <+> pp_ty2
+  | otherwise  -- This shouldn't happen unless the user constructs weird ASTs via the GHC API
+  = let pp_op = ppr_mono_lty tyop unicode
+    in hsep [hsep [pp_op, pp_ty1], pp_ty2]
   where
-    ppr_op_prom
-      | isPromoted prom =
-          char '\'' <> ppr_op
-      | otherwise =
-          ppr_op
-    ppr_op
-      | isSymOcc (getOccName op) = ppLDocName op
-      | otherwise = char '`' <> ppLDocName op <> char '`'
+    pp_ty1 = ppr_mono_lty ty1 unicode
+    pp_ty2 = ppr_mono_lty ty2 unicode
 ppr_mono_ty (HsParTy _ ty) unicode =
   parens (ppr_mono_lty ty unicode)
 --  = ppr_mono_lty ty unicode
@@ -1363,16 +1362,36 @@ ppr_mono_ty (HsDocTy _ ty _) unicode =
   ppr_mono_lty ty unicode
 ppr_mono_ty (HsWildCardTy _) _ = char '_'
 ppr_mono_ty (HsTyLit _ t) u = ppr_tylit t u
-ppr_mono_ty (HsStarTy _ isUni) unicode = starSymbol (isUni || unicode)
+ppr_mono_ty (HsStarTy _) unicode = starSymbol unicode
 ppr_mono_ty (XHsType HsRedacted{}) _ = error "ppr_mono_ty: HsRedacted can't be used here"
 
-ppr_tylit :: HsTyLit DocNameI -> Bool -> LaTeX
-ppr_tylit (HsNumTy _ n) _ = integer n
-ppr_tylit (HsStrTy _ s) _ = text (show s)
-ppr_tylit (HsCharTy _ c) _ = text (show c)
+ppr_infix_ty :: LHsType DocNameI -> Maybe LaTeX
+ppr_infix_ty (L _ (HsTyVar _ prom op)) = Just pp_op_prom
+  where
+    pp_op_prom
+      | isPromoted prom = char '\'' <> pp_op
+      | otherwise = pp_op
+    pp_op
+      | isSymOcc (getOccName op) = ppLDocName op
+      | otherwise = char '`' <> ppLDocName op <> char '`'
+ppr_infix_ty (L _ (HsWildCardTy _)) = Just (text "`_`")
+ppr_infix_ty _ = Nothing
+
+ppr_tylit :: HsLit DocNameI -> Bool -> LaTeX
+ppr_tylit (HsNatural _ n) _ = integer (il_value n)
+ppr_tylit (HsString  _ s) _ = text (show (unpackHText s))
+ppr_tylit (HsChar    _ c) _ = text (show c)
+ppr_tylit _               _ = error "ppr_tylit: unsupported lit"
 
 -- XXX: Ok in verbatim, but not otherwise
 -- XXX: Do something with Unicode parameter?
+
+ppr_modifiers :: [LHsModifier DocNameI] -> Bool -> LaTeX
+ppr_modifiers mods unicode = foldr ((<+>) . ppr_modifier) empty mods
+  where
+    ppr_modifier (L _ (HsModifier ModifierPrintsAs1 _)) = multAnnotation <> char '1'
+    ppr_modifier (L _ (HsModifier ModifierPrintsAsSelf ty)) =
+      multAnnotation <> ppr_mono_lty ty unicode
 
 -------------------------------------------------------------------------------
 
@@ -1454,7 +1473,7 @@ latexMarkup =
   Markup
     { markupParagraph = \p v -> blockElem (p v (text "\\par"))
     , markupEmpty = \_ -> id
-    , markupString = \s v -> inlineElem (text (fixString v s))
+    , markupString = \s v -> inlineElem (text (fixString v (T.unpack s)))
     , markupAppend = \l r v -> l v . r v
     , markupIdentifier = \i v -> inlineElem (markupId v (fmap occName i))
     , markupIdentifierUnchecked = \i v -> inlineElem (markupId v (fmap snd i))
@@ -1464,7 +1483,7 @@ latexMarkup =
             Just lbl -> inlineElem . tt $ lbl v empty
             Nothing ->
               inlineElem
-                ( let (mdl, _ref) = break (== '#') m
+                ( let (mdl, _ref) = break (== '#') (T.unpack m)
                    in (tt (text mdl))
                 )
     , markupWarning = \p v -> p v
@@ -1473,15 +1492,15 @@ latexMarkup =
     , markupMonospaced = \p v -> inlineElem (markupMonospace p v)
     , markupUnorderedList = \p v -> blockElem (itemizedList (map (\p' -> p' v empty) p))
     , markupPic = \p _ -> inlineElem (markupPic p)
-    , markupMathInline = \p _ -> inlineElem (markupMathInline p)
-    , markupMathDisplay = \p _ -> blockElem (markupMathDisplay p)
+    , markupMathInline = \p _ -> inlineElem (markupMathInline (T.unpack p))
+    , markupMathDisplay = \p _ -> blockElem (markupMathDisplay (T.unpack p))
     , markupOrderedList = \p v -> blockElem (enumeratedList (map (\(_, p') -> p' v empty) p))
     , markupDefList = \l v -> blockElem (descriptionList (map (\(a, b) -> (a v empty, b v empty)) l))
     , markupCodeBlock = \p _ -> blockElem (quote (verb (p Verb empty)))
-    , markupHyperlink = \(Hyperlink u l) v -> inlineElem (markupLink u (fmap (\x -> x v empty) l))
+    , markupHyperlink = \(Hyperlink u l) v -> inlineElem (markupLink (T.unpack u) (fmap (\x -> x v empty) l))
     , markupAName = \_ _ -> id -- TODO
-    , markupProperty = \p _ -> blockElem (quote (verb (text p)))
-    , markupExample = \e _ -> blockElem (quote (verb (text $ unlines $ map exampleToString e)))
+    , markupProperty = \p _ -> blockElem (quote (verb (text (T.unpack p))))
+    , markupExample = \e _ -> blockElem (quote (verb (text $ unlines $ map (T.unpack . exampleToString) e)))
     , markupHeader = \(Header l h) p -> blockElem (header l (h p empty))
     , markupTable = \(Table h b) p -> blockElem (table h b p)
     }
@@ -1515,9 +1534,9 @@ latexMarkup =
     markupPic (Picture uri title) = parens (imageText title)
       where
         imageText Nothing = beg
-        imageText (Just t) = beg <> text " " <> text t
+        imageText (Just t) = beg <> text " " <> text (T.unpack t)
 
-        beg = text "image: " <> text uri
+        beg = text "image: " <> text (T.unpack uri)
 
     markupMathInline mathjax = text "\\(" <> text mathjax <> text "\\)"
 
@@ -1525,11 +1544,11 @@ latexMarkup =
 
     markupId v wrappedOcc =
       case v of
-        Verb -> text i
-        Mono -> text "\\haddockid" <> braces (text . latexMonoFilter $ i)
-        Plain -> text "\\haddockid" <> braces (text . latexFilter $ i)
+        Verb -> text (T.unpack i)
+        Mono -> text "\\haddockid" <> braces (text . latexMonoFilter $ T.unpack i)
+        Plain -> text "\\haddockid" <> braces (text . latexFilter $ T.unpack i)
       where
-        i = showWrapped occNameString wrappedOcc
+        i = showWrapped (T.pack . occNameString) wrappedOcc
 
 docToLaTeX :: Doc DocName -> LaTeX
 docToLaTeX doc = markup latexMarkup doc Plain empty
@@ -1550,10 +1569,10 @@ data StringContext
 
 latexStripTrailingWhitespace :: Doc a -> Doc a
 latexStripTrailingWhitespace (DocString s)
-  | null s' = DocEmpty
-  | otherwise = DocString s
+  | T.null s' = DocEmpty
+  | otherwise = DocString s'
   where
-    s' = reverse (dropWhile isSpace (reverse s))
+    s' = T.dropWhileEnd isSpace s
 latexStripTrailingWhitespace (DocAppend l r)
   | DocEmpty <- r' = latexStripTrailingWhitespace l
   | otherwise = DocAppend l r'

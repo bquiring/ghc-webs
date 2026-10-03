@@ -7,6 +7,7 @@
 #
 import sys
 import os
+from datetime import datetime, timezone
 
 # Support for :base-ref:, etc.
 sys.path.insert(0, os.path.abspath('.'))
@@ -16,8 +17,7 @@ import ghc_config
 extensions = ['sphinx.ext.extlinks',
               'sphinx.ext.mathjax',
               # GHC-specific extensions
-              'flags',
-              'ghc_packages']
+              'flags']
 
 templates_path = ['.templates']
 source_suffix = '.rst'
@@ -35,8 +35,6 @@ nitpick_ignore = [
     ("envvar", "TMPDIR"),
 
     ("c:type", "bool"),
-
-    ("extension", "RelaxedPolyRec"),
 ]
 
 rst_prolog = """
@@ -46,7 +44,7 @@ rst_prolog = """
 
 # General information about the project.
 project = u'Glasgow Haskell Compiler'
-copyright = u'2023, GHC Team'
+copyright = "{}, GHC Team".format(datetime.now(timezone.utc).year)
 # N.B. version comes from ghc_config
 release = version  # The full version, including alpha/beta/rc tags.
 

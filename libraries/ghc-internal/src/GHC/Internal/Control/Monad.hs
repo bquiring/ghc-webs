@@ -71,19 +71,24 @@ module GHC.Internal.Control.Monad
 
     , ap
 
+    , thenM
+
     -- ** Strict monadic functions
 
     , (<$!>)
     ) where
 
+import GHC.Internal.Base hiding( mapM, sequence )
 import GHC.Internal.Control.Monad.Fail ( MonadFail(fail) )
 import GHC.Internal.Data.Foldable ( Foldable, sequence_, sequenceA_, msum, mapM_, foldlM, forM_ )
 import GHC.Internal.Data.Functor ( void, (<$>) )
 import GHC.Internal.Data.Traversable ( forM, mapM, traverse, sequence, sequenceA )
 
-import GHC.Internal.Base hiding ( mapM, sequence )
 import GHC.Internal.List ( zipWith, unzip )
+import GHC.Internal.Maybe ( Maybe )
 import GHC.Internal.Num  ( (-) )
+import GHC.Internal.Prim ( seq )
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 -- $setup
 -- >>> import Prelude
@@ -312,7 +317,7 @@ Core: https://gitlab.haskell.org/ghc/ghc/issues/11795#note_118976
 -- | @'replicateM' n act@ performs the action @act@ @n@ times,
 -- and then returns the list of results.
 --
--- @replicateM n (pure x) == 'replicate' n x@
+-- @replicateM n (pure x) == pure ('replicate' n x)@
 --
 -- ==== __Examples__
 --

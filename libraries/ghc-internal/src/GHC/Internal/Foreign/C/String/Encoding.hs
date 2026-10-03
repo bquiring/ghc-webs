@@ -39,6 +39,8 @@ module GHC.Internal.Foreign.C.String.Encoding (
     charIsRepresentable,
   ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base
 import GHC.Internal.Foreign.Marshal.Array
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.Ptr
@@ -56,9 +58,10 @@ import GHC.Internal.Foreign.Marshal.Alloc
 import GHC.Internal.Foreign.ForeignPtr
 
 import GHC.Internal.Debug
+import GHC.Internal.Err (undefined)
 import GHC.Internal.List
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num
-import GHC.Internal.Base
 
 import GHC.Internal.IO
 import GHC.Internal.IO.Exception

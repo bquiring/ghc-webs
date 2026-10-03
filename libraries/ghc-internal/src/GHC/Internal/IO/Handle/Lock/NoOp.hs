@@ -2,6 +2,7 @@
 
 module GHC.Internal.IO.Handle.Lock.NoOp where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
 import GHC.Internal.Base
 import GHC.Internal.IO (throwIO)
 import GHC.Internal.IO.Handle.Lock.Common

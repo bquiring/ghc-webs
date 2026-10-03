@@ -1,5 +1,4 @@
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module GHC.StgToJS.FFI
@@ -30,13 +29,14 @@ import GHC.Types.Unique.Map
 import GHC.Stg.Syntax
 
 import GHC.Builtin.PrimOps
-import GHC.Builtin.Types.Prim
+import GHC.Builtin.WiredIn.Prim
 
 import GHC.Core.Type hiding (typeSize)
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable (renderWithContext, defaultSDocContext, ppr)
 import GHC.Data.FastString
+import Language.Haskell.Syntax.Text
 
 import Data.Char
 import Data.Monoid
@@ -44,7 +44,7 @@ import qualified Data.List as L
 
 genPrimCall :: ExprCtx -> PrimCall -> [StgArg] -> Type -> G (JStgStat, ExprResult)
 genPrimCall ctx (PrimCall lbl _) args t = do
-  j <- parseFFIPattern False False False (unpackFS hdStr ++ unpackFS lbl) t (concatMap typex_expr $ ctxTarget ctx) args
+  j <- parseFFIPattern False False False (unpackFS hdStr ++ unpackHText lbl) t (concatMap typex_expr $ ctxTarget ctx) args
   return (j, ExprInline)
 
 -- | generate the actual call
@@ -182,33 +182,34 @@ genForeignCall :: HasDebugCallStack
                -> [StgArg]
                -> G (JStgStat, ExprResult)
 genForeignCall _ctx
-               (CCall (CCallSpec (StaticTarget _ tgt Nothing True)
+               (CCall (CCallSpec (StaticTarget ext tgt ForeignFunction)
                                    JavaScriptCallConv
                                    PlayRisky))
                _t
                [obj]
                args
-  | tgt == hdBuildObjectStr
-  , Just pairs <- getObjectKeyValuePairs args = do
+  | tgt == fastStringToShortText hdBuildObjectStr
+  , Just pairs <- getObjectKeyValuePairs args
+  , TargetIsInThisUnit <- staticTargetUnit ext = do
       pairs' <- mapM (\(k,v) -> genArg v >>= \vs -> return (k, head vs)) pairs
       return ( (|=) obj (ValExpr (JHash $ listToUniqMap pairs'))
              , ExprInline
              )
 
 genForeignCall ctx (CCall (CCallSpec ccTarget cconv safety)) t tgt args = do
-  emitForeign (ctxSrcSpan ctx) lbl safety cconv (map showArgType args) (showType t)
-  (,exprResult) <$> parseFFIPattern catchExcep async isJsCc (unpackFS lbl) t tgt' args
+  emitForeign (ctxSrcSpan ctx) (mkFastStringShortText lbl) safety cconv (map showArgType args) (showType t)
+  (,exprResult) <$> parseFFIPattern catchExcep async isJsCc (unpackHText lbl) t tgt' args
   where
     isJsCc = cconv == JavaScriptCallConv
 
-    lbl | (StaticTarget _ clbl _mpkg _isFunPtr) <- ccTarget
-            = let clbl'    = unpackFS clbl
+    lbl | (StaticTarget _ clbl _isFunPtr) <- ccTarget
+            = let clbl'    = unpackHText clbl
                   hDollarS = unpackFS hdStr
               in  if | isJsCc -> clbl
                      | wrapperPrefix `L.isPrefixOf` clbl' ->
-                         mkFastString (hDollarS ++ (drop 2 $ dropWhile isDigit $ drop (length wrapperPrefix) clbl'))
-                     | otherwise -> mkFastString $ hDollarS ++ clbl'
-        | otherwise = hdCallDynamicStr
+                         packHText (hDollarS ++ (drop 2 $ dropWhile isDigit $ drop (length wrapperPrefix) clbl'))
+                     | otherwise -> packHText (hDollarS ++ clbl')
+        | otherwise = fastStringToShortText hdCallDynamicStr
 
     exprResult | async     = ExprCont
                | otherwise = ExprInline

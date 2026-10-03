@@ -28,6 +28,7 @@ import GHC.Internal.Num
 import GHC.Internal.IO.Device as IODevice
 import GHC.Internal.IO.Device as RawIO
 import GHC.Internal.IO.Buffer
+import GHC.Internal.Maybe (Maybe(..))
 
 -- | The purpose of 'BufferedIO' is to provide a common interface for I/O
 -- devices that can read and write data through a buffer.  Devices that

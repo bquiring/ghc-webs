@@ -1,8 +1,4 @@
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
@@ -21,6 +17,21 @@ module GHC.Hs.Instances where
 
 -- UndecidableInstances ?
 
+{- Note [Data.Data instances for GHC AST Types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We give all of the frontend types and their instantiations (HsSyn) and
+some other types Data.Data instances. There are two main motivations to
+do so:
+
+* For users of the GHC API it allows to write Generic code over the GHC AST.
+* GHC itself has a few uses of these as well:
+    * In the showAstData, showAstDataFull helpers to print a representation of
+      the actual AST using it's constructors rather than just user facing pretty printing.
+    * It's used to some degree for HIE file generation in the ToHIE instances.
+    * TH serialization uses it for serialization of Annotations (GHC.Serialized)
+    * Some of the dump flags use showAstData to produce the actual dump output.
+-}
+
 import Data.Data hiding ( Fixity )
 
 import GHC.Prelude
@@ -33,9 +44,16 @@ import GHC.Hs.Type
 import GHC.Hs.Pat
 import GHC.Hs.ImpExp
 import GHC.Parser.Annotation
-import GHC.Types.Name.Reader (WithUserRdr(..))
+import GHC.Types.Name.Reader (WithUserRdr(..) )
+import GHC.Types.InlinePragma (ActivationGhc)
+import GHC.Utils.Misc (abstractConstr)
 import GHC.Data.BooleanFormula (BooleanFormula(..))
+import Language.Haskell.Syntax.Decls
+import Language.Haskell.Syntax.Decls.Foreign (CType(..), Header(..))
+import Language.Haskell.Syntax.Decls.Overlap (OverlapMode(..))
 import Language.Haskell.Syntax.Extension (Anno)
+import Language.Haskell.Syntax.Binds.InlinePragma (ActivationX(..), InlinePragma(..))
+import GHC.Tc.Types.ErrCtxt
 
 -- ---------------------------------------------------------------------
 -- Data derivations from GHC.Hs-----------------------------------------
@@ -55,16 +73,23 @@ deriving instance Data (HsValBindsLR GhcPs GhcRn)
 deriving instance Data (HsValBindsLR GhcRn GhcRn)
 deriving instance Data (HsValBindsLR GhcTc GhcTc)
 
+deriving instance Data (ValBind GhcPs GhcPs)
+deriving instance Data (ValBind GhcPs GhcRn)
+deriving instance Data (ValBind GhcRn GhcRn)
+deriving instance Data (ValBind GhcTc GhcTc)
+
 -- deriving instance (DataIdLR pL pL) => Data (NHsValBindsLR pL)
-deriving instance Data (NHsValBindsLR GhcPs)
-deriving instance Data (NHsValBindsLR GhcRn)
-deriving instance Data (NHsValBindsLR GhcTc)
+deriving instance Data (HsValBindGroups 'Parsed)
+deriving instance Data (HsValBindGroups 'Renamed)
+deriving instance Data (HsValBindGroups 'Typechecked)
 
 -- deriving instance (DataIdLR pL pR) => Data (HsBindLR pL pR)
 deriving instance Data (HsBindLR GhcPs GhcPs)
 deriving instance Data (HsBindLR GhcPs GhcRn)
 deriving instance Data (HsBindLR GhcRn GhcRn)
 deriving instance Data (HsBindLR GhcTc GhcTc)
+
+deriving instance Data XPatBindTc
 
 deriving instance Data AbsBinds
 
@@ -144,6 +169,10 @@ deriving instance Data (TyClGroup GhcPs)
 deriving instance Data (TyClGroup GhcRn)
 deriving instance Data (TyClGroup GhcTc)
 
+deriving instance Data (HsNestedGroup GhcPs)
+deriving instance Data (HsNestedGroup GhcRn)
+deriving instance Data (HsNestedGroup GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (FamilyResultSig p)
 deriving instance Data (FamilyResultSig GhcPs)
 deriving instance Data (FamilyResultSig GhcRn)
@@ -183,6 +212,11 @@ deriving instance Data (DerivClauseTys GhcTc)
 deriving instance Data (ConDecl GhcPs)
 deriving instance Data (ConDecl GhcRn)
 deriving instance Data (ConDecl GhcTc)
+
+-- HsConDetails instances
+deriving instance (Data arg, Data rec) => Data (HsConDetails GhcPs arg rec)
+deriving instance (Data arg, Data rec) => Data (HsConDetails GhcRn arg rec)
+deriving instance (Data arg, Data rec) => Data (HsConDetails GhcTc arg rec)
 
 -- deriving instance DataIdLR p p => Data (HsConDeclGADTDetails p)
 deriving instance Data (HsConDeclGADTDetails GhcPs)
@@ -244,6 +278,26 @@ deriving instance Data (ForeignExport GhcPs)
 deriving instance Data (ForeignExport GhcRn)
 deriving instance Data (ForeignExport GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (CImportSpec p)
+deriving instance Data (CImportSpec GhcPs)
+deriving instance Data (CImportSpec GhcRn)
+deriving instance Data (CImportSpec GhcTc)
+
+-- deriving instance (DataIdLR p p) => Data (CCallTarget p)
+deriving instance Data (CCallTarget GhcPs)
+deriving instance Data (CCallTarget GhcRn)
+deriving instance Data (CCallTarget GhcTc)
+
+-- deriving instance (DataIdLR p p) => Data (CType p)
+deriving instance Data (CType GhcPs)
+deriving instance Data (CType GhcRn)
+deriving instance Data (CType GhcTc)
+
+-- deriving instance (DataIdLR p p) => Data (Header p)
+deriving instance Data (Header GhcPs)
+deriving instance Data (Header GhcRn)
+deriving instance Data (Header GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (RuleDecls p)
 deriving instance Data (RuleDecls GhcPs)
 deriving instance Data (RuleDecls GhcRn)
@@ -275,6 +329,14 @@ deriving instance Data (WarnDecls GhcTc)
 deriving instance Data (WarnDecl GhcPs)
 deriving instance Data (WarnDecl GhcRn)
 deriving instance Data (WarnDecl GhcTc)
+
+deriving instance Data (WarningTxt GhcPs)
+deriving instance Data (WarningTxt GhcRn)
+deriving instance Data (WarningTxt GhcTc)
+
+deriving instance Data (InWarningCategory GhcPs)
+deriving instance Data (InWarningCategory GhcRn)
+deriving instance Data (InWarningCategory GhcTc)
 
 -- deriving instance (DataIdLR p p) => Data (AnnDecl p)
 deriving instance Data (AnnProvenance GhcPs)
@@ -457,8 +519,32 @@ deriving instance Data (HsOverLit GhcPs)
 deriving instance Data (HsOverLit GhcRn)
 deriving instance Data (HsOverLit GhcTc)
 
+deriving instance Data (OverLitVal GhcPs)
+deriving instance Data (OverLitVal GhcRn)
+deriving instance Data (OverLitVal GhcTc)
+
 deriving instance Data OverLitRn
 deriving instance Data OverLitTc
+
+deriving instance Data (HsQualLit GhcPs)
+deriving instance Data (HsQualLit GhcRn)
+deriving instance Data (HsQualLit GhcTc)
+
+deriving instance Data (QualLitVal GhcPs)
+deriving instance Data (QualLitVal GhcRn)
+deriving instance Data (QualLitVal GhcTc)
+
+deriving instance Data (FractionalLit GhcPs)
+deriving instance Data (FractionalLit GhcRn)
+deriving instance Data (FractionalLit GhcTc)
+
+deriving instance Data (IntegralLit GhcPs)
+deriving instance Data (IntegralLit GhcRn)
+deriving instance Data (IntegralLit GhcTc)
+
+deriving instance Data (StringLiteral GhcPs)
+deriving instance Data (StringLiteral GhcRn)
+deriving instance Data (StringLiteral GhcTc)
 
 -- ---------------------------------------------------------------------
 -- Data derivations from GHC.Hs.Pat ------------------------------------
@@ -478,6 +564,24 @@ deriving instance (Data body) => Data (HsRecFields GhcTc body)
 
 -- ---------------------------------------------------------------------
 -- Data derivations from GHC.Hs.Type ----------------------------------
+
+-- deriving instance Data (HsModifierOf ty p)
+deriving instance Data ModifierPrintsAs
+deriving instance Data (HsModifierOf (LocatedA (HsType GhcPs)) GhcPs)
+deriving instance Data (HsModifierOf (LocatedA (HsType GhcRn)) GhcRn)
+deriving instance Data (HsModifierOf (LocatedA (HsType GhcRn)) GhcTc)
+deriving instance Data (HsModifierOf (LocatedA (HsExpr GhcPs)) GhcPs)
+deriving instance Data (HsModifierOf (LocatedA (HsExpr GhcRn)) GhcRn)
+deriving instance Data (HsModifierOf (LocatedA (HsExpr GhcTc)) GhcTc)
+
+-- deriving instance Data (HsContext p)
+deriving instance Data (HsContextDetails GhcPs (LocatedA (HsType GhcPs)))
+deriving instance Data (HsContextDetails GhcRn (LocatedA (HsType GhcRn)))
+deriving instance Data (HsContextDetails GhcTc (LocatedA (HsType GhcTc)))
+
+deriving instance Data (HsContextDetails GhcPs (LocatedA (HsExpr GhcPs)))
+deriving instance Data (HsContextDetails GhcRn (LocatedA (HsExpr GhcRn)))
+deriving instance Data (HsContextDetails GhcTc (LocatedA (HsExpr GhcTc)))
 
 -- deriving instance Data (HsBndrVis p)
 deriving instance Data (HsBndrVis GhcPs)
@@ -519,6 +623,11 @@ deriving instance Data (HsForAllTelescope GhcPs)
 deriving instance Data (HsForAllTelescope GhcRn)
 deriving instance Data (HsForAllTelescope GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (HsGadtTelescope p)
+deriving instance Data (HsGadtTelescope GhcPs)
+deriving instance Data (HsGadtTelescope GhcRn)
+deriving instance Data (HsGadtTelescope GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (HsTyVarBndr p)
 deriving instance (Data flag) => Data (HsTyVarBndr flag GhcPs)
 deriving instance (Data flag) => Data (HsTyVarBndr flag GhcRn)
@@ -541,18 +650,18 @@ deriving instance Data (HsType GhcTc)
 
 deriving instance Data HsTypeGhcPsExt
 
--- deriving instance (DataIdLR p p) => Data (HsTyLit p)
-deriving instance Data (HsTyLit GhcPs)
-deriving instance Data (HsTyLit GhcRn)
-deriving instance Data (HsTyLit GhcTc)
+-- deriving instance (DataIdLR p p) => Data (HsFunArr p)
+deriving instance Data (HsFunArr GhcPs)
+deriving instance Data (HsFunArr GhcRn)
+deriving instance Data (HsFunArr GhcTc)
 
--- deriving instance (Data mult, DataIdLR p p) => Data (HsMultAnnOf mult p)
-deriving instance Data (HsMultAnnOf (LocatedA (HsType GhcPs)) GhcPs)
-deriving instance Data (HsMultAnnOf (LocatedA (HsType GhcRn)) GhcRn)
-deriving instance Data (HsMultAnnOf (LocatedA (HsType GhcRn)) GhcTc)
-deriving instance Data (HsMultAnnOf (LocatedA (HsExpr GhcPs)) GhcPs)
-deriving instance Data (HsMultAnnOf (LocatedA (HsExpr GhcRn)) GhcRn)
-deriving instance Data (HsMultAnnOf (LocatedA (HsExpr GhcTc)) GhcTc)
+-- deriving instance (Data mult, DataIdLR p p) => Data (HsModifiedFunArrOf mult p)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsType GhcPs)) GhcPs)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsType GhcRn)) GhcRn)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsType GhcRn)) GhcTc)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsExpr GhcPs)) GhcPs)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsExpr GhcRn)) GhcRn)
+deriving instance Data (HsModifiedFunArrOf (LocatedA (HsExpr GhcTc)) GhcTc)
 
 -- deriving instance (Data a, Data b) => Data (HsArg p a b)
 deriving instance (Data a, Data b) => Data (HsArg GhcPs a b)
@@ -579,6 +688,26 @@ deriving instance Data (ImportDecl GhcPs)
 deriving instance Data (ImportDecl GhcRn)
 deriving instance Data (ImportDecl GhcTc)
 
+-- deriving instance Data (IEThingAllExt p)
+deriving instance Data (IEThingAllExt GhcPs)
+deriving instance Data (IEThingAllExt GhcRn)
+deriving instance Data (IEThingAllExt GhcTc)
+
+-- deriving instance Eq (IEThingAllExt p)
+deriving instance Eq (IEThingAllExt GhcPs)
+deriving instance Eq (IEThingAllExt GhcRn)
+deriving instance Eq (IEThingAllExt GhcTc)
+
+-- deriving instance Data (IEWholeNamespaceExt p)
+deriving instance Data (IEWholeNamespaceExt GhcPs)
+deriving instance Data (IEWholeNamespaceExt GhcRn)
+deriving instance Data (IEWholeNamespaceExt GhcTc)
+
+-- deriving instance Eq (IEWholeNamespaceExt p)
+deriving instance Eq (IEWholeNamespaceExt GhcPs)
+deriving instance Eq (IEWholeNamespaceExt GhcRn)
+deriving instance Eq (IEWholeNamespaceExt GhcTc)
+
 -- deriving instance (DataId name)             => Data (IE name)
 deriving instance Data (IE GhcPs)
 deriving instance Data (IE GhcRn)
@@ -590,13 +719,21 @@ deriving instance Eq (IE GhcRn)
 deriving instance Eq (IE GhcTc)
 
 -- ---------------------------------------------------------------------
+instance Data HsCtxt where
+  gunfold _ _ _ = error "no gunfold for HsCtxt"
+  gfoldl _ k z = k z
+  toConstr _ = abstractConstr "HsCtxt"
+  dataTypeOf = error "no dataTypeOf for HsCtxt"
 
-deriving instance Data HsThingRn
 deriving instance Data XXExprGhcRn
+
+deriving instance Data (HsExpansion GhcRn)
+deriving instance Data (HsExpansion GhcTc)
+
 deriving instance Data a => Data (WithUserRdr a)
 
--- ---------------------------------------------------------------------
-
+-- -------------------------------
+--------------------------------------
 deriving instance Data XXExprGhcTc
 deriving instance Data XXPatGhcTc
 
@@ -608,3 +745,15 @@ deriving instance Data XViaStrategyPs
 
 deriving instance (Typeable p, Data (Anno (IdGhcP p)), Data (IdGhcP p)) => Data (BooleanFormula (GhcPass p))
 ---------------------------------------------------------------------
+
+deriving instance Data ActivationGhc
+
+-- deriving instance Data (InlinePragma p)
+deriving instance Data (InlinePragma GhcPs)
+deriving instance Data (InlinePragma GhcRn)
+deriving instance Data (InlinePragma GhcTc)
+
+-- deriving instance Data (OverlapMode p)
+deriving instance Data (OverlapMode GhcPs)
+deriving instance Data (OverlapMode GhcRn)
+deriving instance Data (OverlapMode GhcTc)

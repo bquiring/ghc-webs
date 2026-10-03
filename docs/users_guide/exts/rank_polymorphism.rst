@@ -12,14 +12,6 @@ Arbitrary-rank polymorphism
 
     Allow types of arbitrary rank.
 
-.. extension:: Rank2Types
-    :shortdesc: Enable rank-2 types.
-
-    :since: 6.8.1
-    :status: Deprecated
-
-    A deprecated alias of :extension:`RankNTypes`.
-
 GHC's type system supports *arbitrary-rank* explicit universal
 quantification in types. For example, all the following types are legal: ::
 
@@ -83,9 +75,24 @@ arguments. As the types of ``h1`` and ``k1`` are not allowed in Haskell-98, we a
 require users to enable :extension:`RankNTypes` to write them (which seems more
 sensible than inventing a separate extension just for this case).
 
-The obsolete language option :extension:`Rank2Types` is a synonym for
-:extension:`RankNTypes`. They used to specify finer distinctions that GHC no
-longer makes.
+The deprecated language options :extension:`Rank2Types` and
+:extension:`PolymorphicComponents` are synonyms for :extension:`RankNTypes`.
+They used to specify finer distinctions that GHC no longer makes.
+
+.. extension:: Rank2Types
+    :shortdesc: Enable rank-N types.
+
+    :since: 6.8.1
+    :status: Deprecated
+
+    A deprecated alias of :extension:`RankNTypes`.
+
+.. extension:: PolymorphicComponents
+    :shortdesc: Enable rank-N types.
+
+    :status: Deprecated
+
+    A deprecated alias of :extension:`RankNTypes`.
 
 .. _univ:
 
@@ -195,7 +202,7 @@ For example: ::
   g3c :: Int -> forall x y. y -> x -> x
 
   f4 :: (Int -> forall a. (Eq a, Show a) => a -> a) -> Bool
-  g4 ::  Int -> forall x. (Show x, Eq x) => x -> x) -> Bool
+  g4 ::  Int -> forall x. (Show x, Eq x) => x -> x
 
 Then the application ``f3 g3a`` is well-typed, because ``g3a`` has a type that matches the type
 expected by ``f3``.  But ``f3 g3b`` is not well typed, because the foralls are in different places.
@@ -206,8 +213,8 @@ These examples can be made to typecheck by eta-expansion. For example ``f3 (\x -
 is well typed, and similarly ``f3 (\x -> g3c x)`` and ``f4 (\x -> g4 x)``.
 
 A similar phenomenon occurs for operator sections. For example,
-``(\`g3a\` "hello")`` is not well typed, but it can be made to typecheck by eta
-expanding it to ``\x -> x \`g3a\` "hello"``.
+``(`g3a` "hello")`` is not well typed, but it can be made to typecheck by eta
+expanding it to ``\x -> x `g3a` "hello"``.
 
 .. extension:: DeepSubsumption
     :shortdesc: Use GHC's deep subsumption checking.

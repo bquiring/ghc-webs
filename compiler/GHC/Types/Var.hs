@@ -7,7 +7,6 @@
 
 {-# LANGUAGE MultiWayIf, PatternSynonyms #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-{-# LANGUAGE DeriveFunctor #-}
 
 -- |
 -- #name_types#
@@ -83,7 +82,7 @@ module GHC.Types.Var (
         -- * PiTyBinder
         PiTyBinder(..), PiTyVarBinder,
         isInvisiblePiTyBinder, isInvisibleAnonPiTyBinder,
-        isVisiblePiTyBinder,
+        isVisiblePiTyBinder, isRuntimePiTyBinder,
         isTyBinder, isNamedPiTyBinder, isAnonPiTyBinder,
         namedPiTyBinder_maybe, anonPiTyBinderType_maybe, piTyBinderType,
 
@@ -120,7 +119,7 @@ import {-# SOURCE #-}   GHC.Core.TyCo.Ppr( pprKind )
 import {-# SOURCE #-}   GHC.Tc.Utils.TcType( TcTyVarDetails, pprTcTyVarDetails, vanillaSkolemTvUnk )
 import {-# SOURCE #-}   GHC.Types.Id.Info( IdDetails, IdInfo, coVarDetails, isCoVarDetails,
                                            vanillaIdInfo, pprIdDetails )
-import {-# SOURCE #-}   GHC.Builtin.Types ( manyDataConTy )
+import {-# SOURCE #-}   GHC.Builtin.WiredIn.Types ( manyDataConTy )
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Unique ( Uniquable, Unique, getKey, getUnique
                         , nonDetCmpUnique )
@@ -130,7 +129,6 @@ import GHC.Utils.Binary
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
-import GHC.Hs.Specificity ()
 import Language.Haskell.Syntax.Specificity
 import Control.DeepSeq
 
@@ -177,7 +175,7 @@ type KindVar = Var     -- Definitely a kind variable
 
 -- See Note [Evidence: EvIds and CoVars]
 -- | Evidence Identifier
-type EvId   = Id        -- Term-level evidence: DictId, IpId, or EqVar
+type EvId   = Id        -- Term-level evidence: DictId, IpId, or CoVar
 
 -- | Evidence Variable
 type EvVar  = EvId      -- ...historical name for EvId
@@ -623,27 +621,27 @@ Note [Types for coercions, predicates, and evidence]
 VarBndr is polymorphic in both var and visibility fields.
 Currently there are nine different uses of 'VarBndr':
 
-* Var.ForAllTyBinder = VarBndr TyCoVar ForAllTyFlag
+* GHC.Types.Var.ForAllTyBinder = VarBndr TyCoVar ForAllTyFlag
   Binder of a forall-type; see ForAllTy in GHC.Core.TyCo.Rep
 
-* Var.TyVarBinder = VarBndr TyVar ForAllTyFlag
+* GHC.Types.Var.TyVarBinder = VarBndr TyVar ForAllTyFlag
   Subset of ForAllTyBinder when we are sure the binder is a TyVar
 
-* Var.InvisTVBinder = VarBndr TyVar Specificity
+* GHC.Types.Var.InvisTVBinder = VarBndr TyVar Specificity
   Specialised form of TyVarBinder, when ForAllTyFlag = Invisible s
   See GHC.Core.Type.splitForAllInvisTVBinders
 
-* Var.ReqTVBinder = VarBndr TyVar ()
+* GHC.Types.Var.ReqTVBinder = VarBndr TyVar ()
   Specialised form of TyVarBinder, when ForAllTyFlag = Required
   See GHC.Core.Type.splitForAllReqTVBinders
   This one is barely used
 
-* TyCon.TyConBinder = VarBndr TyVar TyConBndrVis
+* GHC.Core.TyCon.TyConBinder = VarBndr TyVar TyConBndrVis
   Binders of a TyCon; see TyCon in GHC.Core.TyCon
 
-* IfaceType.IfaceForAllBndr     = VarBndr IfaceBndr ForAllTyFlag
-* IfaceType.IfaceForAllSpecBndr = VarBndr IfaceBndr Specificity
-* IfaceType.IfaceTyConBinder    = VarBndr IfaceBndr TyConBndrVis
+* GHC.Iface.Type.IfaceForAllBndr     = VarBndr IfaceBndr ForAllTyFlag
+* GHC.Iface.Type.IfaceForAllSpecBndr = VarBndr IfaceBndr Specificity
+* GHC.Iface.Type.IfaceTyConBinder    = VarBndr IfaceBndr TyConBndrVis
 -}
 
 data VarBndr var argf = Bndr var argf
@@ -759,7 +757,12 @@ instance NamedThing tv => NamedThing (VarBndr tv flag) where
 -- not. See Note [PiTyBinders]
 data PiTyBinder
   = Named ForAllTyBinder          -- A type-lambda binder, with a ForAllTyFlag
-  | Anon (Scaled Type) FunTyFlag  -- A term-lambda binder. Type here can be CoercionTy.
+                                  -- Erased (not passed at runtime) if the binder is
+                                  -- a type variable; not erased if coercion variable
+
+  | Anon (Scaled Type) FunTyFlag  -- A term-lambda binder, passing a runtime value
+                                  -- The argument can be a constraint (incl dictionary)
+                                  --    or an ordinary value
                                   -- The arrow is described by the FunTyFlag
   deriving Data
 
@@ -794,6 +797,12 @@ namedPiTyBinder_maybe :: PiTyBinder -> Maybe TyCoVar
 namedPiTyBinder_maybe (Named tv) = Just $ binderVar tv
 namedPiTyBinder_maybe _          = Nothing
 
+isRuntimePiTyBinder :: PiTyBinder -> Bool
+isRuntimePiTyBinder (Anon {})            = True  -- Always passed at runtime
+isRuntimePiTyBinder (Named (Bndr tcv _)) = isCoVar tcv
+  -- isCoVar: see Note [Why ForAllTy can quantify over a coercion variable]
+  --          and Note [Unused coercion variable in ForAllTy], in GHC.Core.TyCo.Rep
+
 -- | Does this binder bind a variable that is /not/ erased? Returns
 -- 'True' for anonymous binders.
 isAnonPiTyBinder :: PiTyBinder -> Bool
@@ -819,7 +828,7 @@ piTyBinderType (Named (Bndr tv _)) = varType tv
 piTyBinderType (Anon ty _)         = scaledThing ty
 
 {- Note [PiTyBinders]
-~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
 But a type like
    forall a. Maybe a -> forall b. (a,b) -> b
 
@@ -832,14 +841,18 @@ argument to a Pi-type. GHC Core currently supports two different
 Pi-types:
 
  * Anon ty1 fun_flag: a non-dependent function type,
-   written with ->, e.g. ty1 -> ty2
-   represented as FunTy ty1 ty2. These are
-   lifted to Coercions with the corresponding FunCo.
+     written with ->, e.g. ty1 -> ty2
+     represented as FunTy ty1 ty2.
 
- * Named (Var tv forall_flag)
-    A dependent compile-time-only polytype,
-   written with forall, e.g.  forall (a:*). ty
-   represented as ForAllTy (Bndr a v) ty
+   See wrinkle (PIT1)
+
+   These are lifted to Coercions with the corresponding FunCo.
+
+ * Named (Var tcv forall_flag): a dependent polytype,
+     written with forall, e.g.  forall (a:*). ty
+     represented as ForAllTy (Bndr a v) ty
+
+   See wrinkle (PIT2)
 
 Both forms of Pi-types classify terms/types that take an argument. In other
 words, if `x` is either a function or a polytype, `x arg` makes sense
@@ -847,12 +860,16 @@ words, if `x` is either a function or a polytype, `x arg` makes sense
 
 Wrinkles
 
-* The Anon constructor of PiTyBinder contains a FunTyFlag.  Since
+(PIT1) The Anon constructor of PiTyBinder contains a FunTyFlag.  Since
   the PiTyBinder really only describes the /argument/ it should perhaps
   only have a TypeOrConstraint rather than a full FunTyFlag.  But it's
   very convenient to have the full FunTyFlag, say in mkPiTys, so that's
   what we do.
 
+(PIT2) The `tcv` in `Named (Var tcv forall_flag) is usually a type variable
+  but can exceptionally be a coercion variable: see
+  Note [Why ForAllTy can quantify over a coercion variable].
+  If it's a type variable it will be erased; if coercion variable it will not.
 
 Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

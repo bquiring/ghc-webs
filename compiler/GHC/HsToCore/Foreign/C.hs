@@ -32,6 +32,7 @@ import GHC.HsToCore.Types (ds_next_wrapper_num)
 import GHC.Hs
 
 import GHC.Types.Id
+import GHC.Types.InlinePragma ( ActivationX(NeverActive) )
 import GHC.Types.Literal
 import GHC.Types.ForeignStubs
 import GHC.Types.SourceText
@@ -48,9 +49,10 @@ import GHC.Driver.Config
 import GHC.Cmm.Expr
 import GHC.Cmm.Utils
 
-import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Prim
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs
 
 import GHC.Data.FastString
 
@@ -60,6 +62,7 @@ import GHC.Utils.Encoding
 
 import Data.Maybe
 import Data.List (nub)
+import Language.Haskell.Syntax.Text
 
 dsCFExport:: Id                 -- Either the exported Id,
                                 -- or the foreign-export-dynamic constructor
@@ -67,9 +70,9 @@ dsCFExport:: Id                 -- Either the exported Id,
                                 -- from C, and its representation type
           -> CLabelString       -- The name to export to C land
           -> CCallConv
-          -> Bool               -- True => foreign export dynamic
-                                --         so invoke IO action that's hanging off
-                                --         the first argument's stable pointer
+          -> ExportLinking      -- If foreign export is dynamic
+                                -- then invoke IO action that's hanging off
+                                -- the first argument's stable pointer
           -> DsM ( CHeader      -- contents of Module_stub.h
                  , CStub        -- contents of Module_stub.c
                  , String       -- string describing type to pass to createAdj.
@@ -82,8 +85,9 @@ dsCFExport fn_id co ext_name cconv isDyn = do
        fe_arg_tys'            = mapMaybe anonPiTyBinderType_maybe bndrs
        -- We must use tcSplits here, because we want to see
        -- the (IO t) in the corner of the type!
-       fe_arg_tys | isDyn     = tail fe_arg_tys'
-                  | otherwise = fe_arg_tys'
+       (fe_arg_tys, m_fn_id) = case isDyn of
+         ExportIsDynamic -> (tail fe_arg_tys', Nothing)
+         ExportIsStatic  -> (fe_arg_tys', Just fn_id)
 
        -- Look at the result type of the exported function, orig_res_ty
        -- If it's IO t, return         (t, True)
@@ -96,16 +100,14 @@ dsCFExport fn_id co ext_name cconv isDyn = do
 
     dflags <- getDynFlags
     return $
-      mkFExportCBits dflags ext_name
-                     (if isDyn then Nothing else Just fn_id)
-                     fe_arg_tys res_ty is_IO_res_ty cconv
+      mkFExportCBits dflags (mkFastStringShortText ext_name) m_fn_id fe_arg_tys res_ty is_IO_res_ty cconv
 
 dsCImport :: Id
           -> Coercion
-          -> CImportSpec
+          -> CImportSpec GhcTc
           -> CCallConv
           -> Safety
-          -> Maybe Header
+          -> Maybe (Header GhcTc)
           -> DsM ([Binding], CHeader, CStub)
 dsCImport id co (CLabel cid) _ _ _ = do
    let ty  = coercionLKind co
@@ -117,7 +119,7 @@ dsCImport id co (CLabel cid) _ _ _ = do
    (resTy, foRhs) <- resultWrapper ty
    assert (fromJust resTy `eqType` addrPrimTy) $    -- typechecker ensures this
     let
-        rhs = foRhs (Lit (LitLabel cid fod))
+        rhs = foRhs (Lit (LitLabel (mkFastStringShortText cid) fod))
         rhs' = Cast rhs co
     in
     return ([(id, rhs')], mempty, mempty)
@@ -171,19 +173,19 @@ dsCFExportDynamic :: Id
                  -> DsM ([Binding], CHeader, CStub)
 dsCFExportDynamic id co0 cconv = do
     mod <- getModule
-    let fe_nm = mkFastString $ zEncodeString
+    let fe_nm = packHText $ zEncodeString
             (moduleStableString mod ++ "$" ++ toCName id)
         -- Construct the label based on the passed id, don't use names
         -- depending on Unique. See #13807 and Note [Unique Determinism].
     cback <- newSysLocalDs scaled_arg_ty
-    newStablePtrId <- dsLookupGlobalId newStablePtrName
-    stable_ptr_tycon <- dsLookupTyCon stablePtrTyConName
+    newStablePtrId <- dsLookupKnownOccId newStablePtrIdOcc
+    stable_ptr_tycon <- dsLookupKnownKeyTyCon stablePtrTyConKey
     let
         stable_ptr_ty = mkTyConApp stable_ptr_tycon [arg_ty]
         export_ty     = mkVisFunTyMany stable_ptr_ty arg_ty
-    bindIOId <- dsLookupGlobalId bindIOName
+    bindIOId <- dsLookupKnownOccId bindIOIdOcc
     stbl_value <- newSysLocalMDs stable_ptr_ty
-    (h_code, c_code, typestring) <- dsCFExport id (mkRepReflCo export_ty) fe_nm cconv True
+    (h_code, c_code, typestring) <- dsCFExport id (mkRepReflCo export_ty) fe_nm cconv ExportIsDynamic
     let
          {-
           The arguments to the external function which will
@@ -193,12 +195,12 @@ dsCFExportDynamic id co0 cconv = do
           (ccall).
          -}
         adj_args      = [ Var stbl_value
-                        , Lit (LitLabel fe_nm IsFunction)
+                        , Lit (LitLabel (mkFastStringShortText fe_nm) IsFunction)
                         , Lit (mkLitString typestring)
                         ]
           -- name of external entry point providing these services.
           -- (probably in the RTS.)
-        adjustor   = fsLit "createAdjustor"
+        adjustor   = packHText "createAdjustor"
 
     ccall_adj <- dsCCall adjustor adj_args PlayRisky (mkTyConApp io_tc [res_ty])
         -- PlayRisky: the adjustor doesn't allocate in the Haskell heap or do a callback
@@ -228,7 +230,7 @@ dsCFExportDynamic id co0 cconv = do
 
 
 -- | Foreign calls
-dsFCall :: Id -> Coercion -> ForeignCall -> Maybe Header
+dsFCall :: Id -> Coercion -> ForeignCall -> Maybe (Header GhcTc)
         -> DsM ([(Id, Expr TyVar)], CHeader, CStub)
 dsFCall fn_id co fcall mDeclHeader = do
     let
@@ -240,7 +242,7 @@ dsFCall fn_id co fcall mDeclHeader = do
           | (_, res_ty1) <- tcSplitFunTys ty1
           , newty <- maybe res_ty1 snd (tcSplitIOType_maybe res_ty1)
           , Just (ptr, _) <- splitTyConApp_maybe newty
-          , tyConName ptr == constPtrConName
+          , tyConName ptr `hasKnownKey` constPtrTyConKey
           = text "const"
           | otherwise = empty
 
@@ -257,26 +259,26 @@ dsFCall fn_id co fcall mDeclHeader = do
 
     (fcall', cDoc) <-
               case fcall of
-              CCall (CCallSpec (StaticTarget _ cName mUnitId isFun)
+              CCall (CCallSpec (StaticTarget stExt cName targetKind)
                                CApiConv safety) ->
                do nextWrapperNum <- ds_next_wrapper_num <$> getGblEnv
-                  wrapperName <- mkWrapperName nextWrapperNum "ghc_wrapper" (unpackFS cName)
+                  wrapperName <- mkWrapperName nextWrapperNum "ghc_wrapper" (unpackHText cName)
                   let fcall' = CCall (CCallSpec
-                                      (StaticTarget NoSourceText
-                                                    wrapperName mUnitId
-                                                    True)
+                                      (StaticTarget (stExt { staticTargetLabel = NoSourceText} )
+                                                    (fastStringToShortText wrapperName)
+                                                    ForeignFunction)
                                       CApiConv safety)
                       c = includes
                        $$ fun_proto <+> braces (cRet <> semi)
-                      includes = vcat [ text "#include \"" <> ftext h
+                      includes = vcat [ text "#include \"" <> ftext (mkFastStringShortText h)
                                         <> text "\""
                                       | Header _ h <- nub headers ]
                       fun_proto = constQual <+> cResType <+> pprCconv <+> ppr wrapperName <> parens argTypes
                       cRet
-                       | isVoidRes =                   cCall
-                       | otherwise = text "return" <+> cCall
+                        | isVoidRes =                   cCall
+                        | otherwise = text "return" <+> cCall
                       cCall
-                        | isFun = ppr cName <> parens argVals
+                        | ForeignFunction <- targetKind = ppr cName <> parens argVals
                         | null arg_tys = ppr cName
                         | otherwise = panic "dsFCall: Unexpected arguments to FFI value import"
                       raw_res_ty = case tcSplitIOType_maybe io_res_ty of
@@ -328,37 +330,68 @@ dsFCall fn_id co fcall mDeclHeader = do
 toCName :: Id -> String
 toCName i = showSDocOneLine defaultSDocContext (pprCode (ppr (idName i)))
 
-toCType :: Type -> (Maybe Header, SDoc)
-toCType = f False
-    where f voidOK t
-           -- First, if we have (Ptr t) of (FunPtr t), then we need to
+{- Note [Collapsing void pointer chains]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When translating Haskell types like (Ptr (Ptr Abstract)) to C types for capi
+wrappers, where Abstract has no CType annotation, naively we would produce
+"void**". This is problematic because in C, only void* has implicit conversion
+to any pointer type.
+Modern compilers (gcc, clang) treat -Wincompatible-pointer-types as an error
+by default (#26852), causing compilation failures for capi wrappers.
+
+The fix is to collapse void pointer chains: whenever the inner type of a
+Ptr/FunPtr resolves to void (i.e. the Haskell type has no known C
+representation), we return void* instead of void**, void***, etc.
+This works because void* implicitly converts to any pointer type in C.
+
+Examples:
+  Ptr Abstract              => void*
+  Ptr (Ptr Abstract)        => void*   (used to be void**)
+  Ptr (Ptr (Ptr Abstract))  => void*
+  Ptr (Ptr CInt)            => int**   (CInt has CType "int", don't collapse)
+-}
+
+-- | See Note [Collapsing void pointer chains]
+toCType :: Type -> (Maybe (Header GhcTc), SDoc)
+toCType t = case f False t of
+              (mh, _, cType) -> (mh, cType)
+    where
+      -- The Bool in the return type indicates whether the C type is
+      -- "void" due to an unknown Haskell type (True = void-based).
+      f :: Bool -> Type -> (Maybe (Header GhcTc), Bool, SDoc)
+      f voidOK t
+           -- First, if we have (Ptr t) or (FunPtr t), then we need to
            -- convert t to a C type and put a * after it. If we don't
            -- know a type for t, then "void" is fine, though.
+           -- If the inner type is void-based, we collapse the pointer
+           -- chain to just "void*". See Note [Collapsing void pointer chains].
            | Just (ptr, [t']) <- splitTyConApp_maybe t
-           , tyConName ptr `elem` [ptrTyConName, funPtrTyConName]
+           , tyConUnique ptr `elem` [ptrTyConKey, funPtrTyConKey]
               = case f True t' of
-                (mh, cType') ->
-                    (mh, cType' <> char '*')
+                (mh, True, _) ->
+                    (mh, True, text "void*")
+                (mh, False, cType') ->
+                    (mh, False, cType' <> char '*')
            -- Otherwise, if we have a type constructor application, then
            -- see if there is a C type associated with that constructor.
            -- Note that we aren't looking through type synonyms or
            -- anything, as it may be the synonym that is annotated.
            | Just tycon <- tyConAppTyConPicky_maybe t
-           , Just (CType _ mHeader (_,cType)) <- tyConCType_maybe tycon
-              = (mHeader, ftext cType)
+           , Just (CType _ mHeader cType) <- tyConCType_maybe tycon
+              = (mHeader, False, ppr cType)
            -- If we don't know a C type for this type, then try looking
            -- through one layer of type synonym etc.
            | Just t' <- coreView t
               = f voidOK t'
-          -- Handle 'UnliftedFFITypes' argument
+           -- Handle 'UnliftedFFITypes' argument
            | Just tyCon <- tyConAppTyConPicky_maybe t
            , isPrimTyCon tyCon
            , Just cType <- ppPrimTyConStgType tyCon
-           = (Nothing, text cType)
+           = (Nothing, False, text cType)
 
            -- Otherwise we don't know the C type. If we are allowing
            -- void then return that; otherwise something has gone wrong.
-           | voidOK = (Nothing, text "void")
+           | voidOK = (Nothing, True, text "void")
            | otherwise
               = pprPanic "toCType" (ppr t)
 
@@ -517,8 +550,8 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
                 text "rts_apply" <> parens (
                     cap
                  <> (if is_IO_res_ty
-                      then text "runIO_closure"
-                      else text "runNonIO_closure")
+                      then text "ghc_hs_iface->runIO_closure"
+                      else text "ghc_hs_iface->runNonIO_closure")
                  <> comma
                  <> expr_to_run
                 ) <+> comma

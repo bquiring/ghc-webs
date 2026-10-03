@@ -10,11 +10,14 @@ module GHC.Internal.Event.Poll
     , available
     ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+
 #include "EventConfig.h"
 
 #if !defined(HAVE_POLL_H)
-import GHC.Internal.Base
 import qualified GHC.Internal.Event.Internal as E
+import GHC.Internal.Err (errorWithoutStackTrace)
+import GHC.Internal.Types (Bool(..), IO)
 
 new :: IO E.Backend
 new = errorWithoutStackTrace "Poll back end not implemented for this platform"
@@ -25,17 +28,19 @@ available = False
 #else
 #include <poll.h>
 
+import GHC.Internal.Base
 import GHC.Internal.Control.Concurrent.MVar (MVar, newMVar, swapMVar)
 import GHC.Internal.Data.Bits (Bits, FiniteBits, (.|.), (.&.))
+import GHC.Internal.Err (errorWithoutStackTrace, undefined)
 import GHC.Internal.Foreign.C.Types (CInt(..), CShort(..))
 import GHC.Internal.Foreign.Ptr (Ptr)
 import GHC.Internal.Foreign.Storable (Storable(..))
-import GHC.Internal.Base
 import GHC.Internal.Conc.Sync (withMVar)
 import GHC.Internal.Enum (maxBound)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Real (fromIntegral, div)
-import GHC.Internal.Show (Show)
+import GHC.Internal.Show
 import GHC.Internal.System.Posix.Types (Fd(..), CNfds(..))
 
 import qualified GHC.Internal.Event.Array as A

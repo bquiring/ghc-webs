@@ -1,6 +1,3 @@
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE LambdaCase #-}
-
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -29,14 +26,18 @@ import GHC.Tc.Instance.Class ( matchGlobalInst, ClsInstResult(..), AssocInstInfo
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Instance.Family
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.ErrCtxt
 import GHC.Tc.Types.Rank
 import GHC.Tc.Errors.Types
+import GHC.Tc.Types.Constraint ( userTypeError_maybe )
+import GHC.Tc.Utils.Env (tcLookupId)
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Zonk.TcType
 
-import GHC.Builtin.Types
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.Modules( gHC_CLASSES )
 import GHC.Builtin.Uniques  ( mkAlphaTyVarUnique )
 
 import GHC.Core.Type
@@ -60,6 +61,8 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.Error
 import GHC.Types.Basic   ( TypeOrKind(..), UnboxedTupleOrSum(..)
                          , unboxedTupleOrSumExtension )
+import GHC.Types.Id (isNaughtyRecordSelector)
+import GHC.Types.FieldLabel (flSelector)
 import GHC.Types.Name
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
@@ -69,15 +72,12 @@ import GHC.Types.SrcLoc
 import GHC.Types.TyThing ( TyThing(..) )
 import GHC.Types.Unique.Set( isEmptyUniqSet )
 
-import GHC.Utils.FV
 import GHC.Utils.Error
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
 import GHC.Data.List.SetOps
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Control.Monad
 import Data.Foldable
@@ -279,7 +279,12 @@ checkUserTypeError ctxt ty
   | TySynCtxt {} <- ctxt  -- Do not complain about TypeError on the
   = return ()             -- RHS of type synonyms. See #20181
 
-  | Just msg <- deepUserTypeError_maybe ty
+  | Just msg <- userTypeError_maybe False ty
+      --                            ^^^^^
+      -- Don't look under type-family applications! We only want to pull out
+      -- definite errors.
+      --
+      -- See (UTE1) in Note [Custom type errors in constraints] in GHC.Tc.Types.Constraint.
   = do { env0 <- liftZonkM tcInitTidyEnv
        ; let (env1, tidy_msg) = tidyOpenTypeX env0 msg
        ; failWithTcM (env1, TcRnUserTypeError tidy_msg) }
@@ -672,7 +677,6 @@ that case, the solution is to vary the `ExpandMode`s! In more detail:
    exponential blowup. One consequence of this choice is that if you have
    the following type synonym in one module (with RankNTypes enabled):
 
-     {-# LANGUAGE RankNTypes #-}
      module A where
      type A = forall a. a
 
@@ -1179,7 +1183,7 @@ applying the instance decl would show up two uses of ?x.  #8912.
 checkValidTheta :: UserTypeCtxt -> ThetaType -> TcM ()
 -- Assumes argument is fully zonked
 checkValidTheta ctxt theta
-  = addErrCtxtM (checkThetaCtxt ctxt theta) $
+  = addErrCtxt (ThetaCtxt ctxt theta) $
     do { env <- liftZonkM $ tcInitOpenTidyEnv (tyCoVarsOfTypesList theta)
        ; expand <- initialExpandMode
        ; check_valid_theta env ctxt expand theta }
@@ -1455,10 +1459,6 @@ Flexibility check:
   generalized actually.
 -}
 
-checkThetaCtxt :: UserTypeCtxt -> ThetaType -> TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)
-checkThetaCtxt ctxt theta env
-  = return (env, ThetaCtxt ctxt (tidyTypes env theta))
-
 tyConArityErr :: TyCon -> [TcType] -> TcRnMessage
 -- For type-constructor arity errors, be careful to report
 -- the number of /visible/ arguments required and supplied,
@@ -1543,7 +1543,7 @@ check_special_inst_head dflags hs_src ctxt clas cls_args
   -- Disallow hand-written Typeable instances, except that we
   -- allow a standalone deriving declaration: they are no-ops,
   -- and we warn about them in GHC.Tc.Deriv.deriveStandalone.
-  | clas_nm == typeableClassName
+  | clas_key == typeableClassKey
   , not (hs_src == HsigFile)
     -- Note [Instances of built-in classes in signature files]
   , hand_written_bindings
@@ -1553,8 +1553,8 @@ check_special_inst_head dflags hs_src ctxt clas cls_args
   -- are forbidden outside of signature files (#12837).
   -- Derived instances are forbidden completely (#21087).
      -- FIXME: DataToTag instances in signature files don't actually work yet
-  | clas_nm `elem` [ knownNatClassName, knownSymbolClassName
-                   , knownCharClassName, dataToTagClassName ]
+  | clas_key `elem` [ knownNatClassKey, knownSymbolClassKey
+                    , knownCharClassKey, dataToTagClassKey ]
   , (not (hs_src == HsigFile) && hand_written_bindings) || derived_instance
     -- Note [Instances of built-in classes in signature files]
   = fail_with_inst_err $ IllegalSpecialClassInstance clas False
@@ -1563,20 +1563,20 @@ check_special_inst_head dflags hs_src ctxt clas cls_args
   -- instances for (~), (~~), or Coercible;
   -- but we DO want to allow them in quantified constraints:
   --   f :: (forall a b. Coercible a b => Coercible (m a) (m b)) => ...m...
-  | clas_nm `elem`
-    [ heqTyConName, eqTyConName, coercibleTyConName
-    , withDictClassName, unsatisfiableClassName ]
+  | clas_key `elem`
+    [ heqTyConKey, eqTyConKey, coercibleTyConKey
+    , withDictClassKey, unsatisfiableClassKey ]
   , not quantified_constraint
   = fail_with_inst_err $ IllegalSpecialClassInstance clas False
 
   -- Check for hand-written Generic instances (disallowed in Safe Haskell)
-  | clas_nm `elem` genericClassNames
+  | clas_key `elem` genericClassKeys
   , hand_written_bindings
   =  do { when (safeLanguageOn dflags) $
            fail_with_inst_err $ IllegalSpecialClassInstance clas True
         ; when (safeInferOn dflags) (recordUnsafeInfer emptyMessages) }
 
-  | clas_nm == hasFieldClassName
+  | clas_key == hasFieldClassKey
   , not quantified_constraint
   -- Don't do any validity checking for HasField contexts
   -- inside quantified constraints (#20989): the validity checks
@@ -1605,7 +1605,7 @@ check_special_inst_head dflags hs_src ctxt clas cls_args
                     (TypeThing $ mkClassPred clas cls_args)
                  $ err
 
-    clas_nm = getName clas
+    clas_key = getUnique clas
     ty_args = filterOutInvisibleTypes (classTyCon clas) cls_args
 
     hand_written_bindings
@@ -1717,9 +1717,18 @@ checkHasFieldInst cls tys@[_k_ty, _r_rep, _a_rep, lbl_ty, r_ty, _a_ty] =
                   -> add_err IllegalHasFieldInstanceFamilyTyCon
       | otherwise -> case isStrLitTy lbl_ty of
        Just lbl
-         | let lbl_str = FieldLabelString lbl
-         , isJust (lookupTyConFieldLabel lbl_str tc)
-         -> add_err $ IllegalHasFieldInstanceTyConHasField tc lbl_str
+         | let lbl_str = FieldLabelString (fastStringToShortText lbl)
+         , Just fl <- lookupTyConFieldLabel lbl_str tc
+         -> do
+            -- GHC does not provide HasField instances for naughty record selectors
+            -- (see Note [Naughty record selectors] in GHC.Tc.TyCl.Utils),
+            -- so don't prevent the user from writing such instances.
+            -- See GHC.Tc.Instance.Class.matchHasField.
+            -- Test case: T26295.
+            sel_id <- tcLookupId $ flSelector fl
+            if isNaughtyRecordSelector sel_id
+            then return ()
+            else add_err $ IllegalHasFieldInstanceTyConHasField tc lbl_str
          | otherwise
          -> return ()
        Nothing
@@ -2413,7 +2422,7 @@ checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
               , ppr (mkTyConApp fam_tc pats)
               , text "rhs:" <+> ppr rhs
               , text "qtvs:" <+> ppr qtvs
-              , text "rhs_fvs:" <+> ppr (fvVarSet rhs_fvs)
+              , text "rhs_fvs:" <+> ppr rhs_fvs
               , text "cpt_tvs:" <+> ppr cpt_tvs
               , text "inj_cpt_tvs:" <+> ppr inj_cpt_tvs
               , text "bad_rhs_tvs:" <+> ppr bad_rhs_tvs
@@ -2436,10 +2445,11 @@ checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
        ; check_tvs FamInstLHSUnusedBoundTyVars bad_qtvs
        }
   where
-    rhs_fvs = tyCoFVsOfType rhs
+    rhs_fvs :: DTyCoVarSet  -- Deterministic to avoid error message wobbles
+    rhs_fvs = tyCoVarsOfTypeDSet rhs
 
     cpt_tvs     = tyCoVarsOfTypes pats
-    inj_cpt_tvs = fvVarSet $ injectiveVarsOfTypes False pats
+    inj_cpt_tvs = injectiveVarsOfTypes False pats
       -- The type variables that are in injective positions.
       -- See Note [Dodgy binding sites in type family instances]
       -- NB: The False above is irrelevant, as we never have type families in
@@ -2471,10 +2481,11 @@ checkFamPatBinders fam_tc qtvs non_user_tvs pats rhs
         where
           not_bound_in_pats = not $ qtv `elemVarSet` inj_cpt_tvs
           dodgy             = not_bound_in_pats && qtv `elemVarSet` cpt_tvs
-          used_in_rhs       = qtv `elemVarSet` fvVarSet rhs_fvs
+          used_in_rhs       = qtv `elemDVarSet` rhs_fvs
 
     -- Used on RHS but not bound on LHS
-    bad_rhs_tvs = filterOut ((`elemVarSet` inj_cpt_tvs) <||> (`elem` qtvs)) (fvVarList rhs_fvs)
+    bad_rhs_tvs = filterOut ((`elemVarSet` inj_cpt_tvs) <||> (`elem` qtvs)) $
+                  dVarSetElems rhs_fvs
 
     dodgy_tvs   = cpt_tvs `minusVarSet` inj_cpt_tvs
 

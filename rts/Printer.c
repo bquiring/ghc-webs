@@ -270,6 +270,17 @@ printClosure( const StgClosure *obj )
     case RET_FUN:
     */
 
+    case ANN_FRAME:
+        {
+            StgAnnFrame* frame = (StgAnnFrame*)obj;
+            debugBelch("ANN_FRAME(");
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(",");
+            printPtr((StgPtr)frame->ann);
+            debugBelch(")\n");
+            break;
+        }
+
     case UPDATE_FRAME:
         {
             StgUpdateFrame* frame = (StgUpdateFrame*)obj;
@@ -543,7 +554,7 @@ printSmallBitmap( StgPtr spBottom, StgPtr payload, StgWord bitmap,
     uint32_t i;
 
     for(i = 0; i < size; i++, bitmap >>= 1 ) {
-        debugBelch("   stk[%ld] (%p) = ", (long)(spBottom-(payload+i)), payload+i);
+        debugBelch("   stk[%td] (%p) = ", spBottom-(payload+i), payload+i);
         if ((bitmap & 1) == 0) {
             printPtr((P_)payload[i]);
             debugBelch(" -- ");
@@ -566,7 +577,7 @@ printLargeBitmap( StgPtr spBottom, StgPtr payload, StgLargeBitmap* large_bitmap,
         StgWord bitmap = large_bitmap->bitmap[bmp];
         j = 0;
         for(; i < size && j < BITS_IN(W_); j++, i++, bitmap >>= 1 ) {
-            debugBelch("   stk[%" FMT_Word "] (%p) = ", (W_)(spBottom-(payload+i)), payload+i);
+            debugBelch("   stk[%td] (%p) = ", spBottom-(payload+i), payload+i);
             if ((bitmap & 1) == 0) {
                 printPtr((P_)payload[i]);
                 debugBelch(" -- ");
@@ -694,6 +705,8 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
                 debugBelch("stg_apply_interp_info" );
             } else if (c == (StgWord)&stg_ret_t_info) {
                 debugBelch("stg_ret_t_info" );
+            } else if (c == (StgWord)&stg_ctoi_t_info) {
+                debugBelch("stg_ctoi_t_info" );
             } else if (c == (StgWord)&stg_ctoi_t0_info) {
                 debugBelch("stg_ctoi_t0_info" );
             } else if (c == (StgWord)&stg_ctoi_t1_info) {
@@ -712,8 +725,6 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
                 debugBelch("stg_ctoi_t7_info" );
             } else if (c == (StgWord)&stg_ctoi_t8_info) {
                 debugBelch("stg_ctoi_t8_info" );
-            /* there are more stg_ctoi_tN_info frames,
-               but we don't print them all */
             } else {
                 debugBelch("RET_BCO");
             }
@@ -990,8 +1001,9 @@ findPtrBlocks (StgPtr p, bdescr *bd, StgPtr arr[], int arr_size, int i)
             if (UNTAG_CONST_CLOSURE((StgClosure*)*q) == (const StgClosure *)p) {
                 if (i < arr_size) {
                     for (r = bd->start; r < bd->free; r = end) {
-                        // skip over zeroed-out slop
-                        while (*r == 0) r++;
+                        // See Note [Skipping slop when scanning the heap]
+                        // in ClosureMacros.h
+                        r = skipSlop(r, bd->free);
                         if (!LOOKS_LIKE_CLOSURE_PTR(r)) {
                             debugBelch("%p found at %p, no closure at %p\n",
                                        p, q, r);
@@ -1022,8 +1034,8 @@ findPtr(P_ p, int follow)
 {
   uint32_t g, n;
   bdescr *bd;
-  const int arr_size = 1024;
-  StgPtr arr[arr_size];
+#define ARR_SIZE 1024
+  StgPtr arr[ARR_SIZE];
   int i = 0;
   searched = 0;
 
@@ -1033,24 +1045,24 @@ findPtr(P_ p, int follow)
   // just before a block is used.
   for (n = 0; n < getNumCapabilities(); n++) {
       bd = nurseries[i].blocks;
-      i = findPtrBlocks(p,bd,arr,arr_size,i);
-      if (i >= arr_size) return;
+      i = findPtrBlocks(p,bd,arr,ARR_SIZE,i);
+      if (i >= ARR_SIZE) return;
   }
 #endif
 
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
       bd = generations[g].blocks;
-      i = findPtrBlocks(p,bd,arr,arr_size,i);
+      i = findPtrBlocks(p,bd,arr,ARR_SIZE,i);
       bd = generations[g].large_objects;
-      i = findPtrBlocks(p,bd,arr,arr_size,i);
-      if (i >= arr_size) return;
+      i = findPtrBlocks(p,bd,arr,ARR_SIZE,i);
+      if (i >= ARR_SIZE) return;
       for (n = 0; n < getNumCapabilities(); n++) {
           i = findPtrBlocks(p, gc_threads[n]->gens[g].part_list,
-                            arr, arr_size, i);
+                            arr, ARR_SIZE, i);
           i = findPtrBlocks(p, gc_threads[n]->gens[g].todo_bd,
-                            arr, arr_size, i);
+                            arr, ARR_SIZE, i);
       }
-      if (i >= arr_size) return;
+      if (i >= ARR_SIZE) return;
   }
   if (follow && i == 1) {
       debugBelch("-->\n");
@@ -1123,6 +1135,7 @@ const char *closure_type_names[] = {
  [RET_FUN]               = "RET_FUN",
  [UPDATE_FRAME]          = "UPDATE_FRAME",
  [CATCH_FRAME]           = "CATCH_FRAME",
+ [ANN_FRAME]             = "ANN_FRAME",
  [UNDERFLOW_FRAME]       = "UNDERFLOW_FRAME",
  [STOP_FRAME]            = "STOP_FRAME",
  [BLOCKING_QUEUE]        = "BLOCKING_QUEUE",
@@ -1155,7 +1168,7 @@ const char *closure_type_names[] = {
  [CONTINUATION]          = "CONTINUATION",
 };
 
-#if N_CLOSURE_TYPES != 65
+#if N_CLOSURE_TYPES != 66
 #error Closure types changed: update Printer.c!
 #endif
 

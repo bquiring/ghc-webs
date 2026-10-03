@@ -4,9 +4,12 @@ import Hadrian.BuildPath
 import Hadrian.Haskell.Cabal
 import Hadrian.Haskell.Cabal.Type
 import qualified Text.Parsec      as Parsec
+import GHC.Platform.ArchOS (ArchOS(archOS_OS), OS(..))
+import GHC.Toolchain.Target (Target(tgtArchOs))
 
 import Base
 import Context
+import qualified Data.List as List
 import Expression hiding (way, package, stage)
 import Oracles.ModuleFiles
 import Packages
@@ -18,6 +21,7 @@ import Utilities
 import Data.Time.Clock
 import Rules.Generate (generatedDependencies)
 import Oracles.Flag
+import Way.Type (wayToUnits)
 
 
 -- * Library 'Rules'
@@ -35,8 +39,6 @@ libraryRules = do
         root -/- "stage*/lib/**/libHS*-*.so"    %> registerDynamicLib root "so"
         root -/- "stage*/lib/**/libHS*-*.dll"   %> registerDynamicLib root "dll"
         root -/- "stage*/lib/**/*.a"            %> registerStaticLib  root
-        root -/- "**/HS*-*.o"   %> buildGhciLibO root
-        root -/- "**/HS*-*.p_o" %> buildGhciLibO root
 
 -- * 'Action's for building libraries
 
@@ -100,20 +102,6 @@ buildDynamicLib root suffix dynlibpath = do
         (quote pkgname ++ " (" ++ show stage ++ ", way " ++ show way ++ ").")
         dynlibpath synopsis
 
--- | Build a "GHCi library" ('LibGhci') under the given build root, with the
--- complete path of the file to build is given as the second argument.
--- See Note [Merging object files for GHCi] in GHC.Driver.Pipeline.
-buildGhciLibO :: FilePath -> FilePath -> Action ()
-buildGhciLibO root ghcilibPath = do
-    l@(BuildPath _ stage _ (LibGhci _ _ _ _))
-        <- parsePath (parseBuildLibGhci root)
-                     "<.o ghci lib (build) path parser>"
-                     ghcilibPath
-    let context = libGhciContext l
-    objs <- allObjects context
-    need objs
-    build $ target context (MergeObjects stage) objs [ghcilibPath]
-
 
 {-
 Note [Stamp Files]
@@ -140,35 +128,31 @@ files etc.
 
 buildPackage :: FilePath -> FilePath -> Action ()
 buildPackage root fp = do
-  l@(BuildPath _ _ _ (PkgStamp _ _ _ way)) <- parsePath (parseStampPath root) "<.stamp parser>" fp
+  l@(BuildPath _ stage _ (PkgStamp _ _ _ way)) <- parsePath (parseStampPath root) "<.stamp parser>" fp
   let ctx = stampContext l
   srcs <- hsSources ctx
   gens <- interpretInContext ctx generatedDependencies
 
-  lib_targets <- libraryTargets True ctx
+  lib_targets <- libraryTargets ctx
 
   need (srcs ++ gens ++ lib_targets)
 
   -- Write the current time into the file so the file always changes if
   -- we restamp it because a dependency changes.
   time <- liftIO $ getCurrentTime
-  liftIO $ writeFile fp (show time)
+  writeFileAtomic fp (show time)
   ways <- interpretInContext ctx getLibraryWays
   let hasVanilla = elem vanilla ways
       hasDynamic = elem dynamic ways
-  support <- platformSupportsSharedLibs
+  support <- targetSupportsSharedLibs stage
   when ((hasVanilla && hasDynamic) &&
         support && way == vanilla) $ do
     stamp <- (pkgStampFile (ctx { way = dynamic }))
-    liftIO $ writeFile stamp (show time)
+    writeFileAtomic stamp (show time)
 
 
 
 -- * Helpers
-
--- | Return all Haskell and non-Haskell object files for the given 'Context'.
-allObjects :: Context -> Action [FilePath]
-allObjects context = (++) <$> nonHsObjects context <*> hsObjects context
 
 -- | Return all the non-Haskell object files for the given library context
 -- (object files built from C, C-- and sometimes other things).
@@ -205,9 +189,13 @@ jsObjects context = do
   srcs <- interpretInContext context (getContextData jsSrcs)
   mapM (objectPath context) srcs
 
--- | Return extra object files needed to build the given library context. The
--- resulting list is currently non-empty only when the package from the
--- 'Context' is @ghc-internal@ built with in-tree GMP backend.
+-- | Return extra object files needed to build the given library context.
+--
+-- This is non-empty for:
+--
+-- * @ghc-internal@ when built with in-tree GMP backend
+-- * @rts@ on Windows when linking dynamically
+--
 extraObjects :: Context -> Action [FilePath]
 extraObjects context
     | package context == ghcInternal = do
@@ -215,7 +203,33 @@ extraObjects context
             "gmp" -> gmpObjects (stage context)
             _     -> return []
 
+    | package context == rts = do
+          target   <- interpretInContext context getStagedTarget
+          if not (archOS_OS (tgtArchOs target) == OSMinGW32
+                && Dynamic `wayUnit` way context)
+          then return []
+          else do
+            -- Find the ghc-internal library file name. Note that the
+            -- ghc-internal's .dll.a file is placed in the RTS build dir and not
+            -- the ghc-internal build dir as we only use it when building the
+            -- RTS and not other libraries.
+            ghcInternalDllName <- takeFileName <$> pkgLibraryFile Context {
+                    stage = stage context,
+                    way = rtsWayToLibraryWay (way context),
+                    iplace = iplace context,
+                    package = ghcInternal
+                }
+
+            builddir <- buildPath context
+            return [ builddir -/- ghcInternalDllName <> ".a"]
+
     | otherwise = return []
+
+-- | The rts is compiled in many different ways, but libraries are only built in
+-- (non)Dynamic and (non)Profiled ways. This function converts the rts way into
+-- compatible library way.
+rtsWayToLibraryWay :: Way -> Way
+rtsWayToLibraryWay = wayFromUnits . List.intersect [Dynamic, Profiling] . wayToUnits
 
 -- | Return all the object files to be put into the library we're building for
 -- the given 'Context'.
@@ -228,7 +242,7 @@ libraryObjects context = do
 
 -- | Coarse-grain 'need': make sure all given libraries are fully built.
 needLibrary :: [Context] -> Action ()
-needLibrary cs = need =<< concatMapM (libraryTargets True) cs
+needLibrary cs = need =<< concatMapM libraryTargets cs
 
 -- * Library paths types and parsers
 
@@ -241,19 +255,9 @@ data DynLibExt = So | Dylib deriving (Eq, Show)
 -- | > libHS<pkg name>-<pkg version>-<pkg hash>[_<way suffix>]-ghc<ghc version>.<so|dylib>
 data LibDyn = LibDyn String [Integer] String Way DynLibExt deriving (Eq, Show)
 
--- | > HS<pkg name>-<pkg version>-<pkg hash>[_<way suffix>].o
-data LibGhci = LibGhci String [Integer] String Way deriving (Eq, Show)
-
 -- | Get the 'Context' corresponding to the build path for a given static library.
 libAContext :: BuildPath LibA -> Context
 libAContext (BuildPath _ stage pkgpath (LibA pkgname _ _ way)) =
-    Context stage pkg way Final
-  where
-    pkg = library pkgname pkgpath
-
--- | Get the 'Context' corresponding to the build path for a given GHCi library.
-libGhciContext :: BuildPath LibGhci -> Context
-libGhciContext (BuildPath _ stage pkgpath (LibGhci pkgname _ _ way)) =
     Context stage pkg way Final
   where
     pkg = library pkgname pkgpath
@@ -274,9 +278,8 @@ stampContext (BuildPath _ stage _ (PkgStamp pkgname _ _ way)) =
 
 data PkgStamp = PkgStamp String [Integer] String Way deriving (Eq, Show)
 
-
--- | Parse a path to a ghci library to be built, making sure the path starts
--- with the given build root.
+-- | Parse a path to a package stamp file, making sure the path starts with the
+-- given build root.
 parseStampPath :: FilePath -> Parsec.Parsec String () (BuildPath PkgStamp)
 parseStampPath root = parseBuildPath root parseStamp
 
@@ -296,12 +299,6 @@ parseGhcPkgLibA root
 parseBuildLibA :: FilePath -> Parsec.Parsec String () (BuildPath LibA)
 parseBuildLibA root = parseBuildPath root parseLibAFilename
     Parsec.<?> "build path for a static library"
-
--- | Parse a path to a ghci library to be built, making sure the path starts
--- with the given build root.
-parseBuildLibGhci :: FilePath -> Parsec.Parsec String () (BuildPath LibGhci)
-parseBuildLibGhci root = parseBuildPath root parseLibGhciFilename
-    Parsec.<?> "build path for a ghci library"
 
 -- | Parse a path to a dynamic library to be built, making sure the path starts
 -- with the given build root.
@@ -323,16 +320,6 @@ parseLibAFilename = do
     way <- parseWaySuffix vanilla
     _ <- Parsec.string ".a"
     return (LibA pkgname pkgver pkghash way)
-
--- | Parse the filename of a ghci library to be built into a 'LibGhci' value.
-parseLibGhciFilename :: Parsec.Parsec String () LibGhci
-parseLibGhciFilename = do
-    _ <- Parsec.string "HS"
-    (pkgname, pkgver, pkghash) <- parsePkgId
-    _ <- Parsec.string "."
-    way <- parseWayPrefix vanilla
-    _ <- Parsec.string "o"
-    return (LibGhci pkgname pkgver pkghash way)
 
 -- | Parse the filename of a dynamic library to be built into a 'LibDyn' value.
 parseLibDynFilename :: String -> Parsec.Parsec String () LibDyn

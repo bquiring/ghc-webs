@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Trustworthy #-}
@@ -33,23 +32,21 @@ module GHC.Internal.Data.Functor.Identity (
     Identity(..),
   ) where
 
-import GHC.Internal.Control.Monad.Fix
+import GHC.Internal.Base
 import GHC.Internal.Data.Bits (Bits, FiniteBits)
 import GHC.Internal.Data.Coerce
-import GHC.Internal.Data.Foldable
+import GHC.Internal.Data.Foldable hiding( foldr )
+import qualified GHC.Internal.Data.Foldable as Foldable
 import GHC.Internal.Data.Functor.Utils ((#.))
 import GHC.Internal.Foreign.Storable (Storable)
 import GHC.Internal.Ix (Ix)
-import GHC.Internal.Base ( Applicative(..), Eq(..), Functor(..), Monad(..)
-                , Semigroup, Monoid, Ord(..), ($), (.) )
 import GHC.Internal.Enum (Bounded, Enum)
 import GHC.Internal.Float (Floating, RealFloat)
-import GHC.Internal.Generics (Generic, Generic1)
 import GHC.Internal.Num (Num)
 import GHC.Internal.Read (Read(..), lex, readParen)
 import GHC.Internal.Real (Fractional, Integral, Real, RealFrac)
 import GHC.Internal.Show (Show(..), showParen, showString)
-import GHC.Internal.Types (Bool(..))
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
 
 -- | Identity functor and monad. (a non-strict monad)
 --
@@ -78,8 +75,6 @@ newtype Identity a = Identity { runIdentity :: a }
              , FiniteBits -- ^ @since base-4.9.0.0
              , Floating   -- ^ @since base-4.9.0.0
              , Fractional -- ^ @since base-4.9.0.0
-             , Generic    -- ^ @since base-4.8.0.0
-             , Generic1   -- ^ @since base-4.8.0.0
              , Integral   -- ^ @since base-4.9.0.0
              , Ix         -- ^ @since base-4.9.0.0
              , Semigroup  -- ^ @since base-4.9.0.0
@@ -120,7 +115,7 @@ instance Foldable Identity where
     foldl'                 = coerce
     foldl1 _               = runIdentity
     foldr f z (Identity x) = f x z
-    foldr'                 = foldr
+    foldr'                 = Foldable.foldr  -- Not the one from GHC.Internal.Base!
     foldr1 _               = runIdentity
     length _               = 1
     maximum                = runIdentity
@@ -143,7 +138,3 @@ instance Applicative Identity where
 -- | @since base-4.8.0.0
 instance Monad Identity where
     m >>= k  = k (runIdentity m)
-
--- | @since base-4.8.0.0
-instance MonadFix Identity where
-    mfix f   = Identity (fix (runIdentity . f))

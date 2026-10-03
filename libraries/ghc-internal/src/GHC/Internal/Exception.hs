@@ -66,12 +66,16 @@ module GHC.Internal.Exception
     ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Err (error)
+import GHC.Internal.Prim (raise#)
 import GHC.Internal.Show
 import GHC.Internal.Stack.Types
 import GHC.Internal.IO.Unsafe
 import {-# SOURCE #-} GHC.Internal.Stack (prettyCallStackLines, prettyCallStack, prettySrcLoc, withFrozenCallStack)
-import {-# SOURCE #-} GHC.Internal.Exception.Backtrace (collectBacktraces)
+import {-# SOURCE #-} GHC.Internal.Exception.Backtrace (collectExceptionAnnotation)
+import GHC.Internal.Exception.Context (SomeExceptionAnnotation(..))
 import GHC.Internal.Exception.Type
+import GHC.Internal.Data.Typeable as Rebindable        -- For known-key names
 
 -- | Throw an exception.  Exceptions may be thrown from purely
 -- functional code, but may only be caught within the 'IO' monad.
@@ -86,7 +90,7 @@ throw e =
     -- Note also the absolutely crucial `noinine` in the RHS!
     --   See Note [Hiding precise exception signature in throw]
     let se :: SomeException
-        !se = noinline (unsafePerformIO (toExceptionWithBacktrace e))
+        !se = noinline (unsafePerformIO (withFrozenCallStack $ toExceptionWithBacktrace e))
     in raise# se
 
 -- Note [Capturing the backtrace in throw]
@@ -161,13 +165,18 @@ throw e =
 -- primops which allow more precise guidance of the demand analyser's heuristic
 -- (e.g. #23847).
 
--- | @since base-4.20.0.0
+-- | Collect a Backtrace and attach it to the 'Exception'.
+--
+-- It is recommended to use 'withFrozenCallStack' when calling this function
+-- in order to avoid leaking implementation details of 'toExceptionWithBacktrace'.
+--
+--  @since base-4.20.0.0
 toExceptionWithBacktrace :: (HasCallStack, Exception e)
                          => e -> IO SomeException
 toExceptionWithBacktrace e
   | backtraceDesired e = do
-      bt <- collectBacktraces
-      return (addExceptionContext bt (toException e))
+      SomeExceptionAnnotation ea <- collectExceptionAnnotation
+      return (addExceptionContext ea (toException e))
   | otherwise = return (toException e)
 
 -- | This is thrown when the user calls 'error'. The @String@ is the

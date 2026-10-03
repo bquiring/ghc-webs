@@ -24,7 +24,7 @@ Does something linear.\par}
 \end{haddockdesc}
 \begin{haddockdesc}
 \item[\begin{tabular}{@{}l}
-poly :: forall a (m :: Multiplicity) b. a {\char '45}m -> b
+poly :: a {\char '45}m -> b
 \end{tabular}]
 {\haddockbegindoc
 Does something polymorphic.\par}
@@ -53,7 +53,7 @@ A GADT record with non-linear fields.\par
 \enspace \emph{Constructors}\par
 \haddockbeginconstrs
 & \haddockdecltt{G} & \\
-                      & \qquad \haddockdecltt{::} \enspace \haddockdecltt{forall (mult :: Multiplicity).} {..}
-                                                                                                          -> G mult
+                      & \qquad \haddockdecltt{::} \enspace \haddockdecltt{forall (m :: Multiplicity).} {..}
+                                                                                                       -> G m
 \end{tabulary}\par}
 \end{haddockdesc}

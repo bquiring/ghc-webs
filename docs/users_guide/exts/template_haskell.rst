@@ -114,7 +114,7 @@ enable the quotation subset of Template Haskell (i.e. without top-level splices)
 -  A quasi-quotation can appear in a pattern, type, expression, or
    declaration context and is also written in Oxford brackets:
 
-   -  ``[varid| ... |]``, where the "..." is an arbitrary string; a full
+   -  ``[⟨varid⟩| ... |]``, where the "..." is an arbitrary string; a full
       description of the quasi-quotation facility is given in
       :ref:`th-quasiquotation`.
 
@@ -214,7 +214,7 @@ characterized by having their body at a negative level.
 * Top-level declarations introduce variables at level 1.
 * Imports introduce variables at level 1.
 * Local variables are introduced at the level of their expression. For example,
-  the ``x`` in [| let x = 0 in ... |] is at level 2.
+  the ``x`` in ``[| let x = 0 in ... |]`` is at level 2.
 
 
 Cross-Stage Persistence
@@ -635,7 +635,7 @@ the ``makeLenses`` splice. Even though only ``makeLenses`` is actually used in
 the splice, GHC must assume that any imported identifier might be needed.
 
 If you use :extension:`ExplicitLevelImports`, you can be more precise about which
-modules are needed at which level. For example, ::
+modules are needed at which level. For example:
 
 .. code-block:: haskell
 

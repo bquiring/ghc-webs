@@ -25,8 +25,9 @@ module GHC.Internal.GHCi.Helpers
   ) where
 
 import GHC.Internal.Base
-import GHC.Internal.System.IO
-import GHC.Internal.System.Environment
+import GHC.Internal.IO.Handle (BufferMode (NoBuffering), hSetBuffering, hFlush)
+import GHC.Internal.IO.StdHandles (stdin, stdout, stderr)
+import GHC.Internal.System.Environment (withProgName, withArgs)
 
 disableBuffering :: IO ()
 disableBuffering = do

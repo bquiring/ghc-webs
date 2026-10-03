@@ -1,12 +1,14 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module GHC.Parser.String (
   StringLexError (..),
   lexString,
   lexMultilineString,
+
+  -- * StringMeta
+  StringMeta (..),
+  defaultStrMeta,
 
   -- * Unicode smart quote helpers
   isDoubleSmartQuote,
@@ -18,9 +20,11 @@ import GHC.Prelude hiding (getChar)
 import Control.Arrow ((>>>))
 import Control.Monad (when)
 import Data.Char (chr, ord)
+import Data.Data (Data)
 import qualified Data.Foldable1 as Foldable1
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe (listToMaybe, mapMaybe)
+import GHC.Data.OrdList (fromOL, nilOL, snocOL)
 import GHC.Data.StringBuffer (StringBuffer)
 import qualified GHC.Data.StringBuffer as StringBuffer
 import GHC.Parser.CharClass (
@@ -33,6 +37,7 @@ import GHC.Parser.CharClass (
  )
 import GHC.Parser.Errors.Types (LexErr (..))
 import GHC.Utils.Panic (panic)
+import Language.Haskell.Syntax.Module.Name (ModuleName)
 
 type BufPos = Int
 data StringLexError = StringLexError LexErr BufPos
@@ -169,16 +174,16 @@ collapseGaps = go
       [] -> panic "gap unexpectedly ended"
 
 resolveEscapes :: HasChar c => [c] -> Either (c, LexErr) [c]
-resolveEscapes = go dlistEmpty
+resolveEscapes = go nilOL
   where
     go !acc = \case
-      [] -> pure $ dlistToList acc
+      [] -> pure $ fromOL acc
       Char '\\' : Char '&' : cs -> go acc cs
       backslash@(Char '\\') : cs ->
         case resolveEscapeChar cs of
-          Right (esc, cs') -> go (acc `dlistSnoc` setChar esc backslash) cs'
+          Right (esc, cs') -> go (acc `snocOL` setChar esc backslash) cs'
           Left (c, e) -> Left (c, e)
-      c : cs -> go (acc `dlistSnoc` c) cs
+      c : cs -> go (acc `snocOL` c) cs
 
 -- -----------------------------------------------------------------------------
 -- Escape characters
@@ -277,6 +282,67 @@ isSingleSmartQuote = \case
   '‘' -> True
   '’' -> True
   _ -> False
+
+-- -----------------------------------------------------------------------------
+-- StringMeta
+
+data StringMeta = StringMeta
+  { strMetaMultiline  :: Bool
+  , strMetaQualified  :: Maybe ModuleName
+  }
+  deriving (Show, Data)
+
+defaultStrMeta :: StringMeta
+defaultStrMeta =
+  StringMeta
+    { strMetaMultiline = False
+    , strMetaQualified = Nothing
+    }
+
+{- Note [Implementation of QualifiedStrings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note describes the implementation of the QualifiedStrings extension
+from GHC proposal #723 (https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0723-qualified-strings.rst).
+
+The extension allows users to prefix a string literal with a module qualifier,
+e.g. M."foo" which desugars to M.fromString "foo".
+
+AST representation
+------------------
+Qualified strings are represented in the Haskell AST using the 'HsQualString'
+constructor of 'QualLitVal'.
+
+Lexing & Parsing
+----------------
+When the lexer encounters a module qualifier followed immediately by a string
+(e.g., M."..." or M."""..."""), it parses it as a single unit. The qualifier
+is extracted and stored. The parser then constructs 'HsQualLit' with the module
+qualifier, and 'HsQualString' with the string content.
+
+Desugaring in renamer
+---------------------
+GHC.Rename.Expr.rnExpr desugars qualified string expressions using
+'mkExpandedExpr' to desugar the expression M."foo" into M.fromString "foo".
+
+GHC.Rename.Pat.rnPatAndThen desugars qualified string patterns using
+'mkExpandedPat' to desugar the pattern M."foo" into the view pattern
+  ( (M.fromString "foo" ==) -> True )
+
+'HsQualLit'/'QualLitPat' should not exist in any 'HsExpr GhcRn'/'HsPat GhcRn'
+values because of this desugaring, so we simply panic in all relevant locations.
+We can't simply make these constructors uninhabited
+(e.g. 'type instance XQualLitE GhcRn = DataConCantHappen')
+because we still need a 'HsExpr GhcRn' to put inside 'mkExpandedExpr'.
+
+Pattern-match overlap checking
+------------------------------
+Since qualified string patterns are desugared into view patterns, the pattern
+match checker needs help to see through the desugaring to determine coverage.
+
+In 'GHC.HsToCore.Pmc.Desugar.desugarPat', we treat qualified strings similarly
+to standard string literals for overlap checking, ensuring that
+`f M."a" = ...; f M."a" = ...` is detected as redundant.
+-}
 
 -- -----------------------------------------------------------------------------
 -- Multiline strings
@@ -393,9 +459,9 @@ proposal: https://github.com/ghc-proposals/ghc-proposals/pull/569
 
 Multiline string literals are syntax sugar for normal string literals,
 with an extra post processing step. This all happens in the Lexer; that
-is, HsMultilineString will contain the post-processed string. This matches
-the same behavior as HsString, which contains the normalized string
-(see Note [Literal source text]).
+is, the multi-line HsString will contain the post-processed string.
+This matches the behavior of the single-line HsString, which contains
+the normalized string too (see Note [Literal source text]).
 
 The canonical steps for post processing a multiline string are:
 1. Collapse string gaps
@@ -422,17 +488,3 @@ It's more precisely defined with the following algorithm:
     * Lines with only whitespace characters
 3. Calculate the longest prefix of whitespace shared by all lines in the remaining list
 -}
-
--- -----------------------------------------------------------------------------
--- DList
-
-newtype DList a = DList ([a] -> [a])
-
-dlistEmpty :: DList a
-dlistEmpty = DList id
-
-dlistToList :: DList a -> [a]
-dlistToList (DList f) = f []
-
-dlistSnoc :: DList a -> a -> DList a
-dlistSnoc (DList f) x = DList (f . (x :))

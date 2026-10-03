@@ -1,9 +1,3 @@
-
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE FlexibleContexts #-}
-
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -17,6 +11,7 @@ module GHC.Data.Maybe (
 
         orElse,
         firstJust, firstJusts, firstJustsM,
+        firstRight,
         whenIsJust,
         expectJust,
         rightToMaybe,
@@ -87,6 +82,15 @@ orElse = flip fromMaybe
 rightToMaybe :: Either a b -> Maybe b
 rightToMaybe (Left _)  = Nothing
 rightToMaybe (Right x) = Just x
+
+-- | Return the first 'Right' value in the list.
+--
+-- If the list does not contain any 'Right' values, accumulate the errors of
+-- all the 'Left' values.
+firstRight :: Monoid err => [Either err a] -> Either err a
+firstRight =
+  -- Switch Left/Right & use short-circuiting for 'Applicative (Either a)'.
+  either Right (Left . mconcat) . traverse (either Right Left)
 
 {-
 ************************************************************************

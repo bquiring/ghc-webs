@@ -5,6 +5,11 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -Wincomplete-patterns #-}
+
+-- NB: After fixing #22652 this program right produces warnings
+--     because (F u1 u1 ~ Char) is unsatisfiable
+-- But it produces too many warnings: #26685
+
 module Bug where
 
 import Data.Kind (Type)
@@ -48,4 +53,3 @@ g2 Refl su1 su2
   = case sIsUnit su1 of
       STrue ->
         case su2 of {}
-

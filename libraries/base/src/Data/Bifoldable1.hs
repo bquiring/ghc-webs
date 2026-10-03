@@ -2,7 +2,9 @@
 -- Copyright: Edward Kmett, Oleg Grenrus
 -- License: BSD-3-Clause
 --
+-- @since 4.18.0.0
 
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Safe              #-}
 
@@ -12,6 +14,9 @@ import Control.Applicative (Const (..))
 import Data.Bifoldable     (Bifoldable (..))
 import Data.Semigroup      (Arg (..), Semigroup (..))
 import Prelude             (Either (..), id)
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Essentials as Rebindable
+#endif
 
 class Bifoldable t => Bifoldable1 t where
      bifold1 :: Semigroup m => t m m -> m

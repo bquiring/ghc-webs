@@ -1,17 +1,10 @@
 {-# LANGUAGE CPP                    #-}
-{-# LANGUAGE FlexibleInstances      #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE GADTs                  #-}
-{-# LANGUAGE InstanceSigs           #-}
 {-# LANGUAGE MultiWayIf             #-}
-{-# LANGUAGE ScopedTypeVariables    #-}
-{-# LANGUAGE TupleSections          #-}
 {-# LANGUAGE TypeFamilies           #-}
-{-# LANGUAGE DataKinds              #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-{-# LANGUAGE NamedFieldPuns #-}
 
 #if __GLASGOW_HASKELL__ < 914
 -- In GHC 9.14, GHC.Desugar will be removed from base in favour of
@@ -32,7 +25,7 @@ module GHC.Tc.Gen.Splice(
      tcTypedSplice, tcTypedBracket, tcUntypedBracket,
      runAnnotation, getUntypedSpliceBody,
 
-     runMetaE, runMetaP, runMetaT, runMetaD, runQuasi,
+     runMetaE, runMetaP, runMetaT, runMetaD, runQinTcM,
      tcTopSpliceExpr, lookupThName_maybe,
      defaultRunMeta, runMeta', runRemoteModFinalizers,
      finishTH, runTopSplice
@@ -75,15 +68,15 @@ import GHC.Core.TyCo.Rep as TyCoRep
 import GHC.Core.FamInstEnv
 import GHC.Core.InstEnv as InstEnv
 
-import GHC.Builtin.Names.TH
-import GHC.Builtin.Names
-import GHC.Builtin.Types
+import GHC.Builtin.TH
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.KnownOccs (toAnnotationWrapperIdOcc)
+import GHC.Builtin.WiredIn.Types
 
 import GHC.ThToHs
 import GHC.HsToCore.Docs
 import GHC.HsToCore.Expr
 import GHC.HsToCore.Monad
-import GHC.IfaceToCore
 import GHC.Iface.Load
 
 import GHCi.Message
@@ -104,6 +97,7 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon as DataCon
 
 import GHC.Types.SrcLoc
+import GHC.Types.SourceText
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
@@ -125,7 +119,7 @@ import GHC.Serialized
 import GHC.Unit.Finder
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
-import GHC.Iface.Syntax
+import GHC.IfaceToCore ( tcIfaceImport )
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic as Panic
@@ -144,6 +138,8 @@ import qualified GHC.LanguageExtensions as LangExt
 
 -- THSyntax gives access to internal functions and data types
 import qualified GHC.Boot.TH.Syntax as TH
+import qualified GHC.Boot.TH.Monad  as TH
+import GHC.Boot.TH.Monad  (MetaHandlers(..))
 import qualified GHC.Boot.TH.Ppr    as TH
 
 #if defined(HAVE_INTERNAL_INTERPRETER)
@@ -159,6 +155,8 @@ import Control.DeepSeq
 import Control.Monad
 import Data.Binary
 import Data.Binary.Get
+import Data.Containers.ListUtils ( nubOrd )
+import Data.List ( sortBy )
 import Data.Maybe
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as LB
@@ -172,8 +170,6 @@ import Data.IORef
 import GHC.Parser.HaddockLex (lexHsDoc)
 import GHC.Parser (parseIdentifier)
 import GHC.Rename.Doc (rnHsDoc)
-
-
 
 {-
 Note [Template Haskell state diagram]
@@ -715,8 +711,8 @@ tcTypedBracket rn_expr expr res_ty
        ; let rep = getRuntimeRep expr_ty
        ; meta_ty <- tcCodeTy m_var expr_ty
        ; ps' <- readMutVar ps_var
-       ; codeco <- tcLookupId unsafeCodeCoerceName
-       ; bracket_ty <- mkAppTy m_var <$> tcMetaTy expTyConName
+       ; codeco <- tcLookupKnownOccId unsafeCodeCoerceOcc
+       ; bracket_ty <- mkAppTy m_var <$> tcMetaKnownOccTy expTyConOcc
        ; let brack_tc = HsBracketTc { hsb_quote = ExpBr noExtField expr, hsb_ty = bracket_ty
                                     , hsb_wrap  = Just wrapper, hsb_splices = ps' }
              -- The tc_expr is stored here so that the expression can be used in HIE files.
@@ -771,7 +767,7 @@ mkMetaTyVar =
 -- | For a type 'm', emit the constraint 'Quote m'.
 emitQuoteWanted :: Type -> TcM EvVar
 emitQuoteWanted m_var =  do
-        quote_con <- tcLookupTyCon quoteClassName
+        quote_con <- tcLookupKnownOccTyCon quoteClassOcc
         emitWantedEvVar BracketOrigin $
           mkTyConApp quote_con [m_var]
 
@@ -788,32 +784,32 @@ brackTy b =
         ev_var <- emitQuoteWanted m_var
         -- Construct the final expected type of the quote, for example
         -- m Exp or m Type
-        final_ty <- mkAppTy m_var <$> tcMetaTy n
+        final_ty <- mkAppTy m_var <$> tcMetaKnownOccTy n
         -- Return the evidence variable and metavariable to be used during
         -- desugaring.
         let wrapper = QuoteWrapper ev_var m_var
         return (Just wrapper, final_ty)
   in
   case b of
-    (VarBr {}) -> (Nothing,) <$> tcMetaTy nameTyConName
+    (VarBr {}) -> (Nothing,) <$> tcMetaKnownOccTy nameTyConOcc
                                            -- Result type is Var (not Quote-monadic)
-    (ExpBr {})  -> mkTy expTyConName  -- Result type is m Exp
-    (TypBr {})  -> mkTy typeTyConName -- Result type is m Type
-    (DecBrG {}) -> mkTy decsTyConName -- Result type is m [Dec]
-    (PatBr {})  -> mkTy patTyConName  -- Result type is m Pat
+    (ExpBr {})  -> mkTy expTyConOcc  -- Result type is m Exp
+    (TypBr {})  -> mkTy typeTyConOcc -- Result type is m Type
+    (DecBrG {}) -> mkTy decsTyConOcc -- Result type is m [Dec]
+    (PatBr {})  -> mkTy patTyConOcc  -- Result type is m Pat
     (DecBrL {}) -> panic "tcBrackTy: Unexpected DecBrL"
 
 
 untypedSpliceResultType :: UntypedSpliceFlavour -> TcType -> TcM TcType
 untypedSpliceResultType flavour meta_ty = do
-  sp_ty <- tcMetaTy sp_ty_name
+  sp_ty <- tcMetaKnownOccTy sp_ty_name
   return $ mkAppTy meta_ty sp_ty
   where
     sp_ty_name = case flavour of
-      UntypedExpSplice  -> expTyConName
-      UntypedPatSplice  -> patTyConName
-      UntypedTypeSplice -> typeTyConName
-      UntypedDeclSplice -> decsTyConName
+      UntypedExpSplice  -> expTyConOcc
+      UntypedPatSplice  -> patTyConOcc
+      UntypedTypeSplice -> typeTyConOcc
+      UntypedDeclSplice -> decsTyConOcc
 
 ---------------
 -- | Typechecking a pending splice from a untyped bracket
@@ -832,21 +828,21 @@ tcUntypedSplice (QuoteWrapper _ m_var) splice_name (HsUntypedSpliceExpr (HsUserS
        ; return (PendingTcSplice splice_name expr') }
 tcUntypedSplice (QuoteWrapper _ m_var) splice_name (HsQuasiQuote (HsQuasiQuoteExt flavour) quoter s) = do
    -- 1. Check that the quoter is of type 'QuasiQuoter'
-   qq_type <- mkTyConTy <$> tcLookupTyCon quasiQuoterTyConName
+   qq_type <- tcMetaKnownOccTy quasiQuoterTyConOcc
    quoter' <- setSrcSpan (getLocA quoter) $ tcCheckId (unLoc quoter) (Check qq_type)
 
    -- 2. Check that the quasi-quote has type Q Exp/Q Pat/Q Dec/Q Decs (as appropriate)
-   qTy <- mkTyConTy <$> tcLookupTyCon qTyConName
+   qTy <- mkTyConTy <$> tcLookupKnownOccTyCon qTyConOcc
    quote_ty <- untypedSpliceResultType flavour m_var
    splice_ty <- untypedSpliceResultType flavour qTy
-   res_co <- unifyInvisibleType splice_ty quote_ty
+   res_co <- unifyInvisibleType InvisibleKind splice_ty quote_ty
 
    -- 3. Lookup the relevant field selector from QuasiQuoter
-   sel <- tcLookupId qq_sel_name
+   sel <- tcLookupKnownOccId qq_sel_name
 
    -- 4. Apply the selector to the quasi-quoter
    let expr' = mkLHsWrapCo res_co $
-                nlHsApp (nlHsApp (nlHsVar sel) (noLocA quoter')) (nlHsLit (mkHsStringFS (unLoc s)))
+                nlHsApp (nlHsApp (nlHsVar sel) (noLocA quoter')) (nlHsLit (HsString NoSourceText (unLoc s)))
 
    return (PendingTcSplice splice_name expr')
    where
@@ -872,9 +868,9 @@ tcUntypedSplice q splice_name (XUntypedSplice ils)
        ; v_expr' <- tcCheckMonoExpr v_expr id_ty
        -- lift :: Quote m' => a -> m' Exp
        ; lift <- setSrcSpan (getLocA id_name) $
-                  newMethodFromName (ImplicitLiftOrigin ils)
-                                     GHC.Builtin.Names.TH.liftName
-                                     [getRuntimeRep id_ty, id_ty]
+                  newKnownOccMethod (ImplicitLiftOrigin ils)
+                                    GHC.Builtin.TH.liftIdOcc
+                                    [getRuntimeRep id_ty, id_ty]
        ; let res = nlHsApp (mkLHsWrap (applyQuoteWrapper q) (noLocA lift)) v_expr'
 
        ; return (PendingTcSplice splice_name res) }
@@ -885,7 +881,7 @@ tcPendingSpliceTyped q@(QuoteWrapper _ m_var) splice_name (HsTypedSpliceExpr _ e
        ; let rep = getRuntimeRep res_ty
        ; meta_exp_ty <- tcCodeTy m_var res_ty
        ; expr' <- tcCheckMonoExpr expr meta_exp_ty
-       ; untype_code <- tcLookupId unTypeCodeName
+       ; untype_code <- tcLookupKnownOccId unTypeCodeOcc
        ; let expr'' = mkHsApp
                          (mkLHsWrap (applyQuoteWrapper q)
                            (nlHsTyApp untype_code [rep, res_ty])) expr'
@@ -898,9 +894,9 @@ tcPendingSpliceTyped q splice_name (XTypedSplice ils) res_ty
        ; v_expr' <- tcCheckMonoExpr v_expr res_ty
        -- lift :: Quote m' => a -> m' Exp
        ; lift <- setSrcSpan (getLocA id_name) $
-                  newMethodFromName (ImplicitLiftOrigin ils)
-                                     GHC.Builtin.Names.TH.liftName
-                                     [rep, res_ty]
+                  newKnownOccMethod (ImplicitLiftOrigin ils)
+                                    GHC.Builtin.TH.liftIdOcc
+                                    [rep, res_ty]
        ; let res = nlHsApp (mkLHsWrap (applyQuoteWrapper q) (noLocA lift)) v_expr'
        ; return (PendingTcSplice splice_name res) }
 
@@ -911,7 +907,7 @@ tcCodeTy :: TcType -> TcType -> TcM TcType
 tcCodeTy m_ty exp_ty
   = do { unless (isTauTy exp_ty) $ addErr $
           TcRnTHError $ TypedTHError $ TypedTHWithPolyType exp_ty
-       ; codeCon <- tcLookupTyCon codeTyConName
+       ; codeCon <- tcLookupKnownOccTyCon codeTyConOcc
        ; let rep = getRuntimeRep exp_ty
        ; return (mkTyConApp codeCon [m_ty, rep, exp_ty]) }
 
@@ -982,7 +978,7 @@ tcTopSplice expr res_ty
   = do { -- Typecheck the expression,
          -- making sure it has type Q (T res_ty)
          res_ty <- expTypeToType res_ty
-       ; q_type <- tcMetaTy qTyConName
+       ; q_type <- tcMetaKnownOccTy qTyConOcc
        -- Top level splices must still be of type Q (TExp a)
        ; meta_exp_ty <- tcCodeTy q_type res_ty
        ; q_expr <- tcTopSpliceExpr Typed $
@@ -1086,8 +1082,8 @@ stubNestedSplice = warnPprTrace True "stubNestedSplice" empty $
 runAnnotation target expr = do
     -- Find the classes we want instances for in order to call toAnnotationWrapper
     loc <- getSrcSpanM
-    data_class <- tcLookupClass dataClassName
-    to_annotation_wrapper_id <- tcLookupId toAnnotationWrapperName
+    data_class <- tcLookupKnownKeyClass dataClassKey
+    to_annotation_wrapper_id <- tcLookupKnownOccId toAnnotationWrapperIdOcc
 
     -- Check the instances we require live in another module (we want to execute it..)
     -- and check identifiers live in other modules using TH stage checks. tcSimplifyStagedExpr
@@ -1146,8 +1142,8 @@ convertAnnotationWrapper fhv = do
 ************************************************************************
 -}
 
-runQuasi :: TH.Q a -> TcM a
-runQuasi act = TH.runQ act
+runQinTcM :: TH.Q a -> TcM a
+runQinTcM (TH.Q act) = withRunInIO $ \runInIO -> act (metaHandlersTcM runInIO)
 
 runRemoteModFinalizers :: ThModFinalizers -> TcM ()
 runRemoteModFinalizers (ThModFinalizers finRefs) = do
@@ -1160,7 +1156,7 @@ runRemoteModFinalizers (ThModFinalizers finRefs) = do
 #if defined(HAVE_INTERNAL_INTERPRETER)
     InternalInterp -> do
       qs <- liftIO (withForeignRefs finRefs $ mapM localRef)
-      runQuasi $ sequence_ qs
+      runQinTcM $ sequence_ qs
 #endif
 
     ExternalInterp ext -> withExtInterp ext $ \inst -> do
@@ -1474,63 +1470,14 @@ when showing an error message.
 To call runQ in the Tc monad, we need to make TcM an instance of Quasi:
 -}
 
-instance TH.Quasi TcM where
-  qNewName s = do { u <- newUnique
-                  ; let i = toInteger (getKey u)
-                  ; return (TH.mkNameU s i) }
+-- 'msg' is forced to ensure exceptions don't escape,
+-- see Note [Exceptions in TH]
+report :: Bool -> [Char] -> TcM ()
+report True msg  = seqList msg $ addErr        $ TcRnTHError $ ReportCustomQuasiError True  msg
+report False msg = seqList msg $ addDiagnostic $ TcRnTHError $ ReportCustomQuasiError False msg
 
-  -- 'msg' is forced to ensure exceptions don't escape,
-  -- see Note [Exceptions in TH]
-  qReport True msg  = seqList msg $ addErr        $ TcRnTHError $ ReportCustomQuasiError True  msg
-  qReport False msg = seqList msg $ addDiagnostic $ TcRnTHError $ ReportCustomQuasiError False msg
-
-  qLocation :: TcM TH.Loc
-  qLocation = do { m <- getModule
-                 ; l <- getSrcSpanM
-                 ; r <- case l of
-                        UnhelpfulSpan _ -> pprPanic "qLocation: Unhelpful location"
-                                                    (ppr l)
-                        RealSrcSpan s _ -> return s
-                 ; return (TH.Loc { TH.loc_filename = unpackFS (srcSpanFile r)
-                                  , TH.loc_module   = moduleNameString (moduleName m)
-                                  , TH.loc_package  = unitString (moduleUnit m)
-                                  , TH.loc_start = (srcSpanStartLine r, srcSpanStartCol r)
-                                  , TH.loc_end = (srcSpanEndLine   r, srcSpanEndCol   r) }) }
-
-  qLookupName       = lookupName
-  qReify            = reify
-  qReifyFixity nm   = lookupThName nm >>= reifyFixity
-  qReifyType        = reifyTypeOfThing
-  qReifyInstances   = reifyInstances
-  qReifyRoles       = reifyRoles
-  qReifyAnnotations = reifyAnnotations
-  qReifyModule      = reifyModule
-  qReifyConStrictness nm = do { nm' <- lookupThName nm
-                              ; dc  <- tcLookupDataCon nm'
-                              ; let bangs = dataConImplBangs dc
-                              ; return (map reifyDecidedStrictness bangs) }
-
-        -- For qRecover, discard error messages if
-        -- the recovery action is chosen.  Otherwise
-        -- we'll only fail higher up.
-  qRecover recover main = tryTcDiscardingErrs recover main
-
-  qGetPackageRoot = do
-    dflags <- getDynFlags
-    return $ fromMaybe "." (workingDirectory dflags)
-
-  qAddDependentFile fp = do
-    ref <- fmap tcg_dependent_files getGblEnv
-    dep_files <- readTcRef ref
-    writeTcRef ref (fp:dep_files)
-
-  qAddTempFile suffix = do
-    dflags <- getDynFlags
-    logger <- getLogger
-    tmpfs  <- hsc_tmpfs <$> getTopEnv
-    liftIO $ newTempName logger tmpfs (tmpDir dflags) TFL_GhcSession suffix
-
-  qAddTopDecls thds = do
+addTopDecls :: [TH.Dec] -> TcM ()
+addTopDecls thds = do
       exts <- fmap extensionFlags getDynFlags
       l <- getSrcSpanM
       th_origin <- getThSpliceOrigin
@@ -1556,59 +1503,20 @@ instance TH.Quasi TcM where
         = addErr $ TcRnTHError $ AddTopDeclsError $ InvalidTopDecl d
 
       bindName :: RdrName -> TcM ()
-      bindName (Exact n)
+      bindName rdr_name
+        | Just n <- rdrNameExactName_maybe rdr_name
         = do { th_topnames_var <- fmap tcg_th_topnames getGblEnv
-             ; updTcRef th_topnames_var (\ns -> extendNameSet ns n)
-             }
+             ; updTcRef th_topnames_var (\ns -> extendNameSet ns n) }
+        | otherwise
+        = addErr $ TcRnTHError $ THNameError $ NonExactName rdr_name
 
-      bindName name = addErr $ TcRnTHError $ THNameError $ NonExactName name
-
-  qAddForeignFilePath lang fp = do
-    var <- fmap tcg_th_foreign_files getGblEnv
-    updTcRef var ((lang, fp) :)
-
-  qAddModFinalizer fin = do
-      r <- liftIO $ mkRemoteRef fin
-      fref <- liftIO $ mkForeignRef r (freeRemoteRef r)
-      addModFinalizerRef fref
-
-  qAddCorePlugin plugin = do
-      hsc_env <- getTopEnv
-      let fc        = hsc_FC hsc_env
-      let home_unit = hsc_home_unit hsc_env
-      let dflags    = hsc_dflags hsc_env
-      let fopts     = initFinderOpts dflags
-      r <- liftIO $ findHomeModule fc fopts home_unit (mkModuleName plugin)
-      let err = TcRnTHError $ AddInvalidCorePlugin plugin
-      case r of
-        Found {} -> addErr err
-        FoundMultiple {} -> addErr err
-        _ -> return ()
-      th_coreplugins_var <- tcg_th_coreplugins <$> getGblEnv
-      updTcRef th_coreplugins_var (plugin:)
-
-  qGetQ :: forall a. Typeable a => TcM (Maybe a)
-  qGetQ = do
-      th_state_var <- fmap tcg_th_state getGblEnv
-      th_state <- readTcRef th_state_var
-      -- See #10596 for why we use a scoped type variable here.
-      return (Map.lookup (typeRep (Proxy :: Proxy a)) th_state >>= fromDynamic)
-
-  qPutQ x = do
-      th_state_var <- fmap tcg_th_state getGblEnv
-      updTcRef th_state_var (\m -> Map.insert (typeOf x) (toDyn x) m)
-
-  qIsExtEnabled = xoptM
-
-  qExtsEnabled =
-    EnumSet.toList . extensionFlags . hsc_dflags <$> getTopEnv
-
-  qPutDoc doc_loc s = do
+putDoc :: TH.DocLoc -> String -> TcM ()
+putDoc doc_loc s = do
     th_doc_var <- tcg_th_docs <$> getGblEnv
     resolved_doc_loc <- resolve_loc doc_loc
     is_local <- checkLocalName resolved_doc_loc
     unless is_local $ failWithTc $ TcRnTHError $ AddDocToNonLocalDefn doc_loc
-    let ds = mkGeneratedHsDocString s
+    let ds = mkGeneratedHsDocStringGhc s
         hd = lexHsDoc parseIdentifier ds
     hd' <- rnHsDoc hd
     updTcRef th_doc_var (Map.insert resolved_doc_loc hd')
@@ -1625,14 +1533,130 @@ instance TH.Quasi TcM where
       checkLocalName (InstDoc n) = nameIsLocalOrFrom <$> getModule <*> pure n
       checkLocalName ModuleDoc = pure True
 
-
-  qGetDoc (TH.DeclDoc n) = lookupThName n >>= lookupDeclDoc
-  qGetDoc (TH.InstDoc t) = lookupThInstName t >>= lookupDeclDoc
-  qGetDoc (TH.ArgDoc n i) = lookupThName n >>= lookupArgDoc i
-  qGetDoc TH.ModuleDoc = do
+getDoc :: TH.DocLoc -> TcM (Maybe String)
+getDoc (TH.DeclDoc n) = lookupThName n >>= lookupDeclDoc
+getDoc (TH.InstDoc t) = lookupThInstName t >>= lookupDeclDoc
+getDoc (TH.ArgDoc n i) = lookupThName n >>= lookupArgDoc i
+getDoc TH.ModuleDoc = do
     df <- getDynFlags
     docs <- getGblEnv >>= extractDocs df
     return (renderHsDocString . hsDocString <$> (docs_mod_hdr =<< docs))
+
+getQ :: forall a. Typeable a => TcM (Maybe a)
+getQ = do
+    th_state_var <- fmap tcg_th_state getGblEnv
+    th_state <- readTcRef th_state_var
+    -- See #10596 for why we use a scoped type variable here.
+    return (Map.lookup (typeRep (Proxy :: Proxy a)) th_state >>= fromDynamic)
+
+location :: TcM TH.Loc
+location = do { m <- getModule
+              ; l <- getSrcSpanM
+              ; r <- case l of
+                        RealSrcSpan s _ -> return s
+                        GeneratedSrcSpan{} -> pprPanic "qLocation: generatedSrcSpan"
+                                                    (pprGeneratedSrcSpanDetails)
+                        UnhelpfulSpan _ -> pprPanic "qLocation: Unhelpful location"
+                                                    (ppr l)
+              ; return (TH.Loc { TH.loc_filename = unpackFS (srcSpanFile r)
+                               , TH.loc_module   = moduleNameString (moduleName m)
+                               , TH.loc_package  = unitString (moduleUnit m)
+                               , TH.loc_start = (srcSpanStartLine r, srcSpanStartCol r)
+                               , TH.loc_end = (srcSpanEndLine   r, srcSpanEndCol   r) }) }
+
+metaHandlersTcM :: (forall x. TcM x -> IO x) -> TH.MetaHandlers
+metaHandlersTcM runInIO = TH.MetaHandlers {
+      mLiftIO = id
+    -- We are careful to use the TcM instance not the one for IO, since that would lead to a different error.
+    , mFail = \s -> runInIO $ fail @TcM s
+    , mNewName = \s -> runInIO $ do { u <- newUnique
+                      ; let i = toInteger (getKey u)
+                      ; return (TH.mkNameU s i) }
+
+    , mReport = fmap runInIO . report
+
+    , mLocation = runInIO location
+
+    , mLookupName       = fmap runInIO . lookupName
+    , mReify            = runInIO . reify
+    , mReifyFixity      = \nm -> runInIO $ lookupThName nm >>= reifyFixity
+    , mReifyType        = runInIO . reifyTypeOfThing
+    , mReifyInstances   = fmap runInIO . reifyInstances
+    , mReifyRoles       = runInIO . reifyRoles
+    , mReifyAnnotations = runInIO . reifyAnnotations
+    , mReifyModule      = runInIO . reifyModule
+    , mReifyConStrictness = \nm -> runInIO $ do
+                                      { nm' <- lookupThName nm
+                                      ; dc  <- tcLookupDataCon nm'
+                                      ; let bangs = dataConImplBangs dc
+                                      ; return (map reifyDecidedStrictness bangs) }
+
+    -- For qRecover, discard error messages if
+    -- the recovery action is chosen.  Otherwise
+    -- we'll only fail higher up.
+    , mRecover = \recover main -> runInIO $ tryTcDiscardingErrs (runQinTcM recover) (runQinTcM main)
+
+    , mGetPackageRoot = runInIO $ do
+        dflags <- getDynFlags
+        return $ fromMaybe "." (workingDirectory dflags)
+
+    , mAddDependentFile = \fp -> runInIO $ do
+        ref <- fmap tcg_dependent_files getGblEnv
+        dep_files <- readTcRef ref
+        writeTcRef ref (fp:dep_files)
+
+    , mAddDependentDirectory = \dp -> runInIO $ do
+        ref <- fmap tcg_dependent_dirs getGblEnv
+        dep_dirs <- readTcRef ref
+        writeTcRef ref (dp:dep_dirs)
+
+    , mAddTempFile = \suffix -> runInIO $ do
+        dflags <- getDynFlags
+        logger <- getLogger
+        tmpfs  <- hsc_tmpfs <$> getTopEnv
+        liftIO $ newTempName logger tmpfs (tmpDir dflags) TFL_GhcSession suffix
+
+    , mAddTopDecls = runInIO . addTopDecls
+
+    , mAddForeignFilePath = \lang fp -> runInIO $ do
+        var <- fmap tcg_th_foreign_files getGblEnv
+        updTcRef var ((lang, fp) :)
+
+    , mAddModFinalizer = \fin -> runInIO $ do
+        r <- liftIO $ mkRemoteRef fin
+        fref <- liftIO $ mkForeignRef r (freeRemoteRef r)
+        addModFinalizerRef fref
+
+    , mAddCorePlugin = \plugin -> runInIO $ do
+        hsc_env <- getTopEnv
+        let fc        = hsc_FC hsc_env
+        let home_unit = hsc_home_unit hsc_env
+        let dflags    = hsc_dflags hsc_env
+        let fopts     = initFinderOpts dflags
+        r <- liftIO $ findHomeModule fc fopts home_unit (mkModuleName plugin)
+        let err = TcRnTHError $ AddInvalidCorePlugin plugin
+        case r of
+          Found {} -> addErr err
+          FoundMultiple {} -> addErr err
+          _ -> return ()
+        th_coreplugins_var <- tcg_th_coreplugins <$> getGblEnv
+        updTcRef th_coreplugins_var (plugin:)
+
+    , mGetQ = runInIO getQ
+
+    , mPutQ = \x -> runInIO $ do
+        th_state_var <- fmap tcg_th_state getGblEnv
+        updTcRef th_state_var (\m -> Map.insert (typeOf x) (toDyn x) m)
+
+    , mIsExtEnabled = runInIO . xoptM
+
+    , mExtsEnabled = runInIO $
+        EnumSet.toList . extensionFlags . hsc_dflags <$> getTopEnv
+
+    , mPutDoc = fmap runInIO . putDoc
+
+    , mGetDoc = runInIO . getDoc
+  }
 
 -- | Looks up documentation for a declaration in first the current module,
 -- otherwise tries to find it in another module via 'hscGetModuleInterface'.
@@ -1789,7 +1813,7 @@ runTH ty fhv = do
     InternalInterp -> do
        -- Run it in the local TcM
       hv <- liftIO $ wormhole interp fhv
-      r <- runQuasi (unsafeCoerce hv :: TH.Q a)
+      r <- runQinTcM (unsafeCoerce hv :: TH.Q a)
       return r
 #endif
 
@@ -1798,7 +1822,7 @@ runTH ty fhv = do
       -- Remote GHCi, see Note [Remote Template Haskell] in
       -- libraries/ghci/GHCi/TH.hs.
       rstate <- getTHState inst
-      loc <- TH.qLocation
+      loc <- location
       -- run a remote TH request
       r <- liftIO $
         withForeignRef rstate $ \state_hv ->
@@ -1914,31 +1938,32 @@ wrapTHResult tcm = do
 
 handleTHMessage :: THMessage a -> TcM a
 handleTHMessage msg = case msg of
-  NewName a -> wrapTHResult $ TH.qNewName a
-  Report b str -> wrapTHResult $ TH.qReport b str
-  LookupName b str -> wrapTHResult $ TH.qLookupName b str
-  Reify n -> wrapTHResult $ TH.qReify n
-  ReifyFixity n -> wrapTHResult $ TH.qReifyFixity n
-  ReifyType n -> wrapTHResult $ TH.qReifyType n
-  ReifyInstances n ts -> wrapTHResult $ TH.qReifyInstances n ts
-  ReifyRoles n -> wrapTHResult $ TH.qReifyRoles n
+  NewName a -> wrapTHResult $ runQinTcM $ TH.newName a
+  Report b str -> wrapTHResult $ runQinTcM $ TH.report b str
+  LookupName b str -> wrapTHResult $ runQinTcM $ TH.lookupName b str
+  Reify n -> wrapTHResult $ runQinTcM $ TH.reify n
+  ReifyFixity n -> wrapTHResult $ runQinTcM $ TH.reifyFixity n
+  ReifyType n -> wrapTHResult $ runQinTcM $ TH.reifyType n
+  ReifyInstances n ts -> wrapTHResult $ runQinTcM $ TH.reifyInstances n ts
+  ReifyRoles n -> wrapTHResult $ runQinTcM $ TH.reifyRoles n
   ReifyAnnotations lookup tyrep ->
     wrapTHResult $ (map B.pack <$> getAnnotationsByTypeRep lookup tyrep)
-  ReifyModule m -> wrapTHResult $ TH.qReifyModule m
-  ReifyConStrictness nm -> wrapTHResult $ TH.qReifyConStrictness nm
-  GetPackageRoot -> wrapTHResult $ TH.qGetPackageRoot
-  AddDependentFile f -> wrapTHResult $ TH.qAddDependentFile f
-  AddTempFile s -> wrapTHResult $ TH.qAddTempFile s
+  ReifyModule m -> wrapTHResult $ runQinTcM $ TH.reifyModule m
+  ReifyConStrictness nm -> wrapTHResult $ runQinTcM $ TH.reifyConStrictness nm
+  GetPackageRoot -> wrapTHResult $ runQinTcM $ TH.getPackageRoot
+  AddDependentFile f -> wrapTHResult $ runQinTcM $ TH.addDependentFile f
+  AddDependentDirectory d -> wrapTHResult $ runQinTcM $ TH.addDependentDirectory d
+  AddTempFile s -> wrapTHResult $ runQinTcM $ TH.addTempFile s
   AddModFinalizer r -> do
     interp <- hscInterp <$> getTopEnv
     wrapTHResult $ liftIO (mkFinalizedHValue interp r) >>= addModFinalizerRef
-  AddCorePlugin str -> wrapTHResult $ TH.qAddCorePlugin str
-  AddTopDecls decs -> wrapTHResult $ TH.qAddTopDecls decs
-  AddForeignFilePath lang str -> wrapTHResult $ TH.qAddForeignFilePath lang str
-  IsExtEnabled ext -> wrapTHResult $ TH.qIsExtEnabled ext
-  ExtsEnabled -> wrapTHResult $ TH.qExtsEnabled
-  PutDoc l s -> wrapTHResult $ TH.qPutDoc l s
-  GetDoc l -> wrapTHResult $ TH.qGetDoc l
+  AddCorePlugin str -> wrapTHResult $ runQinTcM $ TH.addCorePlugin str
+  AddTopDecls decs -> wrapTHResult $ runQinTcM $ TH.addTopDecls decs
+  AddForeignFilePath lang str -> wrapTHResult $ runQinTcM $ TH.addForeignFilePath lang str
+  IsExtEnabled ext -> wrapTHResult $ runQinTcM $ TH.isExtEnabled ext
+  ExtsEnabled -> wrapTHResult $ runQinTcM $ TH.extsEnabled
+  PutDoc l s -> wrapTHResult $ runQinTcM $ TH.putDoc l s
+  GetDoc l -> wrapTHResult $ runQinTcM $ TH.getDoc l
   FailIfErrs -> wrapTHResult failIfErrsM
   _ -> panic ("handleTHMessage: unexpected message " ++ show msg)
 
@@ -2258,8 +2283,7 @@ reifyTyCon tc
                  ; instances <- reifyFamilyInstances tc
                                   (familyInstances fam_envs tc)
                  ; return (TH.FamilyI (TH.OpenTypeFamilyD tfHead) instances) }
-         else do { eqns <-
-                     case isClosedSynFamilyTyConWithAxiom_maybe tc of
+         else do { eqns <- case closedFamilyTyConCoAxiom_maybe tc of
                        Just ax -> mapM (reifyAxBranch tc) $
                                   fromBranches $ coAxiomBranches ax
                        Nothing -> return []
@@ -2372,7 +2396,7 @@ reifyDataCon isGadtDataCon tys dc
                      | otherwise                   = do
                          { cxt <- reifyCxt theta'
                          ; ex_tvs'' <- case to_invis_bndrs ex_tvs' of
-                             Nothing  -> noTH DataConVisibleForall (dataConDisplayType False dc)
+                             Nothing  -> noTH DataConVisibleForall (dataConWrapperType dc)
                              Just tvs -> reifyTyVarBndrs tvs
                          ; return (TH.ForallC ex_tvs'' cxt main_con) }
        ; assert (r_arg_tys `equalLength` dcdBangs)
@@ -2979,17 +3003,24 @@ reifyModule (TH.Module (TH.PkgName pkgString) (TH.ModName mString)) = do
   if (reifMod == this_mod) then reifyThisModule else reifyFromIface reifMod
     where
       reifyThisModule = do
-        usages <- fmap (map modToTHMod . Map.keys . imp_mods) getImports
-        return $ TH.ModuleInfo usages
+        import_decls <- tcg_import_decls <$> getGblEnv
+        return $ TH.ModuleInfo (thImportedModules import_decls)
 
       reifyFromIface reifMod = do
         iface <- loadInterfaceForModule (text "reifying module from TH for" <+> ppr reifMod) reifMod
         let IfaceTopEnv _ imports = mi_top_env iface
-            -- Convert IfaceImport to module names
-            usages = [modToTHMod (ifImpModule imp) | imp <- imports]
-        return $ TH.ModuleInfo usages
+        return $ TH.ModuleInfo (thImportedModules (map tcIfaceImport imports))
 
-
+-- | The modules imported by a module, as reported to Template Haskell:
+-- deduplicated, in a deterministic order, and without dependency-only
+-- imports ('isDependOnlyImport') which bring nothing into scope.
+thImportedModules :: [ImportUserSpec] -> [TH.Module]
+thImportedModules import_decls
+  = [ modToTHMod m
+    | m <- sortBy stableModuleCmp $ nubOrd
+             [ is_mod (ius_decl spec)
+             | spec <- import_decls
+             , not (isDependOnlyImport (ius_imports spec)) ] ]
 
 ------------------------------
 mkThAppTs :: TH.Type -> [TH.Type] -> TH.Type
@@ -3109,8 +3140,8 @@ tcGetInterp = do
 
 -- Note [Hard-wiring in-tree template-haskell for desugaring quotes]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- To desugar Template Haskell quotes, GHC needs to wire in a bunch of Names in the
--- `ghc-internal` library as Note [Known-key names], in GHC.Builtin.Names.TH.
+-- To desugar Template Haskell quotes, GHC needs to known a bunch of OccNames,
+-- see Note [Overview of known entities] in GHC.Builtin.
 -- Consider
 -- > foo :: Q Exp
 -- > foo = [| unwords ["hello", "world"] |]

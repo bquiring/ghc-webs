@@ -1,6 +1,4 @@
-
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE BinaryLiterals #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 {-
@@ -25,6 +23,8 @@ module GHC.Types.Demand (
     lubCard, lubDmd, lubSubDmd,
     -- *** Greatest lower bound
     glbCard,
+    -- *** Maximum (glb on strictness, lub on usage)
+    maxCard, maxDmd,
     -- *** Plus
     plusCard, plusDmd, plusSubDmd,
     -- *** Multiply
@@ -51,13 +51,13 @@ module GHC.Types.Demand (
 
     -- * Demand environments
     DmdEnv(..), addVarDmdEnv, mkTermDmdEnv, nopDmdEnv, plusDmdEnv, plusDmdEnvs,
-    multDmdEnv, reuseEnv,
+    lubDmdEnv, multDmdEnv, reuseEnv,
 
     -- * Demand types
     DmdType(..), dmdTypeDepth,
     -- ** Algebra
     nopDmdType, botDmdType,
-    lubDmdType, plusDmdType, multDmdType, discardArgDmds,
+    lubDmdType, maxDmdType, plusDmdType, multDmdType, discardArgDmds,
     -- ** Other operations
     peelFV, findIdDemand, addDemand, splitDmdTy, deferAfterPreciseException,
 
@@ -510,7 +510,7 @@ type CardNonOnce = Card
 -- | Absent, {0}. Pretty-printed as A.
 pattern C_00 :: Card
 pattern C_00 = Card 0b001
--- | Bottom, {}. Pretty-printed as A.
+-- | Bottom, {}. Pretty-printed as B.
 pattern C_10 :: Card
 pattern C_10 = Card 0b000
 -- | Strict and used once, {1}. Pretty-printed as 1.
@@ -866,6 +866,90 @@ lubSubDmd sd1@Poly{}   sd2          = lubSubDmd sd2 sd1
 -- Otherwise (Call `lub` Prod) return Top
 lubSubDmd _            _            = topSubDmd
 
+{- Note [Combining demands for stable unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a function has a stable unfolding, the optimised RHS and the unfolding
+may have different demand signatures for the same arguments. This can happen
+because:
+
+  * The optimised RHS may have had transformations applied that reveal
+    strictness (e.g., inlining exposes a case on an argument).
+    Example:
+       RHS: x
+       Unfolding: head [x]
+    It's clear that the RHS is strict in `x`, but the demand analyser won't
+    spot that when it analyses the unfolding.
+
+  * The optimised RHS may have had transformations applied that drop usage
+    (e.g., a rewrite rule fires that doesn't use an argument, or a seq on
+    a dictionary is dropped because dictionaries are known to terminate;
+    see Note [NON-BOTTOM-DICTS invariant]).
+    Example:
+       RHS: a
+       Unfolding: fst g
+    where `g` is in scope as `g = (a,b)`.
+
+See Note [Absence analysis for stable unfoldings and RULES] in
+GHC.Core.Opt.DmdAnal for the broader context.
+
+When we inline the stable unfolding at a call site, we get the unfolding's
+behaviour, not the RHS's. So we must be conservative and combine the demands:
+
+  * For strictness (lower bounds): we can take the MAXIMUM (glb).
+    If the RHS reveals that an argument is strict, that strictness was
+    always there semantically - the analysis just couldn't see it in the
+    unfolding. Sound optimisations never make lazy code strict.
+
+  * For usage (upper bounds): we must take the MAXIMUM (lub).
+    If the unfolding uses an argument but the RHS doesn't, we must not
+    mark it absent, or we'll replace it with rubbish that the unfolding
+    will then try to use, causing a segfault. See #26416.
+
+So for cardinality bounds [l1..u1] from RHS and [l2..u2] from unfolding,
+we compute [max(l1,l2)..max(u1,u2)].
+-}
+
+-- | Takes the maximum of both the lower and upper bound of two 'Card's.
+-- Semantically, this is glb on lower (strictness) and lub on upper (usage).
+-- See Note [Combining demands for stable unfoldings].
+maxCard :: Card -> Card -> Card
+-- Given Note [Bit vector representation for Card]:
+--   * bit 0 (strictness): take AND (glb) - 0 means strict, so 0 wins
+--   * bits 1,2 (usage): take OR (lub) - if either uses, result uses
+maxCard (Card a) (Card b) = Card ((a .&. b .&. 0b001) .|. ((a .|. b) .&. 0b110))
+
+-- | Takes the maximum of both the lower and upper bounds of two 'Demand's.
+-- Semantically, glb on lower (strictness) and lub on upper (usage).
+-- See Note [Combining demands for stable unfoldings].
+maxDmd :: Demand -> Demand -> Demand
+maxDmd BotDmd      dmd2        = dmd2
+maxDmd dmd1        BotDmd      = dmd1
+maxDmd (n1 :* sd1) (n2 :* sd2) =
+  maxCard n1 n2 :* maxSubDmd sd1 sd2
+
+maxSubDmd :: SubDemand -> SubDemand -> SubDemand
+-- Shortcuts for neutral and absorbing elements.
+maxSubDmd (Poly Unboxed C_00)  sd                   = sd
+maxSubDmd sd                   (Poly Unboxed C_00)  = sd
+maxSubDmd sd@(Poly Boxed C_1N) _                    = sd
+maxSubDmd _                    sd@(Poly Boxed C_1N) = sd
+-- Prod
+maxSubDmd (Prod b1 ds1) (Poly b2 n2)
+  | let !d = polyFieldDmd b2 n2
+  = mkProd (lubBoxity b1 b2) (strictMap (maxDmd d) ds1)
+maxSubDmd (Prod b1 ds1) (Prod b2 ds2)
+  | equalLength ds1 ds2
+  = mkProd (lubBoxity b1 b2) (strictZipWith maxDmd ds1 ds2)
+-- Handle Call
+maxSubDmd (Call n1 sd1) (viewCall -> Just (n2, sd2)) =
+  mkCall (maxCard n1 n2) (maxSubDmd sd1 sd2)
+-- Handle Poly
+maxSubDmd (Poly b1 n1) (Poly b2 n2) = Poly (lubBoxity b1 b2) (maxCard n1 n2)
+-- Other Poly case by commutativity
+maxSubDmd sd1@Poly{}   sd2          = maxSubDmd sd2 sd1
+-- Otherwise (Call `max` Prod) return Top
+maxSubDmd _            _            = topSubDmd
+
 -- | Denotes '+' on 'Demand'.
 plusDmd :: Demand -> Demand -> Demand
 plusDmd AbsDmd      dmd2        = dmd2
@@ -981,18 +1065,10 @@ strictifyDmd = plusDmd seqDmd
 strictifyDictDmd :: Type -> Demand -> Demand
 strictifyDictDmd ty (n :* Prod b ds)
   | not (isAbs n)
-  , Just field_tys <- as_non_newtype_dict ty
-  = C_1N :* mkProd b (zipWith strictifyDictDmd field_tys ds)
+  , isTerminatingType ty
+  , Just (_tc, _arg_tys, _data_con, field_tys) <- splitDataProductType_maybe ty
+  = C_1N :* mkProd b (zipWith strictifyDictDmd (map scaledThing field_tys) ds)
       -- main idea: ensure it's strict
-  where
-    -- Return a TyCon and a list of field types if the given
-    -- type is a non-newtype dictionary type
-    as_non_newtype_dict ty
-      | isTerminatingType ty
-      , Just (_tc, _arg_tys, _data_con, field_tys) <- splitDataProductType_maybe ty
-      = Just (map scaledThing field_tys)
-      | otherwise
-      = Nothing
 strictifyDictDmd _  dmd = dmd
 
 -- | Make a 'Demand' lazy.
@@ -1774,12 +1850,14 @@ botDmdEnv = mkEmptyDmdEnv botDiv
 exnDmdEnv :: DmdEnv
 exnDmdEnv = mkEmptyDmdEnv exnDiv
 
+combineDmdEnv :: (Demand -> Demand -> Demand) -> DmdEnv -> DmdEnv -> DmdEnv
+combineDmdEnv f (DE fv1 d1) (DE fv2 d2)
+  -- See Note [Demand env Equality]
+  = DE (plusVarEnv_CD f fv1 (defaultFvDmd d1) fv2 (defaultFvDmd d2))
+       (lubDivergence d1 d2)
+
 lubDmdEnv :: DmdEnv -> DmdEnv -> DmdEnv
-lubDmdEnv (DE fv1 d1) (DE fv2 d2) = DE lub_fv lub_div
-  where
-    -- See Note [Demand env Equality]
-    lub_fv  = plusVarEnv_CD lubDmd fv1 (defaultFvDmd d1) fv2 (defaultFvDmd d2)
-    lub_div = lubDivergence d1 d2
+lubDmdEnv = combineDmdEnv lubDmd
 
 addVarDmdEnv :: DmdEnv -> Id -> Demand -> DmdEnv
 addVarDmdEnv env@(DE fvs div) id dmd
@@ -1833,16 +1911,31 @@ instance Eq DmdType where
     = ds1 == ds2 -- cheap checks first
       && env1 == env2
 
+-- | The smaller 'DmdType' is eta expanded using its 'defaultArgDmd'.
+-- See Note [Default demand on free variables and arguments].
+zipDmdType :: (Demand -> Demand -> Demand) -> DmdType -> DmdType -> DmdType
+zipDmdType f (DmdType fv1 ds1) (DmdType fv2 ds2)
+  = DmdType (combineDmdEnv f fv1 fv2) (go ds1 ds2)
+  where
+    def1, def2 :: Demand  -- Default argument demands for eta expansion
+    def1 = defaultArgDmd (de_div fv1)
+    def2 = defaultArgDmd (de_div fv2)
+
+    -- If `ds1` is shorter than `ds2`, extend `ds1` with the appropriate
+    -- default demand `def1`; and similarly if `ds2` is shorter
+    go (d1:ds1') (d2:ds2') = f d1 d2 : go ds1' ds2'
+    go []        ds2'      = map (def1 `f`) ds2'
+    go ds1'      []        = map (`f` def2) ds1'
+
 -- | Compute the least upper bound of two 'DmdType's elicited /by the same
 -- incoming demand/!
 lubDmdType :: DmdType -> DmdType -> DmdType
-lubDmdType d1 d2 = DmdType lub_fv lub_ds
-  where
-    n = max (dmdTypeDepth d1) (dmdTypeDepth d2)
-    (DmdType fv1 ds1) = etaExpandDmdType n d1
-    (DmdType fv2 ds2) = etaExpandDmdType n d2
-    lub_ds  = zipWithEqual lubDmd ds1 ds2
-    lub_fv = lubDmdEnv fv1 fv2
+lubDmdType = zipDmdType lubDmd
+
+-- | Combine two 'DmdType's for stable unfolding analysis.
+-- See Note [Combining demands for stable unfoldings].
+maxDmdType :: DmdType -> DmdType -> DmdType
+maxDmdType = zipDmdType maxDmd
 
 discardArgDmds :: DmdType -> DmdEnv
 discardArgDmds (DmdType fv _) = fv
@@ -1951,7 +2044,7 @@ gets reached.  For example, we don't want to be strict in the strict free
 variables of 'rhs'.
 
 So we have the simple definition
-  deferAfterPreciseException = lubDmdType (DmdType emptyDmdEnv [] exnDiv)
+  deferAfterPreciseException = lubDmdType (DmdType (DE emptyVarEnv exnDiv) [])
 
 Historically, when we had `lubBoxity = _unboxedWins` (see Note [unboxedWins]),
 we had a more complicated definition for deferAfterPreciseException to make sure
@@ -1959,7 +2052,7 @@ it preserved boxity in its argument. That was needed for code like
    case <I/O operation> of
       (# s', r) -> f x
 
-which uses `x` *boxed*. If we `lub`bed it with `(DmdType emptyDmdEnv [] exnDiv)`
+which uses `x` *boxed*. If we `lub`bed it with `(DmdType (DE emptyVarEnv exnDiv) [])`
 we'd get an *unboxed* demand on `x` (because we let Unboxed win),
 which led to #20746.  Nowadays with `lubBoxity = boxedWins` we don't need
 the complicated definition.
@@ -2096,8 +2189,8 @@ transformer, namely
         a single DmdType
 (Nevertheless we dignify DmdSig as a distinct type.)
 
-The DmdSig for an Id is a semantic thing.  Suppose a function `f` has a DmdSig of
-  DmdSig (DmdType (fv_dmds,res) [d1..dn])
+The DmdSig for an Id is a semantic thing. Suppose a function `f` has a DmdSig of
+  DmdSig (DmdType (DE fv_dmds div) [d1..dn])
 Here `n` is called the "demand-sig arity" of the DmdSig.  The signature means:
   * If you apply `f` to n arguments (the demand-sig-arity)
   * then you can unleash demands d1..dn on the arguments
@@ -2111,10 +2204,10 @@ demand, used for signature inference. Therefore we place a top demand on all
 arguments.
 
 For example, the demand transformer described by the demand signature
-        DmdSig (DmdType {x -> <1L>} <A><1P(L,L)>)
+        <A><1P(L,L)>{x->1L}
 says that when the function is applied to two arguments, it
-unleashes demand 1L on the free var x, A on the first arg,
-and 1P(L,L) on the second.
+unleashes demand A on the first arg, 1P(L,L) on the second,
+and 1L on the free var x.
 
 If this same function is applied to one arg, all we can say is that it
 uses x with 1L, and its arg with demand 1P(L,L).
@@ -2134,10 +2227,10 @@ was evaluated. Here's an example:
 
 The abstract transformer (let's call it F_e) of the if expression (let's
 call it e) would transform an incoming (undersaturated!) head sub-demand A
-into a demand type like {x-><1L>,y-><L>}<L>. In pictures:
+into a demand type like <L>{x->1L,y->L}. In pictures:
 
      SubDemand ---F_e---> DmdType
-     <A>                  {x-><1L>,y-><L>}<L>
+     <A>                  <L>{x->1L,y->L}
 
 Let's assume that the demand transformers we compute for an expression are
 correct wrt. to some concrete semantics for Core. How do demand signatures fit
@@ -2145,7 +2238,7 @@ in? They are strange beasts, given that they come with strict rules when to
 it's sound to unleash them.
 
 Fortunately, we can formalise the rules with Galois connections. Consider
-f's strictness signature, {}<1L><L>. It's a single-point approximation of
+f's strictness signature, <1L><L>. It's a single-point approximation of
 the actual abstract transformer of f's RHS for arity 2. So, what happens is that
 we abstract *once more* from the abstract domain we already are in, replacing
 the incoming Demand by a simple lattice with two elements denoting incoming
@@ -2165,8 +2258,8 @@ With
 and F_f being the abstract transformer of f's RHS and f_f being the abstracted
 abstract transformer computable from our demand signature simply by
 
-  f_f(>=2) = {}<1L><L>
-  f_f(<2)  = multDmdType C_0N {}<1L><L>
+  f_f(>=2) = <1L><L>
+  f_f(<2)  = multDmdType C_0N <1L><L>
 
 where multDmdType makes a proper top element out of the given demand type.
 
@@ -2188,9 +2281,9 @@ yields a more precise demand type:
 
     incoming sub-demand   |  demand type
     --------------------------------
-    P(A)                  |  <L><L>{}
-    C(1,C(1,P(L)))        |  <1P(L)><L>{}
-    C(1,C(1,1P(1P(L),A))) |  <1P(A)><A>{}
+    P(A)                  |  <L><L>
+    C(1,C(1,P(L)))        |  <1P(L)><L>
+    C(1,C(1,1P(1P(L),A))) |  <1P(A)><A>
 
 Note that in the first example, the depth of the demand type was *higher* than
 the arity of the incoming call demand due to the anonymous lambda.
@@ -2409,20 +2502,23 @@ dmdTransformDataConSig str_marks sd = case viewProd arity body_sd of
 -- on the result into the indicated dictionary component (if saturated).
 -- See Note [Demand transformer for a dictionary selector].
 dmdTransformDictSelSig :: DmdSig -> DmdTransformer
--- NB: This currently doesn't handle newtype dictionaries.
--- It should simply apply call_sd directly to the dictionary, I suppose.
-dmdTransformDictSelSig (DmdSig (DmdType _ [_ :* prod])) call_sd
+
+
+dmdTransformDictSelSig (DmdSig (DmdType _ [_ :* dict_dmd])) call_sd
+   -- NB: dict_dmd comes from the demand signature of the class-op
+   --     which is created in GHC.Types.Id.Make.mkDictSelId
    | (n, sd') <- peelCallDmd call_sd
-   , Prod _ sig_ds <- prod
+   , Prod _ sig_ds <- dict_dmd
    = multDmdType n $
      DmdType nopDmdEnv [C_11 :* mkProd Unboxed (map (enhance sd') sig_ds)]
    | otherwise
    = nopDmdType -- See Note [Demand transformer for a dictionary selector]
   where
-    enhance _  AbsDmd   = AbsDmd
-    enhance _  BotDmd   = BotDmd
-    enhance sd _dmd_var = C_11 :* sd  -- This is the one!
-                                      -- C_11, because we multiply with n above
+    enhance _   AbsDmd   = AbsDmd
+    enhance _   BotDmd   = BotDmd
+    enhance sd' _dmd_var = C_11 :* sd'  -- This is the one!
+                           -- C_11, because we multiply with n above
+
 dmdTransformDictSelSig sig sd = pprPanic "dmdTransformDictSelSig: no args" (ppr sig $$ ppr sd)
 
 {-
@@ -2465,21 +2561,8 @@ demand, really) by the demand 'd'. The '1' acts as if it was a demand variable,
 the whole signature really means `\d. P(AAAdAAAAA)` for any incoming
 demand 'd'.
 
-For single-method classes, which are represented by newtypes the signature
-of 'op' won't look like P(...), so matching on Prod will fail.
-That's fine: if we are doing strictness analysis we are also doing inlining,
-so we'll have inlined 'op' into a cast.  So we can bale out in a conservative
-way, returning nopDmdType. SG: Although we then probably want to apply the eval
-demand 'd' directly to 'op' rather than turning it into 'topSubDmd'...
-
-It is (just.. #8329) possible to be running strictness analysis *without*
-having inlined class ops from single-method classes.  Suppose you are using
-ghc --make; and the first module has a local -O0 flag.  So you may load a class
-without interface pragmas, ie (currently) without an unfolding for the class
-ops.   Now if a subsequent module in the --make sweep has a local -O flag
-you might do strictness analysis, but there is no inlining for the class op.
-This is weird, so I'm not worried about whether this optimises brilliantly; but
-it should not fall over.
+NB: even unary classes behave as if there was a data constructor, and so do
+not need special handling here. See Note [Unary class magic] in GHC.Core.TyCon.
 -}
 
 zapDmdEnv :: DmdEnv -> DmdEnv
@@ -2658,15 +2741,15 @@ This is the syntax for demand signatures:
        |  x            exnDiv
        |  b            botDiv
 
-  sig ::= {x->dx,y->dy,z->dz...}<d1><d2><d3>...<dn>div
-                  ^              ^   ^   ^      ^   ^
-                  |              |   |   |      |   |
-                  |              \---+---+------/   |
-                  |                  |              |
-             demand on free        demand on      divergence
-               variables           arguments      information
-           (omitted if empty)                     (omitted if
-                                                no information)
+  sig ::= <d1><d2><d3>...<dn>div{x->dx,y->dy,z->dz...}
+           ^   ^   ^      ^   ^              ^
+           |   |   |      |   |              |
+           \---+---+------/   |              |
+               |              |              |
+            demand on    divergence        demand on
+            arguments    information      free variables
+                         (omitted if     (omitted if empty)
+                         no information)
 
 Note [Demand examples]
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -2745,7 +2828,10 @@ instance Outputable DmdEnv where
     = ppr div <> if null fv_elts then empty
                  else braces (fsep (map pp_elt fv_elts))
     where
-      pp_elt (uniq, dmd) = ppr uniq <> text "->" <> ppr dmd
+      pp_elt (uniq, dmd) =
+        sdocOption sdocSuppressUniques $ \case
+          True  -> ppr dmd
+          False -> ppr uniq <> text "->" <> ppr dmd
       fv_elts = nonDetUFMToList fvs
         -- It's OK to use nonDetUFMToList here because we only do it for
         -- pretty printing

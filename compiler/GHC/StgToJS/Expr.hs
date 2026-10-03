@@ -1,7 +1,4 @@
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE LambdaCase    #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns  #-}
 
 -----------------------------------------------------------------------------
@@ -59,6 +56,7 @@ import GHC.StgToJS.Linker.Utils (decodeModifiedUTF8)
 import GHC.Types.CostCentre
 import GHC.Types.Tickish
 import GHC.Types.Var.Set
+import GHC.Types.Name
 import GHC.Types.Id
 import GHC.Types.Unique.FM
 import GHC.Types.RepType
@@ -68,7 +66,7 @@ import GHC.Stg.Syntax
 import GHC.Stg.Utils
 
 import GHC.Builtin.PrimOps
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 
 import GHC.Core hiding (Var)
 import GHC.Core.TyCon
@@ -312,7 +310,7 @@ genBody ctx startReg args e typ = do
   -- load arguments into local variables
   la <- do
     args' <- concatMapM genIdArgI args
-    return (declAssignAll args' (fmap toJExpr [startReg..]))
+    return (declAssignAll args' (jsRegsFrom startReg))
 
   -- assert that arguments have valid runtime reps
   lav <- verifyRuntimeReps args
@@ -617,7 +615,7 @@ genCase ctx bnd e at alts l
   | StgLit (LitString bs) <- e
   , [GenStgAlt DEFAULT _ rhs] <- alts
   , StgApp i args <- rhs
-  , idName i == unpackCStringName
+  , i `hasKnownKey` unpackCStringIdKey
   , [StgVarArg b'] <- args
   , bnd == b'
   , Just d <- decodeModifiedUTF8 bs
@@ -629,7 +627,7 @@ genCase ctx bnd e at alts l
   | StgLit (LitString bs) <- e
   , [GenStgAlt DEFAULT _ rhs] <- alts
   , StgApp i args <- rhs
-  , idName i == unpackCStringUtf8Name
+  , i `hasKnownKey` unpackCStringUtf8IdKey
   , [StgVarArg b'] <- args
   , bnd == b'
   , Just d <- decodeModifiedUTF8 bs
@@ -665,7 +663,7 @@ genCase ctx bnd e at alts l
   | otherwise = do
       rj       <- genRet ctx bnd at alts l
       let ctx' = ctxSetTop bnd
-                  $ ctxSetTarget (assocIdExprs bnd (map toJExpr [R1 ..]))
+                  $ ctxSetTarget (assocIdExprs bnd jsRegsFromR1)
                   $ ctx
       (ej, _r) <- genExpr ctx' e
       return (rj <> ej, ExprCont)
@@ -730,7 +728,7 @@ genRet ctx e at as l = freshIdent >>= f
 
     fun free = resetSlots $ do
       decs          <- declVarsForId e
-      load          <- flip assignAll (map toJExpr [R1 ..]) . map toJExpr <$> identsForId e
+      load          <- flip assignAll jsRegsFromR1 . map toJExpr <$> identsForId e
       loadv         <- verifyRuntimeReps [e]
       ras           <- loadRetArgs free
       rasv          <- verifyRuntimeReps (map (\(x,_,_)->x) free)

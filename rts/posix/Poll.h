@@ -1,0 +1,41 @@
+/* -----------------------------------------------------------------------------
+ *
+ * (c) The GHC Team 2020-2023
+ *
+ * An I/O manager based on the classic Unix poll() system call.
+ *
+ * Prototypes for functions in Poll.c
+ *
+ * -------------------------------------------------------------------------*/
+
+#pragma once
+
+#include "IOManager.h"
+
+#include "BeginPrivate.h"
+
+#if defined(IOMGR_ENABLED_POLL)
+
+void initCapabilityIOManagerPoll(CapIOManager *iomgr);
+void freeCapabilityIOManagerPoll(CapIOManager *iomgr);
+
+/* Synchronous I/O and timer operations */
+IOSubmitResult syncIOWaitReadyPoll(CapIOManager *iomgr, StgTSO *tso,
+                                   enum IOReadOrWrite rw, HsInt fd);
+void syncIOCancelPoll(CapIOManager *iomgr, StgTSO *tso);
+
+/* Asynchronous operations */
+IOSubmitResult asyncIOWaitReadyPoll(CapIOManager *iomgr, StgAsyncIOOp *aiop,
+                                    enum IOReadOrWrite rw, int fd);
+void asyncIOCancelPoll(CapIOManager *iomgr, StgAsyncIOOp *aiop);
+
+/* Scheduler operations */
+bool anyPendingTimeoutsOrIOPoll(CapIOManager *iomgr);
+void pollCompletedTimeoutsOrIOPoll(CapIOManager *iomgr);
+bool awaitCompletedTimeoutsOrIOPoll(CapIOManager *iomgr);
+void interruptIOManagerPoll(CapIOManager *iomgr);
+
+#endif /* IOMGR_ENABLED_POLL */
+
+#include "EndPrivate.h"
+

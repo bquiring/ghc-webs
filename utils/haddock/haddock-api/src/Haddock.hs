@@ -29,6 +29,7 @@ module Haddock (
   withGhc
 ) where
 
+import Control.Concurrent.MVar (modifyMVar, modifyMVar_, newMVar)
 import Control.DeepSeq (force)
 import Control.Monad hiding (forM_)
 import Control.Monad.IO.Class (MonadIO(..))
@@ -41,6 +42,7 @@ import Data.Maybe
 import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Version (makeVersion)
+import GHC.Conc (getNumProcessors)
 import GHC.Parser.Lexer (ParserOpts)
 import qualified GHC.Driver.Config.Parser as Parser
 import qualified Data.Map.Strict as Map
@@ -54,6 +56,8 @@ import qualified GHC.Paths as GhcPaths
 import Paths_haddock_api (getDataDir)
 #endif
 import System.Directory (doesDirectoryExist, getTemporaryDirectory)
+import qualified Data.Text as T
+import qualified Data.Text.IO.Utf8 as T.Utf8
 import Text.ParserCombinators.ReadP (readP_to_S)
 import GHC hiding (verbosity)
 import GHC.Settings.Config
@@ -65,6 +69,7 @@ import GHC.Utils.Error
 import GHC.Utils.Logger
 import GHC.Types.Name.Cache
 import GHC.Unit
+import GHC.Unit.External.Index
 import GHC.Utils.Panic (handleGhcException)
 import GHC.Data.FastString
 
@@ -82,12 +87,56 @@ import Haddock.Version
 import Haddock.InterfaceFile
 import Haddock.Options
 import Haddock.Utils
-import Haddock.GhcUtils (modifySessionDynFlags, setOutputDir)
+import Haddock.GhcUtils (fastStringToText, modifySessionDynFlags, setOutputDir)
 import Haddock.Compat (getProcessID)
+import System.Semaphore (AbstractSem(..), openSemaphore, releaseSemaphoreToken, waitOnSemaphore)
 
 --------------------------------------------------------------------------------
 -- * Exception handling
 --------------------------------------------------------------------------------
+
+concSemChoiceFromFlags :: [Flag] -> Maybe (Either FilePath (Maybe Int))
+concSemChoiceFromFlags =
+  List.foldl' step Nothing
+  where
+    step _ (Flag_ParCount n) = Just (Right n)
+    step _ (Flag_ParSemaphore sem) = Just (Left sem)
+    step acc _ = acc
+
+-- | Build the render concurrency semaphore selected by Haddock's parallelism flags.
+-- Without an explicit flag, render sequentially; @-j@ uses the host processor
+-- count, @-jN@ uses a local bounded semaphore, and @-jsem@ joins the external
+-- semaphore used for GHC jobserver coordination.
+concSemFromChoice :: Maybe (Either FilePath (Maybe Int)) -> IO AbstractSem
+concSemFromChoice choice =
+  case choice of
+    Nothing -> newBoundedSem 1
+    Just (Right Nothing) -> newBoundedSem =<< getNumProcessors
+    Just (Right (Just n)) -> newBoundedSem n
+    Just (Left semName) -> do
+      openSemaphore semName >>= \case
+        Left err -> throwIO err
+        Right sem -> do
+          tokens <- newMVar []
+          pure
+            AbstractSem
+              { acquireSem = mask $ \restore -> do
+                  token <- restore (waitOnSemaphore sem)
+                  modifyMVar_ tokens $ \held -> pure (token : held)
+              , releaseSem = mask_ $ do
+                  token <- modifyMVar tokens $ \case
+                    [] -> pure ([], Nothing)
+                    heldToken : heldTokens -> pure (heldTokens, Just heldToken)
+                  forM_ token releaseSemaphoreToken
+              }
+
+injectParFlags :: Maybe (Either FilePath (Maybe Int)) -> [Flag] -> [Flag]
+injectParFlags choice flags =
+  case choice of
+    Nothing -> flags
+    Just (Right Nothing) -> Flag_OptGhc "-j" : flags
+    Just (Right (Just n)) -> Flag_OptGhc ("-j" ++ show n) : flags
+    Just (Left sem) -> Flag_OptGhc "-jsem" : Flag_OptGhc sem : flags
 
 
 handleTopExceptions :: IO a -> IO a
@@ -177,11 +226,12 @@ haddockWithGhc ghc args = handleTopExceptions $ do
           Just "YES" | not noCompilation -> return $ Flag_OptGhc "-dynamic-too" : flags
           _ -> return flags
 
-  -- Inject `-j` into ghc options, if given to Haddock
-  flags' <- pure $ case optParCount flags'' of
-    Nothing       -> flags''
-    Just Nothing  -> Flag_OptGhc "-j" : flags''
-    Just (Just n) -> Flag_OptGhc ("-j" ++ show n) : flags''
+  let parChoice = concSemChoiceFromFlags flags''
+
+  -- Inject parallelism flags into ghc options, if given to Haddock
+  flags' <- pure $ injectParFlags parChoice flags''
+
+  concSem <- concSemFromChoice parChoice
 
   -- Whether or not to bypass the interface version check
   let noChecks = Flag_BypassInterfaceVersonCheck `elem` flags
@@ -211,7 +261,9 @@ haddockWithGhc ghc args = handleTopExceptions $ do
     logger' <- getLogger
     let logger = setLogFlags logger' (initLogFlags dflags)
     let parserOpts = Parser.initParserOpts dflags
-    !unit_state <- hsc_units <$> getSession
+    env <- getSession
+    let !unit_state = hsc_units env
+    !unit_index <- liftIO $ hscUnitIndex env
 
     -- If any --show-interface was used, show the given interfaces
     forM_ (optShowInterfaceFile flags) $ \path -> liftIO $ do
@@ -238,7 +290,7 @@ haddockWithGhc ghc args = handleTopExceptions $ do
           }
 
       -- Render the interfaces.
-      liftIO $ renderStep dflags parserOpts logger unit_state flags sinceQual qual packages ifaces
+      liftIO $ renderStep dflags parserOpts logger unit_index unit_state flags sinceQual qual concSem packages ifaces
 
     -- If we were not given any input files, error if documentation was
     -- requested
@@ -251,7 +303,7 @@ haddockWithGhc ghc args = handleTopExceptions $ do
       packages <- liftIO $ readInterfaceFiles name_cache (readIfaceArgs flags) noChecks
 
       -- Render even though there are no input files (usually contents/index).
-      liftIO $ renderStep dflags parserOpts logger unit_state flags sinceQual qual packages []
+      liftIO $ renderStep dflags parserOpts logger unit_index unit_state flags sinceQual qual concSem packages []
 
 -- | Run the GHC action using a temporary output directory
 withTempOutputDir :: Ghc a -> Ghc a
@@ -307,14 +359,16 @@ renderStep
   :: DynFlags
   -> ParserOpts
   -> Logger
+  -> UnitIndex
   -> UnitState
   -> [Flag]
   -> SinceQual
   -> QualOption
+  -> AbstractSem
   -> [(DocPaths, Visibility, FilePath, InterfaceFile)]
   -> [Interface]
   -> IO ()
-renderStep dflags parserOpts logger unit_state flags sinceQual nameQual pkgs interfaces = do
+renderStep dflags parserOpts logger unit_index unit_state flags sinceQual nameQual concSem pkgs interfaces = do
   updateHTMLXRefs (map (\(docPath, _ifaceFilePath, _showModules, ifaceFile) ->
                           ( case baseUrl flags of
                               Nothing  -> docPathsHtml docPath
@@ -330,7 +384,7 @@ renderStep dflags parserOpts logger unit_state flags sinceQual nameQual pkgs int
       (DocPaths {docPathsSources=Just path}, _, _, ifile) <- pkgs
       iface <- ifInstalledIfaces ifile
       return (instMod iface, path)
-  render dflags parserOpts logger unit_state flags sinceQual nameQual interfaces installedIfaces extSrcMap
+  render dflags parserOpts logger unit_index unit_state flags sinceQual nameQual concSem interfaces installedIfaces extSrcMap
   where
     -- get package name from unit-id
     packageName :: Unit -> String
@@ -344,15 +398,17 @@ render
   :: DynFlags
   -> ParserOpts
   -> Logger
+  -> UnitIndex
   -> UnitState
   -> [Flag]
   -> SinceQual
   -> QualOption
+  -> AbstractSem
   -> [Interface]
   -> [(FilePath, PackageInterfaces)]
   -> Map Module FilePath
   -> IO ()
-render dflags parserOpts logger unit_state flags sinceQual qual ifaces packages extSrcMap = do
+render dflags parserOpts logger unit_index unit_state flags sinceQual qual concSem ifaces packages extSrcMap = do
   let
     packageInfo = PackageInfo { piPackageName    = fromMaybe (PackageName mempty)
                                                  $ optPackageName flags
@@ -405,7 +461,7 @@ render dflags parserOpts logger unit_state flags sinceQual qual ifaces packages 
     pkgKey           = fmap moduleUnit pkgMod
     pkgStr           = fmap unitString pkgKey
     pkgNameVer       = modulePackageInfo unit_state flags pkgMod
-    pkgName          = fmap (unpackFS . (\(PackageName n) -> n)) (fst pkgNameVer)
+    pkgName          = fmap (fastStringToText . (\(PackageName n) -> n)) (fst pkgNameVer)
     sincePkg         = case sinceQual of
                          External -> pkgName
                          Always -> Nothing
@@ -454,7 +510,7 @@ render dflags parserOpts logger unit_state flags sinceQual qual ifaces packages 
     -- records the *wired in* identity base.  So untranslate it
     -- so that we can service the request.
     unwire :: Module -> Module
-    unwire m = m { moduleUnit = unwireUnit unit_state (moduleUnit m) }
+    unwire m = m { moduleUnit = unwireUnit unit_index (moduleUnit m) }
 
   reexportedIfaces <- concat `fmap` (for (reexportFlags flags) $ \mod_str -> do
     let warn' = hPutStrLn stderr . ("Warning: " ++)
@@ -516,7 +572,7 @@ render dflags parserOpts logger unit_state flags sinceQual qual ifaces packages 
                   prologue
                   themes opt_mathjax sourceUrls' opt_wiki_urls opt_base_url
                   opt_contents_url opt_index_url unicode sincePkg packageInfo
-                  qual pretty withQuickjump
+                  qual pretty concSem withQuickjump
       return ()
     unless (withBaseURL || isJust (optOneShot flags)) $ do
       copyHtmlBits odir libDir themes withQuickjump
@@ -555,7 +611,7 @@ render dflags parserOpts logger unit_state flags sinceQual qual ifaces packages 
   when (Flag_HyperlinkedSource `elem` flags && not (null ifaces)) $ do
     withTiming logger "ppHyperlinkedSource" (const ()) $ do
       _ <- {-# SCC ppHyperlinkedSource #-}
-           ppHyperlinkedSource (verbosity flags) (isJust (optOneShot flags)) odir libDir opt_source_css pretty srcMap ifaces
+           ppHyperlinkedSource (verbosity flags) (isJust (optOneShot flags)) odir libDir opt_source_css pretty concSem srcMap ifaces
       return ()
 
 
@@ -644,7 +700,7 @@ withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
 
       (dynflags'', rest, _) <- parseDynamicFlags logger dynflags' (map noLoc flags')
       if not (null rest)
-        then throwE ("Couldn't parse GHC options: " ++ unwords flags')
+        then throwE (T.pack ("Couldn't parse GHC options: " ++ unwords flags'))
         else return dynflags''
 
 unsetPatternMatchWarnings :: DynFlags -> DynFlags
@@ -832,14 +888,11 @@ getPrologue parserOpts flags =
   case [filename | Flag_Prologue filename <- flags ] of
     [] -> return Nothing
     [filename] -> do
-      h <- openFile filename ReadMode
-      hSetEncoding h utf8
-      str <- hGetContents h -- semi-closes the handle
+      str <- T.Utf8.readFile filename
       return . Just $! second (fmap rdrName) $ parseParas parserOpts Nothing str
     _ -> throwE "multiple -p/--prologue options"
 
 
 rightOrThrowE :: Either String b -> IO b
-rightOrThrowE (Left msg) = throwE msg
+rightOrThrowE (Left msg) = throwE (T.pack msg)
 rightOrThrowE (Right x) = pure x
-

@@ -1,3 +1,5 @@
--- External symbols referenced by the RTS
-ld-options:
-#include "external-symbols.flags"
+extra-libraries: @EXTRA_LIBS@
+extra-libraries-static: @EXTRA_LIBS@
+include-dirs: @FFIIncludeDir@
+extra-lib-dirs: @FFILibDir@
+extra-lib-dirs-static: @FFILibDir@

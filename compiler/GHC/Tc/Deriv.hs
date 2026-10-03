@@ -5,14 +5,13 @@
 -}
 
 
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- | Handles @deriving@ clauses on @data@ declarations.
-module GHC.Tc.Deriv ( tcDeriving, DerivInfo(..) ) where
+module GHC.Tc.Deriv ( tcDeriving, DerivInfo(..), tcOverlapMode ) where
 
 import GHC.Prelude
 
@@ -22,6 +21,7 @@ import GHC.Driver.Session
 import GHC.Tc.Errors.Types
 import GHC.Tc.Instance.Family
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.ErrCtxt( UserTypeCtxt(..) )
 import GHC.Tc.Deriv.Infer
 import GHC.Tc.Deriv.Utils
 import GHC.Tc.Deriv.Generate
@@ -57,15 +57,13 @@ import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.SrcLoc
 
-import GHC.Unit.Module.Warnings
-import GHC.Builtin.Names
+import GHC.Builtin.KnownKeys
 
 import GHC.Utils.Error
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Logger
-import GHC.Utils.FV as FV (fvVarList, unionFV, mkFVs)
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Data.Bag
@@ -181,7 +179,7 @@ data DerivInfo = DerivInfo { di_rep_tc  :: TyCon
                              -- See @Note [Scoped tyvars in a TcTyCon]@ in
                              -- "GHC.Core.TyCon".
                            , di_clauses :: [LHsDerivingClause GhcRn]
-                           , di_ctxt    :: ErrCtxtMsg -- ^ error context
+                           , di_ctxt    :: HsCtxt -- ^ error context
                            }
 
 {-
@@ -198,7 +196,7 @@ tcDeriving  :: [DerivInfo]       -- All `deriving` clauses
             -> TcM (TcGblEnv, Bag (InstInfo GhcRn), HsValBinds GhcRn)
 tcDeriving deriv_infos deriv_decls
   = recoverM (do { g <- getGblEnv
-                 ; return (g, emptyBag, emptyValBindsOut)}) $
+                 ; return (g, emptyBag, emptyValBindsRn)}) $
     do  { -- Fish the "deriving"-related information out of the GHC.Tc.Utils.Env
           -- And make the necessary "equations".
           early_specs <- makeDerivSpecs deriv_infos deriv_decls
@@ -250,7 +248,7 @@ tcDeriving deriv_infos deriv_decls
 
         ; gbl_env <- tcExtendLocalInstEnv (map iSpec (bagToList inst_info))
                                           getGblEnv
-        ; let all_dus = rn_dus `plusDU` usesOnly (NameSet.mkFVs $ concat fvs)
+        ; let all_dus = rn_dus `plusDU` usesOnly (NameSet.mkFNs $ concat fvs)
         ; return (addTcgDUs gbl_env all_dus, inst_info, rn_aux_binds) } }
   where
     ddump_deriving :: Bag (InstInfo GhcRn) -> HsValBinds GhcRn
@@ -298,19 +296,19 @@ renameDeriv inst_infos bagBinds
         -- before renaming the instances themselves
         ; traceTc "rnd" (vcat (map (\i -> pprInstInfoDetails i $$ text "") inst_infos))
         ; let (aux_binds, aux_sigs) = unzipBag bagBinds
-              aux_val_binds = ValBinds NoAnnSortKey (bagToList aux_binds) (bagToList aux_sigs)
+              aux_val_binds = ValBinds noExtField (map VbBind (bagToList aux_binds) ++ map VbSig (bagToList aux_sigs))
         -- Importantly, we use rnLocalValBindsLHS, not rnTopBindsLHS, to rename
         -- auxiliary bindings as if they were defined locally.
         -- See Note [Auxiliary binders] in GHC.Tc.Deriv.Generate.
-        ; (bndrs, rn_aux_lhs) <- rnLocalValBindsLHS emptyMiniFixityEnv aux_val_binds
+        ; (bndrs, (binds', sigs')) <- rnLocalValBindsLHS emptyMiniFixityEnv aux_val_binds
         ; bindLocalNames bndrs $
-    do  { (rn_aux, dus_aux) <- rnLocalValBindsRHS (mkNameSet bndrs) rn_aux_lhs
+    do  { (rn_aux, dus_aux) <- rnLocalValBindsRHS (mkNameSet bndrs) (makeRnValBinds noExtField binds' sigs')
         ; (rn_inst_infos, fvs_insts) <- mapAndUnzipM rn_inst_info inst_infos
         ; return (listToBag rn_inst_infos, rn_aux,
-                  dus_aux `plusDU` usesOnly (plusFVs fvs_insts)) } }
+                  dus_aux `plusDU` usesOnly (plusFNs fvs_insts)) } }
 
   where
-    rn_inst_info :: InstInfo GhcPs -> TcM (InstInfo GhcRn, FreeVars)
+    rn_inst_info :: InstInfo GhcPs -> TcM (InstInfo GhcRn, FreeNames)
     rn_inst_info
       inst_info@(InstInfo { iSpec = inst
                           , iBinds = InstBindings
@@ -511,7 +509,7 @@ makeDerivSpecs deriv_infos deriv_decls
         ; eqns2 <- mapM (recoverM (pure Nothing) . deriveStandalone) deriv_decls
         ; return $ concat eqns1 ++ catMaybes eqns2 }
   where
-    deriv_clause_preds :: LDerivClauseTys GhcRn -> LocatedC [LHsSigType GhcRn]
+    deriv_clause_preds :: LDerivClauseTys GhcRn -> LocatedA [LHsSigType GhcRn]
     deriv_clause_preds (L loc dct) = case dct of
       DctSingle _ ty -> L loc [ty]
       DctMulti _ tys -> L loc tys
@@ -522,9 +520,9 @@ deriveClause :: TyCon
              -> [(Name, TcTyVar)]  -- Scoped type variables taken from tcTyConScopedTyVars
                                    -- See Note [Scoped tyvars in a TcTyCon] in "GHC.Core.TyCon"
              -> Maybe (LDerivStrategy GhcRn)
-             -> LocatedC [LHsSigType GhcRn]
+             -> LocatedA [LHsSigType GhcRn]
                 -- ^ The location refers to the @(Show, Eq)@ part of @deriving (Show, Eq)@.
-             -> ErrCtxtMsg
+             -> HsCtxt
              -> TcM [EarlyDerivSpec]
 deriveClause rep_tc scoped_tvs mb_lderiv_strat (L loc deriv_preds) err_ctxt
   = setSrcSpanA loc $
@@ -554,7 +552,7 @@ deriveClause rep_tc scoped_tvs mb_lderiv_strat (L loc deriv_preds) err_ctxt
         return (snd <$> earlyDerivSpecs)
   where
     tvs = tyConTyVars rep_tc
-    (tc, tys) = case tyConFamInstSig_maybe rep_tc of
+    (tc, tys) = case tyConDataFamInstSig_maybe rep_tc of
                         -- data family:
                   Just (fam_tc, pats, _) -> (fam_tc, pats)
       -- NB: deriveTyData wants the *user-specified*
@@ -584,7 +582,7 @@ derivePred tc tys mb_lderiv_strat via_tvs deriv_pred =
       Nothing -> return Nothing
       Just (cls, cls_tvs, arg_tys, arg_kind) ->
         do let mb_deriv_strat = fmap unLoc mb_lderiv_strat
-           if className cls == typeableClassName
+           if cls `hasKnownKey` typeableClassKey
            then do warnUselessTypeable
                    return Nothing
            else let deriv_tvs = via_tvs ++ cls_tvs in
@@ -697,7 +695,7 @@ deriveStandalone (L loc (DerivDecl (warn, _) deriv_ty mb_lderiv_strat overlap_mo
   = setSrcSpanA loc                       $
     addErrCtxt (StandaloneDerivCtxt deriv_ty)  $
     do { traceTc "Standalone deriving decl for" (ppr deriv_ty)
-       ; let ctxt = GHC.Tc.Types.Origin.InstDeclCtxt True
+       ; let ctxt = GHC.Tc.Types.ErrCtxt.InstDeclCtxt True
        ; traceTc "Deriving strategy (standalone deriving)" $
            vcat [ppr mb_lderiv_strat, ppr deriv_ty]
        ; (mb_lderiv_strat, via_tvs) <- tcDerivStrategy mb_lderiv_strat
@@ -761,11 +759,11 @@ deriveStandalone (L loc (DerivDecl (warn, _) deriv_ty mb_lderiv_strat overlap_mo
               , text "inst_tys':" <+> ppr inst_tys' ]
                 -- C.f. GHC.Tc.TyCl.Instance.tcLocalInstDecl1
 
-       ; if className cls == typeableClassName
+       ; if cls `hasKnownKey` typeableClassKey
          then do warnUselessTypeable
                  return Nothing
          else do early_deriv_spec <-
-                   mkEqnHelp (fmap unLoc overlap_mode)
+                   mkEqnHelp (fmap (tcOverlapMode . unLoc) overlap_mode)
                              tvs' cls inst_tys'
                              deriv_ctxt' mb_deriv_strat'
                              (fmap unLoc warn)
@@ -774,6 +772,16 @@ deriveStandalone (L loc (DerivDecl (warn, _) deriv_ty mb_lderiv_strat overlap_mo
                    deriv_ty
                    early_deriv_spec
                  pure (Just early_deriv_spec) }
+
+
+tcOverlapMode :: OverlapMode GhcRn -> OverlapMode GhcTc
+tcOverlapMode = \case
+  NoOverlap    s -> NoOverlap    (fst s)
+  Overlappable s -> Overlappable (fst s)
+  Overlapping  s -> Overlapping  (fst s)
+  Overlaps     s -> Overlaps     (fst s)
+  Incoherent   s -> Incoherent   (fst s)
+  NonCanonical s -> NonCanonical (fst s)
 
 -- Typecheck the type in a standalone deriving declaration.
 --
@@ -801,7 +809,7 @@ tcStandaloneDerivInstType ctxt
     (HsWC { hswc_body = deriv_ty@(L loc (HsSig { sig_bndrs = outer_bndrs
                                                , sig_body = deriv_ty_body }))})
   | (theta, rho) <- splitLHsQualTy deriv_ty_body
-  , [wc_pred] <- fromMaybeContext theta
+  , [wc_pred] <- hsc_ctxt $ fromMaybeContext theta
   , L wc_span (HsWildCardTy _) <- ignoreParens wc_pred
   = do dfun_ty <- tcHsClsInstType ctxt $ L loc $
                   HsSig { sig_ext   = noExtField
@@ -884,9 +892,9 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
                                          final_cls_tys ++ final_tc_args
                                            ++ deriv_strat_tys final_mb_deriv_strat
 
-        ; let tkvs = scopedSort $ fvVarList $
-                     unionFV (tyCoFVsOfTypes tc_args_to_keep)
-                             (FV.mkFVs deriv_tvs)
+        ; let tkvs = scopedSort $ dVarSetElems $
+                     tyCoVarsOfTypesDSet tc_args_to_keep
+                     `extendDVarSetList` deriv_tvs
               (tkvs', cls_tys', tc_args', mb_deriv_strat')
                 = propagate_subst kind_subst tkvs cls_tys
                                   tc_args_to_keep mb_deriv_strat
@@ -958,7 +966,7 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
 You might wonder if we could use (tyConArity tc) at this point, rather
 than (length tc_args).  But for data families the two can differ!  The
 tc and tc_args passed into 'deriveTyData' come from 'deriveClause' which
-in turn gets them from 'tyConFamInstSig_maybe' which in turn gets them
+in turn gets them from 'tyConDataFamInstSig_maybe' which in turn gets them
 from DataFamInstTyCon:
 
 | DataFamInstTyCon          -- See Note [Data type families]
@@ -1220,7 +1228,7 @@ instance (at least from the user's perspective), the amount of engineering
 required to obtain the latter instance just isn't worth it.
 -}
 
-mkEqnHelp :: Maybe OverlapMode
+mkEqnHelp :: Maybe (OverlapMode GhcTc)
           -> [TyVar]
           -> Class -> [Type]
           -> DerivContext
@@ -2181,7 +2189,7 @@ doDerivInstErrorChecks2 clas clas_inst theta wildcard mechanism
          -- Check for Generic instances that are derived with an exotic
          -- deriving strategy like DAC
          -- See Note [Deriving strategies]
-       ; when (exotic_mechanism && className clas `elem` genericClassNames) $
+       ; when (exotic_mechanism && getUnique clas `elem` genericClassKeys) $
          do { failIfTc (safeLanguageOn dflags)
                        (TcRnCannotDeriveInstance clas mempty Nothing NoGeneralizedNewtypeDeriving $
                           DerivErrSafeHaskellGenericInst)
@@ -2352,4 +2360,3 @@ derivingThingErrMechanism mechanism why
     newtype_deriving
       = if isDerivSpecNewtype mechanism then YesGeneralizedNewtypeDeriving
                                         else NoGeneralizedNewtypeDeriving
-

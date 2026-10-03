@@ -140,6 +140,45 @@ EXTERN_INLINE StgHalfWord GET_TAG(const StgClosure *con)
     return get_itbl(con)->srt;
 }
 
+/* ----------------------------------------------------------------------------
+   Macros for untagging and retagging closure pointers
+   For more information look at the comments in Cmm.h
+   ------------------------------------------------------------------------- */
+
+EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p);
+EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p)
+{
+    return (StgWord)p & TAG_MASK;
+}
+
+EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p);
+EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p)
+{
+    return (StgClosure*)((StgWord)p & ~TAG_MASK);
+}
+
+EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p);
+EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p)
+{
+    return (const StgClosure*)((StgWord)p & ~TAG_MASK);
+}
+
+EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p);
+EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p)
+{
+    return (StgClosure*)((StgWord)p | tag);
+}
+
+// Compute the pointer tag for the constructor and tag the pointer;
+// see Note [Data constructor dynamic tags] in GHC.StgToCmm.Closure.
+//
+// Note: we need to update this if we change the tagging strategy.
+EXTERN_INLINE StgClosure *tagConstr(StgClosure *con);
+EXTERN_INLINE StgClosure *tagConstr(StgClosure *con)
+{
+    return TAG_CLOSURE(stg_min(TAG_MASK, 1 + GET_TAG(con)), con);
+}
+
 /* -----------------------------------------------------------------------------
    Macros for building closures
    -------------------------------------------------------------------------- */
@@ -252,35 +291,6 @@ EXTERN_INLINE P_ INTLIKE_CLOSURE(int n) {
     return (P_)&stg_INTLIKE_closure[(n)-MIN_INTLIKE];
 }
 
-/* ----------------------------------------------------------------------------
-   Macros for untagging and retagging closure pointers
-   For more information look at the comments in Cmm.h
-   ------------------------------------------------------------------------- */
-
-EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p);
-EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p)
-{
-    return (StgWord)p & TAG_MASK;
-}
-
-EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p);
-EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p)
-{
-    return (StgClosure*)((StgWord)p & ~TAG_MASK);
-}
-
-EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p);
-EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p)
-{
-    return (const StgClosure*)((StgWord)p & ~TAG_MASK);
-}
-
-EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p);
-EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p)
-{
-    return (StgClosure*)((StgWord)p | tag);
-}
-
 /* -----------------------------------------------------------------------------
    Forwarding pointers
    -------------------------------------------------------------------------- */
@@ -371,6 +381,18 @@ EXTERN_INLINE StgOffset THUNK_SELECTOR_sizeW ( void )
 EXTERN_INLINE StgOffset BLACKHOLE_sizeW ( void );
 EXTERN_INLINE StgOffset BLACKHOLE_sizeW ( void )
 { return sizeofW(StgInd); } // a BLACKHOLE is a kind of indirection
+
+/* -----------------------------------------------------------------------------
+   Blackhole predicates
+   -------------------------------------------------------------------------- */
+
+#define IS_BLACKHOLE_INFO(info) \
+    ((info) == &stg_BLACKHOLE_info || \
+     (info) == &__stg_EAGER_BLACKHOLE_info || \
+     (info) == &stg_CAF_BLACKHOLE_info)
+
+#define IS_BLACKHOLE_OR_WHITEHOLE_INFO(info) \
+    (IS_BLACKHOLE_INFO(info) || (info) == &stg_WHITEHOLE_info)
 
 /* --------------------------------------------------------------------------
    Sizes of closures
@@ -511,29 +533,34 @@ EXTERN_INLINE StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n)
  */
 
  /*
-   Note [zeroing slop when overwriting closures]
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   When we overwrite a closure in the heap with a smaller one, in some scenarios
-   we need to write zero words into "slop"; the memory that is left
-   unoccupied. See Note [slop on the heap]
+   Note [marking slop when overwriting immutable closures]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   When we overwrite a closure in the heap with a smaller one, we need to mark
+   the "slop" -- the memory that is left unoccupied -- so that the heap can be
+   linearly scanned. See Note [slop on the heap]
 
-   Zeroing slop is required for:
+   For mutable closures (e.g. shrinking arrays), slop is always marked
+   unconditionally via writeSlopMarker, in all build modes.
+   See Note [shrink-array slop marker] in PrimOps.cmm.
+
+   For immutable closures (e.g. thunks overwritten with indirections), slop
+   marking is only needed for:
 
     - full-heap sanity checks (DEBUG, and +RTS -DS),
 
-    - LDV profiling (PROFILING, and +RTS -hb) and
+    - LDV profiling (PROFILING, and +RTS -hb)
 
-   However we can get into trouble if we're zeroing slop for ordinarily
-   immutable closures when using multiple threads, since there is nothing
-   preventing another thread from still being in the process of reading the
-   memory we're about to zero.
+   However we can get into trouble if we're marking slop for immutable closures
+   when using multiple threads, since there is nothing preventing another thread
+   from still being in the process of reading the memory we're about to
+   overwrite.
 
-   Thus, with the THREADED RTS and +RTS -N2 or greater we must not zero
+   Thus, with the THREADED RTS and +RTS -N2 or greater we must not mark
    immutable closure's slop. Similarly, the concurrent GC's mark thread
-   may race when a mutator during slop-zeroing. Consequently, we also disable
-   zeroing when the non-moving GC is in use.
+   may race with a mutator during slop marking. Consequently, we also disable
+   marking of immutable closures when the non-moving GC is in use.
 
-   Hence, an immutable closure's slop is zeroed when either:
+   Hence, an immutable closure's slop is marked when either:
 
     - PROFILING && era > 0 (LDV is on) && !nonmoving-gc-enabled or
     - !THREADED && DEBUG
@@ -553,15 +580,11 @@ EXTERN_INLINE StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n)
     overwritingClosure(c)
 #define OVERWRITING_CLOSURE_SIZE(c, size) \
     overwritingClosureSize(c, size)
-#define OVERWRITING_CLOSURE_MUTABLE(c, off) \
-    overwritingMutableClosureOfs(c, off)
 #else
 #define OVERWRITING_CLOSURE(c) \
     do { (void) sizeof(c); } while(0)
 #define OVERWRITING_CLOSURE_SIZE(c, size) \
     do { (void) sizeof(c); (void) sizeof(size); } while(0)
-#define OVERWRITING_CLOSURE_MUTABLE(c, off) \
-    do { (void) sizeof(c); (void) sizeof(off); } while(0)
 #endif
 
 #if defined(PROFILING)
@@ -569,16 +592,95 @@ void LDV_recordDead (const StgClosure *c, uint32_t size);
 RTS_PRIVATE bool isInherentlyUsed ( StgHalfWord closure_type );
 #endif
 
+// Note [Slop marker memory ordering]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// The non-moving GC mark thread reads SmallMutArrPtrs payload elements
+// concurrently with the mutator, which may shrink the array via
+// stg_shrinkSmallMutableArrayzh.  Shrinking writes a slop marker over the
+// vacated elements (see Note [shrink-array slop marker] in PrimOps.cmm):
+//
+//   n == 1:  slop[0] = 0
+//   n >= 2:  slop[0] = -1   (sentinel)
+//            slop[1] = n-2  (count of further slop words)
+//
+// The mark thread reads elements with ACQUIRE_LOAD and, at each position i>0,
+// re-reads element i-1 after reading i to detect a concurrently written -1
+// sentinel (see rts/sm/NonMovingMark.c).  For this check to be sound the
+// store of -1 to slop[0] must be visible to the reader when it observes the
+// skip count at slop[1].  This is guaranteed by the release-acquire pairing:
+// the RELEASE_STORE of n-2 to slop[1] ensures that the prior RELAXED_STORE
+// of -1 to slop[0] is visible to any thread that performs an ACQUIRE_LOAD of
+// slop[1] and sees the skip count.
+//
+// The re-read of element i-1 is only performed when the value c just read at
+// position i could plausibly be a skip count, i.e. when (StgWord)c < n-i
+// (a skip count at position i must satisfy i + skip <= n-1, so skip < n-i).
+// Values at or above that bound are valid closure pointers, so no re-read is
+// needed.  In practice closure pointers are word-aligned kernel addresses and
+// far exceed any plausible skip count, so this eliminates virtually all of
+// the redundant re-reads.
+//
+// The non-moving GC only runs in the threaded RTS, where RELEASE_STORE and
+// ACQUIRE_LOAD are both __atomic_* operations.  The _ALWAYS variants are not
+// needed here.
+INLINE_HEADER void writeSlopMarker(StgWord *slop, StgWord n)
+{
+    // See Note [Slop marker memory ordering]
+    if (n == 1) {
+        RELAXED_STORE(&slop[0], (StgWord)0);
+    } else if (n >= 2) {
+        RELAXED_STORE(&slop[0], (StgWord)(-1));
+        RELEASE_STORE(&slop[1], n - 2);
+    }
+}
+
+// Note [Skipping slop when scanning the heap]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Every linear scan of the heap (heap census, LDV census, sanity checker,
+// findPtr) has to step over slop between closures.  Slop comes in two forms:
+//
+//  1. Zero words: alignment padding for large/pinned objects, zeroed
+//     explicitly (see MEMSET_SLOP_W in allocatePinned).
+//
+//  2. Slop markers: written by writeSlopMarker whenever a closure is
+//     overwritten by a smaller one.  See Note [shrink-array slop marker]
+//     in PrimOps.cmm for the encoding.
+//
+// A closure can be shrunk repeatedly, leaving consecutive slop regions, so we
+// must loop until reaching a word that can't be slop.  Info pointers are never
+// 0 or (StgWord)(-1), so such a word starts the next closure.
+//
+// All scanners must use skipSlop: if any one of them keeps its own copy of
+// this loop it will go out of sync with the encoding (#27585).
+INLINE_HEADER StgPtr skipSlop(StgPtr p, StgPtr end)
+{
+    while (p < end) {
+        if (!*p) {
+            // single-word slop region, or alignment padding
+            p++;
+        } else if (*p == (StgWord)(-1)) {
+            // Multi-word slop region: sentinel, count, then that many words.
+            // writeSlopMarker only writes the sentinel for n >= 2, so the count
+            // word is always within the region.  We assert rather than bail out
+            // so that a corrupt heap is reported instead of silently skipped.
+            ASSERT(p + 1 < end);
+            p += 2 + *(p + 1);
+        } else {
+            break;
+        }
+    }
+    return p;
+}
+
 INLINE_HEADER void
-zeroSlop (StgClosure *p,
-          uint32_t offset,    /*< offset to start zeroing at, in words */
-          uint32_t size,      /*< total closure size, in words */
-          bool known_mutable  /*< is this a closure who's slop we can always zero? */
+markImmutableSlop (StgClosure *p,
+          uint32_t offset,    /*< offset to start marking at, in words */
+          uint32_t size       /*< total closure size, in words */
          )
 {
-    // see Note [zeroing slop when overwriting closures], also #8402
+    // see Note [marking slop when overwriting immutable closures], also #8402
 
-    const bool want_to_zero_immutable_slop = false
+    const bool want_to_mark = false
         // Sanity checking (-DS) is enabled
         || RTS_DEREF(RtsFlags).DebugFlags.sanity
 #if defined(PROFILING)
@@ -587,44 +689,23 @@ zeroSlop (StgClosure *p,
 #endif
         ;
 
-    const bool can_zero_immutable_slop =
+    const bool can_mark =
         // Only if we're running single threaded.
         getNumCapabilities() == 1
         && !RTS_DEREF(RtsFlags).GcFlags.useNonmoving; // see #23170
 
-    const bool zero_slop_immutable =
-        want_to_zero_immutable_slop && can_zero_immutable_slop;
-
-    const bool zero_slop_mutable =
-#if defined(PROFILING)
-        // Always zero mutable closure slop when profiling. We do this to cover
-        // the case of shrinking mutable arrays in pinned blocks for the heap
-        // profiler, see Note [skipping slop in the heap profiler]
-        //
-        // TODO: We could make this check more specific and only zero if the
-        // object is in a BF_PINNED bdescr here. Update Note [slop on the heap]
-        // and [zeroing slop when overwriting closures] if you change this.
-        true
-#else
-        zero_slop_immutable
-#endif
-        ;
-
-    const bool zero_slop =
-        // If we're not sure this is a mutable closure treat it like an
-        // immutable one.
-        known_mutable ? zero_slop_mutable : zero_slop_immutable;
-
-    if(!zero_slop)
+    if(!(want_to_mark && can_mark))
         return;
 
-    for (uint32_t i = offset; i < size; i++) {
-        ((StgWord *)p)[i] = 0;
-    }
+    // Write a slop marker so that the heap profiler and sanity checker can skip
+    // over the slop without reading stale heap pointers.
+    // See Note [shrink-array slop marker] in PrimOps.cmm for the encoding.
+    writeSlopMarker((StgWord *)p + offset, size - offset);
 }
 
 // N.B. the stg_* variants of the utilities below are only for calling from
 // Cmm. The INLINE_HEADER functions should be used when in C.
+void stg_writeSlopMarker (StgWord *slop, StgWord n);
 void stg_overwritingClosure (StgClosure *p);
 INLINE_HEADER void overwritingClosure (StgClosure *p)
 {
@@ -633,30 +714,9 @@ INLINE_HEADER void overwritingClosure (StgClosure *p)
     if(era > 0 && !isInherentlyUsed(get_itbl(p)->type))
         LDV_recordDead(p, size);
 #endif
-    zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
+    markImmutableSlop(p, sizeofW(StgThunkHeader), size);
 }
 
-
-// Version of 'overwritingClosure' which overwrites only a suffix of a
-// closure.  The offset is expressed in words relative to 'p' and shall
-// be less than or equal to closure_sizeW(p), and usually at least as
-// large as the respective thunk header.
-void stg_overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
-INLINE_HEADER void overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
-{
-    // Since overwritingClosureOfs is only ever called by:
-    //
-    //   - shrinkMutableByteArray# (ARR_WORDS) and
-    //
-    //   - shrinkSmallMutableArray# (SMALL_MUT_ARR_PTRS)
-    //
-    // we can safely omit the Ldv_recordDead call. Since these closures are
-    // considered inherently used we don't need to track their destruction.
-#if defined(PROFILING)
-    ASSERT(isInherentlyUsed(get_itbl(p)->type) == true);
-#endif
-    zeroSlop(p, offset, closure_sizeW(p), /*known_mutable=*/true);
-}
 
 // Version of 'overwritingClosure' which takes closure size as argument.
 void stg_overwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
@@ -669,5 +729,5 @@ INLINE_HEADER void overwritingClosureSize (StgClosure *p, uint32_t size)
     if(era > 0)
         LDV_recordDead(p, size);
 #endif
-    zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
+    markImmutableSlop(p, sizeofW(StgThunkHeader), size);
 }

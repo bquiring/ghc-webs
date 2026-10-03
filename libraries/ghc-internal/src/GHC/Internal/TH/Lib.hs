@@ -19,9 +19,8 @@
 -- is safe to break things.
 
 module GHC.Internal.TH.Lib where
-
-import GHC.Internal.TH.Syntax hiding (Role, InjectivityAnn)
-import qualified GHC.Internal.TH.Syntax as TH
+import GHC.Internal.TH.Syntax
+import GHC.Internal.TH.Monad
 
 #ifdef BOOTSTRAP_TH
 import Control.Applicative(liftA, Applicative(..))
@@ -31,18 +30,21 @@ import Data.List.NonEmpty ( NonEmpty(..) )
 import GHC.Exts (TYPE)
 import Prelude hiding (Applicative(..))
 #else
-import GHC.Internal.Base hiding (NonEmpty (..), Type, Module, inline)
-import GHC.Internal.Data.Foldable
+import GHC.Internal.Base hiding( Type, Module, inline )
+import GHC.Internal.Data.Foldable hiding( foldr )
 import GHC.Internal.Data.Functor
 import GHC.Internal.Data.Maybe
-import GHC.Internal.Data.NonEmpty (NonEmpty(..))
 import GHC.Internal.Data.Traversable (traverse, sequenceA)
+import GHC.Internal.Err (error)
 import GHC.Internal.Integer
 import GHC.Internal.List (zip)
 import GHC.Internal.Real
-import GHC.Internal.Show
 import GHC.Internal.Word
 import qualified GHC.Internal.Types as Kind (Type)
+import GHC.Internal.Num  as Rebindable( fromInteger )  -- For known-key names
+import GHC.Internal.Enum as Rebindable( enumFrom )    -- For known-key names
+import qualified GHC.Internal.Data.Typeable.Internal as Rebindable
+import qualified GHC.Internal.Stack.Types as Rebindable
 #endif
 
 ----------------------------------------------------------
@@ -90,10 +92,6 @@ type PatSynDirQ          = Q PatSynDir
 type PatSynArgsQ         = Q PatSynArgs
 type FamilyResultSigQ    = Q FamilyResultSig
 type DerivStrategyQ      = Q DerivStrategy
-
--- must be defined here for DsMeta to find it
-type Role                = TH.Role
-type InjectivityAnn      = TH.InjectivityAnn
 
 type TyVarBndrUnit       = TyVarBndr ()
 type TyVarBndrSpec       = TyVarBndr Specificity
@@ -555,20 +553,6 @@ pragInlD name inline rm phases
 pragOpaqueD :: Quote m => Name -> m Dec
 pragOpaqueD name = pure $ PragmaD $ OpaqueP name
 
-{-# DEPRECATED pragSpecD "Please use 'pragSpecED' instead. 'pragSpecD' will be removed in GHC 9.18." #-}
-pragSpecD :: Quote m => Name -> m Type -> Phases -> m Dec
-pragSpecD n ty phases
-  = do
-      ty1    <- ty
-      pure $ PragmaD $ SpecialiseP n ty1 Nothing phases
-
-{-# DEPRECATED pragSpecInlD "Please use 'pragSpecInlED' instead. 'pragSpecInlD' will be removed in GHC 9.18." #-}
-pragSpecInlD :: Quote m => Name -> m Type -> Inline -> Phases -> m Dec
-pragSpecInlD n ty inline phases
-  = do
-      ty1    <- ty
-      pure $ PragmaD $ SpecialiseP n ty1 (Just inline) phases
-
 pragSpecED :: Quote m
            => Maybe [m (TyVarBndr ())] -> [m RuleBndr]
            -> m Exp
@@ -868,22 +852,6 @@ implicitParamT n t
       t' <- t
       pure $ ImplicitParamT n t'
 
-{-# DEPRECATED classP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please use 'conT' and 'appT'." #-}
-classP :: Quote m => Name -> [m Type] -> m Pred
-classP cla tys
-  = do
-      tysl <- sequenceA tys
-      pure (foldl AppT (ConT cla) tysl)
-
-{-# DEPRECATED equalP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please see 'equalityT'." #-}
-equalP :: Quote m => m Type -> m Type -> m Pred
-equalP tleft tright
-  = do
-      tleft1  <- tleft
-      tright1 <- tright
-      eqT <- equalityT
-      pure (foldl AppT eqT [tleft1, tright1])
-
 promotedT :: Quote m => Name -> m Type
 promotedT = pure . PromotedT
 
@@ -906,20 +874,6 @@ noSourceStrictness = pure NoSourceStrictness
 sourceLazy         = pure SourceLazy
 sourceStrict       = pure SourceStrict
 
-{-# DEPRECATED isStrict
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang noSourceUnpackedness sourceStrict'"] #-}
-{-# DEPRECATED notStrict
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang noSourceUnpackedness noSourceStrictness'"] #-}
-{-# DEPRECATED unpacked
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang sourceUnpack sourceStrict'"] #-}
-isStrict, notStrict, unpacked :: Quote m => m Strict
-isStrict = bang noSourceUnpackedness sourceStrict
-notStrict = bang noSourceUnpackedness noSourceStrictness
-unpacked = bang sourceUnpack sourceStrict
-
 bang :: Quote m => m SourceUnpackedness -> m SourceStrictness -> m Bang
 bang u s = do u' <- u
               s' <- s
@@ -931,25 +885,10 @@ bangType = liftA2 (,)
 varBangType :: Quote m => Name -> m BangType -> m VarBangType
 varBangType v bt = (\(b, t) -> (v, b, t)) <$> bt
 
-{-# DEPRECATED strictType
-               "As of @template-haskell-2.11.0.0@, 'StrictType' has been replaced by 'BangType'. Please use 'bangType' instead." #-}
-strictType :: Quote m => m Strict -> m Type -> m StrictType
-strictType = bangType
-
-{-# DEPRECATED varStrictType
-               "As of @template-haskell-2.11.0.0@, 'VarStrictType' has been replaced by 'VarBangType'. Please use 'varBangType' instead." #-}
-varStrictType :: Quote m => Name -> m StrictType -> m VarStrictType
-varStrictType = varBangType
-
 -- * Type Literals
 
--- MonadFail here complicates things (a lot) because it would mean we would
--- have to emit a MonadFail constraint during typechecking if there was any
--- chance the desugaring would use numTyLit, which in general is hard to
--- predict.
 numTyLit :: Quote m => Integer -> m TyLit
-numTyLit n = if n >= 0 then pure (NumTyLit n)
-                       else error ("Negative type-level number: " ++ show n)
+numTyLit n = pure (NumTyLit n)
 
 strTyLit :: Quote m => String -> m TyLit
 strTyLit s = pure (StrTyLit s)
@@ -1030,7 +969,7 @@ tyVarSig = fmap TyVarSig
 -- *   Injectivity annotation
 
 injectivityAnn :: Name -> [Name] -> InjectivityAnn
-injectivityAnn = TH.InjectivityAnn
+injectivityAnn = InjectivityAnn
 
 -------------------------------------------------------------------------------
 -- *   Role
@@ -1133,7 +1072,7 @@ withDecDoc :: String -> Q Dec -> Q Dec
 withDecDoc doc dec = do
   dec' <- dec
   case doc_loc dec' of
-    Just loc -> qAddModFinalizer $ qPutDoc loc doc
+    Just loc -> addModFinalizer $ putDoc loc doc
     Nothing  -> pure ()
   pure dec'
   where
@@ -1182,7 +1121,7 @@ funD_doc :: Name -> [Q Clause]
          -> [Maybe String] -- ^ Documentation to attach to arguments
          -> Q Dec
 funD_doc nm cs mfun_doc arg_docs = do
-  qAddModFinalizer $ sequence_
+  addModFinalizer $ sequence_
     [putDoc (ArgDoc nm i) s | (i, Just s) <- zip [0..] arg_docs]
   let dec = funD nm cs
   case mfun_doc of
@@ -1199,7 +1138,7 @@ dataD_doc :: Q Cxt -> Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
           -- ^ Documentation to attach to the data declaration
           -> Q Dec
 dataD_doc ctxt tc tvs ksig cons_with_docs derivs mdoc = do
-  qAddModFinalizer $ mapM_ docCons cons_with_docs
+  addModFinalizer $ mapM_ docCons cons_with_docs
   let dec = dataD ctxt tc tvs ksig (map (\(con, _, _) -> con) cons_with_docs) derivs
   maybe dec (flip withDecDoc dec) mdoc
 
@@ -1213,7 +1152,7 @@ newtypeD_doc :: Q Cxt -> Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
              -- ^ Documentation to attach to the newtype declaration
              -> Q Dec
 newtypeD_doc ctxt tc tvs ksig con_with_docs@(con, _, _) derivs mdoc = do
-  qAddModFinalizer $ docCons con_with_docs
+  addModFinalizer $ docCons con_with_docs
   let dec = newtypeD ctxt tc tvs ksig con derivs
   maybe dec (flip withDecDoc dec) mdoc
 
@@ -1226,7 +1165,7 @@ typeDataD_doc :: Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
           -- ^ Documentation to attach to the data declaration
           -> Q Dec
 typeDataD_doc tc tvs ksig cons_with_docs mdoc = do
-  qAddModFinalizer $ mapM_ docCons cons_with_docs
+  addModFinalizer $ mapM_ docCons cons_with_docs
   let dec = typeDataD tc tvs ksig (map (\(con, _, _) -> con) cons_with_docs)
   maybe dec (flip withDecDoc dec) mdoc
 
@@ -1240,7 +1179,7 @@ dataInstD_doc :: Q Cxt -> (Maybe [Q (TyVarBndr ())]) -> Q Type -> Maybe (Q Kind)
               -- ^ Documentation to attach to the instance declaration
               -> Q Dec
 dataInstD_doc ctxt mb_bndrs ty ksig cons_with_docs derivs mdoc = do
-  qAddModFinalizer $ mapM_ docCons cons_with_docs
+  addModFinalizer $ mapM_ docCons cons_with_docs
   let dec = dataInstD ctxt mb_bndrs ty ksig (map (\(con, _, _) -> con) cons_with_docs)
               derivs
   maybe dec (flip withDecDoc dec) mdoc
@@ -1256,7 +1195,7 @@ newtypeInstD_doc :: Q Cxt -> (Maybe [Q (TyVarBndr ())]) -> Q Type
                  -- ^ Documentation to attach to the instance declaration
                  -> Q Dec
 newtypeInstD_doc ctxt mb_bndrs ty ksig con_with_docs@(con, _, _) derivs mdoc = do
-  qAddModFinalizer $ docCons con_with_docs
+  addModFinalizer $ docCons con_with_docs
   let dec = newtypeInstD ctxt mb_bndrs ty ksig con derivs
   maybe dec (flip withDecDoc dec) mdoc
 
@@ -1266,7 +1205,7 @@ patSynD_doc :: Name -> Q PatSynArgs -> Q PatSynDir -> Q Pat
             -> [Maybe String] -- ^ Documentation to attach to the pattern arguments
             -> Q Dec
 patSynD_doc name args dir pat mdoc arg_docs = do
-  qAddModFinalizer $ sequence_
+  addModFinalizer $ sequence_
     [putDoc (ArgDoc name i) s | (i, Just s) <- zip [0..] arg_docs]
   let dec = patSynD name args dir pat
   maybe dec (flip withDecDoc dec) mdoc

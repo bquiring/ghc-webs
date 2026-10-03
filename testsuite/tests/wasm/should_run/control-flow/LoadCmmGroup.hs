@@ -19,7 +19,6 @@ import GHC
 import GHC.Cmm
 import GHC.Cmm.Parser
 import GHC.Core.Lint.Interactive
-import GHC.Core.TyCon
 import GHC.CoreToStg
 import GHC.CoreToStg.Prep
 import GHC.Data.Stream hiding (mapM, map)
@@ -80,7 +79,7 @@ cmmOfSummary summ = do
 frontend :: DynFlags -> HscEnv -> ModSummary -> IO ModGuts
 frontend _dflags env summary = do
    parsed <- hscParse env summary
-   (checked, _) <- hscTypecheckRename env summary parsed
+   (checked, _) <- hscTypecheckRename env summary StartAndKeepRunningTcMPlugins parsed
    hscDesugar env summary checked >>= hscSimplify env []
 
 loadCmm :: FilePath -> Ghc CmmGroup
@@ -92,16 +91,17 @@ stgify :: ModSummary -> ModGuts -> Ghc [StgTopBinding]
 stgify summary guts = do
     hsc_env <- getSession
     let dflags = hsc_dflags hsc_env
-    prepd_binds <- liftIO $ do
+    liftIO $ do
       cp_cfg <- initCorePrepConfig hsc_env
-      corePrepPgm (hsc_logger hsc_env) cp_cfg (initCorePrepPgmConfig dflags (interactiveInScope $ hsc_IC hsc_env)) this_mod location core_binds data_tycons
-    return $ fstOf3 $ coreToStg (initCoreToStgOpts dflags) (ms_mod summary) (ms_location summary) prepd_binds
-  where this_mod = mg_module guts
-        location = ms_location summary
-        core_binds = mg_binds guts
-        data_tycons = filter isDataTyCon tycons
-        tycons = mg_tcs guts
-
+      prepd_binds <- corePrepPgm (hsc_logger hsc_env) cp_cfg
+                       (initCorePrepPgmConfig dflags (interactiveInScope $ hsc_IC hsc_env))
+                       this_mod core_binds
+      (binds, _, _) <- coreToStg (initCoreToStgOpts dflags) (ms_mod summary)
+                                 (ms_location summary) prepd_binds
+      return binds
+  where
+    this_mod = mg_module guts
+    core_binds = mg_binds guts
 
 slurpCmm :: HscEnv -> FilePath -> IO (CmmGroup)
 slurpCmm hsc_env filename = runHsc hsc_env $ do

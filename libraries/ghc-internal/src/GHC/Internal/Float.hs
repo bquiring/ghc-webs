@@ -9,9 +9,16 @@
 {-# LANGUAGE CApiFFI #-}
 -- We believe we could deorphan this module, by moving lots of things
 -- around, but we haven't got there yet:
+
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+   -- Defines RealFloat
+
 {-# OPTIONS_GHC -Wno-orphans #-}
 {-# OPTIONS_HADDOCK not-home #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
+-- For init in formatRealFloatAlt
+{-# OPTIONS_GHC -Wno-x-partial #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -56,7 +63,7 @@ module GHC.Internal.Float
     , word2Float
     , integerToFloat#
     , naturalToFloat#
-    , rationalToFloat
+    , rationalToFloat#, rationalToFloat
     , castWord32ToFloat
     , castFloatToWord32
     , castWord32ToFloat#
@@ -95,7 +102,7 @@ module GHC.Internal.Float
     , word2Double
     , integerToDouble#
     , naturalToDouble#
-    , rationalToDouble
+    , rationalToDouble#, rationalToDouble
     , castWord64ToDouble
     , castDoubleToWord64
     , castWord64ToDouble#
@@ -163,12 +170,31 @@ module GHC.Internal.Float
     , stgWord32ToFloat
     ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Maybe
 
-import GHC.Internal.Base
 import GHC.Internal.Bits
 import GHC.Internal.List
 import GHC.Internal.Enum
+import GHC.Internal.Err (errorWithoutStackTrace)
+import GHC.Internal.Prim (
+    Float#, Double#, Int#, Word32#, Word64#, acosDouble#, acosFloat#,
+    acoshDouble#, acoshFloat#, and#, asinDouble#, asinFloat#, asinhDouble#,
+    asinhFloat#, atanDouble#, atanFloat#, atanhDouble#, atanhFloat#,
+    castDoubleToWord64#, castFloatToWord32#, castWord32ToFloat#,
+    castWord64ToDouble#, cosDouble#, cosFloat#, coshDouble#, coshFloat#,
+    decodeFloat_Int#, divideFloat#, double2Float#, eqWord#, expDouble#,
+    expFloat#, expm1Double#, expm1Float#, fabsDouble#, fabsFloat#,
+    float2Double#, geFloat#, gtFloat#, gtWord#, int2Float#, int2Double#,
+    int2Word#, leFloat#, log1pDouble#, log1pFloat#, logDouble#,
+    logFloat#, ltFloat#, ltWord#, minusFloat#, minusWord#, negateDouble#,
+    negateFloat#, negateInt#, plusFloat#, powerFloat#, sinDouble#, sinFloat#,
+    sinhDouble#, sinhFloat#, sqrtDouble#, sqrtFloat#, tanDouble#, tanFloat#,
+    tanhDouble#, tanhFloat#, timesFloat#, uncheckedIShiftRA#, uncheckedShiftL#,
+    word2Float#, word2Double#, word2Int#,
+    (+#), (+##), (-#), (-##), (*##), (**##), (/##), (<#), (<##), (<=#), (<=##),
+    (>#), (>##), (>=#), (>=##),
+  )
 import GHC.Internal.Show
 import GHC.Internal.Num
 import GHC.Internal.Real
@@ -177,6 +203,14 @@ import GHC.Internal.Arr
 import GHC.Internal.Float.RealFracMethods
 import GHC.Internal.Float.ConversionUtils
 import GHC.Internal.Bignum.BigNat
+import GHC.Internal.Stack.Types as Rebindable
+
+#if WORD_SIZE_IN_BITS == 64
+import GHC.Internal.Prim (
+    int64ToInt#,
+    word64ToWord#,
+  )
+#endif
 
 infixr 8  **
 
@@ -445,6 +479,12 @@ instance  Real Float  where
             | otherwise                                         ->
                     IS m# :% integerShiftL# 1 (int2Word# (negateInt# e#))
 
+-- | @since base-4.24
+--
+instance  Bounded Float  where
+    minBound = negate (1/0)
+    maxBound = 1/0
+
 -- | @since base-2.01
 --
 -- This instance implements IEEE 754 standard with all its usual pitfalls
@@ -466,19 +506,24 @@ instance  Fractional Float  where
     recip x             =  1.0 / x
 
 rationalToFloat :: Integer -> Integer -> Float
-{-# NOINLINE [0] rationalToFloat #-}
--- Re NOINLINE pragma, see Note [realToFrac natural-to-float]
-rationalToFloat n 0
-    | n == 0        = 0/0
-    | n < 0         = (-1)/0
-    | otherwise     = 1/0
-rationalToFloat n d
-    | n == 0        = encodeFloat 0 0
-    | n < 0         = -(fromRat'' minEx mantDigs (-n) d)
-    | otherwise     = fromRat'' minEx mantDigs n d
+{-# INLINE rationalToFloat #-}
+rationalToFloat n d = F# (rationalToFloat# n d)
+
+rationalToFloat# :: Integer -> Integer -> Float#
+-- Re INLINE pragma, see Note [realToFrac natural-to-float]
+{-# INLINE [0] rationalToFloat# #-}
+rationalToFloat# n 0
+    | n == 0        = 0.0#  `divideFloat#` 0.0#
+    | n < 0         = -1.0# `divideFloat#` 0.0#
+    | otherwise     = 1.0#  `divideFloat#` 0.0#
+rationalToFloat# n d
+    | n == 0        = unwrap (encodeFloat 0 0)
+    | n < 0         = unwrap (negate (fromRat'' minEx mantDigs (-n) d))
+    | otherwise     = unwrap (fromRat'' minEx mantDigs n d)
       where
         minEx       = FLT_MIN_EXP
         mantDigs    = FLT_MANT_DIG
+        unwrap (F# f#) = f#
 
 -- | @since base-2.01
 --
@@ -697,6 +742,12 @@ instance  Real Double  where
             | otherwise                                            ->
                 m :% integerShiftL# 1 (int2Word# (negateInt# e#))
 
+-- | @since base-4.24
+--
+instance  Bounded Double  where
+    minBound = negate (1/0)
+    maxBound = 1/0
+
 -- | @since base-2.01
 --
 -- This instance implements IEEE 754 standard with all its usual pitfalls
@@ -718,19 +769,24 @@ instance  Fractional Double  where
     recip x             =  1.0 / x
 
 rationalToDouble :: Integer -> Integer -> Double
-{-# NOINLINE [0] rationalToDouble #-}
--- Re NOINLINE pragma, see Note [realToFrac natural-to-float]
-rationalToDouble n 0
-    | n == 0        = 0/0
-    | n < 0         = (-1)/0
-    | otherwise     = 1/0
-rationalToDouble n d
-    | n == 0        = encodeFloat 0 0
-    | n < 0         = -(fromRat'' minEx mantDigs (-n) d)
-    | otherwise     = fromRat'' minEx mantDigs n d
+{-# INLINE rationalToDouble #-}
+rationalToDouble n d = D# (rationalToDouble# n d)
+
+rationalToDouble# :: Integer -> Integer -> Double#
+{-# INLINE [0] rationalToDouble# #-}
+-- Re INLINE pragma, see Note [realToFrac natural-to-float]
+rationalToDouble# n 0
+    | n == 0        = 0.0##  /## 0.0##
+    | n < 0         = -1.0## /## 0.0##
+    | otherwise     = 1.0##  /## 0.0##
+rationalToDouble# n d
+    | n == 0        = unwrap (encodeFloat 0 0)
+    | n < 0         = unwrap (negate (fromRat'' minEx mantDigs (-n) d))
+    | otherwise     = unwrap (fromRat'' minEx mantDigs n d)
       where
         minEx       = DBL_MIN_EXP
         mantDigs    = DBL_MANT_DIG
+        unwrap (D# d#) = d#
 
 -- | @since base-2.01
 instance  Floating Double  where
@@ -1673,7 +1729,11 @@ Now we'd have a BUILTIN constant folding rule for rationalToFloat; but
 to allow that rule to fire reliably we should delay inlining rationalToFloat
 until stage 0.  (It may get an inlining from CPR analysis.)
 
-Hence the NOINLINE[0] rationalToFloat, and similarly rationalToDouble.
+Hence the INLINE[0] rationalToFloat, and similarly for rationalToDouble.
+This activation means:
+
+  - we don't inline until phase 0 (solving the above)
+  - we do inline starting at phase 0 (because we do want it inlining in the end)
 -}
 
 -- Utils
@@ -1751,8 +1811,8 @@ stgWord32ToFloat :: Word32# -> Float#
 stgWord32ToFloat = castWord32ToFloat#
 
 
--- | @'castWord32ToFloat' w@ does a bit-for-bit copy from an integral value
--- to a floating-point value.
+-- | @'castWord32ToFloat' w@ does a bit-for-bit copy from a 'Word32'
+-- to a 'Float', according to the IEEE 754 binary32 format.
 --
 -- @since base-4.11.0.0
 
@@ -1760,8 +1820,8 @@ stgWord32ToFloat = castWord32ToFloat#
 castWord32ToFloat :: Word32 -> Float
 castWord32ToFloat (W32# w#) = F# (castWord32ToFloat# w#)
 
--- | @'castFloatToWord32' f@ does a bit-for-bit copy from a floating-point value
--- to an integral value.
+-- | @'castFloatToWord32' f@ does a bit-for-bit copy from a 'Float'
+-- to a 'Word32', according to the IEEE 754 binary32 format.
 --
 -- @since base-4.11.0.0
 
@@ -1769,8 +1829,8 @@ castWord32ToFloat (W32# w#) = F# (castWord32ToFloat# w#)
 castFloatToWord32 :: Float -> Word32
 castFloatToWord32 (F# f#) = W32# (castFloatToWord32# f#)
 
--- | @'castWord64ToDouble' w@ does a bit-for-bit copy from an integral value
--- to a floating-point value.
+-- | @'castWord64ToDouble' w@ does a bit-for-bit copy from a 'Word64'
+-- to a 'Double', according to the IEEE 754 binary64 format.
 --
 -- @since base-4.11.0.0
 
@@ -1778,8 +1838,8 @@ castFloatToWord32 (F# f#) = W32# (castFloatToWord32# f#)
 castWord64ToDouble :: Word64 -> Double
 castWord64ToDouble (W64# w) = D# (castWord64ToDouble# w)
 
--- | @'castDoubleToWord64' f@ does a bit-for-bit copy from a floating-point value
--- to an integral value.
+-- | @'castDoubleToWord64' f@ does a bit-for-bit copy from a 'Double'
+-- to a 'Word64', according to the IEEE 754 binary64 format.
 --
 -- @since base-4.11.0.0
 

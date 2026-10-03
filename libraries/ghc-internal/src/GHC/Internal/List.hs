@@ -43,11 +43,13 @@ module GHC.Internal.List (
 
  ) where
 
-import GHC.Internal.Data.Maybe
 import GHC.Internal.Base
+import GHC.Internal.Data.Maybe
+import GHC.Internal.Err (error)
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Bignum.Integer (Integer)
-import GHC.Internal.Stack.Types (HasCallStack)
+import GHC.Internal.Prim (seq)
+import GHC.Internal.Stack.Types
 
 infixl 9  !?, !!
 infix  4 `elem`, `notElem`
@@ -190,12 +192,18 @@ tail                    :: HasCallStack => [a] -> [a]
 tail (_:xs)             =  xs
 tail []                 =  errorEmptyList "tail"
 
-{-# WARNING in "x-partial" tail "This is a partial function, it throws an error on empty lists. Replace it with 'drop' 1, or use pattern matching or 'GHC.Internal.Data.List.uncons' instead. Consider refactoring to use \"Data.List.NonEmpty\"." #-}
+{-# WARNING in "x-partial" tail "This is a partial function, it throws an error on empty lists. Replace it with 'drop' 1, or use pattern matching or 'Data.List.uncons' instead. Consider refactoring to use \"Data.List.NonEmpty\"." #-}
 
 -- | \(\mathcal{O}(n)\). Extract the last element of a list, which must be
 -- finite and non-empty.
 --
--- WARNING: This function is partial. Consider using 'unsnoc' instead.
+-- To disable the warning about partiality put
+-- @{-# OPTIONS_GHC -Wno-x-partial -Wno-unrecognised-warning-flags #-}@
+-- at the top of the file. To disable it throughout a package put the same
+-- options into @ghc-options@ section of Cabal file. To disable it in GHCi
+-- put @:set -Wno-x-partial -Wno-unrecognised-warning-flags@ into @~/.ghci@
+-- config file. See also the
+-- [migration guide](https://github.com/haskell/core-libraries-committee/blob/main/guides/warning-for-init-and-last.md).
 --
 -- ==== __Examples__
 --
@@ -218,10 +226,18 @@ last xs = foldl (\_ x -> x) lastError xs
 lastError :: HasCallStack => a
 lastError = errorEmptyList "last"
 
+{-# WARNING in "x-partial" last "This is a partial function, it throws an error on empty lists. Use 'Data.List.unsnoc' instead. Consider refactoring to use \"Data.List.NonEmpty\"." #-}
+
 -- | \(\mathcal{O}(n)\). Return all the elements of a list except the last one.
 -- The list must be non-empty.
 --
--- WARNING: This function is partial. Consider using 'unsnoc' instead.
+-- To disable the warning about partiality put
+-- @{-# OPTIONS_GHC -Wno-x-partial -Wno-unrecognised-warning-flags #-}@
+-- at the top of the file. To disable it throughout a package put the same
+-- options into @ghc-options@ section of Cabal file. To disable it in GHCi
+-- put @:set -Wno-x-partial -Wno-unrecognised-warning-flags@ into  @~/.ghci@
+-- config file. See also the
+-- [migration guide](https://github.com/haskell/core-libraries-committee/blob/main/guides/warning-for-init-and-last.md).
 --
 -- ==== __Examples__
 --
@@ -239,6 +255,8 @@ init []                 =  errorEmptyList "init"
 init (x:xs)             =  init' x xs
   where init' _ []     = []
         init' y (z:zs) = y : init' z zs
+
+{-# WARNING in "x-partial" init "This is a partial function, it throws an error on empty lists. Use 'Data.List.unsnoc' instead. Consider refactoring to use \"Data.List.NonEmpty\"." #-}
 
 -- | \(\mathcal{O}(1)\). Test whether a list is empty.
 --
@@ -854,11 +872,17 @@ minimum xs              =  foldl1' min xs
 -- ==== __Laziness__
 --
 -- Note that 'iterate' is lazy, potentially leading to thunk build-up if
--- the consumer doesn't force each iterate. See 'iterate'' for a strict
+-- the consumer doesn't force each element. See 'iterate'' for a strict
 -- variant of this function.
 --
--- >>> take 1 $ iterate undefined 42
--- [42]
+-- >>> let xs = iterate (\x -> if x == 0 then undefined else x - 1) 2
+-- >>> xs
+-- [2,1,0,*** Exception: Prelude.undefined
+-- >>> length (take 10 xs)
+-- 10
+--
+-- In @xs@ every element following @0@ is bottom, but the list itself is
+-- infinitely long because it is generated without forcing its elements.
 --
 -- ==== __Examples__
 --
@@ -889,24 +913,26 @@ iterateFB c f x0 = go x0
 
 -- | 'iterate'' is the strict version of 'iterate'.
 --
--- It forces the result of each application of the function to weak head normal
--- form (WHNF)
--- before proceeding.
+-- It forces each element to weak head normal form (WHNF) before proceeding.
 --
--- >>> take 1 $ iterate' undefined 42
+-- ==== __Laziness__
+--
+-- >>> let xs = iterate' (\x -> if x == 0 then undefined else x - 1) 2
+-- >>> xs
+-- [2,1,0*** Exception: Prelude.undefined
+-- >>> length (take 10 xs)
 -- *** Exception: Prelude.undefined
+--
+-- The list @xs@ has 3 elements followed by a tail that is bottom.
+--
 {-# NOINLINE [1] iterate' #-}
 iterate' :: (a -> a) -> a -> [a]
-iterate' f x =
-    let x' = f x
-    in x' `seq` (x : iterate' f x')
+iterate' f !x = x : iterate' f (f x)
 
 {-# INLINE [0] iterate'FB #-} -- See Note [Inline FB functions]
 iterate'FB :: (a -> b -> b) -> (a -> a) -> a -> b
 iterate'FB c f x0 = go x0
-  where go x =
-            let x' = f x
-            in x' `seq` (x `c` go x')
+  where go !x = x `c` go (f x)
 
 {-# RULES
 "iterate'"    [~1] forall f x.   iterate' f x = build (\c _n -> iterate'FB c f x)
@@ -1485,14 +1511,9 @@ all p (x:xs)    =  p x && all p xs
 --
 -- >>> 3 `elem` [4..]
 -- * Hangs forever *
-elem                    :: (Eq a) => a -> [a] -> Bool
-elem _ []       = False
-elem x (y:ys)   = x==y || elem x ys
-{-# NOINLINE [1] elem #-}
-{-# RULES
-"elem/build"    forall x (g :: forall b . (a -> b -> b) -> b -> b)
-   . elem x (build g) = g (\ y r -> (x == y) || r) False
- #-}
+elem :: Eq a => a -> [a] -> Bool
+elem x = foldr (\y r -> x == y || r) False
+{-# INLINE elem #-}
 
 -- | 'notElem' is the negation of 'elem'.
 --
@@ -1512,14 +1533,9 @@ elem x (y:ys)   = x==y || elem x ys
 --
 -- >>> 3 `notElem` [4..]
 -- * Hangs forever *
-notElem                 :: (Eq a) => a -> [a] -> Bool
-notElem _ []    =  True
-notElem x (y:ys)=  x /= y && notElem x ys
-{-# NOINLINE [1] notElem #-}
-{-# RULES
-"notElem/build" forall x (g :: forall b . (a -> b -> b) -> b -> b)
-   . notElem x (build g) = g (\ y r -> (x /= y) && r) True
- #-}
+notElem :: Eq a => a -> [a] -> Bool
+notElem x = foldr (\y r -> x /= y && r) True
+{-# INLINE notElem #-}
 
 -- | \(\mathcal{O}(n)\). 'lookup' @key assocs@ looks up a key in an association
 -- list.

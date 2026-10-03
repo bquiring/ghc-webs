@@ -1,8 +1,9 @@
 module CommandLine (
     optDescrs, cmdLineArgsMap, cmdFlavour, lookupFreeze1, lookupFreeze2, lookupSkipDepends,
-    cmdBignum, cmdBignumCheck, cmdProgressInfo, cmdCompleteSetting,
+    lookupBignum,
+    cmdBignum, cmdProgressInfo, cmdCompleteSetting,
     cmdDocsArgs, cmdUnitIdHash, lookupBuildRoot, TestArgs(..), TestSpeed(..), defaultTestArgs,
-    cmdPrefix, DocArgs(..), defaultDocArgs
+    cmdPrefix, cmdChangelogVersion, DocArgs(..), defaultDocArgs
     ) where
 
 import Data.Either
@@ -30,14 +31,14 @@ data CommandLineArgs = CommandLineArgs
     , skipDepends    :: Bool
     , unitIdHash     :: Bool
     , bignum         :: Maybe String
-    , bignumCheck    :: Bool
     , progressInfo   :: ProgressInfo
     , buildRoot      :: BuildRoot
     , testArgs       :: TestArgs
     , docsArgs       :: DocArgs
     , docTargets     :: DocTargets
-    , prefix         :: Maybe FilePath
-    , completeStg    :: Maybe String }
+    , prefix           :: Maybe FilePath
+    , changelogVersion :: Maybe String
+    , completeStg      :: Maybe String }
     deriving (Eq, Show)
 
 -- | Default values for 'CommandLineArgs'.
@@ -50,14 +51,14 @@ defaultCommandLineArgs = CommandLineArgs
     , skipDepends    = False
     , unitIdHash     = False
     , bignum         = Nothing
-    , bignumCheck    = False
     , progressInfo   = Brief
     , buildRoot      = BuildRoot "_build"
     , testArgs       = defaultTestArgs
     , docsArgs       = defaultDocArgs
     , docTargets     = Set.fromList [minBound..maxBound]
-    , prefix         = Nothing
-    , completeStg    = Nothing }
+    , prefix           = Nothing
+    , changelogVersion = Nothing
+    , completeStg      = Nothing }
 
 -- | These arguments are used by the `test` target.
 data TestArgs = TestArgs
@@ -68,6 +69,7 @@ data TestArgs = TestArgs
     , testJUnit      :: Maybe FilePath
     , testMetricsFile:: Maybe FilePath
     , testOnly       :: [String]
+    , testSkip       :: [String]
     , testOnlyPerf   :: Bool
     , testSkipPerf   :: Bool
     , testRootDirs   :: [FilePath]
@@ -97,6 +99,7 @@ defaultTestArgs = TestArgs
     , testJUnit      = Nothing
     , testMetricsFile= Nothing
     , testOnly       = []
+    , testSkip       = []
     , testOnlyPerf   = False
     , testSkipPerf   = False
     , testRootDirs   = []
@@ -114,7 +117,7 @@ data DocArgs = DocArgs
   } deriving (Eq, Show)
 
 defaultDocArgs :: DocArgs
-defaultDocArgs = DocArgs { docsBaseUrl = "../%pkgid%" }
+defaultDocArgs = DocArgs { docsBaseUrl = "../%pkg%" }
 
 readConfigure :: Either String (CommandLineArgs -> CommandLineArgs)
 readConfigure = Left "hadrian --configure has been deprecated (see #20167). Please run ./boot; ./configure manually"
@@ -124,10 +127,7 @@ readFlavour ms = Right $ \flags -> flags { flavour = lower <$> ms }
 
 readBignum :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readBignum Nothing   = Right id
-readBignum (Just ms) = Right $ \flags -> case break (== '-') (lower ms) of
-   (backend,"")          -> flags { bignum = Just backend }
-   ("check",'-':backend) -> flags { bignum = Just backend, bignumCheck = True }
-   _                     -> flags { bignum = Just (lower ms) }
+readBignum (Just ms) = Right $ \flags -> flags { bignum = Just (lower ms) }
 
 readBuildRoot :: FilePath -> Either String (CommandLineArgs -> CommandLineArgs)
 readBuildRoot ms =
@@ -188,6 +188,13 @@ readTestOnly tests = Right $ \flags ->
   where tests' = maybe [] words tests
         tests'' flags = testOnly (testArgs flags) ++ tests'
 
+readTestSkip :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestSkip tests = Right $ \flags ->
+  flags { testArgs = (testArgs flags) { testSkip = tests'' flags } }
+
+  where tests' = maybe [] words tests
+        tests'' flags = testSkip (testArgs flags) ++ tests'
+
 readTestOnlyPerf :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestOnlyPerf = Right $ \flags -> flags { testArgs = (testArgs flags) { testOnlyPerf = True } }
 
@@ -240,6 +247,9 @@ readBrokenTests tests =
 readPrefix :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readPrefix ms = Right $ \flags -> flags { prefix = ms }
 
+readChangelogVersion :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readChangelogVersion ms = Right $ \flags -> flags { changelogVersion = ms }
+
 readCompleteStg :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readCompleteStg ms = Right $ \flags -> flags { completeStg = ms }
 
@@ -271,7 +281,7 @@ optDescrs =
     , Option ['o'] ["build-root"] (ReqArg readBuildRoot "BUILD_ROOT")
       "Where to store build artifacts. (Default _build)."
     , Option [] ["flavour"] (OptArg readFlavour "FLAVOUR")
-      "Build flavour (Default, Devel1, Devel2, Perf, Prof, Quick or Quickest)."
+      "Build flavour (Default, Devel1, Devel2, Perf, Prof or Quick)."
     , Option [] ["freeze1"] (NoArg readFreeze1)
       "Freeze Stage1 GHC."
     , Option [] ["freeze2"] (NoArg readFreeze2)
@@ -281,7 +291,7 @@ optDescrs =
     , Option [] ["skip-depends"] (NoArg readSkipDepends)
       "Skip rebuilding dependency information."
     , Option [] ["bignum"] (OptArg readBignum "BACKEND")
-      "Select bignum backend: native, gmp (default), check-gmp (gmp compared to native), ffi."
+      "Select bignum backend: native, gmp (default)."
     , Option [] ["progress-info"] (ReqArg readProgressInfo "STYLE")
       "Progress info style (None, Brief, Normal or Unicorn)."
     , Option [] ["docs"] (ReqArg readDocsArg "TARGET")
@@ -300,6 +310,8 @@ optDescrs =
       "Output testsuite performance metrics summary."
     , Option [] ["only"] (OptArg readTestOnly "TESTS")
       "Test cases to run."
+    , Option [] ["skip-test"] (OptArg readTestSkip "TESTS")
+      "Test cases to skip."
     , Option [] ["only-perf"] (NoArg readTestOnlyPerf)
       "Only run performance tests."
     , Option [] ["skip-perf"] (NoArg readTestSkipPerf)
@@ -320,6 +332,8 @@ optDescrs =
     , Option [] ["test-have-intree-files"] (NoArg readTestHasInTreeFiles) "Run the in-tree tests even with an out of tree compiler"
     , Option [] ["prefix"] (OptArg readPrefix "PATH")
         "Destination path for the bindist 'install' rule"
+    , Option [] ["changelog-version"] (OptArg readChangelogVersion "VERSION")
+        "Version number for the 'changelog' rule (e.g. 10.2.1)"
     , Option [] ["complete-setting"] (OptArg readCompleteStg "SETTING")
         "Setting key to autocomplete, for the 'autocomplete' target."
     , Option [] ["haddock-for-hackage"] (NoArg readHaddockBaseUrl)
@@ -358,11 +372,11 @@ cmdLineArgsMap = do
         else return []
     let allSettings = cliSettings ++ fileSettings
 
-    return $ insertExtra (progressInfo   args) -- Accessed by Hadrian.Utilities
-           $ insertExtra (buildRoot      args) -- Accessed by Hadrian.Utilities
-           $ insertExtra (testArgs       args) -- Accessed by Settings.Builders.RunTest
-           $ insertExtra (docsArgs       args) -- Accessed by Rules.Documentation
-           $ insertExtra allSettings           -- Accessed by Settings
+    return $ insertExtra (progressInfo               args) -- Accessed by Hadrian.Utilities
+           $ insertExtra (buildRoot                  args) -- Accessed by Hadrian.Utilities
+           $ insertExtra (testArgs                   args) -- Accessed by Settings.Builders.RunTest
+           $ insertExtra (docsArgs                   args) -- Accessed by Rules.Documentation
+           $ insertExtra allSettings                       -- Accessed by Settings
            $ insertExtra args Map.empty
 
 cmdLineArgs :: Action CommandLineArgs
@@ -373,6 +387,9 @@ cmdFlavour = flavour <$> cmdLineArgs
 
 cmdPrefix :: Action (Maybe String)
 cmdPrefix = prefix <$> cmdLineArgs
+
+cmdChangelogVersion :: Action (Maybe String)
+cmdChangelogVersion = changelogVersion <$> cmdLineArgs
 
 cmdCompleteSetting :: Action (Maybe String)
 cmdCompleteSetting = completeStg <$> cmdLineArgs
@@ -389,14 +406,14 @@ lookupFreeze2 = freeze2 . lookupExtra defaultCommandLineArgs
 lookupSkipDepends :: Map.HashMap TypeRep Dynamic -> Bool
 lookupSkipDepends = skipDepends . lookupExtra defaultCommandLineArgs
 
+lookupBignum :: Map.HashMap TypeRep Dynamic -> Maybe String
+lookupBignum = bignum . lookupExtra defaultCommandLineArgs
+
 cmdUnitIdHash :: Action Bool
 cmdUnitIdHash = unitIdHash <$> cmdLineArgs
 
 cmdBignum :: Action (Maybe String)
 cmdBignum = bignum <$> cmdLineArgs
-
-cmdBignumCheck :: Action Bool
-cmdBignumCheck = bignumCheck <$> cmdLineArgs
 
 cmdProgressInfo :: Action ProgressInfo
 cmdProgressInfo = progressInfo <$> cmdLineArgs

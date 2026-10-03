@@ -4,6 +4,10 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE Trustworthy #-}
+
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines Bounded, Enum
+
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -37,13 +41,18 @@ module GHC.Internal.Enum
   )
 where
 
-import GHC.Internal.Base hiding ( many )
+import GHC.Internal.Base hiding( many )
 import GHC.Internal.Char
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Bignum.Integer
 import GHC.Internal.Num
 import GHC.Internal.Show
+import GHC.Internal.Prim (
+    Int#, Word#, chr#, eqWord#, gtWord#, geWord#, int2Word#, ltWord#,
+    minusWord#, ord#, plusWord#, seq, word2Int#,
+    (+#), (-#), (==#), (/=#), (<#), (>#), (>=#),
+  )
 import GHC.Internal.Tuple (Solo (..))
-default ()              -- Double isn't available yet
 
 -- | The 'Bounded' class is used to name the upper and lower limits of a
 -- type.  'Ord' is not a superclass of 'Bounded' since types that are not

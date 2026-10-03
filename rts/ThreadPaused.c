@@ -15,6 +15,7 @@
 #include "RaiseAsync.h"
 #include "Trace.h"
 #include "Threads.h"
+#include "Messages.h"
 #include "sm/NonMovingMark.h"
 
 #include <string.h> // for memmove()
@@ -182,6 +183,30 @@ stackSqueeze(Capability *cap, StgTSO *tso, StgPtr bottom)
     }
 }
 
+/*
+ * Check whether tso is the owner of the black hole bh.
+ *
+ * We must call this from the capability that runs tso,
+ * since that guarantees that the writes to bh->indirectee
+ * by tso claiming ownership have been visible. If another
+ * tso has claimed it again afterwards we can safely suspend
+ * our work.
+ */
+static bool
+threadPausedBlackHoleOwner(StgTSO *tso, StgClosure *bh)
+{
+    StgClosure *ind = RELAXED_LOAD(&((StgInd*)bh)->indirectee);
+    if (ind == (StgClosure*)tso) {
+        return true;
+    }
+    const StgInfoTable *ind_info = GET_INFO(UNTAG_CLOSURE(ind));
+    if (ind_info == &stg_BLOCKING_QUEUE_CLEAN_info
+        || ind_info == &stg_BLOCKING_QUEUE_DIRTY_info) {
+        return ((StgBlockingQueue*)UNTAG_CLOSURE(ind))->owner == tso;
+    }
+    return false;
+}
+
 /* -----------------------------------------------------------------------------
  * Pausing a thread
  *
@@ -254,11 +279,10 @@ threadPaused(Capability *cap, StgTSO *tso)
             // Note [suspend duplicate work]
             // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             // If the info table is a WHITEHOLE or a BLACKHOLE, then
-            // another thread has claimed it (via the SET_INFO()
-            // below), or is in the process of doing so.  In that case
-            // we want to suspend the work that the current thread has
-            // done on this thunk and wait until the other thread has
-            // finished.
+            // some thread has claimed it, or is in the process of doing
+            // so. In that case we want to suspend the work that the
+            // current thread has done on this thunk and wait until the
+            // other thread has finished.
             //
             // If eager blackholing is taking place, it could be the
             // case that the blackhole points to the current
@@ -286,13 +310,13 @@ threadPaused(Capability *cap, StgTSO *tso)
             // Note that great care is required when entering computations
             // suspended by this mechanism. See Note [AP_STACKs must be eagerly
             // blackholed] for details.
-            if (((bh_info == &stg_BLACKHOLE_info)
-                 && (RELAXED_LOAD(&((StgInd*)bh)->indirectee) != (StgClosure*)tso))
+            if ((IS_BLACKHOLE_INFO(bh_info)
+                && !threadPausedBlackHoleOwner(tso, bh))
                 || (bh_info == &stg_WHITEHOLE_info))
             {
                 debugTrace(DEBUG_squeeze,
-                           "suspending duplicate work: %ld words of stack",
-                           (long)((StgPtr)frame - tso->stackobj->sp));
+                           "suspending duplicate work: %td words of stack",
+                           (StgPtr)frame - tso->stackobj->sp);
 
                 // If this closure is already an indirection, then
                 // suspend the computation up to this point.
@@ -314,48 +338,64 @@ threadPaused(Capability *cap, StgTSO *tso)
                 continue;
             }
 
-            // an EAGER_BLACKHOLE or CAF_BLACKHOLE gets turned into a
-            // BLACKHOLE here.
+            // If we have a frame that is already eagerly blackholed, we
+            // shouldn't overwrite its payload: There may already be a blocking
+            // queue (see #26324).
+            if(frame_info == &stg_bh_upd_frame_info
+               || IS_BLACKHOLE_INFO(bh_info)) {
+                // already a black hole: we do nothing
+
+                // it should be a black hole (but we may not own it, as another
+                // thread could have raced us to claim it)
+                ASSERT(IS_BLACKHOLE_INFO(bh_info));
+
+            } else {
+                // lazy black hole
+
 #if defined(THREADED_RTS)
-            // first we turn it into a WHITEHOLE to claim it, and if
-            // successful we write our TSO and then the BLACKHOLE info pointer.
-            cur_bh_info = (const StgInfoTable *)
-                cas((StgVolatilePtr)&bh->header.info,
-                    (StgWord)bh_info,
-                    (StgWord)&stg_WHITEHOLE_info);
+                // first we turn it into a WHITEHOLE to claim it, and if
+                // successful we write our TSO and then the BLACKHOLE info pointer.
+                cur_bh_info = (const StgInfoTable *)
+                    cas((StgVolatilePtr)&bh->header.info,
+                        (StgWord)bh_info,
+                        (StgWord)&stg_WHITEHOLE_info);
 
-            if (cur_bh_info != bh_info) {
-                bh_info = cur_bh_info;
+                if (cur_bh_info != bh_info) {
+                    bh_info = cur_bh_info;
 #if defined(PROF_SPIN)
-                NONATOMIC_ADD(&whitehole_threadPaused_spin, 1);
+                    NONATOMIC_ADD(&whitehole_threadPaused_spin, 1);
 #endif
-                busy_wait_nop();
-                goto retry;
-            }
-#endif
-
-            IF_NONMOVING_WRITE_BARRIER_ENABLED {
-                if (ip_THUNK(INFO_PTR_TO_STRUCT(bh_info))) {
-                    // We are about to replace a thunk with a blackhole.
-                    // Add the free variables of the closure we are about to
-                    // overwrite to the update remembered set.
-                    // N.B. We caught the WHITEHOLE case above.
-                    updateRemembSetPushThunkEager(cap,
-                                                  THUNK_INFO_PTR_TO_STRUCT(bh_info),
-                                                  (StgThunk *) bh);
+                    busy_wait_nop();
+                    goto retry;
                 }
+#endif
+                ASSERT(bh_info != &stg_WHITEHOLE_info);
+
+                IF_NONMOVING_WRITE_BARRIER_ENABLED {
+                    if (ip_THUNK(INFO_PTR_TO_STRUCT(bh_info))) {
+                        // We are about to replace a thunk with a blackhole.
+                        // Add the free variables of the closure we are about to
+                        // overwrite to the update remembered set.
+                        // N.B. We caught the WHITEHOLE case above.
+                        updateRemembSetPushThunkEager(cap,
+                                                    THUNK_INFO_PTR_TO_STRUCT(bh_info),
+                                                    (StgThunk *) bh);
+                    }
+                }
+
+                // mark the slop so that the sanity checker can tell
+                // where the next closure is. N.B. We mustn't do this until we have
+                // pushed the free variables to the update remembered set above.
+                OVERWRITING_CLOSURE_SIZE(bh, closure_sizeW_(bh, INFO_PTR_TO_STRUCT(bh_info)));
+
+                // The payload of the BLACKHOLE points to the TSO
+                RELEASE_STORE(&((StgInd *)bh)->indirectee, (StgClosure *)tso);
+                SET_INFO_RELEASE(bh,&stg_BLACKHOLE_info);
             }
 
-            // zero out the slop so that the sanity checker can tell
-            // where the next closure is. N.B. We mustn't do this until we have
-            // pushed the free variables to the update remembered set above.
-            OVERWRITING_CLOSURE_SIZE(bh, closure_sizeW_(bh, INFO_PTR_TO_STRUCT(bh_info)));
-
-            // The payload of the BLACKHOLE points to the TSO
-            RELEASE_STORE(&((StgInd *)bh)->indirectee, (StgClosure *)tso);
-            SET_INFO_RELEASE(bh,&stg_BLACKHOLE_info);
-
-            // .. and we need a write barrier, since we just mutated the closure:
+            // We need a write barrier, since the closure was mutated (by
+            // threadPaused for lazy black holes, or the mutator for eager
+            // black holes).
             recordClosureMutated(cap,bh);
 
             // We pretend that bh has just been created.

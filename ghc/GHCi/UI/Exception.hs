@@ -1,9 +1,7 @@
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE LambdaCase #-}
+{-# OPTIONS_GHC -Wno-x-internalDebugShowMessages #-}
 module GHCi.UI.Exception
   ( GhciCommandError(..)
   , throwGhciCommandError
@@ -25,8 +23,6 @@ import GHC.Driver.Errors.Types
 
 import GHC.Iface.Errors.Ppr
 import GHC.Iface.Errors.Types
-
-import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Tc.Errors.Ppr
 import GHC.Tc.Errors.Types
@@ -56,15 +52,12 @@ newtype GhciCommandError =  GhciCommandError (Messages GhciMessage)
 instance Exception GhciCommandError
 
 instance Show GhciCommandError where
-  -- We implement 'Show' because it's required by the 'Exception' instance, but diagnostics
-  -- shouldn't be shown via the 'Show' typeclass, but rather rendered using the ppr functions.
+  -- We implement 'Show' because it's required by the 'Exception' instance, but
+  -- diagnostics must not be shown via 'Show', but instead reported via
+  -- `GHC.Driver.Errors.printMessages`.
+  --
   -- This also explains why there is no 'Show' instance for a 'MsgEnvelope'.
-  show (GhciCommandError msgs) =
-      renderWithContext defaultSDocContext
-    . vcat
-    . pprMsgEnvelopeBagWithLocDefault
-    . getMessages
-    $ msgs
+  show (GhciCommandError msgs) = internalDebugShowMessages msgs
 
 -- | Perform the given action and call the exception handler if the action
 -- throws a 'GhciCommandError'.  See 'GhciCommandError' for more information.
@@ -140,7 +133,7 @@ instance Diagnostic GhciMessage where
     GhciUnknownMessage m -> diagnosticReason m
 
   diagnosticHints = \case
-    GhciGhcMessage     m -> map GhciGhcHint     (ghciDiagnosticHints m)
+    GhciGhcMessage     m -> map GhciGhcHint (diagnosticHints m)
     GhciCommandMessage m -> map GhciCommandHint (diagnosticHints m)
     GhciUnknownMessage m -> diagnosticHints m
 
@@ -148,40 +141,6 @@ instance Diagnostic GhciMessage where
     GhciGhcMessage     m -> diagnosticCode m
     GhciCommandMessage m -> diagnosticCode m
     GhciUnknownMessage m -> diagnosticCode m
-
-
--- | Modifications to hint messages which we want to display in GHCi.
-ghciDiagnosticHints :: GhcMessage -> [GhcHint]
-ghciDiagnosticHints msg = map modifyHintForGHCi (diagnosticHints msg)
-  where
-    modifyHintForGHCi :: GhcHint -> GhcHint
-    modifyHintForGHCi = \case
-      SuggestExtension extHint -> SuggestExtension $ modifyExtHintForGHCi extHint
-      hint -> hint
-    modifyExtHintForGHCi :: LanguageExtensionHint -> LanguageExtensionHint
-    modifyExtHintForGHCi = \case
-      SuggestSingleExtension    doc ext  -> SuggestSingleExtension    (suggestSetExt [ext] doc False) ext
-      SuggestExtensionInOrderTo doc ext  -> SuggestExtensionInOrderTo (suggestSetExt [ext] doc False) ext
-      SuggestAnyExtension       doc exts -> SuggestAnyExtension       (suggestSetExt exts  doc True ) exts
-      SuggestExtensions         doc exts -> SuggestExtensions         (suggestSetExt exts  doc False) exts
-    -- Suggest enabling extension with :set -X<ext>
-    -- SuggestAnyExtension will be on multiple lines so the user can select which to enable without editing
-    suggestSetExt :: [LangExt.Extension] -> SDoc -> Bool -> SDoc
-    suggestSetExt exts doc enable_any = doc $$ hang header 2 exts_cmds
-      where
-        header = text "You may enable" <+> which <+> text "language extension" <> plural exts <+> text "in GHCi with:"
-        which
-          | [ _ext ] <- exts
-          = text "this"
-          | otherwise
-          = if enable_any
-            then text "these"
-            else text "all of these"
-        exts_cmds
-          | enable_any
-          = vcat $ map (\ext -> text ":set -X" <> ppr ext) exts
-          | otherwise
-          = text ":set" <> hcat (map (\ext -> text " -X" <> ppr ext) exts)
 
 -- | Modifications to error messages which we want to display in GHCi
 ghciDiagnosticMessage :: GhcMessageOpts -> GhcMessage -> DecoratedSDoc
@@ -225,11 +184,13 @@ ghciDiagnosticMessage ghc_opts msg =
           Just (pprWithUnitState us $ cantFindErrorX pkg_hidden_hint may_show_locations module_or_interface cfi)
         _ -> Nothing
       where
-
+        may_show_locations :: [String] -> SDoc
         may_show_locations = mayShowLocations ":set -v" (ifaceShowTriedFiles opts)
 
+        pkg_hidden_hint :: UnitInfo -> SDoc
         pkg_hidden_hint = pkgHiddenHint hidden_msg (ifaceBuildingCabalPackage opts)
           where
+            hidden_msg :: UnitInfo -> SDoc
             hidden_msg pkg =
               text "You can run" <+>
               quotes (text ":set -package " <> ppr (unitPackageName pkg)) <+>

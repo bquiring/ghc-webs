@@ -1,5 +1,3 @@
-
-
 -----------------------------------------------------------------------------
 --
 -- Code generator utilities; mostly monadic
@@ -8,7 +6,6 @@
 --
 -----------------------------------------------------------------------------
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TupleSections #-}
 
 module GHC.StgToCmm.Utils (
         emitDataLits, emitRODataLits,
@@ -163,7 +160,7 @@ mkTaggedObjectLoad platform reg base offset tag
   = mkAssign (CmmLocal reg)
              (CmmLoad (cmmOffsetB platform
                                   (CmmReg (CmmLocal base))
-                                  (offset - tag))
+                                  (offset - fromDynTag tag))
                       (localRegType reg)
                       NaturallyAligned)
 
@@ -189,23 +186,27 @@ tagToClosure platform tycon tag
 emitBarf :: String -> FCode ()
 emitBarf msg = do
   strLbl <- newStringCLit msg
-  emitRtsCall rtsUnitId (fsLit "barf") [(CmmLit strLbl,AddrHint)] False
+  emitRtsCallGen [] (mkCmmCodeLabel rtsUnitId (fsLit "sbarf"))
+    CmmNeverReturns
+    [(CmmLit strLbl, AddrHint)] False
 
 emitRtsCall :: UnitId -> FastString -> [(CmmExpr,ForeignHint)] -> Bool -> FCode ()
-emitRtsCall pkg fun = emitRtsCallGen [] (mkCmmCodeLabel pkg fun)
+emitRtsCall pkg fun = emitRtsCallGen [] (mkCmmCodeLabel pkg fun) CmmMayReturn
 
 emitRtsCallWithResult :: LocalReg -> ForeignHint -> UnitId -> FastString
         -> [(CmmExpr,ForeignHint)] -> Bool -> FCode ()
-emitRtsCallWithResult res hint pkg = emitRtsCallGen [(res,hint)] . mkCmmCodeLabel pkg
+emitRtsCallWithResult res hint pkg =
+  \fun -> emitRtsCallGen [(res,hint)] (mkCmmCodeLabel pkg fun) CmmMayReturn
 
 -- Make a call to an RTS C procedure
 emitRtsCallGen
    :: [(LocalReg,ForeignHint)]
    -> CLabel
+   -> CmmReturnInfo
    -> [(CmmExpr,ForeignHint)]
    -> Bool -- True <=> CmmSafe call
    -> FCode ()
-emitRtsCallGen res lbl args safe
+emitRtsCallGen res lbl ret_info args safe
   = do { platform <- getPlatform
        ; updfr_off <- getUpdFrameOff
        ; let (caller_save, caller_load) = callerSaveVolatileRegs platform
@@ -217,7 +218,7 @@ emitRtsCallGen res lbl args safe
       if safe then
         emit =<< mkCmmCall fun_expr res' args' updfr_off
       else do
-        let conv = ForeignConvention CCallConv arg_hints res_hints CmmMayReturn
+        let conv = ForeignConvention CCallConv arg_hints res_hints ret_info
         emit $ mkUnsafeCall (ForeignTarget fun_expr conv) res' args'
     (args', arg_hints) = unzip args
     (res',  res_hints) = unzip res
@@ -477,41 +478,49 @@ divideBranches branches = (lo_branches, mid, hi_branches)
 --------------
 emitCmmLitSwitch :: CmmExpr                    -- Tag to switch on
                -> [(Literal, CmmAGraphScoped)] -- Tagged branches
-               -> CmmAGraphScoped              -- Default branch (always)
+               -> Maybe CmmAGraphScoped        -- Default branch
                -> FCode ()                     -- Emit the code
-emitCmmLitSwitch _scrut [] deflt = emit $ fst deflt
-emitCmmLitSwitch scrut branches@(branch:_) deflt = do
+emitCmmLitSwitch _scrut [] (Just deflt) = emit $ fst deflt
+emitCmmLitSwitch _scrut [] Nothing      = panic "emitCmmLitSwitch: expected DEFAULT branch (no alts)"
+emitCmmLitSwitch scrut branches@(branch:_) mdeflt = do
     scrut' <- assignTemp' scrut
     join_lbl <- newBlockId
-    deflt_lbl <- label_code join_lbl deflt
     branches_lbls <- label_branches join_lbl branches
 
     platform <- getPlatform
     let cmm_ty = cmmExprType platform scrut
         rep = typeWidth cmm_ty
 
-    -- We find the necessary type information in the literals in the branches
-    let (signed,range) = case branch of
-          (LitNumber nt _, _) -> (signed,range)
-            where
-              signed = litNumIsSigned nt
-              range  = case litNumRange platform nt of
-                        (Just mi, Just ma) -> (mi,ma)
-                                              -- unbounded literals (Natural and
-                                              -- Integer) must have been
-                                              -- lowered at this point
-                        partial_bounds     -> pprPanic "Unexpected unbounded literal range"
-                                                       (ppr partial_bounds)
-               -- assuming native word range
-          _ -> (False, (0, platformMaxWord platform))
-
     if isFloatType cmm_ty
-    then emit =<< mk_float_switch rep scrut' deflt_lbl noBound branches_lbls
-    else emit $ mk_discrete_switch
+    then do
+      deflt_lbl <- case mdeflt of
+                    Nothing    -> panic "emitCmmLitSwitch: expected DEFAULT branch (float switch)"
+                    Just deflt -> label_code join_lbl deflt
+      emit =<< mk_float_switch rep scrut' deflt_lbl noBound branches_lbls
+    else do
+      -- We find the necessary type information in the literals in the branches
+      let (signed,range) = case branch of
+            (LitNumber nt _, _) -> (signed,range)
+              where
+                signed = litNumIsSigned nt
+                range  = case litNumRange platform nt of
+                          (Just mi, Just ma) -> (mi,ma)
+                                                -- unbounded literals (Natural and
+                                                -- Integer) must have been
+                                                -- lowered at this point
+                          partial_bounds     -> pprPanic "Unexpected unbounded literal range"
+                                                         (ppr partial_bounds)
+                 -- assuming native word range
+            _ -> (False, (0, platformMaxWord platform))
+
+      mdeflt_lbl <- case mdeflt of
+        Nothing    -> pure Nothing
+        Just deflt -> Just <$> label_code join_lbl deflt
+      emit $ mk_discrete_switch
         signed
         scrut'
         [(litValue lit,l) | (lit,l) <- branches_lbls]
-        (Just deflt_lbl)
+        mdeflt_lbl
         range
     emitLabel join_lbl
 

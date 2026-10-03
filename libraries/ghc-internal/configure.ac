@@ -12,7 +12,7 @@ AC_USE_SYSTEM_EXTENSIONS
 
 AC_MSG_CHECKING(for WINDOWS platform)
 case $host_alias in
-    *mingw32*|*mingw64*|*cygwin*|*msys*|*windows*)
+    *mingw32*|*mingw64*|*msys*|*windows*)
         WINDOWS=YES;;
     *)
         WINDOWS=NO;;
@@ -23,7 +23,7 @@ AC_MSG_RESULT($WINDOWS)
 AC_CHECK_TYPES([long long])
 
 # check for specific header (.h) files that we are interested in
-AC_CHECK_HEADERS([ctype.h errno.h fcntl.h inttypes.h limits.h signal.h sys/file.h sys/resource.h sys/select.h sys/stat.h sys/syscall.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/types.h sys/utsname.h sys/wait.h termios.h time.h unistd.h utime.h windows.h winsock.h langinfo.h poll.h sys/epoll.h sys/event.h sys/eventfd.h sys/socket.h])
+AC_CHECK_HEADERS([ctype.h errno.h fcntl.h inttypes.h limits.h signal.h sys/resource.h sys/select.h sys/stat.h sys/syscall.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/types.h sys/utsname.h sys/wait.h termios.h unistd.h utime.h windows.h winsock.h langinfo.h poll.h sys/epoll.h sys/event.h sys/eventfd.h sys/socket.h])
 
 # Enable large file support. Do this before testing the types ino_t, off_t, and
 # rlim_t, because it will affect the result of that test.
@@ -195,28 +195,10 @@ dnl--------------------------------------------------------------------
    if test "$HaveFrameworkGMP" = "YES" || test "$HaveLibGmp" = "YES"
    then
        AC_MSG_RESULT([no])
-       UseIntreeGmp=0
        AC_CHECK_HEADER([gmp.h], , [AC_MSG_ERROR([Cannot find gmp.h])])
-
-       AC_MSG_CHECKING([GMP version])
-       AC_COMPUTE_INT(GhcGmpVerMj, __GNU_MP_VERSION, [#include <gmp.h>],
-           AC_MSG_ERROR([Unable to get value of __GNU_MP_VERSION]))
-       AC_COMPUTE_INT(GhcGmpVerMi, __GNU_MP_VERSION_MINOR, [#include <gmp.h>],
-           AC_MSG_ERROR([Unable to get value of __GNU_MP_VERSION_MINOR]))
-       AC_COMPUTE_INT(GhcGmpVerPl, __GNU_MP_VERSION_PATCHLEVEL, [#include <gmp.h>],
-           AC_MSG_ERROR([Unable to get value of __GNU_MP_VERSION_PATCHLEVEL]))
-       AC_MSG_RESULT([$GhcGmpVerMj.$GhcGmpVerMi.$GhcGmpVerPl])
-
    else
        AC_MSG_RESULT([yes])
-       UseIntreeGmp=1
        HaveSecurePowm=1
-
-       AC_MSG_CHECKING([GMP version])
-       GhcGmpVerMj=6
-       GhcGmpVerMi=1
-       GhcGmpVerPl=2
-       AC_MSG_RESULT([$GhcGmpVerMj.$GhcGmpVerMi.$GhcGmpVerPl])
    fi
 
    GMP_INSTALL_INCLUDES="HsIntegerGmp.h ghc-gmp.h"
@@ -231,10 +213,6 @@ AC_SUBST(GMP_INSTALL_INCLUDES)
 AC_SUBST(HaveLibGmp)
 AC_SUBST(HaveFrameworkGMP)
 AC_SUBST(HaveSecurePowm)
-AC_SUBST(UseIntreeGmp)
-AC_SUBST(GhcGmpVerMj)
-AC_SUBST(GhcGmpVerMi)
-AC_SUBST(GhcGmpVerPl)
 
 # Compute offsets/sizes used by jsbits/base.js
 if test "$host" = "javascript-ghcjs"

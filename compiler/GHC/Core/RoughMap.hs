@@ -36,10 +36,10 @@ import GHC.Core.Type
 import GHC.Utils.Outputable
 import GHC.Types.Name
 import GHC.Types.Name.Env
-import GHC.Builtin.Types.Prim( cONSTRAINTTyConName, tYPETyConName )
 
 import Control.Monad (join)
 import Data.Data (Data)
+import Data.Maybe (fromMaybe)
 import GHC.Utils.Panic
 
 {-
@@ -347,16 +347,7 @@ typeToRoughMatchTc ty
 
 roughMatchTyConName :: TyCon -> Name
 roughMatchTyConName tc
-  | tc_name == cONSTRAINTTyConName
-  = tYPETyConName  -- TYPE and CONSTRAINT are not apart, so they must use
-                   -- the same rough-map key. We arbitrarily use TYPE.
-                   -- See Note [Type and Constraint are not apart]
-                   -- wrinkle (W1) in GHC.Builtin.Types.Prim
-  | otherwise
-  = assertPpr (isGenerativeTyCon tc Nominal) (ppr tc) tc_name
-  where
-    tc_name = tyConName tc
-
+  = assertPpr (isGenerativeTyCon tc Nominal) (ppr tc) (tyConName tc)
 
 -- | Trie of @[RoughMatchTc]@
 --
@@ -459,10 +450,9 @@ insertRM [] v rm@(RM {}) =
     rm { rm_empty = v `consBag` rm_empty rm }
 
 insertRM (RM_KnownTc k : ks) v rm@(RM {}) =
-    rm { rm_known = alterDNameEnv f (rm_known rm) k }
+    rm { rm_known = upsertDNameEnv f (rm_known rm) k }
   where
-    f Nothing  = Just $ (insertRM ks v emptyRM)
-    f (Just m) = Just $ (insertRM ks v m)
+    f = insertRM ks v . fromMaybe emptyRM
 
 insertRM (RM_WildCard : ks) v rm@(RM {}) =
     rm { rm_wild = insertRM ks v (rm_wild rm) }

@@ -8,11 +8,16 @@
    (EpAnn
     (EpaSpan { DumpParsedAstComments.hs:1:1 })
     (AnnsModule
-     (NoEpTok)
+     (EpTok
+      (EpaSpan { <no location info> }))
      (EpTok
       (EpaSpan { DumpParsedAstComments.hs:5:1-6 }))
      (EpTok
       (EpaSpan { DumpParsedAstComments.hs:5:30-34 }))
+     ((,,)
+      (EpTok (EpaSpan { <no location info> }))
+      (EpTok (EpaSpan { <no location info> }))
+      [])
      []
      []
      (Just
@@ -36,15 +41,14 @@
         { DumpParsedAstComments.hs:1:1-28 }))]
      []))
    (EpVirtualBraces
-    (1))
+    (EpaSpan { DumpParsedAstComments.hs:9:1 }))
    (Nothing)
    (Nothing))
   (Just
    (L
     (EpAnn
      (EpaSpan { DumpParsedAstComments.hs:5:8-28 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       []))
     {ModuleName: DumpParsedAstComments}))
@@ -53,8 +57,7 @@
   [(L
     (EpAnn
      (EpaSpan { DumpParsedAstComments.hs:9:1-7 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       [(L
         (EpaSpan
@@ -84,23 +87,22 @@
        (Unqual
         {OccName: bar}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { DumpParsedAstComments.hs:9:1-7 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { DumpParsedAstComments.hs:9:1-7 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -118,11 +120,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -148,8 +155,7 @@
                (L
                 (EpAnn
                  (EpaSpan { DumpParsedAstComments.hs:9:7 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsOverLit
@@ -167,8 +173,7 @@
   ,(L
     (EpAnn
      (EpaSpan { DumpParsedAstComments.hs:(14,1)-(16,3) })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       [(L
         (EpaSpan
@@ -205,23 +210,22 @@
        (Unqual
         {OccName: foo}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { DumpParsedAstComments.hs:(14,1)-(16,3) })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { DumpParsedAstComments.hs:(14,1)-(16,3) })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -239,11 +243,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -269,8 +278,7 @@
                (L
                 (EpAnn
                  (EpaSpan { DumpParsedAstComments.hs:(14,7)-(16,3) })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   [(L
                     (EpaSpan
@@ -280,32 +288,26 @@
                       "-- normal comment")
                      { DumpParsedAstComments.hs:14:7-8 }))]))
                 (HsDo
-                 (AnnList
-                  (Just
-                   (EpaSpan { DumpParsedAstComments.hs:16:3 }))
-                  (ListNone)
-                  []
-                  (EpaSpan { DumpParsedAstComments.hs:14:7-8 })
-                  [])
+                 ((,)
+                  (Right
+                   (AnnList
+                    (AnnListLayout
+                     (EpaSpan { DumpParsedAstComments.hs:16:3 }))
+                    (ListNone)
+                    []))
+                  (EpaSpan { DumpParsedAstComments.hs:14:7-8 }))
                  (DoExpr
                   (Nothing))
                  (L
                   (EpAnn
                    (EpaSpan { DumpParsedAstComments.hs:16:3 })
-                   (AnnList
-                    (Just
-                     (EpaSpan { DumpParsedAstComments.hs:16:3 }))
-                    (ListNone)
-                    []
-                    (NoEpTok)
-                    [])
+                   []
                    (EpaComments
                     []))
                   [(L
                     (EpAnn
                      (EpaSpan { DumpParsedAstComments.hs:16:3 })
-                     (AnnListItem
-                      [])
+                     []
                      (EpaComments
                       []))
                     (BodyStmt
@@ -313,8 +315,7 @@
                      (L
                       (EpAnn
                        (EpaSpan { DumpParsedAstComments.hs:16:3 })
-                       (AnnListItem
-                        [])
+                       []
                        (EpaComments
                         []))
                       (HsOverLit
@@ -334,8 +335,7 @@
   ,(L
     (EpAnn
      (EpaSpan { DumpParsedAstComments.hs:19:1-23 })
-     (AnnListItem
-      [])
+     []
      (EpaComments
       [(L
         (EpaSpan
@@ -358,23 +358,22 @@
        (Unqual
         {OccName: main}))
       (MG
-       (FromSource)
+       ((,)
+        (FromSource)
+        (AnnList
+         (AnnListNoLayout)
+         (ListNone)
+         []))
        (L
         (EpAnn
          (EpaSpan { DumpParsedAstComments.hs:19:1-23 })
-         (AnnList
-          (Nothing)
-          (ListNone)
-          []
-          (NoEpTok)
-          [])
+         []
          (EpaComments
           []))
         [(L
           (EpAnn
            (EpaSpan { DumpParsedAstComments.hs:19:1-23 })
-           (AnnListItem
-            [])
+           []
            (EpaComments
             []))
           (Match
@@ -392,11 +391,16 @@
             (Prefix)
             (NoSrcStrict)
             (AnnFunRhs
-             (NoEpTok)
+             (EpTok
+              (EpaSpan { <no location info> }))
              []
              []))
            (L
-            (EpaSpan { <no location info> })
+            (EpAnn
+             (EpaSpan { <no location info> })
+             []
+             (EpaComments
+              []))
             [])
            (GRHSs
             (EpaComments
@@ -422,8 +426,7 @@
                (L
                 (EpAnn
                  (EpaSpan { DumpParsedAstComments.hs:19:8-23 })
-                 (AnnListItem
-                  [])
+                 []
                  (EpaComments
                   []))
                 (HsApp
@@ -431,8 +434,7 @@
                  (L
                   (EpAnn
                    (EpaSpan { DumpParsedAstComments.hs:19:8-15 })
-                   (AnnListItem
-                    [])
+                   []
                    (EpaComments
                     []))
                   (HsVar
@@ -449,15 +451,14 @@
                  (L
                   (EpAnn
                    (EpaSpan { DumpParsedAstComments.hs:19:17-23 })
-                   (AnnListItem
-                    [])
+                   []
                    (EpaComments
                     []))
                   (HsLit
                    (NoExtField)
                    (HsString
                     (SourceText "hello")
-                    {FastString: "hello"})))))))
+                    "hello")))))))
              [])
             (EmptyLocalBinds
              (NoExtField)))))])))))]))

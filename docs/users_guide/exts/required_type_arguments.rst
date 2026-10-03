@@ -285,8 +285,27 @@ type arguments::
 
 A few limitations apply:
 
-* The ``*`` syntax of :extension:`StarIsType` is not available due to a
-  conflict with the multiplication operator.
+* The ``*`` syntax of :extension:`StarIsType` is only partially available in
+  required type arguments due to a conflict with the multiplication operator.
+
+  Concretely, there are three cases to be aware of:
+
+  * In type syntax, e.g. in ``f (Int :: *)`` or ``f (Left Int :: Either * Bool)``,
+    the :extension:`StarIsType` extension has full effect.
+
+  * In term syntax, in positions where an operator may occur, the
+    :extension:`StarIsType` extension has no effect, meaning that ``*`` is
+    parsed as an operator. For example, in ``f (*)``, ``f (Maybe *)`` and
+    ``f (Either * Bool)``, the ``*``\s refer to whichever ``*`` is in scope.
+    In such positions, the ``*`` does not receive any special treatment compared
+    to e.g. ``+`` in ``f (+)`` or ``f (Either + Int)``.
+
+  * In term syntax, in positions where ``*`` is a direct argument to ``->``, e.g.
+    in ``f (* -> * -> *)`` and ``f (* -> Constraint)``, the ``*``\s stand for
+    ``Type``, provided the :extension:`StarIsType` extension is enabled.
+    This is supported from GHC 10.0 onwards; earlier versions will produce
+    a parse error.
+
   What to do instead: use ``Type`` from the ``Data.Kind`` module.
 
 * The ``'`` syntax of :extension:`DataKinds` is not available due to a conflict
@@ -341,7 +360,9 @@ longer compile: ::
   f :: a -> a    -- RequiredTypeArguments: the top-level `a` is captured
 
 Because of that, merely enabling :extension:`RequiredTypeArguments` might lead
-to type errors of this form::
+to type errors of this form:
+
+.. code-block:: none
 
   Term variable ‘a’ cannot be used here
     (term variables cannot be promoted)
@@ -356,7 +377,9 @@ If you are converting a large codebase to be compatible with
 :extension:`RequiredTypeArguments`, consider using
 :ghc-flag:`-Wterm-variable-capture` during the migration. It is a warning that
 detects instances of implicit quantification incompatible with
-:extension:`RequiredTypeArguments`: ::
+:extension:`RequiredTypeArguments`:
+
+.. code-block:: none
 
   The type variable ‘a’ is implicitly quantified,
   even though another variable of the same name is in scope:

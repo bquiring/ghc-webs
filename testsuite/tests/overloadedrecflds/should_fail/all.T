@@ -33,12 +33,15 @@ test('hasfieldfail03', normal, compile_fail, [''])
 test('hasfieldfail04', normal, compile_fail, [''])
 test('T14953', [extra_files(['T14953_A.hs', 'T14953_B.hs'])],
      multimod_compile_fail, ['T14953', ''])
+test('T26480', extra_files(['T26480_aux1.hs', 'T26480_aux2.hs']), multimod_compile_fail, ['T26480', '-v0'])
+test('T26480b', normal, compile_fail, [''])
 test('DuplicateExports', normal, compile_fail, [''])
 test('T17420', [extra_files(['T17420A.hs'])], multimod_compile_fail,
      ['T17420', ''])
 test('T17469', [extra_files(['T17469A.hs'])], multimod_compile_fail,
      ['T17469', ''])
 test('T17965', normal, compile_fail, [''])
+test('T26391', normal, compile_fail, [''])
 test('DRFHoleFits', extra_files(['DRFHoleFits_A.hs']), multimod_compile_fail, ['DRFHoleFits', '-v0'])
 test('DRFPartialFields', normal, compile_fail, [''])
 test('T16745', extra_files(['T16745C.hs', 'T16745B.hs']), multimod_compile_fail, ['T16745A', ''])

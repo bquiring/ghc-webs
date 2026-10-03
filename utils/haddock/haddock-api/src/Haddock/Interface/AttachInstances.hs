@@ -32,7 +32,7 @@ import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Ord (comparing)
 import qualified Data.Sequence as Seq
 import GHC
-import GHC.Builtin.Types (unrestrictedFunTyConName)
+import GHC.Builtin.WiredIn.Types (unrestrictedFunTyConName)
 import GHC.Core (isOrphan)
 import GHC.Core.Class
 import GHC.Core.Coercion
@@ -42,7 +42,7 @@ import GHC.Core.InstEnv
 import GHC.Core.TyCo.Compare (eqType)
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
-import GHC.Data.FastString (unpackFS)
+import Haddock.GhcUtils (fastStringToText)
 import GHC.Driver.Env.Types
 import GHC.HsToCore.Docs
 import GHC.Iface.Load
@@ -95,7 +95,7 @@ attachInstances expInfo ifaces instIfaceMap isOneShot = do
 
   (_msgs, mb_index) <- do
     hsc_env <- getSession
-    liftIO $ runTcInteractive hsc_env $ do
+    liftIO $ runTcInteractive NoTcMPlugins hsc_env $ do
       -- In one shot mode we don't want to load anything more than is already loaded
       unless isOneShot $ do
         let doc = text "Need interface for haddock"
@@ -251,10 +251,12 @@ attachToExportItem cls_index fam_index index expInfo getInstDoc getFixity getIns
             }
         where
           fixities :: [(Name, Fixity)]
-          !fixities = force . Map.toList $ List.foldl' f Map.empty all_names
+          -- Use DNameEnv to guarantee a deterministic output regardless of the
+          -- uniques assigned to each_name e.g. off of the interface file.
+          !fixities = force . eltsDNameEnv $ List.foldl' f emptyDNameEnv all_names
 
-          f :: Map.Map Name Fixity -> Name -> Map.Map Name Fixity
-          f !fs n = Map.alter (<|> getFixity n) n fs
+          f :: DNameEnv (Name, Fixity) -> Name -> DNameEnv (Name, Fixity)
+          f !fs n = alterDNameEnv (<|> ((,) n <$> getFixity n)) fs n
 
           patsyn_names :: [Name]
           patsyn_names = concatMap (getMainDeclBinder emptyOccEnv . fst) patsyns
@@ -369,7 +371,7 @@ simplify (TyConApp tc ts) =
     (SName (tyConName tc))
     (mapMaybe simplify_maybe ts)
 simplify (LitTy (NumTyLit n)) = SimpleIntTyLit n
-simplify (LitTy (StrTyLit s)) = SimpleStringTyLit (unpackFS s)
+simplify (LitTy (StrTyLit s)) = SimpleStringTyLit (fastStringToText s)
 simplify (LitTy (CharTyLit c)) = SimpleCharTyLit c
 simplify (CastTy ty _) = simplify ty
 simplify (CoercionTy _) = error "simplify:Coercion"

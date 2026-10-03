@@ -54,6 +54,10 @@ module Haddock.Utils
   , replace
   , spanWith
 
+    -- * Concurrency utilities
+  , mapConcurrentlyWith_
+  , newBoundedSem
+
     -- * Logging
   , parseVerbosity
   , Verbosity (..)
@@ -83,6 +87,15 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import Documentation.Haddock.Doc (emptyMetaDoc)
 import Haddock.Types
+import Data.Text.Lazy (Text)
+import qualified Data.Text.Lazy as LText
+
+import Control.Concurrent (forkFinally)
+import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (throwIO)
+import Control.Monad (void)
+import System.Semaphore (AbstractSem (..))
 
 --------------------------------------------------------------------------------
 
@@ -184,35 +197,43 @@ subIndexHtmlFile ls = "doc-index-" ++ b ++ ".html"
 -- before being matched with IDs in the target document.
 -------------------------------------------------------------------------------
 
-moduleUrl :: Module -> String
-moduleUrl = moduleHtmlFile
+moduleUrl :: Module -> Text
+moduleUrl module_ = LText.pack (moduleHtmlFile module_)
 
-moduleNameUrl :: Module -> OccName -> String
-moduleNameUrl mdl n = moduleUrl mdl ++ '#' : nameAnchorId n
+moduleNameUrl :: Module -> OccName -> Text
+moduleNameUrl mdl n = moduleUrl mdl <> "#" <> nameAnchorId n
 
-moduleNameUrl' :: ModuleName -> OccName -> String
-moduleNameUrl' mdl n = moduleHtmlFile' mdl ++ '#' : nameAnchorId n
+moduleNameUrl' :: ModuleName -> OccName -> Text
+moduleNameUrl' mdl n = LText.pack (moduleHtmlFile' mdl) <> "#" <> nameAnchorId n
 
-nameAnchorId :: OccName -> String
-nameAnchorId name = makeAnchorId (prefix : ':' : occNameString name)
+nameAnchorId :: OccName -> Text
+nameAnchorId name = makeAnchorId (prefix <> ":" <> LText.pack (occNameString name))
   where
     prefix
-      | isValOcc name = 'v'
-      | otherwise = 't'
+      | isValOcc name = "v"
+      | otherwise = "t"
 
 -- | Takes an arbitrary string and makes it a valid anchor ID. The mapping is
 -- identity preserving.
-makeAnchorId :: String -> String
-makeAnchorId [] = []
-makeAnchorId (f : r) = escape isAlpha f ++ concatMap (escape isLegal) r
+makeAnchorId :: Text -> Text
+makeAnchorId input =
+    case LText.uncons input of
+        Nothing        -> LText.empty
+        Just (f, rest) ->
+            escape isAlpha f <> LText.concatMap (escape isLegal) rest
   where
+    escape :: (Char -> Bool) -> Char -> Text
     escape p c
-      | p c = [c]
-      | otherwise = '-' : show (ord c) ++ "-"
+        | p c       = LText.singleton c
+        | otherwise =
+            -- "-" <> show (ord c) <> "-"
+            LText.cons '-' (LText.pack (show (ord c) <> "-"))
+
+    isLegal :: Char -> Bool
     isLegal ':' = True
     isLegal '_' = True
     isLegal '.' = True
-    isLegal c = isAscii c && isAlphaNum c
+    isLegal c   = isAscii c && isAlphaNum c
 
 -- NB: '-' is legal in IDs, but we use it as the escape char
 
@@ -272,7 +293,7 @@ escapeURIString :: (Char -> Bool) -> String -> String
 escapeURIString = concatMap . escapeURIChar
 
 isUnreserved :: Char -> Bool
-isUnreserved c = isAlphaNumChar c || (c `elem` "-_.~")
+isUnreserved c = isAlphaNumChar c || (c `elem` ("-_.~" :: String))
 
 isAlphaChar, isDigitChar, isAlphaNumChar :: Char -> Bool
 isAlphaChar c = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
@@ -323,6 +344,43 @@ html_xrefs = unsafePerformIO (readIORef html_xrefs_ref)
 {-# NOINLINE html_xrefs' #-}
 html_xrefs' :: Map ModuleName FilePath
 html_xrefs' = unsafePerformIO (readIORef html_xrefs_ref')
+
+-- * Concurrency utilities
+
+--------------------------------------------------------------------------------
+
+mapConcurrentlyWith_ :: AbstractSem -> (a -> IO ()) -> [a] -> IO ()
+mapConcurrentlyWith_ _ _ [] = return ()
+mapConcurrentlyWith_ concSem f xs = do
+  -- Create MVars to wait for completion and collect results
+  resultMVars <- mapM (const newEmptyMVar) xs
+
+  -- Fork a thread for each element
+  mapM_ (forkThread concSem) (zip xs resultMVars)
+
+  -- Wait for all threads and collect any errors
+  results <- mapM takeMVar resultMVars
+
+  -- Re-throw the first exception if any
+  case [err | Left err <- results] of
+    (err:_) -> throwIO err
+    [] -> return ()
+  where
+    forkThread concSem' (x, resultMVar) = do
+      acquireSem concSem'
+      void $ forkFinally (f x) $ \res -> do
+        releaseSem concSem'
+        putMVar resultMVar res
+
+newBoundedSem :: Int -> IO AbstractSem
+newBoundedSem maxThreads = do
+  sem <- newQSem (max 1 maxThreads)
+  pure
+    AbstractSem
+      { acquireSem = waitQSem sem
+      , releaseSem = signalQSem sem
+      }
+
 
 -----------------------------------------------------------------------------
 

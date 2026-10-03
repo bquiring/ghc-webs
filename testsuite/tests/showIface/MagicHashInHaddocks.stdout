@@ -3,10 +3,10 @@ docs:
          Just text:
                 -- | 'foo#' `Bar##` `*##`
               identifiers:
-                {MagicHashInHaddocks.hs:3:7-10}
-                foo#
-                {MagicHashInHaddocks.hs:3:14-18}
+                {EpAnn EpaSpan MagicHashInHaddocks.hs:3:14-18 NameAnnTrailing [] EpaComments []}
                 Bar##
+                {EpAnn EpaSpan MagicHashInHaddocks.hs:3:7-10 NameAnnTrailing [] EpaComments []}
+                foo#
        export docs:
          []
        declaration docs:
@@ -21,7 +21,7 @@ docs:
        named chunks:
        haddock options:
        language:
-         Nothing
+         Just GHC2021
        language extensions:
          MonomorphismRestriction
          RelaxedPolyRec

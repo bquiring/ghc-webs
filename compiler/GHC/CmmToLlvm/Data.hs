@@ -19,6 +19,7 @@ import GHC.Cmm.CLabel
 import GHC.Cmm.InitFini
 import GHC.Cmm
 import GHC.Platform
+import GHC.Types.Literal.Floating
 
 import GHC.Data.FastString
 import GHC.Utils.Panic
@@ -75,7 +76,7 @@ genLlvmData (sect, statics)
                 IsFiniArray -> fsLit "llvm.global_dtors"
     in genGlobalLabelArray var clbls
 
-genLlvmData (sec, CmmStaticsRaw lbl xs) = do
+genLlvmData (sec@(Section t _), CmmStaticsRaw lbl xs) = do
     label <- strCLabel_llvm lbl
     static <- mapM genData xs
     lmsec <- llvmSection sec
@@ -92,7 +93,7 @@ genLlvmData (sec, CmmStaticsRaw lbl xs) = do
                                                     then Just 2 else Just 1
                             Section Data _    -> Just $ platformWordSizeInBytes platform
                             _                 -> Nothing
-        const          = if sectionProtection sec == ReadOnlySection
+        const          = if sectionProtection t == ReadOnlySection
                             then Constant else Global
         varDef         = LMGlobalVar label tyAlias link lmsec align const
         globDef        = LMGlobal varDef struct
@@ -145,10 +146,9 @@ llvmSectionType p t = case t of
     CString                 -> case platformOS p of
                                  OSMinGW32 -> fsLit ".rdata$str"
                                  _         -> fsLit ".rodata.str"
-
+    IPE                     -> fsLit ".ipe"
     InitArray               -> panic "llvmSectionType: InitArray"
     FiniArray               -> panic "llvmSectionType: FiniArray"
-    OtherSection _          -> panic "llvmSectionType: unknown section type"
 
 -- | Format a Cmm Section into a LLVM section name
 llvmSection :: Section -> LlvmM LMSection
@@ -194,14 +194,11 @@ genStaticLit :: CmmLit -> LlvmM LlvmStatic
 genStaticLit (CmmInt i w)
     = return $ LMStaticLit (LMIntLit i (LMInt $ widthInBits w))
 
-genStaticLit (CmmFloat r W32)
-    = return $ LMStaticLit (LMFloatLit (widenFp (fromRational r :: Float)) (widthToLlvmFloat W32))
+genStaticLit (CmmFloat r LitFloat)
+    = return $ LMStaticLit (LMFloatLit (widenFp (litFloatingToHostFloat r)) (widthToLlvmFloat W32))
 
-genStaticLit (CmmFloat r W64)
-    = return $ LMStaticLit (LMFloatLit (fromRational r :: Double) (widthToLlvmFloat W64))
-
-genStaticLit (CmmFloat _r _w)
-    = panic "genStaticLit (CmmLit:CmmFloat), unsupported float lit"
+genStaticLit (CmmFloat r LitDouble)
+    = return $ LMStaticLit (LMFloatLit (litFloatingToHostDouble r) (widthToLlvmFloat W64))
 
 genStaticLit (CmmVec ls)
     = do sls <- mapM toLlvmLit ls

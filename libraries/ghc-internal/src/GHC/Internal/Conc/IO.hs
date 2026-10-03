@@ -56,10 +56,19 @@ module GHC.Internal.Conc.IO
         , win32ConsoleHandler
         , toWin32ConsoleEvent
 #endif
+        , raisePrimIOException -- exported for use within RTS
         ) where
 
 import GHC.Internal.Base
 import GHC.Internal.Conc.Sync as Sync
+import GHC.Internal.Err (errorWithoutStackTrace)
+import GHC.Internal.Exception (SomeException, Exception(toException))
+import qualified GHC.Internal.Foreign.C.Error as C
+import GHC.Internal.Foreign.C.Types (CInt)
+import GHC.Internal.Maybe (Maybe(Nothing))
+import GHC.Internal.STM as STM
+import GHC.Internal.Prim (Int#, State#, RealWorld,
+                          delay#, waitRead#, waitWrite#, raiseIO#)
 import GHC.Internal.Real ( fromIntegral )
 import GHC.Internal.System.Posix.Types
 
@@ -142,17 +151,17 @@ threadWaitWrite fd
 -- to read from a file descriptor. The second returned value
 -- is an IO action that can be used to deregister interest
 -- in the file descriptor.
-threadWaitReadSTM :: Fd -> IO (Sync.STM (), IO ())
+threadWaitReadSTM :: Fd -> IO (STM.STM (), IO ())
 threadWaitReadSTM fd
 #if !defined(mingw32_HOST_OS) && !defined(javascript_HOST_ARCH)
   | threaded  = Event.threadWaitReadSTM fd
 #endif
   | otherwise = do
-      m <- Sync.newTVarIO False
+      m <- STM.newTVarIO False
       t <- Sync.forkIO $ do
         threadWaitRead fd
-        Sync.atomically $ Sync.writeTVar m True
-      let waitAction = do b <- Sync.readTVar m
+        STM.atomically $ STM.writeTVar m True
+      let waitAction = do b <- STM.readTVar m
                           if b then return () else retry
       let killAction = Sync.killThread t
       return (waitAction, killAction)
@@ -161,17 +170,17 @@ threadWaitReadSTM fd
 -- can be written to a file descriptor. The second returned value
 -- is an IO action that can be used to deregister interest
 -- in the file descriptor.
-threadWaitWriteSTM :: Fd -> IO (Sync.STM (), IO ())
+threadWaitWriteSTM :: Fd -> IO (STM.STM (), IO ())
 threadWaitWriteSTM fd
 #if !defined(mingw32_HOST_OS) && !defined(javascript_HOST_ARCH)
   | threaded  = Event.threadWaitWriteSTM fd
 #endif
   | otherwise = do
-      m <- Sync.newTVarIO False
+      m <- STM.newTVarIO False
       t <- Sync.forkIO $ do
         threadWaitWrite fd
-        Sync.atomically $ Sync.writeTVar m True
-      let waitAction = do b <- Sync.readTVar m
+        STM.atomically $ STM.writeTVar m True
+      let waitAction = do b <- STM.readTVar m
                           if b then return () else retry
       let killAction = Sync.killThread t
       return (waitAction, killAction)
@@ -246,3 +255,39 @@ registerDelay _usecs
 #if !defined(javascript_HOST_ARCH)
 foreign import ccall unsafe "rtsSupportsBoundThreads" threaded :: Bool
 #endif
+
+
+-- ---------------------------------------------------------------------------
+-- PrimIOException
+
+-- FIXME: raisePrimIOException throws an IOException, which is not ideal. It is
+-- not in a position to fill in most of the information for an IOException.
+-- Much better would be to have a new PrimIOException exception type, and for
+-- I/O primops to catch that and rethrow with the proper context. In particular
+-- we do not have a proper location, since that's fundamantally something from
+-- a higher level library.
+--
+-- Unfortunately, catching and throwing converts async exceptions to sync ones.
+-- This breaks any thunks that, via unsafePerformIO, use such operations. We
+-- have tests that check for this, e.g. T26341a T26341b. Catching and rethrowing
+-- here would break those tests.
+--
+-- See issue #2558, #24189 and #26368.
+
+-- | Internal helper funtion used by the in-RTS I\/O managers for reporting
+-- exceptions. Do not use directly.
+--
+-- Do not change the type signature \/ ABI without updating the Cmm callers!
+-- There is no signature checking for Cmm to Hs calls.
+--
+raisePrimIOException :: Int# -> State# RealWorld -> (# State# RealWorld, a #)
+raisePrimIOException errno# s =
+    let exception :: SomeException
+        exception = toException
+                      (C.errnoToIOError "threadWaitRead/Write"
+                                        (toCErrno errno#)
+                                        Nothing Nothing)
+     in raiseIO# exception s
+  where
+    toCErrno :: Int# -> C.Errno
+    toCErrno e = C.Errno ((fromIntegral :: Int -> CInt) (I# e))

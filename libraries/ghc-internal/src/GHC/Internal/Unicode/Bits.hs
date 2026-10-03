@@ -31,12 +31,14 @@ module GHC.Internal.Unicode.Bits
     where
 
 import GHC.Internal.Bits (finiteBitSize, popCount)
-import {-# SOURCE #-} GHC.Internal.ByteOrder
+import GHC.Internal.Classes (Eq(..))
+import GHC.Internal.ByteOrder
 import GHC.Internal.Prim
 import GHC.Internal.ST
-import GHC.Internal.Base
+import GHC.Internal.Base (($))
 import GHC.Internal.Num
 import GHC.Internal.List
+import GHC.Internal.Types
 import GHC.Internal.Word
 
 -- | @lookup64 addr index@ looks up the bit stored at bit index @index@ using a

@@ -128,9 +128,10 @@ module GHC.Internal.System.Posix.Types (
   Limit
  ) where
 
+import GHC.Internal.Types as Rebindable -- For known-occ names
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Bits
-import GHC.Internal.Base
+import GHC.Internal.Classes (Eq, Ord)
 import GHC.Internal.Foreign.Storable
 import GHC.Internal.Enum
 import GHC.Internal.Int

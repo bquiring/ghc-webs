@@ -40,7 +40,7 @@ import GHC.Core.Coercion.Axiom
   ( CoAxBranch(..), coAxiomBranches, fromBranches )
 import GHC.Core.TyCon
   ( TyCon, tyConName
-  , isClosedSynFamilyTyConWithAxiom_maybe
+  , closedFamilyTyConCoAxiom_maybe
   )
 import qualified GHC.Core.TyCo.Rep as GHC
   ( Type )
@@ -67,7 +67,7 @@ import GHC.Types.PkgQual
 import GHC.Tc.Utils.Monad
   ( initIfaceLoad )
 import GHC.Unit.Finder
-  ( FindResult(..), findImportedModule )
+  ( FindResult(..), ModuleLookupScope(..), findImportedModule )
 import GHC.Utils.Outputable
   ( text )
 import Language.Haskell.Syntax.Module.Name
@@ -109,7 +109,7 @@ outdated _ = Nothing
 getFamEqnCodes :: Maybe LibDir -> IO ( Map DiagnosticCode ( FamEqnIndex, String, Use ) )
 getFamEqnCodes mb_libDir =
   do { tc <- ghcDiagnosticCodeTyCon mb_libDir
-     ; return $ case isClosedSynFamilyTyConWithAxiom_maybe tc of
+     ; return $ case closedFamilyTyConCoAxiom_maybe tc of
      { Nothing -> error "can't find equations for 'GhcDiagnosticCode'"
      ; Just ax -> Map.fromList
                 $ zipWith parseBranch [1..]
@@ -157,7 +157,7 @@ ghcDiagnosticCodeTyCon mb_libDir =
      ; liftIO
 
   -- STEP 2: look up the module "GHC.Types.Error.Codes"
-  do { res <- findImportedModule hsc_env (mkModuleName "GHC.Types.Error.Codes") NoPkgQual
+  do { res <- findImportedModule hsc_env LookupUser (mkModuleName "GHC.Types.Error.Codes") NoPkgQual
      ; case res of
      { Found _ modl ->
 

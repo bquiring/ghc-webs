@@ -89,21 +89,25 @@ disInstr ( StgBCO *bco, int pc )
          p1           = BCO_GET_LARGE_ARG;
          info_mod     = BCO_GET_LARGE_ARG;
          info_unit_id = BCO_GET_LARGE_ARG;
-         info_wix     = BCO_NEXT;
+         info_wix     = BCO_READ_NEXT_32;
          np           = BCO_GET_LARGE_ARG;
          debugBelch ("BRK_FUN " );  printPtr( ptrs[p1] );
-         debugBelch("%" FMT_Word, literals[info_mod] );
-         debugBelch("%" FMT_Word, literals[info_unit_id] );
-         debugBelch("%" FMT_Word, info_wix );
+         debugBelch(" %" FMT_Word, literals[info_mod] );
+         debugBelch(" %" FMT_Word, literals[info_unit_id] );
+         debugBelch(" %" FMT_Word, info_wix );
          CostCentre* cc = (CostCentre*)literals[np];
          if (cc) {
            debugBelch(" %s", cc->label);
          }
          debugBelch("\n");
          break; }
-      case bci_BRK_ALTS:
-         debugBelch ("BRK_ALTS %d\n", BCO_NEXT);
-         break;
+      case bci_HPC_TICK: {
+         W_ p1, info_wix;
+         p1       = BCO_GET_LARGE_ARG;
+         info_wix = BCO_READ_NEXT_32;
+         debugBelch("HPC_TICK "); printPtr((StgPtr)literals[p1]);
+         debugBelch(" %" FMT_Word "\n", info_wix);
+         break; }
       case bci_SWIZZLE: {
          W_     stkoff = BCO_GET_LARGE_ARG;
          StgInt by     = BCO_GET_LARGE_ARG;

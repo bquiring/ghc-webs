@@ -1,8 +1,4 @@
-
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE FlexibleInstances #-}
 
 -----------------------------------------------------------------------------
 --
@@ -16,7 +12,7 @@
 -----------------------------------------------------------------------------
 
 module GHC.StgToCmm.Closure (
-        DynTag,  tagForCon, isSmallFamily,
+        DynTag, tagForCon, isSmallFamily, toDynTag, fromDynTag,
 
         idPrimRep1, idPrimRepU, isGcPtrRep, addIdReps, addArgReps,
 
@@ -69,12 +65,12 @@ module GHC.StgToCmm.Closure (
 
 import GHC.Prelude
 import GHC.Platform
+import GHC.Platform.Tag (DynTag, mAX_PTR_TAG, isSmallFamily, toDynTag, fromDynTag)
 import GHC.Platform.Profile
 
 import GHC.Stg.Syntax
 import GHC.Runtime.Heap.Layout
 import GHC.Cmm
-import GHC.Cmm.Utils
 import GHC.StgToCmm.Types
 import GHC.StgToCmm.Sequel
 
@@ -323,39 +319,14 @@ mkLFStringLit = LFUnlifted
 --                Dynamic pointer tagging
 -----------------------------------------------------
 
-type DynTag = Int       -- The tag on a *pointer*
-                        -- (from the dynamic-tagging paper)
-
--- Note [Data constructor dynamic tags]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- The family size of a data type (the number of constructors
--- or the arity of a function) can be either:
---    * small, if the family size < 2**tag_bits
---    * big, otherwise.
---
--- Small families can have the constructor tag in the tag bits.
--- Big families always use the tag values 1..mAX_PTR_TAG to represent
--- evaluatedness, the last one lumping together all overflowing ones.
--- We don't have very many tag bits: for example, we have 2 bits on
--- x86-32 and 3 bits on x86-64.
---
--- Also see Note [Tagging big families] in GHC.StgToCmm.Expr
---
--- The interpreter also needs to be updated if we change the
--- tagging strategy; see tagConstr in rts/Interpreter.c.
-
-isSmallFamily :: Platform -> Int -> Bool
-isSmallFamily platform fam_size = fam_size <= mAX_PTR_TAG platform
-
 tagForCon :: Platform -> DataCon -> DynTag
-tagForCon platform con = min (dataConTag con) (mAX_PTR_TAG platform)
--- NB: 1-indexed
+-- NB: 1-indexed; result is clamped to mAX_PTR_TAG.
+tagForCon platform con = toDynTag platform (min (dataConTag con) (fromDynTag (mAX_PTR_TAG platform)))
 
 tagForArity :: Platform -> RepArity -> DynTag
 tagForArity platform arity
- | isSmallFamily platform arity = arity
- | otherwise                    = 0
+ | isSmallFamily platform arity = toDynTag platform arity
+ | otherwise                    = toDynTag platform 0
 
 -- | Return the tag in the low order bits of a variable bound
 -- to this LambdaForm
@@ -363,7 +334,7 @@ lfDynTag :: Platform -> LambdaFormInfo -> DynTag
 lfDynTag platform lf = case lf of
    LFCon con               -> tagForCon   platform con
    LFReEntrant _ arity _ _ -> tagForArity platform arity
-   _other                  -> 0
+   _other                  -> toDynTag platform 0
 
 
 -----------------------------------------------------------------------------
@@ -621,12 +592,15 @@ getCallMethod cfg name id (LFThunk _ _ updatable std_form_info is_fun)
 getCallMethod cfg name id (LFUnknown might_be_a_function) n_args _cg_locs _self_loop_info
   | n_args == 0
   , Just sig <- idTagSig_maybe id
-  , isTaggedSig sig -- Infered to be already evaluated by EPT analysis
-  -- When profiling we must enter all potential functions to make sure we update the SCC
-  -- even if the function itself is already evaluated.
+  , isTaggedSig sig -- This `id` is evaluated and properly tagged; no need to enter it
+                    -- See (EPT-codegen) in Note [EPT enforcement] in GHC.Stg.EnforceEpt
+
+  -- When profiling we must enter all potential functions to make sure we update
+  -- the SCC even if the function itself is already evaluated.
   -- See Note [Evaluating functions with profiling] in rts/Apply.cmm
   , not (profileIsProfiling (stgToCmmProfile cfg) && might_be_a_function)
-  = InferedReturnIt -- See Note [EPT enforcement]
+
+  = InferedReturnIt -- See (EPT-codegen) in Note [EPT enforcement]
 
   | might_be_a_function = SlowCall
 

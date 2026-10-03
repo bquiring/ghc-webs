@@ -5,6 +5,9 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BlockArguments #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+    -- Defines lots of functions that have BuiltinRules
+
 #include "MachDeps.h"
 #include "WordSize.h"
 
@@ -118,8 +121,6 @@ import GHC.Internal.Classes
 
 import GHC.Internal.Bignum.BigNat
 import GHC.Internal.Bignum.Primitives
-
-default ()
 
 -- | Natural number
 --
@@ -488,7 +489,7 @@ naturalAndNot :: Natural -> Natural -> Natural
 {-# NOINLINE naturalAndNot #-}
 naturalAndNot (NS n) (NS m) = NS (n `and#` not# m)
 naturalAndNot (NS n) (NB m) = NS (n `and#` not# (bigNatToWord# m))
-naturalAndNot (NB n) (NS m) = NS (bigNatToWord# n `and#` not# m)
+naturalAndNot (NB n) (NS m) = NB (bigNatAndNotWord# n m)
 naturalAndNot (NB n) (NB m) = naturalFromBigNat# (bigNatAndNot n m)
 
 naturalOr :: Natural -> Natural -> Natural

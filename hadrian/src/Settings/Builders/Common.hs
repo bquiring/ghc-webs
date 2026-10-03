@@ -5,7 +5,7 @@ module Settings.Builders.Common (
     module Oracles.Setting,
     module Settings,
     module UserSettings,
-    cIncludeArgs, ldArgs, cArgs, cppArgs, cWarnings,
+    cIncludeArgs, cWarnings,
     packageDatabaseArgs, bootPackageDatabaseArgs,
     getStagedCCFlags, wayCcArgs
     ) where
@@ -38,22 +38,13 @@ cIncludeArgs = do
             , pure [ "-I" ++ pkgPath pkg -/- dir | dir <- incDirs ]
             , pure [ "-I" ++       unifyPath dir | dir <- depDirs ] ]
 
-ldArgs :: Args
-ldArgs = mempty
-
-cArgs :: Args
-cArgs = mempty
-
-cppArgs :: Args
-cppArgs = mempty
-
 -- TODO: should be in a different file
 cWarnings :: Args
 cWarnings = mconcat
     [ arg "-Wall"
-    , flag CcLlvmBackend ? arg "-Wno-unknown-pragmas"
-    , notM (flag CcLlvmBackend) ? not windowsHost ? arg "-Werror=unused-but-set-variable"
-    , notM (flag CcLlvmBackend) ? arg "-Wno-error=inline" ]
+    , staged (buildFlag CcLlvmBackend) ? arg "-Wno-unknown-pragmas"
+    , notM (staged (buildFlag CcLlvmBackend)) ? not windowsHost ? arg "-Werror=unused-but-set-variable"
+    , notM (staged (buildFlag CcLlvmBackend)) ? arg "-Wno-error=inline" ]
 
 packageDatabaseArgs :: Args
 packageDatabaseArgs = do

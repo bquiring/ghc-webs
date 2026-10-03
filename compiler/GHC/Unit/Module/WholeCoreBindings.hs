@@ -1,5 +1,4 @@
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 
@@ -9,6 +8,7 @@ import GHC.Cmm.CLabel
 import GHC.Driver.DynFlags (DynFlags (targetPlatform), initSDocContext)
 import GHC.ForeignSrcLang (ForeignSrcLang (..))
 import GHC.Iface.Syntax
+import GHC.HsToCore.Breakpoints.Types (ModBreaks)
 import GHC.Prelude
 import GHC.Types.ForeignStubs
 import GHC.Unit.Module.Location
@@ -48,12 +48,8 @@ The lifecycle of a WholeCoreBindings typically proceeds as follows:
 
 2. `initWholeCoreBindings` turns a WholeCoreBindings into a proper BCOs linkable. This step combines together
    all the necessary information from a ModIface, ModDetails and WholeCoreBindings in order to
-   create the linkable. The linkable created is a "LazyBCOs" linkable, which
-   was introduced just for initWholeCoreBindings, so that the bytecode can be generated lazily.
-   Using the `BCOs` constructor directly here leads to the bytecode being forced
-   too eagerly.
-
-3. Then when bytecode is needed, the LazyBCOs value is inspected and unpacked and
+   create the linkable.
+3. Then when bytecode is needed, the BCOs value is inspected and unpacked and
    the linkable is used as before.
 
 The flag `-fwrite-if-simplified-core` determines whether the extra information is written
@@ -127,12 +123,16 @@ the object files.
 
 data WholeCoreBindings = WholeCoreBindings
             { wcb_bindings :: [IfaceBindingX IfaceMaybeRhs IfaceTopBndrInfo] -- ^ serialised tidied core bindings.
+            , wcb_modBreaks :: Maybe ModBreaks -- ^ if @wcb_bindings@ contains breakpoints, this field provides the metadata required by the bytecode debugger.
             , wcb_module   :: Module  -- ^ The module which the bindings are for
             , wcb_mod_location :: ModLocation -- ^ The location where the sources reside.
               -- | Stubs for foreign declarations and files added via
               -- 'GHC.Internal.TH.Syntax.addForeignFilePath'.
             , wcb_foreign :: IfaceForeign
             }
+
+instance Outputable WholeCoreBindings where
+  ppr (WholeCoreBindings {}) = text "WholeCoreBindings"
 
 {-
 Note [Foreign stubs and TH bytecode linking]

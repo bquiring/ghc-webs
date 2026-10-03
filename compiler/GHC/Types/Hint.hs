@@ -1,5 +1,3 @@
-{-# LANGUAGE ExistentialQuantification #-}
-
 module GHC.Types.Hint (
     GhcHint(..)
   , AvailableBindings(..)
@@ -7,11 +5,13 @@ module GHC.Types.Hint (
   , LanguageExtensionHint(..)
   , ImportItemSuggestion(..)
   , ImportSuggestion(..)
+  , ExportItemSuggestion(..)
   , HowInScope(..)
   , SimilarName(..)
   , StarIsType(..)
   , UntickedPromotedThing(..)
   , AssumedDerivingStrategy(..)
+  , SemaphoreUpgradeTarget(..)
   , SigLike(..)
   , pprUntickedConstructor, isBareSymbol
   , suggestExtension
@@ -25,7 +25,7 @@ module GHC.Types.Hint (
   ) where
 
 import Language.Haskell.Syntax.Expr (LHsExpr)
-import Language.Haskell.Syntax (LPat, LIdP, LHsSigType, LHsSigWcType, Sig)
+import Language.Haskell.Syntax (HsModifier, LPat, LIdP, LHsSigType, LHsSigWcType, Sig)
 
 import GHC.Prelude
 
@@ -41,13 +41,16 @@ import GHC.Core.FamInstEnv (FamFlavor)
 import GHC.Core.TyCon (TyCon)
 import GHC.Core.Type (Type)
 import GHC.Types.Fixity (LexicalFixity(..))
+import GHC.Types.InlinePragma (ActivationGhc)
 import GHC.Types.Name (Name, NameSpace, OccName (occNameFS), isSymOcc, nameOccName)
-import GHC.Types.Name.Reader (RdrName (Unqual), ImpDeclSpec)
+import GHC.Types.Name.Reader (RdrName (Unqual), ImpDeclSpec, GlobalRdrElt)
 import GHC.Types.SrcLoc (SrcSpan)
-import GHC.Types.Basic (Activation, RuleName)
+import GHC.Types.Basic (RuleName, VisArity)
 import GHC.Parser.Errors.Basic
 import GHC.Utils.Outputable
-import GHC.Data.FastString (fsLit, FastString)
+import GHC.Data.FastString (fsLit)
+
+import Language.Haskell.Syntax.Basic (FieldLabelString)
 
 import Data.Typeable ( Typeable )
 import Data.Map.Strict (Map)
@@ -248,7 +251,7 @@ data GhcHint
     -}
   | SuggestBindToWildcard !(LHsExpr GhcTc)
 
-  | SuggestAddInlineOrNoInlinePragma !Var !Activation
+  | SuggestAddInlineOrNoInlinePragma !Var !ActivationGhc
 
   | SuggestAddPhaseToCompetingRule !RuleName
     {-| Suggests adding an identifier to the export list of a signature.
@@ -340,6 +343,14 @@ data GhcHint
     -}
   | SuggestAddStandaloneKindSignature Name
 
+    {-| Suggests to annotate each constructor field with explicit strictness
+        (@!@ or @~@).
+
+        Triggered by: 'GHC.Tc.Errors.Types.TcRnImplicitFieldStrictness'
+        Test case(s): warnings/should_compile/T16836a
+    -}
+  | SuggestExplicitFieldStrictness
+
     {-| Suggests the user to fill in the wildcard constraint to
         disambiguate which constraint that is.
 
@@ -394,6 +405,12 @@ data GhcHint
   -}
   | SuggestSimilarNames RdrName (NE.NonEmpty SimilarName)
 
+  {-| Suggest a similar record selector that the user might have meant.
+
+      Test case: T26480b.
+  -}
+  | SuggestSimilarSelectors TyCon TyCon FieldLabelString (NE.NonEmpty (TyCon, SimilarName))
+
   {-| Remind the user that the field selector has been suppressed
       because of -XNoFieldSelectors.
 
@@ -410,6 +427,22 @@ data GhcHint
       Test cases: mod28, mod36, mod87, mod114, ...
   -}
   | ImportSuggestion OccName ImportSuggestion
+
+  {-| Suggest to remove an explicit import list, i.e. to use @import M@
+      as opposed to @import M (a, b)@.
+  -}
+  | SuggestRemoveImportList
+
+  {-| Suggest to change an export item, e.g. to remove a namespace specifier.
+
+      Test cases: T12488a, T12488a_foo, T12488e, T12488g, T25899e2
+  -}
+  | SuggestChangeExportItem ExportItemSuggestion
+
+  {-| Suggest to use a named module self-export of the form
+      @module M (module M) where@.
+  -}
+  | SuggestNamedModuleSelfExport
 
   {-| Found a pragma in the body of a module, suggest placing it in the header.
   -}
@@ -447,8 +480,8 @@ data GhcHint
       superclass that defines the canonical version of the method.
     -}
   | SuggestMoveNonCanonicalDefinition
-    Name -- ^ move the implementation from this method
-    Name -- ^ ... to this method
+    OccName -- ^ move the implementation from this method
+    OccName -- ^ ... to this method
     String -- ^ Documentation URL
 
     {-| Suggest to increase the solver maximum reduction depth -}
@@ -458,15 +491,12 @@ data GhcHint
       canonical version of that method.
     -}
   | SuggestRemoveNonCanonicalDefinition
-    Name -- ^ method with non-canonical implementation
-    Name -- ^ possible other method to use as the RHS instead
+    OccName -- ^ method with non-canonical implementation
+    OccName -- ^ possible other method to use as the RHS instead
     String -- ^ Documentation URL
   {-| Suggest eta-reducing a type synonym used in the implementation
       of abstract data. -}
   | SuggestEtaReduceAbsDataTySyn TyCon
-  {-| Remind the user that there is no field of a type and name in the record,
-      constructors are in the usual order $x$, $r$, $a$ -}
-  | RemindRecordMissingField FastString Type Type
   {-| Suggest binding the type variable on the LHS of the type declaration
   -}
   | SuggestBindTyVarOnLhs RdrName
@@ -514,6 +544,48 @@ data GhcHint
   {-| Suggest using the `data` keyword -}
   | SuggestDataKeyword
 
+  {-| Suggest adding signature to modifier -}
+  | SuggestModifierSignature (HsModifier GhcRn) Name
+
+  {-| Suggest upgrading either the @-jsem@ jobserver or GHC itself to
+      support the given semaphore protocol version.
+
+      Triggered by 'GHC.Driver.Errors.Types.DriverSemaphoreOpenFailure'
+      carrying a 'System.Semaphore.SemaphoreIncompatibleVersion'.
+  -}
+  | SuggestUpgradeForSemaphoreVersionMismatch !SemaphoreUpgradeTarget !Int
+    -- ^ The 'Int' is the required protocol version.
+
+  {-| Suggest replacing a record wildcard pattern @C {..}@ with @C {}@,
+      which matches a constructor without binding its fields.
+
+      Triggered by 'GHC.Tc.Errors.Types.TcRnIllegalWildcardsInConstructor'
+      in a record pattern.
+  -}
+  | SuggestEmptyRecordBraces !Name
+
+  {-| Suggest applying a constructor directly to its arguments instead
+      of record syntax, for constructors without labelled fields.
+
+      Triggered by 'GHC.Tc.Errors.Types.TcRnIllegalWildcardsInConstructor'
+      in a record construction and record patterns.
+      The 'VisArity' is the number of positional arguments of the constructor.
+  -}
+  | SuggestExplicitConstructorArguments !Name !VisArity
+
+-- | What the user should upgrade to resolve an @-jsem@ semaphore
+--   protocol version mismatch.
+data SemaphoreUpgradeTarget
+  = UpgradeCabalInstall
+    -- ^ Jobserver is @cabal-install@ (we are building a Cabal package)
+    --   and speaks an older protocol than GHC.
+  | UpgradeJobserver
+    -- ^ Jobserver (not @cabal-install@) speaks an older protocol than
+    --   GHC.
+  | UpgradeGHC
+    -- ^ Jobserver speaks a newer protocol than GHC.
+  deriving (Eq, Show)
+
 -- | The deriving strategy that was assumed when not explicitly listed in the
 --   source. This is used solely by the missing-deriving-strategies warning.
 --   There's no `Via` case because we never assume that.
@@ -551,6 +623,11 @@ data ImportItemSuggestion =
     -- Why no 'ImportItemAddData'?  Because the suggestion to add 'data' is
     -- represented by the 'ImportDataCon' constructor of 'ImportSuggestion'.
 
+-- | Suggest to change an export item.
+data ExportItemSuggestion =
+    ExportItemRemoveSubordinateType
+  | ExportItemRemoveSubordinateData
+
 -- | Suggest how to fix an import.
 data ImportSuggestion
   -- | Some module exports what we want, but we aren't explicitly importing it.
@@ -579,7 +656,7 @@ data HowInScope
 
 data SimilarName
   = SimilarName Name
-  | SimilarRdrName RdrName (Maybe HowInScope)
+  | SimilarRdrName RdrName (Maybe GlobalRdrElt) (Maybe HowInScope)
 
 -- | Some kind of signature, such as a fixity signature, standalone
 -- kind signature, COMPLETE pragma, role annotation, etc.

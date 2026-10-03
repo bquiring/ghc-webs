@@ -1,13 +1,7 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE Strict #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -44,6 +38,7 @@ import GHC.Prelude
 import GHC.StgToCmm.CgUtils
 import GHC.Types.Basic
 import GHC.Types.ForeignCall
+import GHC.Types.Literal.Floating
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
@@ -113,7 +108,7 @@ symKindFromCLabel lbl
 -- | Calculate a data section's kind, see haddock docs of
 -- 'DataSectionKind' for more explanation.
 dataSectionKindFromCmmSection :: Section -> DataSectionKind
-dataSectionKindFromCmmSection s = case sectionProtection s of
+dataSectionKindFromCmmSection (Section t _) = case sectionProtection t of
   ReadWriteSection -> SectionData
   _ -> SectionROData
 
@@ -141,8 +136,8 @@ lower_CmmStatic s = case s of
   CmmStaticLit (CmmInt i W16) -> pure $ DataI16 $ fromInteger $ narrowU W16 i
   CmmStaticLit (CmmInt i W32) -> pure $ DataI32 $ fromInteger $ narrowU W32 i
   CmmStaticLit (CmmInt i W64) -> pure $ DataI64 $ fromInteger $ narrowU W64 i
-  CmmStaticLit (CmmFloat f W32) -> pure $ DataF32 $ fromRational f
-  CmmStaticLit (CmmFloat d W64) -> pure $ DataF64 $ fromRational d
+  CmmStaticLit (CmmFloat f LitFloat) -> pure $ DataF32 $ litFloatingToHostFloat f
+  CmmStaticLit (CmmFloat d LitDouble) -> pure $ DataF64 $ litFloatingToHostDouble d
   CmmStaticLit (CmmLabel lbl) ->
     onAnySym lbl
       $> DataSym
@@ -438,7 +433,7 @@ lower_MO_S_Shr lbl w0 [x, y] = case someWasmTypeFromCmmType (cmmBits w0) of
 lower_MO_S_Shr _ _ _ = panic "lower_MO_S_Shr: unreachable"
 
 -- | Lower a 'MO_MulMayOflo' operation. It's translated to a ccall to
--- @hs_mulIntMayOflo@ function in @ghc-prim/cbits/mulIntMayOflo@,
+-- @hs_mulIntMayOflo@ function in @rts/prim/mulIntMayOflo@,
 -- otherwise it's quite non-trivial to implement as inline assembly.
 lower_MO_MulMayOflo ::
   CLabel -> Width -> [CmmExpr] -> WasmCodeGenM w (SomeWasmExpr w)
@@ -894,21 +889,21 @@ lower_CmmLit lit = do
             WasmExpr $
               WasmConst ty $
                 narrowU w i
-    CmmFloat f W32 ->
+    CmmFloat f LitFloat ->
       pure $
         SomeWasmExpr TagF32 $
           WasmExpr $
             WasmConst
               TagI32
-              (toInteger $ castFloatToWord32 $ fromRational f)
+              (toInteger $ castFloatToWord32 $ litFloatingToHostFloat f)
               `WasmConcat` WasmReinterpret TagI32 TagF32
-    CmmFloat f W64 ->
+    CmmFloat f LitDouble ->
       pure $
         SomeWasmExpr TagF64 $
           WasmExpr $
             WasmConst
               TagI64
-              (toInteger $ castDoubleToWord64 $ fromRational f)
+              (toInteger $ castDoubleToWord64 $ litFloatingToHostDouble f)
               `WasmConcat` WasmReinterpret TagI64 TagF64
     CmmLabel lbl' -> do
       onAnySym lbl'

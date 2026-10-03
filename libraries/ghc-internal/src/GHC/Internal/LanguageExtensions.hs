@@ -18,7 +18,8 @@ import GHC.Generics (Generic)
 import GHC.Internal.Base
 import GHC.Internal.Show
 import GHC.Internal.Generics
-import GHC.Internal.Enum
+import GHC.Internal.Enum  -- For deriving
+import GHC.Internal.Num   -- For deriving
 #endif
 
 -- | The language extensions known to GHC.
@@ -86,6 +87,7 @@ data Extension
    | InstanceSigs
    | ApplicativeDo
    | LinearTypes
+   | Modifiers
    | RequiredTypeArguments    -- Visible forall (VDQ) in types of terms
 
    | StandaloneDeriving
@@ -167,6 +169,8 @@ data Extension
    | MultilineStrings
    | ExplicitLevelImports
    | ImplicitStagePersistence
+   | QualifiedStrings
+   | LazyFieldAnnotations
    deriving (Eq, Enum, Show, Generic, Bounded)
 -- 'Ord' and 'Bounded' are provided for GHC API users (see discussions
 -- in https://gitlab.haskell.org/ghc/ghc/merge_requests/2707 and

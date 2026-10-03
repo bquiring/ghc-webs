@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 module GHC.Driver.DynFlags (
         -- * Dynamic flags and associated configuration types
         DumpFlag(..),
@@ -28,13 +27,17 @@ module GHC.Driver.DynFlags (
         ParMakeCount(..),
         ways,
         HasDynFlags(..), ContainsDynFlags(..),
-        RtsOptsEnabled(..),
+        RtsOptsEnabled(..), haveRtsOptsFlags,
         GhcMode(..), isOneShot,
         GhcLink(..), isNoLink,
+        isExecutableLink,
+        mostlyStaticExclude,
+        ExecutableLinkMode(..),
         PackageFlag(..), PackageArg(..), ModRenaming(..),
         packageFlagsChanged,
         IgnorePackageFlag(..), TrustFlag(..),
         PackageDBFlag(..), PkgDbRef(..),
+        isPackageDbRef,
         Option(..), showOpt,
         DynLibLoader(..),
         positionIndependent,
@@ -58,7 +61,7 @@ module GHC.Driver.DynFlags (
 
         -- ** System tool settings and locations
         programName, projectVersion,
-        ghcUsagePath, ghciUsagePath, topDir, toolDir,
+        ghcUsagePath, ghciUsagePath, topDir, libDir, toolDir,
         versionedAppDir, versionedFilePath,
         extraGccViaCFlags, globalPackageDatabasePath,
 
@@ -81,13 +84,19 @@ module GHC.Driver.DynFlags (
         isSse4_2Enabled,
         isAvxEnabled,
         isAvx2Enabled,
+        isAvx512bwEnabled,
         isAvx512cdEnabled,
+        isAvx512dqEnabled,
         isAvx512erEnabled,
         isAvx512fEnabled,
         isAvx512pfEnabled,
+        isAvx512vlEnabled,
         isFmaEnabled,
+        isGfniEnabled,
         isBmiEnabled,
-        isBmi2Enabled
+        isBmi2Enabled,
+        -- For LoongArch platform
+        isLa664Enabled
 ) where
 
 import GHC.Prelude
@@ -101,7 +110,8 @@ import GHC.Core.Unfold
 import GHC.Data.Bool
 import GHC.Data.EnumSet (EnumSet)
 import GHC.Data.Maybe
-import GHC.Builtin.Names ( mAIN_NAME )
+import GHC.Data.OsPath ( OsPath )
+import GHC.Builtin.Modules ( mAIN_NAME )
 import GHC.Driver.Backend
 import GHC.Driver.Flags
 import GHC.Driver.IncludeSpecs
@@ -109,6 +119,7 @@ import GHC.Driver.Phases ( Phase(..), phaseInputExt )
 import GHC.Driver.Plugins.External
 import GHC.Settings
 import GHC.Settings.Constants
+import GHC.Types.Name.Occurrence
 import GHC.Types.Basic ( IntWithInf, treatZeroAsInf )
 import GHC.Types.Error (DiagnosticReason(..))
 import GHC.Types.ProfAuto
@@ -117,6 +128,7 @@ import GHC.Types.SrcLoc
 import GHC.Unit.Module
 import GHC.Unit.Module.Warnings
 import GHC.Utils.CliOption
+import GHC.Stg.Debug.Types (StgDebugDctConfig(..))
 import GHC.SysTools.Terminal ( stderrSupportsAnsiColors )
 import GHC.UniqueSubdir (uniqueSubdir)
 import GHC.Utils.Outputable
@@ -134,6 +146,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.Reader (ReaderT)
 import Control.Monad.Trans.Writer (WriterT)
+import qualified Data.Set as Set
 import Data.Word
 import System.IO
 import System.IO.Error (catchIOError)
@@ -142,9 +155,10 @@ import System.FilePath (normalise, (</>))
 import System.Directory
 import GHC.Foreign (withCString, peekCString)
 
-import qualified Data.Set as Set
+import GHC.Types.Unique.Set
 
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.Toolchain.Target (Target)
 
 -- -----------------------------------------------------------------------------
 -- DynFlags
@@ -178,6 +192,7 @@ data DynFlags = DynFlags {
   toolSettings      :: {-# UNPACK #-} !ToolSettings,
   platformMisc      :: {-# UNPACK #-} !PlatformMisc,
   rawSettings       :: [(String, String)],
+  rawTarget         :: Target,
   tmpDir            :: TempDir,
 
   llvmOptLevel          :: Int,         -- ^ LLVM optimisation level
@@ -261,7 +276,7 @@ data DynFlags = DynFlags {
   -- Note [Filepaths and Multiple Home Units]
   workingDirectory      :: Maybe FilePath,
   thisPackageName       :: Maybe String, -- ^ What the package is called, use with multiple home units
-  hiddenModules         :: Set.Set ModuleName,
+  hiddenModules         :: !(UniqSet ModuleName),
   reexportedModules     :: [ReexportedModule],
 
   -- ways
@@ -275,6 +290,7 @@ data DynFlags = DynFlags {
   dylibInstallName      :: Maybe String,
   hiDir                 :: Maybe String,
   hieDir                :: Maybe String,
+  bytecodeDir           :: Maybe String,
   stubDir               :: Maybe String,
   dumpDir               :: Maybe String,
 
@@ -282,6 +298,7 @@ data DynFlags = DynFlags {
   hcSuf                 :: String,
   hiSuf_                :: String,
   hieSuf                :: String,
+  bytecodeSuf           :: String,
 
   dynObjectSuf_         :: String,
   dynHiSuf_             :: String,
@@ -362,6 +379,8 @@ data DynFlags = DynFlags {
   packageEnv            :: Maybe FilePath,
         -- ^ Filepath to the package environment file (if overriding default)
 
+  -- Known-key exclusions
+  knownKeyExclusions :: [OccName],
 
   -- hsc dynamic flags
   dumpFlags             :: EnumSet DumpFlag,
@@ -411,6 +430,7 @@ data DynFlags = DynFlags {
   -- wasm ghci browser mode
   ghciBrowserHost                  :: !String,
   ghciBrowserPort                  :: !Int,
+  ghciBrowserAssetsDir             :: !(Maybe FilePath),
   ghciBrowserPuppeteerLaunchOpts   :: !(Maybe String),
   ghciBrowserPlaywrightBrowserType :: !(Maybe String),
   ghciBrowserPlaywrightLaunchOpts  :: !(Maybe String),
@@ -441,15 +461,18 @@ data DynFlags = DynFlags {
   interactivePrint      :: Maybe String,
 
   -- | Machine dependent flags (-m\<blah> stuff)
-  sseVersion            :: Maybe SseVersion,
+  sseAvxVersion         :: Maybe SseAvxVersion,
   bmiVersion            :: Maybe BmiVersion,
-  avx                   :: Bool,
-  avx2                  :: Bool,
-  avx512cd              :: Bool, -- Enable AVX-512 Conflict Detection Instructions.
-  avx512er              :: Bool, -- Enable AVX-512 Exponential and Reciprocal Instructions.
-  avx512f               :: Bool, -- Enable AVX-512 instructions.
-  avx512pf              :: Bool, -- Enable AVX-512 PreFetch Instructions.
+  avx512bw              :: Bool, -- ^ Enable AVX-512BW Instructions.
+  avx512cd              :: Bool, -- ^ Enable AVX-512 Conflict Detection Instructions.
+  avx512dq              :: Bool, -- ^ Enable AVX-512DQ Instructions.
+  avx512er              :: Bool, -- ^ Enable AVX-512 Exponential and Reciprocal Instructions.
+  avx512f               :: Bool, -- ^ Enable AVX-512 instructions.
+  avx512pf              :: Bool, -- ^ Enable AVX-512 PreFetch Instructions.
+  avx512vl              :: Bool, -- ^ Enable AVX-512VL Instructions.
   fma                   :: Bool, -- ^ Enable FMA instructions.
+  gfni                  :: Bool, -- ^ Enable GFNI Instructions.
+  la664                 :: Bool, -- ^ Enable LA664 instructions
 
   -- Constants used to control the amount of optimization done.
 
@@ -476,7 +499,11 @@ data DynFlags = DynFlags {
     -- 'Int' because it can be used to test uniques in decreasing order.
 
   -- | Temporary: CFG Edge weights for fast iterations
-  cfgWeights            :: Weights
+  cfgWeights            :: Weights,
+
+  -- | Configuration specifying which constructor names we should create
+  -- distinct info tables for
+  distinctConstructorTables :: StgDebugDctConfig
 }
 
 class HasDynFlags m where
@@ -522,6 +549,7 @@ initDynFlags dflags = do
                          `catchIOError` \_ -> return False
  ghcNoUnicodeEnv <- lookupEnv "GHC_NO_UNICODE"
  let useUnicode' = isNothing ghcNoUnicodeEnv && canUseUnicode
+ canUseColor <- stderrSupportsAnsiColors
  maybeGhcColorsEnv  <- lookupEnv "GHC_COLORS"
  maybeGhcColoursEnv <- lookupEnv "GHC_COLOURS"
  let adjustCols (Just env) = Col.parseScheme env
@@ -533,9 +561,9 @@ initDynFlags dflags = do
  return dflags{
         useUnicode    = useUnicode',
         useColor      = useColor',
-        canUseColor   = stderrSupportsAnsiColors,
+        canUseColor   = canUseColor,
         -- if the terminal supports color, we assume it supports links as well
-        canUseErrorLinks = stderrSupportsAnsiColors,
+        canUseErrorLinks = canUseColor,
         colScheme     = colScheme',
         tmpDir        = TempDir tmp_dir
         }
@@ -547,7 +575,7 @@ defaultDynFlags mySettings =
 -- See Note [Updating flag description in the User's Guide]
      DynFlags {
         ghcMode                 = CompManager,
-        ghcLink                 = LinkBinary,
+        ghcLink                 = LinkExecutable Dynamic,
         backend                 = platformDefaultBackend (sTargetPlatform mySettings),
         verbosity               = 0,
         debugLevel              = 0,
@@ -597,13 +625,14 @@ defaultDynFlags mySettings =
 
         workingDirectory        = Nothing,
         thisPackageName         = Nothing,
-        hiddenModules           = Set.empty,
+        hiddenModules           = emptyUniqSet,
         reexportedModules       = [],
 
         objectDir               = Nothing,
         dylibInstallName        = Nothing,
         hiDir                   = Nothing,
         hieDir                  = Nothing,
+        bytecodeDir             = Nothing,
         stubDir                 = Nothing,
         dumpDir                 = Nothing,
 
@@ -611,6 +640,7 @@ defaultDynFlags mySettings =
         hcSuf                   = phaseInputExt HCc,
         hiSuf_                  = "hi",
         hieSuf                  = "hie",
+        bytecodeSuf             = "gbc",
 
         dynObjectSuf_           = "dyn_" ++ phaseInputExt StopLn,
         dynHiSuf_               = "dyn_hi",
@@ -656,6 +686,7 @@ defaultDynFlags mySettings =
         targetPlatform = sTargetPlatform mySettings,
         platformMisc = sPlatformMisc mySettings,
         rawSettings = sRawSettings mySettings,
+        rawTarget   = sRawTarget mySettings,
 
         tmpDir                  = panic "defaultDynFlags: uninitialized tmpDir",
 
@@ -670,6 +701,7 @@ defaultDynFlags mySettings =
         -- end of ghc -M values
         ghcVersionFile = Nothing,
         haddockOptions = Nothing,
+        knownKeyExclusions = [],
         dumpFlags = EnumSet.empty,
         generalFlags = EnumSet.fromList (defaultFlags mySettings),
         warningFlags = EnumSet.fromList standardWarnings,
@@ -702,13 +734,14 @@ defaultDynFlags mySettings =
 
         ghciBrowserHost = "127.0.0.1",
         ghciBrowserPort = 0,
+        ghciBrowserAssetsDir = Nothing,
         ghciBrowserPuppeteerLaunchOpts = Nothing,
         ghciBrowserPlaywrightBrowserType = Nothing,
         ghciBrowserPlaywrightLaunchOpts = Nothing,
 
         flushOut = defaultFlushOut,
-        pprUserLength = 5,
-        pprCols = 100,
+        pprUserLength = defaultSDocDepth,
+        pprCols = defaultSDocCols,
         useUnicode = False,
         useColor = Auto,
         canUseColor = False,
@@ -718,16 +751,20 @@ defaultDynFlags mySettings =
         profAuto = NoProfAuto,
         callerCcFilters = [],
         interactivePrint = Nothing,
-        sseVersion = Nothing,
+        sseAvxVersion = Nothing,
         bmiVersion = Nothing,
-        avx = False,
-        avx2 = False,
+        avx512bw = False,
         avx512cd = False,
+        avx512dq = False,
         avx512er = False,
         avx512f = False,
         avx512pf = False,
+        avx512vl = False,
         -- Use FMA by default on AArch64
         fma = (platformArch . sTargetPlatform $ mySettings) == ArchAArch64,
+        gfni = False,
+        -- For LoongArch, la464 is used by default.
+        la664 = False,
 
         maxInlineAllocSize = 128,
         maxInlineMemcpyInsns = 32,
@@ -738,7 +775,9 @@ defaultDynFlags mySettings =
 
         reverseErrors = False,
         maxErrors     = Nothing,
-        cfgWeights    = defaultWeights
+        cfgWeights    = defaultWeights,
+
+        distinctConstructorTables = None
       }
 
 type FatalMessager = String -> IO ()
@@ -797,13 +836,46 @@ isOneShot _other  = False
 -- | What to do in the link step, if there is one.
 data GhcLink
   = NoLink              -- ^ Don't link at all
-  | LinkBinary          -- ^ Link object code into a binary
+  | LinkExecutable ExecutableLinkMode -- ^ Link object code into an executable
   | LinkInMemory        -- ^ Use the in-memory dynamic linker (works for both
                         --   bytecode and object code).
   | LinkDynLib          -- ^ Link objects into a dynamic lib (DLL on Windows, DSO on ELF platforms)
+  | LinkBytecodeLib     -- ^ Link bytecode objects into a bytecode lib
   | LinkStaticLib       -- ^ Link objects into a static lib
   | LinkMergedObj       -- ^ Link objects into a merged "GHCi object"
   deriving (Eq, Show)
+
+isExecutableLink :: GhcLink -> Bool
+isExecutableLink (LinkExecutable _) = True
+isExecutableLink _              = False
+
+-- | How we link the binary.
+--
+-- This mostly deals with how external system dependencies are treated.
+-- The 'Ways' determine how Haskell libraries are linked.
+data ExecutableLinkMode
+  = FullyStatic                    -- ^ fully static binary (incompatible with 'WayDyn')
+  | MostlyStatic (Maybe [String])  -- ^ we link system libraries statically, except the ones provided
+                                   --   if none (Nothing) are provided, then we use a static list depending on the target platform
+  | Dynamic                        -- ^ default
+  deriving (Eq, Show)
+
+-- | Compute the static linking exclusion list.
+--
+-- - if the user passed a list, we use that
+-- - otherwise we use a best effort static list depending on target platform
+mostlyStaticExclude :: Maybe [String] -> Platform -> [String]
+mostlyStaticExclude (Just xs) _ = xs
+mostlyStaticExclude Nothing pf =
+  case platformOS pf of
+    OSMinGW32 -> win
+    _ -> unix
+
+ where
+  win = [ "wsock32", "gdi32", "winmm", "dbghelp", "psapi", "user32", "shell32"
+        , "mingw32", "kernel32", "advapi32", "mingwex", "ws2_32", "shlwapi"
+        , "ole32", "rpcrt4", "ntdll", "ucrt"]
+  unix = ["c", "m", "rt", "dl", "pthread", "stdc++", "c++", "c++abi", "atomic"]
 
 isNoLink :: GhcLink -> Bool
 isNoLink NoLink = True
@@ -815,7 +887,7 @@ isNoLink _      = False
 data PackageArg =
       PackageArg String    -- ^ @-package@, by 'PackageName'
     | UnitIdArg Unit       -- ^ @-package-id@, by 'Unit'
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 instance Outputable PackageArg where
     ppr (PackageArg pn) = text "package" <+> text pn
@@ -836,7 +908,7 @@ data ModRenaming = ModRenaming {
     modRenamingWithImplicit :: Bool, -- ^ Bring all exposed modules into scope?
     modRenamings :: [(ModuleName, ModuleName)] -- ^ Bring module @m@ into scope
                                                --   under name @n@.
-  } deriving (Eq)
+  } deriving (Eq, Ord)
 instance Outputable ModRenaming where
     ppr (ModRenaming b rns) = ppr b <+> parens (ppr rns)
 
@@ -854,14 +926,21 @@ data TrustFlag
 data PackageFlag
   = ExposePackage   String PackageArg ModRenaming -- ^ @-package@, @-package-id@
   | HidePackage     String -- ^ @-hide-package@
-  deriving (Eq) -- NB: equality instance is used by packageFlagsChanged
+  deriving (Eq, Ord) -- NB: equality instance is used by packageFlagsChanged
 
 data PackageDBFlag
   = PackageDB PkgDbRef
   | NoUserPackageDB
   | NoGlobalPackageDB
   | ClearPackageDBs
-  deriving (Eq)
+  deriving (Eq, Ord)
+
+isPackageDbRef :: PackageDBFlag -> Maybe PkgDbRef
+isPackageDbRef = \ case
+  PackageDB ref -> Just ref
+  NoUserPackageDB -> Nothing
+  NoGlobalPackageDB -> Nothing
+  ClearPackageDBs -> Nothing
 
 packageFlagsChanged :: DynFlags -> DynFlags -> Bool
 packageFlagsChanged idflags1 idflags0 =
@@ -890,6 +969,13 @@ data RtsOptsEnabled
   = RtsOptsNone | RtsOptsIgnore | RtsOptsIgnoreAll | RtsOptsSafeOnly
   | RtsOptsAll
   deriving (Show)
+
+haveRtsOptsFlags :: DynFlags -> Bool
+haveRtsOptsFlags dflags =
+        isJust (rtsOpts dflags) || case rtsOptsEnabled dflags of
+                                       RtsOptsSafeOnly -> False
+                                       _ -> True
+
 
 -- | Are we building with @-fPIE@ or @-fPIC@ enabled?
 positionIndependent :: DynFlags -> Bool
@@ -935,8 +1021,8 @@ setDynamicNow dflags0 =
 data PkgDbRef
   = GlobalPkgDb
   | UserPkgDb
-  | PkgDbPath FilePath
-  deriving Eq
+  | PkgDbPath OsPath
+  deriving (Eq, Ord)
 
 
 
@@ -1160,7 +1246,6 @@ defaultFlags settings
       Opt_SpecialiseIncoherents,
       Opt_WriteSelfRecompInfo
     ]
-
     ++ [f | (ns,f) <- optLevelFlags, 0 `elem` ns]
              -- The default -O0 options
 
@@ -1250,6 +1335,7 @@ optLevelFlags -- see Note [Documenting optimisation flags]
     , ([1,2],   Opt_CfgBlocklayout)      -- Experimental
 
     , ([1,2],   Opt_Specialise)
+    , ([1,2],   Opt_PolymorphicSpecialisation)  -- Now on by default (#23559)
     , ([1,2],   Opt_CrossModuleSpecialise)
     , ([1,2],   Opt_InlineGenerics)
     , ([1,2],   Opt_Strictness)
@@ -1434,6 +1520,8 @@ ghciUsagePath         :: DynFlags -> FilePath
 ghciUsagePath dflags = fileSettings_ghciUsagePath $ fileSettings dflags
 topDir                :: DynFlags -> FilePath
 topDir dflags = fileSettings_topDir $ fileSettings dflags
+libDir                :: DynFlags -> FilePath
+libDir dflags = fileSettings_libDir $ fileSettings dflags
 toolDir               :: DynFlags -> Maybe FilePath
 toolDir dflags = fileSettings_toolDir $ fileSettings dflags
 extraGccViaCFlags     :: DynFlags -> [String]
@@ -1486,6 +1574,7 @@ initSDocContext dflags style = SDC
   , sdocLineLength                  = pprCols dflags
   , sdocCanUseUnicode               = useUnicode dflags
   , sdocPrintErrIndexLinks          = overrideWith (canUseErrorLinks dflags) (useErrorLinks dflags)
+  , sdocInteractiveErrorHints       = gopt Opt_InteractiveErrorHints dflags
   , sdocHexWordLiterals             = gopt Opt_HexWordLiterals dflags
   , sdocPprDebug                    = dopt Opt_D_ppr_debug dflags
   , sdocPrintUnicodeSyntax          = gopt Opt_PrintUnicodeSyntax dflags
@@ -1510,6 +1599,7 @@ initSDocContext dflags style = SDC
   , sdocSuppressModulePrefixes      = gopt Opt_SuppressModulePrefixes dflags
   , sdocSuppressStgExts             = gopt Opt_SuppressStgExts dflags
   , sdocSuppressStgReps             = gopt Opt_SuppressStgReps dflags
+  , sdocStableCoreDumpOrder         = gopt Opt_StableCoreDumpOrder dflags
   , sdocErrorSpans                  = gopt Opt_ErrorSpans dflags
   , sdocStarIsType                  = xopt LangExt.StarIsType dflags
   , sdocLinearTypes                 = xopt LangExt.LinearTypes dflags
@@ -1533,37 +1623,96 @@ initPromotionTickContext dflags =
 -- SSE, AVX, FMA
 
 isSse3Enabled :: DynFlags -> Bool
-isSse3Enabled dflags = sseVersion dflags >= Just SSE3
+isSse3Enabled dflags = sseAvxVersion dflags >= Just SSE3 || isAvxEnabled dflags
 
 isSsse3Enabled :: DynFlags -> Bool
-isSsse3Enabled dflags = sseVersion dflags >= Just SSSE3
+isSsse3Enabled dflags = sseAvxVersion dflags >= Just SSSE3 || isAvxEnabled dflags
 
 isSse4_1Enabled :: DynFlags -> Bool
-isSse4_1Enabled dflags = sseVersion dflags >= Just SSE4
+isSse4_1Enabled dflags = sseAvxVersion dflags >= Just SSE4 || isAvxEnabled dflags
 
 isSse4_2Enabled :: DynFlags -> Bool
-isSse4_2Enabled dflags = sseVersion dflags >= Just SSE42
+isSse4_2Enabled dflags = sseAvxVersion dflags >= Just SSE42 || isAvxEnabled dflags
 
 isAvxEnabled :: DynFlags -> Bool
-isAvxEnabled dflags = avx dflags || avx2 dflags || avx512f dflags
+isAvxEnabled dflags = sseAvxVersion dflags >= Just AVX1 || (isX86 && fma dflags) || isAvx512fEnabled dflags
+  where
+    -- -mfma can be used on multiple platforms, but -mavx is x86-only
+    isX86 = case platformArch (targetPlatform dflags) of
+      ArchX86_64 -> True
+      ArchX86    -> True
+      _          -> False
 
 isAvx2Enabled :: DynFlags -> Bool
-isAvx2Enabled dflags = avx2 dflags || avx512f dflags
+isAvx2Enabled dflags = sseAvxVersion dflags >= Just AVX2 || isAvx512fEnabled dflags
+
+isAvx512bwEnabled :: DynFlags -> Bool
+isAvx512bwEnabled dflags = avx512bw dflags
 
 isAvx512cdEnabled :: DynFlags -> Bool
 isAvx512cdEnabled dflags = avx512cd dflags
+
+isAvx512dqEnabled :: DynFlags -> Bool
+isAvx512dqEnabled dflags = avx512dq dflags
 
 isAvx512erEnabled :: DynFlags -> Bool
 isAvx512erEnabled dflags = avx512er dflags
 
 isAvx512fEnabled :: DynFlags -> Bool
-isAvx512fEnabled dflags = avx512f dflags
+isAvx512fEnabled dflags = avx512f dflags || avx512bw dflags || avx512cd dflags || avx512dq dflags || avx512er dflags || avx512pf dflags || avx512vl dflags
 
 isAvx512pfEnabled :: DynFlags -> Bool
 isAvx512pfEnabled dflags = avx512pf dflags
 
+isAvx512vlEnabled :: DynFlags -> Bool
+isAvx512vlEnabled dflags = avx512vl dflags
+
 isFmaEnabled :: DynFlags -> Bool
-isFmaEnabled dflags = fma dflags
+isFmaEnabled dflags = fma dflags || (isX86 && isAvx512fEnabled dflags)
+  where
+    -- -mfma is used on multiple platforms, but -mavx512f is x86-only
+    isX86 = case platformArch (targetPlatform dflags) of
+      ArchX86_64 -> True
+      ArchX86    -> True
+      _          -> False
+
+isGfniEnabled :: DynFlags -> Bool
+isGfniEnabled dflags = gfni dflags
+
+{- Note [Implications between X86 CPU feature flags]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Many X86 CPU feature flags (such as -mavx, -mfma or -msse4) imply other
+feature flags. In particular, there are straightforward linear implication
+structures:
+
+  1. AVX2 -> AVX -> SSE4.2 -> SSE4 -> SSSE3 -> SSE3 -> SSE2 -> SSE1
+  2. BMI2 -> BMI1
+
+together with other implications such as
+
+  3. FMA -> AVX
+  4. AVX512{BW,CD,DQ,ER,PF,VL} -> AVX512F -> AVX2
+
+
+We handle this as follows:
+
+  A. When parsing command line options into `DynFlags`, we record:
+    - an `SseAvxVersion` which gives the SSE/AVX level supported in
+      the total order (1),
+    - a `BmiVersion` for (2),
+    - whether FMA is enabled,
+    - various AVX512 flags saying which AVX512 extensions are supported
+
+  B. When converting these "raw" `DynFlags` into a `CmmConfig` for use
+     in code generator backends, we handle the remaining implications (3) (4),
+     e.g. if the user passed -mavx512f then we also set the `SseAvxVersion`
+     to `AVX2`.
+-}
+
+-- -----------------------------------------------------------------------------
+-- LA664
+isLa664Enabled :: DynFlags -> Bool
+isLa664Enabled dflags = la664 dflags
 
 -- -----------------------------------------------------------------------------
 -- BMI2

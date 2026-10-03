@@ -42,8 +42,13 @@ import GHC.Internal.IORef
 import GHC.Internal.IO.Buffer
 import GHC.Internal.IO.Encoding.Failure
 import GHC.Internal.IO.Encoding.Types
+import GHC.Internal.Prim (
+    chr#, uncheckedIShiftL#, word2Int#, word8ToWord#, (+#), (-#),
+  )
 import GHC.Internal.Word
 import GHC.Internal.Data.Bits
+import qualified GHC.Internal.IO.Exception as Rebindable
+import qualified GHC.Internal.Stack.Types as Rebindable
 
 utf8 :: TextEncoding
 utf8 = mkUTF8 ErrorOnCodingFailure

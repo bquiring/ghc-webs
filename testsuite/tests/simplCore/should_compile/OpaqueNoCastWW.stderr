@@ -1,24 +1,24 @@
 
 ==================== Tidy Core ====================
 Result size of Tidy Core
-  = {terms: 82, types: 52, coercions: 29, joins: 0/0}
+  = {terms: 82, types: 52, coercions: 26, joins: 0/0}
 
 -- RHS size: {terms: 3, types: 3, coercions: 0, joins: 0/0}
 unsafeToInteger1 :: forall (n :: Nat). Signed n -> Signed n
 [GblId, Arity=1, Unf=OtherCon []]
 unsafeToInteger1 = \ (@(n :: Nat)) (ds :: Signed n) -> ds
 
--- RHS size: {terms: 1, types: 0, coercions: 8, joins: 0/0}
+-- RHS size: {terms: 1, types: 0, coercions: 7, joins: 0/0}
 unsafeToInteger :: forall (n :: Nat). Signed n -> Integer
 [GblId[[RecSel]], Arity=1, Unf=OtherCon []]
 unsafeToInteger
   = unsafeToInteger1
-    `cast` (forall (n :: <Nat>_N).
-            <Signed n>_R %<Many>_N ->_R OpaqueNoCastWW.N:Signed <n>_P
+    `cast` (forall (n ::~ <Nat>_N).
+            <Signed n>_R ->_R OpaqueNoCastWW.N:Signed <n>_P
             :: (forall (n :: Nat). Signed n -> Signed n)
                ~R# (forall (n :: Nat). Signed n -> Integer))
 
--- RHS size: {terms: 8, types: 7, coercions: 21, joins: 0/0}
+-- RHS size: {terms: 8, types: 7, coercions: 19, joins: 0/0}
 times [InlPrag=OPAQUE]
   :: forall (m :: Nat) (n :: Nat).
      Signed m -> Signed n -> Signed (m + n)
@@ -33,10 +33,10 @@ times
          (ds `cast` (OpaqueNoCastWW.N:Signed <m>_P :: Signed m ~R# Integer))
          (ds1
           `cast` (OpaqueNoCastWW.N:Signed <n>_P :: Signed n ~R# Integer)))
-    `cast` (forall (m :: <Nat>_N) (n :: <Nat>_N).
+    `cast` (forall (m ::~ <Nat>_N) (n ::~ <Nat>_N).
             <Signed m>_R
-            %<Many>_N ->_R <Signed n>_R
-            %<Many>_N ->_R Sym (OpaqueNoCastWW.N:Signed <m + n>_P)
+            ->_R <Signed n>_R
+            ->_R Sym (OpaqueNoCastWW.N:Signed <m + n>_P)
             :: (forall (m :: Nat) (n :: Nat). Signed m -> Signed n -> Integer)
                ~R# (forall (m :: Nat) (n :: Nat).
                     Signed m -> Signed n -> Signed (m + n)))
@@ -62,7 +62,7 @@ $trModule4 :: GHC.Internal.Types.TrName
 $trModule4 = GHC.Internal.Types.TrNameS $trModule3
 
 -- RHS size: {terms: 3, types: 0, coercions: 0, joins: 0/0}
-OpaqueNoCastWW.$trModule :: GHC.Internal.Types.Module
+OpaqueNoCastWW.$trModule [InlPrag=[~]] :: GHC.Internal.Types.Module
 [GblId, Unf=OtherCon []]
 OpaqueNoCastWW.$trModule
   = GHC.Internal.Types.Module $trModule2 $trModule4
@@ -92,7 +92,7 @@ $krep2
 $krep3 :: GHC.Internal.Types.KindRep
 [GblId, Unf=OtherCon []]
 $krep3
-  = GHC.Internal.Types.KindRepFun $krep2 GHC.Internal.Types.krep$*
+  = GHC.Internal.Types.KindRepFun $krep2 GHC.Internal.Types.krepStar
 
 -- RHS size: {terms: 1, types: 0, coercions: 0, joins: 0/0}
 $tcSigned1 :: GHC.Internal.Prim.Addr#
@@ -105,7 +105,7 @@ $tcSigned2 :: GHC.Internal.Types.TrName
 $tcSigned2 = GHC.Internal.Types.TrNameS $tcSigned1
 
 -- RHS size: {terms: 7, types: 0, coercions: 0, joins: 0/0}
-OpaqueNoCastWW.$tcSigned :: GHC.Internal.Types.TyCon
+OpaqueNoCastWW.$tcSigned [InlPrag=[~]] :: GHC.Internal.Types.TyCon
 [GblId, Unf=OtherCon []]
 OpaqueNoCastWW.$tcSigned
   = GHC.Internal.Types.TyCon
@@ -148,7 +148,7 @@ $tc'S2 :: GHC.Internal.Types.TrName
 $tc'S2 = GHC.Internal.Types.TrNameS $tc'S1
 
 -- RHS size: {terms: 7, types: 0, coercions: 0, joins: 0/0}
-OpaqueNoCastWW.$tc'S :: GHC.Internal.Types.TyCon
+OpaqueNoCastWW.$tc'S [InlPrag=[~]] :: GHC.Internal.Types.TyCon
 [GblId, Unf=OtherCon []]
 OpaqueNoCastWW.$tc'S
   = GHC.Internal.Types.TyCon

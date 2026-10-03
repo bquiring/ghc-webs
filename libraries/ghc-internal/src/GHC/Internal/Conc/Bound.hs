@@ -30,7 +30,12 @@ module GHC.Internal.Conc.Bound
     , runInUnboundThread
     , rtsSupportsBoundThreads
     ) where
---
+
+import GHC.Internal.Base
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Data.Typeable.Internal as Rebindable
+import GHC.Internal.Num as Rebindable( fromInteger )  -- For known-key names
+
 -- JavaScript platform doesn't support bound threads
 #if !defined(javascript_HOST_ARCH)
 #define SUPPORT_BOUND_THREADS
@@ -38,7 +43,7 @@ module GHC.Internal.Conc.Bound
 
 #if !defined(SUPPORT_BOUND_THREADS)
 
-import GHC.Internal.Base
+import GHC.Internal.Err (error)
 import GHC.Internal.Conc.Sync (ThreadId)
 
 forkOS :: IO () -> IO ThreadId
@@ -61,17 +66,18 @@ rtsSupportsBoundThreads = False
 
 #else
 
+import GHC.Internal.Err (undefined)
 import GHC.Internal.Foreign.StablePtr
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Control.Monad.Fail
 import GHC.Internal.Data.Either
 import qualified GHC.Internal.Control.Exception.Base as Exception
-import GHC.Internal.Base
 import GHC.Internal.Conc.Sync
 import GHC.Internal.IO
 import GHC.Internal.Exception
 import GHC.Internal.IORef
 import GHC.Internal.MVar
+import GHC.Internal.Prim (isCurrentThreadBound#, (/=#))
 
 -- | 'True' if bound threads are supported.
 -- If @rtsSupportsBoundThreads@ is 'False', 'isCurrentThreadBound'

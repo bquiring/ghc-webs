@@ -36,6 +36,7 @@ module GHC.Internal.IO.Encoding (
         argvEncoding
     ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
 import GHC.Internal.Base
 import GHC.Internal.IO.Exception
 import GHC.Internal.IO.Buffer
@@ -45,13 +46,15 @@ import GHC.Internal.IO.Encoding.Types
 import qualified GHC.Internal.IO.Encoding.Iconv as Iconv
 #else
 import qualified GHC.Internal.IO.Encoding.CodePage as CodePage
-import GHC.Internal.Text.Read (reads)
+import GHC.Internal.Read (readsPrec)
+import qualified GHC.Internal.Num as Rebindable
 #endif
 import qualified GHC.Internal.IO.Encoding.Latin1 as Latin1
 import qualified GHC.Internal.IO.Encoding.UTF8   as UTF8
 import qualified GHC.Internal.IO.Encoding.UTF16  as UTF16
 import qualified GHC.Internal.IO.Encoding.UTF32  as UTF32
 import GHC.Internal.List
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Word
 
 import GHC.Internal.Data.IORef
@@ -316,7 +319,8 @@ mkTextEncoding' cfm enc =
     _ | isAscii -> return (Latin1.mkAscii cfm)
     _ | isLatin1 -> return (Latin1.mkLatin1_checked cfm)
 #if defined(mingw32_HOST_OS)
-    'C':'P':n | [(cp,"")] <- reads n -> return $ CodePage.mkCodePageEncoding cfm cp
+    'C':'P':n | [(cp,"")] <- readsPrec 0 n -> return $ CodePage.mkCodePageEncoding cfm cp
+        -- 'readsPrec 0' is the same as 'reads', but 'reads' is only defined in @base@.
     _ -> unknownEncodingErr (enc ++ codingFailureModeSuffix cfm)
 #else
     -- Otherwise, handle other encoding needs via iconv.

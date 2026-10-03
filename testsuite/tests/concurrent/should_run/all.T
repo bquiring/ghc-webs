@@ -309,3 +309,37 @@ test('hs_try_putmvar003',
 
 # Check forkIO exception determinism under optimization
 test('T13330', normal, compile_and_run, ['-O'])
+
+test('T16761', normal, compile_and_run, [''])
+
+test('T26341', normal, compile_and_run, [''])
+
+# Test EINTR for async I/O interrupted by an exception (#26341)
+test('T26341a'
+    # test uses pipe operations which are not supported by the JS/wasm backends
+    , when(arch('wasm32') or arch('javascript'), skip)
+    , compile_and_run, ['-package process'])
+
+# Stress test: many threads repeatedly interrupt and re-enter async-blocked
+# thunks (#26341). Before the fix, this would crash due to dangling
+# StgAsyncIOResult pointers on the stack.
+test('T26341b'
+    # test uses pipe operations which are not supported by the JS/wasm backends
+    , when(arch('wasm32') or arch('javascript'), skip)
+    , compile_and_run, ['-package process'])
+
+# Scheduler fairness
+test('T27105',
+     [when(arch('wasm32'), skip),   # same reason as T367_letnoescape
+      fragile(27522),
+      run_timeout_multiplier(0.05)], # we expect this to run for ~2s
+     compile_and_run, [''])
+test('T27105_fail',
+     [when(arch('wasm32'), skip),
+      # And we can expect it to fail if we context switch too coarsely
+      extra_run_opts('+RTS -C0.2 -RTS'), expect_fail,
+      run_timeout_multiplier(0.05)],
+     multimod_compile_and_run, ['T27105.hs', ''])
+
+test('T27657a', normal, compile_and_run, [''])
+test('T27657b', normal, compile_and_run, [''])

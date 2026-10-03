@@ -1,6 +1,7 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE CPP, NoImplicitPrelude, BangPatterns, MagicHash, UnboxedTuples #-}
 {-# OPTIONS_HADDOCK not-home #-}
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -46,10 +47,10 @@ module GHC.Internal.Word (
     eqWord64, neWord64, gtWord64, geWord64, ltWord64, leWord64
     ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Maybe
 
 import GHC.Internal.Prim
-import GHC.Internal.Base
 
 import GHC.Internal.Bits
 import GHC.Internal.Enum

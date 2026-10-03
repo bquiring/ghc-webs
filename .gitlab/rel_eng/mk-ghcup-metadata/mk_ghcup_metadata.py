@@ -195,26 +195,25 @@ def mk_new_yaml(release_mode, version, date, pipeline_type, job_map):
         return mk_one_metadata(release_mode, version, job_map, mk_from_platform(pipeline_type, platform))
 
     # Here are all the bindists we can distribute
-    ubuntu1804 = mk(ubuntu("18_04"))
-    ubuntu2004 = mk(ubuntu("20_04"))
     ubuntu2204 = mk(ubuntu("22_04"))
     ubuntu2404 = mk(ubuntu("24_04"))
     rocky8 = mk(rocky("8"))
-    fedora33 = mk(fedora(33))
+    fedora43 = mk(fedora(43))
     darwin_x86 = mk(darwin("x86_64"))
     darwin_arm64 = mk(darwin("aarch64"))
     windows = mk(windowsArtifact)
-    alpine3_12 = mk(alpine("3_12"))
-    alpine3_20 = mk(alpine("3_20"))
-    alpine3_18_arm64 = mk(alpine("3_18", arch='aarch64'))
-    deb9 = mk(debian(9, "x86_64"))
-    deb10 = mk(debian(10, "x86_64"))
+    alpine3_23 = mk(alpine("3_23"))
+    alpine3_23_arm64 = mk(alpine("3_23", arch='aarch64'))
+    alpine3_23_i386 = mk(alpine("3_23", arch='i386'))
     deb11 = mk(debian(11, "x86_64"))
     deb12 = mk(debian(12, "x86_64"))
-    deb10_arm64 = mk(debian(10, "aarch64"))
+    deb13 = mk(debian(13, "x86_64"))
+    deb11_arm64 = mk(debian(11, "aarch64"))
     deb12_arm64 = mk(debian(12, "aarch64"))
-    deb10_i386 = mk(debian(10, "i386"))
+    deb13_arm64 = mk(debian(13, "aarch64"))
+    deb11_i386 = mk(debian(11, "i386"))
     deb12_i386 = mk(debian(12, "i386"))
+    deb13_i386 = mk(debian(13, "i386"))
 
     source = mk_one_metadata(release_mode, version, job_map, source_artifact)
     test = mk_one_metadata(release_mode, version, job_map, test_artifact)
@@ -222,50 +221,43 @@ def mk_new_yaml(release_mode, version, date, pipeline_type, job_map):
     # The actual metadata, this is not a precise science, but just what the ghcup
     # developers want.
 
-    a64 = { "Linux_Debian": { "< 10": deb9
-                           , "( >= 10 && < 11 )": deb10
-                           , "( >= 11 && < 12 )": deb11
-                           , ">= 12": deb12
-                           , "unknown_versioning": deb11 }
-          , "Linux_Ubuntu" : { "unknown_versioning": ubuntu2004
-                             , "( >= 16 && < 18 )": deb9
-                             , "( >= 18 && < 19 )": ubuntu1804
-                             , "( >= 19 && < 21 )": ubuntu2004
-                             , "( >= 21 && < 24 )": ubuntu2204
+    a64 = { "Linux_Debian": { "< 12" : deb11
+                            , "( >= 12 && < 13 )": deb12
+                            , ">= 13": deb13
+                            , "unknown_versioning": deb11 }
+          , "Linux_Ubuntu" : { "unknown_versioning": ubuntu2204
+                             , "( < 24  )": ubuntu2204
                              , "( >= 24 )": ubuntu2404
                              }
-          , "Linux_Mint"   : { "< 20": ubuntu1804
-                             , ">= 20": ubuntu2004
-                             , "unknown_versioning": ubuntu2004 }
+          , "Linux_Mint"   : { "< 24": ubuntu2204
+                             , ">= 24": ubuntu2404
+                             , "unknown_versioning": ubuntu2204 }
           , "Linux_CentOS"  : { "( >= 8 && < 9 )" : rocky8
                               , "unknown_versioning" : rocky8  }
-          , "Linux_Fedora"  : { ">= 33": fedora33
+          , "Linux_Fedora"  : { ">= 43": fedora43
                               , "unknown_versioning": rocky8 }
-          , "Linux_RedHat"  : { "< 9": rocky8
-                              , ">= 9": fedora33
-                              , "unknown_versioning": fedora33 }
+          , "Linux_RedHat"  : { "unknown_versioning": rocky8 }
           , "Linux_UnknownLinux" : { "unknown_versioning": rocky8 }
           , "Darwin" : { "unknown_versioning" : darwin_x86 }
           , "Windows" : { "unknown_versioning" :  windows }
-          , "Linux_Alpine" : { "( >= 3.12 && < 3.20 )": alpine3_12
-                             , ">= 3.20": alpine3_20
-                             , "unknown_versioning": alpine3_12 }
-
+          , "Linux_Alpine" : { "unknown_versioning": alpine3_23 }
           }
 
-    a32 = { "Linux_Debian": { "( >= 10 && < 12 )": deb10_i386
-                            , ">= 12": deb12_i386
-                            , "unknown_versioning": deb10_i386 }
-          , "Linux_Ubuntu": { "unknown_versioning": deb10_i386 }
-          , "Linux_Mint" : { "unknown_versioning": deb10_i386 }
-          , "Linux_UnknownLinux" : { "unknown_versioning": deb10_i386 }
+    a32 = { "Linux_Debian": { "( >= 11 && < 12 )": deb11_i386
+                            , "( >= 12 && < 13 )": deb12_i386
+                            , ">= 13": deb13_i386
+                            , "unknown_versioning": deb11_i386 }
+          , "Linux_Ubuntu": { "unknown_versioning": deb11_i386 }
+          , "Linux_Mint" : { "unknown_versioning": deb11_i386 }
+          , "Linux_Alpine" : { "unknown_versioning": alpine3_23_i386 }
+          , "Linux_UnknownLinux" : { "unknown_versioning": deb11_i386 }
           }
 
-    arm64 = { "Linux_UnknownLinux": { "unknown_versioning": deb10_arm64 }
-            , "Linux_Alpine" : { "unknown_versioning": alpine3_18_arm64 }
-            , "Linux_Debian": { "( >= 10 && < 12 )": deb10_arm64
+    arm64 = { "Linux_UnknownLinux": { "unknown_versioning": deb11_arm64 }
+            , "Linux_Alpine" : { "unknown_versioning": alpine3_23_arm64 }
+            , "Linux_Debian": { "( >= 11 && < 12 )": deb11_arm64
                               , "( >= 12 )": deb12_arm64
-                              , "unknown_versioning": deb10_arm64
+                              , "unknown_versioning": deb11_arm64
                               }
             , "Darwin": { "unknown_versioning": darwin_arm64 }
             }
@@ -332,6 +324,7 @@ def main() -> None:
     # TODO: We could work out the --version from the project-version CI job.
     parser.add_argument('--version', required=True, type=str, help='Version of the GHC compiler')
     parser.add_argument('--date', required=True, type=str, help='Date of the compiler release')
+    parser.add_argument('output_path', nargs='?', type=Path, help='Path to write the output to, if not set, dump to stdout')
     args = parser.parse_args()
 
     project = gl.projects.get(1, lazy=True)
@@ -360,10 +353,14 @@ def main() -> None:
         with open(args.metadata, 'r') as file:
             ghcup_metadata = yaml.safe_load(file)
             if  args.version in ghcup_metadata['ghcupDownloads']['GHC']:
-                raise RuntimeError("Refusing to override existing version in metadata")
+                eprint("GHCUp nightly run produced the same metadata as last night")
             setNightlyTags(ghcup_metadata)
             ghcup_metadata['ghcupDownloads']['GHC'][args.version] = new_yaml
-            print(yaml.dump(ghcup_metadata))
+            if args.output_path:
+                with open(args.output_path, 'w') as ofile:
+                    yaml.dump(ghcup_metadata, ofile)
+            else:
+                print(yaml.dump(ghcup_metadata))
 
 
 

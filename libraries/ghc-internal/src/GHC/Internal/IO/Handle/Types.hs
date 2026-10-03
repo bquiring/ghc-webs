@@ -41,6 +41,7 @@ module GHC.Internal.IO.Handle.Types (
 #undef DEBUG
 
 import GHC.Internal.Base
+import GHC.Internal.Maybe (Maybe)
 import GHC.Internal.MVar
 import GHC.Internal.IO
 import GHC.Internal.IO.Buffer
@@ -48,7 +49,6 @@ import GHC.Internal.IO.BufferedIO
 import GHC.Internal.IO.Encoding.Types
 import GHC.Internal.IORef
 import GHC.Internal.Show
-import GHC.Internal.Read
 import GHC.Internal.Word
 import GHC.Internal.IO.Device
 import GHC.Internal.Data.Typeable
@@ -157,6 +157,7 @@ data BufferList e
 data HandleType
  = ClosedHandle
  | SemiClosedHandle
+   -- ^ See the documentation of 'GHC.IO.Handle.Text.hGetContents'.
  | ReadHandle
  | WriteHandle
  | AppendHandle
@@ -269,7 +270,6 @@ data BufferMode
                 -- is 'Just' @n@ and is otherwise implementation-dependent.
    deriving ( Eq   -- ^ @since base-4.2.0.0
             , Ord  -- ^ @since base-4.2.0.0
-            , Read -- ^ @since base-4.2.0.0
             , Show -- ^ @since base-4.2.0.0
             )
 
@@ -375,7 +375,6 @@ data Newline = LF    -- ^ @\'\\n\'@
              | CRLF  -- ^ @\'\\r\\n\'@
              deriving ( Eq   -- ^ @since base-4.2.0.0
                       , Ord  -- ^ @since base-4.3.0.0
-                      , Read -- ^ @since base-4.3.0.0
                       , Show -- ^ @since base-4.3.0.0
                       )
 
@@ -392,7 +391,6 @@ data NewlineMode
                  }
              deriving ( Eq   -- ^ @since base-4.2.0.0
                       , Ord  -- ^ @since base-4.3.0.0
-                      , Read -- ^ @since base-4.3.0.0
                       , Show -- ^ @since base-4.3.0.0
                       )
 

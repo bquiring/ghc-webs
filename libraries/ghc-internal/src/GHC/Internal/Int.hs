@@ -7,6 +7,7 @@
 {-# LANGUAGE UnboxedTuples #-}
 
 {-# OPTIONS_HADDOCK not-home #-}
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -39,12 +40,10 @@ module GHC.Internal.Int (
 
     ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Data.Bits
 import GHC.Internal.Data.Maybe
-
 import GHC.Internal.Prim
-import GHC.Internal.Base
-
 import GHC.Internal.Enum
 import GHC.Internal.Num
 import GHC.Internal.Real

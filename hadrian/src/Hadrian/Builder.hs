@@ -14,7 +14,7 @@
 module Hadrian.Builder (
     Builder (..), BuildInfo (..), needBuilders, runBuilder,
     runBuilderWithCmdOptions, build, buildWithResources, buildWithCmdOptions,
-    getBuilderPath, builderEnvironment, askWithResources
+    getBuilderPath, builderEnvironment, remBuilderEnvironment, askWithResources
     ) where
 
 import Data.List
@@ -29,7 +29,9 @@ import Hadrian.Utilities
 
 -- | This data structure captures all information relevant to invoking a builder.
 data BuildInfo = BuildInfo {
-    -- | Command line arguments.
+    -- | Command line arguments. Some builders (e.g. Ar, Ghc, Haddock) omit
+    -- buildInputs from buildArgs so that buildInputs can be passed separately
+    -- using a response file.
     buildArgs :: [String],
     -- | Input files.
     buildInputs :: [FilePath],
@@ -59,10 +61,10 @@ class ShakeValue b => Builder b where
     runBuilderWith builder buildInfo = do
         let args = buildArgs buildInfo
         needBuilders [builder]
-        path <- builderPath builder
+        prog <- exeSpawnPath =<< builderPath builder
         let msg = if null args then "" else " (" ++ intercalate ", " args ++ ")"
         putBuild $ "| Run " ++ show builder ++ msg
-        quietly $ cmd (buildOptions buildInfo) [path] args
+        quietly $ cmdExe prog (buildOptions buildInfo) args
 
 needBuilders :: Builder b => [b] -> Action ()
 needBuilders bs = do
@@ -162,3 +164,7 @@ builderEnvironment variable builder = do
     needBuilders [builder]
     path <- builderPath builder
     return $ AddEnv variable path
+
+-- | Remove (unset) an environment variable
+remBuilderEnvironment :: String -> Action CmdOption
+remBuilderEnvironment variable = pure $ RemEnv variable

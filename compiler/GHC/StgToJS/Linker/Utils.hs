@@ -42,7 +42,7 @@ import           Prelude
 import GHC.Platform
 import Data.List (isPrefixOf)
 
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import Language.Haskell.Syntax.Basic
 import GHC.Types.Name
 import GHC.StgToJS.Ids
@@ -52,7 +52,7 @@ import GHC.Data.FastString
 
 -- | Retrieve library directories provided by the @UnitId@ in @UnitState@
 getInstalledPackageLibDirs :: UnitState -> UnitId -> [ShortText]
-getInstalledPackageLibDirs us = maybe mempty unitLibraryDirs . lookupUnitId us
+getInstalledPackageLibDirs us = maybe mempty unitLibraryDirsStatic . lookupUnitId us
 
 -- | Retrieve the names of the libraries provided by @UnitId@
 getInstalledPackageHsLibs :: UnitState -> UnitId -> [ShortText]

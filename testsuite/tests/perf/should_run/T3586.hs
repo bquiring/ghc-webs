@@ -1,5 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
-{-# OPTIONS -fvia-C -optc-O3 -fexcess-precision -optc-msse3 #-}
+{-# OPTIONS -optc-O3 -fexcess-precision #-}
 
 import Control.Monad.ST
 import Data.Array.ST
@@ -14,7 +14,8 @@ go :: STUArray s Int Double -> Int -> Double -> ST s Double
 go !a i !acc
     | i < 1     = return acc
     | otherwise = do
-         b <- unsafeRead a i
-         unsafeWrite a i (b+3.0)
-         c <- unsafeRead a i
+         -- unsafeRead/unsafeWrite use 0-based index
+         b <- unsafeRead a (i-1)
+         unsafeWrite a (i-1) (b+3.0)
+         c <- unsafeRead a (i-1)
          go a (i-1) (c+acc)

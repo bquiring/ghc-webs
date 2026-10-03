@@ -5,10 +5,7 @@
 -}
 
 
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE LambdaCase #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
@@ -41,50 +38,58 @@ import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.ErrCtxt( ReportRedundantConstraints(..) )
 import GHC.Tc.TyCl.Build
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Instance.Class( AssocInstInfo(..), isNotAssociated )
-import GHC.Core.Multiplicity
-import GHC.Core.InstEnv
 import GHC.Tc.Instance.Family
-import GHC.Core.FamInstEnv
+
 import GHC.Tc.Deriv
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Unify
-import GHC.Builtin.Names ( unsatisfiableIdName )
-import GHC.Core        ( Expr(..), mkApps, mkVarApps, mkLams )
-import GHC.Core.Make   ( nO_METHOD_BINDING_ERROR_ID )
-import GHC.Core.Unfold.Make ( mkInlineUnfoldingWithArity, mkDFunUnfolding )
-import GHC.Core.Type
-import GHC.Core.SimpleOpt
-import GHC.Core.Predicate( classMethodInstTy )
 import GHC.Tc.Types.Evidence
+
+import GHC.Builtin.KnownKeys ( unsatisfiableIdKey )
+
+import GHC.Core        ( Expr(..), mkVarApps )
+import GHC.Core.Make   ( nO_METHOD_BINDING_ERROR_ID )
+import GHC.Core.Unfold.Make ( mkDFunUnfolding )
+import GHC.Core.FamInstEnv
+import GHC.Core.Type
+import GHC.Core.Multiplicity
+import GHC.Core.InstEnv
+import GHC.Core.Predicate( classMethodInstTy )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.Class
+
 import GHC.Types.Var as Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Data.Bag
 import GHC.Types.Basic
-import GHC.Types.Fixity
-import GHC.Driver.DynFlags
-import GHC.Driver.Ppr
-import GHC.Utils.Logger
-import GHC.Data.FastString
+import GHC.Types.ForeignCall ( typeCheckCType )
 import GHC.Types.Id
+import GHC.Types.InlinePragma
 import GHC.Types.SourceFile
 import GHC.Types.SourceText
-import GHC.Data.List.SetOps
 import GHC.Types.Name
 import GHC.Types.Name.Set
+import GHC.Types.SrcLoc
+
+import GHC.Driver.DynFlags
+import GHC.Driver.Ppr
+
+import GHC.Utils.Logger
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Types.SrcLoc
 import GHC.Utils.Misc
+
+import GHC.Data.FastString
+import GHC.Data.List.SetOps
+import GHC.Data.Bag
 import GHC.Data.BooleanFormula ( isUnsatisfied )
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -184,6 +189,8 @@ Note [Instances and loop breakers]
 
 Note [ClassOp/DFun selection]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This important Note explains how DFunIds and ClassOps work.
+
 One thing we see a lot is stuff like
     op2 (df d1 d2)
 where 'op2' is a ClassOp and 'df' is DFun.  Now, we could inline *both*
@@ -217,6 +224,12 @@ Instead we use a cunning trick.
  * We make 'df' CONLIKE, so that shared uses still match; eg
       let d = df d1 d2
       in ...(op2 d)...(op1 d)...
+
+ * ClassOps have no unfolding; they work /only/ through their RULE.
+   But a ClassOp might be called with no arguments, or with an argument that
+   the rule doesn't fire on.   So each ClassOp does get an executable top-level
+   definition, injected by GHC.Iface.Tidy.getClassImplicitBinds, which uses
+   `GHC.Types.Id.Make.mkDictSelRhs` to make the code.
 
 Note [Single-method classes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -421,7 +434,7 @@ tcInstDeclsDeriv deriv_infos derivds
   = do th_lvl <- getThLevel -- See Note [Deriving inside TH brackets]
        if isBrackLevel th_lvl
        then do { gbl_env <- getGblEnv
-               ; return (gbl_env, bagToList emptyBag, emptyValBindsOut) }
+               ; return (gbl_env, bagToList emptyBag, emptyValBindsRn) }
        else do { (tcg_env, info_bag, valbinds) <- tcDeriving deriv_infos derivds
                ; return (tcg_env, bagToList info_bag, valbinds) }
 
@@ -434,17 +447,17 @@ addFamInsts :: [FamInst] -> TcM (TcGblEnv, ThBindEnv)
 --        (b) the type envt with stuff from data type decls
 addFamInsts fam_insts
   = tcExtendLocalFamInstEnv fam_insts $
-    tcExtendGlobalEnv axioms          $
+    tcExtendGlobalEnv axioms $
     do { traceTc "addFamInsts" (pprFamInsts fam_insts)
        ; (gbl_env, th_bndrs) <- addTyConsToGblEnv data_rep_tycons
-                    -- Does not add its axiom; that comes
-                    -- from adding the 'axioms' above
+                    -- NB: this does not add the data family instance axioms;
+                    -- those are added separately above.
        ; return (gbl_env, th_bndrs)
        }
   where
     axioms = map (ACoAxiom . toBranchedAxiom . famInstAxiom) fam_insts
     data_rep_tycons = famInstsRepTyCons fam_insts
-      -- The representation tycons for 'data instances' declarations
+      -- The representation tycons for data family instance declarations.
 
 {-
 Note [Deriving inside TH brackets]
@@ -485,11 +498,13 @@ tcLocalInstDecl (L loc (ClsInstD { cid_inst = decl }))
 tcClsInstDecl :: LClsInstDecl GhcRn
               -> TcM ([InstInfo GhcRn], [FamInst], [DerivInfo])
 -- The returned DerivInfos are for any associated data families
-tcClsInstDecl (L loc (ClsInstDecl { cid_ext = lwarn
-                                  , cid_poly_ty = hs_ty, cid_binds = binds
-                                  , cid_sigs = uprags, cid_tyfam_insts = ats
+tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty
+                                  , cid_ext = (lwarn,  HsNestedGroup
+                                       { ng_meths = binds
+                                       , ng_sigs = uprags, ng_tyfam_insts = ats
+                                       , ng_datafam_insts = adts })
                                   , cid_overlap_mode = overlap_mode
-                                  , cid_datafam_insts = adts }))
+                                  }))
   = setSrcSpanA loc                   $
     addErrCtxt (instDeclCtxt1 hs_ty)  $
     do  { dfun_ty <- tcHsClsInstType (InstDeclCtxt False) hs_ty
@@ -518,7 +533,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_ext = lwarn
                                                  , ai_tyvars = visible_skol_tvs
                                                  , ai_inst_env = mini_env }
                     ; df_stuff  <- mapAndRecoverM (tcDataFamInstDecl mb_info tv_skol_env) adts
-                    ; tf_insts1 <- mapAndRecoverM (tcTyFamInstDecl mb_info)   ats
+                    ; tf_insts1 <- mapAndRecoverM (tcTyFamInstDecl mb_info) ats
 
                       -- Check for missing associated types and build them
                       -- from their defaults (if available)
@@ -543,7 +558,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_ext = lwarn
                 -- Dfun location is that of instance *header*
 
         ; let warn = fmap unLoc lwarn
-        ; ispec <- newClsInst (fmap unLoc overlap_mode) dfun_name
+        ; ispec <- newClsInst (fmap (tcOverlapMode . unLoc) overlap_mode) dfun_name
                               tyvars theta clas inst_tys warn
 
         ; let inst_binds = InstBindings
@@ -732,6 +747,8 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
                  -- first, so there is no reason to suppose that the eta_tvs
                  -- (obtained from the pats) are at the end (#11148)
 
+             user_kind = mkTyConKind full_tcbs tc_res_kind
+
        -- Eta-expand the representation tycon until it has result
        -- kind `TYPE r`, for some `r`. If UnliftedNewtypes is not enabled, we
        -- go one step further and ensure that it has kind `TYPE 'LiftedRep`.
@@ -795,8 +812,11 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
                   tcConDecls (DDataInstance orig_res_ty) rec_rep_tc tc_ty_binders tc_res_kind
                       hs_cons
 
+              -- Generate fresh names for the representation TyCon and CoAxiom
+              -- of the data family instance.
               ; rep_tc_name <- newFamInstTyConName lfam_name pats
               ; axiom_name  <- newFamInstAxiomName lfam_name [pats]
+
               ; tc_rhs <- case data_cons of
                      DataTypeCons type_data data_cons -> return $
                         mkLevPolyDataTyConRhs
@@ -813,10 +833,11 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
 
                       -- NB: Use the full ty_binders from the pats. See bullet toward
                       -- the end of Note [Data type families] in GHC.Core.TyCon
-                    rep_tc   = mkAlgTyCon rep_tc_name
-                                          ty_binders res_kind
+                    rep_tc   = mkAlgTyCon rep_tc_name user_kind
+                                          ty_binders (length extra_tcbs)
+                                          res_kind
                                           (map (const Nominal) ty_binders)
-                                          (fmap unLoc cType) stupid_theta
+                                          (fmap (typeCheckCType . unLoc) cType) stupid_theta
                                           tc_rhs parent
                                           gadt_syntax
                  -- We always assume that indexed types are recursive.  Why?
@@ -1379,13 +1400,8 @@ tcInstDecl2 (InstInfo { iSpec = ispec, iBinds = ibinds })
              inst_tv_tys = mkTyVarTys inst_tyvars
              arg_wrapper = mkWpEvVarApps dfun_ev_vars <.> mkWpTyApps inst_tv_tys
 
-             is_newtype = isNewTyCon class_tc
              dfun_id_w_prags = addDFunPrags dfun_id sc_meth_ids
-             dfun_spec_prags
-                | is_newtype = SpecPrags []
-                | otherwise  = SpecPrags spec_inst_prags
-                    -- Newtype dfuns just inline unconditionally,
-                    -- so don't attempt to specialise them
+             dfun_spec_prags = SpecPrags spec_inst_prags
 
              export = ABE { abe_wrap = idHsWrapper
                           , abe_poly = dfun_id_w_prags
@@ -1418,18 +1434,10 @@ addDFunPrags :: DFunId -> [Id] -> DFunId
 -- the DFunId rather than from the skolem pieces that the typechecker
 -- is messing with.
 addDFunPrags dfun_id sc_meth_ids
- | is_newtype
-  = dfun_id `setIdUnfolding`  mkInlineUnfoldingWithArity defaultSimpleOpts StableSystemSrc 0 con_app
-            `setInlinePragma` alwaysInlinePragma { inl_sat = Just 0 }
- | otherwise
  = dfun_id `setIdUnfolding`  mkDFunUnfolding dfun_bndrs dict_con dict_args
            `setInlinePragma` dfunInlinePragma
+           -- NB: mkDFunUnfolding takes care of unary classes
  where
-   con_app    = mkLams dfun_bndrs $
-                mkApps (Var (dataConWrapId dict_con)) dict_args
-                -- This application will satisfy the Core invariants
-                -- from Note [Representation polymorphism invariants] in GHC.Core,
-                -- because typeclass method types are never unlifted.
    dict_args  = map Type inst_tys ++
                 [mkVarApps (Var id) dfun_bndrs | id <- sc_meth_ids]
 
@@ -1438,7 +1446,6 @@ addDFunPrags dfun_id sc_meth_ids
    dfun_bndrs  = dfun_tvs ++ ev_ids
    clas_tc     = classTyCon clas
    dict_con    = tyConSingleDataCon clas_tc
-   is_newtype  = isNewTyCon clas_tc
 
 wrapId :: HsWrapper -> Id -> HsExpr GhcTc
 wrapId wrapper id = mkHsWrap wrapper (mkHsVar (noLocA id))
@@ -1481,8 +1488,7 @@ Notice that
    implication for the whole instance declaration, with the expected
    skolems and givens.  We need this to get the correct "redundant
    constraint" warnings, gathering all the uses from all the methods
-   and superclasses.  See GHC.Tc.Solver Note [Tracking redundant
-   constraints]
+   and superclasses.  See GHC.Tc.SolverSolve Note [Tracking needed EvIds]
 
  * The given constraints in the outer implication may generate
    evidence, notably by superclass selection.  Since the method and
@@ -1875,7 +1881,7 @@ tcMethods _skol_info dfun_id clas tyvars dfun_ev_vars inst_tys
       _ | (theta_id,unsat_msg) : _ <- unsat_thetas
         -> do { (meth_id, _) <- mkMethIds clas tyvars dfun_ev_vars
                                          inst_tys sel_id
-             ; unsat_id <- tcLookupId unsatisfiableIdName
+             ; unsat_id <- tcLookupKnownKeyId unsatisfiableIdKey
              -- Recall that unsatisfiable :: forall {rep} (msg :: ErrorMessage) (a :: TYPE rep). Unsatisfiable msg => a
              --
              -- So we need to instantiate the forall and pass the dictionary evidence.
@@ -1889,7 +1895,8 @@ tcMethods _skol_info dfun_id clas tyvars dfun_ev_vars inst_tys
 
       Just (dm_name, dm_spec) ->
         do { (meth_bind, inline_prags) <- mkDefMethBind inst_loc dfun_id clas sel_id dm_name dm_spec
-           ; tcMethodBody True clas tyvars dfun_ev_vars inst_tys
+           ; tcMethodBody (is_vanilla_dm dm_spec)
+                          clas tyvars dfun_ev_vars inst_tys
                           dfun_ev_binds is_derived hs_sig_fn
                           spec_inst_prags inline_prags
                           sel_id meth_bind inst_loc }
@@ -1944,6 +1951,12 @@ tcMethods _skol_info dfun_id clas tyvars dfun_ev_vars inst_tys
         bind_nms         = map unLoc $ collectMethodBinders binds
         cls_meth_nms     = map (idName . fst) op_items
         mismatched_meths = bind_nms `minusList` cls_meth_nms
+
+    is_vanilla_dm :: DefMethSpec ty -> Bool
+    -- See (TRC5) in Note [Tracking needed EvIds]
+    --            in GHC.Tc.Solver.Solve
+    is_vanilla_dm VanillaDM      = True
+    is_vanilla_dm (GenericDM {}) = False
 
 {-
 Note [Mismatched class methods and associated type families]
@@ -2014,20 +2027,22 @@ Instead, we take the following approach:
 -}
 
 ------------------------
-tcMethodBody :: Bool
+tcMethodBody :: Bool   -- True <=> This is a vanilla default method
+                       -- See (TRC5) in Note [Tracking needed EvIds]
+                       --            in GHC.Tc.Solver.Solve
              -> Class -> [TcTyVar] -> [EvVar] -> [TcType]
              -> TcEvBinds -> Bool
              -> HsSigFun
              -> [LTcSpecPrag] -> [LSig GhcRn]
              -> Id -> LHsBind GhcRn -> SrcSpan
              -> TcM (TcId, LHsBind GhcTc, Maybe Implication)
-tcMethodBody is_def_meth clas tyvars dfun_ev_vars inst_tys
-                     dfun_ev_binds is_derived
-                     sig_fn spec_inst_prags prags
-                     sel_id (L bind_loc meth_bind) bndr_loc
+tcMethodBody is_vanilla_dm clas tyvars dfun_ev_vars inst_tys
+             dfun_ev_binds is_derived
+             sig_fn spec_inst_prags prags
+             sel_id (L bind_loc meth_bind) bndr_loc
   = add_meth_ctxt $
     do { traceTc "tcMethodBody" (ppr sel_id <+> ppr (idType sel_id) $$ ppr bndr_loc)
-       ; let skol_info = MethSkol meth_name is_def_meth
+       ; let skol_info = MethSkol meth_name is_vanilla_dm
        ; (global_meth_id, local_meth_id) <- setSrcSpan bndr_loc $
                                             mkMethIds clas tyvars dfun_ev_vars
                                                       inst_tys sel_id
@@ -2079,7 +2094,7 @@ tcMethodBody is_def_meth clas tyvars dfun_ev_vars inst_tys
         -- we want to print out the full source code if there's an error
         -- because otherwise the user won't see the code at all
     add_meth_ctxt thing
-      | is_derived = addLandmarkErrCtxt (DerivBindCtxt sel_id clas inst_tys) thing
+      | is_derived = addErrCtxt (DerivBindCtxt sel_id clas inst_tys) thing
       | otherwise  = thing
 
 tcMethodBodyHelp :: HsSigFun -> Id -> TcId
@@ -2100,7 +2115,7 @@ tcMethodBodyHelp hs_sig_fn sel_id local_meth_id meth_bind
                                 -- The instance-sig is the focus here; the class-meth-sig
                                 -- is fixed (#18036)
                    ; let orig = InstanceSigOrigin sel_name sig_ty local_meth_ty
-                   ; hs_wrap <- addErrCtxtM (methSigCtxt sel_name sig_ty local_meth_ty) $
+                   ; hs_wrap <- addErrCtxt (MethSigCtxt sel_name sig_ty local_meth_ty) $
                                 tcSubTypeSigma orig ctxt sig_ty local_meth_ty
                    ; return (sig_ty, hs_wrap) }
 
@@ -2168,11 +2183,6 @@ mkMethIds clas tyvars dfun_ev_vars inst_tys sel_id
     poly_meth_ty  = mkSpecSigmaTy tyvars theta local_meth_ty
     theta         = map idType dfun_ev_vars
 
-methSigCtxt :: Name -> TcType -> TcType -> TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)
-methSigCtxt sel_name sig_ty meth_ty env0
-  = do { (env1, sig_ty)  <- zonkTidyTcType env0 sig_ty
-       ; (env2, meth_ty) <- zonkTidyTcType env1 meth_ty
-       ; return (env2, MethSigCtxt sel_name sig_ty meth_ty) }
 
 {- Note [Instance method signatures]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2255,7 +2265,7 @@ mkDefMethBind :: SrcSpan -> DFunId -> Class -> Id -> Name
 mkDefMethBind loc dfun_id clas sel_id dm_name dm_spec
   = do  { logger <- getLogger
         ; dm_id <- tcLookupId dm_name
-        ; let inline_prag = idInlinePragma dm_id
+        ; let inline_prag = inlinePragmaToGhcRn $ idInlinePragma dm_id
               inline_prags | isAnyInlinePragma inline_prag
                            = [noLocA (InlineSig noAnn fn inline_prag)]
                            | otherwise
@@ -2273,6 +2283,13 @@ mkDefMethBind loc dfun_id clas sel_id dm_name dm_spec
     (_, _, _, inst_tys) = tcSplitDFunTy (idType dfun_id)
     (_, _, sel_tau) = tcSplitMethodTy (idType sel_id)
     (sel_tvbs, _) = tcSplitForAllInvisTVBinders sel_tau
+
+    -- We get the 'InlinePragmaInfo' from a typechecked 'Id', but we
+    -- want to return the data in 'GhcRn'.
+    inlinePragmaToGhcRn :: InlinePragma GhcTc -> InlinePragma GhcRn
+    inlinePragmaToGhcRn prag@(InlinePragma { inl_ext = src, inl_act = act }) =
+      prag { inl_ext = src, inl_act = act }
+
 
     -- Compute the instance types to use in the visible type application. See
     -- Note [Default methods in instances].
@@ -2671,11 +2688,11 @@ tcSpecInst _  _ = panic "tcSpecInst"
 ************************************************************************
 -}
 
-instDeclCtxt1 :: LHsSigType GhcRn -> ErrCtxtMsg
+instDeclCtxt1 :: LHsSigType GhcRn -> HsCtxt
 instDeclCtxt1 hs_inst_ty
   = InstDeclErrCtxt $ Left $ getLHsInstDeclHead hs_inst_ty
 
-instDeclCtxt2 :: Type -> ErrCtxtMsg
+instDeclCtxt2 :: Type -> HsCtxt
 instDeclCtxt2 dfun_ty
   = InstDeclErrCtxt $ Right $ head_ty
   where

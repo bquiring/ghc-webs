@@ -1,7 +1,8 @@
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE DerivingVia #-}
+
+{-# OPTIONS_GHC -Wwarn=incomplete-record-selectors #-}
+
 -- | Dependencies and Usage of a module
 module GHC.Unit.Module.Deps
    ( Dependencies(dep_direct_mods
@@ -19,21 +20,28 @@ module GHC.Unit.Module.Deps
    , noDependencies
    , pprDeps
    , Usage (..)
+   , stableUsageCmp
    , HomeModImport (..)
    , HomeModImportedAvails (..)
    , ImportAvails (..)
    , IfaceImportLevel(..)
    , tcImportLevel
+   , LinkablePartUsage(..)
+   , linkablePartUsageObjectPaths
    )
 where
 
 import GHC.Prelude
 
 import GHC.Data.FastString
+import GHC.Data.FlatBag
+import GHC.Data.OsPath
+import qualified GHC.Data.OsPath as OsPath
 
 import GHC.Types.Avail
 import GHC.Types.SafeHaskell
 import GHC.Types.Name
+import GHC.Types.Name.Set
 import GHC.Types.Basic
 
 import GHC.Unit.Module.Imported
@@ -45,13 +53,13 @@ import GHC.Utils.Fingerprint
 import GHC.Utils.Binary
 import GHC.Utils.Outputable
 
+import Control.DeepSeq
+import Data.Bifunctor
+import qualified Data.Foldable as Foldable
+import Data.Function (on)
 import Data.List (sortBy, sort, partition)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Bifunctor
-import Control.DeepSeq
-import GHC.Types.Name.Set
-
 
 
 -- | Dependency information about ALL modules and packages below this one
@@ -93,7 +101,7 @@ data Dependencies = Deps
    , dep_boot_mods_ :: Set (UnitId, ModuleNameWithIsBoot)
       -- ^ All modules which have boot files below this one, and whether we
       -- should use the boot file or not.
-      -- This information is only used to populate the eps_is_boot field.
+      -- This information is only used to populate the 'eps_is_boot' field.
       -- See Note [Structure of dep_boot_mods]
 
    , dep_orphs_ :: [Module]
@@ -169,9 +177,12 @@ instance Outputable IfaceImportLevel where
 
 -- | Extract information from the rename and typecheck phases to produce
 -- a dependencies information for the module being compiled.
---
--- The fourth argument is a list of plugin modules.
-mkDependencies :: HomeUnit -> Module -> ImportAvails -> [Module] -> Dependencies
+mkDependencies
+  :: HomeUnit
+  -> Module         -- ^ The module being compiled
+  -> ImportAvails
+  -> [Module]       -- ^ Plugin modules
+  -> Dependencies
 mkDependencies home_unit mod imports plugin_mods =
   let (home_plugins, external_plugins) = partition (isHomeUnit home_unit . moduleUnit) plugin_mods
       plugin_units = Set.fromList (map (toUnitId . moduleUnit) external_plugins)
@@ -199,7 +210,8 @@ mkDependencies home_unit mod imports plugin_mods =
             -- We must also remove self-references from imp_orphs. See
             -- Note [Module self-dependency]
 
-      direct_pkgs = Set.map (\(lvl, uid) -> (IfaceImportLevel lvl, uid)) (imp_dep_direct_pkgs imports)
+      direct_pkgs =
+        Set.map (\(lvl, uid) -> (IfaceImportLevel lvl, uid)) (imp_dep_direct_pkgs imports)
 
       -- Set the packages required to be Safe according to Safe Haskell.
       -- See Note [Tracking Trust Transitively] in GHC.Rename.Names
@@ -357,12 +369,29 @@ data Usage
         -- contents don't change.  This previously lead to odd
         -- recompilation behaviors; see #8114
   }
-  | UsageHomeModuleInterface {
+  | UsageDirectory {
+        usg_dir_path  :: FastString,
+        -- ^ External dir dependency. From TH addDependentFile.
+        -- Should be absolute.
+        usg_dir_hash  :: Fingerprint,
+        -- ^ 'Fingerprint' of the directories contents.
+
+        usg_dir_label :: Maybe String
+        -- ^ An optional string which is used in recompilation messages if
+        -- dir in question has changed.
+
+        -- Note: We do a very shallow check indeed, just what the contents of
+        -- the directory are, aka what files and directories are within it.
+        -- If those files/directories have their own contents changed, then
+        -- we won't spot it here. If you do want to spot that, the caller
+        -- should recursively add them to their useage.
+  }
+  | UsageHomeModuleBytecode {
         usg_mod_name :: ModuleName
         -- ^ Name of the module
         , usg_unit_id :: UnitId
         -- ^ UnitId of the HomeUnit the module is from
-        , usg_iface_hash :: Fingerprint
+        , usg_bytecode_hash :: Fingerprint
         -- ^ The *interface* hash of the module, not the ABI hash.
         -- This changes when anything about the interface (and hence the
         -- module) has changed.
@@ -395,8 +424,9 @@ instance NFData Usage where
   rnf (UsagePackageModule mod hash safe) = rnf mod `seq` rnf hash `seq` rnf safe `seq` ()
   rnf (UsageHomeModule mod uid hash entities exports safe) = rnf mod `seq` rnf uid `seq` rnf hash `seq` rnf entities `seq` rnf exports `seq` rnf safe `seq` ()
   rnf (UsageFile file hash label) = rnf file `seq` rnf hash `seq` rnf label `seq` ()
+  rnf (UsageDirectory dir hash label) = rnf dir `seq` rnf hash `seq` rnf label `seq` ()
   rnf (UsageMergedRequirement mod hash) = rnf mod `seq` rnf hash `seq` ()
-  rnf (UsageHomeModuleInterface mod uid hash) = rnf mod `seq` rnf uid `seq` rnf hash `seq` ()
+  rnf (UsageHomeModuleBytecode mod uid hash) = rnf mod `seq` rnf uid `seq` rnf hash `seq` ()
 
 instance Binary Usage where
     put_ bh usg@UsagePackageModule{} = do
@@ -425,11 +455,17 @@ instance Binary Usage where
         put_ bh (usg_mod      usg)
         put_ bh (usg_mod_hash usg)
 
-    put_ bh usg@UsageHomeModuleInterface{} = do
+    put_ bh usg@UsageHomeModuleBytecode{} = do
         putByte bh 4
         put_ bh (usg_mod_name usg)
         put_ bh (usg_unit_id  usg)
-        put_ bh (usg_iface_hash usg)
+        put_ bh (usg_bytecode_hash usg)
+
+    put_ bh usg@UsageDirectory{} = do
+        putByte bh 5
+        put_ bh (usg_dir_path usg)
+        put_ bh (usg_dir_hash usg)
+        put_ bh (usg_dir_label usg)
 
     get bh = do
         h <- getByte bh
@@ -461,8 +497,55 @@ instance Binary Usage where
             mod <- get bh
             uid <- get bh
             hash <- get bh
-            return UsageHomeModuleInterface { usg_mod_name = mod, usg_unit_id = uid, usg_iface_hash = hash }
+            return UsageHomeModuleBytecode { usg_mod_name = mod, usg_unit_id = uid, usg_bytecode_hash = hash }
+          5 -> do
+            dp    <- get bh
+            hash  <- get bh
+            label <- get bh
+            return UsageDirectory { usg_dir_path = dp, usg_dir_hash = hash, usg_dir_label = label }
+
           i -> error ("Binary.get(Usage): " ++ show i)
+
+-- | Compares 'Usage's by constructor and, if the constructors are the same, by
+--   identifying strings, to achieve a predictable ordering.
+stableUsageCmp :: Usage -> Usage -> Ordering
+stableUsageCmp
+    usage1@UsagePackageModule {}
+    usage2@UsagePackageModule {}
+    = (compare `on` usg_mod) usage1 usage2
+stableUsageCmp
+    usage1@UsageHomeModule {}
+    usage2@UsageHomeModule {}
+    = (compare `on` Module <$> usg_unit_id <*> usg_mod_name) usage1 usage2
+stableUsageCmp
+    usage1@UsageFile {}
+    usage2@UsageFile {}
+    = (lexicalCompareFS `on` usg_file_path) usage1 usage2
+stableUsageCmp
+    usage1@UsageDirectory {}
+    usage2@UsageDirectory {}
+    = (lexicalCompareFS `on` usg_dir_path) usage1 usage2
+stableUsageCmp
+    usage1@UsageHomeModuleBytecode {}
+    usage2@UsageHomeModuleBytecode {}
+    = (compare `on` Module <$> usg_unit_id <*> usg_mod_name) usage1 usage2
+stableUsageCmp
+    usage1@UsageMergedRequirement {}
+    usage2@UsageMergedRequirement {}
+    = (compare `on` usg_mod) usage1 usage2
+stableUsageCmp
+    usage1
+    usage2
+    = (compare `on` constructorIndex) usage1 usage2
+    where
+
+    constructorIndex :: Usage -> Int
+    constructorIndex UsagePackageModule      {} = 0
+    constructorIndex UsageHomeModule         {} = 1
+    constructorIndex UsageFile               {} = 2
+    constructorIndex UsageDirectory          {} = 3
+    constructorIndex UsageHomeModuleBytecode {} = 4
+    constructorIndex UsageMergedRequirement  {} = 5
 
 -- | Records the imports that we depend on from a home module,
 -- for recompilation checking.
@@ -572,7 +655,7 @@ hash of the module. The export hash is computed in `GHC.Iface.Recomp.addFingerpr
 -}
 
 {-
-Note [Structure of dep_boot_deps]
+Note [Structure of dep_boot_mods]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 In `-c` mode we always need to know whether to load the normal or boot version of
@@ -619,8 +702,12 @@ No: if I need to load the interface for module X from package P I always look fo
 data ImportAvails
    = ImportAvails {
         imp_mods :: ImportedMods,
-          --      = ModuleEnv [ImportedModsVal],
-          -- ^ Domain is all directly-imported modules
+          --      = Map Module [ImportedBy],
+          -- ^ Domain is all directly-imported modules.  Each entry says
+          -- whether a user-written import brought the module in
+          -- ('ImportedByUser', with the details of that import) or the
+          -- system did ('ImportedBySystem'); user-facing consumers filter
+          -- with 'importedByUser'.
           --
           -- See the documentation on ImportedModsVal in
           -- "GHC.Unit.Module.Imported" for the meaning of the fields.
@@ -667,3 +754,33 @@ data ImportAvails
           -- ^ Family instance modules below us in the import tree (and maybe
           -- including us for imported modules)
       }
+
+-- | Record usage of a 'LinkablePart'.
+data LinkablePartUsage
+  = FileLinkablePartUsage
+    { flu_file :: !FilePath
+    , flu_module :: !Module
+    , flu_linkable_objs :: !(FlatBag OsPath)
+    }
+  | ByteCodeLinkablePartUsage
+    { bclu_module :: !Module
+    , bclu_hash :: !Fingerprint
+    , bclu_linkable_objs :: !(FlatBag OsPath)
+    }
+
+instance Outputable LinkablePartUsage where
+  ppr = \ case
+    FileLinkablePartUsage fp modl _objs ->
+      text "FileLinkableUsage" <+> text fp <+> ppr modl
+
+    ByteCodeLinkablePartUsage modl hash _objs ->
+      text "ByteCodeLinkableUsage" <+> ppr modl <+> ppr hash
+
+linkablePartUsageObjectPaths :: LinkablePartUsage -> [FilePath]
+linkablePartUsageObjectPaths lnkUsage =
+  map OsPath.unsafeDecodeUtf . Foldable.toList $ linkableUsageObjectOsPaths lnkUsage
+
+linkableUsageObjectOsPaths :: LinkablePartUsage -> FlatBag OsPath
+linkableUsageObjectOsPaths lnkUsage = case lnkUsage of
+  FileLinkablePartUsage{flu_linkable_objs} -> flu_linkable_objs
+  ByteCodeLinkablePartUsage{bclu_linkable_objs} -> bclu_linkable_objs

@@ -39,18 +39,17 @@ module GHC.Tc.Zonk.TcType
   , zonkCt, zonkWC, zonkSimples, zonkImplication
 
     -- * Rewriter sets
-  , zonkRewriterSet, zonkCtRewriterSet, zonkCtEvRewriterSet
+  , zonkCoHoleSet, zonkCtCoHoleSet, zonkCtEvCoHoleSet
 
     -- * Coercion holes
   , isFilledCoercionHole, unpackCoercionHole, unpackCoercionHole_maybe
-
 
     -- * Tidying
   , tcInitTidyEnv, tcInitOpenTidyEnv
   , tidyCt, tidyEvVar, tidyDelayedError
 
     -- ** Zonk & tidy
-  , zonkTidyTcType, zonkTidyTcTypes
+  , zonkTidyTcType, zonkTidyTcTypes, zonkTidyHsCtxt
   , zonkTidyOrigin, zonkTidyOrigins
   , zonkTidyFRRInfos
 
@@ -92,11 +91,13 @@ import GHC.Core.Predicate
 import GHC.Utils.Constants
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Misc
-import GHC.Utils.Monad ( mapAccumLM )
+import GHC.Utils.Monad ( mapAccumLM, liftIO )
 import GHC.Utils.Panic
 
 import GHC.Data.Bag
 import GHC.Data.Pair
+
+import GHC.IORef (readIORef)
 
 import Data.Semigroup
 import Data.Maybe
@@ -237,11 +238,12 @@ zonkCo      :: Coercion -> ZonkM Coercion
       , tcm_tycon      = zonkTcTyCon }
       where
         hole :: () -> CoercionHole -> ZonkM Coercion
-        hole _ hole@(CoercionHole { ch_ref = ref, ch_co_var = cv })
+        hole _ hole@(CH { ch_ref = ref, ch_co_var = cv })
           = do { contents <- readTcRef ref
                ; case contents of
-                   Just co -> do { co' <- zonkCo co
-                                 ; checkCoercionHole cv co' }
+                   Just (CPH { cph_co = co })
+                           -> do { co' <- zonkCo co
+                                     ; checkCoercionHole cv co' }
                    Nothing -> do { cv' <- zonkCoVar cv
                                  ; return $ HoleCo (hole { ch_co_var = cv' }) } }
 
@@ -508,13 +510,13 @@ zonkCt ct
 
 zonkCtEvidence :: CtEvidence -> ZonkM CtEvidence
 -- Zonks the ctev_pred and the ctev_rewriters; but not ctev_evar
--- For ctev_rewriters, see (WRW2) in Note [Wanteds rewrite Wanteds]
+-- For ctev_rewriters, see (WRW11) in Note [Wanteds rewrite Wanteds: rewriter-sets]
 zonkCtEvidence (CtGiven (GivenCt { ctev_pred = pred, ctev_evar = var, ctev_loc = loc }))
   = do { pred' <- zonkTcType pred
        ; return (CtGiven (GivenCt { ctev_pred = pred', ctev_evar = var, ctev_loc = loc })) }
 zonkCtEvidence (CtWanted wanted@(WantedCt { ctev_pred = pred, ctev_rewriters = rws }))
   = do { pred' <- zonkTcType pred
-       ; rws'  <- zonkRewriterSet rws
+       ; rws'  <- zonkCoHoleSet rws
        ; return (CtWanted (wanted { ctev_pred = pred', ctev_rewriters = rws' })) }
 
 zonkSkolemInfo :: SkolemInfo -> ZonkM SkolemInfo
@@ -524,7 +526,7 @@ zonkSkolemInfoAnon :: SkolemInfoAnon -> ZonkM SkolemInfoAnon
 zonkSkolemInfoAnon (SigSkol cx ty tv_prs) = do { ty' <- zonkTcType ty
                                                ; return (SigSkol cx ty' tv_prs) }
 zonkSkolemInfoAnon (InferSkol ntys) = do { ntys' <- mapM do_one ntys
-                                     ; return (InferSkol ntys') }
+                                         ; return (InferSkol ntys') }
   where
     do_one (n, ty) = do { ty' <- zonkTcType ty; return (n, ty') }
 zonkSkolemInfoAnon skol_info = return skol_info
@@ -556,66 +558,55 @@ But c.f Note [Sharing when zonking to Type] in GHC.Tc.Zonk.Type.
 ************************************************************************
 -}
 
-zonkCtRewriterSet :: Ct -> ZonkM Ct
-zonkCtRewriterSet ct
+zonkCtCoHoleSet :: Ct -> ZonkM Ct
+zonkCtCoHoleSet ct
   | isGivenCt ct
   = return ct
   | otherwise
   = case ct of
-      CEqCan eq@(EqCt { eq_ev = ev })       -> do { ev' <- zonkCtEvRewriterSet ev
+      CEqCan eq@(EqCt { eq_ev = ev })       -> do { ev' <- zonkCtEvCoHoleSet ev
                                                   ; return (CEqCan (eq { eq_ev = ev' })) }
-      CIrredCan ir@(IrredCt { ir_ev = ev }) -> do { ev' <- zonkCtEvRewriterSet ev
+      CIrredCan ir@(IrredCt { ir_ev = ev }) -> do { ev' <- zonkCtEvCoHoleSet ev
                                                   ; return (CIrredCan (ir { ir_ev = ev' })) }
-      CDictCan di@(DictCt { di_ev = ev })   -> do { ev' <- zonkCtEvRewriterSet ev
+      CDictCan di@(DictCt { di_ev = ev })   -> do { ev' <- zonkCtEvCoHoleSet ev
                                                   ; return (CDictCan (di { di_ev = ev' })) }
       CQuantCan {}     -> return ct
-      CNonCanonical ev -> do { ev' <- zonkCtEvRewriterSet ev
+      CNonCanonical ev -> do { ev' <- zonkCtEvCoHoleSet ev
                              ; return (CNonCanonical ev') }
 
-zonkCtEvRewriterSet :: CtEvidence -> ZonkM CtEvidence
-zonkCtEvRewriterSet ev@(CtGiven {})
+zonkCtEvCoHoleSet :: CtEvidence -> ZonkM CtEvidence
+zonkCtEvCoHoleSet ev@(CtGiven {})
   = return ev
-zonkCtEvRewriterSet ev@(CtWanted wtd)
-  = do { rewriters' <- zonkRewriterSet (ctEvRewriters ev)
+zonkCtEvCoHoleSet ev@(CtWanted wtd)
+  = do { rewriters' <- zonkCoHoleSet (ctEvRewriters ev)
        ; return (CtWanted $ setWantedCtEvRewriters wtd rewriters') }
 
 -- | Zonk a rewriter set; if a coercion hole in the set has been filled,
 -- find all the free un-filled coercion holes in the coercion that fills it
-zonkRewriterSet :: RewriterSet -> ZonkM RewriterSet
-zonkRewriterSet (RewriterSet set)
-  = nonDetStrictFoldUniqSet go (return emptyRewriterSet) set
+zonkCoHoleSet :: CoHoleSet -> ZonkM CoHoleSet
+zonkCoHoleSet (CoHoleSet set)
+  = unUCHM (nonDetStrictFoldUniqSet go mempty set)
      -- This does not introduce non-determinism, because the only
      -- monadic action is to read, and the combining function is
      -- commutative
   where
-    go :: CoercionHole -> ZonkM RewriterSet -> ZonkM RewriterSet
-    go hole m_acc = unionRewriterSet <$> check_hole hole <*> m_acc
+    go :: CoercionHole -> UnfilledCoercionHoleMonoid -> UnfilledCoercionHoleMonoid
+    go hole m_acc = freeHolesOfHole hole `mappend` m_acc
 
-    check_hole :: CoercionHole -> ZonkM RewriterSet
-    check_hole hole
-      = do { m_co <- unpackCoercionHole_maybe hole
-           ; case m_co of
-               Nothing -> return (unitRewriterSet hole)  -- Not filled
-               Just co -> unUCHM (check_co co) }         -- Filled: look inside
+freeHolesOfHole :: CoercionHole -> UnfilledCoercionHoleMonoid
+freeHolesOfHole hole
+  = UCHM $ do { m_co <- unpackCoercionHole_maybe hole
+              ; case m_co of
+                   Nothing -> return (unitCoHoleSet hole)  -- Not filled
+                   Just (CPH { cph_holes = holes }) -> zonkCoHoleSet holes }
 
-    check_ty :: Type -> UnfilledCoercionHoleMonoid
-    check_co :: Coercion -> UnfilledCoercionHoleMonoid
-    (check_ty, _, check_co, _) = foldTyCo folder ()
-
-    folder :: TyCoFolder () UnfilledCoercionHoleMonoid
-    folder = TyCoFolder { tcf_view  = noView
-                        , tcf_tyvar = \ _ tv -> check_ty (tyVarKind tv)
-                        , tcf_covar = \ _ cv -> check_ty (varType cv)
-                        , tcf_hole  = \ _ -> UCHM . check_hole
-                        , tcf_tycobinder = \ _ _ _ -> () }
-
-newtype UnfilledCoercionHoleMonoid = UCHM { unUCHM :: ZonkM RewriterSet }
+newtype UnfilledCoercionHoleMonoid = UCHM { unUCHM :: ZonkM CoHoleSet }
 
 instance Semigroup UnfilledCoercionHoleMonoid where
-  UCHM l <> UCHM r = UCHM (unionRewriterSet <$> l <*> r)
+  UCHM l <> UCHM r = UCHM (unionCoHoleSet <$> l <*> r)
 
 instance Monoid UnfilledCoercionHoleMonoid where
-  mempty = UCHM (return emptyRewriterSet)
+  mempty = UCHM (return emptyCoHoleSet)
 
 
 {-
@@ -628,7 +619,7 @@ instance Monoid UnfilledCoercionHoleMonoid where
 
 -- | Is a coercion hole filled in?
 isFilledCoercionHole :: CoercionHole -> ZonkM Bool
-isFilledCoercionHole (CoercionHole { ch_ref = ref })
+isFilledCoercionHole (CH { ch_ref = ref })
   = isJust <$> readTcRef ref
 
 -- | Retrieve the contents of a coercion hole. Panics if the hole
@@ -637,12 +628,12 @@ unpackCoercionHole :: CoercionHole -> ZonkM Coercion
 unpackCoercionHole hole
   = do { contents <- unpackCoercionHole_maybe hole
        ; case contents of
-           Just co -> return co
+           Just (CPH { cph_co = co }) -> return co
            Nothing -> pprPanic "Unfilled coercion hole" (ppr hole) }
 
 -- | Retrieve the contents of a coercion hole, if it is filled
-unpackCoercionHole_maybe :: CoercionHole -> ZonkM (Maybe Coercion)
-unpackCoercionHole_maybe (CoercionHole { ch_ref = ref }) = readTcRef ref
+unpackCoercionHole_maybe :: CoercionHole -> ZonkM (Maybe CoercionPlusHoles)
+unpackCoercionHole_maybe (CH { ch_ref = ref }) = readTcRef ref
 
 
 {-
@@ -703,6 +694,9 @@ zonkTidyOrigin env (GivenSCOrigin skol_info sc_depth blocked)
   = do { skol_info1 <- zonkSkolemInfoAnon skol_info
        ; let skol_info2 = tidySkolemInfoAnon env skol_info1
        ; return (env, GivenSCOrigin skol_info2 sc_depth blocked) }
+zonkTidyOrigin env (ScOrigin (IsQC pred orig) nkd)
+  = do { (env1, pred') <- zonkTidyTcType env pred
+       ; return (env1, ScOrigin (IsQC pred' orig) nkd) }
 zonkTidyOrigin env orig@(TypeEqOrigin { uo_actual   = act
                                       , uo_expected = exp })
   = do { (env1, act') <- zonkTidyTcType env  act
@@ -714,23 +708,11 @@ zonkTidyOrigin env (KindEqOrigin ty1 ty2 orig t_or_k)
        ; (env2, ty2')  <- zonkTidyTcType env1 ty2
        ; (env3, orig') <- zonkTidyOrigin env2 orig
        ; return (env3, KindEqOrigin ty1' ty2' orig' t_or_k) }
-zonkTidyOrigin env (FunDepOrigin1 p1 o1 l1 p2 o2 l2)
-  = do { (env1, p1') <- zonkTidyTcType env  p1
-       ; (env2, o1') <- zonkTidyOrigin env1 o1
-       ; (env3, p2') <- zonkTidyTcType env2 p2
-       ; (env4, o2') <- zonkTidyOrigin env3 o2
-       ; return (env4, FunDepOrigin1 p1' o1' l1 p2' o2' l2) }
-zonkTidyOrigin env (FunDepOrigin2 p1 o1 p2 l2)
-  = do { (env1, p1') <- zonkTidyTcType env  p1
-       ; (env2, p2') <- zonkTidyTcType env1 p2
-       ; (env3, o1') <- zonkTidyOrigin env2 o1
-       ; return (env3, FunDepOrigin2 p1' o1' p2' l2) }
-zonkTidyOrigin env (InjTFOrigin1 pred1 orig1 loc1 pred2 orig2 loc2)
-  = do { (env1, pred1') <- zonkTidyTcType env  pred1
-       ; (env2, orig1') <- zonkTidyOrigin env1 orig1
-       ; (env3, pred2') <- zonkTidyTcType env2 pred2
-       ; (env4, orig2') <- zonkTidyOrigin env3 orig2
-       ; return (env4, InjTFOrigin1 pred1' orig1' loc1 pred2' orig2' loc2) }
+zonkTidyOrigin env (DefaultReprEqOrigin ty1 ty2 orig)
+  = do { (env1, ty1')  <- zonkTidyTcType env  ty1
+       ; (env2, ty2')  <- zonkTidyTcType env1 ty2
+       ; (env3, orig') <- zonkTidyOrigin env2 orig
+       ; return (env3, DefaultReprEqOrigin ty1' ty2' orig') }
 zonkTidyOrigin env (CycleBreakerOrigin orig)
   = do { (env1, orig') <- zonkTidyOrigin env orig
        ; return (env1, CycleBreakerOrigin orig') }
@@ -813,3 +795,49 @@ tidyFRROrigin env (FixedRuntimeRepOrigin ty orig)
 tidyEvVar :: TidyEnv -> EvVar -> EvVar
 tidyEvVar env var = updateIdTypeAndMult (tidyType env) var
   -- No need for tidyOpenType because all the free tyvars are already tidied
+
+
+zonkTidyHsCtxt :: TidyEnv -> HsCtxt -> ZonkM (TidyEnv, HsCtxt)
+-- We zonk and tidy a HsCtxt just before putting it into an error message
+-- so that it contains as much info as possible, as tidily as possible
+zonkTidyHsCtxt env e@(ExprCtxt{}) = return (env, e)
+zonkTidyHsCtxt env (ThetaCtxt ctxt theta_ty) = do
+  (env', theta_ty') <- zonkTidyTcTypes env theta_ty
+  return $ (env', ThetaCtxt ctxt theta_ty')
+zonkTidyHsCtxt env (InferredTypeCtxt n ty) = do
+  (env', ty') <- zonkTidyTcType env ty
+  return $ (env', InferredTypeCtxt n ty')
+zonkTidyHsCtxt env (ClassOpCtxt n ty) = do
+  (env', ty') <- zonkTidyTcType env ty
+  return $ (env', ClassOpCtxt n ty')
+zonkTidyHsCtxt env (MethSigCtxt n ty1 ty2) = do
+  (env', ty1) <- zonkTidyTcType env ty1
+  (env', ty2) <- zonkTidyTcType env' ty2
+  return $ (env',  MethSigCtxt n ty1 ty2)
+zonkTidyHsCtxt env e@(FunAppCtxt{}) = return (env, e)
+zonkTidyHsCtxt env (FunTysCtxt ctxt ty i1 i2) = do
+  (env', ty') <- zonkTidyTcType env ty
+  return $ (env', FunTysCtxt ctxt ty' i1 i2)
+zonkTidyHsCtxt env (FunResCtxt e n ty1 env_ty) = do
+  (env', ty1')    <- zonkTidyTcType env ty1
+  (env', env_ty') <- zonkExpType env' env_ty
+  return $ (env', FunResCtxt e n ty1' env_ty')
+zonkTidyHsCtxt env (PatSigErrCtxt sig_ty res_ty) = do
+  (env', sig_ty') <- zonkTidyTcType env sig_ty
+  (env', res_ty') <- zonkExpType env' res_ty
+  return (env', PatSigErrCtxt sig_ty' res_ty')
+zonkTidyHsCtxt env p = return (env, p)
+
+zonkExpType :: TidyEnv -> ExpType -> ZonkM (TidyEnv, ExpType)
+-- Zonk Infer{} to Check.  The hole should have been filled in by now
+zonkExpType env (Check ty)
+  = do { (env', ty') <- zonkTidyTcType env ty
+       ; return (env', Check ty') }
+zonkExpType env (Infer ir@(IR { ir_ref = ref }))
+  = do { -- inlining readExpTyp_maybe to avoid module dep loops
+       ; mb_ty <- liftIO $ readIORef ref
+       ; case mb_ty of
+            Nothing -> pprPanic "zonkTidyHsCtxt PatSigErrCtxt" (ppr ir)
+            Just ty -> do { (env', ty') <- zonkTidyTcType env ty
+                          ; return (env', Check ty') } }
+

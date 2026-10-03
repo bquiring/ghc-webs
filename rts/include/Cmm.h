@@ -441,12 +441,6 @@
 #define HP_CHK_P(bytes, fun, arg)               \
    HEAP_CHECK(bytes, GC_PRIM_P(fun,arg))
 
-// TODO I'm not seeing where ALLOC_P_TICKY is used; can it be removed?
-//         -NSF March 2013
-#define ALLOC_P_TICKY(bytes, fun, arg)          \
-   HP_CHK_P(bytes);                             \
-   TICK_ALLOC_RTS(bytes);
-
 // Load a field out of structure with relaxed ordering.
 #define RELAXED_LOAD_FIELD(fld, ptr) \
     REP_##fld![(ptr) + OFFSET_##fld]
@@ -665,15 +659,9 @@
 #if defined(PROFILING) || defined(DEBUG)
 #define OVERWRITING_CLOSURE_SIZE(c, size) foreign "C" stg_overwritingClosureSize(c "ptr", size)
 #define OVERWRITING_CLOSURE(c) foreign "C" stg_overwritingClosure(c "ptr")
-#define OVERWRITING_CLOSURE_MUTABLE(c, off) foreign "C" stg_overwritingMutableClosureOfs(c "ptr", off)
 #else
 #define OVERWRITING_CLOSURE_SIZE(c, size) /* nothing */
 #define OVERWRITING_CLOSURE(c) /* nothing */
-/* This is used to zero slop after shrunk arrays. It is important that we do
- * this whenever profiling is enabled as described in Note [slop on the heap]
- * in Storage.c. */
-#define OVERWRITING_CLOSURE_MUTABLE(c, off) \
-    if (TO_W_(RtsFlags_ProfFlags_doHeapProfile(RtsFlags)) != 0) { foreign "C" stg_overwritingMutableClosureOfs(c "ptr", off); }
 #endif
 
 #define IS_STACK_CLEAN(stack) \
@@ -819,7 +807,6 @@
 
 #define NO_TREC                   stg_NO_TREC_closure
 #define END_TSO_QUEUE             stg_END_TSO_QUEUE_closure
-#define STM_AWOKEN                stg_STM_AWOKEN_closure
 
 #define recordMutableCap(p, gen)                                        \
   W_ __bd;                                                              \

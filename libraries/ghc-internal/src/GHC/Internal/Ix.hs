@@ -2,6 +2,9 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
+{-# OPTIONS_GHC -fdefines-known-key-names #-}
+   -- Defines Ix
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Internal.Ix
@@ -20,9 +23,11 @@ module GHC.Internal.Ix (
         Ix(..), indexError
     ) where
 
-import GHC.Internal.Enum
-import GHC.Internal.Num
 import GHC.Internal.Base
+import GHC.Internal.Enum
+import GHC.Internal.Err (errorWithoutStackTrace)
+import GHC.Internal.Num
+import GHC.Internal.Prim ((<=#))
 import GHC.Internal.Real( fromIntegral )
 import GHC.Internal.Show
 import GHC.Internal.Tuple (Solo (..))
@@ -136,7 +141,7 @@ For 1-d, 2-d, and 3-d arrays of Int we have specialised instances to avoid this.
 
 Note [Out-of-bounds error messages]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The default method for 'index' generates hoplelessIndexError, because
+The default method for 'index' generates 'hopelessIndexError', because
 Ix doesn't have Show as a superclass.  For particular base types we
 can do better, so we override the default method for index.
 

@@ -25,7 +25,8 @@ module GHC.Weak
      -- this handler will be ignored.
      setFinalizerExceptionHandler,
      getFinalizerExceptionHandler,
-     printToHandleFinalizerExceptionHandler
+     GHC.Weak.Finalize.printToHandleFinalizerExceptionHandler
      ) where
 
 import GHC.Internal.Weak
+import GHC.Weak.Finalize

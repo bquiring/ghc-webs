@@ -3,7 +3,6 @@
 {-# LANGUAGE MultiWayIf #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# LANGUAGE LambdaCase #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -30,6 +29,7 @@ import GHC.HsToCore.Utils
 import GHC.HsToCore.Arrows
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Pmc
+import GHC.HsToCore.Types( LdiNablas(..) )
 import GHC.HsToCore.Pmc.Utils
 import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.Quote
@@ -45,22 +45,22 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Instance.Class (lookupHasFieldLabel)
 
 import GHC.Core
-import GHC.Core.FVs( exprsFreeVarsList )
+import GHC.Core.FVs( exprFreeVarsList, exprsFreeVarsList )
 import GHC.Core.FamInstEnv( topNormaliseType )
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep
 import GHC.Core.Utils
 import GHC.Core.Make
+import GHC.Core.Make.Box ( mkBox, mkUnbox )
+import GHC.Core.Make.BigTuple ( mkBigCoreTupTy )
 import GHC.Core.PatSyn
 
 import GHC.Driver.Session
 
-import GHC.Types.SourceText
 import GHC.Types.Name hiding (varName)
 import GHC.Types.CostCentre
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Id.Make
 import GHC.Types.Var( isInvisibleAnonPiTyBinder )
 import GHC.Types.Var.Set( isEmptyVarSet, elemVarSet )
 import GHC.Types.Basic
@@ -70,13 +70,16 @@ import GHC.Types.Tickish
 import GHC.Unit.Module
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Builtin.Types
-import GHC.Builtin.Names
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Types.Box ( boxTyCon )
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Ids
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 import Control.Monad
+import GHC.Data.FastString
 
 {-
 ************************************************************************
@@ -95,9 +98,9 @@ dsLocalBinds (HsIPBinds _ binds)  body = dsIPBinds  binds body
 -------------------------
 -- caller sets location
 dsValBinds :: HsValBinds GhcTc -> CoreExpr -> DsM CoreExpr
-dsValBinds (XValBindsLR (NValBinds binds _)) body
+dsValBinds (XValBindsLR (HsVBG grps _)) body
   = do { dflags <- getDynFlags
-       ; foldrM (ds_val_bind dflags) body binds }
+       ; foldrM (ds_val_bind dflags) body grps }
 dsValBinds (ValBinds {})       _    = panic "dsValBinds ValBindsIn"
 
 -------------------------
@@ -110,13 +113,18 @@ dsIPBinds (IPBinds ev_binds ip_binds) body
         ; foldrM ds_ip_bind inner ip_binds } }
   where
     ds_ip_bind :: LIPBind GhcTc -> CoreExpr -> DsM CoreExpr
+    -- Given (IPBind n s e), we have
+    --     n :: IP s ty, e :: ty
+    -- Use evWrapIP to convert `e` (the user-written RHS) to an IP dictionary
     ds_ip_bind (L _ (IPBind n _ e)) body
       = do e' <- dsLExpr e
-           return (Let (NonRec n e') body)
+           return (Let (NonRec n (evWrapIPE (idType n) e')) body)
 
 -------------------------
 -- caller sets location
-ds_val_bind :: DynFlags -> (RecFlag, LHsBinds GhcTc) -> CoreExpr -> DsM CoreExpr
+ds_val_bind :: DynFlags
+            -> (RecFlag, LHsBinds GhcTc) -> CoreExpr
+            -> DsM CoreExpr
 -- Special case for bindings which bind unlifted variables
 -- We need to do a case right away, rather than building
 -- a tuple and doing selections.
@@ -166,18 +174,18 @@ ds_val_bind _ (is_rec, binds) _body
 -- would transform a linear definition into a non-linear one. See Wrinkle 2
 -- Note [Desugar Strict binds] in GHC.HsToCore.Binds.
 ds_val_bind dflags (NonRecursive, hsbinds) body
-  | [L _loc (PatBind { pat_lhs = pat, pat_rhs = grhss, pat_mult = mult_ann
-                     , pat_ext = (ty, (rhs_tick, _var_ticks))})] <- hsbinds
+  | [L _loc (PatBind { pat_lhs = pat, pat_rhs = grhss
+                     , pat_ext = ext })] <- hsbinds
         -- Non-recursive, non-overloaded bindings only come in ones
   , pat' <- decideBangHood dflags pat
   , isBangedLPat pat'
   = do { rhss_nablas <- pmcGRHSs PatBindGuards grhss
-        ; rhs_expr <- dsGuarded grhss ty rhss_nablas
-        ; let rhs' = mkOptTickBox rhs_tick rhs_expr
+        ; rhs_expr <- dsGuarded grhss (patBindGRHSType ext) rhss_nablas
+        ; let rhs' = mkOptTickBox (patBindRHSTicks ext) rhs_expr
         ; let body_ty = exprType body
-        ; let mult = getTcMultAnn mult_ann
-        ; error_expr <- mkErrorAppDs pAT_ERROR_ID body_ty (ppr pat')
-        ; matchSimply rhs' PatBindRhs mult pat' body error_expr }
+        ; error_expr <- mkErrorAppDs pAT_ERROR_ID body_ty (ppr pat)
+                        -- Show the original user-written `pat` in error msg
+        ; matchSimply rhs' PatBindRhs (patBindMult ext) pat' body error_expr }
     -- This is the one place where matchSimply is given a non-ManyTy
     -- multiplicity argument.
     --
@@ -189,19 +197,24 @@ ds_val_bind dflags (NonRecursive, hsbinds) body
 -- Ordinary case for bindings; none should be unlifted
 ds_val_bind _ (is_rec, binds) body
   = do  { massert (isRec is_rec || isSingleton binds)
-               -- we should never produce a non-recursive list of multiple binds
+          -- We should never produce a non-recursive list of multiple binds
 
         ; (force_vars,prs) <- dsLHsBinds binds
-        ; let body' = foldr seqVar body force_vars
-        ; assertPpr (not (any (isUnliftedType . idType . fst) prs)) (ppr is_rec $$ ppr binds) $
+
+        ; assertPpr (not (any (isUnliftedType . idType . fst) prs))
+                    (ppr is_rec $$ ppr binds) $
+          return ()
           -- NB: bindings have a fixed RuntimeRep, so it's OK to call isUnliftedType
-          case prs of
+
+        ; case prs of
             [] -> return body
-            _  -> return (mkLets (mk_binds is_rec prs) body') }
+            _  -> return (mkLets (mk_binds is_rec prs) $
+                          foldr seqVar body force_vars )
             -- We can make a non-recursive let because we make sure to return
             -- the bindings in dependency order in dsLHsBinds,
             -- see Note [Return non-recursive bindings in dependency order] in
             -- GHC.HsToCore.Binds
+        }
 
 -- | Helper function. You can use the result of 'mk_binds' with 'mkLets' for
 -- instance.
@@ -240,11 +253,11 @@ dsUnliftedBind (FunBind { fun_id = L l fun
        ; return (bindNonRec fun rhs' body) } }
 
 dsUnliftedBind (PatBind { pat_lhs = pat, pat_rhs = grhss
-                        , pat_ext = (ty, _) }) body
+                        , pat_ext = ext }) body
   =     -- let C x# y# = rhs in body
         -- ==> case rhs of C x# y# -> body
     do { match_nablas <- pmcGRHSs PatBindGuards grhss
-       ; rhs          <- dsGuarded grhss ty match_nablas
+       ; rhs          <- dsGuarded grhss (patBindGRHSType ext) match_nablas
        ; let eqn = EqnMatch { eqn_pat = pat, eqn_rest = EqnDone (cantFailMatchResult body) }
        ; var    <- selectMatchVar ManyTy (unLoc pat)
                     -- `var` will end up in a let binder, so the multiplicity
@@ -287,16 +300,17 @@ dsExpr (HsOverLit _ lit)
   = do { warnAboutOverflowedOverLit lit
        ; dsOverLit lit }
 
+dsExpr (HsQualLit _ lit)
+  = case lit of
+
 dsExpr e@(XExpr ext_expr_tc)
   = case ext_expr_tc of
       HsRecSelTc {} -> dsApp e
       WrapExpr {}   -> dsApp e
       ConLikeTc {}  -> dsApp e
 
-      ExpandedThingTc o e
-        | OrigStmt (L loc _) <- o
-        -> putSrcSpanDsA loc $ dsExpr e
-        | otherwise -> dsExpr e
+      ExpandedThingTc (HSE _ e) -> dsLExpr e
+
       -- Hpc Support
       HsTick tickish e -> do
         e' <- dsLExpr e
@@ -402,7 +416,7 @@ dsExpr (HsPragE _ (HsPragSCC _ cc) expr)
          then do
             mod_name <- getModule
             count <- goptM Opt_ProfCountEntries
-            let nm = sl_fs cc
+            let nm = mkFastStringShortText $ sl_fs cc
             flavour <- mkExprCCFlavour <$> getCCIndexDsM nm
             Tick (ProfNote (mkUserCC nm mod_name (getLocA expr) flavour) count True)
                  <$> dsLExpr expr
@@ -410,7 +424,7 @@ dsExpr (HsPragE _ (HsPragSCC _ cc) expr)
 
 dsExpr (HsCase ctxt discrim matches)
   = do { core_discrim <- dsLExpr discrim
-       ; ([discrim_var], matching_code) <- matchWrapper ctxt (Just [discrim]) matches
+       ; ([discrim_var], matching_code) <- matchWrapper ctxt (Just [core_discrim]) matches
        ; return (bindNonRec discrim_var core_discrim matching_code) }
 
 -- Pepe: The binds are in scope in the body but NOT in the binding group
@@ -456,28 +470,53 @@ dsExpr (ArithSeq expr witness seq)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
 for an overview.
-    g = ... static f ...
-==>
-    g = ... makeStatic loc f ...
+        ... static{from_static_ptr} e ...
+    ==>
+        s = /\abc. makeStatic e
+        ... (from_static_ptr (s @a @b @c)) ...
+
+Here `from_static_ptr` is a suitably-instantiated instantiated version of
+the overloaded function `fromStaticPtr`.
 -}
 
-dsExpr (HsStatic (_, whole_ty) expr@(L loc _))
-  = do { expr_ds <- dsLExpr expr
-       ; let (_, [ty]) = splitTyConApp whole_ty
-       ; makeStaticId <- dsLookupGlobalId makeStaticName
+dsExpr (HsStatic (static_ptr_ty, from_static_fun) expr@(L loc _))
+  = do { dflags <- getDynFlags
 
-       ; dflags <- getDynFlags
-       ;  let platform = targetPlatform dflags
-              (line, col) = case locA loc of
+       ; make_static_id <- dsLookupKnownKeyId makeStaticKey
+       ; expr_ds        <- dsLExpr expr
+       ; from_static_ds <- dsExpr from_static_fun
+
+       -- The static expression can have free type variables,
+       -- which we should quantify.  We can also have free Ids,
+       -- but they will be bound at top level
+       ; let (_, [ty]) = splitTyConApp static_ptr_ty
+
+             static_fvs :: [Var]
+             static_fvs = scopedSort $
+                          filter isTyVar $
+                          exprFreeVarsList expr_ds
+
+             platform = targetPlatform dflags
+             (line, col) = case locA loc of
                   RealSrcSpan r _ -> ( srcLocLine $ realSrcSpanStart r
                                      , srcLocCol  $ realSrcSpanStart r )
                   _               -> (0, 0)
-              srcLoc = mkCoreTup [ mkIntExprInt platform line
-                                 , mkIntExprInt platform col
-                                 ]
+             srcLoc = mkCoreTup [ mkIntExprInt platform line
+                                , mkIntExprInt platform col ]
 
-       ; putSrcSpanDsA loc $ return $
-         mkCoreApps (Var makeStaticId) [ Type ty, srcLoc, expr_ds ] }
+             static_rhs = mkLams static_fvs $
+                          mkCoreApps (Var make_static_id) [ Type ty, srcLoc, expr_ds ]
+
+       ; static_id <- newStaticId (mkSpecForAllTys static_fvs static_ptr_ty)
+
+       -- Emit the static bindings to top level, but NOT when we are in
+       -- the auxiliary desugaring for the pattern-match checking
+       ; ldi_nablas <- getPmNablas
+       ; case ldi_nablas of
+           NoPmc  -> return ()
+           Ldi {} -> emitStaticBinds [(static_id, static_rhs)]
+
+       ; return (App from_static_ds (mkVarApps (Var static_id) static_fvs)) }
 
 {- Note [Desugaring record construction]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -547,6 +586,7 @@ dsExpr (HsGetField x _ _) = dataConCantHappen x
 dsExpr (HsProjection x _) = dataConCantHappen x
 dsExpr (RecordUpd x _ _)  = dataConCantHappen x
 dsExpr (HsEmbTy x _)      = dataConCantHappen x
+dsExpr (HsStar x)         = dataConCantHappen x
 dsExpr (HsQual x _ _)     = dataConCantHappen x
 dsExpr (HsForAll x _ _)   = dataConCantHappen x
 dsExpr (HsFunArr x _ _ _) = dataConCantHappen x
@@ -675,22 +715,21 @@ ds_app (XExpr (WrapExpr hs_wrap fun)) hs_args core_args
                                   ; return (core_wrap core_fun) }
                  ; return (mkCoreApps core_fun all_args) } }
 
-ds_app (XExpr (ConLikeTc con tvs tys)) _hs_args core_args
--- Desugar desugars 'ConLikeTc': it eta-expands
--- data constructors to make linear types work.
--- See Note [Typechecking data constructors] in GHC.Tc.Gen.Head
+ds_app (XExpr (ConLikeTc con)) _hs_args core_args
   = do { ds_con <- dsHsConLike con
-       ; ids    <- newSysLocalsDs tys
-           -- NB: these 'Id's may be representation-polymorphic;
-           -- see Wrinkle [Representation-polymorphic lambda] in
-           -- Note [Typechecking data constructors] in GHC.Tc.Gen.Head.
-       ; let core_fun = mkLams tvs $ mkLams ids $
-                        ds_con `mkTyApps` mkTyVarTys tvs
-                               `mkVarApps` ids
-       ; return (mkApps core_fun core_args) }
+       ; return (mkApps ds_con core_args) }
 
 ds_app (XExpr (HsRecSelTc (FieldOcc { foLabel = L _ sel_id }))) _hs_args core_args
   = ds_app_rec_sel sel_id sel_id core_args
+
+ds_app (XExpr (ExpandedThingTc (HSE _orig e))) hs_args core_args
+  = ds_app (unLoc e) hs_args core_args
+  -- NB: this is important for the 'getField' case of 'ds_app_var', which needs
+  -- to see all type arguments to 'getField' at once, while for record field
+  -- projections such as (.fld) we may get:
+  --
+  --   XExpr (ExpandedThingTc (HSE (.fld) (getField @Symbol @LiftedRep @LiftedRep "fld")))
+  --     `HsAppType` rec_ty `HsAppType` fld
 
 ds_app (HsVar _ lfun) hs_args core_args
   = ds_app_var lfun hs_args core_args
@@ -707,8 +746,10 @@ ds_app_var (L loc fun_id) hs_args core_args
   -----------------------
   -- Deal with getField applications. General form:
   --   getField
-  --     @GHC.Types.Symbol                        {k}
-  --     @"sel"                                   x_ty
+  --     @Symbol                                  {k}
+  --     @LiftedRep                               {r_rep}
+  --     @LiftedRep                               {a_rep}
+  --     @"sel"                                   fld
   --     @T                                       r_ty
   --     @Int                                     a_ty
   --     ($dHasField :: HasField "sel" T Int)     dict
@@ -732,7 +773,7 @@ ds_app_var (L loc fun_id) hs_args core_args
   -----------------------
   -- Warn about identities for (fromInteger :: Integer -> Integer) etc
   -- They all have a type like:  forall <tvs>. <cxt> => arg_ty -> res_ty
-  | idName fun_id `elem` numericConversionNames
+  | getUnique fun_id `elem` numericConversionKeys
   , let (conv_ty, _) = apply_invis_args fun_id core_args
   , Just (arg_ty, res_ty) <- splitVisibleFunTy_maybe conv_ty
   = do { dflags <- getDynFlags
@@ -777,9 +818,41 @@ ds_app_var (L loc fun_id) hs_args core_args
             `mkCoreApps` rest_args)
 
   -----------------------
+  -- Desugar away the magic 'box'/'unbox' Ids.
+  -- See Note [Desugaring box & unbox] in GHC.Core.Make.Box.
+  | fun_id `hasKey` boxIdKey || fun_id `hasKey` unboxIdKey
+  = ds_box_unbox fun_id core_args
+
+  -----------------------
   -- Phew!  No more special cases.  Just build an applications
   | otherwise
   = ds_app_finish fun_id core_args
+
+---------------
+-- | Desugar an application of the magic 'box'/'unbox' 'Id's.
+-- See Note [Desugaring box & unbox] in GHC.Core.Make.Box.
+ds_box_unbox :: Id -> [CoreExpr] -> DsM CoreExpr
+ds_box_unbox fun_id core_args
+  = case core_args of
+      -- Applied to a value argument: desugar it in place.
+      Type rep : Type ty : arg : rest
+        -> do { e <- mk rep ty arg
+              ; return (mkCoreApps e rest) }
+      -- Applied only to its type arguments: eta-expand, then desugar.
+      [Type rep, Type ty]
+        -> do { x <- newSysLocalDs (Scaled ManyTy (arg_ty rep ty))
+              ; e <- mk rep ty (Var x)
+              ; return (Lam x e) }
+      _ -> pprPanic "ds_box_unbox: box/unbox lacks its two type arguments"
+                    (ppr fun_id <+> ppr core_args)
+  where
+    is_box = fun_id `hasKey` boxIdKey
+    mk | is_box    = mkBox
+       | otherwise = mkUnbox
+    -- The type of the value argument that box/unbox expects.
+    arg_ty rep ty
+      | is_box    = ty                             -- box   :: a -> Box @rep a
+      | otherwise = mkTyConApp boxTyCon [rep, ty]  -- unbox :: Box @rep a -> a
 
 ---------------
 ds_app_finish :: Id -> [CoreExpr] -> DsM CoreExpr
@@ -884,8 +957,7 @@ dsHsConLike (PatSynCon ps)
   | Just (builder_name, _, add_void) <- patSynBuilder ps
   = do { builder_id <- dsLookupGlobalId builder_name
        ; return (if add_void
-                 then mkCoreApp (text "dsConLike" <+> ppr ps)
-                                (Var builder_id) unboxedUnitExpr
+                 then mkCoreApp (Var builder_id) unboxedUnitExpr
                  else Var builder_id) }
   | otherwise
   = pprPanic "dsConLike" (ppr ps)
@@ -1122,14 +1194,15 @@ dsDo ctx stmts res_ty
             , xbstc_boundResultMult = ManyTy
             , xbstc_failOp          = Nothing -- Tuple cannot fail
             }
-          (mkBigLHsPatTupId later_pats)
+          -- The recursive tuple is boxed, so we unbox when binding it and box
+          -- when building it; see Note [Boxing big tuple elements] in
+          -- GHC.HsToCore.Utils.
+          (mkBigLHsVarPatTupId tup_ids)
           mfix_app
 
         tup_ids      = rec_ids ++ filterOut (`elem` rec_ids) later_ids
         tup_ty       = mkBigCoreTupTy (map idType tup_ids) -- Deals with singleton case
-        rec_tup_pats = map nlVarPat tup_ids
-        later_pats   = rec_tup_pats
-        rets         = map noLocA rec_rets
+        rets         = zipWith mkHsBoxApp (map idType tup_ids) (map noLocA rec_rets)
         mfix_app     = nlHsSyntaxApps mfix_op [mfix_arg]
         match_group  = MatchGroupTc [unrestricted tup_ty] body_ty (Generated OtherExpansion SkipPmc)
         mfix_arg     = noLocA $ HsLam noAnn LamSingle
@@ -1138,7 +1211,7 @@ dsDo ctx stmts res_ty
                                                     (noLocA [mfix_pat]) body]
                                , mg_ext = match_group
                                })
-        mfix_pat     = noLocA $ LazyPat noExtField $ mkBigLHsPatTupId rec_tup_pats
+        mfix_pat     = noLocA $ LazyPat noExtField $ mkBigLHsVarPatTupId tup_ids
         body         = noLocA $ HsDo body_ty
                                 ctx (noLocA (rec_stmts ++ [ret_stmt]))
         ret_app      = nlHsSyntaxApps return_op [mkBigLHsTupId rets]
@@ -1237,18 +1310,18 @@ Other places that requires from the same treatment:
 
 -- Warn about certain types of values discarded in monadic bindings (#3263)
 warnDiscardedDoBindings :: LHsExpr GhcTc -> Type -> Type -> DsM ()
-warnDiscardedDoBindings rhs m_ty elt_ty
-  = do { warn_unused <- woptM Opt_WarnUnusedDoBind
+warnDiscardedDoBindings rhs@(L rhs_loc _) m_ty elt_ty
+  = putSrcSpanDsA rhs_loc $ do { warn_unused <- woptM Opt_WarnUnusedDoBind
        ; warn_wrong <- woptM Opt_WarnWrongDoBind
        ; when (warn_unused || warn_wrong) $
     do { fam_inst_envs <- dsGetFamInstEnvs
        ; let norm_elt_ty = topNormaliseType fam_inst_envs elt_ty
              supressible_ty =
-               isUnitTy norm_elt_ty || isAnyTy norm_elt_ty || isZonkAnyTy norm_elt_ty
+               isUnitTy norm_elt_ty || isAnyTy norm_elt_ty || isUnusedTypeTy norm_elt_ty
          -- Warn about discarding things in 'monadic' binding,
          -- however few types are excluded:
          --   * Unit type `()`
-         --   * `ZonkAny` or `Any` type see (Any8) of Note [Any types]
+         --   * `UnusedType` or `Any` type see (Any5) of Note [The types Any and UnusedType]
        ; if warn_unused && not supressible_ty
          then diagnosticDs (DsUnusedDoBind rhs elt_ty)
          else

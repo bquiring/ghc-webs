@@ -28,7 +28,7 @@ build-type:     Custom
 extra-source-files: changelog.md
 
 custom-setup
-    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.14, directory, filepath
+    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.16, directory, filepath
 
 source-repository head
     type:     git
@@ -45,14 +45,16 @@ Flag bootstrap
         Manual: True
 
 Library
-    default-language: Haskell2010
+    default-language: GHC2024
     other-extensions: DeriveGeneric, RankNTypes, ScopedTypeVariables
     default-extensions: NoImplicitPrelude
 
     exposed-modules:
             GHC.BaseDir
+            GHC.Data.ShortByteString
             GHC.Data.ShortText
             GHC.Data.SizedSeq
+            GHC.Data.SmallArray
             GHC.Utils.Encoding
             GHC.Utils.Encoding.UTF8
             GHC.LanguageExtensions
@@ -75,14 +77,17 @@ Library
             GHC.Version
             GHC.Platform.Host
 
-    build-depends: base       >= 4.7 && < 4.23,
+    build-depends: base       >= 4.7 && < 4.24,
                    binary     == 0.8.*,
                    bytestring >= 0.10 && < 0.13,
                    containers >= 0.5 && < 0.9,
                    directory  >= 1.2 && < 1.4,
                    filepath   >= 1.3 && < 1.6,
+                   file-io    >= 0.1.6 && < 0.3,
+                   os-string  >= 2.0.1 && < 2.1,
                    deepseq    >= 1.4 && < 1.6,
-                   ghc-platform >= 0.1,
+                   ghc-platform  >= 0.1,
+                   ghc-toolchain >= 0.1
 
     -- reexport modules from ghc-boot-th so that packages
     -- don't have to import all of ghc-boot and ghc-boot-th.

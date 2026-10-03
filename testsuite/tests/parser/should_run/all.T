@@ -20,6 +20,7 @@ test('HexFloatLiterals', normal, compile_and_run, [''])
 test('NumericUnderscores0', normal, compile_and_run, [''])
 test('NumericUnderscores1', normal, compile_and_run, [''])
 test('LexNegLit', normal, compile_and_run, [''])
+test('StringStartsWithNull', normal, compile_and_run, [''])
 test('RecordDotSyntax1', normal, compile_and_run, [''])
 test('RecordDotSyntax2', normal, compile_and_run, [''])
 test('RecordDotSyntax3', [extra_files(['RecordDotSyntaxA.hs'])], multimod_compile_and_run, ['RecordDotSyntax3', ''])
@@ -27,6 +28,7 @@ test('RecordDotSyntax4', [extra_files(['RecordDotSyntaxA.hs'])], multimod_compil
 test('RecordDotSyntax5', normal, compile_and_run, [''])
 test('ListTuplePunsConstraints', extra_files(['ListTuplePunsConstraints.hs']), ghci_script, ['ListTuplePunsConstraints.script'])
 test('T25937', normal, compile_and_run, [''])
+test('T26415', normal, compile_and_run, [''])
 
 # Multiline strings
 test('MultilineStrings', normal, compile_and_run, [''])

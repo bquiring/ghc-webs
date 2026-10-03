@@ -33,8 +33,10 @@ module GHC.Internal.Data.Either (
  ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Show
 import GHC.Internal.Read
+import GHC.Internal.Num as Rebindable( fromInteger )   -- For known-key names
 
 -- $setup
 -- Allow the use of some Prelude functions in doctests.

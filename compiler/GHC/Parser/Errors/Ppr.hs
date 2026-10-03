@@ -1,11 +1,5 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -31,8 +25,8 @@ import GHC.Utils.Misc
 import GHC.Data.FastString
 import GHC.Data.Maybe (catMaybes)
 import GHC.Hs.Expr (prependQualified, HsExpr(..), HsLamVariant(..), lamCaseKeyword)
-import GHC.Hs.Type (pprLHsContext, pprHsArrow, pprHsForAll)
-import GHC.Builtin.Names (allNameStringList)
+import GHC.Hs.Type (pprLHsContext, pprHsForAll, pprHsModifiedFunArr, pprLHsModifiers)
+import GHC.Builtin (allNameStringList)
 import qualified GHC.LanguageExtensions as LangExt
 import Data.List.NonEmpty (NonEmpty((:|)))
 import GHC.Hs.Pat (Pat(..), LPat)
@@ -87,12 +81,12 @@ instance Diagnostic PsMessage where
       -> let mk_prefix_msg extension_name syntax_meaning =
                   text "The prefix use of a" <+> quotes (pprOperatorWhitespaceSymbol sym)
                     <+> text "would denote" <+> syntax_meaning
-               $$ nest 2 (text "were the" <+> extension_name <+> text "extension enabled.")
+               $$ nest 2 (text "were the" <+> extension_name <+> text "enabled.")
          in mkSimpleDecorated $
          case sym of
-           OperatorWhitespaceSymbol_PrefixPercent -> mk_prefix_msg (text "LinearTypes") (text "a multiplicity annotation")
-           OperatorWhitespaceSymbol_PrefixDollar -> mk_prefix_msg (text "TemplateHaskell") (text "an untyped splice")
-           OperatorWhitespaceSymbol_PrefixDollarDollar -> mk_prefix_msg (text "TemplateHaskell") (text "a typed splice")
+           OperatorWhitespaceSymbol_PrefixPercent -> mk_prefix_msg (text "Modifiers or LinearTypes extensions") (text "a multiplicity annotation")
+           OperatorWhitespaceSymbol_PrefixDollar -> mk_prefix_msg (text "TemplateHaskell extension") (text "an untyped splice")
+           OperatorWhitespaceSymbol_PrefixDollarDollar -> mk_prefix_msg (text "TemplateHaskell extension") (text "a typed splice")
     PsWarnOperatorWhitespace sym occ_type
       -> let mk_msg occ_type_str =
                   text "The" <+> text occ_type_str <+> text "use of a" <+> quotes (ftext sym)
@@ -119,7 +113,7 @@ instance Diagnostic PsMessage where
                           <> if null prag then empty else text ":" <+> text prag
     PsWarnMisplacedPragma prag
       -> mkSimpleDecorated $ text "Misplaced" <+> pprFileHeaderPragmaType prag <+> text "pragma"
-    PsWarnImportPreQualified
+    PsWarnImportPreQualified _iqp_on
       -> mkSimpleDecorated $
             text "Found" <+> quotes (text "qualified")
              <+> text "in prepositive position"
@@ -199,8 +193,6 @@ instance Diagnostic PsMessage where
            $$ text "Did you mean to add a space after the '!'?"
     PsErrInvalidInfixHole
       -> mkSimpleDecorated $ text "Invalid infix hole, expected an infix operator"
-    PsErrExpectedHyphen
-      -> mkSimpleDecorated $ text "Expected a hyphen"
     PsErrSpaceInSCC
       -> mkSimpleDecorated $ text "Spaces are not allowed in SCCs"
     PsErrEmptyDoubleQuotes _th_on
@@ -217,6 +209,8 @@ instance Diagnostic PsMessage where
       -> mkSimpleDecorated $ text "A lambda requires at least one parameter"
     PsErrLinearFunction
       -> mkSimpleDecorated $ text "Illegal use of linear functions"
+    PsErrModifierSyntax _
+      -> mkSimpleDecorated $ text "Illegal use of modifier syntax"
     PsErrOverloadedRecordUpdateNotEnabled
       -> mkSimpleDecorated $ text "Illegal overloaded record update"
     PsErrMultiWayIf
@@ -240,6 +234,8 @@ instance Diagnostic PsMessage where
     PsErrIllegalQualifiedDo qdoDoc
       -> mkSimpleDecorated $
            text "Illegal qualified" <+> quotes qdoDoc <+> text "block"
+    PsErrIllegalMultilineStrings
+      -> mkSimpleDecorated $ text "Illegal multiline string literal"
     PsErrQualifiedDoInCmd m
       -> mkSimpleDecorated $
            hang (text "Parse error in command:") 2 $
@@ -247,20 +243,20 @@ instance Diagnostic PsMessage where
              $$ text "qualified 'do' is not supported in commands."
     PsErrRecordSyntaxInPatSynDecl pat
       -> mkSimpleDecorated $
-           text "record syntax not supported for pattern synonym declarations:"
+           text "Record syntax not supported for pattern synonym declarations:"
            $$ ppr pat
     PsErrEmptyWhereInPatSynDecl patsyn_name
       -> mkSimpleDecorated $
-           text "pattern synonym 'where' clause cannot be empty"
+           text "Pattern synonym 'where' clause cannot be empty"
            $$ text "In the pattern synonym declaration for: "
               <+> ppr (patsyn_name)
     PsErrInvalidWhereBindInPatSynDecl patsyn_name decl
       -> mkSimpleDecorated $
-           text "pattern synonym 'where' clause must bind the pattern synonym's name"
+           text "Pattern synonym 'where' clause must bind the pattern synonym's name"
            <+> quotes (ppr patsyn_name) $$ ppr decl
     PsErrNoSingleWhereBindInPatSynDecl _patsyn_name decl
       -> mkSimpleDecorated $
-           text "pattern synonym 'where' clause must contain a single binding:"
+           text "Pattern synonym 'where' clause must contain a single binding:"
            $$ ppr decl
     PsErrDeclSpliceNotAtTopLevel d
       -> mkSimpleDecorated $
@@ -273,10 +269,30 @@ instance Diagnostic PsMessage where
                   2 (pprWithCommas ppr vs)
                 , text "See https://gitlab.haskell.org/ghc/ghc/issues/16754 for details."
                 ]
-    PsErrIllegalExplicitNamespace
+    PsErrIllegalExplicitNamespace kw
       -> mkSimpleDecorated $
-           text "Illegal keyword 'type'"
-
+           text "Illegal keyword" <+> quotes kw_doc
+         where
+           kw_doc = case kw of
+             ExplicitTypeNamespace{} -> text "type"
+             ExplicitDataNamespace{} -> text "data"
+    PsErrUnsupportedExplicitNamespace kw pos
+      -> mkDecorated
+           [ text "Unsupported use of keyword" <+> quotes kw_doc
+           , case pos of
+                UnsupportedNameSpaceInIEThingWith ->
+                     text "A namespace-specified wildcard may not appear alongside other items"
+                  $$ text "in a list of children." ]
+         where
+           kw_doc = case kw of
+             ExplicitTypeNamespace{} -> text "type"
+             ExplicitDataNamespace{} -> text "data"
+    PsErrPlainWildcardImport
+      -> mkSimpleDecorated $
+           text "Illegal plain wildcard (..) in a module import"
+    PsErrPlainWildcardExport
+      -> mkSimpleDecorated $
+           text "Illegal plain wildcard (..) in a module export"
     PsErrUnallowedPragma prag
       -> mkSimpleDecorated $
            hang (text "A pragma is not allowed in this position:") 2
@@ -502,15 +518,15 @@ instance Diagnostic PsMessage where
                     <+> equals_or_where) ] ]
     PsErrInvalidPackageName pkg
       -> mkSimpleDecorated $ vcat
-            [ text "Parse error" <> colon <+> quotes (ftext pkg)
+            [ text "Parse error" <> colon <+> quotes (ppr pkg)
             , text "Version number or non-alphanumeric" <+>
               text "character in package name"
             ]
 
-    PsErrIllegalGadtRecordMultiplicity arr
+    PsErrIllegalGadtRecordModifier arr
       -> mkSimpleDecorated $ vcat
-            [ text "Parse error" <> colon <+> quotes (ppr arr)
-            , text "Record constructors in GADTs must use an ordinary, non-linear arrow."
+            [ text "Parse error" <> colon <+> quotes (pprHsModifiedFunArr arr)
+            , text "Record constructors in GADTs must use an ordinary, non-modified arrow."
             ]
     PsErrInvalidCApiImport {} -> mkSimpleDecorated $ vcat [ text "Wrapper stubs can't be used with CApiFFI."]
 
@@ -553,8 +569,8 @@ instance Diagnostic PsMessage where
         , text "Type syntax in patterns isn't supported at the time"]
         where
           (what, ctx') = case ctx of
-            PETS_FunctionArrow arg arr res -> ("function arrow", ppr arg <+> pprHsArrow arr <+> ppr res)
-            PETS_Multiplicity tok p        -> ("multiplicity annotation", ppr tok <> ppr p)
+            PETS_FunctionArrow arg arr res -> ("function arrow", ppr arg <+> pprHsModifiedFunArr arr <+> ppr res)
+            PETS_Multiplicity mods         -> ("multiplicity annotation", pprLHsModifiers mods)
             PETS_ForallTelescope tele body -> ("forall telescope", pprHsForAll tele Nothing <+> ppr body)
             PETS_ConstraintContext ctx     -> ("constraint context", ppr ctx)
 
@@ -587,7 +603,7 @@ instance Diagnostic PsMessage where
     PsWarnStarIsType                              -> WarningWithFlag Opt_WarnStarIsType
     PsWarnUnrecognisedPragma{}                    -> WarningWithFlag Opt_WarnUnrecognisedPragmas
     PsWarnMisplacedPragma{}                       -> WarningWithFlag Opt_WarnMisplacedPragmas
-    PsWarnImportPreQualified                      -> WarningWithFlag Opt_WarnPrepositiveQualifiedModule
+    PsWarnImportPreQualified{}                    -> WarningWithFlag Opt_WarnPrepositiveQualifiedModule
     PsWarnViewPatternSignatures{}                 -> WarningWithFlag Opt_WarnViewPatternSignatures
     PsErrLexer{}                                  -> ErrorWithoutFlag
     PsErrCmmLexer                                 -> ErrorWithoutFlag
@@ -597,12 +613,12 @@ instance Diagnostic PsMessage where
     PsErrLazyPatWithoutSpace{}                    -> ErrorWithoutFlag
     PsErrBangPatWithoutSpace{}                    -> ErrorWithoutFlag
     PsErrInvalidInfixHole                         -> ErrorWithoutFlag
-    PsErrExpectedHyphen                           -> ErrorWithoutFlag
     PsErrSpaceInSCC                               -> ErrorWithoutFlag
     PsErrEmptyDoubleQuotes{}                      -> ErrorWithoutFlag
     PsErrLambdaCase{}                             -> ErrorWithoutFlag
     PsErrEmptyLambda{}                            -> ErrorWithoutFlag
     PsErrLinearFunction{}                         -> ErrorWithoutFlag
+    PsErrModifierSyntax{}                         -> ErrorWithoutFlag
     PsErrMultiWayIf{}                             -> ErrorWithoutFlag
     PsErrOverloadedRecordUpdateNotEnabled{}       -> ErrorWithoutFlag
     PsErrNumUnderscores{}                         -> ErrorWithoutFlag
@@ -612,6 +628,7 @@ instance Diagnostic PsMessage where
     PsErrOverloadedRecordUpdateNoQualifiedFields  -> ErrorWithoutFlag
     PsErrExplicitForall{}                         -> ErrorWithoutFlag
     PsErrIllegalQualifiedDo{}                     -> ErrorWithoutFlag
+    PsErrIllegalMultilineStrings{}                -> ErrorWithoutFlag
     PsErrQualifiedDoInCmd{}                       -> ErrorWithoutFlag
     PsErrRecordSyntaxInPatSynDecl{}               -> ErrorWithoutFlag
     PsErrEmptyWhereInPatSynDecl{}                 -> ErrorWithoutFlag
@@ -619,7 +636,10 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> ErrorWithoutFlag
     PsErrDeclSpliceNotAtTopLevel{}                -> ErrorWithoutFlag
     PsErrMultipleNamesInStandaloneKindSignature{} -> ErrorWithoutFlag
-    PsErrIllegalExplicitNamespace                 -> ErrorWithoutFlag
+    PsErrIllegalExplicitNamespace{}               -> ErrorWithoutFlag
+    PsErrUnsupportedExplicitNamespace{}           -> ErrorWithoutFlag
+    PsErrPlainWildcardImport{}                    -> ErrorWithoutFlag
+    PsErrPlainWildcardExport{}                    -> ErrorWithoutFlag
     PsErrUnallowedPragma{}                        -> ErrorWithoutFlag
     PsErrImportPostQualified                      -> ErrorWithoutFlag
     PsErrImportQualifiedTwice                     -> ErrorWithoutFlag
@@ -685,7 +705,7 @@ instance Diagnostic PsMessage where
     PsErrUnexpectedTypeInDecl{}                   -> ErrorWithoutFlag
     PsErrInvalidPackageName{}                     -> ErrorWithoutFlag
     PsErrParseRightOpSectionInPat{}               -> ErrorWithoutFlag
-    PsErrIllegalGadtRecordMultiplicity{}          -> ErrorWithoutFlag
+    PsErrIllegalGadtRecordModifier{}              -> ErrorWithoutFlag
     PsErrInvalidCApiImport {}                     -> ErrorWithoutFlag
     PsErrMultipleConForNewtype {}                 -> ErrorWithoutFlag
     PsErrUnicodeCharLooksLike{}                   -> ErrorWithoutFlag
@@ -715,8 +735,10 @@ instance Diagnostic PsMessage where
           then noHints
           else [SuggestCorrectPragmaName suggestions]
     PsWarnMisplacedPragma{}                       -> [SuggestPlacePragmaInHeader]
-    PsWarnImportPreQualified                      -> [ SuggestQualifiedAfterModuleName
-                                                     , suggestExtension LangExt.ImportQualifiedPost]
+    PsWarnImportPreQualified iqp_on | iqp_on     -> [ SuggestQualifiedAfterModuleName ]
+                                    | otherwise  -> [ SuggestQualifiedAfterModuleName
+                                                    , suggestExtension LangExt.ImportQualifiedPost
+                                                    ]
     PsWarnViewPatternSignatures{}                 -> [SuggestParenthesizePatternRHS]
     PsErrLexer{}                                  -> noHints
     PsErrCmmLexer                                 -> noHints
@@ -735,13 +757,14 @@ instance Diagnostic PsMessage where
     PsErrLazyPatWithoutSpace{}                    -> noHints
     PsErrBangPatWithoutSpace{}                    -> noHints
     PsErrInvalidInfixHole                         -> noHints
-    PsErrExpectedHyphen                           -> noHints
     PsErrSpaceInSCC                               -> noHints
     PsErrEmptyDoubleQuotes th_on | th_on          -> [SuggestThQuotationSyntax]
                                  | otherwise      -> noHints
     PsErrLambdaCase{}                             -> [suggestExtension LangExt.LambdaCase]
     PsErrEmptyLambda{}                            -> noHints
     PsErrLinearFunction{}                         -> [suggestExtension LangExt.LinearTypes]
+    PsErrModifierSyntax SuggestModifiers          -> [suggestExtension LangExt.Modifiers]
+    PsErrModifierSyntax DontSuggestModifiers      -> []
     PsErrMultiWayIf{}                             -> [suggestExtension LangExt.MultiWayIf]
     PsErrOverloadedRecordUpdateNotEnabled{}       -> [suggestExtension LangExt.OverloadedRecordUpdate]
     PsErrNumUnderscores{}                         -> [suggestExtension LangExt.NumericUnderscores]
@@ -752,6 +775,7 @@ instance Diagnostic PsMessage where
     PsErrExplicitForall is_unicode                -> [useExtensionInOrderTo info LangExt.ExplicitForAll]
       where info = "to enable syntax:" <+> forallSym is_unicode <+> angleBrackets "tvs" <> dot <+> angleBrackets "type"
     PsErrIllegalQualifiedDo{}                     -> [suggestExtension LangExt.QualifiedDo]
+    PsErrIllegalMultilineStrings{}                -> [suggestExtension LangExt.MultilineStrings]
     PsErrQualifiedDoInCmd{}                       -> noHints
     PsErrRecordSyntaxInPatSynDecl{}               -> noHints
     PsErrEmptyWhereInPatSynDecl{}                 -> noHints
@@ -759,7 +783,10 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> noHints
     PsErrDeclSpliceNotAtTopLevel{}                -> noHints
     PsErrMultipleNamesInStandaloneKindSignature{} -> noHints
-    PsErrIllegalExplicitNamespace                 -> [suggestExtension LangExt.ExplicitNamespaces]
+    PsErrIllegalExplicitNamespace{}               -> [suggestExtension LangExt.ExplicitNamespaces]
+    PsErrUnsupportedExplicitNamespace{}           -> noHints
+    PsErrPlainWildcardImport{}                    -> [SuggestRemoveImportList]
+    PsErrPlainWildcardExport{}                    -> [SuggestNamedModuleSelfExport]
     PsErrUnallowedPragma{}                        -> noHints
     PsErrImportPostQualified                      -> [suggestExtension LangExt.ImportQualifiedPost]
     PsErrImportQualifiedTwice                     -> noHints
@@ -858,7 +885,7 @@ instance Diagnostic PsMessage where
         pattern_RDR = mkUnqual varName (fsLit "pattern")
     PsErrUnexpectedTypeInDecl{}                   -> noHints
     PsErrInvalidPackageName{}                     -> noHints
-    PsErrIllegalGadtRecordMultiplicity{}          -> noHints
+    PsErrIllegalGadtRecordModifier{}              -> noHints
     PsErrInvalidCApiImport {}                     -> noHints
     PsErrMultipleConForNewtype {}                 -> noHints
     PsErrUnicodeCharLooksLike{}                   -> noHints

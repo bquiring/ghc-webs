@@ -12,7 +12,7 @@ module GHC.Core.TyCo.Subst
         -- * Substitutions
         Subst(..), TvSubstEnv, CvSubstEnv, IdSubstEnv,
         emptyIdSubstEnv, emptyTvSubstEnv, emptyCvSubstEnv, composeTCvSubst,
-        emptySubst, mkEmptySubst, isEmptyTCvSubst, isEmptySubst,
+        emptySubst, mkEmptySubst, isEmptyTvSubst, isEmptyTCvSubst, isEmptySubst,
         mkSubst, mkTCvSubst, mkTvSubst, mkCvSubst, mkIdSubst,
         getTvSubstEnv, getIdSubstEnv,
         getCvSubstEnv, substInScopeSet, setInScope, getSubstRangeTyCoFVs,
@@ -29,11 +29,10 @@ module GHC.Core.TyCo.Subst
         mkTvSubstPrs,
 
         substTyWith, substTyWithCoVars, substTysWith, substTysWithCoVars,
-        substCoWith,
+        substCoWithInScope,
         substTy, substTyAddInScope, substScaledTy,
         substTyUnchecked, substTysUnchecked, substScaledTysUnchecked, substThetaUnchecked,
         substTyWithUnchecked, substScaledTyUnchecked,
-        substCoUnchecked, substCoWithUnchecked,
         substTyWithInScope,
         substTys, substScaledTys, substTheta,
         lookupTyVar,
@@ -44,8 +43,8 @@ module GHC.Core.TyCo.Subst
         substCoVarBndr, substDCoVarSet,
         substTyVar, substTyVars, substTyVarToTyVar,
         substTyCoVars,
-        substTyCoBndr, substForAllCoBndr,
-        substVarBndrUsing, substForAllCoBndrUsing,
+        substTyCoBndr,
+        substVarBndrUsing,
         checkValidSubst, isValidTCvSubst,
   ) where
 
@@ -60,7 +59,7 @@ import {-# SOURCE #-} GHC.Core.Coercion
    , mkAxiomCo, mkAppCo, mkGReflCo
    , mkInstCo, mkLRCo, mkTyConAppCo
    , mkCoercionType
-   , coercionKind, coercionLKind, coVarTypesRole )
+   , coVarTypesRole )
 import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprTyVar )
 import {-# SOURCE #-} GHC.Core.Ppr ( ) -- instance Outputable CoreExpr
 import {-# SOURCE #-} GHC.Core ( CoreExpr )
@@ -68,12 +67,10 @@ import {-# SOURCE #-} GHC.Core ( CoreExpr )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
 
-import GHC.Types.Basic( SwapFlag(..), isSwapped, pickSwap, notSwapped )
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 
-import GHC.Data.Pair
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Misc
 import GHC.Types.Unique.Supply
@@ -141,8 +138,8 @@ type CvSubstEnv = CoVarEnv Coercion
 When calling (substTy subst ty) it should be the case that
 the in-scope set in the substitution is a superset of both:
 
-  (SIa) The free vars of the range of the substitution
-  (SIb) The free vars of ty minus the domain of the substitution
+  (SIa) The deep free vars of the range of the substitution
+  (SIb) The deep free vars of ty minus the domain of the substitution
 
 * Reason for (SIa). Consider
       substTy [a :-> Maybe b] (forall b. b->a)
@@ -158,6 +155,8 @@ the in-scope set in the substitution is a superset of both:
   getting this:
       forall x. (Maybe b, x, x)
   Breaking (SIb) caused the bug from #11371.
+
+* Why /deep/ free vars?  See Note [No type-shadowing in Core] in GHC.Core.
 
 Note: if the free vars of the range of the substitution are freshly created,
 then the problems of (SIa) can't happen, and so it would be sound to
@@ -263,6 +262,11 @@ isEmptySubst :: Subst -> Bool
 isEmptySubst (Subst _ id_env tv_env cv_env)
   = isEmptyVarEnv id_env && isEmptyVarEnv tv_env && isEmptyVarEnv cv_env
 
+-- | Checks if the type substitution (only) is empty
+isEmptyTvSubst :: Subst -> Bool
+isEmptyTvSubst (Subst _ _ tv_env _)
+  = isEmptyVarEnv tv_env
+
 -- | Checks whether the tyvar and covar environments are empty.
 -- This function should be used over 'isEmptySubst' when substituting
 -- for types, because types currently do not contain expressions; we can
@@ -306,14 +310,14 @@ substInScopeSet (Subst in_scope _ _ _) = in_scope
 setInScope :: Subst -> InScopeSet -> Subst
 setInScope (Subst _ ids tvs cvs) in_scope = Subst in_scope ids tvs cvs
 
--- | Returns the free variables of the types in the range of a substitution as
--- a non-deterministic set.
+-- | Returns the deep free variables of the types in the range of a
+-- substitution as a non-deterministic set.
 getSubstRangeTyCoFVs :: Subst -> VarSet
 getSubstRangeTyCoFVs (Subst _ _ tenv cenv)
   = tenvFVs `unionVarSet` cenvFVs
   where
-    tenvFVs = shallowTyCoVarsOfTyVarEnv tenv
-    cenvFVs = shallowTyCoVarsOfCoVarEnv cenv
+    tenvFVs = tyCoVarsOfTyVarEnv tenv
+    cenvFVs = tyCoVarsOfCoVarEnv cenv
 
 isInScope :: Var -> Subst -> Bool
 isInScope v (Subst in_scope _ _ _) = v `elemInScopeSet` in_scope
@@ -373,7 +377,7 @@ extendTCvSubstWithClone subst tcv
 -- You must ensure that the in-scope set is such that
 -- Note [The substitution invariant] holds
 -- after extending the substitution like this.
-extendTvSubst :: Subst -> TyVar -> Type -> Subst
+extendTvSubst :: HasDebugCallStack => Subst -> TyVar -> Type -> Subst
 extendTvSubst (Subst in_scope ids tvs cvs) tv ty
   = assert (isTyVar tv) $
     Subst in_scope ids (extendVarEnv tvs tv ty) cvs
@@ -440,7 +444,7 @@ unionSubst (Subst in_scope1 ids1 tenv1 cenv1) (Subst in_scope2 ids2 tenv2 cenv2)
 -- environment. No CoVars or Ids, please!
 zipTvSubst :: HasDebugCallStack => [TyVar] -> [Type] -> Subst
 zipTvSubst tvs tys
-  = mkTvSubst (mkInScopeSet (shallowTyCoVarsOfTypes tys)) tenv
+  = mkTvSubst (mkInScopeSet (tyCoVarsOfTypes tys)) tenv
   where
     tenv = zipTyEnv tvs tys
 
@@ -448,7 +452,7 @@ zipTvSubst tvs tys
 -- environment.  No TyVars, please!
 zipCvSubst :: HasDebugCallStack => [CoVar] -> [Coercion] -> Subst
 zipCvSubst cvs cos
-  = mkCvSubst (mkInScopeSet (shallowTyCoVarsOfCos cos)) cenv
+  = mkCvSubst (mkInScopeSet (tyCoVarsOfCos cos)) cenv
   where
     cenv = zipCoEnv cvs cos
 
@@ -456,7 +460,7 @@ zipCvSubst cvs cos
 zipTCvSubst :: HasDebugCallStack => [TyCoVar] -> [Type] -> Subst
 zipTCvSubst tcvs tys
   = zip_tcvsubst tcvs tys $
-    mkEmptySubst $ mkInScopeSet $ shallowTyCoVarsOfTypes tys
+    mkEmptySubst $ mkInScopeSet $ tyCoVarsOfTypes tys
   where zip_tcvsubst :: [TyCoVar] -> [Type] -> Subst -> Subst
         zip_tcvsubst (tv:tvs) (ty:tys) subst
           = zip_tcvsubst tvs tys (extendTCvSubst subst tv ty)
@@ -473,7 +477,7 @@ mkTvSubstPrs prs =
     assertPpr onlyTyVarsAndNoCoercionTy (text "prs" <+> ppr prs) $
     mkTvSubst in_scope tenv
   where tenv = mkVarEnv prs
-        in_scope = mkInScopeSet $ shallowTyCoVarsOfTypes $ map snd prs
+        in_scope = mkInScopeSet $ tyCoVarsOfTypes $ map snd prs
         onlyTyVarsAndNoCoercionTy =
           and [ isTyVar tv && not (isCoercionTy ty)
               | (tv, ty) <- prs ]
@@ -620,28 +624,19 @@ substTyWithUnchecked tvs tys
 -- Pre-condition: the 'in_scope' set should satisfy Note [The substitution
 -- invariant]; specifically it should include the free vars of 'tys',
 -- and of 'ty' minus the domain of the subst.
-substTyWithInScope :: HasDebugCallStack => InScopeSet -> [TyVar] -> [Type] -> Type -> Type
+substTyWithInScope :: HasDebugCallStack
+                   => InScopeSet -> [TyVar] -> [Type] -> Type -> Type
 substTyWithInScope in_scope tvs tys ty =
   assert (tvs `equalLength` tys )
   substTy (mkTvSubst in_scope tenv) ty
   where tenv = zipTyEnv tvs tys
 
 -- | Coercion substitution, see 'zipTvSubst'
-substCoWith :: HasDebugCallStack => [TyVar] -> [Type] -> Coercion -> Coercion
-substCoWith tvs tys = assert (tvs `equalLength` tys )
-                      substCo (zipTvSubst tvs tys)
-
--- | Coercion substitution, see 'zipTvSubst'. Disables sanity checks.
--- The problems that the sanity checks in substCo catch are described in
--- Note [The substitution invariant].
--- The goal of #11371 is to migrate all the calls of substCoUnchecked to
--- substCo and remove this function. Please don't use in new code.
-substCoWithUnchecked :: [TyVar] -> [Type] -> Coercion -> Coercion
-substCoWithUnchecked tvs tys
+substCoWithInScope :: HasDebugCallStack
+                   => InScopeSet -> [TyVar] -> [Type] -> Coercion -> Coercion
+substCoWithInScope in_scope tvs tys co
   = assert (tvs `equalLength` tys )
-    substCoUnchecked (zipTvSubst tvs tys)
-
-
+    substCo (mkTvSubst in_scope (zipTyEnv tvs tys)) co
 
 -- | Substitute covars within a type
 substTyWithCoVars :: [CoVar] -> [Coercion] -> Type -> Type
@@ -666,8 +661,8 @@ substTyAddInScope subst ty =
   substTy (extendSubstInScopeSet subst $ tyCoVarsOfType ty) ty
 
 -- | When calling `substTy` it should be the case that the in-scope set in
--- the substitution is a superset of the free vars of the range of the
--- substitution.
+-- the substitution is a superset of the (deep) free vars of the range of
+-- the substitution.
 -- See also Note [The substitution invariant].
 -- TODO: take into account ids and rename as isValidSubst
 isValidTCvSubst :: Subst -> Bool
@@ -675,8 +670,8 @@ isValidTCvSubst (Subst in_scope _ tenv cenv) =
   (tenvFVs `varSetInScope` in_scope) &&
   (cenvFVs `varSetInScope` in_scope)
   where
-  tenvFVs = shallowTyCoVarsOfTyVarEnv tenv
-  cenvFVs = shallowTyCoVarsOfCoVarEnv cenv
+  tenvFVs = tyCoVarsOfTyVarEnv tenv
+  cenvFVs = tyCoVarsOfCoVarEnv cenv
 
 -- | This checks if the substitution satisfies the invariant from
 -- Note [The substitution invariant].
@@ -685,9 +680,9 @@ checkValidSubst subst@(Subst in_scope _ tenv cenv) tys cos a
   = assertPpr (isValidTCvSubst subst)
               (text "in_scope" <+> ppr in_scope $$
                text "tenv" <+> ppr tenv $$
-               text "tenvFVs" <+> ppr (shallowTyCoVarsOfTyVarEnv tenv) $$
+               text "tenvFVs" <+> ppr (tyCoVarsOfTyVarEnv tenv) $$
                text "cenv" <+> ppr cenv $$
-               text "cenvFVs" <+> ppr (shallowTyCoVarsOfCoVarEnv cenv) $$
+               text "cenvFVs" <+> ppr (tyCoVarsOfCoVarEnv cenv) $$
                text "tys" <+> ppr tys $$
                text "cos" <+> ppr cos) $
     assertPpr tysCosFVsInScope
@@ -702,8 +697,8 @@ checkValidSubst subst@(Subst in_scope _ tenv cenv) tys cos a
   substDomain = nonDetKeysUFM tenv ++ nonDetKeysUFM cenv
     -- It's OK to use nonDetKeysUFM here, because we only use this list to
     -- remove some elements from a set
-  needInScope = (shallowTyCoVarsOfTypes tys `unionVarSet`
-                 shallowTyCoVarsOfCos cos)
+  needInScope = (tyCoVarsOfTypes tys `unionVarSet`
+                 tyCoVarsOfCos cos)
                 `delListFromUniqSet_Directly` substDomain
   tysCosFVsInScope = needInScope `varSetInScope` in_scope
 
@@ -802,10 +797,10 @@ subst_ty subst ty
             !res' = go res
         in ty { ft_mult = mult', ft_arg = arg', ft_res = res' }
     go (ForAllTy (Bndr tv vis) ty)
-                         = case substVarBndrUnchecked subst tv of
-                             (subst', tv') ->
-                               (ForAllTy $! ((Bndr $! tv') vis)) $!
-                                            (subst_ty subst' ty)
+      = (ForAllTy $! ((Bndr $! tv') vis)) $! (subst_ty subst' ty)
+      where
+        !(subst',tv') = substVarBndrUnchecked subst tv
+                        -- Unchecked because subst_ty is used from substTyUnchecked
     go (LitTy n)         = LitTy $! n
     go (CastTy ty co)    = (mkCastTy $! (go ty)) $! (subst_co subst co)
     go (CoercionTy co)   = CoercionTy $! (subst_co subst co)
@@ -852,16 +847,6 @@ substCo subst co
   | isEmptyTCvSubst subst = co
   | otherwise = checkValidSubst subst [] [co] $ subst_co subst co
 
--- | Substitute within a 'Coercion' disabling sanity checks.
--- The problems that the sanity checks in substCo catch are described in
--- Note [The substitution invariant].
--- The goal of #11371 is to migrate all the calls of substCoUnchecked to
--- substCo and remove this function. Please don't use in new code.
-substCoUnchecked :: Subst -> Coercion -> Coercion
-substCoUnchecked subst co
-  | isEmptyTCvSubst subst = co
-  | otherwise = subst_co subst co
-
 -- | Substitute within several 'Coercion's
 -- The substitution has to satisfy the invariants described in
 -- Note [The substitution invariant].
@@ -870,7 +855,7 @@ substCos subst cos
   | isEmptyTCvSubst subst = cos
   | otherwise = checkValidSubst subst [] cos $ map (subst_co subst) cos
 
-subst_co :: Subst -> Coercion -> Coercion
+subst_co :: HasDebugCallStack => Subst -> Coercion -> Coercion
 subst_co subst co
   = go co
   where
@@ -887,10 +872,14 @@ subst_co subst co
     go (TyConAppCo r tc args)= mkTyConAppCo r tc $! go_cos args
     go (AxiomCo con cos)     = mkAxiomCo con $! go_cos cos
     go (AppCo co arg)        = (mkAppCo $! go co) $! go arg
-    go (ForAllCo tv visL visR kind_co co)
-      = case substForAllCoBndrUnchecked subst tv kind_co of
-         (subst', tv', kind_co') ->
-          ((mkForAllCo $! tv') visL visR $! kind_co') $! subst_co subst' co
+    go (ForAllCo { fco_tcv = tcv, fco_visL = visL, fco_visR = visR
+                 , fco_kind = kind_co, fco_body = co })
+      = ((mkForAllCo $! tcv') visL visR
+           $! go_mco kind_co)
+           $! subst_co subst' co
+      where
+        !(subst', tcv') = substVarBndrUnchecked subst tcv
+                          -- Unchecked because used from substTyUnchecked
     go (FunCo r afl afr w co1 co2)   = ((mkFunCo2 r afl afr $! go w) $! go co1) $! go co2
     go (CoVarCo cv)          = substCoVar subst cv
     go (UnivCo { uco_prov = p, uco_role = r
@@ -910,95 +899,13 @@ subst_co subst co
                  in cos' `seqList` cos'
 
     -- See Note [Substituting in a coercion hole]
-    go_hole h@(CoercionHole { ch_co_var = cv })
-      = h { ch_co_var = updateVarType go_ty cv }
+    go_hole h@(CH { ch_co_var = cv }) = h { ch_co_var = updateVarType go_ty cv }
 
 -- | Perform a substitution within a 'DVarSet' of free variables,
--- returning the shallow free coercion variables.
+-- returning the free coercion variables.
 substDCoVarSet :: Subst -> DCoVarSet -> DCoVarSet
 substDCoVarSet subst cvs = coVarsOfCosDSet $ map (substCoVar subst) $
                            dVarSetElems cvs
-
-substForAllCoBndr :: Subst -> TyCoVar -> KindCoercion
-                  -> (Subst, TyCoVar, Coercion)
-substForAllCoBndr subst
-  = substForAllCoBndrUsing NotSwapped (substCo subst) subst
-
--- | Like 'substForAllCoBndr', but disables sanity checks.
--- The problems that the sanity checks in substCo catch are described in
--- Note [The substitution invariant].
--- The goal of #11371 is to migrate all the calls of substCoUnchecked to
--- substCo and remove this function. Please don't use in new code.
-substForAllCoBndrUnchecked :: Subst -> TyCoVar -> KindCoercion
-                           -> (Subst, TyCoVar, Coercion)
-substForAllCoBndrUnchecked subst
-  = substForAllCoBndrUsing NotSwapped (substCoUnchecked subst) subst
-
--- See Note [Sym and ForAllCo]
-substForAllCoBndrUsing :: SwapFlag  -- Apply sym to binder?
-                       -> (Coercion -> Coercion)  -- transformation to kind co
-                       -> Subst -> TyCoVar -> KindCoercion
-                       -> (Subst, TyCoVar, KindCoercion)
-substForAllCoBndrUsing sym sco subst old_var
-  | isTyVar old_var = substForAllCoTyVarBndrUsing sym sco subst old_var
-  | otherwise       = substForAllCoCoVarBndrUsing sym sco subst old_var
-
-substForAllCoTyVarBndrUsing :: SwapFlag  -- Apply sym to binder?
-                            -> (Coercion -> Coercion)  -- transformation to kind co
-                            -> Subst -> TyVar -> KindCoercion
-                            -> (Subst, TyVar, KindCoercion)
-substForAllCoTyVarBndrUsing sym sco (Subst in_scope idenv tenv cenv) old_var old_kind_co
-  = assert (isTyVar old_var )
-    ( Subst (in_scope `extendInScopeSet` new_var) idenv new_env cenv
-    , new_var, new_kind_co )
-  where
-    new_env | no_change, notSwapped sym
-            = delVarEnv tenv old_var
-            | isSwapped sym
-            = extendVarEnv tenv old_var $
-              TyVarTy new_var `CastTy` new_kind_co
-            | otherwise
-            = extendVarEnv tenv old_var (TyVarTy new_var)
-
-    no_kind_change = noFreeVarsOfCo old_kind_co
-    no_change = no_kind_change && (new_var == old_var)
-
-    new_kind_co | no_kind_change = old_kind_co
-                | otherwise      = sco old_kind_co
-
-    new_ki1 = coercionLKind new_kind_co
-    -- We could do substitution to (tyVarKind old_var). We don't do so because
-    -- we already substituted new_kind_co, which contains the kind information
-    -- we want. We don't want to do substitution once more. Also, in most cases,
-    -- new_kind_co is a Refl, in which case coercionKind is really fast.
-
-    new_var  = uniqAway in_scope (setTyVarKind old_var new_ki1)
-
-substForAllCoCoVarBndrUsing :: SwapFlag  -- Apply sym to binder?
-                            -> (Coercion -> Coercion)  -- transformation to kind co
-                            -> Subst -> CoVar -> KindCoercion
-                            -> (Subst, CoVar, KindCoercion)
-substForAllCoCoVarBndrUsing sym sco (Subst in_scope idenv tenv cenv)
-                            old_var old_kind_co
-  = assert (isCoVar old_var )
-    ( Subst (in_scope `extendInScopeSet` new_var) idenv tenv new_cenv
-    , new_var, new_kind_co )
-  where
-    new_cenv | no_change, notSwapped sym
-             = delVarEnv cenv old_var
-             | otherwise
-             = extendVarEnv cenv old_var (mkCoVarCo new_var)
-
-    no_kind_change = noFreeVarsOfCo old_kind_co
-    no_change = no_kind_change && (new_var == old_var)
-
-    new_kind_co | no_kind_change = old_kind_co
-                | otherwise      = sco old_kind_co
-
-    Pair h1 h2 = coercionKind new_kind_co
-
-    new_var       = uniqAway in_scope $ mkCoVar (varName old_var) new_var_type
-    new_var_type  = pickSwap sym h1 h2
 
 substCoVar :: Subst -> CoVar -> Coercion
 substCoVar (Subst _ _ _ cenv) cv
@@ -1055,11 +962,12 @@ substTyVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     new_env | no_change = delVarEnv tenv old_var
             | otherwise = extendVarEnv tenv old_var (TyVarTy new_var)
 
-    _no_capture = not (new_var `elemVarSet` shallowTyCoVarsOfTyVarEnv tenv)
+    _no_capture = not (new_var `elemVarSet` tyCoVarsOfTyVarEnv tenv)
     -- Assertion check that we are not capturing something in the substitution
 
     old_ki = tyVarKind old_var
-    no_kind_change = noFreeVarsOfType old_ki -- verify that kind is closed
+    no_kind_change = isEmptyTCvSubst subst || noFreeVarsOfType old_ki
+                     -- isEmptyTCvSubst: see Note [Keeping the substitution empty]
     no_change = no_kind_change && (new_var == old_var)
         -- no_change means that the new_var is identical in
         -- all respects to the old_var (same unique, same kind)
@@ -1087,7 +995,8 @@ substCoVarBndrUsing subst_fn subst@(Subst in_scope idenv tenv cenv) old_var
     (Subst (in_scope `extendInScopeSet` new_var) idenv tenv new_cenv, new_var)
   where
     new_co         = mkCoVarCo new_var
-    no_kind_change = noFreeVarsOfTypes [t1, t2]
+    no_kind_change = isEmptyTCvSubst subst || noFreeVarsOfTypes [t1, t2]
+                     -- isEmptyTCvSubst: see Note [Keeping the substitution empty]
     no_change      = new_var == old_var && no_kind_change
 
     new_cenv | no_change = delVarEnv cenv old_var
@@ -1133,3 +1042,22 @@ substTyCoBndr subst (Anon ty af)          = (subst, Anon (substScaledTy subst ty
 substTyCoBndr subst (Named (Bndr tv vis)) = (subst', Named (Bndr tv' vis))
                                           where
                                             (subst', tv') = substVarBndr subst tv
+
+{- Note [Keeping the substitution empty]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A very common situation is where we run over a term doing no cloning,
+no substitution, nothing.  In that case the TCvSubst will be empty, and
+it is /very/ valuable to /keep/ it empty:
+
+* It's wasted effort to build up an identity substitution mapping
+  [x:->x, y:->y].
+
+* When we come to a binder, if the incoming substitution is empty,
+  we can avoid substituting its type; and that in turn may mean that
+  the binder itself does not change and we don't need to extend the
+  substitution.
+
+* In the Simplifier we substitute over both types and coercions.
+  If the substitution is empty, this is a no-op -- but only if it
+  is empty!
+-}

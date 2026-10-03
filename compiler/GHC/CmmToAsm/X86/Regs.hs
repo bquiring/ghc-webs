@@ -58,6 +58,7 @@ import GHC.Cmm
 import GHC.Cmm.CLabel           ( CLabel )
 import GHC.Utils.Panic
 import GHC.Platform
+import GHC.Types.Literal.Floating
 
 -- | regSqueeze_class reg
 --      Calculate the maximum number of register colors that could be
@@ -107,8 +108,8 @@ data Imm
   | ImmCLbl     CLabel      -- AbstractC Label (with baggage)
   | ImmLit      FastString
   | ImmIndex    CLabel Int
-  | ImmFloat    Rational
-  | ImmDouble   Rational
+  | ImmFloat    !Float
+  | ImmDouble   !Double
   | ImmConstantSum Imm Imm
   | ImmConstantDiff Imm Imm
 
@@ -121,8 +122,8 @@ litToImm (CmmInt i w)        = ImmInteger (narrowS w i)
                 -- narrow to the width: a CmmInt might be out of
                 -- range, but we assume that ImmInteger only contains
                 -- in-range values.  A signed value should be fine here.
-litToImm (CmmFloat f W32)    = ImmFloat f
-litToImm (CmmFloat f W64)    = ImmDouble f
+litToImm (CmmFloat f LitFloat)  = ImmFloat  (litFloatingToHostFloat  f)
+litToImm (CmmFloat f LitDouble) = ImmDouble (litFloatingToHostDouble f)
 litToImm (CmmLabel l)        = ImmCLbl l
 litToImm (CmmLabelOff l off) = ImmIndex l off
 litToImm (CmmLabelDiffOff l1 l2 off _)
@@ -193,27 +194,23 @@ spRel platform n
 firstxmm :: RegNo
 firstxmm  = 16
 
---  on 32bit platformOSs, only the first 8 XMM/YMM/ZMM registers are available
-lastxmm :: Platform -> RegNo
-lastxmm platform
- | target32Bit platform = firstxmm + 7  -- xmm0 - xmmm7
- | otherwise            = firstxmm + 15 -- xmm0 -xmm15
+--  on 32bit platforms, only the first 8 XMM/YMM/ZMM registers are available
+lastxmm :: PlatformWordSize -> RegNo
+lastxmm PW4 = firstxmm + 7  -- xmm0 - xmm7
+lastxmm PW8 = firstxmm + 15 -- xmm0 - xmm15
 
-lastint :: Platform -> RegNo
-lastint platform
- | target32Bit platform = 7 -- not %r8..%r15
- | otherwise            = 15
+lastint :: PlatformWordSize -> RegNo
+lastint PW4 = 7 -- not %r8..%r15
+lastint PW8 = 15
 
-intregnos :: Platform -> [RegNo]
-intregnos platform = [0 .. lastint platform]
+intregnos :: PlatformWordSize -> [RegNo]
+intregnos wordSize = [0 .. lastint wordSize]
 
-
-
-xmmregnos :: Platform -> [RegNo]
-xmmregnos platform = [firstxmm  .. lastxmm platform]
+xmmregnos :: PlatformWordSize -> [RegNo]
+xmmregnos wordSize = [firstxmm .. lastxmm wordSize]
 
 floatregnos :: Platform -> [RegNo]
-floatregnos platform = xmmregnos platform
+floatregnos platform = xmmregnos (platformWordSize platform)
 
 -- argRegs is the set of regs which are read for an n-argument call to C.
 -- For archs which pass all args on the stack (x86), is empty.
@@ -223,7 +220,7 @@ argRegs _       = panic "MachRegs.argRegs(x86): should not be used!"
 
 -- | The complete set of machine registers.
 allMachRegNos :: Platform -> [RegNo]
-allMachRegNos platform = intregnos platform ++ floatregnos platform
+allMachRegNos platform = intregnos (platformWordSize platform) ++ floatregnos platform
 
 -- | Take the class of a register.
 {-# INLINE classOfRealReg #-}
@@ -235,9 +232,11 @@ classOfRealReg :: Platform -> RealReg -> RegClass
 classOfRealReg platform reg
     = case reg of
         RealRegSingle i
-            | i <= lastint platform -> RcInteger
-            | i <= lastxmm platform -> RcFloatOrVector
+            | i <= lastint wordSize -> RcInteger
+            | i <= lastxmm wordSize -> RcFloatOrVector
             | otherwise             -> panic "X86.Reg.classOfRealReg registerSingle too high"
+  where
+    wordSize = platformWordSize platform
 
 -- machine specific ------------------------------------------------------------
 

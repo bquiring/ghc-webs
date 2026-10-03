@@ -21,7 +21,10 @@ module GHC.Tc.Deriv.Utils (
         mkDirectThetaSpec, substPredSpec, captureThetaSpecConstraints,
         checkOriginativeSideConditions, hasStockDeriving,
         std_class_via_coercible, non_coercible_class,
-        newDerivClsInst, extendLocalInstEnv
+        newDerivClsInst, extendLocalInstEnv,
+
+        -- Syntax tree construction
+        nlHsCompose
     ) where
 
 import GHC.Prelude
@@ -35,11 +38,12 @@ import GHC.Tc.Deriv.Generate
 import GHC.Tc.Deriv.Functor
 import GHC.Tc.Deriv.Generics
 import GHC.Tc.Errors.Types
-import GHC.Tc.Types.Constraint (WantedConstraints, mkNonCanonical, mkSimpleWC)
+import GHC.Tc.Types.Constraint (WantedConstraints, mkNonCanonical)
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.ErrCtxt( UserTypeCtxt( InstDeclCtxt, DerivClauseCtxt ) )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Unify (tcSubTypeSigma, buildImplicationFor)
+import GHC.Tc.Utils.Unify (tcSubTypeSigma)
 import GHC.Tc.Zonk.Type
 
 import GHC.Core.Class
@@ -52,7 +56,6 @@ import GHC.Core.Type
 import GHC.Hs
 import GHC.Driver.Session
 import GHC.Unit.Module (getModule)
-import GHC.Unit.Module.Warnings
 import GHC.Unit.Module.ModIface (mi_fix)
 
 import GHC.Iface.Load   (loadInterfaceForName)
@@ -61,21 +64,25 @@ import GHC.Types.Fixity.Env (lookupFixity)
 import GHC.Types.Name
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Set
-import GHC.Types.Id( idName )
 
-import GHC.Builtin.Names
-import GHC.Builtin.Names.TH (liftClassKey)
+import GHC.Builtin.KnownKeys
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Error
-import GHC.Utils.Unique (sameUnique)
 
 import Control.Monad.Trans.Reader
 import Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.List.SetOps (assocMaybe)
+
+
+{- *********************************************************************
+*                                                                      *
+        The DerivM monad and its DerivEnv environment
+*                                                                      *
+********************************************************************* -}
 
 -- | To avoid having to manually plumb everything in 'DerivEnv' throughout
 -- various functions in "GHC.Tc.Deriv" and "GHC.Tc.Deriv.Infer", we use 'DerivM', which
@@ -114,7 +121,7 @@ mkDerivOrigin standalone = DerivOrigin standalone
 -- determining what its @EarlyDerivSpec@ should be.
 -- See @Note [DerivEnv and DerivSpecMechanism]@.
 data DerivEnv = DerivEnv
-  { denv_overlap_mode :: Maybe OverlapMode
+  { denv_overlap_mode :: Maybe (OverlapMode GhcTc)
     -- ^ Is this an overlapping instance?
   , denv_tvs          :: [TyVar]
     -- ^ Universally quantified type variables in the instance. If the
@@ -169,7 +176,7 @@ data DerivSpec theta = DS { ds_loc                 :: SrcSpan
                           , ds_tys                 :: [Type]
                           , ds_skol_info           :: SkolemInfo
                           , ds_user_ctxt           :: UserTypeCtxt
-                          , ds_overlap             :: Maybe OverlapMode
+                          , ds_overlap             :: Maybe (OverlapMode GhcTc)
                           , ds_standalone_wildcard :: Maybe SrcSpan
                               -- See Note [Inferring the instance context]
                               -- in GHC.Tc.Deriv.Infer
@@ -700,42 +707,8 @@ emitPredSpecConstraints :: UserTypeCtxt -> PredSpec -> TcM ()
 emitPredSpecConstraints _ (SimplePredSpec { sps_pred = wanted_pred
                                           , sps_origin = orig
                                           , sps_type_or_kind = t_or_k })
-  -- For constraints like (C a) or (Ord b), emit the
-  -- constraints directly as simple wanted constraints.
-  | isRhoTy wanted_pred
   = do { ev <- newWanted orig (Just t_or_k) wanted_pred
        ; emitSimple (mkNonCanonical ev) }
-
-  | otherwise
-    -- Forall-predicates, can come from
-    --     * GHC.Tc.Deriv.Infer.inferConstraintsCoerceBased.
-    --     * Quantified constraints in superclasses
-    --     (See comments with sps_pred.)
-    -- For these forall-predicates we want to emit an /implication/-constraint,
-    -- and NOT a /forall/-constraint. Why?  Because forall-constraints are solved
-    -- all-or-nothing, but here when we are trying to infer the context for an
-    -- instance decl, we need that half-solved implication.  See the rather
-    -- exotic test T20815 and Note [Inferred contexts from method constraints]
-    --
-    -- See also (WFA3) in Note [Solving a Wanted forall-constraint] in GHC.Tc.Solver.Solve
-  = do { let (_,_,head_ty) = tcSplitQuantPredTy wanted_pred  -- Yuk
-             skol_info_anon
-               = case orig of
-                   DerivOriginCoerce meth _ _ _ -> MethSkol (idName meth) False
-                   DerivOrigin _                -> InstSkol (IsQC orig) (pSizeHead head_ty)
-                   _ -> pprPanic "emitPredSpecConstraints" (ppr orig $$ ppr wanted_pred)
-                        -- We only get a polymorphic wanted_pred from limited places
-                        -- Computing `skol_info_anon` is a bit messy, but arises from
-                        -- the fact that SimplePredSpec is not really simple!
-
-       ; skol_info <- mkSkolemInfo skol_info_anon
-       ; (_wrapper, tv_prs, givens, wanted_rho) <- topSkolemise skol_info wanted_pred
-         -- _wrapper: we ignore the evidence from all these constraints
-       ; (tc_lvl, ev) <- pushTcLevelM $ newWanted orig (Just t_or_k) wanted_rho
-       ; let skol_tvs = map (binderVar . snd) tv_prs
-       ; (implic, _) <- buildImplicationFor tc_lvl skol_info_anon skol_tvs
-                               givens (mkSimpleWC [ev])
-       ; emitImplications implic }
 
 emitPredSpecConstraints user_ctxt
   (SubTypePredSpec { stps_ty_actual   = ty_actual
@@ -929,34 +902,34 @@ classArgsErr cls cls_tys = DerivErrNotAClass (mkClassPred cls cls_tys)
 -- class for which stock deriving isn't possible.
 stockSideConditions :: DerivContext -> Class -> Maybe Condition
 stockSideConditions deriv_ctxt cls
-  | sameUnique cls_key eqClassKey          = Just (cond_std `andCond` cond_args cls)
-  | sameUnique cls_key ordClassKey         = Just (cond_std `andCond` cond_args cls)
-  | sameUnique cls_key showClassKey        = Just (cond_std `andCond` cond_args cls)
-  | sameUnique cls_key readClassKey        = Just (cond_std `andCond` cond_args cls)
-  | sameUnique cls_key enumClassKey        = Just (cond_std `andCond` cond_isEnumeration)
-  | sameUnique cls_key ixClassKey          = Just (cond_std `andCond` cond_enumOrProduct cls)
-  | sameUnique cls_key boundedClassKey     = Just (cond_std `andCond` cond_enumOrProduct cls)
-  | sameUnique cls_key dataClassKey        = Just (checkFlag LangExt.DeriveDataTypeable `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_args cls)
-  | sameUnique cls_key functorClassKey     = Just (checkFlag LangExt.DeriveFunctor `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_functorOK True False)
-  | sameUnique cls_key foldableClassKey    = Just (checkFlag LangExt.DeriveFoldable `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_functorOK False True)
-                                                   -- Functor/Fold/Trav works ok
-                                                   -- for rank-n types
-  | sameUnique cls_key traversableClassKey = Just (checkFlag LangExt.DeriveTraversable `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_functorOK False False)
-  | sameUnique cls_key genClassKey         = Just (checkFlag LangExt.DeriveGeneric `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_RepresentableOk)
-  | sameUnique cls_key gen1ClassKey        = Just (checkFlag LangExt.DeriveGeneric `andCond`
-                                                   cond_vanilla `andCond`
-                                                   cond_Representable1Ok)
-  | sameUnique cls_key liftClassKey        = Just (checkFlag LangExt.DeriveLift `andCond`
+  | cls_key == eqClassKey          = Just (cond_std `andCond` cond_args cls)
+  | cls_key == ordClassKey         = Just (cond_std `andCond` cond_args cls)
+  | cls_key == showClassKey        = Just (cond_std `andCond` cond_args cls)
+  | cls_key == readClassKey        = Just (cond_std `andCond` cond_args cls)
+  | cls_key == enumClassKey        = Just (cond_std `andCond` cond_isEnumeration)
+  | cls_key == ixClassKey          = Just (cond_std `andCond` cond_enumOrProduct cls)
+  | cls_key == boundedClassKey     = Just (cond_std `andCond` cond_enumOrProduct cls)
+  | cls_key == dataClassKey        = Just (checkFlag LangExt.DeriveDataTypeable `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_args cls)
+  | cls_key == functorClassKey     = Just (checkFlag LangExt.DeriveFunctor `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_functorOK True False)
+  | cls_key == foldableClassKey    = Just (checkFlag LangExt.DeriveFoldable `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_functorOK False True)
+                                        -- Functor/Fold/Trav works ok
+                                        -- for rank-n types
+  | cls_key == traversableClassKey = Just (checkFlag LangExt.DeriveTraversable `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_functorOK False False)
+  | cls_key == genClassKey         = Just (checkFlag LangExt.DeriveGeneric `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_RepresentableOk)
+  | cls_key == gen1ClassKey        = Just (checkFlag LangExt.DeriveGeneric `andCond`
+                                        cond_vanilla `andCond`
+                                        cond_Representable1Ok)
+  | cls_key == liftClassKey        = Just (checkFlag LangExt.DeriveLift `andCond`
                                                    checkFlag LangExt.ImplicitStagePersistence `andCond`
                                                    cond_vanilla `andCond`
                                                    cond_args cls)

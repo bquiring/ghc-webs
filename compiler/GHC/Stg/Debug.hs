@@ -1,9 +1,9 @@
-{-# LANGUAGE TupleSections #-}
-
 -- This module contains functions which implement
 -- the -finfo-table-map and -fdistinct-constructor-tables flags
 module GHC.Stg.Debug
   ( StgDebugOpts(..)
+  , StgDebugDctConfig(..)
+  , dctConfigOnly
   , collectDebugInformation
   ) where
 
@@ -17,24 +17,19 @@ import GHC.Types.Tickish
 import GHC.Core.DataCon
 import GHC.Types.IPE
 import GHC.Unit.Module
-import GHC.Types.Name   ( getName, getOccName, occNameFS, nameSrcSpan)
+import GHC.Types.Name   ( getName, getOccName, occNameFS, nameSrcSpan, occName, occNameString)
 import GHC.Data.FastString
+import GHC.Stg.Debug.Types
 
 import Control.Monad (when)
 import Control.Monad.Trans.Reader
+import qualified Data.Set as Set
 import GHC.Utils.Monad.State.Strict
 import Control.Monad.Trans.Class
 import GHC.Types.SrcLoc
 import Control.Applicative
 import qualified Data.List.NonEmpty as NE
 import Data.List.NonEmpty (NonEmpty(..))
-
-data SpanWithLabel = SpanWithLabel RealSrcSpan LexicalFastString
-
-data StgDebugOpts = StgDebugOpts
-  { stgDebug_infoTableMap              :: !Bool
-  , stgDebug_distinctConstructorTables :: !Bool
-  }
 
 data R = R { rOpts :: StgDebugOpts, rModLocation :: ModLocation, rSpan :: Maybe SpanWithLabel }
 
@@ -140,10 +135,12 @@ collectAlt alt = do e' <- collectExpr $ alt_rhs alt
 -- propagated downwards by 'withSpan'. It's "quick" because it works only using immediate context rather
 -- than looking at the parent context like 'withSpan'
 quickSourcePos :: FastString -> StgExpr -> Maybe SpanWithLabel
-quickSourcePos cur_mod (StgTick (SourceNote ss m) e)
-  | srcSpanFile ss == cur_mod = Just (SpanWithLabel ss m)
-  | otherwise = quickSourcePos cur_mod e
-quickSourcePos _ _ = Nothing
+quickSourcePos cur_mod e
+  = uncurry SpanWithLabel <$> bestSourceNote False cur_mod (head_ticks e)
+  where
+    -- The ticks at the head of the expression, outermost first.
+    head_ticks (StgTick t e') = t : head_ticks e'
+    head_ticks _              = []
 
 recordStgIdPosition :: Id -> Maybe SpanWithLabel -> Maybe SpanWithLabel -> M ()
 recordStgIdPosition id best_span ss = do
@@ -155,6 +152,8 @@ recordStgIdPosition id best_span ss = do
     let mbspan = (\(SpanWithLabel rss d) -> (rss, d)) <$> (best_span <|> cc <|> ss)
     lift $ modify (\env -> env { provClosure = addToUDFM (provClosure env) (idName id) (idName id, (idType id, mbspan)) })
 
+-- | If @-fdistinct-constructor-tables@ is enabled, each occurrence of a data
+-- constructor will be given its own info table
 numberDataCon :: DataCon -> [StgTickish] -> M ConstructorNumber
 -- Unboxed tuples and sums do not allocate so they
 -- have no info tables.
@@ -162,27 +161,61 @@ numberDataCon dc _ | isUnboxedTupleDataCon dc = return NoNumber
 numberDataCon dc _ | isUnboxedSumDataCon dc = return NoNumber
 numberDataCon dc ts = do
   opts <- asks rOpts
-  if not (stgDebug_distinctConstructorTables opts) then return NoNumber else do
+  if shouldMakeDistinctTable opts dc then do
+    -- -fdistinct-constructor-tables is enabled and we do want to make distinct
+    -- tables for this constructor. Add an entry to the data constructor map for
+    -- this occurrence of the data constructor with a unique number and a src
+    -- span
     env <- lift get
     mcc <- asks rSpan
-    let !mbest_span = (\(SpanWithLabel rss l) -> (rss, l)) <$> (selectTick ts <|> mcc)
-    let !dcMap' = alterUDFM (maybe (Just (dc, (0, mbest_span) :| [] ))
-                        (\(_dc, xs@((k, _):|_)) -> Just $! (dc, (k + 1, mbest_span) `NE.cons` xs))) (provDC env) dc
+    let
+      -- Guess a src span for this occurrence using source note ticks and the
+      -- current span in the environment
+      !mbest_span = selectTick ts <|> (\(SpanWithLabel rss l) -> (rss, l)) <$> mcc
+
+      -- Add the occurrence to the data constructor map of the InfoTableProvMap,
+      -- noting the unique number assigned for this occurence
+      (!r, !dcMap') =
+        alterUDFM_L
+          ( maybe
+              (Just (dc, (0, mbest_span) :| [] ))
+              ( \(_dc, xs@((k, _):|_)) ->
+                  Just $! (dc, (k + 1, mbest_span) `NE.cons` xs)
+              )
+          )
+          (provDC env)
+          dc
     lift $ put (env { provDC = dcMap' })
-    let r = lookupUDFM dcMap' dc
     return $ case r of
       Nothing -> NoNumber
       Just (_, res) -> Numbered (fst (NE.head res))
+  else do
+    -- -fdistinct-constructor-tables is not enabled, or we do not want to make
+    -- distinct tables for this specific constructor
+    return NoNumber
 
-selectTick :: [StgTickish] -> Maybe SpanWithLabel
-selectTick [] = Nothing
-selectTick (SourceNote rss d : ts ) = selectTick ts <|> Just (SpanWithLabel rss d)
-selectTick (_:ts) = selectTick ts
+selectTick :: [StgTickish] -> Maybe (RealSrcSpan, LexicalFastString)
+selectTick = foldl' go Nothing
+  where
+    go :: Maybe (RealSrcSpan, LexicalFastString) -> StgTickish -> Maybe (RealSrcSpan, LexicalFastString)
+    go _   (SourceNote rss d) = Just (rss, d)
+    go acc _                  = acc
 
-{-
-Note [Mapping Info Tables to Source Positions]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- | Descide whether a distinct info table should be made for a usage of a data
+-- constructor. We only want to do this if -fdistinct-constructor-tables was
+-- given and this constructor name was given, or no constructor names were
+-- given.
+shouldMakeDistinctTable :: StgDebugOpts -> DataCon -> Bool
+shouldMakeDistinctTable StgDebugOpts{stgDebug_distinctConstructorTables} dc =
+  case stgDebug_distinctConstructorTables of
+    All -> True
+    Only these -> Set.member dcStr these
+    None -> False
+  where
+    dcStr = occNameString . occName $ dataConName dc
 
+{- Note [Mapping Info Tables to Source Positions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This note describes what the `-finfo-table-map` flag achieves.
 
 When debugging memory issues it is very useful to be able to map a specific closure

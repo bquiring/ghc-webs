@@ -8,16 +8,19 @@
  *       For the WINIO manager see base in the GHC.Event modules.
  */
 
-#if !defined(THREADED_RTS)
 
 #include "Rts.h"
+#include <errno.h>
+#include "win32/AsyncMIO.h"
+
+#if !defined(THREADED_RTS)
+
 #include "RtsUtils.h"
 #include <windows.h>
 #include <stdio.h>
 #include "Schedule.h"
 #include "Capability.h"
 #include "IOManagerInternals.h"
-#include "win32/AsyncMIO.h"
 #include "win32/MIOManager.h"
 
 /*
@@ -218,8 +221,12 @@ shutdownAsyncIO(bool wait_threads)
  * requests to make further progress. In the latter scenario,
  * awaitRequests() will simply block waiting for worker threads
  * to complete if the 'completedTable' is empty.
+ *
+ * The result reports if the wait completed successfully (typically with some
+ * work available), or was interrupted by abandonRequestWait(), with true
+ * meaning completed, and false meaning interrupted.
  */
-int
+bool
 awaitRequests(bool wait)
 {
 #if !defined(THREADED_RTS)
@@ -243,7 +250,7 @@ start:
 #endif
         ) {
         OS_RELEASE_LOCK(&queue_lock);
-        return 0;
+        return true;
     }
     if (completed_hw == 0) {
         // empty table, drop lock and wait
@@ -256,22 +263,24 @@ start:
                 // a request was completed
                 break;
             case WAIT_OBJECT_0 + 1:
+                // abandon_req_wait signaled, by abandonRequestWait()
+                return false;
             case WAIT_TIMEOUT:
                 // timeout (unlikely) or told to abandon waiting
-                return 0;
+                return true;
             case WAIT_FAILED: {
                 DWORD dw = GetLastError();
                 fprintf(stderr, "awaitRequests: wait failed -- "
                                 "error code: %lu\n", dw); fflush(stderr);
-                return 0;
+                return true;
             }
             default:
                 fprintf(stderr, "awaitRequests: unexpected wait return "
                                 "code %lu\n", dwRes); fflush(stderr);
-                return 0;
+                return true;
             }
         } else {
-            return 0;
+            return true;
         }
         goto start;
     } else {
@@ -295,18 +304,13 @@ start:
             for(tso = iomgr->blocked_queue_hd; tso != END_TSO_QUEUE;
                   tso = tso->_link) {
 
-                switch(ACQUIRE_LOAD(&tso->why_blocked)) {
+                switch (UntagWhyBlocked(ACQUIRE_LOAD(&tso->why_blocked))) {
                 case BlockedOnRead:
                 case BlockedOnWrite:
                 case BlockedOnDoProc:
-                    if (tso->block_info.async_result->reqID == rID) {
-                        // Found the thread blocked waiting on request;
-                        // stodgily fill
-                        // in its result block.
-                        tso->block_info.async_result->len =
-                          completedTable[i].len;
-                        tso->block_info.async_result->errCode =
-                          completedTable[i].errCode;
+                    if (tso->block_info.async_reqID == rID) {
+                        HsInt len     = completedTable[i].len;
+                        HsInt errCode = completedTable[i].errCode;
 
                         // Drop the matched TSO from blocked_queue
                         if (prev) {
@@ -320,22 +324,23 @@ start:
                         }
 
                         // Terminates the run queue + this inner for-loop.
-                        tso->_link = END_TSO_QUEUE;
-                        tso->why_blocked = NotBlocked;
-                        // save the StgAsyncIOResult in the
-                        // stg_block_async_info stack frame, because
-                        // the block_info field will be overwritten by
-                        // pushOnRunQueue().
-                        tso->stackobj->sp[1] = (W_)tso->block_info.async_result;
+                        // For stg_block_async frames (read/write/doProc),
+                        // write len and errCode directly to the stack.
+                        // For stg_block_noregs frames (delay), nothing
+                        // to write.
+                        if (tso->stackobj->sp[0] == (W_)&stg_block_async_info) {
+                            tso->stackobj->sp[1] = (W_)len;
+                            tso->stackobj->sp[2] = (W_)errCode;
+                        }
                         pushOnRunQueue(&MainCapability, tso);
+                        RELEASE_STORE(&tso->why_blocked, NotBlocked);
                         break;
                     }
                     break;
-                default:
-                    if (tso->why_blocked != NotBlocked) {
-                        barf("awaitRequests: odd thread state");
-                    }
+                case NotBlocked:
                     break;
+                default:
+                    barf("awaitRequests: odd thread state");
                 }
 
                 prev = tso;
@@ -351,7 +356,7 @@ start:
         completed_hw = 0;
         ResetEvent(completed_req_event);
         OS_RELEASE_LOCK(&queue_lock);
-        return 1;
+        return true;
     }
 #endif /* !THREADED_RTS */
 }
@@ -382,10 +387,9 @@ abandonRequestWait( void )
     interruptIOManagerEvent ();
 }
 
-void
-resetAbandonRequestWait( void )
-{
-    ResetEvent(abandon_req_wait);
-}
-
 #endif /* !defined(THREADED_RTS) */
+
+HsInt rts_EINTR(void)
+{
+    return EINTR;
+}

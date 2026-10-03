@@ -95,6 +95,7 @@ module GHC.Internal.Foreign.C.String (   -- representation of strings in C
 
   ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.Marshal.Array
 import GHC.Internal.Foreign.C.Types
 import GHC.Internal.Foreign.Ptr
@@ -106,7 +107,7 @@ import GHC.Internal.Char
 import GHC.Internal.List
 import GHC.Internal.Real
 import GHC.Internal.Num
-import GHC.Internal.Base
+import GHC.Internal.Prim (seq)
 
 import {-# SOURCE #-} GHC.Internal.IO.Encoding
 import qualified GHC.Internal.Foreign.C.String.Encoding as GHC

@@ -1,7 +1,3 @@
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
 {-# LANGUAGE MagicHash           #-}
 {-# LANGUAGE MultiWayIf          #-}
 
@@ -24,15 +20,15 @@ module GHC.Tc.Utils.TcType (
   --------------------------------
   -- Types
   TcType, TcSigmaType, TcTypeFRR, TcSigmaTypeFRR,
-  TcRhoType, TcTauType, TcPredType, TcThetaType,
+  TcRhoType, TcRhoTypeFRR, TcTauType, TcPredType, TcThetaType,
   TcTyVar, TcTyVarSet, TcDTyVarSet, TcTyCoVarSet, TcDTyCoVarSet,
   TcKind, TcCoVar, TcTyCoVar, TcTyVarBinder, TcInvisTVBinder, TcReqTVBinder,
   TcTyCon, MonoTcTyCon, PolyTcTyCon, TcTyConBinder, KnotTied,
 
-  ExpType(..), ExpKind, InferResult(..),
+  ExpType(..), ExpKind, InferResult(..), InferInstFlag(..), InferFRRFlag(..),
   ExpTypeFRR, ExpSigmaType, ExpSigmaTypeFRR,
-  ExpRhoType,
-  mkCheckExpType,
+  ExpRhoType, ExpRhoTypeFRR,
+  mkCheckExpType, getCheckExpType,
   checkingExpType_maybe, checkingExpType,
 
   ExpPatType(..), mkCheckExpFunPatTy, mkInvisExpPatType,
@@ -45,6 +41,7 @@ module GHC.Tc.Utils.TcType (
   TcLevel(..), topTcLevel, pushTcLevel, isTopTcLevel,
   strictlyDeeperThan, deeperThanOrSame, sameDepthAs,
   tcTypeLevel, tcTyVarLevel, maxTcLevel, minTcLevel,
+  infiniteTcLevel, isInfiniteTcLevel,
 
   --------------------------------
   -- MetaDetails
@@ -88,7 +85,7 @@ module GHC.Tc.Utils.TcType (
   isSigmaTy, isRhoTy, isRhoExpTy, isOverloadedTy,
   isFloatingPrimTy, isDoubleTy, isFloatTy, isIntTy, isWordTy, isStringTy,
   isIntegerTy, isNaturalTy,
-  isBoolTy, isUnitTy, isAnyTy, isZonkAnyTy, isCharTy,
+  isBoolTy, isUnitTy, isAnyTy, isUnusedTypeTy, isCharTy,
   isTauTy, isTauTyCon, tcIsTyVarTy,
   isPredTy, isSimplePredTy, isTyVarClassPred,
   checkValidClsArgs, hasTyVarHead,
@@ -98,7 +95,8 @@ module GHC.Tc.Utils.TcType (
   -- Re-exported from GHC.Core.TyCo.Compare
   -- mainly just for back-compat reasons
   eqType, eqTypes, nonDetCmpType, eqTypeX,
-  pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck, mayLookIdentical,
+  pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck,
+  mayLookIdentical, pprWithInvisibleBits, InvisibleBit(..), InvisibleBits,
   tcEqTyConApps, eqForAllVis, eqVarBndrs,
 
   ---------------------------------
@@ -176,7 +174,6 @@ module GHC.Tc.Utils.TcType (
   substTyUnchecked, substTysUnchecked, substScaledTyUnchecked,
   substThetaUnchecked,
   substTyWithUnchecked,
-  substCoUnchecked, substCoWithUnchecked,
   substTheta,
 
   isUnliftedType,
@@ -186,7 +183,6 @@ module GHC.Tc.Utils.TcType (
   coreView,
 
   tyCoVarsOfType, tyCoVarsOfTypes, closeOverKinds,
-  tyCoFVsOfType, tyCoFVsOfTypes,
   tyCoVarsOfTypeDSet, tyCoVarsOfTypesDSet, closeOverKindsDSet,
   tyCoVarsOfTypeList, tyCoVarsOfTypesList,
   noFreeVarsOfType,
@@ -223,19 +219,21 @@ import {-# SOURCE #-} GHC.Tc.Types.Origin
   ( SkolemInfo, unkSkol
   , FixedRuntimeRepOrigin, FixedRuntimeRepContext )
 
--- others:
+import GHC.Types.Var.FV
 import GHC.Types.Name as Name
             -- We use this to make dictionaries for type literals.
             -- Perhaps there's a better way to do this?
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
-import GHC.Builtin.Names
-import GHC.Builtin.Types ( coercibleClass, eqClass, heqClass, unitTyConKey
-                         , listTyCon, constraintKind )
 import GHC.Types.Basic
-import GHC.Utils.Misc
+
+import GHC.Builtin.KnownKeys
+import GHC.Builtin.WiredIn.Types ( coercibleClass, eqClass, heqClass, unitTyConKey
+                         , listTyCon, constraintKind )
 import GHC.Data.Maybe
 import GHC.Data.List.SetOps ( getNth, findDupsEq )
+
+import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
@@ -367,7 +365,7 @@ type TcThetaType    = ThetaType
 type TcSigmaType    = TcType
 
 -- | A 'TcSigmaTypeFRR' is a 'TcSigmaType' which has a syntactically
---  fixed 'RuntimeRep' in the sense of Note [Fixed RuntimeRep]
+-- fixed 'RuntimeRep' in the sense of Note [Fixed RuntimeRep]
 -- in GHC.Tc.Utils.Concrete.
 --
 -- In particular, this means that:
@@ -380,8 +378,11 @@ type TcSigmaType    = TcType
 -- See Note [Return arguments with a fixed RuntimeRep.
 type TcSigmaTypeFRR = TcSigmaType
     -- TODO: consider making this a newtype.
+type TcRhoTypeFRR   = TcRhoType
 
 type TcRhoType      = TcType  -- Note [TcRhoType]
+-- | A 'TcRhoType' which has a syntactically fixed 'RuntimeRep', in the sense of
+-- Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
 type TcTauType      = TcType
 type TcKind         = Kind
 type TcTyVarSet     = TyVarSet
@@ -408,8 +409,12 @@ data InferResult
        , ir_lvl  :: TcLevel
          -- ^ See Note [TcLevel of ExpType] in GHC.Tc.Utils.TcMType
 
-       , ir_frr  :: Maybe FixedRuntimeRepContext
+       , ir_frr  :: InferFRRFlag
          -- ^ See Note [FixedRuntimeRep context in ExpType] in GHC.Tc.Utils.TcMType
+
+       , ir_inst :: InferInstFlag
+         -- ^ True <=> when DeepSubsumption is on, deeply instantiate before filling,
+         -- See Note [Instantiation of InferResult] in GHC.Tc.Utils.Unify
 
        , ir_ref  :: IORef (Maybe TcType) }
          -- ^ The type that fills in this hole should be a @Type@,
@@ -419,25 +424,48 @@ data InferResult
          -- @rr@ must be concrete, in the sense of Note [Concrete types]
          -- in GHC.Tc.Utils.Concrete.
 
-type ExpSigmaType    = ExpType
+data InferFRRFlag
+  = IFRR_Check                -- Check that the result type has a fixed runtime rep
+      FixedRuntimeRepContext  -- Typically used for function arguments and lambdas
+
+  | IFRR_Any                  -- No need to check for fixed runtime-rep
+
+data InferInstFlag  -- Specifies whether the inference should return an uninstantiated
+                    -- SigmaType, or a (possibly deeply) instantiated RhoType
+                    -- See Note [Instantiation of InferResult] in GHC.Tc.Utils.Unify
+
+  = IIF_Sigma       -- Trying to infer a SigmaType
+                    -- Don't instantiate at all, regardless of DeepSubsumption
+                    -- Typically used when inferring the type of a pattern
+
+  | IIF_ShallowRho  -- Trying to infer a shallow RhoType (no foralls or => at the top)
+                    -- Top-instantiate (only, regardless of DeepSubsumption) before filling the hole
+                    -- Used only for view patterns; see Note [View patterns and polymorphism]
+
+  | IIF_DeepRho     -- Trying to infer a possibly-deep RhoType (depending on DeepSubsumption)
+                    -- If DeepSubsumption is off, same as IIF_ShallowRho
+                    -- If DeepSubsumption is on, instantiate deeply before filling the hole
+                    -- Typically used when inferring the type of an expression
+
+type ExpSigmaType = ExpType
+type ExpRhoType   = ExpType
+      -- Invariant: in ExpRhoType, if -XDeepSubsumption is on,
+      --            and we are in checking mode (i.e. the ExpRhoType is (Check rho)),
+      --            then the `rho` is deeply skolemised
 
 -- | An 'ExpType' which has a fixed RuntimeRep.
 --
 -- For a 'Check' 'ExpType', the stored 'TcType' must have
 -- a fixed RuntimeRep. For an 'Infer' 'ExpType', the 'ir_frr'
--- field must be of the form @Just frr_orig@.
-type ExpTypeFRR      = ExpType
+-- field must be of the form @IFRR_Check frr_orig@.
+type ExpTypeFRR = ExpType
 
 -- | Like 'TcSigmaTypeFRR', but for an expected type.
 --
 -- See 'ExpTypeFRR'.
 type ExpSigmaTypeFRR = ExpTypeFRR
+type ExpRhoTypeFRR   = ExpTypeFRR
   -- TODO: consider making this a newtype.
-
-type ExpRhoType = ExpType
-      -- Invariant: if -XDeepSubsumption is on,
-      --            and we are checking (i.e. the ExpRhoType is (Check rho)),
-      --            then the `rho` is deeply skolemised
 
 -- | Like 'ExpType', but on kind level
 type ExpKind = ExpType
@@ -447,16 +475,27 @@ instance Outputable ExpType where
   ppr (Infer ir) = ppr ir
 
 instance Outputable InferResult where
-  ppr (IR { ir_uniq = u, ir_lvl = lvl, ir_frr = mb_frr })
-    = text "Infer" <> mb_frr_text <> braces (ppr u <> comma <> ppr lvl)
+  ppr (IR { ir_uniq = u, ir_lvl = lvl, ir_frr = mb_frr, ir_inst = inst })
+    = text "Infer" <> parens (pp_inst <> pp_frr)
+                   <> braces (ppr u <> comma <> ppr lvl)
     where
-      mb_frr_text = case mb_frr of
-        Just _  -> text "FRR"
-        Nothing -> empty
+     pp_inst = case inst of
+                IIF_Sigma      -> text "Sigma"
+                IIF_ShallowRho -> text "ShallowRho"
+                IIF_DeepRho    -> text "DeepRho"
+     pp_frr = case mb_frr of
+                IFRR_Check {} -> text ",FRR"
+                IFRR_Any      -> empty
 
 -- | Make an 'ExpType' suitable for checking.
 mkCheckExpType :: TcType -> ExpType
 mkCheckExpType = Check
+
+getCheckExpType :: HasDebugCallStack => ExpType -> TcType
+-- Expect a (Check ty).
+-- See Note [ExpType in HsCtxt] in GHC.Tc.Types.ErrCtxt
+getCheckExpType (Check ty) = ty
+getCheckExpType (Infer ir) = pprPanic "getCheckExpType" (ppr ir)
 
 -- | Returns the expected type when in checking mode.
 checkingExpType_maybe :: ExpType -> Maybe TcType
@@ -699,7 +738,7 @@ data TcLevel = TcLevel {-# UNPACK #-} !Int
              | QLInstVar
   -- See Note [TcLevel invariants] for what this Int is
   -- See also Note [TcLevel assignment]
-  -- See also Note [The QLInstVar TcLevel]
+  -- See also Note [QuickLook instantiation variables]
 
 {-
 Note [TcLevel invariants]
@@ -734,7 +773,7 @@ Note [TcLevel invariants]
 The level of a MetaTyVar also governs its untouchability.  See
 Note [Unification preconditions] in GHC.Tc.Utils.Unify.
 
-  -- See also Note [The QLInstVar TcLevel]
+  -- See also Note [QuickLook instantiation variables]
 
 Note [TcLevel assignment]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -745,21 +784,23 @@ We arrange the TcLevels like this
    2          Second-level implication constraints
    ...etc...
    QLInstVar  The level for QuickLook instantiation variables
-              See Note [The QLInstVar TcLevel]
+              See Note [QuickLook instantiation variables]
 
-Note [The QLInstVar TcLevel]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-QuickLook instantiation variables are identified by having a TcLevel
-of QLInstVar.  See Note [Quick Look overview] in GHC.Tc.Gen.App.
+Note [QuickLook instantiation variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A QuickLook instantiation variable is identified precisely by
+    having a TcLevel of QLInstVar
+See (QL1) in Note [Quick Look overview] in GHC.Tc.Gen.App.
 
 The QLInstVar level behaves like infinity: it is greater than any
 other TcLevel.  See `strictlyDeeperThan` and friends in this module.
+
 That ensures that we never unify an ordinary unification variable
 with a QL instantiation variable, e.g.
       alpha[tau:3] := Maybe beta[tau:qlinstvar]
-(This is an immediate consequence of our general rule that we never
+This is an immediate consequence of our general rule that we never
 unify a variable with a type mentioning deeper variables; the skolem
-escape check.)
+escape check.
 
 QL instantation variables are eventually turned into ordinary unificaiton
 variables; see (QL3) in Note [Quick Look overview].
@@ -770,8 +811,8 @@ Invariant (GivenInv) is not essential, but it is easy to guarantee, and
 it is a useful extra piece of structure.  It ensures that the Givens of
 an implication don't change because of unifications /at the same level/
 caused by Wanteds.  (Wanteds can also cause unifications at an outer
-level, but that will iterate the entire implication; see GHC.Tc.Solver.Monad
-Note [The Unification Level Flag].)
+level, but that will iterate the entire implication; see GHC.Tc.Solver.Solve
+Note [When to iterate the solver: unifications].)
 
 Givens can certainly contain meta-tyvars from /outer/ levels.  E.g.
    data T a where
@@ -785,8 +826,8 @@ arising from the pattern match will look like this:
    forall[2] . Eq alpha[1] => (alpha[1] ~ Bool)
 
 But if we unify alpha (which in this case we will), we'll iterate
-the entire implication via Note [The Unification Level Flag] in
-GHC.Tc.Solver.Monad.  That isn't true of unifications at the /ambient/
+the entire implication via Note [When to iterate the solver: unifications]
+in GHC.Tc.Solver.Solve.  That isn't true of unifications at the /ambient/
 level.
 
 It would be entirely possible to weaken (GivenInv), to LESS THAN OR
@@ -812,6 +853,12 @@ We can unify alpha:=b in the inner implication, because 'alpha' is
 touchable; but then 'b' has escaped its scope into the outer implication.
 -}
 
+infiniteTcLevel :: TcLevel
+-- It is sometimes helpful to be able to say "infinitely deep"
+-- Particularly as a unit for `minTcLevel`
+-- Happily QLInstVar behaves like infinity :-)
+infiniteTcLevel = QLInstVar
+
 maxTcLevel :: TcLevel -> TcLevel -> TcLevel
 maxTcLevel (TcLevel a) (TcLevel b)
   | a > b      = TcLevel a
@@ -834,20 +881,24 @@ isTopTcLevel :: TcLevel -> Bool
 isTopTcLevel (TcLevel 0) = True
 isTopTcLevel _            = False
 
+isInfiniteTcLevel :: TcLevel -> Bool
+isInfiniteTcLevel QLInstVar = True
+isInfiniteTcLevel _         = False
+
 pushTcLevel :: TcLevel -> TcLevel
 -- See Note [TcLevel assignment]
 pushTcLevel (TcLevel us) = TcLevel (us + 1)
 pushTcLevel QLInstVar    = QLInstVar
 
 strictlyDeeperThan :: TcLevel -> TcLevel -> Bool
--- See Note [The QLInstVar TcLevel]
+-- See Note [QuickLook instantiation variables]
 strictlyDeeperThan (TcLevel tv_tclvl) (TcLevel ctxt_tclvl)
   = tv_tclvl > ctxt_tclvl
 strictlyDeeperThan QLInstVar (TcLevel {})  = True
 strictlyDeeperThan _ _                     = False
 
 deeperThanOrSame :: TcLevel -> TcLevel -> Bool
--- See Note [The QLInstVar TcLevel]
+-- See Note [QuickLook instantiation variables]
 deeperThanOrSame (TcLevel tv_tclvl) (TcLevel ctxt_tclvl)
   = tv_tclvl >= ctxt_tclvl
 deeperThanOrSame (TcLevel {}) QLInstVar  = False
@@ -960,8 +1011,8 @@ tcTyFamInstsAndVisX = go
     go _            (LitTy {})         = []
     go is_invis_arg (ForAllTy bndr ty) = go is_invis_arg (binderType bndr)
                                          ++ go is_invis_arg ty
-    go is_invis_arg (FunTy _ w ty1 ty2)  = go is_invis_arg w
-                                         ++ go is_invis_arg ty1
+    go is_invis_arg (FunTy _ w ty1 ty2)  =  go is_invis_arg ty1
+                                         ++ go is_invis_arg w
                                          ++ go is_invis_arg ty2
     go is_invis_arg ty@(AppTy _ _)     =
       let (ty_head, ty_args) = splitAppTys ty
@@ -1135,11 +1186,11 @@ exactTyCoVarsOfTypes :: [Type] -> TyCoVarSet
 exactTyCoVarsOfType  ty  = runTyCoVars (exact_ty ty)
 exactTyCoVarsOfTypes tys = runTyCoVars (exact_tys tys)
 
-exact_ty  :: Type       -> Endo TyCoVarSet
-exact_tys :: [Type]     -> Endo TyCoVarSet
-(exact_ty, exact_tys, _, _) = foldTyCo exactTcvFolder emptyVarSet
+exact_ty  :: Type       -> TyCoFV
+exact_tys :: [Type]     -> TyCoFV
+(exact_ty, exact_tys, _, _) = foldTyCo exactTcvFolder
 
-exactTcvFolder :: TyCoFolder TyCoVarSet (Endo TyCoVarSet)
+exactTcvFolder :: TyCoFolder TyCoFV
 exactTcvFolder = deepTcvFolder { tcf_view = coreView }
                  -- This is the key line
 
@@ -2006,7 +2057,7 @@ isFloatTy, isDoubleTy,
     isFloatPrimTy, isDoublePrimTy,
     isIntegerTy, isNaturalTy,
     isIntTy, isWordTy, isBoolTy,
-    isUnitTy, isAnyTy, isZonkAnyTy, isCharTy :: Type -> Bool
+    isUnitTy, isAnyTy, isUnusedTypeTy, isCharTy :: Type -> Bool
 isFloatTy      = is_tc floatTyConKey
 isDoubleTy     = is_tc doubleTyConKey
 isFloatPrimTy  = is_tc floatPrimTyConKey
@@ -2018,7 +2069,7 @@ isWordTy       = is_tc wordTyConKey
 isBoolTy       = is_tc boolTyConKey
 isUnitTy       = is_tc unitTyConKey
 isAnyTy        = is_tc anyTyConKey
-isZonkAnyTy    = is_tc zonkAnyTyConKey
+isUnusedTypeTy = is_tc unusedTypeTyConKey
 isCharTy       = is_tc charTyConKey
 
 -- | Check whether the type is of the form @Any :: k@,
@@ -2059,6 +2110,7 @@ isRigidTy ty
   | Just (tc,_) <- tcSplitTyConApp_maybe ty = isGenerativeTyCon tc Nominal
   | Just {} <- tcSplitAppTy_maybe ty        = True
   | isForAllTy ty                           = True
+  | Just {} <- isLitTy ty                   = True
   | otherwise                               = False
 
 {-
@@ -2401,7 +2453,7 @@ isTerminatingClass cls
     || cls `hasKey` typeableClassKey
             -- Typeable constraints are bigger than they appear due
             -- to kind polymorphism, but we can never get instance divergence this way
-    || cls `hasKey` unsatisfiableClassNameKey
+    || cls `hasKey` unsatisfiableClassKey
 
 allDistinctTyVars :: TyVarSet -> [KindOrType] -> Bool
 -- (allDistinctTyVars tvs tys) returns True if tys are

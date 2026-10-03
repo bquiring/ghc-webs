@@ -17,7 +17,7 @@ import GHC.Types.Var.Env
 import GHC.Types.Unique.DFM
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Builtin.Types
+import GHC.Builtin.WiredIn.Types
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import Control.Monad.Trans.RWS.CPS
@@ -62,7 +62,7 @@ pprRefutableShapes (var, alts)
   = var <+> text "is not one of" <+> format_alts alts
   where
     format_alts = braces . fsep . punctuate comma . shorten . map ppr_alt
-    shorten (a:b:c:_:_)       = a:b:c:[text "..."]
+    shorten (a:b:c:_:_)       = a:b:c:[ellipsis]
     shorten xs                = xs
     ppr_alt (PmAltConLike cl) = ppr cl
     ppr_alt (PmAltLit lit)    = ppr lit

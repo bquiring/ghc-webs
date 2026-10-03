@@ -37,13 +37,11 @@ module GHC.Internal.Control.Monad.ST.Lazy.Imp (
         unsafeIOToST
     ) where
 
-import GHC.Internal.Control.Monad.Fix
-import GHC.Internal.Data.Tuple
-
-import qualified GHC.Internal.Control.Monad.ST.Imp as ST
-
-import qualified GHC.Internal.ST as GHC.ST
 import GHC.Internal.Base
+import GHC.Internal.Data.Tuple
+import qualified GHC.Internal.Control.Monad.ST.Imp as ST
+import qualified GHC.Internal.ST as GHC.ST
+import GHC.Internal.Prim (RealWorld, State#, noDuplicate#)
 
 -- | The lazy @'ST'@ monad.
 -- The ST monad allows for destructive updates, but is escapable (unlike @IO@).
@@ -210,9 +208,13 @@ fixST m = ST (\ s ->
 -- itself is demanded directly in the `let` body. See also
 -- Note [Lazy ST: not producing lazy pairs].
 
--- | @since base-2.01
-instance MonadFix (ST s) where
-        mfix = fixST
+-- | @since base-4.23.0.0
+instance Semigroup a => Semigroup (ST s a) where
+    (<>) = liftA2 (<>)
+
+-- | @since base-4.23.0.0
+instance Monoid a => Monoid (ST s a) where
+    mempty = pure mempty
 
 -- ---------------------------------------------------------------------------
 -- Strict <--> Lazy

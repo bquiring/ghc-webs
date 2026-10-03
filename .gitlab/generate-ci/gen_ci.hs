@@ -20,6 +20,8 @@ import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Set as S
 import System.Environment
 import Data.List
+import qualified Data.ByteString.Lazy.Char8 as B8
+import Data.Char (isSpace)
 
 {-
 Note [Generating the CI pipeline]
@@ -82,7 +84,7 @@ The generated names for the jobs is important as there are a few downstream cons
 of the jobs artifacts. Therefore some care should be taken if changing the generated
 names of jobs to update these other places.
 
-1. Fedora33 jobs are required by head.hackage
+1. fedora43 jobs are required by head.hackage
 2. The fetch-gitlab release utility pulls release artifacts from the
 3. The ghc-head-from script downloads release artifacts based on a pipeline change.
 4. Some subsequent CI jobs have explicit dependencies (for example docs-tarball, perf, perf-nofib)
@@ -111,23 +113,18 @@ data Opsys
   | Windows deriving (Eq)
 
 data LinuxDistro
-  = Debian12
+  = Debian13
+  | Debian12
   | Debian12Wine
-  | Debian12Riscv
+  | Debian13Riscv
   | Debian11
   | Debian11Js
-  | Debian10
-  | Debian9
-  | Fedora33
-  | Fedora38
+  | Fedora43
   | Ubuntu2404LoongArch64
   | Ubuntu2404
   | Ubuntu2204
-  | Ubuntu2004
-  | Ubuntu1804
   | Alpine312
-  | Alpine318
-  | Alpine320
+  | Alpine323
   | AlpineWasm
   | Rocky8
   deriving (Eq)
@@ -140,9 +137,14 @@ bignumString :: BignumBackend -> String
 bignumString Gmp = "gmp"
 bignumString Native = "native"
 
+data TimeoutIncrease = TimeoutIncrease | NoTimeoutIncrease
+
 data CrossEmulator
   = NoEmulator
-  | NoEmulatorNeeded
+  | NoEmulatorNeeded TimeoutIncrease
+      -- ^ Some targets (e.g. JavaScript) don't require an explicit emulator
+      -- managed by the testsuite (a shell script's shebang is used instead),
+      -- yet tests need more time to execute hence they require an increased timeout.
   | Emulator String
 
 -- | A BuildConfig records all the options which can be modified to affect the
@@ -157,16 +159,19 @@ data BuildConfig
                 , withNuma       :: Bool
                 , withZstd       :: Bool
                 , crossTarget    :: Maybe String
+                , crossStage     :: Maybe Int
                 , crossEmulator  :: CrossEmulator
                 , configureWrapper :: Maybe String
                 , fullyStatic    :: Bool
                 , hostFullyStatic :: Bool
                 , tablesNextToCode :: Bool
                 , threadSanitiser :: Bool
+                , ubsan :: Bool
                 , noSplitSections :: Bool
                 , validateNonmovingGc :: Bool
                 , textWithSIMDUTF :: Bool
                 , testsuiteUsePerf :: Bool
+                , testsuiteWays :: [String]
                 }
 
 -- Extra arguments to pass to ./configure due to the BuildConfig
@@ -174,7 +179,7 @@ configureArgsStr :: BuildConfig -> String
 configureArgsStr bc = unwords $
      ["--enable-unregisterised"| unregisterised bc ]
   ++ ["--disable-tables-next-to-code" | not (tablesNextToCode bc) ]
-  ++ ["--with-intree-gmp" | Just _ <- pure (crossTarget bc) ]
+  ++ ["--with-intree-gmp" | Just _ <- [crossTarget bc] ]
   ++ ["--with-system-libffi" | crossTarget bc == Just "wasm32-wasi" ]
   ++ ["--enable-ipe-data-compression" | withZstd bc ]
   ++ ["--enable-strict-ghc-toolchain-check"]
@@ -188,6 +193,7 @@ mkJobFlavour BuildConfig{..} = Flavour buildFlavour opts
            [FullyStatic | fullyStatic] ++
            [HostFullyStatic | hostFullyStatic] ++
            [ThreadSanitiser | threadSanitiser] ++
+           [UBSan | ubsan] ++
            [NoSplitSections | noSplitSections, buildFlavour == Release ] ++
            [BootNonmovingGc | validateNonmovingGc ] ++
            [TextWithSIMDUTF | textWithSIMDUTF]
@@ -200,6 +206,7 @@ data FlavourTrans =
     | FullyStatic
     | HostFullyStatic
     | ThreadSanitiser
+    | UBSan
     | NoSplitSections
     | BootNonmovingGc
     | TextWithSIMDUTF
@@ -222,16 +229,19 @@ vanilla = BuildConfig
   , withNuma = False
   , withZstd = False
   , crossTarget = Nothing
+  , crossStage  = Nothing
   , crossEmulator = NoEmulator
   , configureWrapper = Nothing
   , fullyStatic = False
   , hostFullyStatic = False
   , tablesNextToCode = True
   , threadSanitiser = False
+  , ubsan = False
   , noSplitSections = False
   , validateNonmovingGc = False
   , textWithSIMDUTF = False
   , testsuiteUsePerf = False
+  , testsuiteWays = []
   }
 
 splitSectionsBroken :: BuildConfig -> BuildConfig
@@ -271,15 +281,19 @@ crossConfig :: String       -- ^ target triple
             -> BuildConfig
 crossConfig triple emulator configure_wrapper =
     vanilla { crossTarget = Just triple
+            , crossStage  = Just 2
             , crossEmulator = emulator
             , configureWrapper = configure_wrapper
             }
 
 llvm :: BuildConfig
-llvm = vanilla { llvmBootstrap = True }
+llvm = vanilla { llvmBootstrap = True, testsuiteWays = ["llvm", "optllvm"] }
 
 tsan :: BuildConfig
 tsan = vanilla { threadSanitiser = True }
+
+enableUBSan :: BuildConfig
+enableUBSan = vanilla { withDwarf = True, ubsan = True }
 
 noTntc :: BuildConfig
 noTntc = vanilla { tablesNextToCode = False }
@@ -313,24 +327,19 @@ runnerPerfTag arch sys = runnerTag arch sys ++ "-perf"
 -- These names are used to find the docker image so they have to match what is
 -- in the docker registry.
 distroName :: LinuxDistro -> String
+distroName Debian13      = "deb13"
 distroName Debian12      = "deb12"
 distroName Debian11      = "deb11"
 distroName Debian11Js    = "deb11-emsdk-closure"
-distroName Debian12Riscv = "deb12-riscv"
+distroName Debian13Riscv = "deb13-riscv"
 distroName Debian12Wine  = "deb12-wine"
-distroName Debian10      = "deb10"
-distroName Debian9       = "deb9"
-distroName Fedora33      = "fedora33"
-distroName Fedora38      = "fedora38"
+distroName Fedora43      = "fedora43"
 distroName Ubuntu2404LoongArch64 = "ubuntu24_04-loongarch"
-distroName Ubuntu1804    = "ubuntu18_04"
-distroName Ubuntu2004    = "ubuntu20_04"
 distroName Ubuntu2204    = "ubuntu22_04"
 distroName Ubuntu2404    = "ubuntu24_04"
 distroName Alpine312     = "alpine3_12"
-distroName Alpine318     = "alpine3_18"
-distroName Alpine320     = "alpine3_20"
-distroName AlpineWasm    = "alpine3_20-wasm"
+distroName Alpine323     = "alpine3_23"
+distroName AlpineWasm    = "alpine3_23-wasm"
 distroName Rocky8        = "rocky8"
 
 opsysName :: Opsys -> String
@@ -377,6 +386,7 @@ flavourString (Flavour base trans) = base_string base ++ concatMap (("+" ++) . f
     flavour_string FullyStatic = "fully_static"
     flavour_string HostFullyStatic = "host_fully_static"
     flavour_string ThreadSanitiser = "thread_sanitizer_cmm"
+    flavour_string UBSan = "ubsan"
     flavour_string NoSplitSections = "no_split_sections"
     flavour_string BootNonmovingGc = "boot_nonmoving_gc"
     flavour_string TextWithSIMDUTF = "text_simdutf"
@@ -446,8 +456,8 @@ opsysVariables _ FreeBSD14 = mconcat
     -- Prefer to use the system's clang-based toolchain and not gcc
   , "CC" =: "cc"
   , "CXX" =: "c++"
-  , "GHC_VERSION" =: "9.6.4"
-  , "CABAL_INSTALL_VERSION" =: "3.10.3.0"
+  , "FETCH_GHC_VERSION" =: "9.10.3"
+  , "CABAL_INSTALL_VERSION" =: "3.14.2.0"
   ]
 opsysVariables arch (Linux distro) = distroVariables arch distro
 opsysVariables AArch64 (Darwin {}) = mconcat
@@ -476,9 +486,9 @@ opsysVariables Amd64 (Darwin {}) = mconcat
 opsysVariables _ (Windows {}) = mconcat
   [ "MSYSTEM" =: "CLANG64"
   , "LANG" =: "en_US.UTF-8"
-  , "CABAL_INSTALL_VERSION" =: "3.10.2.0"
+  , "CABAL_INSTALL_VERSION" =: "3.14.2.0"
   , "HADRIAN_ARGS" =: "--docs=no-sphinx-pdfs"
-  , "GHC_VERSION" =: "9.6.4"
+  , "FETCH_GHC_VERSION" =: "9.10.3"
   ]
 opsysVariables _ _ = mempty
 
@@ -493,7 +503,6 @@ alpineVariables arch = mconcat $
   [ mconcat [ brokenTest test "#25498" | test <- ["simd009", "T25169"] ]
   | I386 <- [arch]
   ] ++
-  [ brokenTest "T22033" "#25497" | I386 <- [arch] ] ++
   [ -- Bootstrap compiler has incorrectly configured target triple #25200
     "CONFIGURE_ARGS" =: "--enable-ignore-build-platform-mismatch --build=aarch64-unknown-linux --host=aarch64-unknown-linux --target=aarch64-unknown-linux"
   | AArch64 <- [arch]
@@ -502,16 +511,7 @@ alpineVariables arch = mconcat $
 
 distroVariables :: Arch -> LinuxDistro -> Variables
 distroVariables arch Alpine312 = alpineVariables arch
-distroVariables arch Alpine318 = alpineVariables arch
-distroVariables arch Alpine320 = alpineVariables arch
-distroVariables _    Fedora33  = mconcat
-  -- LLC/OPT do not work for some reason in our fedora images
-  -- These tests fail with this error: T11649 T5681 T7571 T8131b
-  -- +/opt/llvm/bin/opt: /lib64/libtinfo.so.5: no version information available (required by /opt/llvm/bin/opt)
-  -- +/opt/llvm/bin/llc: /lib64/libtinfo.so.5: no version information available (required by /opt/llvm/bin/llc)
-  [ "LLC" =: "/bin/false"
-  , "OPT" =: "/bin/false"
-  ]
+distroVariables arch Alpine323 = alpineVariables arch
 distroVariables _ _ = mempty
 
 -----------------------------------------------------------------------------
@@ -810,6 +810,9 @@ data Job
         , jobPlatform  :: (Arch, Opsys)
         }
 
+instance Show Job where
+  show = B8.unpack . encode
+
 instance ToJSON Job where
   toJSON Job{..} = object
     [ "stage" A..= jobStage
@@ -886,23 +889,41 @@ job arch opsys buildConfig = NamedJob { name = jobName, jobInfo = Job {..} }
       , "INSTALL_CONFIGURE_ARGS" =: "--enable-strict-ghc-toolchain-check"
       , maybe mempty ("CONFIGURE_WRAPPER" =:) (configureWrapper buildConfig)
       , maybe mempty ("CROSS_TARGET" =:) (crossTarget buildConfig)
+      , maybe mempty (("CROSS_STAGE" =:) . show) (crossStage buildConfig)
       , case crossEmulator buildConfig of
           NoEmulator
             -- we need an emulator but it isn't set. Won't run the testsuite
             | Just _ <- crossTarget buildConfig
-                           -> "CROSS_EMULATOR" =: "NOT_SET"
-            | otherwise    -> mempty
-          Emulator s       -> "CROSS_EMULATOR" =: s
-          NoEmulatorNeeded -> mempty
+                             -> "CROSS_EMULATOR" =: "NOT_SET"
+            | otherwise      -> mempty
+          Emulator s         -> "CROSS_EMULATOR" =: s
+          NoEmulatorNeeded _ -> mempty
       , if withNuma buildConfig then "ENABLE_NUMA" =: "1" else mempty
-      , let runtestArgs =
+      , let
+            -- Emulators are naturally slower than native machines.
+            -- Triple the default of 300.
+            timeoutConf = "-e config.timeout=900"
+            testTimeoutArg =
+                case crossEmulator buildConfig of
+                  Emulator _ -> timeoutConf
+                  -- NodeJS (Javascript) is slower than native code
+                  NoEmulatorNeeded TimeoutIncrease -> timeoutConf
+                  _ -> mempty
+            runtestArgs =
+                testTimeoutArg :
                 [ "--way=nonmoving --way=nonmoving_thr --way=nonmoving_thr_sanity"
                 | validateNonmovingGc buildConfig
                 ]
-        in "RUNTEST_ARGS" =: unwords runtestArgs
+        in "RUNTEST_ARGS" =: (trim . unwords) runtestArgs
       , if testsuiteUsePerf buildConfig then "RUNTEST_ARGS" =: "--config perf_path=perf" else mempty
+      , "TEST_WAYS" =: unwords (testsuiteWays buildConfig)
       ]
 
+    trim :: String -> String
+    trim = dropWhileEnd isSpace . dropWhile isSpace
+
+    -- Keep in sync with the exclude list in `function clean()` in
+    -- `.gitlab/ci.sh`!
     jobArtifacts = Artifacts
       { junitReport = "junit.xml"
       , expireIn = "2 weeks"
@@ -1137,13 +1158,10 @@ jobs = Map.fromList $ concatMap flattenJobGroup job_groups
 debian_x86 :: [JobGroup Job]
 debian_x86 =
   [ -- Release configurations
-    -- We still build Deb9 bindists for now due to Ubuntu 18 and Linux Mint 19
-    -- not being at EOL until April 2023 and they still need tinfo5.
-    disableValidate (standardBuildsWithConfig Amd64 (Linux Debian9) (splitSectionsBroken vanilla))
-  , disableValidate (standardBuilds Amd64 (Linux Debian10))
-  , disableValidate (standardBuildsWithConfig Amd64 (Linux Debian10) dwarf)
+    disableValidate (standardBuildsWithConfig Amd64 (Linux Debian11) dwarf)
   , disableValidate (standardBuilds Amd64 (Linux Debian11))
   , disableValidate (standardBuilds Amd64 (Linux Debian12))
+  , disableValidate (standardBuilds Amd64 (Linux Debian13))
 
 
     -- Validate only builds
@@ -1155,7 +1173,7 @@ debian_x86 =
   , -- Nightly allowed to fail: #22343
     modifyNightlyJobs allowFailure (modifyValidateJobs manual (validateBuilds Amd64 (Linux validate_debian) noTntc))
     -- Run the 'perf' profiling nightly job in the release config.
-  , perfProfilingJob Amd64 (Linux Debian12) releaseConfig
+  , perfProfilingJob Amd64 (Linux Debian13) releaseConfig
 
   , onlyRule LLVMBackend (validateBuilds Amd64 (Linux validate_debian) llvm)
   , addValidateRule TestPrimops (standardBuilds Amd64 (Linux validate_debian))
@@ -1164,7 +1182,7 @@ debian_x86 =
   , onlyRule IpeData (validateBuilds Amd64 (Linux validate_debian) zstdIpe)
   ]
   where
-    validate_debian = Debian12
+    validate_debian = Debian13
 
     perfProfilingJob arch sys buildConfig =
         -- Rename the job to avoid conflicts
@@ -1182,24 +1200,23 @@ debian_x86 =
 
 debian_aarch64 :: [JobGroup Job]
 debian_aarch64 =
-  [
-     disableValidate (standardBuildsWithConfig AArch64 (Linux Debian10) (splitSectionsBroken vanilla))
-   , fastCI (standardBuildsWithConfig AArch64 (Linux Debian12) (splitSectionsBroken vanilla))
-     -- LLVM backend bootstrap
-   , onlyRule LLVMBackend (validateBuilds AArch64 (Linux Debian12) llvm)
+  [ disableValidate (standardBuildsWithConfig AArch64 (Linux Debian11) (splitSectionsBroken vanilla))
+  , disableValidate (standardBuildsWithConfig AArch64 (Linux Debian12) (splitSectionsBroken vanilla))
+  , fastCI (standardBuildsWithConfig AArch64 (Linux Debian13) (splitSectionsBroken vanilla))
+    -- LLVM backend bootstrap
+  , onlyRule LLVMBackend (validateBuilds AArch64 (Linux Debian13) llvm)
   ]
 
 debian_i386 :: [JobGroup Job]
 debian_i386 =
-  [ disableValidate (standardBuildsWithConfig I386 (Linux Debian10) (splitSectionsBroken vanilla))
-  , addValidateRule I386Backend (standardBuildsWithConfig I386 (Linux Debian12) (splitSectionsBroken vanilla))
+  [ disableValidate (standardBuildsWithConfig I386 (Linux Debian11) (splitSectionsBroken vanilla))
+  , disableValidate (standardBuildsWithConfig I386 (Linux Debian12) (splitSectionsBroken vanilla))
+  , addValidateRule I386Backend (standardBuildsWithConfig I386 (Linux Debian13) (splitSectionsBroken vanilla))
   ]
 
 ubuntu_x86 :: [JobGroup Job]
 ubuntu_x86 =
-  [ disableValidate (standardBuilds Amd64 (Linux Ubuntu1804))
-  , disableValidate (standardBuilds Amd64 (Linux Ubuntu2004))
-  , disableValidate (standardBuilds Amd64 (Linux Ubuntu2204))
+  [ disableValidate (standardBuilds Amd64 (Linux Ubuntu2204))
   , disableValidate (standardBuilds Amd64 (Linux Ubuntu2404))
   ]
 
@@ -1210,13 +1227,22 @@ rhel_x86 =
 
 fedora_x86 :: [JobGroup Job]
 fedora_x86 =
-  [ -- Fedora33 job is always built with perf so there's one job in the normal
+  [ -- Fedora43 job is always built with perf so there's one job in the normal
     -- validate pipeline which is built with perf.
-    fastCI (standardBuildsWithConfig Amd64 (Linux Fedora33) releaseConfig)
+    fastCI (standardBuildsWithConfig Amd64 (Linux Fedora43) releaseConfig)
     -- This job is only for generating head.hackage docs
-  , hackage_doc_job (disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora33) releaseConfig))
-  , disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora33) dwarf)
-  , disableValidate (standardBuilds Amd64 (Linux Fedora38))
+  , hackage_doc_job (disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora43) releaseConfig))
+  , disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora43) dwarf)
+  , disableValidate (standardBuilds Amd64 (Linux Fedora43))
+    -- For UBSan jobs, only enable for validate/nightly pipelines.
+    -- Also disable docs since it's not the point for UBSan jobs.
+  , modifyJobs
+      ( setVariable "HADRIAN_ARGS" "--docs=none"
+          . addVariable
+            "UBSAN_OPTIONS"
+            "suppressions=$CI_PROJECT_DIR/rts/.ubsan-suppressions"
+      )
+      $ validateBuilds Amd64 (Linux Fedora43) enableUBSan
   ]
   where
     hackage_doc_job = rename (<> "-hackage") . modifyJobs (addVariable "HADRIAN_ARGS" "--haddock-for-hackage")
@@ -1235,7 +1261,7 @@ darwin =
 
 freebsd_jobs :: [JobGroup Job]
 freebsd_jobs =
-  [ addValidateRule FreeBSDLabel (standardBuilds Amd64 FreeBSD14)
+  [ addValidateRule FreeBSDLabel (standardBuildsWithConfig Amd64 FreeBSD14 (splitSectionsBroken vanilla))
   ]
 
 alpine_x86 :: [JobGroup Job]
@@ -1244,9 +1270,8 @@ alpine_x86 =
     fullyStaticBrokenTests (standardBuildsWithConfig Amd64 (Linux Alpine312) (splitSectionsBroken static))
   , fullyStaticBrokenTests (disableValidate (allowFailureGroup (standardBuildsWithConfig Amd64 (Linux Alpine312) staticNativeInt)))
     -- Dynamically linked build, suitable for building your own static executables on alpine
-  , disableValidate (standardBuildsWithConfig Amd64 (Linux Alpine312) (splitSectionsBroken vanilla))
-  , disableValidate (standardBuildsWithConfig Amd64 (Linux Alpine320) (splitSectionsBroken vanilla))
-  , allowFailureGroup (standardBuildsWithConfig I386 (Linux Alpine320) (splitSectionsBroken vanilla))
+  , disableValidate (standardBuildsWithConfig Amd64 (Linux Alpine323) (splitSectionsBroken vanilla))
+  , standardBuildsWithConfig I386 (Linux Alpine323) (splitSectionsBroken vanilla)
   ]
   where
     -- ghcilink002 broken due to #17869
@@ -1257,16 +1282,16 @@ alpine_x86 =
 
 alpine_aarch64 :: [JobGroup Job]
 alpine_aarch64 = [
-  disableValidate (standardBuildsWithConfig AArch64 (Linux Alpine318) (splitSectionsBroken vanilla))
+  disableValidate (standardBuildsWithConfig AArch64 (Linux Alpine323) (splitSectionsBroken vanilla))
   ]
 
 cross_jobs :: [JobGroup Job]
 cross_jobs = [
     -- x86 -> aarch64
-    validateBuilds Amd64 (Linux Debian11) (crossConfig "aarch64-linux-gnu" (Emulator "qemu-aarch64 -L /usr/aarch64-linux-gnu") Nothing)
+    validateBuilds Amd64 (Linux Debian13) (crossConfig "aarch64-linux-gnu" (Emulator "qemu-aarch64 -L /usr/aarch64-linux-gnu") Nothing)
 
     -- x86_64 -> riscv
-  , addValidateRule RiscV (validateBuilds Amd64 (Linux Debian12Riscv) (crossConfig "riscv64-linux-gnu" (Emulator "qemu-riscv64 -L /usr/riscv64-linux-gnu") Nothing))
+  , addValidateRule RiscV (validateBuilds Amd64 (Linux Debian13Riscv) (crossConfig "riscv64-linux-gnu" (Emulator "qemu-riscv64 -L /usr/riscv64-linux-gnu") Nothing))
 
     -- x86_64 -> loongarch64
   , addValidateRule LoongArch64 (validateBuilds Amd64 (Linux Ubuntu2404LoongArch64) (crossConfig "loongarch64-linux-gnu" (Emulator "qemu-loongarch64 -L /usr/loongarch64-linux-gnu") Nothing))
@@ -1290,7 +1315,7 @@ cross_jobs = [
         (validateBuilds AArch64 (Linux Debian12Wine) (winAarch64Config {llvmBootstrap = True}))
   ]
   where
-    javascriptConfig = (crossConfig "javascript-unknown-ghcjs" (Emulator "js-emulator") (Just "emconfigure"))
+    javascriptConfig = (crossConfig "javascript-unknown-ghcjs" (NoEmulatorNeeded TimeoutIncrease) (Just "emconfigure"))
                          { bignumBackend = Native }
 
     makeWinArmJobs = modifyJobs
@@ -1318,6 +1343,13 @@ cross_jobs = [
           -- unexpected triple.
         . setVariable "CFLAGS" cflags
         . setVariable "CONF_CC_OPTS_STAGE2" cflags
+          -- For bindists `$USER_CONF_CC_OPTS_STAGE2` is not automatically set
+          -- to `$CONF_CC_OPTS_STAGE2`. But, we still have to deal with the hack
+          -- mentioned in the previous comment.
+          --
+          -- TODO: It would be nice to get rid of this hack. This would probably
+          -- involve setting the toolchain up in a different way.
+        . setVariable "USER_CONF_CC_OPTS_STAGE2" cflags
         ) where
             llvm_prefix = "/opt/llvm-mingw-linux/bin/aarch64-w64-mingw32-"
             cflags = "-fuse-ld=" ++ llvm_prefix ++ "ld --rtlib=compiler-rt"
@@ -1335,7 +1367,7 @@ cross_jobs = [
         $ addValidateRule WasmBackend $ validateBuilds Amd64 (Linux AlpineWasm) cfg
 
     wasm_build_config =
-      (crossConfig "wasm32-wasi" NoEmulatorNeeded Nothing)
+      (crossConfig "wasm32-wasi" (NoEmulatorNeeded NoTimeoutIncrease) Nothing)
         { hostFullyStatic = True
         , buildFlavour    = Release -- TODO: This needs to be validate but wasm backend doesn't pass yet
         , textWithSIMDUTF = True
@@ -1375,32 +1407,32 @@ mkPlatform arch opsys = archName arch <> "-" <> opsysName opsys
 platform_mapping :: Map String (JobGroup BindistInfo)
 platform_mapping = Map.map go combined_result
   where
-    whitelist = [ "x86_64-linux-alpine3_12-validate"
-                , "x86_64-linux-deb11-validate"
+    whitelist = [ "x86_64-linux-alpine3_12-validate+fully_static"
+                , "x86_64-linux-deb11-validate+debug_info"
                 , "x86_64-linux-deb12-validate"
-                , "x86_64-linux-deb10-validate+debug_info"
-                , "x86_64-linux-fedora33-release"
-                , "x86_64-linux-deb11-cross_aarch64-linux-gnu-validate"
+                , "x86_64-linux-deb13-validate"
+                , "x86_64-linux-fedora43-release"
                 , "x86_64-windows-validate"
                 , "aarch64-linux-deb12-validate"
+                , "aarch64-linux-deb13-validate"
                 , "aarch64-linux-deb12-wine-int_native-cross_aarch64-unknown-mingw32-validate"
-                , "nightly-x86_64-linux-alpine3_20-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf"
+                , "nightly-x86_64-linux-alpine3_23-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf"
                 , "nightly-x86_64-linux-deb11-validate"
                 , "nightly-x86_64-linux-deb12-validate"
-                , "x86_64-linux-alpine3_20-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf"
-                , "x86_64-linux-deb12-validate+thread_sanitizer_cmm"
-                , "nightly-aarch64-linux-deb10-validate"
+                , "nightly-x86_64-linux-deb13-validate"
+                , "x86_64-linux-alpine3_23-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf"
+                , "nightly-aarch64-linux-deb11-validate"
                 , "nightly-aarch64-linux-deb12-validate"
+                , "nightly-aarch64-linux-deb13-validate"
                 , "nightly-aarch64-linux-deb12-wine-int_native-cross_aarch64-unknown-mingw32-validate"
-                , "nightly-x86_64-linux-alpine3_12-validate"
-                , "nightly-x86_64-linux-deb10-validate"
-                , "nightly-x86_64-linux-fedora33-release"
+                , "nightly-x86_64-linux-alpine3_12-validate+fully_static"
+                , "nightly-x86_64-linux-fedora43-release"
                 , "nightly-x86_64-windows-validate"
-                , "release-x86_64-linux-alpine3_12-release+no_split_sections"
-                , "release-x86_64-linux-deb10-release"
+                , "release-x86_64-linux-alpine3_12-release+fully_static+no_split_sections"
                 , "release-x86_64-linux-deb11-release"
                 , "release-x86_64-linux-deb12-release"
-                , "release-x86_64-linux-fedora33-release"
+                , "release-x86_64-linux-deb13-release"
+                , "release-x86_64-linux-fedora43-release"
                 , "release-x86_64-windows-release"
                 ]
 
@@ -1418,13 +1450,20 @@ platform_mapping = Map.map go combined_result
 
     combined_result =
       Map.fromList
-      [ (p, StandardTriple { v = Map.lookup p vs
-                           , n = Map.lookup p ns
-                           , r = Map.lookup p rs })
-      | p <- S.toList all_platforms
+      [ (platform, StandardTriple
+          { v = Map.lookup platform vs
+          , n = Map.lookup platform ns
+          , r = Map.lookup platform rs })
+      | platform <- S.toList all_platforms
       ]
 
     combine a b
+      | name a `elem` whitelist
+      , name b `elem` whitelist
+      , name a /= name b = error $ unlines
+        [ "both selected, can only select one job for a specific key: "
+        , show (name a)
+        , show (name b) ] -- Explicitly selected
       | name a `elem` whitelist = a -- Explicitly selected
       | name b `elem` whitelist = b
       | otherwise = error (show (name a) ++ show (name b))

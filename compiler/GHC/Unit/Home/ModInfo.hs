@@ -3,13 +3,12 @@
 module GHC.Unit.Home.ModInfo
    (
      HomeModInfo (..)
-   , HomeModLinkable(..)
    , homeModInfoObject
    , homeModInfoByteCode
+   , HomeModLinkable (..)
+   , homeModLinkableByteCode
+   , homeModLinkableObject
    , emptyHomeModInfoLinkable
-   , justBytecode
-   , justObjects
-   , bytecodeAndObjects
    )
 where
 
@@ -18,11 +17,10 @@ import GHC.Prelude
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.ModDetails
 
-import GHC.Linker.Types ( Linkable(..), linkableIsNativeCodeOnly )
+import GHC.Linker.Types ( Linkable, LinkableWith, ModuleByteCode, LinkablePart (..) )
 
 import GHC.Utils.Outputable
-import GHC.Utils.Panic
-
+import qualified Data.List.NonEmpty as NE
 
 -- | Information about modules in the package being compiled
 data HomeModInfo = HomeModInfo
@@ -53,36 +51,26 @@ data HomeModInfo = HomeModInfo
    }
 
 homeModInfoByteCode :: HomeModInfo -> Maybe Linkable
-homeModInfoByteCode = homeMod_bytecode . hm_linkable
+homeModInfoByteCode = homeModLinkableByteCode . hm_linkable
 
 homeModInfoObject :: HomeModInfo -> Maybe Linkable
-homeModInfoObject = homeMod_object . hm_linkable
+homeModInfoObject = homeModLinkableObject . hm_linkable
 
 emptyHomeModInfoLinkable :: HomeModLinkable
 emptyHomeModInfoLinkable = HomeModLinkable Nothing Nothing
 
 -- See Note [Home module build products]
-data HomeModLinkable = HomeModLinkable { homeMod_bytecode :: !(Maybe Linkable)
+data HomeModLinkable = HomeModLinkable { homeMod_bytecode :: !(Maybe (LinkableWith ModuleByteCode))
                                        , homeMod_object   :: !(Maybe Linkable) }
+
+homeModLinkableByteCode :: HomeModLinkable -> Maybe Linkable
+homeModLinkableByteCode = fmap (fmap (NE.singleton . DotGBC)) . homeMod_bytecode
+
+homeModLinkableObject :: HomeModLinkable -> Maybe Linkable
+homeModLinkableObject = homeMod_object
 
 instance Outputable HomeModLinkable where
   ppr (HomeModLinkable l1 l2) = ppr l1 $$ ppr l2
-
-justBytecode :: Linkable -> HomeModLinkable
-justBytecode lm =
-  assertPpr (not (linkableIsNativeCodeOnly lm)) (ppr lm)
-   $ emptyHomeModInfoLinkable { homeMod_bytecode = Just lm }
-
-justObjects :: Linkable -> HomeModLinkable
-justObjects lm =
-  assertPpr (linkableIsNativeCodeOnly lm) (ppr lm)
-   $ emptyHomeModInfoLinkable { homeMod_object = Just lm }
-
-bytecodeAndObjects :: Linkable -> Linkable -> HomeModLinkable
-bytecodeAndObjects bc o =
-  assertPpr (not (linkableIsNativeCodeOnly bc) && linkableIsNativeCodeOnly o) (ppr bc $$ ppr o)
-    (HomeModLinkable (Just bc) (Just o))
-
 
 {-
 Note [Home module build products]

@@ -529,6 +529,7 @@ traverseGetChildren(StgClosure *c, StgClosure **first_child, bool *other_childre
     case RET_BCO:
     case RET_SMALL:
     case RET_BIG:
+    case ANN_FRAME:
         // invalid objects
     case IND:
     case INVALID_OBJECT:
@@ -832,6 +833,7 @@ traversePop(traverseState *ts, StgClosure **c, StgClosure **cp, stackData *data,
         case RET_BCO:
         case RET_SMALL:
         case RET_BIG:
+        case ANN_FRAME:
             // invalid objects
         case IND:
         case INVALID_OBJECT:
@@ -965,6 +967,7 @@ traversePushStack(traverseState *ts, StgClosure *cp, stackElement *sep,
         case CATCH_RETRY_FRAME:
         case ATOMICALLY_FRAME:
         case RET_SMALL:
+        case ANN_FRAME:
             bitmap = BITMAP_BITS(info->i.layout.bitmap);
             size   = BITMAP_SIZE(info->i.layout.bitmap);
             p++;
@@ -1239,15 +1242,12 @@ inner_loop:
         traversePushClosure(ts, (StgClosure *) tso->blocked_exceptions, c, sep, child_data);
         traversePushClosure(ts, (StgClosure *) tso->bq, c, sep, child_data);
         traversePushClosure(ts, (StgClosure *) tso->trec, c, sep, child_data);
-        switch (ACQUIRE_LOAD(&tso->why_blocked)) {
-        case BlockedOnMVar:
-        case BlockedOnMVarRead:
-        case BlockedOnBlackHole:
-        case BlockedOnMsgThrowTo:
+
+        StgThreadWhyBlocked why_blocked = ACQUIRE_LOAD(&tso->why_blocked);
+        if (IsBlockInfoClosure(why_blocked) && why_blocked != NotBlocked) {
+            // The NotBlocked case uses block_info.prev as a TSO back link.
+            // Do not follow in that case or we'll get into a loop.
             traversePushClosure(ts, tso->block_info.closure, c, sep, child_data);
-            break;
-        default:
-            break;
         }
         goto loop;
     }

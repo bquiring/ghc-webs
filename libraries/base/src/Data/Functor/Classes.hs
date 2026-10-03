@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE DefaultSignatures    #-}
@@ -71,6 +72,11 @@ module Data.Functor.Classes (
     showsBinary1,
   ) where
 
+import Prelude hiding( foldr )
+#if __GLASGOW_HASKELL__ >= 1001
+import qualified GHC.Essentials as Rebindable
+#endif
+
 import Control.Applicative (Alternative((<|>)), Const(Const))
 
 import GHC.Internal.Data.Functor.Identity (Identity(Identity))
@@ -85,10 +91,10 @@ import GHC.Internal.Read (expectP, list, paren, readField)
 import GHC.Internal.Show (appPrec)
 
 import GHC.Internal.Text.ParserCombinators.ReadPrec (ReadPrec, readPrec_to_S, readS_to_Prec, pfail)
-import GHC.Internal.Text.Read (Read(..), parens, prec, step, reset)
+import Text.Read (Read(..), parens, prec, step, reset)
 import GHC.Internal.Text.Read.Lex (Lexeme(..))
 import GHC.Internal.Text.Show (showListWith)
-import Prelude
+
 
 -- $setup
 -- >>> import Prelude

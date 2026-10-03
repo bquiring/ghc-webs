@@ -2,9 +2,6 @@
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE DataKinds #-}
 
 {-# OPTIONS_GHC -fno-specialise #-}
    -- Don't do type-class specialisation; it goes mad in this module
@@ -39,6 +36,7 @@ import GHC.Utils.Outputable
 
 import Data.Data hiding (Fixity)
 import qualified Data.ByteString as B
+import qualified GHC.Data.ShortText as ST
 import GHC.TypeLits
 
 -- | Should source spans be removed from output.
@@ -69,16 +67,15 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
               `extQ` string `extQ` fastString `extQ` srcSpan `extQ` realSrcSpan
               `extQ` annotationModule
               `extQ` annotationGrhsAnn
+              `extQ` annotationAnnListEpAnn
               `extQ` annotationAnnList
-              `extQ` annotationAnnListWhere
-              `extQ` annotationAnnListCommas
-              `extQ` annotationAnnListIE
-              `extQ` annotationEpAnnImportDecl
               `extQ` annotationNoEpAnns
               `extQ` annotationExprBracket
               `extQ` annotationTypedBracket
               `extQ` epTokenOC
               `extQ` epTokenCC
+              `extQ` epTokenOpenP
+              `extQ` epTokenCloseP
               `extQ` epTokenInstance
               `extQ` epTokenForall
               `extQ` annParen
@@ -92,15 +89,13 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
               `extQ` deltaPos
               `extQ` epaLocation
               `extQ` maybe_epaLocation
+              `extQ` shortText
               `extQ` bytestring
               `extQ` name `extQ` occName `extQ` moduleName `extQ` var
               `extQ` dataCon
               `extQ` bagName `extQ` bagRdrName `extQ` bagVar `extQ` nameSet
               `ext2Q` located
               `extQ` srcSpanAnnA
-              `extQ` srcSpanAnnL
-              `extQ` srcSpanAnnP
-              `extQ` srcSpanAnnC
               `extQ` srcSpanAnnN
 
       where generic :: Data a => a -> SDoc
@@ -114,6 +109,9 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
             fastString s = braces $
                             text "FastString:"
                         <+> text (normalize_newlines . show $ s)
+
+            shortText :: ST.ShortText -> SDoc
+            shortText = text . normalize_newlines . show
 
             bytestring :: B.ByteString -> SDoc
             bytestring = text . normalize_newlines . show
@@ -224,7 +222,6 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
              NoBlankEpAnnotations -> parens (case ap of
                                       (AnnParens       o c) -> text "AnnParens"       $$ vcat [showAstData' o, showAstData' c]
                                       (AnnParensHash   o c) -> text "AnnParensHash"   $$ vcat [showAstData' o, showAstData' c]
-                                      (AnnParensSquare o c) -> text "AnnParensSquare" $$ vcat [showAstData' o, showAstData' c]
                                       )
 
             annClassDecl :: AnnClassDecl -> SDoc
@@ -295,6 +292,12 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
             epTokenCC :: EpToken "}" -> SDoc
             epTokenCC = epToken'
 
+            epTokenOpenP :: EpToken "(" -> SDoc
+            epTokenOpenP = epToken'
+
+            epTokenCloseP :: EpToken ")" -> SDoc
+            epTokenCloseP = epToken'
+
             epTokenInstance :: EpToken "instance" -> SDoc
             epTokenInstance = epToken'
 
@@ -307,11 +310,6 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
                                       $ text "blanked:" <+> text "EpToken"
              NoBlankEpAnnotations ->
               parens $ text "EpTok" <+> epaLocation s
-            epToken' NoEpTok = case ba of
-             BlankEpAnnotations -> parens
-                                      $ text "blanked:" <+> text "EpToken"
-             NoBlankEpAnnotations ->
-              parens $ text "NoEpTok"
 
             epUniToken' :: EpUniToken sym1 sym2 -> SDoc
             epUniToken' (EpUniTok s f) = case ba of
@@ -319,12 +317,6 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
                                       $ text "blanked:" <+> text "EpUniToken"
              NoBlankEpAnnotations ->
               parens $ text "EpUniTok" <+> epaLocation s <+> ppr f
-            epUniToken' NoEpUniTok = case ba of
-             BlankEpAnnotations -> parens
-                                      $ text "blanked:" <+> text "EpUniToken"
-             NoBlankEpAnnotations ->
-              parens $ text "NoEpUniTok"
-
 
             var  :: Var -> SDoc
             var v      = braces $ text "Var:" <+> ppr v
@@ -365,20 +357,14 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
             annotationGrhsAnn :: EpAnn GrhsAnn -> SDoc
             annotationGrhsAnn = annotation' (text "EpAnn GrhsAnn")
 
-            annotationAnnList :: EpAnn (AnnList ()) -> SDoc
-            annotationAnnList = annotation' (text "EpAnn (AnnList ())")
+            annotationAnnListEpAnn :: EpAnn AnnList -> SDoc
+            annotationAnnListEpAnn = annotation' (text "EpAnn AnnList")
 
-            annotationAnnListWhere :: EpAnn (AnnList (EpToken "where")) -> SDoc
-            annotationAnnListWhere = annotation' (text "EpAnn (AnnList (EpToken \"where\"))")
-
-            annotationAnnListCommas :: EpAnn (AnnList [EpToken ","]) -> SDoc
-            annotationAnnListCommas = annotation' (text "EpAnn (AnnList [EpToken \",\"])")
-
-            annotationAnnListIE :: EpAnn (AnnList (EpToken "hiding", [EpToken ","])) -> SDoc
-            annotationAnnListIE = annotation' (text "EpAnn (AnnList (EpToken \"hiding\", [EpToken \",\"]))")
-
-            annotationEpAnnImportDecl :: EpAnn EpAnnImportDecl -> SDoc
-            annotationEpAnnImportDecl = annotation' (text "EpAnn EpAnnImportDecl")
+            annotationAnnList :: AnnList -> SDoc
+            annotationAnnList anns = case ba of
+             BlankEpAnnotations -> parens (text "blanked:" <+> text "AnnList ()")
+             NoBlankEpAnnotations -> parens $ text (showConstr (toConstr anns))
+                                               $$ vcat (gmapQ showAstData' anns)
 
             annotationNoEpAnns :: EpAnn NoEpAnns -> SDoc
             annotationNoEpAnns = annotation' (text "EpAnn NoEpAnns")
@@ -392,17 +378,8 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
 
             -- -------------------------
 
-            srcSpanAnnA :: EpAnn AnnListItem -> SDoc
+            srcSpanAnnA :: EpAnn [TrailingAnn] -> SDoc
             srcSpanAnnA = locatedAnn'' (text "SrcSpanAnnA")
-
-            srcSpanAnnL :: EpAnn (AnnList ()) -> SDoc
-            srcSpanAnnL = locatedAnn'' (text "SrcSpanAnnL")
-
-            srcSpanAnnP :: EpAnn AnnPragma -> SDoc
-            srcSpanAnnP = locatedAnn'' (text "SrcSpanAnnP")
-
-            srcSpanAnnC :: EpAnn AnnContext -> SDoc
-            srcSpanAnnC = locatedAnn'' (text "SrcSpanAnnC")
 
             srcSpanAnnN :: EpAnn NameAnn -> SDoc
             srcSpanAnnN = locatedAnn'' (text "SrcSpanAnnN")

@@ -832,6 +832,11 @@ PprLetIn:
 	$(CHECK_PPR)   $(LIBDIR) PprLetIn.hs
 	$(CHECK_EXACT) $(LIBDIR) PprLetIn.hs
 
+.PHONY: PprInfixHole
+PprInfixHole:
+	$(CHECK_PPR)   $(LIBDIR) PprInfixHole.hs
+	$(CHECK_EXACT) $(LIBDIR) PprInfixHole.hs
+
 .PHONY: CaseAltComments
 CaseAltComments:
 	$(CHECK_PPR)   $(LIBDIR) CaseAltComments.hs
@@ -902,6 +907,11 @@ Test25885:
 	$(CHECK_PPR)   $(LIBDIR) Test25885.hs
 	$(CHECK_EXACT) $(LIBDIR) Test25885.hs
 
+.PHONY: Test27291
+Test27291:
+	$(CHECK_PPR)   $(LIBDIR) Test27291.hs
+	$(CHECK_EXACT) $(LIBDIR) Test27291.hs
+
 .PHONY: TestLevelImports
 TestLevelImports:
 	$(CHECK_PPR)   $(LIBDIR) TestLevelImports.hs
@@ -912,3 +922,23 @@ TestLevelImports:
 TestNamedDefaults:
 	$(CHECK_PPR)   $(LIBDIR) TestNamedDefaults.hs
 	$(CHECK_EXACT) $(LIBDIR) TestNamedDefaults.hs
+
+.PHONY: PprModifiers
+PprModifiers:
+	$(CHECK_PPR)   $(LIBDIR) PprModifiers.hs
+	$(CHECK_EXACT) $(LIBDIR) PprModifiers.hs
+
+.PHONY: PprQualifiedStrings
+PprQualifiedStrings:
+	$(CHECK_PPR)   $(LIBDIR) PprQualifiedStrings.hs
+	$(CHECK_EXACT) $(LIBDIR) PprQualifiedStrings.hs
+
+.PHONY: Haddock1
+Haddock1:
+	# $(CHECK_PPR)   $(LIBDIR) Haddock1.hs
+	$(CHECK_EXACT) $(LIBDIR) Haddock1.hs
+
+.PHONY: T27423c
+T27423c:
+	$(CHECK_PPR)   $(LIBDIR) T27423c.hs
+	$(CHECK_EXACT) $(LIBDIR) T27423c.hs

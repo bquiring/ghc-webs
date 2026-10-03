@@ -6,9 +6,9 @@ module GHC.Internal.ClosureTypes
     ( ClosureType(..)
     ) where
 
-import GHC.Internal.Data.Eq
-import GHC.Internal.Data.Ord
+import GHC.Internal.Base
 import GHC.Internal.Enum
+import GHC.Internal.Num
 import GHC.Internal.Generics
 import GHC.Internal.Show
 
@@ -83,5 +83,6 @@ data ClosureType
     | SMALL_MUT_ARR_PTRS_FROZEN_CLEAN
     | COMPACT_NFDATA
     | CONTINUATION
+    | ANN_FRAME
     | N_CLOSURE_TYPES
     deriving (Enum, Eq, Ord, Show, Generic)

@@ -23,14 +23,21 @@ fi
 CABVERSTR=$("$CABAL" --numeric-version)
 CABVER=( ${CABVERSTR//./ } )
 
-if [ "${CABVER[0]}" -gt 2 -o "${CABVER[0]}" -eq 2 -a "${CABVER[1]}" -ge 2 ];
-then
-    "$CABAL" --project-file="$PROJ" new-build "${CABFLAGS[@]}" -j exe:hadrian
-    # use new-exec instead of new-run to make sure that the build-tools (alex & happy) are in PATH
-    "$CABAL" --project-file="$PROJ" new-exec  "${CABFLAGS[@]}"    hadrian -- \
-        --directory "$PWD" \
-        "$@"
-else
-    echo "Cabal version is too old; you need at least cabal-install 3.0"
+# We use 'cabal path', introduced with cabal-install 3.12.
+# Check version ahead of time to avoid a surprising failure later (#27317).
+if [ "${CABVER[0]}" -lt 3 ] || { [ "${CABVER[0]}" -eq 3 ] && [ "${CABVER[1]}" -lt 12 ]; }; then
+    echo "Cabal version is too old; you need at least cabal-install 3.12"
     exit 2
 fi
+
+REMOTE_REPO_CACHE=$("$CABAL" --with-compiler="$GHC" path --output-format=key-value 2>/dev/null | awk '/^remote-repo-cache:/ { print $2 }')
+if ! [ -d "$REMOTE_REPO_CACHE/hackage.haskell.org" ]; then
+    echo "Please run 'cabal update' first"
+    exit 2
+fi
+
+"$CABAL" --project-file="$PROJ" new-build "${CABFLAGS[@]}" -j exe:hadrian
+# use new-exec instead of new-run to make sure that the build-tools (alex & happy) are in PATH
+"$CABAL" --project-file="$PROJ" new-exec  "${CABFLAGS[@]}"    hadrian -- \
+    --directory "$PWD" \
+    "$@"

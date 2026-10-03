@@ -1,7 +1,4 @@
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE TypeApplications #-}
 
 module GHC.Tc.Solver.InertSet (
     -- * The work list
@@ -16,7 +13,7 @@ module GHC.Tc.Solver.InertSet (
     -- * The inert set
     InertSet(..),
     InertCans(..),
-    emptyInertSet, emptyInertCans,
+    emptyInertSet, emptyInertCans, resetInertCans,
 
     noGivenNewtypeReprEqs, updGivenEqs,
     prohibitedSuperClassSolve,
@@ -24,7 +21,7 @@ module GHC.Tc.Solver.InertSet (
     -- * Inert equalities
     InertEqs,
     foldTyEqs, delEq, findEq,
-    partitionInertEqs, partitionFunEqs,
+    partitionInertEqs, partitionFunEqs, transformAndPartitionTyVarEqs,
     filterInertEqs, filterFunEqs,
     foldFunEqs, addEqToCans,
 
@@ -69,14 +66,14 @@ import GHC.Core.Predicate
 import qualified GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCon
 import GHC.Core.Class( Class, classTyCon )
-import GHC.Builtin.Names( eqPrimTyConKey, heqTyConKey, eqTyConKey, coercibleTyConKey )
+import GHC.Builtin.KnownKeys( eqPrimTyConKey, heqTyConKey, eqTyConKey, coercibleTyConKey )
 import GHC.Utils.Misc       ( partitionWith )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Data.Bag
 
 import Control.Monad      ( forM_ )
-import Data.List.NonEmpty ( NonEmpty(..), (<|) )
+import qualified Data.List.NonEmpty as NE
 import Data.Function      ( on )
 
 {-
@@ -130,7 +127,8 @@ It's very important to process equalities over class constraints:
 Further refinements:
 
 * Among the equalities we prioritise ones with an empty rewriter set;
-  see Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint, wrinkle (W1).
+  see Note [Wanteds rewrite Wanteds: rewriter-sets] in GHC.Tc.Types.Constraint,
+  wrinkle (WRW8).
 
 * Among equalities with an empty rewriter set, we prioritise nominal equalities.
    * They have more rewriting power, so doing them first is better.
@@ -142,7 +140,7 @@ Note [Prioritise class equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We prioritise equalities in the solver (see selectWorkItem). But class
 constraints like (a ~ b) and (a ~~ b) are actually equalities too;
-see Note [The equality types story] in GHC.Builtin.Types.Prim.
+see Note [The equality types story] in GHC.Builtin.WiredIn.Prim.
 
 Failing to prioritise these is inefficient (more kick-outs etc).
 But, worse, it can prevent us spotting a "recursive knot" among
@@ -171,7 +169,7 @@ data WorkList
        , wl_rw_eqs  :: [Ct]  -- Like wl_eqs, but ones that may have a non-empty
                              -- rewriter set
          -- We prioritise wl_eqs over wl_rw_eqs;
-         -- see Note [Prioritise Wanteds with empty RewriterSet]
+         -- see Note [Prioritise Wanteds with empty CoHoleSet]
          -- in GHC.Tc.Types.Constraint for more details.
 
        , wl_rest :: [Ct]
@@ -200,11 +198,11 @@ workListSize :: WorkList -> Int
 workListSize (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs, wl_rest = rest })
   = length eqs_N + length eqs_X + length rw_eqs + length rest
 
-extendWorkListEq :: RewriterSet -> Ct -> WorkList -> WorkList
+extendWorkListEq :: CoHoleSet -> Ct -> WorkList -> WorkList
 extendWorkListEq rewriters ct
     wl@(WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs })
-  | isEmptyRewriterSet rewriters      -- A wanted that has not been rewritten
-    -- isEmptyRewriterSet: see Note [Prioritise Wanteds with empty RewriterSet]
+  | isEmptyCoHoleSet rewriters      -- A wanted that has not been rewritten
+    -- isEmptyCoHoleSet: see Note [Prioritise Wanteds with empty CoHoleSet]
     --                         in GHC.Tc.Types.Constraint
   = if isNominalEqualityCt ct
     then wl { wl_eqs_N = ct : eqs_N }
@@ -223,8 +221,8 @@ extendWorkListChildEqs :: CtEvidence -> Bag Ct -> WorkList -> WorkList
 -- Precondition: new_eqs is non-empty
 extendWorkListChildEqs parent_ev new_eqs
     wl@(WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs })
-  | isEmptyRewriterSet (ctEvRewriters parent_ev)
-    -- isEmptyRewriterSet: see Note [Prioritise Wanteds with empty RewriterSet]
+  | isEmptyCoHoleSet (ctEvRewriters parent_ev)
+    -- isEmptyCoHoleSet: see Note [Prioritise Wanteds with empty CoHoleSet]
     --                         in GHC.Tc.Types.Constraint
     -- If the rewriter set is empty, add to wl_eqs_X and wl_eqs_N
   = case partitionBag isNominalEqualityCt new_eqs of
@@ -244,7 +242,7 @@ extendWorkListChildEqs parent_ev new_eqs
     push_on_front new_eqs eqs = foldr (:) eqs new_eqs
 
 extendWorkListRewrittenEqs :: [EqCt] -> WorkList -> WorkList
--- Don't bother checking the RewriterSet: just pop them into wl_rw_eqs
+-- Don't bother checking the CoHoleSet: just pop them into wl_rw_eqs
 extendWorkListRewrittenEqs new_eqs wl@(WL { wl_rw_eqs = rw_eqs })
   = wl { wl_rw_eqs = foldr ((:) . CEqCan) rw_eqs new_eqs }
 
@@ -305,7 +303,7 @@ instance Outputable WorkList where
 *                                                                      *
 ********************************************************************* -}
 
-type CycleBreakerVarStack = NonEmpty (Bag (TcTyVar, TcType))
+type CycleBreakerVarStack = NE.NonEmpty (Bag (TcTyVar, TcType))
    -- ^ a stack of (CycleBreakerTv, original family applications) lists
    -- first element in the stack corresponds to current implication;
    --   later elements correspond to outer implications
@@ -323,6 +321,7 @@ data InertSet
        , inert_givens :: InertCans
               -- A subset of inert_cans, containing only Givens
               -- Used to initialise inert_cans when recursing inside implications
+              -- See `resetInertCans`
 
        , inert_cycle_breakers :: CycleBreakerVarStack
 
@@ -371,19 +370,27 @@ emptyInertCans given_eq_lvl
        , inert_given_eq_lvl = given_eq_lvl
        , inert_given_eqs    = False
        , inert_dicts        = emptyDictMap
-       , inert_insts        = []
+       , inert_qcis         = []
        , inert_irreds       = emptyBag }
 
 emptyInertSet :: TcLevel -> InertSet
 emptyInertSet given_eq_lvl
   = IS { inert_cans           = empty_cans
        , inert_givens         = empty_cans
-       , inert_cycle_breakers = emptyBag :| []
+       , inert_cycle_breakers = emptyBag NE.:| []
        , inert_famapp_cache   = emptyFunEqs
        , inert_solved_dicts   = emptyDictMap
        , inert_safehask       = emptyDictMap }
   where
     empty_cans = emptyInertCans given_eq_lvl
+
+
+resetInertCans :: InertSet -> InertSet
+-- Reset the `inert_cans` to the saved `inert_givens :: InertCans`
+-- In effect, this just purges all Wanteds from the InertSet
+resetInertCans inerts@(IS { inert_givens = saved_givens })
+  = inerts { inert_cans = saved_givens }
+
 
 {- Note [Solved dictionaries]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -453,7 +460,7 @@ In implementation terms
   - It is only called when applying an instance decl,
     in GHC.Tc.Solver.Dict.tryInstances
 
-  - ClsInst.InstanceWhat says what kind of instance was
+  - GHC.Tc.Instance.Class.InstanceWhat says what kind of instance was
     used to solve the constraint.  In particular
       * LocalInstance identifies quantified constraints
       * BuiltinEqInstance identifies the strange built-in
@@ -793,7 +800,7 @@ The InertCans represents a collection of constraints with the following properti
     eg a wanted cannot rewrite a given)
 
   * CEqCan equalities: see Note [inert_eqs: the inert equalities]
-    Also see documentation in Constraint.Ct for a list of invariants
+    Also see documentation in GHC.Tc.Types.Constraint.Ct for a list of invariants
 
 Note [inert_eqs: the inert equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1023,7 +1030,7 @@ Here are the KickOut Criteria:
     When adding [lhs_w -fw-> rhs_w] to a well-formed terminating substitution S,
     element [lhs_s -fs-> rhs_s] in S meets the KickOut Criteria if:
 
-    (KK0) fw >= fs    AND   any of (KK1), (KK2) or (KK3) hold
+    (KK0) fw >= fs    AND   any of (KK1), (KK2), (KK3) or (KK4) hold
 
     * (KK1: satisfy WF1) `lhs_w` is rewritable in `lhs_s`.
 
@@ -1040,6 +1047,11 @@ Here are the KickOut Criteria:
       * (KK3b) If the role of `fs` is Representational:
            kick out if `rhs_s` is of form `(lhs_w t1 .. tn)`
 
+    * (KK4: completeness) Kick out if
+      * (KK4a) lhs_s = F lhs_tys, and
+      * (KK4b) F is closed or has injectivity annotions
+      * (KK4c) lhs_w is rewritable (anywhere) in rhs_s
+
 Rationale
 
 * (KK0) kick out only if `fw` can rewrite `fs`.
@@ -1052,6 +1064,13 @@ Rationale
 * (KK2) see Note [KK2: termination of the extended substitution]
 
 * (KK3) see Note [KK3: completeness of solving]
+
+* (KK4) is about completeness.  If we have
+     Inert:  F alpha ~ [beta]
+     Work:   beta ~ Int
+  and F is closed or injective, then we want to kick out the inert item, in
+  case we get injectivity information from `F alpha ~ [Int]` that allows us to
+  solve it.
 
 The above story is a bit vague wrt roles, but the code is not.
 See Note [Flavours with roles]
@@ -1177,7 +1196,7 @@ Wrinkles:
   by the inert item.  And too much kick-out is positively harmful.
   (Historical example #14363.)
 
-* (KK3b) addresses teh main example above for KK3. Another way to understand
+* (KK3b) addresses the main example above for KK3. Another way to understand
   (KK3b) is that we treat an inert item
         a -f-> b
   in the same way as
@@ -1248,7 +1267,8 @@ data InertCans   -- See Note [Detailed InertCans Invariants] for more
               -- All fully rewritten (modulo flavour constraints)
               --     wrt inert_eqs
 
-       , inert_insts :: [QCInst]
+       , inert_qcis :: [QCInst] -- See Note [Quantified constraints]
+                                -- in GHC.Tc.Solver.Solve
 
        , inert_irreds :: InertIrreds
               -- Irreducible predicates that cannot be made canonical,
@@ -1280,7 +1300,7 @@ instance Outputable InertCans where
           , inert_irreds = irreds
           , inert_given_eq_lvl = ge_lvl
           , inert_given_eqs = given_eqs
-          , inert_insts = insts })
+          , inert_qcis = insts })
 
     = braces $ vcat
       [ ppUnless (isEmptyDVarEnv eqs) $
@@ -1349,27 +1369,30 @@ findEq icans (TyVarLHS tv) = findTyEqs icans tv
 findEq icans (TyFamLHS fun_tc fun_args)
   = concat @Maybe (findFunEq (inert_funeqs icans) fun_tc fun_args)
 
-{-# INLINE partition_eqs_container #-}
-partition_eqs_container
-  :: forall container
-   . container    -- empty container
-  -> (forall b. (EqCt -> b -> b) ->  container -> b -> b) -- folder
-  -> (EqCt -> container -> container)  -- extender
-  -> (EqCt -> Bool)
-  -> container
-  -> ([EqCt], container)
-partition_eqs_container empty_container fold_container extend_container pred orig_inerts
-  = fold_container folder orig_inerts ([], empty_container)
+transformAndPartitionTyVarEqs
+  :: (EqCt -> Either EqCt EqCt)         -- Left => chuck out, Right => keep
+  -> InertEqs
+  -> ([EqCt], InertEqs)               -- (chuck-out, keep)
+transformAndPartitionTyVarEqs pred orig_inerts
+  = foldTyEqs folder orig_inerts ([], emptyTyEqs)
   where
-    folder :: EqCt -> ([EqCt], container) -> ([EqCt], container)
+    folder :: EqCt -> ([EqCt], InertEqs) -> ([EqCt], InertEqs)
     folder eq_ct (acc_true, acc_false)
-      | pred eq_ct = (eq_ct : acc_true, acc_false)
-      | otherwise  = (acc_true,         extend_container eq_ct acc_false)
+      = case pred eq_ct of
+           Left eq_ct'  -> (eq_ct' : acc_true, acc_false)
+           Right eq_ct' -> (acc_true, addInertEqs eq_ct' acc_false)
 
 partitionInertEqs :: (EqCt -> Bool)   -- EqCt will always have a TyVarLHS
                   -> InertEqs
                   -> ([EqCt], InertEqs)
-partitionInertEqs = partition_eqs_container emptyTyEqs foldTyEqs addInertEqs
+partitionInertEqs pred orig_inerts
+  = foldTyEqs folder orig_inerts ([], emptyTyEqs)
+  where
+    folder :: EqCt -> ([EqCt], InertEqs) -> ([EqCt], InertEqs)
+    folder eq_ct (acc_true, acc_false)
+      = case pred eq_ct of
+           True  -> (eq_ct : acc_true, acc_false)
+           False -> (acc_true, addInertEqs eq_ct acc_false)
 
 addInertEqs :: EqCt -> InertEqs -> InertEqs
 -- Precondition: CanEqLHS is a TyVarLHS
@@ -1402,7 +1425,14 @@ foldFunEqs k fun_eqs z = foldTcAppMap (\eqs z -> foldr k z eqs) fun_eqs z
 partitionFunEqs :: (EqCt -> Bool)    -- EqCt will have a TyFamLHS
                 -> InertFunEqs
                 -> ([EqCt], InertFunEqs)
-partitionFunEqs = partition_eqs_container emptyFunEqs foldFunEqs addFunEqs
+partitionFunEqs pred orig_inerts
+  = foldFunEqs folder orig_inerts ([], emptyFunEqs)
+  where
+    folder :: EqCt -> ([EqCt], InertFunEqs) -> ([EqCt], InertFunEqs)
+    folder eq_ct (acc_true, acc_false)
+      = case pred eq_ct of
+           True  -> (eq_ct : acc_true, acc_false)
+           False -> (acc_true, addFunEqs eq_ct acc_false)
 
 addFunEqs :: EqCt -> InertFunEqs -> InertFunEqs
 -- Precondition: EqCt is a TyFamLHS
@@ -1414,12 +1444,11 @@ addFunEqs other _ = pprPanic "extendFunEqs" (ppr other)
 filterFunEqs :: (EqCt -> Bool) -> InertFunEqs -> InertFunEqs
 filterFunEqs f = mapMaybeTcAppMap g
   where
-    g xs =
-      let filtered = filter f xs
-      in
-        if null filtered
-        then Nothing
-        else Just filtered
+    g xs | null filtered = Nothing
+         | otherwise     = Just filtered
+         where
+           filtered = filter f xs
+
 
 {- *********************************************************************
 *                                                                      *
@@ -1604,18 +1633,18 @@ data WhereToLook = LookEverywhere | LookOnlyUnderFamApps
 kickOutRewritableLHS :: KickOutSpec -> CtFlavourRole -> InertCans -> (Cts, InertCans)
 -- See Note [kickOutRewritable]
 kickOutRewritableLHS ko_spec new_fr@(_, new_role)
-                     ics@(IC { inert_eqs      = tv_eqs
-                             , inert_dicts    = dictmap
-                             , inert_funeqs   = funeqmap
-                             , inert_irreds   = irreds
-                             , inert_insts    = old_insts })
+                     ics@(IC { inert_eqs     = tv_eqs
+                             , inert_dicts   = dictmap
+                             , inert_funeqs  = funeqmap
+                             , inert_irreds  = irreds
+                             , inert_qcis    = old_insts })
   = (kicked_out, inert_cans_in)
   where
-    inert_cans_in = ics { inert_eqs      = tv_eqs_in
-                        , inert_dicts    = dicts_in
-                        , inert_funeqs   = feqs_in
-                        , inert_irreds   = irs_in
-                        , inert_insts    = insts_in }
+    inert_cans_in = ics { inert_eqs     = tv_eqs_in
+                        , inert_dicts   = dicts_in
+                        , inert_funeqs  = feqs_in
+                        , inert_irreds  = irs_in
+                        , inert_qcis    = insts_in }
 
     kicked_out :: Cts
     kicked_out = (fmap CDictCan dicts_out `andCts` fmap CIrredCan irs_out)
@@ -1712,6 +1741,12 @@ kickOutRewritableLHS ko_spec new_fr@(_, new_role)
          -- The above check redundantly checks the role & flavour,
          -- but it's very convenient
 
+      -- (KK4)
+      | TyFamLHS tc _ <- lhs        -- (KK4a)
+      , famTyConHasInjectivity tc   -- (KK4b)
+      , fr_can_rewrite_ty LookEverywhere eq_rel rhs_ty   -- (KK4c)
+      = True
+
       -- (KK2)
       | let where_to_look | fs_can_rewrite_fr = LookOnlyUnderFamApps
                           | otherwise         = LookEverywhere
@@ -1800,7 +1835,7 @@ new equality, to maintain the inert-set invariants.
 NB: we could in principle avoid kick-out:
   a) When unifying a meta-tyvar from an outer level, because
      then the entire implication will be iterated; see
-     Note [The Unification Level Flag] in GHC.Tc.Solver.Monad.
+     Note [When to iterate the solver: unifications] in GHC.Tc.Solver.Solve
 
   b) For Givens, after a unification.  By (GivenInv) in GHC.Tc.Utils.TcType
      Note [TcLevel invariants], a Given can't include a meta-tyvar from
@@ -1856,9 +1891,9 @@ noGivenNewtypeReprEqs :: TyCon -> InertSet -> Bool
 -- True <=> there is no Given looking like (N tys1 ~ N tys2)
 -- See Note [Decomposing newtype equalities] (EX3) in GHC.Tc.Solver.Equality
 noGivenNewtypeReprEqs tc (IS { inert_cans = inerts })
-  | IC { inert_irreds = irreds, inert_insts = quant_cts } <- inerts
+  | IC { inert_irreds = irreds, inert_qcis = quant_cts } <- inerts
   = not (anyBag might_help_irred irreds || any might_help_qc quant_cts)
-    -- Look in both inert_irreds /and/ inert_insts (#26020)
+    -- Look in both inert_irreds /and/ inert_qcis (#26020)
   where
     might_help_irred (IrredCt { ir_ev = ev })
       | EqPred ReprEq t1 t2 <- classifyPredType (ctEvPred ev)
@@ -1913,8 +1948,9 @@ prohibitedSuperClassSolve given_loc wanted_loc
 
 -- | Push a fresh environment onto the cycle-breaker var stack. Useful
 -- when entering a nested implication.
-pushCycleBreakerVarStack :: CycleBreakerVarStack -> CycleBreakerVarStack
-pushCycleBreakerVarStack = (emptyBag <|)
+pushCycleBreakerVarStack :: InertSet -> InertSet
+pushCycleBreakerVarStack inerts@(IS { inert_cycle_breakers = cbs })
+  = inerts { inert_cycle_breakers = emptyBag NE.<| cbs }
 
 -- | Add a new cycle-breaker binding to the top environment on the stack.
 addCycleBreakerBindings :: Bag (TcTyVar, Type)   -- ^ (cbv,expansion) pairs
@@ -1923,14 +1959,14 @@ addCycleBreakerBindings prs ics
   = assertPpr (all (isCycleBreakerTyVar . fst) prs) (ppr prs) $
     ics { inert_cycle_breakers = add_to (inert_cycle_breakers ics) }
   where
-    add_to (top_env :| rest_envs) = (prs `unionBags` top_env) :| rest_envs
+    add_to (top_env NE.:| rest_envs) = (prs `unionBags` top_env) NE.:| rest_envs
 
 -- | Perform a monadic operation on all pairs in the top environment
 -- in the stack.
 forAllCycleBreakerBindings_ :: Monad m
                             => CycleBreakerVarStack
                             -> (TcTyVar -> TcType -> m ()) -> m ()
-forAllCycleBreakerBindings_ (top_env :| _rest_envs) action
+forAllCycleBreakerBindings_ (top_env NE.:| _rest_envs) action
   = forM_ top_env (uncurry action)
 {-# INLINABLE forAllCycleBreakerBindings_ #-}  -- to allow SPECIALISE later
 
@@ -1987,7 +2023,7 @@ solveOneFromTheOther ct_i ct_w
         -- If only one has an empty rewriter set, use it
         -- c.f. GHC.Tc.Solver.Equality.inertsCanDischarge, and especially
         --      (CE4) in Note [Combining equalities]
-        | Just res <- better (isEmptyRewriterSet rw_i) (isEmptyRewriterSet rw_w)
+        | Just res <- better (isEmptyCoHoleSet rw_i) (isEmptyCoHoleSet rw_w)
         -> res
 
         -- If only one is a WantedSuperclassOrigin (arising from expanding
@@ -2091,7 +2127,7 @@ solveOneFromTheOther.
 
       - For everything else, we want to keep the outermost one.  Reason: that
         makes it more likely that the inner one will turn out to be unused,
-        and can be reported as redundant.  See Note [Tracking redundant constraints]
+        and can be reported as redundant.  See Note [Tracking needed EvIds]
         in GHC.Tc.Solver.
 
         It transpires that using the outermost one is responsible for an
@@ -2104,7 +2140,7 @@ solveOneFromTheOther.
            according to Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance.
 
        (b) Prefer constraints that are not superclass selections. See
-           (TRC3) in Note [Tracking redundant constraints] in GHC.Tc.Solver.
+           (TRC3) in Note [Tracking needed EvIds] in GHC.Tc.Solver.
 
        (c) If both are GivenSCOrigin, chooose the one with the shallower
            superclass-selection depth, in the hope of identifying more correct

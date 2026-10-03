@@ -1,41 +1,27 @@
 module Settings.Flavours.Validate (validateFlavour, slowValidateFlavour,
                                     quickValidateFlavour) where
 
-import qualified Data.Set as Set
 
 import Expression
 import Flavour
-import Oracles.Flag
 import {-# SOURCE #-} Settings.Default
 
 -- Please update doc/flavours.md when changing this file.
 validateFlavour :: Flavour
-validateFlavour = enableLinting $ werror $ defaultFlavour
+validateFlavour = enableLinting $ werror $ quickValidateFlavour
     { name = "validate"
     , extraArgs = validateArgs <> defaultHaddockExtraArgs
-    , libraryWays = Set.fromList <$>
-                    mconcat [ pure [vanilla]
-                            , notStage0 ? platformSupportsSharedLibs ? pure [dynamic]
-                            ]
-    , rtsWays = Set.fromList <$>
-                mconcat [ pure [vanilla, debug]
-                        , targetSupportsThreadedRts ? pure [threaded, threadedDebug]
-                        , notStage0 ? platformSupportsSharedLibs ? pure
-                            [ dynamic, debugDynamic
-                            ]
-                        , notStage0 ? platformSupportsSharedLibs ? targetSupportsThreadedRts ? pure
-                            [ threadedDynamic, threadedDebugDynamic ]
-                        ]
     , ghcDebugAssertions = (<= Stage1)
     }
 
 validateArgs :: Args
 validateArgs = sourceArgs SourceArgs
-    { hsDefault  = mconcat [ stage0 ? pure ["-O0", "-H64m"]
+    { hsDefault  = mconcat [ stage0 ? pure ["-O0"]
                              -- See #11487
                            , notStage0 ? arg "-fllvm-fill-undef-with-garbage"
                            , notStage0 ? arg "-dno-debug-output"
                            , notStage0 ? arg "-fcheck-prim-bounds"
+                           , pure ["+RTS", "-O64M", "-RTS"]
                            ]
     , hsLibrary  = pure ["-O"]
     , hsCompiler = mconcat [ stage0 ? pure ["-O2"]
@@ -52,13 +38,13 @@ slowValidateFlavour = validateFlavour
 
 quickValidateArgs :: Args
 quickValidateArgs = sourceArgs SourceArgs
-    { hsDefault  = mempty
+    { hsDefault  = pure ["+RTS", "-O64M", "-RTS"]
     , hsLibrary  = pure [ "-O" ]
     , hsCompiler = mconcat [ stage0 ? arg "-O2", notStage0 ? arg "-O"]
     , hsGhc      = pure [ "-O", "-hide-all-packages" ]
     }
 
 quickValidateFlavour :: Flavour
-quickValidateFlavour = werror $ validateFlavour
+quickValidateFlavour = werror $ disableProfiledLibs $ defaultFlavour
     { name               = "quick-validate"
     , extraArgs               = quickValidateArgs }

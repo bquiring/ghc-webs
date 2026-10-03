@@ -9,15 +9,16 @@ import Packages
 
 -- | Default Haskell warning-related arguments.
 defaultGhcWarningsArgs :: Args
-defaultGhcWarningsArgs = mconcat
+defaultGhcWarningsArgs = do
+   mconcat
     [ notStage0 ? arg "-Wnoncanonical-monad-instances"
-    , notM (flag CcLlvmBackend) ? arg "-optc-Wno-error=inline"
-    , flag CcLlvmBackend ? arg "-optc-Wno-unknown-pragmas"
+    , notM (staged (buildFlag CcLlvmBackend)) ? arg "-optc-Wno-error=inline"
+    , staged (buildFlag CcLlvmBackend) ? arg "-optc-Wno-unknown-pragmas"
       -- Cabal can seemingly produce filepaths with incorrect case on filesystems
       -- with case-insensitive names. Ignore such issues for now as they seem benign.
       -- See #17798.
-    , isOsxTarget ? arg "-optP-Wno-nonportable-include-path"
-    , isWinTarget ? arg "-optP-Wno-nonportable-include-path"
+    , staged isOsxTarget ? arg "-optP-Wno-nonportable-include-path"
+    , staged isWinTarget ? arg "-optP-Wno-nonportable-include-path"
     ]
 
 -- | Package-specific warnings-related arguments, mostly suppressing various warnings.
@@ -72,7 +73,11 @@ ghcWarningsArgs = do
         , package terminfo     ? pure [ "-Wno-unused-imports", "-Wno-deriving-typeable" ]
         , package stm          ? pure [ "-Wno-deriving-typeable" ]
         , package osString     ? pure [ "-Wno-deriving-typeable", "-Wno-unused-imports" ]
-        , package parsec       ? pure [ "-Wno-deriving-typeable" ]
+        , package parsec       ? pure [ "-Wno-deriving-typeable"
+                                      , "-Wno-x-partial"
+                                      ]
+
+        , package filepath     ? pure [ "-Wno-x-partial" ]
 
         , package cabal        ? pure [ "-Wno-deriving-typeable", "-Wno-incomplete-record-selectors" ]
              -- The -Wno-incomplete-record-selectors is due to
@@ -92,4 +97,5 @@ ghcWarningsArgs = do
                                       ]
         , package xhtml        ? pure [ "-Wno-unused-imports" ]
         , package containers   ? pure [ "-Wno-unused-imports" ]
+        , package semaphoreCompat ? pure [ "-Wno-unused-imports" ]
         ] ]

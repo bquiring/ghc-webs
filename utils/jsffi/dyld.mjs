@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --disable-warning=ExperimentalWarning --max-old-space-size=65536 --no-turbo-fast-api-calls --wasm-lazy-validation
+#!/usr/bin/env -S node --disable-warning=ExperimentalWarning --max-old-space-size=65536 --wasm-lazy-validation
 
 // Note [The Wasm Dynamic Linker]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -9,7 +9,7 @@
 //    iserv (GHCi.Server.defaultServer). This part only runs in
 //    nodejs.
 // 2. Dynamic linker: provide RTS linker interfaces like
-//    loadDLL/lookupSymbol etc which are imported by wasm iserv. This
+//    loadDLLs/lookupSymbol etc which are imported by wasm iserv. This
 //    part can run in browsers as well.
 //
 // When GHC starts external interpreter for the wasm target, it starts
@@ -50,7 +50,7 @@
 //
 // *** What works right now and what doesn't work yet?
 //
-// loadDLL & bytecode interpreter work. Template Haskell & ghci work.
+// loadDLLs & bytecode interpreter work. Template Haskell & ghci work.
 // Profiled dynamic code works. Compiled code and bytecode can all be
 // loaded, though the side effects are constrained to what's supported
 // by wasi preview1: we map the full host filesystem into wasm cause
@@ -285,13 +285,13 @@ function originFromServerAddress({ address, family, port }) {
 }
 
 // Browser/node portable code stays above this watermark.
-const isNode = Boolean(globalThis?.process?.versions?.node);
+const isNode = Boolean(globalThis?.process?.versions?.node && !globalThis.Deno);
 
 // Too cumbersome to only import at use sites. Too troublesome to
 // factor out browser-only/node-only logic into different modules. For
 // now, just make these global let bindings optionally initialized if
 // isNode and be careful to not use them in browser-only logic.
-let fs, http, path, require, stream, util, wasi, ws, zlib;
+let fs, http, path, require, stream, wasi, ws;
 
 if (isNode) {
   require = (await import("node:module")).createRequire(import.meta.url);
@@ -300,36 +300,34 @@ if (isNode) {
   http = require("http");
   path = require("path");
   stream = require("stream");
-  util = require("util");
   wasi = require("wasi");
-  zlib = require("zlib");
 
   // Optional npm dependencies loaded via NODE_PATH
   try {
     ws = require("ws");
   } catch {}
 } else {
-  wasi = await import(
-    "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.4.1/dist/index.js"
-  );
+  wasi = await import("https://esm.sh/gh/haskell-wasm/browser_wasi_shim");
 }
 
 // A subset of dyld logic that can only be run in the host node
 // process and has full access to local filesystem
-class DyLDHost {
+export class DyLDHost {
   // Deduped absolute paths of directories where we lookup .so files
   #rpaths = new Set();
 
-  constructor() {
-    // Inherited pipe file descriptors from GHC
-    const out_fd = Number.parseInt(process.argv[4]),
-      in_fd = Number.parseInt(process.argv[5]);
-
+  constructor({ outFd, inFd }) {
+    // When running a non-iserv shared library with node, the DyLDHost
+    // instance is created without a pair of fds, so skip creation of
+    // readStream/writeStream, they won't be used anyway
+    if (!(typeof outFd === "number" && typeof inFd === "number")) {
+      return;
+    }
     this.readStream = stream.Readable.toWeb(
-      fs.createReadStream(undefined, { fd: in_fd })
+      fs.createReadStream(undefined, { fd: inFd })
     );
     this.writeStream = stream.Writable.toWeb(
-      fs.createWriteStream(undefined, { fd: out_fd })
+      fs.createWriteStream(undefined, { fd: outFd })
     );
   }
 
@@ -376,6 +374,72 @@ class DyLDHost {
     return new Response(stream.Readable.toWeb(fs.createReadStream(p)), {
       headers: { "Content-Type": "application/wasm" },
     });
+  }
+}
+
+// Runs in the browser and uses the in-memory vfs, doesn't do any RPC
+// calls
+export class DyLDBrowserHost {
+  // Deduped absolute paths of directories where we lookup .so files
+  #rpaths = new Set();
+  // The PreopenDirectory object of the root filesystem
+  rootfs;
+  // Continuations to output a single line to stdout/stderr
+  stdout;
+  stderr;
+
+  // Given canonicalized absolute file path, returns the File object,
+  // or null if absent
+  #readFile(p) {
+    const { ret, entry } = this.rootfs.dir.get_entry_for_path({
+      parts: p.split("/").filter((tok) => tok !== ""),
+      is_dir: false,
+    });
+    return ret === 0 ? entry : null;
+  }
+
+  constructor({ rootfs, stdout, stderr }) {
+    this.rootfs = rootfs
+      ? rootfs
+      : new wasi.PreopenDirectory("/", [["tmp", new wasi.Directory([])]]);
+    this.stdout = stdout ? stdout : (msg) => console.info(msg);
+    this.stderr = stderr ? stderr : (msg) => console.warn(msg);
+  }
+
+  // p must be canonicalized absolute path
+  async addLibrarySearchPath(p) {
+    this.#rpaths.add(p);
+    return null;
+  }
+
+  async findSystemLibrary(f) {
+    if (f.startsWith("/")) {
+      if (this.#readFile(f)) {
+        return f;
+      }
+      throw new Error(`findSystemLibrary(${f}): not found in /`);
+    }
+
+    for (const rpath of this.#rpaths) {
+      const r = `${rpath}/${f}`;
+      if (this.#readFile(r)) {
+        return r;
+      }
+    }
+
+    throw new Error(
+      `findSystemLibrary(${f}): not found in ${[...this.#rpaths]}`
+    );
+  }
+
+  async fetchWasm(p) {
+    const entry = this.#readFile(p);
+    const r = new Response(entry.data, {
+      headers: { "Content-Type": "application/wasm" },
+    });
+    // It's only fetched once, take the chance to prune it in vfs to save memory
+    entry.data = new Uint8Array();
+    return r;
   }
 }
 
@@ -496,19 +560,39 @@ export class DyLDRPC {
 
 // Actual implementation of endpoints used by DyLDRPC
 class DyLDRPCServer {
-  #dyldHost = new DyLDHost();
+  #mimeDb;
+  #dyldHost;
   #server;
   #wss;
 
   constructor({
     host,
     port,
+    assetsDir,
     dyldPath,
-    libdir,
-    ghciSoPath,
+    searchDirs,
+    mainSoPath,
+    outFd,
+    inFd,
     args,
     redirectWasiConsole,
   }) {
+    this.#mimeDb = fetch("https://cdn.jsdelivr.net/npm/mime-db@1.54.0/db.json")
+      .then((resp) => resp.json())
+      .then((db) => {
+        const ext2mime = {};
+        for (const mime in db) {
+          if (db[mime].extensions) {
+            for (const ext of db[mime].extensions) {
+              ext2mime[`.${ext}`] = mime;
+            }
+          }
+        }
+        return ext2mime;
+      });
+
+    this.#dyldHost = new DyLDHost({ outFd, inFd });
+
     this.#server = http.createServer(async (req, res) => {
       const origin = originFromServerAddress(await this.listening);
 
@@ -542,7 +626,7 @@ class DyLDRPCServer {
         res.end(
           `
 import { DyLDRPC, main } from "./fs${dyldPath}";
-const args = ${JSON.stringify({ libdir, ghciSoPath, args })};
+const args = ${JSON.stringify({ searchDirs, mainSoPath, args, isIserv: true })};
 args.rpc = new DyLDRPC({origin: "${origin}", redirectWasiConsole: ${redirectWasiConsole}});
 args.rpc.opened.then(() => main(args));
 `
@@ -561,30 +645,35 @@ args.rpc.opened.then(() => main(args));
           }[path.extname(p)] || "application/octet-stream"
         );
 
-        const buf = Buffer.from(await fs.promises.readFile(p));
-        const etag = `sha512-${Buffer.from(
-          await crypto.subtle.digest("SHA-512", buf)
-        ).toString("base64")}`;
+        res.writeHead(200);
+        fs.createReadStream(p).pipe(res);
+        return;
+      }
 
-        res.setHeader("ETag", etag);
+      if (req.url.startsWith("/assets")) {
+        const p = path.resolve(
+          assetsDir,
+          new URL(req.url, origin).pathname.replace("/assets/", ""),
+        );
+        try {
+          await fs.promises.access(p, fs.promises.constants.R_OK);
 
-        if (req.headers["if-none-match"] === etag) {
-          res.writeHead(304);
-          res.end();
-          return;
+          res.setHeader(
+            "Content-Type",
+            (await this.#mimeDb)[path.extname(p)] || "application/octet-stream",
+          );
+
+          res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+
+          res.writeHead(200);
+          fs.createReadStream(p).pipe(res);
+        } catch {
+          res.writeHead(404, {
+            "Content-Type": "text/plain",
+          });
+          res.end("not found");
         }
 
-        res.setHeader("Content-Encoding", "br");
-
-        res.writeHead(200);
-        res.end(
-          await util.promisify(zlib.brotliCompress)(buf, {
-            params: {
-              [zlib.constants.BROTLI_PARAM_QUALITY]:
-                zlib.constants.BROTLI_MIN_QUALITY,
-            },
-          })
-        );
         return;
       }
 
@@ -759,10 +848,36 @@ class DyLD {
           ),
           wasi.ConsoleStdout.lineBuffered((msg) => this.#rpc.stdout(msg)),
           wasi.ConsoleStdout.lineBuffered((msg) => this.#rpc.stderr(msg)),
+          // for ghci browser mode, default to an empty rootfs with
+          // /tmp
+          this.#rpc instanceof DyLDBrowserHost
+            ? this.#rpc.rootfs
+            : new wasi.PreopenDirectory("/", [["tmp", new wasi.Directory([])]]),
         ],
         { debug: false }
       );
     }
+
+    // Both wasi implementations we use provide
+    // wasi.initialize(instance) to initialize a wasip1 reactor
+    // module. However, instance does not really need to be a
+    // WebAssembly.Instance object; the wasi implementations only need
+    // to access instance.exports.memory for the wasi syscalls to
+    // work.
+    //
+    // Given we'll reuse the same wasi object across different
+    // WebAssembly.Instance objects anyway and
+    // wasi.initialize(instance) can't be called more than once, we
+    // use this simple trick and pass a fake instance object that
+    // contains just enough info for the wasi implementation to
+    // initialize its internal state. Later when we load each wasm
+    // shared library, we can just manually invoke their
+    // initialization functions.
+    this.#wasi.initialize({
+      exports: {
+        memory: this.#memory,
+      },
+    });
 
     // Keep this in sync with rts/wasm/Wasm.S!
     for (let i = 1; i <= 10; ++i) {
@@ -801,17 +916,17 @@ class DyLD {
     return this.#rpc.findSystemLibrary(f);
   }
 
-  // When we do loadDLL, we first perform "downsweep" which return a
+  // When we do loadDLLs, we first perform "downsweep" which return a
   // toposorted array of dependencies up to itself, then sequentially
   // load the downsweep result.
   //
   // The rationale of a separate downsweep phase, instead of a simple
-  // recursive loadDLL function is: V8 delegates async
+  // recursive loadDLLs function is: V8 delegates async
   // WebAssembly.compile to a background worker thread pool. To
   // maintain consistent internal linker state, we *must* load each so
   // file sequentially, but it's okay to kick off compilation asap,
   // store the Promise in downsweep result and await for the actual
-  // WebAssembly.Module in loadDLL logic. This way we can harness some
+  // WebAssembly.Module in loadDLLs logic. This way we can harness some
   // background parallelism.
   async #downsweep(p) {
     const toks = p.split("/");
@@ -852,8 +967,31 @@ class DyLD {
     return acc;
   }
 
-  // The real stuff
-  async loadDLL(p) {
+  // Batch load multiple DLLs in one go.
+  // Accepts a NUL-delimited string of paths to avoid array marshalling.
+  // Each path can be absolute or a soname; dependency resolution is
+  // performed across the full set to enable maximal parallel compile
+  // while maintaining sequential instantiation order.
+  async loadDLLs(packed) {
+    // Normalize input to an array of strings. When called from Haskell
+    // we pass a single JSString containing NUL-separated paths.
+    const paths = (
+      typeof packed === "string"
+        ? packed.length === 0
+          ? []
+          : packed.split("\0")
+        : [packed]
+    ) // tolerate an accidental single path object
+      .filter((s) => s.length > 0)
+      .reverse();
+
+    // Compute a single downsweep plan for the whole batch.
+    // Note: #downsweep mutates #loadedSos to break cycles and dedup.
+    const plan = [];
+    for (const p of paths) {
+      plan.push(...(await this.#downsweep(p)));
+    }
+
     for (const {
       memSize,
       memP2Align,
@@ -861,7 +999,7 @@ class DyLD {
       tableP2Align,
       modp,
       soname,
-    } of await this.#downsweep(p)) {
+    } of plan) {
       const import_obj = {
         wasi_snapshot_preview1: this.#wasi.wasiImport,
         env: {
@@ -1037,10 +1175,13 @@ class DyLD {
           // anything, if it's required later a GOT.func entry will be
           // created on demand.
           if (this.#gotFunc[k]) {
-            // ghc-prim/ghc-internal may export functions imported by
-            // rts
-            console.assert(this.#gotFunc[k].value === DyLD.#poison);
-            this.#table.set(this.#gotFunc[k].value, v);
+            const got = this.#gotFunc[k];
+            if (got.value === DyLD.#poison) {
+              const idx = this.#table.grow(1, v);
+              got.value = idx;
+            } else {
+              this.#table.set(got.value, v);
+            }
           }
           continue;
         }
@@ -1063,50 +1204,20 @@ class DyLD {
         throw new Error(`cannot handle export ${k} ${v}`);
       }
 
-      // We call wasi.initialize when loading libc.so, then reuse the
-      // wasi instance globally. When loading later .so files, just
-      // manually invoke _initialize().
-      if (soname === "libc.so") {
+      // See
+      // https://gitlab.haskell.org/haskell-wasm/llvm-project/-/blob/release/21.x/lld/wasm/Writer.cpp#L1451,
+      // __wasm_apply_data_relocs is now optional so only call it if
+      // it exists (we know for sure it exists for libc.so though).
+      // There's also __wasm_init_memory (not relevant yet, we don't
+      // use passive segments) & __wasm_apply_global_relocs but
+      // those are included in the start function and should have
+      // been called upon instantiation, see
+      // Writer::createStartFunction().
+      if (instance.exports.__wasm_apply_data_relocs) {
         instance.exports.__wasm_apply_data_relocs();
-        // wasm-ld forbits --export-memory with --shared, I don't know
-        // why but this is sufficient to make things work
-        this.#wasi.initialize({
-          exports: {
-            memory: this.#memory,
-            _initialize: instance.exports._initialize,
-          },
-        });
-        continue;
       }
 
-      const init = () => {
-        // See
-        // https://gitlab.haskell.org/haskell-wasm/llvm-project/-/blob/release/20.x/lld/wasm/Writer.cpp#L1450,
-        // __wasm_apply_data_relocs is now optional so only call it if
-        // it exists (we know for sure it exists for libc.so though).
-        // There's also __wasm_init_memory (not relevant yet, we don't
-        // use passive segments) & __wasm_apply_global_relocs but
-        // those are included in the start function and should have
-        // been called upon instantiation, see
-        // Writer::createStartFunction().
-        if (instance.exports.__wasm_apply_data_relocs) {
-          instance.exports.__wasm_apply_data_relocs();
-        }
-
-        instance.exports._initialize();
-      };
-
-      // rts init must be deferred until ghc-internal symbols are
-      // exported. We hard code this hack for now.
-      if (/libHSrts-\d+(\.\d+)*/i.test(soname)) {
-        this.rts_init = init;
-        continue;
-      }
-      if (/libHSghc-internal-\d+(\.\d+)*/i.test(soname)) {
-        this.rts_init();
-        delete this.rts_init;
-      }
-      init();
+      instance.exports._initialize();
     }
   }
 
@@ -1129,17 +1240,47 @@ class DyLD {
     }
     return 0;
   }
+
+  lookupSymbolPtr(symPtr, symLen) {
+    const sym = new TextDecoder("utf-8", { fatal: true }).decode(
+      new Uint8Array(this.#memory.buffer, symPtr, symLen)
+    );
+    return this.lookupSymbol(sym);
+  }
 }
 
-export async function main({ rpc, libdir, ghciSoPath, args }) {
+// The main entry point of dyld that may be run on node/browser, and
+// may run either iserv defaultMain from the ghci library or an
+// alternative entry point from another shared library
+export async function main({
+  rpc, // Handle the side effects of DyLD
+  searchDirs, // Initial library search directories
+  mainSoPath, // Could also be another shared library that's actually not ghci
+  args, // WASI argv starting with the executable name. +RTS etc will be respected
+  isIserv, // set to true when running iserv defaultServer
+}) {
   try {
     const dyld = new DyLD({
-      args: ["dyld.so", ...args],
+      args,
       rpc,
     });
-    await dyld.addLibrarySearchPath(libdir);
-    await dyld.loadDLL(ghciSoPath);
+    for (const libdir of searchDirs) {
+      await dyld.addLibrarySearchPath(libdir);
+    }
+    await dyld.loadDLLs(mainSoPath);
 
+    // At this point, rts/ghc-internal are loaded, perform wasm shared
+    // library specific RTS startup logic, see Note [JSFFI initialization]
+    dyld.exportFuncs.__ghc_wasm_jsffi_init();
+
+    // We're not running iserv, just return the dyld instance so user
+    // could use it to invoke their exported functions, and don't
+    // perform cleanup (see finally block)
+    if (!isIserv) {
+      return dyld;
+    }
+
+    // iserv-specific logic follows
     const reader = rpc.readStream.getReader();
     const writer = rpc.writeStream.getWriter();
 
@@ -1158,30 +1299,25 @@ export async function main({ rpc, libdir, ghciSoPath, args }) {
       writer.write(new Uint8Array(buf));
     };
 
-    await dyld.exportFuncs.defaultServer(cb_sig, cb_recv, cb_send);
+    return await dyld.exportFuncs.defaultServer(cb_sig, cb_recv, cb_send);
   } finally {
-    rpc.close();
+    if (isIserv) {
+      rpc.close();
+    }
   }
 }
 
-(async () => {
-  if (!isNode) {
-    return;
-  }
-
-  const libdir = process.argv[2];
-  const ghciSoPath = process.argv[3];
-  const args = process.argv.slice(6);
-
+// node-specific iserv-specific logic
+async function nodeMain({ searchDirs, mainSoPath, outFd, inFd, args }) {
   if (!process.env.GHCI_BROWSER) {
-    const rpc = new DyLDHost();
-    await main({
+    const rpc = new DyLDHost({ outFd, inFd });
+    return await main({
       rpc,
-      libdir,
-      ghciSoPath,
+      searchDirs,
+      mainSoPath,
       args,
+      isIserv: true,
     });
-    return;
   }
 
   if (!ws) {
@@ -1193,9 +1329,12 @@ export async function main({ rpc, libdir, ghciSoPath, args }) {
   const server = new DyLDRPCServer({
     host: process.env.GHCI_BROWSER_HOST || "127.0.0.1",
     port: process.env.GHCI_BROWSER_PORT || 0,
+    assetsDir: process.env.GHCI_BROWSER_ASSETS_DIR || process.cwd(),
     dyldPath: import.meta.filename,
-    libdir,
-    ghciSoPath,
+    searchDirs,
+    mainSoPath,
+    outFd,
+    inFd,
     args,
     redirectWasiConsole:
       process.env.GHCI_BROWSER_PUPPETEER_LAUNCH_OPTS ||
@@ -1284,6 +1423,20 @@ export async function main({ rpc, libdir, ghciSoPath, args }) {
   }
 
   console.log(
-    `Open ${origin}/main.html or import ${origin}/main.js to boot ghci`
+    `Open ${origin}/main.html or import("${origin}/main.js") to boot ghci`
   );
-})();
+}
+
+const isNodeMain = isNode && import.meta.main;
+
+// node iserv as invoked by
+// GHC.Runtime.Interpreter.Wasm.spawnWasmInterp
+if (isNodeMain) {
+  const clibdir = process.argv[2];
+  const mainSoPath = process.argv[3];
+  const outFd = Number.parseInt(process.argv[4]),
+    inFd = Number.parseInt(process.argv[5]);
+  const args = ["dyld.so", ...process.argv.slice(6)];
+
+  await nodeMain({ searchDirs: [clibdir], mainSoPath, outFd, inFd, args });
+}

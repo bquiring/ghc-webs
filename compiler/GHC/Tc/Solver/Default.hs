@@ -20,16 +20,16 @@ import GHC.Tc.Zonk.TcType     as TcM
 import GHC.Tc.Solver.Solve( solveWanteds )
 import GHC.Tc.Solver.Monad  as TcS
 import GHC.Tc.Types.Constraint
-import GHC.Tc.Types.CtLoc( mkGivenLoc )
+import GHC.Tc.Types.CtLoc( mkGivenLoc, updateCtLocOrigin )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType
 
 import GHC.Core.Class
 import GHC.Core.Reduction( Reduction, reductionCoercion )
 import GHC.Core
-import GHC.Core.DataCon
 import GHC.Core.Make
-import GHC.Core.Coercion( isReflCo, mkReflCo, mkSubCo, hasCoercionHole )
+import GHC.Core.Make.Box ( boxDictTy, liftConstraint, unliftConstraintExpr )
+import GHC.Core.Coercion( isReflCo, mkSubCo, hasCoercionHole )
 import GHC.Core.Unify    ( tcMatchTyKis )
 import GHC.Core.Predicate
 import GHC.Core.Type
@@ -39,15 +39,19 @@ import GHC.Types.DefaultEnv ( ClassDefaults (..), defaultList )
 import GHC.Types.Unique.Set
 import GHC.Types.Id
 
-import GHC.Builtin.Utils
-import GHC.Builtin.Names
-import GHC.Builtin.Types
+import GHC.Builtin
+import GHC.Builtin.KnownOccs ( emptyExceptionContextIdOcc )
+import GHC.Builtin.KnownKeys( unsatisfiableIdKey
+                            , isStringClassKey
+                            )
+import GHC.Builtin.Modules ( gHC_INTERNAL_TYPEERROR )
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.WiredIn.Types.Box ( mkDictBoxDataCon )
 
-import GHC.Types.TyThing ( MonadThings(lookupId) )
+import GHC.Types.Unique
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Types.Id.Make  ( unboxedUnitExpr )
 
 import GHC.Driver.DynFlags
 import GHC.Unit.Module ( getModule )
@@ -68,6 +72,7 @@ import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import GHC.Data.Maybe     ( isJust, mapMaybe, catMaybes )
 import Data.Monoid     ( First(..) )
+import qualified GHC.Tc.Utils.Env as TcM
 
 
 {- Note [Top-level Defaulting Plan]
@@ -272,20 +277,17 @@ unsatisfiableEv_maybe v = (v,) <$> isUnsatisfiableCt_maybe (idType v)
 -- solve all the other Wanted constraints, including those nested within
 -- deeper implications.
 solveImplicationUsingUnsatGiven :: (EvVar, Type) -> Implication -> TcS Implication
-solveImplicationUsingUnsatGiven
-  unsat_given@(given_ev,_)
+solveImplicationUsingUnsatGiven unsat_given
   impl@(Implic { ic_wanted = wtd, ic_tclvl = tclvl, ic_binds = ev_binds_var
-               , ic_need_implic = inner })
+               , ic_info = skol_info })
   | isCoEvBindsVar ev_binds_var
   -- We can't use Unsatisfiable evidence in kinds.
   -- See Note [Coercion evidence only] in GHC.Tc.Types.Evidence.
   = return impl
   | otherwise
-  = do { wcs <- nestImplicTcS ev_binds_var tclvl $ go_wc wtd
+  = do { wcs <- nestImplicTcS skol_info ev_binds_var tclvl $ go_wc wtd
        ; setImplicationStatus $
-         impl { ic_wanted = wcs
-              , ic_need_implic = inner `extendEvNeedSet` given_ev } }
-                -- Record that the Given is needed; I'm not certain why
+         impl { ic_wanted = wcs } }
   where
     go_wc :: WantedConstraints -> TcS WantedConstraints
     go_wc wc@(WC { wc_simple = wtds, wc_impl = impls })
@@ -296,7 +298,7 @@ solveImplicationUsingUnsatGiven
     go_simple ct = case ctEvidence ct of
       CtWanted (WantedCt { ctev_pred = pty, ctev_dest = dest })
         -> do { ev_expr <- unsatisfiableEvExpr unsat_given pty
-              ; setWantedEvTerm dest EvNonCanonical $ EvExpr ev_expr }
+              ; setWantedDict dest EvNonCanonical $ EvExpr ev_expr }
       _ -> return ()
 
 -- | Create an evidence expression for an arbitrary constraint using
@@ -311,32 +313,27 @@ unsatisfiableEvExpr (unsat_ev, given_msg) wtd_ty
          -- This avoids problems with circularity; where we are trying to look
          -- up the "unsatisfiable" Id while we are in the middle of typechecking it.
        ; if mod == gHC_INTERNAL_TYPEERROR then return (Var unsat_ev) else
-    do { unsatisfiable_id <- tcLookupId unsatisfiableIdName
+    do { unsatisfiable_id <- tcLookupKnownKeyId unsatisfiableIdKey
 
          -- See Note [Evidence terms from Unsatisfiable Givens]
          -- for a description of what evidence term we are constructing here.
 
-       ; let -- (##) -=> wtd_ty
-             fun_ty = mkFunTy visArgConstraintLike ManyTy unboxedUnitTy wtd_ty
-             mkDictBox = case boxingDataCon fun_ty of
-               BI_Box { bi_data_con = mkDictBox } -> mkDictBox
-               _ -> pprPanic "unsatisfiableEvExpr: no DictBox!" (ppr wtd_ty)
-             dictBox = dataConTyCon mkDictBox
-       ; ev_bndr <- mkSysLocalM (fsLit "ct") ManyTy fun_ty
-             -- Dict ((##) -=> wtd_ty)
-       ; let scrut_ty = mkTyConApp dictBox [fun_ty]
-             -- unsatisfiable @{LiftedRep} @given_msg @(Dict ((##) -=> wtd_ty)) unsat_ev
+         -- Box the constraint @wtd_ty@ with 'DictBox'.
+         -- NB: this handles both lifted and unlifted constraints.
+       ; ev_bndr <- mkSysLocalM (fsLit "ct") ManyTy (liftConstraint wtd_ty)
+       ; let scrut_ty = boxDictTy wtd_ty
+             -- unsatisfiable @{LiftedRep} @given_msg @(DictBox (liftConstraint wtd_ty)) unsat_ev
              scrut =
                mkCoreApps (Var unsatisfiable_id)
                  [ Type liftedRepTy
                  , Type given_msg
                  , Type scrut_ty
                  , Var unsat_ev ]
-             -- case scrut of { MkDictBox @((##) -=> wtd_ty)) ct -> ct (# #) }
+             -- case scrut of { MkDictBox ct -> ct (# #) }
              ev_expr =
                mkWildCase scrut (unrestricted $ scrut_ty) wtd_ty
-               [ Alt (DataAlt mkDictBox) [ev_bndr] $
-                   mkCoreApps (Var ev_bndr) [unboxedUnitExpr]
+               [ Alt (DataAlt mkDictBoxDataCon) [ev_bndr] $
+                   unliftConstraintExpr (Var ev_bndr)
                ]
         ; return ev_expr } }
 
@@ -385,9 +382,8 @@ This allows us to indirectly box constraints with different representations
 *                                                                               *
 ****************************************************************************** -}
 
--- | A 'TcS' action which can may solve a `Ct`
-type CtDefaultingStrategy = Ct -> TcS Bool
-  -- True <=> I solved the constraint
+-- | A 'TcS' action which may solve a 'Ct' or emit new 'Cts'
+type CtDefaultingStrategy = Ct -> TcS WantedConstraints
 
 tryConstraintDefaulting :: WantedConstraints -> TcS WantedConstraints
 -- See Note [Overview of implicit CallStacks] in GHC.Tc.Types.Evidence
@@ -395,42 +391,53 @@ tryConstraintDefaulting wc
   | isEmptyWC wc
   = return wc
   | otherwise
-  = do { (n_unifs, better_wc) <- reportUnifications (go_wc wc)
-         -- We may have done unifications; so solve again
-       ; solveAgainIf (n_unifs > 0) better_wc }
+  = do { (outermost_unif_lvl, better_wc) <- reportCoarseGrainUnifications $
+                                            go_wc False wc
+
+       -- We may have done unifications; if so, solve again
+       ; let unif_happened = not (isInfiniteTcLevel outermost_unif_lvl)
+       ; solveAgainIf unif_happened better_wc }
   where
-    go_wc :: WantedConstraints -> TcS WantedConstraints
-    go_wc wc@(WC { wc_simple = simples, wc_impl = implics })
-      = do { simples' <- mapMaybeBagM go_simple simples
-           ; implics' <- mapBagM go_implic implics
-           ; return (wc { wc_simple = simples', wc_impl = implics' }) }
+    go_wc :: Bool -> WantedConstraints -> TcS WantedConstraints
+    -- Bool is true if there are enclosing given equalities
+    go_wc encl_eqs (WC { wc_simple = simples, wc_impl = implics, wc_errors = errs })
+      = do { new_wc <- foldMapM (tryCtDefaultingStrategy encl_eqs) simples
+           ; new_implics <- mapBagM (go_implic encl_eqs) implics
+           ; return $
+               new_wc `addImplics` new_implics `addDelayedErrors` errs
+           }
 
-    go_simple :: Ct -> TcS (Maybe Ct)
-    go_simple ct = do { solved <- tryCtDefaultingStrategy ct
-                      ; if solved then return Nothing
-                                  else return (Just ct) }
-
-    go_implic :: Implication -> TcS Implication
-    -- The Maybe is because solving the CallStack constraint
-    -- may well allow us to discard the implication entirely
-    go_implic implic
-      | isSolvedStatus (ic_status implic)
+    go_implic :: Bool -> Implication -> TcS Implication
+    go_implic encl_eqs implic@(Implic { ic_tclvl = tclvl
+                                      , ic_status = status, ic_wanted = wanteds
+                                      , ic_given_eqs = given_eqs, ic_binds = binds })
+      | isSolvedStatus status
       = return implic  -- Nothing to solve inside here
       | otherwise
-      = do { wanteds <- setEvBindsTcS (ic_binds implic) $
-                        -- defaultCallStack sets a binding, so
-                        -- we must set the correct binding group
-                        go_wc (ic_wanted implic)
-           ; setImplicationStatus (implic { ic_wanted = wanteds }) }
+      = do { let encl_eqs' = encl_eqs || given_eqs /= NoGivenEqs
 
-tryCtDefaultingStrategy :: CtDefaultingStrategy
+           ; wanteds' <- setTcLevelTcS tclvl $
+                         -- Set the levels so that reportCoarseGrainUnifications works
+                         setEvBindsTcS binds $
+                         -- defaultCallStack sets a binding, so
+                         -- we must set the correct binding group
+                         go_wc encl_eqs' wanteds
+
+           ; setImplicationStatus (implic { ic_wanted = wanteds' }) }
+
+tryCtDefaultingStrategy :: Bool -> CtDefaultingStrategy
 -- The composition of all the CtDefaultingStrategies we want
-tryCtDefaultingStrategy
+-- The Bool is True if there are enclosing equalities
+tryCtDefaultingStrategy encl_eqs
   = foldr1 combineStrategies
     ( defaultCallStack :|
       defaultExceptionContext :
-      defaultEquality :
+      defaultEquality encl_eqs :
       [] )
+
+-- | Don't default; keep the constraint as is.
+noDefaulting :: Ct -> TcS WantedConstraints
+noDefaulting ct = return (emptyWC { wc_simple = unitBag ct })
 
 -- | Default @ExceptionContext@ constraints to @emptyExceptionContext@.
 defaultExceptionContext :: CtDefaultingStrategy
@@ -438,15 +445,15 @@ defaultExceptionContext ct
   | ClassPred cls tys <- classifyPredType (ctPred ct)
   , isJust (isExceptionContextPred cls tys)
   = do { warnTcS $ TcRnDefaultedExceptionContext (ctLoc ct)
-       ; empty_ec_id <- lookupId emptyExceptionContextName
+       ; empty_ec_id <- wrapTcS (TcM.tcLookupKnownOccId emptyExceptionContextIdOcc)
        ; let ev = ctEvidence ct
-             ev_tm = mkEvCast (Var empty_ec_id) (wrapIP (ctEvPred ev))
-       ; setEvBindIfWanted ev EvCanonical ev_tm
+             ev_tm = EvExpr (evWrapIPE (ctEvPred ev) (Var empty_ec_id))
+       ; setDictIfWanted ev EvCanonical ev_tm
          -- EvCanonical: see Note [CallStack and ExceptionContext hack]
          --              in GHC.Tc.Solver.Dict
-       ; return True }
+       ; return emptyWC }
   | otherwise
-  = return False
+  = noDefaulting ct
 
 -- | Default any remaining @CallStack@ constraints to empty @CallStack@s.
 -- See Note [Overview of implicit CallStacks] in GHC.Tc.Types.Evidence
@@ -454,67 +461,60 @@ defaultCallStack :: CtDefaultingStrategy
 defaultCallStack ct
   | ClassPred cls tys <- classifyPredType (ctPred ct)
   , isJust (isCallStackPred cls tys)
-  = do { solveCallStack (ctEvidence ct) EvCsEmpty
-       ; return True }
+  = do { dflags <- getDynFlags
+         -- See Note [Warn about defaulted CallStacks] in GHC.Tc.Solver.Dict.
+       ; when (wopt Opt_WarnDefaultedCallStack dflags) $
+           do { let loc = ctLoc ct
+              ; ctLocWarnTcS loc (TcRnDefaultedCallStack loc) }
+       ; solveCallStack (ctEvidence ct) EvCsEmpty
+       ; return emptyWC }
   | otherwise
-  = return False
+  = noDefaulting ct
 
-defaultEquality :: CtDefaultingStrategy
+defaultEquality :: Bool -> CtDefaultingStrategy
 -- See Note [Defaulting equalities]
-defaultEquality ct
+-- The Bool is True if there are enclosing equalities
+defaultEquality encl_eqs ct
   | EqPred eq_rel ty1 ty2 <- classifyPredType (ctPred ct)
   = do { -- Remember: `ct` may not be zonked;
          -- see (DE3) in Note [Defaulting equalities]
          z_ty1 <- TcS.zonkTcType ty1
        ; z_ty2 <- TcS.zonkTcType ty2
        ; case eq_rel of
-          { NomEq ->
-       -- Now see if either LHS or RHS is a bare type variable
-       -- You might think the type variable will only be on the LHS
-       -- but with a type function we might get   F t1 ~ alpha
-         case (getTyVar_maybe z_ty1, getTyVar_maybe z_ty2) of
-           (Just z_tv1, _) -> try_default_tv z_tv1 z_ty2
-           (_, Just z_tv2) -> try_default_tv z_tv2 z_ty1
-           _               -> return False ;
+           NomEq -> -- Now see if either LHS or RHS is a bare type variable
+                    -- You might think the type variable will only be on the LHS
+                    -- but with a type function we might get   F t1 ~ alpha
+                    case (getTyVar_maybe z_ty1, getTyVar_maybe z_ty2) of
+                      (Just z_tv1, _) -> try_default_tv_nom z_tv1 z_ty2
+                      (_, Just z_tv2) -> try_default_tv_nom z_tv2 z_ty1
+                      _               -> noDefaulting ct ;
 
-          ; ReprEq
-              -- See Note [Defaulting representational equalities]
-              | CIrredCan (IrredCt { ir_reason }) <- ct
-              , isInsolubleReason ir_reason
-              -- Don't do this for definitely insoluble representational
-              -- equalities such as Int ~R# Bool.
-              -> return False
-              | otherwise
-              ->
-       do { traceTcS "defaultEquality ReprEq {" $ vcat
-              [ text "ct:" <+> ppr ct
-              , text "z_ty1:" <+> ppr z_ty1
-              , text "z_ty2:" <+> ppr z_ty2
-              ]
-            -- Promote this representational equality to a nominal equality.
-            --
-            -- This handles cases such as @IO alpha[tau] ~R# IO Int@
-            -- by defaulting @alpha := Int@, which is useful in practice
-            -- (see Note [Defaulting representational equalities]).
-          ; (co, new_eqs, _unifs) <-
-              wrapUnifierX (ctEvidence ct) Nominal $
-              -- NB: nominal equality!
-                \ uenv -> uType uenv z_ty1 z_ty2
-            -- Only accept this solution if no new equalities are produced
-            -- by the unifier.
-            --
-            -- See Note [Defaulting representational equalities].
-          ; if null new_eqs
-            then do { setEvBindIfWanted (ctEvidence ct) EvCanonical $
-                       (evCoercion $ mkSubCo co)
-                    ; return True }
-            else return False
-          } } }
+           ReprEq -- See Note [Defaulting representational equalities]
+
+                  -- Don't even try this for definitely-insoluble
+                  -- representational equalities such as Int ~R# Bool.
+                  | CIrredCan (IrredCt { ir_reason }) <- ct
+                  , isInsolubleReason ir_reason
+                  -> noDefaulting ct
+
+                  -- Nor if there are enclosing equalities
+                  -- See (DRE1) in Note [Defaulting representational equalities]
+                  | encl_eqs
+                  -> noDefaulting ct
+
+                  | otherwise
+                  -> try_default_repr z_ty1 z_ty2
+        }
   | otherwise
-  = return False
+  = noDefaulting ct
 
   where
-    try_default_tv lhs_tv rhs_ty
+    ev  = ctEvidence ct
+    rws = ctEvRewriters ev
+    loc = ctEvLoc ev
+
+    -- try_default_tv_nom: used for tv ~#N ty
+    try_default_tv_nom lhs_tv rhs_ty
       | MetaTv { mtv_info = info } <- tcTyVarDetails lhs_tv
       , tyVarKind lhs_tv `tcEqType` typeKind rhs_ty
       , checkTopShape info rhs_ty
@@ -544,25 +544,64 @@ defaultEquality ct
                  vcat [ ppr lhs_tv <+> char '~' <+>  ppr rhs_ty
                       , ppr (tyVarKind lhs_tv)
                       , ppr (typeKind rhs_ty) ]
-               ; return False }
+               ; noDefaulting ct }
 
         -- All tests passed: do the unification
         default_tv
           = do { traceTcS "defaultEquality success:" (ppr rhs_ty)
                ; unifyTyVar lhs_tv rhs_ty  -- NB: unifyTyVar adds to the
                                            -- TcS unification counter
-               ; setEvBindIfWanted (ctEvidence ct) EvCanonical $
-                 evCoercion (mkReflCo Nominal rhs_ty)
-               ; return True
+               ; setEqIfWanted ev (mkReflCPH NomEq rhs_ty)
+               ; return emptyWC
                }
 
+    try_default_repr z_ty1 z_ty2
+      = do { traceTcS "defaultEquality ReprEq {" $ vcat
+              [ text "ct:" <+> ppr ct
+              , text "ty1:" <+> ppr z_ty1
+              , text "ty2:" <+> ppr z_ty2
+              ]
+            -- Promote this representational equality to a nominal equality.
+            --
+            -- This handles cases such as @IO alpha[tau] ~R# IO Int@
+            -- by defaulting @alpha := Int@, which is useful in practice
+            -- (see Note [Defaulting representational equalities]).
+           ; let loc' = loc `updateCtLocOrigin` DefaultReprEqOrigin z_ty1 z_ty2
+           ; nom_ev <- newWantedNC loc' rws $ mkNomEqPred z_ty1 z_ty2
+
+            -- Call the solver on this nominal equality
+           ; residual_wc <-
+               nestTcS $
+                 solveWanteds (emptyWC { wc_simple = unitBag (mkNonCanonical $ CtWanted nom_ev) })
+
+           ; traceTcS "defaultEquality ReprEq }" $ vcat
+               [ text "ct:" <+> ppr ct
+               , text "ty1:" <+> ppr z_ty1
+               , text "ty2:" <+> ppr z_ty2
+               , text "ev:" <+> ppr ev
+               , text "nom_ev:" <+> ppr nom_ev
+               , text "residual_wc:" <+> ppr residual_wc
+               ]
+
+             -- Solve the representational equality from the nominal one
+             -- using mkSubCo
+           ; let nom_co = wantedCtEvCoercion nom_ev
+           ; setEqIfWanted ev $
+              CPH { cph_co = mkSubCo nom_co, cph_holes = emptyCoHoleSet }
+           ; return residual_wc }
 
 combineStrategies :: CtDefaultingStrategy -> CtDefaultingStrategy -> CtDefaultingStrategy
 combineStrategies default1 default2 ct
-  = do { solved <- default1 ct
-       ; case solved of
-           True  -> return True  -- default1 solved it!
-           False -> default2 ct  -- default1 failed, try default2
+  = do { wc1@(WC { wc_simple = simples1, wc_impl = implics1, wc_errors = errs1 })
+           <- default1 ct
+       ; if isEmptyWC wc1
+         then return emptyWC  -- default1 solved it!
+         else
+            -- Apply default2 to each simple constraint returned by default1
+            do { new_wc <- foldMapM default2 simples1
+               ; return $
+                   new_wc `addImplics` implics1 `addDelayedErrors` errs1
+               }
        }
 
 
@@ -645,7 +684,9 @@ Wrinkles:
      f x = case x of T1 -> True
 
   Should we infer f :: T a -> Bool, or f :: T a -> a.  Both are valid, but
-  neither is more general than the other.
+  neither is more general than the other.   But by the time defaulting takes
+  place all let-bound variables have got their final types; defaulting won't
+  affect let-generalisation.
 
 (DE2) We still can't unify if there is a skolem-escape check, or an occurs check,
   or it it'd mean unifying a TyVarTv with a non-tyvar.  It's only the
@@ -682,15 +723,7 @@ Wrinkles:
 
   See #10009, and Note [Limited defaulting in the ambiguity check].
 
-
-Note [Must simplify after defaulting]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We may have a deeply buried constraint
-    (t:*) ~ (a:Open)
-which we couldn't solve because of the kind incompatibility, and 'a' is free.
-Then when we default 'a' we can solve the constraint.  And we want to do
-that before starting in on type classes.  We MUST do it before reporting
-errors, because it isn't an error!  #7967 was due to this.
+(DE7) For representational equalities see Note [Defaulting representational equalities]
 
 Note [Defaulting representational equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -731,17 +764,12 @@ user to provide additional type applications:
     sequenceNested_ = coerce $ sequence_ @( Compose f1 f2 ) @IO @()
 
 The plan for defaulting a representational equality, say [W] ty1 ~R# ty2,
-is thus as follows:
+is as follows:
 
-  1. attempt to unify ty1 ~# ty2 (at nominal role)
-  2. a. if this succeeds without deferring any constraints, accept this solution
-     b. otherwise, keep the original constraint.
+  1. call the solver on the nominal equality ty1 ~# ty2
+  2. continue with any remaining constraints
 
-(2b) ensures that we don't degrade all error messages by always turning unsolved
-representational equalities into nominal ones; we only want to default a
-representational equality when we can fully solve it.
-
-Note that this does not threaten principle types. Recall that the original worry
+Note that this does not threaten principal types. Recall that the original worry
 (as per Note [Do not unify representational equalities]) was that we might have
 
     [W] alpha ~R# Int
@@ -750,6 +778,34 @@ Note that this does not threaten principle types. Recall that the original worry
 in which case unifying alpha := Int would be wrong, as the correct solution is
 alpha := Age. This worry doesn't concern us in top-level defaulting, because
 defaulting takes place after generalisation; it is fully monomorphic.
+
+This strategy is designed to handle situations such as:
+
+  type family F a = r | r -> a
+  type instance F Int = Bool
+
+  [W] F beta ~R Bool
+
+Here, we need to use the injectivity annotation to figure out that beta := Int
+is a valid solution. This means we need to invoke the solver, and not just
+the eager unifier (which does not make use of injectivity annotations).
+
+(DRE1) Suppose we have (see test UnliftedNewtypesCoerceFail)
+         [G] Coercible a b
+         [W] alpha ~R# beta
+  Then we don't want to make alpha:=beta, because we probably should really solve it
+  from the Given Coercible constraint.  So we check first for the absence of enclosing
+  equalities.  This is a bit ad-hoc, but so is all of defaulting really.
+
+Note [Must simplify after defaulting]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We may have a deeply buried constraint
+    (t:*) ~ (a:Open)
+which we couldn't solve because of the kind incompatibility, and 'a' is free.
+Then when we default 'a' we can solve the constraint.  And we want to do
+that before starting in on type classes.  We MUST do it before reporting
+errors, because it isn't an error!  #7967 was due to this.
+
 
 *********************************************************************************
 *                                                                               *
@@ -807,7 +863,7 @@ define the following:
     a class defined in the Prelude or the standard library, as defined
     by the Haskell 98 report (section 4.3.4)
 
-    These are defined in GHC.Builtin.Names.standardClassKeys.
+    These are defined in GHC.Builtin.KnownKeys.standardClassKeys.
 
 The rules for defaulting a collection 'S' of unsolved constraints are as follows:
 
@@ -950,14 +1006,15 @@ applyDefaultingRules :: WantedConstraints -> TcS Bool
 -- See Note [How type-class constraints are defaulted]
 
 applyDefaultingRules wanteds
-  | isEmptyWC wanteds
+  | isSolvedWC wanteds -- not isEmptyWC, see (SCS5) in Note [Shortcut solving]
   = return False
   | otherwise
   = do { (default_env, extended_rules) <- getDefaultInfo
        ; wanteds                       <- TcS.zonkWC wanteds
 
        ; tcg_env <- TcS.getGblEnv
-       ; let plugins = tcg_defaulting_plugins tcg_env
+       ; tcm_plugins <- TcS.readTcRef (tcg_plugins tcg_env)
+       ; let plugins = defaultingTcMPlugins tcm_plugins
              default_tys = defaultList default_env
              -- see Note [Named default declarations] in GHC.Tc.Gen.Default
 
@@ -1133,7 +1190,7 @@ disambigProposalSequences orig_wanteds wanteds proposalSequences allConsistent
        ; tclvl             <- TcS.getTcLevel
        -- Step (3) in Note [How type-class constraints are defaulted]
        ; successes <- fmap catMaybes $
-                      nestImplicTcS fake_ev_binds_var (pushTcLevel tclvl) $
+                      nestImplicTcS DefaultSkol fake_ev_binds_var (pushTcLevel tclvl) $
                       mapM firstSuccess proposalSequences
        ; traceTcS "disambigProposalSequences {" (vcat [ ppr wanteds
                                                       , ppr proposalSequences
@@ -1189,7 +1246,7 @@ tryDefaultGroup wanteds (Proposal assignments)
                                          | CtWanted wtd <- map ctEvidence wanteds
                                          ]
                ; residual <- solveSimpleWanteds (listToBag new_wanteds)
-               ; return $ if isEmptyBag residual then Just (tvs, subst) else Nothing }
+               ; return $ if isEmptyWC residual then Just (tvs, subst) else Nothing }
 
           | otherwise
           = return Nothing

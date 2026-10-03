@@ -1,14 +1,5 @@
-
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
-{-# LANGUAGE LambdaCase #-}
                                       -- in module Language.Haskell.Syntax.Extension
 {-
 (c) The University of Glasgow 2006
@@ -20,8 +11,8 @@ GHC.Hs.Type: Abstract syntax: user-defined types
 
 -- See Note [Language.Haskell.Syntax.* Hierarchy] for why not GHC.Hs.*
 module Language.Haskell.Syntax.Type (
-        HsMultAnn, HsMultAnnOf(..),
-        XUnannotated, XLinearAnn, XExplicitMult, XXMultAnnOf,
+        HsFunArr(..), HsModifiedFunArr, HsModifiedFunArrOf(..),
+        XHsStandardArr, XHsLinearArr, XHsModifiedFunArr,
 
         HsType(..), LHsType, HsKind, LHsKind,
         HsBndrVis(..), XBndrRequired, XBndrInvisible, XXBndrVis,
@@ -30,6 +21,7 @@ module Language.Haskell.Syntax.Type (
         isHsBndrInvisible,
         isHsBndrWildCard,
         HsForAllTelescope(..),
+        HsGadtTelescope(..), LHsGadtTelescope, XGadtForAll, XGadtPar, XXGadtArg,
         HsTyVarBndr(..), LHsTyVarBndr,
         LHsQTyVars(..),
         HsOuterTyVarBndrs(..), HsOuterFamEqnTyVarBndrs, HsOuterSigTyVarBndrs,
@@ -38,9 +30,10 @@ module Language.Haskell.Syntax.Type (
         HsSigType(..), LHsSigType, LHsSigWcType, LHsWcType,
         HsTyPat(..), LHsTyPat,
         HsTupleSort(..),
-        HsContext, LHsContext,
-        HsTyLit(..),
-        HsIPName(..), hsIPNameFS,
+        HsContext, LHsContext, HsContextDetails(..), XHsContext, XXHsContextDetails,
+        HsModifierOf(..), LHsModifierOf,  HsModifier, LHsModifier, XModifier,
+        HsLit(..),
+        HsIPName(..),
         HsArg(..), XValArg, XTypeArg, XArgPar, XXArg,
 
         LHsTypeArg,
@@ -49,33 +42,28 @@ module Language.Haskell.Syntax.Type (
 
         HsConDeclRecField(..), LHsConDeclRecField,
 
-        HsConDetails(..),
+        HsConDetails(..), XPrefixCon, XRecCon, XInfixCon, XXHsConDetails,
         HsConDeclField(..),
 
         FieldOcc(..), LFieldOcc,
 
         mapHsOuterImplicit,
-        hsQTvExplicit,
         isHsKindedTyVar
     ) where
 
 import {-# SOURCE #-} Language.Haskell.Syntax.Expr ( HsUntypedSplice )
 
 import Language.Haskell.Syntax.Basic ( SrcStrictness, SrcUnpackedness )
+import Language.Haskell.Syntax.Doc (LHsDoc)
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Specificity
-
-
-import GHC.Hs.Doc (LHsDoc)
-import GHC.Data.FastString (FastString)
-import GHC.Utils.Panic( panic )
+import Language.Haskell.Syntax.Lit
+import Language.Haskell.Syntax.Text
 
 import Data.Data hiding ( Fixity, Prefix, Infix )
 import Data.Maybe
 import Data.Eq
 import Data.Bool
-import Data.Char
-import Prelude (Integer)
 import Data.Ord (Ord)
 import Control.DeepSeq
 
@@ -281,7 +269,99 @@ quantified in left-to-right order in kind signatures is nice since:
 type LHsContext pass = XRec pass (HsContext pass)
 
 -- | Haskell Context
-type HsContext pass = [LHsType pass]
+type HsContext pass = HsContextDetails pass (LHsType pass)
+
+data HsContextDetails pass arg
+  = HsContext
+    { hsc_ext  :: !(XHsContext pass)
+    , hsc_ctxt :: [arg]
+    }
+  | XHsContextDetails !(XXHsContextDetails pass)
+
+type family XHsContext  p
+type family XXHsContextDetails p
+
+-- | Located Modifier
+type LHsModifierOf ty pass = XRec pass (HsModifierOf ty pass)
+
+-- | Modifier. Usually a modifier holds an 'LHsType', but inside expressions, it
+-- has an 'LHsExpr'. See Note [Overview of Modifiers].
+data HsModifierOf ty pass = HsModifier !(XModifier pass) ty
+type family XModifier pass
+
+type LHsModifier pass = XRec pass (HsModifier pass)
+type HsModifier pass = HsModifierOf (LHsType (NoGhcTc pass)) pass
+
+{-
+Note [Overview of Modifiers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Modifiers were introduced in GHC proposal #370
+(https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0370-modifiers.rst).
+They are the @%foo@s in, for example:
+
+* @f :: Int %1 -> Int@
+* @data D = %X D1 | %Y D2@
+* @%X; class A a where ...@
+
+Wherever a modifier (@%foo@ where @foo@ is a type) is recognized in syntax, a
+list of 'HsModifier's is added to the syntax tree. Most commonly, the list is
+then renamed and possibly typechecked, and all modifiers are warned about but
+otherwise ignored.
+
+The places the modifiers may show up are:
+
+* Type and class declarations (see 'tcdModifiers' in 'TyClDecl)
+* Class instance declarations ('cid_modifiers' in 'ClsInstDecl')
+* Foreign declarations ('fd_modifiers' in 'ForeignDecl')
+* Default declarations ('defd_modifiers' in 'DefaultDecl')
+* Type signatures ('TypeSig' in 'Sig')
+* Patterns ('ModifiedPat' in 'Pat')
+* Data constructors ('con_modifiers' in 'ConDecl')
+* Record field declarations ('cdf_multiplicity' in 'HsConDeclField')
+* GADT-style constructor arguments (also 'cdf_multiplicity', see
+  Note [HsConDeclField on pass])
+* Function arrows ('HsFunTy')
+
+In more detail, the moving parts are:
+
+* Parsing: A list of modifiers @['HsModifier' pass]@ (where each 'HsModifier'
+  holds a type) is attached to the syntax tree at each of the places listed
+  above. For the last three, the modifiers may be accompanied by a linear arrow
+  (@⊸@) which affects typechecking. So for these, they're attached in an
+  'HsModifiedFunArr' which bundles them with the arrow.
+
+* Renaming: each modifier is renamed as a type ('rnModifiersContext',
+  'rnHsModifiedFunArrWith'). Most modifiers are subsequently typechecked. A
+  known bug is that some modifiers aren't typechecked (e.g. 'cid_modifiers'),
+  because they appear in contexts that don't themselves get typechecked.
+  Modifiers which won't get typechecked are currently all ignored, and warned
+  about ('rnModifiersContextAndWarn').
+
+* Typechecking: most commonly, modifiers are typechecked as types
+  ('tcModifiersAndWarn'), and warned about but otherwise ignored.
+
+Warnings are controlled by @-Wunrecognised-modifiers@ (on by default).
+
+The only current use of modifiers is multiplicity annotations for linear types.
+These modifiers are recognized in pattern bindings, @let %1 x = ...@;
+constructor arguments (both record style, @data A = B { %1 x :: Int }@; and GADT
+style, @data A where B :: Int %1 -> A@); and function arrows, @Int %1 -> Int@.
+
+Modifiers in these positions are typechecked with 'tcModifiersMult' (pattern
+bindings) or 'tcMult' (when we have an 'HsModifiedFunArr'), and modifiers of
+kind 'Multiplicity' affect typechecking. Non-'Multiplicity' modifiers in these
+positions are treated the same as any other modifiers. See
+Note [Typechecking Multiplicity modifiers] in GHC.Tc.Gen.HsType.
+
+The modifier @%1@ is a special case, interpreted differently depending on linear
+types. With @-XLinearTypes@, @%1@ means the same as @%'One'@. (Specifically
+@'One' :: 'Multiplicity'@, not just whatever @One@ happens to be in scope.) With
+@-XNoLinearTypes@, it means the same as @%(1 :: 'Nat')@. When warning about this
+modifier being unrecognised, we always suggest enabling linear types, even if it
+still won't be recognised then. The rationale is that a modifier unrecognised by
+GHC might be recognised by other tooling, and it would be an unpleasant surprise
+if its meaning changed unexpectedly when a user enabled linear types.
+-}
 
 -- | Located Haskell Type
 type LHsType pass = XRec pass (HsType pass)
@@ -313,6 +393,42 @@ data HsForAllTelescope pass
     }
   | XHsForAllTelescope !(XXHsForAllTelescope pass)
 
+-- | A type for interleaved GADT foralls and parentheses, inspired by HsArg.
+--
+-- Here's an example:
+--
+--  data D where
+--    MkD :: forall x y. -- these go to the `con_outer_bndrs` field
+--             forall a b. ( forall c. forall d. ( forall. ...
+--             ↑           ↑ ↑         ↑         ↑ ↑
+--             1           2 3         4         5 6
+--
+-- That would correspond to a list
+--
+--   1 → [ HsGadtForAll
+--   2 → , HsGadtPar
+--   3 → , HsGadtForAll
+--   4 → , HsGadtForAll
+--   5 → , HsGadtPar
+--   6 → , HsGadtForAll
+--       , ...]
+data HsGadtTelescope pass
+  = HsGadtForAll !(XGadtForAll pass) (HsForAllTelescope pass)
+  | HsGadtPar !(XGadtPar pass)
+    -- ^ `HsGadtPar` is only usefull for pretty-printing/exact-printing for recovering
+    -- parenthisis interleaved with foralls.
+    --
+    -- This approach differs from `HsPar`, which wraps the inner expression as if
+    -- surrounding it with parentheses. We can ditch the `HsPar` approach because
+    -- we know that all parentheses will be closed after the return type.
+  | XHsGadtTelescope !(XXGadtArg pass)
+
+type LHsGadtTelescope pass = XRec pass (HsGadtTelescope pass)
+
+type family XGadtForAll pass
+type family XGadtPar    pass
+type family XXGadtArg   pass
+
 -- | Located Haskell Type Variable Binder
 type LHsTyVarBndr flag pass = XRec pass (HsTyVarBndr flag pass)
                          -- See Note [HsType binders]
@@ -325,10 +441,6 @@ data LHsQTyVars pass   -- See Note [HsType binders]
                 -- Explicit variables, written by the user
     }
   | XLHsQTyVars !(XXLHsQTyVars pass)
-
-hsQTvExplicit :: LHsQTyVars pass -> [LHsTyVarBndr (HsBndrVis pass) pass]
-hsQTvExplicit (HsQTvs { hsq_explicit = explicit_tvs }) = explicit_tvs
-hsQTvExplicit (XLHsQTyVars {})                         = panic "hsQTvExplicit"
 
 ------------------------------------------------
 --            HsOuterTyVarBndrs
@@ -665,11 +777,8 @@ mapHsOuterImplicit _ hso@(XHsOuterTyVarBndrs{}) = hso
 --------------------------------------------------
 -- | These names are used early on to store the names of implicit
 -- parameters.  They completely disappear after type-checking.
-newtype HsIPName = HsIPName FastString
+newtype HsIPName = HsIPName HText
   deriving( Eq, Data )
-
-hsIPNameFS :: HsIPName -> FastString
-hsIPNameFS (HsIPName n) = n
 
 --------------------------------------------------
 
@@ -822,13 +931,13 @@ data HsType pass
       , hst_ctxt  :: LHsContext pass  -- Context C => blah
       , hst_body  :: LHsType pass }
 
+  -- | Type variable, type constructor, or (promoted) data constructor.
+  --
+  -- Includes named wildcards (such as @_foo@), but not bare wildcards @_@.
   | HsTyVar  (XTyVar pass)
-              PromotionFlag    -- Whether explicitly promoted,
-                               -- for the pretty printer
-             (LIdOccP pass)
-                  -- Type variable, type constructor, or data constructor
-                  -- see Note [Promotions (HsTyVar)]
-                  -- See Note [Located RdrNames] in GHC.Hs.Expr
+              PromotionFlag    -- ^ Whether explicitly promoted, for the pretty printer.
+                               -- See Note [Promotions (HsTyVar)]
+             (LIdOccP pass)    -- ^ See Note [Located RdrNames] in GHC.Hs.Expr
 
   | HsAppTy             (XAppTy pass)
                         (LHsType pass)
@@ -839,7 +948,7 @@ data HsType pass
                         (LHsKind pass)
 
   | HsFunTy             (XFunTy pass)
-                        (HsMultAnn pass) -- multiplicty annotations, includes the arrow
+                        (HsModifiedFunArr pass) -- multiplicty annotations, includes the arrow
                         (LHsType pass)   -- function type
                         (LHsType pass)
 
@@ -854,9 +963,9 @@ data HsType pass
                         [LHsType pass]  -- Element types (length gives arity)
 
   | HsOpTy              (XOpTy pass)
-                        PromotionFlag    -- Whether explicitly promoted,
-                                         -- for the pretty printer
-                        (LHsType pass) (LIdOccP pass) (LHsType pass)
+                        (LHsType pass)  -- ^ First argument
+                        (LHsType pass)  -- ^ Operator (always a @HsTyVar@ or a @HsWildCardTy@)
+                        (LHsType pass)  -- ^ Second argument
 
   | HsParTy             (XParTy pass)
                         (LHsType pass)   -- See Note [Parens in HsSyn] in GHC.Hs.Expr
@@ -871,9 +980,7 @@ data HsType pass
       -- ^
       -- > (?x :: ty)
 
-  | HsStarTy            (XStarTy pass)
-                        Bool             -- Is this the Unicode variant?
-                                         -- Note [HsStarTy]
+  | HsStarTy            (XStarTy pass)  -- Note [HsStarTy]
 
   | HsKindSig           (XKindSig pass)
                         (LHsType pass)  -- (ty :: kind)
@@ -897,7 +1004,7 @@ data HsType pass
         PromotionFlag      -- whether explicitly promoted, for pretty printer
         [LHsType pass]
 
-  | HsTyLit (XTyLit pass) (HsTyLit pass)      -- A promoted numeric literal.
+  | HsTyLit (XTyLit pass) (HsLit pass)      -- A promoted literal
 
   | HsWildCardTy (XWildCardTy pass)  -- A type wildcard
       -- See Note [The wildcard story for types]
@@ -906,39 +1013,35 @@ data HsType pass
   | XHsType
       !(XXType pass)
 
+type HsModifiedFunArr pass = HsModifiedFunArrOf (LHsType (NoGhcTc pass)) pass
 
--- | Haskell Type Literal
-data HsTyLit pass
-  = HsNumTy  (XNumTy pass) Integer
-  | HsStrTy  (XStrTy pass) FastString
-  | HsCharTy (XCharTy pass) Char
-  | XTyLit   !(XXTyLit pass)
+-- | Denotes function arrows with optional modifiers attached.
+--
+-- The `mult` type argument is usually `LHsType (NoGhcTc pass)`, but when the
+-- annotation is part of a type used in a term, it is `LHsExpr pass`. See Note
+-- [Types in terms].
+data HsModifiedFunArrOf mult pass
+  = HsModifiedFunArr
+      !(XHsModifiedFunArr mult pass) -- ^ extension field
+      [LHsModifierOf mult pass] -- ^ attached modifiers
+      (HsFunArr pass) -- ^ the actual arrow
 
-type HsMultAnn pass = HsMultAnnOf (LHsType (NoGhcTc pass)) pass
+type family XHsModifiedFunArr mult p
 
--- | Denotes multiplicity annotations in the surface language.
--- The `mult` type argument is usually `LHsType (NoGhcTc pass)`, but when the annotation
--- is part of a type used in a term, it is `LHsExpr pass`. See Note [Types in terms].
-data HsMultAnnOf mult pass
-  = HsUnannotated !(XUnannotated mult pass)
-    -- ^ a -> b or a → b or { nm :: a }
+-- | Denotes a function arrow, which could be @->@ or @⊸@ or @::@. @::@ counts
+-- as an "arrow" for these purposes, because in `HsConDeclField` we need to
+-- support both
+--
+-- > data T where MkT :: Int -> Bool -> T
+-- > data T where MkT :: { x :: Int, y :: Bool } -> T
+data HsFunArr pass
+  = HsStandardArr !(XHsStandardArr pass)
+    -- ^ @a -> b@ or @a → b@ or @{ nm :: a }@.
+  | HsLinearArr !(XHsLinearArr pass)
+    -- ^ @a ⊸ b@.
 
-  | HsLinearAnn !(XLinearAnn mult pass)
-    -- ^ a %1 -> b or a %1 → b, or a ⊸ b, or { nm %1 :: a }
-
-  | HsExplicitMult !(XExplicitMult mult pass) !mult
-    -- ^ a %m -> b or a %m → b or { nm %m :: a }
-    -- (very much including `a %Many -> b`!
-    -- This is how the programmer wrote it). It is stored as an
-    -- `HsType` so as to preserve the syntax as written in the
-    -- program.
-
-  | XMultAnnOf !(XXMultAnnOf mult pass)
-
-type family XUnannotated  mult p
-type family XLinearAnn    mult p
-type family XExplicitMult mult p
-type family XXMultAnnOf   mult p
+type family XHsStandardArr p
+type family XHsLinearArr p
 
 {-
 Note [Unit tuples]
@@ -1062,11 +1165,16 @@ data HsConDeclRecField pass
 -- a separate data type entirely (see 'HsConDeclGADTDetails' in
 -- "GHC.Hs.Decls"). This is because GADT constructors cannot be declared with
 -- infix syntax, unlike the concepts above (#18844).
-data HsConDetails arg rec
-  = PrefixCon [arg]             -- C @t1 @t2 p1 p2 p3
-  | RecCon    rec               -- C { x = p1, y = p2 }
-  | InfixCon  arg arg           -- p1 `C` p2
-  deriving Data
+data HsConDetails p arg rec
+  = PrefixCon !(XPrefixCon p) [arg]    -- C @t1 @t2 p1 p2 p3
+  | RecCon    !(XRecCon p)    rec      -- C { x = p1, y = p2 }
+  | InfixCon  !(XInfixCon p)  arg arg  -- p1 `C` p2
+  | XHsConDetails !(XXHsConDetails p)
+
+type family XPrefixCon      p
+type family XRecCon         p
+type family XInfixCon       p
+type family XXHsConDetails  p
 
 -- | Constructor declaration field specification, see Note [HsConDeclField on pass]
 data HsConDeclField pass
@@ -1083,7 +1191,7 @@ data HsConDeclField pass
           -- E.g. data T a = MkT !a
           --   or data T a where MtT :: !a -> T a
 
-        , cdf_multiplicity :: HsMultAnn pass
+        , cdf_multiplicity :: HsModifiedFunArr pass
           -- ^ User-specified multiplicity, if any
           -- E.g. data T a = MkT { t %Many :: a }
           --   or data T a where MtT :: a %1 -> T a

@@ -25,14 +25,16 @@ module GHC.Internal.Event.Array
     , useAsPtr
     ) where
 
+import qualified GHC.Internal.Stack.Types as Rebindable
+import GHC.Internal.Base hiding( empty )
 import GHC.Internal.Data.Bits ((.|.), shiftR)
 import GHC.Internal.Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import GHC.Internal.Data.Maybe
+import GHC.Internal.Err (errorWithoutStackTrace, undefined)
 import GHC.Internal.Foreign.C.Types (CSize(..))
 import GHC.Internal.Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import GHC.Internal.Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import GHC.Internal.Foreign.Storable (Storable(..))
-import GHC.Internal.Base hiding (empty)
 import GHC.Internal.ForeignPtr (mallocPlainForeignPtrBytes, newForeignPtr_, unsafeWithForeignPtr)
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Real (fromIntegral)

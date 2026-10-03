@@ -12,6 +12,7 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Platform.Ways
 import GHC.Settings (ToolSettings(toolSettings_ldSupportsSingleModule))
+import GHC.SysTools.Tasks
 
 import GHC.Driver.Config.Linker
 import GHC.Driver.Session
@@ -91,11 +92,9 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
          | OSMinGW32 <- os         = pkgs_with_rts
          | gopt Opt_LinkRts dflags = pkgs_with_rts
          | otherwise               = pkgs_without_rts
-        pkg_link_opts = hsLibs unit_link_opts ++ extraLibs unit_link_opts ++ otherFlags unit_link_opts
-          where
-            namever = ghcNameVersion dflags
-            ways_   = ways dflags
-            unit_link_opts = collectLinkOpts namever ways_ pkgs
+    unit_link_opts <- collectLinkOpts (ghcNameVersion dflags) (ways dflags) Nothing pkgs
+    let pkg_link_opts = hsLibs unit_link_opts ++ extraLibs unit_link_opts ++ otherFlags unit_link_opts
+
 
         -- probably _stub.o files
         -- and last temporary shared object file
@@ -150,10 +149,6 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
             --   (and should) do without this for all libraries except
             --   the RTS; all we need to do is to pass the correct
             --   HSfoo_dyn.dylib files to the link command.
-            --   This feature requires Mac OS X 10.3 or later; there is
-            --   a similar feature, -flat_namespace -undefined suppress,
-            --   which works on earlier versions, but it has other
-            --   disadvantages.
             -- -single_module
             --   Build the dynamic library as a single "module", i.e. no
             --   dynamic binding nonsense when referring to symbols from
@@ -211,8 +206,10 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                  ++ [ Option "-Wl,-dead_strip_dylibs", Option "-Wl,-headerpad,8000" ]
               )
             -- Make sure to honour -fno-use-rpaths if set on darwin as well; see #20004
-            when (gopt Opt_RPath dflags) $
-              runInjectRPaths logger (toolSettings dflags) pkg_lib_paths output_fn
+            when (gopt Opt_RPath dflags) $ do
+              let otool_opts = configureOtool dflags
+              let install_name_opts = configureInstallName dflags
+              runInjectRPaths logger otool_opts install_name_opts pkg_lib_paths output_fn
         _ -> do
             -------------------------------------------------------------------
             -- Making a DSO
@@ -230,7 +227,6 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
 
             runLink logger tmpfs linker_config (
                     map Option verbFlags
-                 ++ libmLinkOpts platform
                  ++ [ Option "-o"
                     , FileOption "" output_fn
                     ]
@@ -263,6 +259,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                     --    driver is a more pragmatic solution.
                  ++ [ Option "-Wl,--Bsymbolic,--experimental-pic,--unresolved-symbols=import-dynamic" | arch == ArchWasm32 ]
                  ++ extra_ld_inputs
+                 ++ libmLinkOpts platform
                  ++ map Option lib_path_opts
                  ++ map Option pkg_lib_path_opts
                  ++ map Option pkg_link_opts

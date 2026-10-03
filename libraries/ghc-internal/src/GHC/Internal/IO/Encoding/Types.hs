@@ -30,9 +30,9 @@ module GHC.Internal.IO.Encoding.Types (
   ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Prim (RealWorld, State#)
 import GHC.Internal.Word
 import GHC.Internal.Show
--- import GHC.Internal.IO
 import GHC.Internal.IO.Buffer
 
 -- -----------------------------------------------------------------------------

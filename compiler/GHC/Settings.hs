@@ -11,6 +11,7 @@ module GHC.Settings
   , PlatformMisc (..)
   -- * Accessors
   , dynLibSuffix
+  , bytecodeLibSuffix
   , sProgramName
   , sProjectVersion
   , sGhcUsagePath
@@ -23,7 +24,6 @@ module GHC.Settings
   , sMergeObjsSupportsResponseFiles
   , sLdIsGnuLd
   , sGccSupportsNoPie
-  , sUseInplaceMinGW
   , sArSupportsDashL
   , sPgm_L
   , sPgm_P
@@ -75,6 +75,7 @@ import GHC.Utils.CliOption
 import GHC.Utils.Fingerprint
 import GHC.Platform
 import GHC.Unit.Types
+import GHC.Toolchain.Target
 
 data Settings = Settings
   { sGhcNameVersion    :: {-# UNPACk #-} !GhcNameVersion
@@ -87,6 +88,10 @@ data Settings = Settings
   -- You shouldn't need to look things up in rawSettings directly.
   -- They should have their own fields instead.
   , sRawSettings       :: [(String, String)]
+
+  -- Store the target to print out information about the raw target description
+  -- (e.g. in --info)
+  , sRawTarget         :: Target
   }
 
 data UnitSettings = UnitSettings { unitSettings_baseUnitId :: !UnitId }
@@ -101,8 +106,8 @@ data ToolSettings = ToolSettings
   , toolSettings_ldSupportsSingleModule  :: Bool
   , toolSettings_mergeObjsSupportsResponseFiles :: Bool
   , toolSettings_ldIsGnuLd               :: Bool
+  , toolSettings_ldSupportsVerbatimNamespace :: Bool
   , toolSettings_ccSupportsNoPie         :: Bool
-  , toolSettings_useInplaceMinGW         :: Bool
   , toolSettings_arSupportsDashL         :: Bool
   , toolSettings_cmmCppSupportsG0        :: Bool
 
@@ -174,11 +179,24 @@ data ToolSettings = ToolSettings
 -- | Paths to various files and directories used by GHC, including those that
 -- provide more settings.
 data FileSettings = FileSettings
-  { fileSettings_ghcUsagePath          :: FilePath       -- ditto
-  , fileSettings_ghciUsagePath         :: FilePath       -- ditto
-  , fileSettings_toolDir               :: Maybe FilePath -- ditto
-  , fileSettings_topDir                :: FilePath       -- ditto
+  { fileSettings_ghcUsagePath          :: FilePath
+    -- ^ Path to @ghc-usage.txt@, displayed by @ghc --help@
+  , fileSettings_ghciUsagePath         :: FilePath
+    -- ^ Path to @ghci-usage.txt@, displayed by @ghci --help@
+  , fileSettings_toolDir               :: Maybe FilePath
+    -- ^ Directory containing the mingw toolchain (Windows only);
+    -- see Note [tooldir: How GHC finds mingw on Windows] in `GHC.SysTools.BaseDir`
+  , fileSettings_topDir                :: FilePath
+    -- ^ GHC's top directory: the root from which GHC locates its support files
+    -- (e.g. settings).
+    -- See Note [topdir: How GHC finds its files] in `GHC.SysTools.BaseDir`
   , fileSettings_globalPackageDatabase :: FilePath
+    -- ^ Path to the global package database, relative to `libDir`
+  , fileSettings_libDir                :: FilePath
+    -- ^ Directory containing GHC's library packages and the global package
+    -- database. Defaults to 'fileSettings_topDir' but can differ in inplace
+    -- builds used for cross-compilation testing (the "stage2 cross-compiler"
+    -- scenario).
   }
 
 
@@ -191,6 +209,9 @@ data GhcNameVersion = GhcNameVersion
 -- | Dynamic library suffix
 dynLibSuffix :: GhcNameVersion -> String
 dynLibSuffix (GhcNameVersion name ver) = '-':name ++ ver
+
+bytecodeLibSuffix :: String
+bytecodeLibSuffix = "bytecodelib"
 
 -----------------------------------------------------------------------------
 -- Accessors from 'Settings'
@@ -221,8 +242,6 @@ sLdIsGnuLd :: Settings -> Bool
 sLdIsGnuLd = toolSettings_ldIsGnuLd . sToolSettings
 sGccSupportsNoPie :: Settings -> Bool
 sGccSupportsNoPie = toolSettings_ccSupportsNoPie . sToolSettings
-sUseInplaceMinGW :: Settings -> Bool
-sUseInplaceMinGW = toolSettings_useInplaceMinGW . sToolSettings
 sArSupportsDashL :: Settings -> Bool
 sArSupportsDashL = toolSettings_arSupportsDashL . sToolSettings
 

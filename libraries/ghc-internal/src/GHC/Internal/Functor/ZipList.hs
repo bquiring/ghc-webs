@@ -1,20 +1,16 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 
 module GHC.Internal.Functor.ZipList (ZipList(..)) where
 
-import GHC.Internal.Base
-import GHC.Internal.Generics
+import GHC.Internal.Base hiding( foldr )
 import GHC.Internal.List (repeat, zipWith)
-import GHC.Internal.Read (Read)
-import GHC.Internal.Show (Show)
-import GHC.Internal.Data.Foldable (Foldable)
+import GHC.Internal.Read
+import GHC.Internal.Show
+import GHC.Internal.Data.Foldable
 import GHC.Internal.Data.Traversable (Traversable(..))
-import GHC.Internal.Data.Data (Data)
 
 -- | Lists, but with an 'Applicative' functor based on zipping.
 --
@@ -43,10 +39,7 @@ newtype ZipList a = ZipList { getZipList :: [a] }
                            , Read     -- ^ @since base-4.7.0.0
                            , Functor  -- ^ @since base-2.01
                            , Foldable -- ^ @since base-4.9.0.0
-                           , Generic  -- ^ @since base-4.7.0.0
-                           , Generic1 -- ^ @since base-4.7.0.0
                            )
--- See GHC.Internal.Data.Traversable for Traversable instance due to import loops
 
 
 -- | @since base-4.9.0.0
@@ -77,7 +70,3 @@ instance Alternative ZipList where
        go (x:xs) (_:ys) = x : go xs ys
        go    []     ys  = ys
        go    xs      _  = xs
-
--- | @since base-4.14.0.0
-deriving instance Data a => Data (ZipList a)
-

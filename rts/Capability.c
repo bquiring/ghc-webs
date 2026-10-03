@@ -286,7 +286,8 @@ initCapability (Capability *cap, uint32_t i)
 #endif
     cap->total_allocated        = 0;
 
-    initCapabilityIOManager(cap); /* initialises cap->iomgr */
+    cap->iomgr = allocCapabilityIOManager(cap);
+    initCapabilityIOManager(cap->iomgr);
 
     cap->f.stgEagerBlackholeInfo = (W_)&__stg_EAGER_BLACKHOLE_info;
     cap->f.stgGCEnter1     = (StgFunPtr)__stg_gc_enter_1;
@@ -413,7 +414,7 @@ void initCapabilities (void)
         max_n_capabilities = RtsFlags.ParFlags.nCapabilities;
     }
 
-    capabilities = stgMallocBytes(sizeof(Capability) * max_n_capabilities, "initCapabilities");
+    capabilities = stgMallocBytes(sizeof(Capability *) * max_n_capabilities, "initCapabilities");
 
     n_capabilities = 0;
     moreCapabilities(0, RtsFlags.ParFlags.nCapabilities);
@@ -422,7 +423,7 @@ void initCapabilities (void)
 #else /* !THREADED_RTS */
 
     n_capabilities = 1;
-    capabilities = stgMallocBytes(sizeof(Capability), "initCapabilities");
+    capabilities = stgMallocBytes(sizeof(Capability *), "initCapabilities");
     capabilities[0] = &MainCapability;
 
     initCapability(&MainCapability, 0);
@@ -443,13 +444,6 @@ void
 moreCapabilities (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
 {
 #if defined(THREADED_RTS)
-    // We must disable the timer while we do this since the tick handler may
-    // call contextSwitchAllCapabilities, which may see the capabilities array
-    // as we free it. The alternative would be to protect the capabilities
-    // array with a lock but this seems more expensive than necessary.
-    // See #17289.
-    stopTimer();
-
     if (to == 1) {
         // THREADED_RTS must work on builds that don't have a mutable
         // BaseReg (eg. unregisterised), so in this case
@@ -470,8 +464,6 @@ moreCapabilities (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
     }
 
     debugTrace(DEBUG_sched, "allocated %d more capabilities", to - from);
-
-    startTimer();
 #endif
 }
 
@@ -534,13 +526,20 @@ giveCapabilityToTask (Capability *cap USED_IF_DEBUG, Task *task)
 /* ----------------------------------------------------------------------------
  * releaseCapability
  *
- * The current Task (cap->task) releases the Capability.  The Capability is
- * marked free, and if there is any work to do, an appropriate Task is woken up.
+ * This serves two purposes:
+ *
+ * 1. The current Task (cap->running_task) releases the Capability.
+ *    The Capability is marked free, and if there is any work to do, an
+ *    appropriate Task is woken up.
+ *
+ * 2. There is no current task (cap->task == NULL), and thus the Capability
+ *    is idle, and we want to wake up an idle Task to animate the Capability.
+ *    In this case set always_wakeup. See also prodCapability.
  *
  * The caller must hold cap->lock and will still hold it after
  * releaseCapability returns.
  *
- * N.B. May need to take all_tasks_mutex.
+ * N.B. May need to take all_tasks_mutex, if it needs to start a new task.
  *
  * ------------------------------------------------------------------------- */
 
@@ -549,12 +548,18 @@ void
 releaseCapability_ (Capability* cap,
                     bool always_wakeup)
 {
-    Task *task;
+    {
+        Task *task = cap->running_task;
 
-    task = cap->running_task;
-
-    ASSERT_PARTIAL_CAPABILITY_INVARIANTS(cap,task);
-    ASSERT_RETURNING_TASKS(cap,task);
+        ASSERT(task || always_wakeup);
+        // To cover purpose 2 above, we allow the cap->running_task to be
+        // NULL, to handle cases where a thread (that is not itself a Task)
+        // needs to wake up an idle task for the capability.
+        if (task) {
+            ASSERT_PARTIAL_CAPABILITY_INVARIANTS(cap,task);
+            ASSERT_RETURNING_TASKS(cap,task);
+        }
+    }
     ASSERT_LOCK_HELD(&cap->lock);
 
     RELAXED_STORE(&cap->running_task, NULL);
@@ -590,8 +595,8 @@ releaseCapability_ (Capability* cap,
         // assertion is false: in schedule() we force a yield after
         // ThreadBlocked, but the thread may be back on the run queue
         // by now.
-        task = peekRunQueue(cap)->bound->task;
-        giveCapabilityToTask(cap, task);
+        Task *btask = peekRunQueue(cap)->bound->task;
+        giveCapabilityToTask(cap, btask);
         return;
     }
 
@@ -1096,14 +1101,23 @@ yieldCapability
 #if defined(THREADED_RTS)
 
 void
-prodCapability (Capability *cap, Task *task)
+prodCapability (Capability *cap)
 {
     ACQUIRE_LOCK(&cap->lock);
     if (!cap->running_task) {
-        cap->running_task = task;
         releaseCapability_(cap,true);
     }
     RELEASE_LOCK(&cap->lock);
+}
+
+/* Ensure at least one capability is not idle. Used to wake up the RTS
+ * in cases where we anticipate that all capabilities may be idle. In
+ * particular it is used for the ctl-c handler, and after the idle GC
+ * timeout to initiate idle GC. */
+void
+prodOneCapability (void)
+{
+    prodCapability(getCapability(0));
 }
 
 #endif /* THREADED_RTS */
@@ -1279,6 +1293,8 @@ shutdownCapabilities(Task *task, bool safe)
 static void
 freeCapability (Capability *cap)
 {
+    freeCapabilityIOManager(cap->iomgr);
+    stgFree(cap->iomgr);
     stgFree(cap->mut_lists);
     stgFree(cap->saved_mut_lists);
     if (cap->current_segments) {
@@ -1344,7 +1360,7 @@ markCapability (evac_fn evac, void *user, Capability *cap,
     }
 #endif
 
-    markCapabilityIOManager(evac, user, cap);
+    markCapabilityIOManager(evac, user, cap->iomgr);
 
     // Free STM structures for this Capability
     stmPreGCHook(cap);
@@ -1380,7 +1396,9 @@ bool checkSparkCountInvariant (void)
     /* The invariant is
      *   created = converted + remaining + gcd + fizzled
      */
-    debugTrace(DEBUG_sparks,"spark invariant: %ld == %ld + %ld + %ld + %ld "
+    debugTrace(DEBUG_sparks,"spark invariant: %" FMT_Word " == "
+                            "%" FMT_Word " + %" FMT_Word64 " + "
+                            "%" FMT_Word " + %" FMT_Word " "
                             "(created == converted + remaining + gcd + fizzled)",
                             sparks.created, sparks.converted, remaining,
                             sparks.gcd, sparks.fizzled);

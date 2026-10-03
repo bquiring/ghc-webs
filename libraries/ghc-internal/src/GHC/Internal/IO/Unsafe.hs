@@ -26,6 +26,7 @@ module GHC.Internal.IO.Unsafe (
   ) where
 
 import GHC.Internal.Base
+import GHC.Internal.Prim (noDuplicate#)
 
 {-
 Note [unsafePerformIO and strictness]

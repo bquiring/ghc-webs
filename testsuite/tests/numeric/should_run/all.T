@@ -3,6 +3,10 @@
 #	extra run flags
 #	expected process return value, if not zero
 
+# some bugs only surface with -O, omitting optasm may cause them to
+# slip into releases! (e.g. #26711)
+setTestOpts(when(have_ncg(), extra_ways(['optasm'])))
+
 test('arith001', normal, compile_and_run, [''])
 test('arith002', normal, compile_and_run, [''])
 test('arith003', normal, compile_and_run, [''])
@@ -82,8 +86,19 @@ test('IntegerToFloat', normal, compile_and_run, [''])
 test('T20291', normal, compile_and_run, [''])
 test('T22282', normal, compile_and_run, [''])
 test('T22671', js_fragile(24259), compile_and_run, [''])
-test('foundation', [when(js_arch(), run_timeout_multiplier(2)), js_fragile(24259), extra_ways(['optasm','ghci','ghci-opt'])], compile_and_run, ['-package transformers -fno-break-points'])
+# the high run timeout multiplier exists because of timeouts with the wasm backend
+test('foundation',
+     [ mini_quickcheck
+     , run_timeout_multiplier(4)
+     , js_fragile(24259)
+     , extra_ways(['optasm','ghci','ghci-opt'])
+     ]
+     , multimod_compile_and_run
+     , ['foundation', '-fno-break-points'])
 test('T24066', normal, compile_and_run, [''])
 test('div01', normal, compile_and_run, [''])
 test('T24245', normal, compile_and_run, [''])
 test('T25653', normal, compile_and_run, [''])
+test('T18619', exit_code(1), compile_and_run, [''])
+test('T26230', normal, compile_and_run, [''])
+test('T21176', normal, compile_and_run, [''])

@@ -80,15 +80,15 @@ time you fire up a build. This is not possible with the Make build system.
   build _build/stage1/lib/package.conf.d/text-1.2.3.0.conf # OR actual path
   ```
 
-- Building with a particular flavour (e.g `quickest`)
+- Building with a particular flavour (e.g `quick`)
 
   ``` sh
   # Make
-  echo "BuildFlavour=quickest" >> mk/build.mk
+  echo "BuildFlavour=quick" >> mk/build.mk
   make
 
   # Hadrian
-  build --flavour=quickest
+  build --flavour=quick
   ```
   See [flavours documentation](https://gitlab.haskell.org/ghc/ghc/blob/master/hadrian/doc/flavours.md) for info on flavours.
 
@@ -133,7 +133,8 @@ time you fire up a build. This is not possible with the Make build system.
 
   As illustrated in the examples above, you can use the `TEST` environment
   variable, the `--only=...` flag or even both to restrict your testsuite run
-  to some (usually small) subset of the testsuite.
+  to some (usually small) subset of the testsuite. You can also skip specific
+  tests with `--skip-test=...` (e.g. `build test --skip-test="test1 test2"`).
 
   See [the docs for the test rules](./testsuite.md) if you want to know about
   all the options that hadrian supports and what they correspond to in the Make

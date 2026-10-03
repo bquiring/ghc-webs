@@ -48,17 +48,20 @@ module GHC.Internal.Event.TimerManager
 ------------------------------------------------------------------------
 -- Imports
 
+import GHC.Internal.Base
 import GHC.Internal.Control.Exception (finally)
 import GHC.Internal.Data.Foldable (sequence_)
 import GHC.Internal.Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef, readIORef,
                    writeIORef)
-import GHC.Internal.Base
+import GHC.Internal.Err (errorWithoutStackTrace)
 import GHC.Internal.Clock (getMonotonicTimeNSec)
 import GHC.Internal.Conc.Signal (runHandlers)
 import GHC.Internal.Enum (maxBound)
+import GHC.Internal.Maybe (Maybe(..))
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Real (quot, fromIntegral)
-import GHC.Internal.Show (Show(..))
+import GHC.Internal.Prim (seq)
+import GHC.Internal.Show
 import GHC.Internal.Event.Control
 import GHC.Internal.Event.Internal (Backend, Event, evtRead, Timeout(..))
 import GHC.Internal.Event.Unique (UniqueSource, newSource, newUnique)
@@ -119,7 +122,7 @@ new = newWith =<< newDefaultBackend
 newWith :: Backend -> IO TimerManager
 newWith be = do
   timeouts <- newIORef Q.empty
-  ctrl <- newControl True
+  ctrl <- newControl
   state <- newIORef Created
   us <- newSource
   _ <- mkWeakIORef state $ do

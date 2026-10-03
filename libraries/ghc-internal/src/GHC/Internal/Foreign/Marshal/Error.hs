@@ -28,9 +28,9 @@ module GHC.Internal.Foreign.Marshal.Error (
   void
 ) where
 
-import GHC.Internal.Foreign.Ptr
-
+import qualified GHC.Internal.Stack.Types as Rebindable
 import GHC.Internal.Base
+import GHC.Internal.Foreign.Ptr
 import GHC.Internal.Num
 import GHC.Internal.IO.Exception
 

@@ -1,18 +1,7 @@
 {-# LANGUAGE BangPatterns, MagicHash, UnboxedTuples, GeneralizedNewtypeDeriving, DerivingStrategies #-}
 {-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
--- gross hack: we maneuvered ourselves into a position where we can't boot GHC with a LLVM based GHC anymore.
--- LLVM based GHC's fail to compile memcmp ffi calls.  These end up as memcmp$def in the llvm ir, however we
--- don't have any prototypes and subsequently the llvm toolchain chokes on them.  Since 7fdcce6d, we use
--- ShortText for the package database.  This however introduces this very module; which through inlining ends
--- up bringing memcmp_ByteArray from bytestring:Data.ByteString.Short.Internal into scope, which results in
--- the memcmp call we choke on.
---
--- The solution thusly is to force late binding via the linker instead of inlining when comping with the
--- bootstrap compiler.  This will produce a slower (slightly less optimised) stage1 compiler only.
---
--- See issue 18857. hsyl20 deserves credit for coming up with the idea for the solution.
--- |
--- An Unicode string for internal GHC use. Meant to replace String
+
+-- | An Unicode string for internal GHC use. Meant to replace String
 -- in places where being a lazy linked is not very useful and a more
 -- memory efficient data structure is desirable.
 
@@ -43,6 +32,7 @@ import Prelude
 
 import Control.Monad (guard)
 import Control.DeepSeq as DeepSeq
+import Data.Data
 import Data.Binary
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Short.Internal as SBS
@@ -50,14 +40,33 @@ import GHC.Exts
 import GHC.IO
 import GHC.Utils.Encoding
 import System.FilePath (isPathSeparator)
+import Data.Function
 
 {-| A 'ShortText' is a modified UTF-8 encoded string meant for short strings like
 file paths, module descriptions, etc.
+
+GHC's Modified UTF-8 encoding diverges from Standard UTF-8 because:
+
+1. It uses the overlong encoding for NUL characters 0xC080, to avoid issues with C
+  code that assumes NUL terminated strings.
+
+2. It allows arbitrary (and unpaired) surrogate values (generalised UTF-8, see
+  e.g. [this page](https://wtf-8.codeberg.page/#generalized-utf8)).
+
+Or in summary it is a "generalised UTF-8 + overlong NUL" encoding, a bit like
+Java's modified UTF-8 is "CESU-8 + overlong NUL".
 -}
 newtype ShortText = ShortText { contents :: SBS.ShortByteString
                               }
-                              deriving stock (Show)
-                              deriving newtype (Eq, Ord, Binary, Semigroup, Monoid, NFData)
+                              deriving newtype (Eq, Binary, Semigroup, Monoid, NFData)
+
+instance Show ShortText where
+  show = show . unpack
+
+instance Ord ShortText where
+  -- Must compare Modified UTF-8 codepoins!
+  -- Stock deriving Ord is subtly incorrect!
+  compare = utf8CompareShortByteString `on` contents
 
 -- We don't want to derive this one from ShortByteString since that one won't handle
 -- UTF-8 characters correctly.
@@ -132,3 +141,14 @@ stripPrefix prefix st = do
           !(# s3, fba #) = unsafeFreezeByteArray# ba s2
       in  (# s3, SBS.SBS fba #)
     return . Just . ShortText $ newSBS
+
+instance Data ShortText where
+  toConstr _   = shortTextConstr
+  gunfold _ _  = error "ShortText:gunfold"
+  dataTypeOf _ = mkNoRepType "ShortText"
+
+shortTextConstr :: Constr
+shortTextConstr = mkConstr shortTextDataType ("{abstract:ShortText}") [] Prefix
+
+shortTextDataType :: DataType
+shortTextDataType = mkDataType "ShortText" [shortTextConstr]

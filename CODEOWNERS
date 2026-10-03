@@ -59,14 +59,13 @@
 /compiler/GHC/Runtime/Interpreter/Wasm.hs @TerrorJack
 
 [Core libraries]
-/libraries/base/                  @hvr
+/libraries/base/                  @core-libraries
 /libraries/ghci/                  @simonmar
 /libraries/template-haskell/      @rae
 /testsuite/tests/interface-stability/ @core-libraries
 
 [Internal utilities and libraries]
 /utils/iserv-proxy/               @angerman @simonmar
-/utils/iserv/                     @angerman @simonmar
 /utils/fs/                        @Phyx
 /utils/jsffi                      @TerrorJack
 /utils/haddock                     @Kleidukos

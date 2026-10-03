@@ -10,6 +10,7 @@ import qualified Hadrian.Oracles.Path
 import qualified Hadrian.Oracles.TextFile
 import qualified Hadrian.Haskell.Hash
 
+import BindistConfig
 import Expression
 import qualified Oracles.Flavour
 import qualified Oracles.ModuleFiles
@@ -21,7 +22,6 @@ import qualified Rules.Dependencies
 import qualified Rules.Documentation
 import qualified Rules.Generate
 import qualified Rules.Gmp
-import qualified Rules.Libffi
 import qualified Rules.Library
 import qualified Rules.Program
 import qualified Rules.Register
@@ -54,11 +54,19 @@ topLevelTargets = action $ do
         packages <- stagePackages stage
         mapM (path stage) packages
 
+    -- For cross compilers, also build the target (stage 2) libraries. They
+    -- are built by and ship with the executable_stage compiler, so include
+    -- them iff that compiler is built.
+    cfg <- implicitBindistConfig
+    lib_targets <- if executable_stage cfg < finalStage
+        then map snd . fst <$> Rules.BinaryDist.bindistPackageTargets cfg
+        else return []
+
     -- Why we need wrappers: https://gitlab.haskell.org/ghc/ghc/issues/16534.
     root <- buildRoot
     let wrappers = [ root -/- ("ghc-" ++ stageString s) | s <- [Stage1, Stage2, Stage3]
                                                         , s < finalStage ]
-    need (targets ++ wrappers)
+    need (targets ++ lib_targets ++ wrappers)
   where
     -- either the package database config file for libraries or
     -- the programPath for programs. However this still does
@@ -71,26 +79,19 @@ topLevelTargets = action $ do
     name stage pkg | isLibrary pkg = return (pkgName pkg)
                    | otherwise     = programName (vanillaContext stage pkg)
 
--- TODO: Get rid of the @includeGhciLib@ hack.
 -- | Return the list of targets associated with a given 'Stage' and 'Package'.
--- By setting the Boolean parameter to False it is possible to exclude the GHCi
--- library from the targets, and avoid configuring the package to determine
--- whether GHCi library needs to be built for it. We typically want to set
--- this parameter to True, however it is important to set it to False when
--- computing 'topLevelTargets', as otherwise the whole build gets sequentialised
--- because packages are configured in the order respecting their dependencies.
-packageTargets :: Bool -> Stage -> Package -> Action [FilePath]
-packageTargets includeGhciLib stage pkg = do
+packageTargets :: Stage -> Package -> Action [FilePath]
+packageTargets stage pkg = do
     let context = vanillaContext stage pkg
     activePackages <- stagePackages stage
     if pkg `notElem` activePackages
     then return [] -- Skip inactive packages.
     else if isLibrary pkg
         then do -- Collect all targets of a library package.
-            let pkgWays = if pkg == rts then getRtsWays else getLibraryWays
+            let pkgWays = if pkg `elem` [rts, libffi] then getRtsWays else getLibraryWays
             ways  <- interpretInContext context pkgWays
             libs  <- mapM (\w -> pkgLibraryFile (Context stage pkg w (error "unused"))) (Set.toList ways)
-            more  <- Rules.Library.libraryTargets includeGhciLib context
+            more  <- Rules.Library.libraryTargets context
             setupConfig <- pkgSetupConfigFile context
             return $ [setupConfig] ++ libs ++ more
         else do -- The only target of a program package is the executable.
@@ -133,7 +134,6 @@ buildRules = do
     Rules.Generate.generateRules
     Rules.Generate.templateRules
     Rules.Gmp.gmpRules
-    Rules.Libffi.libffiRules
     Rules.Library.libraryRules
     Rules.Rts.rtsRules
     packageRules

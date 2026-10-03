@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 module GHC.Weak.Finalize
     ( -- * Handling exceptions
@@ -7,16 +8,24 @@ module GHC.Weak.Finalize
       -- this handler will be ignored.
       setFinalizerExceptionHandler
     , getFinalizerExceptionHandler
-    , printToHandleFinalizerExceptionHandler
+    , GHC.Weak.Finalize.printToHandleFinalizerExceptionHandler
       -- * Internal
     , GHC.Weak.Finalize.runFinalizerBatch
     ) where
 
 import GHC.Internal.Weak.Finalize
 
--- These imports can be removed once runFinalizerBatch is removed,
--- as can MagicHash above.
-import GHC.Internal.Base (Int, Array#, IO, State#, RealWorld)
+import GHC.Internal.Base (return, (++))
+import GHC.Internal.Exception
+import GHC.Internal.IO (catchException)
+import GHC.Internal.IO.Handle.Types (Handle)
+import GHC.Internal.IO.Handle.Text (hPutStrLn)
+import GHC.Internal.Prim (Array#, State#, RealWorld)
+import GHC.Internal.Types (Int, IO)
+#if __GLASGOW_HASKELL__ >= 1001
+import GHC.Internal.Num   as Rebindable( Num )  -- A necessary known-key name
+import GHC.Internal.Types as Rebindable( unpackCString#, unpackCStringUtf8# )
+#endif
 
 
 {-# DEPRECATED runFinalizerBatch
@@ -36,3 +45,13 @@ runFinalizerBatch :: Int
                   -> Array# (State# RealWorld -> State# RealWorld)
                   -> IO ()
 runFinalizerBatch = GHC.Internal.Weak.Finalize.runFinalizerBatch
+
+-- | An exception handler for 'Handle' finalization that prints the error to
+-- the given 'Handle', but doesn't rethrow it.
+--
+-- @since base-4.18.0.0
+printToHandleFinalizerExceptionHandler :: Handle -> SomeException -> IO ()
+printToHandleFinalizerExceptionHandler hdl se =
+    hPutStrLn hdl msg `catchException` (\(SomeException _) -> return ())
+  where
+    msg = "Exception during weak pointer finalization (ignored): " ++ displayException se ++ "\n"

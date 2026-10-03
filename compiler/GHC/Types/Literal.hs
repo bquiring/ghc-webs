@@ -4,8 +4,6 @@
 
 -}
 
-{-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 
@@ -15,6 +13,8 @@ module GHC.Types.Literal
         -- * Main data type
           Literal(..)           -- Exported to ParseIface
         , LitNumType(..)
+        , LitFloating
+        , LitFloatingType(..)
 
         -- ** Creating Literals
         , mkLitInt, mkLitIntWrap, mkLitIntWrapC, mkLitIntUnchecked
@@ -58,13 +58,13 @@ module GHC.Types.Literal
         , narrowWord8Lit, narrowWord16Lit, narrowWord32Lit, narrowWord64Lit
         , convertToIntLit, convertToWordLit
         , charToIntLit, intToCharLit
-        , floatToIntLit, intToFloatLit, doubleToIntLit, intToDoubleLit
-        , nullAddrLit, floatToDoubleLit, doubleToFloatLit
+        , nullAddrLit
         ) where
 
 import GHC.Prelude
 
-import GHC.Builtin.Types.Prim
+import GHC.Types.Literal.Floating
+import GHC.Builtin.WiredIn.Prim
 import GHC.Core.Type( Type, RuntimeRepType, mkForAllTy, mkTyVarTy, typeOrConstraintKind )
 import GHC.Core.TyCo.Compare( nonDetCmpType )
 import GHC.Types.Var
@@ -77,14 +77,13 @@ import GHC.Platform
 import GHC.Utils.Panic
 import GHC.Utils.Encoding
 
+import Control.DeepSeq
 import Data.ByteString (ByteString)
 import Data.Int
 import Data.Word
 import Data.Char
 import Data.Data ( Data )
-import GHC.Exts( isTrue#, dataToTag#, (<#) )
-import Numeric ( fromRat )
-import Control.DeepSeq
+import GHC.Exts
 
 {-
 ************************************************************************
@@ -141,8 +140,9 @@ data Literal
       -- INVARIANT: the Type has no free variables
       --    and so substitution etc can ignore it
 
-  | LitFloat   Rational         -- ^ @Float#@. Create with 'mkLitFloat'
-  | LitDouble  Rational         -- ^ @Double#@. Create with 'mkLitDouble'
+  | LitFloating !LitFloatingType !LitFloating
+                                -- ^ @Float#@ or @Double#@.
+                                -- Create with 'mkLitFloat' or 'mkLitDouble'.
 
   | LitLabel   FastString FunctionOrData
                                 -- ^ A label literal. Parameters:
@@ -218,7 +218,6 @@ instance NFData LitNumType where
     rnf (LitNumWord32) = ()
     rnf (LitNumWord64) = ()
 
-
 {-
 Note [BigNum literals]
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -264,8 +263,8 @@ instance Binary Literal where
     put_ bh (LitChar aa)     = do putByte bh 0; put_ bh aa
     put_ bh (LitString ab)   = do putByte bh 1; put_ bh ab
     put_ bh (LitNullAddr)    = putByte bh 2
-    put_ bh (LitFloat ah)    = do putByte bh 3; put_ bh ah
-    put_ bh (LitDouble ai)   = do putByte bh 4; put_ bh ai
+    put_ bh (LitFloating LitFloat ah)  = do putByte bh 3; put_ bh ah
+    put_ bh (LitFloating LitDouble ai) = do putByte bh 4; put_ bh ai
     put_ bh (LitLabel aj fod)
         = do putByte bh 5
              put_ bh aj
@@ -289,10 +288,10 @@ instance Binary Literal where
               2 -> return (LitNullAddr)
               3 -> do
                     ah <- get bh
-                    return (LitFloat ah)
+                    return (LitFloating LitFloat ah)
               4 -> do
                     ai <- get bh
-                    return (LitDouble ai)
+                    return (LitFloating LitDouble ai)
               5 -> do
                     aj <- get bh
                     fod <- get bh
@@ -308,8 +307,7 @@ instance NFData Literal where
     rnf (LitNumber nt i) = rnf nt `seq` rnf i
     rnf (LitString s) = rnf s
     rnf LitNullAddr = ()
-    rnf (LitFloat r) = rnf r
-    rnf (LitDouble r) = rnf r
+    rnf (LitFloating ty f) = rnf ty `seq` rnf f
     rnf (LitLabel l1 k2) = rnf l1 `seq` rnf k2
     rnf (LitRubbish {}) = () -- LitRubbish is not contained within interface files.
                              -- See Note [Rubbish literals].
@@ -587,13 +585,18 @@ mkLitWord64Wrap i = mkLitWord64Unchecked (toInteger (fromIntegral i :: Word64))
 mkLitWord64Unchecked :: Integer -> Literal
 mkLitWord64Unchecked i = LitNumber LitNumWord64 i
 
+
+-- mkLit(Float|Double) do not take a Platform argument because
+-- performing platform-dependent rounding at literal-creation
+-- time may hurt proper '-fexcess-precision' in constant-folding
+
 -- | Creates a 'Literal' of type @Float#@
 mkLitFloat :: Rational -> Literal
-mkLitFloat = LitFloat
+mkLitFloat x = LitFloating LitFloat (rationalToLitFloating x)
 
 -- | Creates a 'Literal' of type @Double#@
 mkLitDouble :: Rational -> Literal
-mkLitDouble = LitDouble
+mkLitDouble x = LitFloating LitDouble (rationalToLitFloating x)
 
 -- | Creates a 'Literal' of type @Char#@
 mkLitChar :: Char -> Literal
@@ -656,19 +659,18 @@ isMaxBound _        _                  = False
 inCharRange :: Char -> Bool
 inCharRange c =  c >= '\0' && c <= chr tARGET_MAX_CHAR
 
--- | Tests whether the literal represents a zero of whatever type it is
+-- | Tests whether the literal represents a zero of whatever type it is.
+-- For floating-point literals, positive and negative zero both return True.
 isZeroLit :: Literal -> Bool
 isZeroLit (LitNumber _ 0) = True
-isZeroLit (LitFloat  0)   = True
-isZeroLit (LitDouble 0)   = True
-isZeroLit _               = False
+isZeroLit (LitFloating _ f) = isZeroLF f
+isZeroLit _ = False
 
 -- | Tests whether the literal represents a one of whatever type it is
 isOneLit :: Literal -> Bool
 isOneLit (LitNumber _ 1) = True
-isOneLit (LitFloat  1)   = True
-isOneLit (LitDouble 1)   = True
-isOneLit _               = False
+isOneLit (LitFloating _ f) = isOneLF f
+isOneLit _ = False
 
 -- | Returns the 'Integer' contained in the 'Literal', for when that makes
 -- sense, i.e. for 'Char' and numbers.
@@ -700,12 +702,6 @@ mapLitValue _        _ l                  = pprPanic "mapLitValue" (ppr l)
         ~~~~~~~~~
 -}
 
-charToIntLit, intToCharLit,
-  floatToIntLit, intToFloatLit,
-  doubleToIntLit, intToDoubleLit,
-  floatToDoubleLit, doubleToFloatLit
-  :: Literal -> Literal
-
 -- | Narrow a literal number (unchecked result range)
 narrowLit' :: forall a. Integral a => LitNumType -> Literal -> Literal
 narrowLit' nt' (LitNumber _ i)  = LitNumber nt' (toInteger (fromInteger i :: a))
@@ -731,25 +727,12 @@ convertToWordLit _platform l                 = pprPanic "convertToWordLit" (ppr 
 convertToIntLit  platform (LitNumber _nt i)  = mkLitIntWrap platform i
 convertToIntLit  _platform l                 = pprPanic "convertToIntLit" (ppr l)
 
+charToIntLit, intToCharLit :: Literal -> Literal
+
 charToIntLit (LitChar c)       = mkLitIntUnchecked (toInteger (ord c))
 charToIntLit l                 = pprPanic "charToIntLit" (ppr l)
 intToCharLit (LitNumber _ i)   = LitChar (chr (fromInteger i))
 intToCharLit l                 = pprPanic "intToCharLit" (ppr l)
-
-floatToIntLit (LitFloat f)      = mkLitIntUnchecked (truncate f)
-floatToIntLit l                 = pprPanic "floatToIntLit" (ppr l)
-intToFloatLit (LitNumber _ i)   = LitFloat (fromInteger i)
-intToFloatLit l                 = pprPanic "intToFloatLit" (ppr l)
-
-doubleToIntLit (LitDouble f)     = mkLitIntUnchecked (truncate f)
-doubleToIntLit l                 = pprPanic "doubleToIntLit" (ppr l)
-intToDoubleLit (LitNumber _ i)   = LitDouble (fromInteger i)
-intToDoubleLit l                 = pprPanic "intToDoubleLit" (ppr l)
-
-floatToDoubleLit (LitFloat  f) = LitDouble f
-floatToDoubleLit l             = pprPanic "floatToDoubleLit" (ppr l)
-doubleToFloatLit (LitDouble d) = LitFloat  d
-doubleToFloatLit l             = pprPanic "doubleToFloatLit" (ppr l)
 
 nullAddrLit :: Literal
 nullAddrLit = LitNullAddr
@@ -859,8 +842,8 @@ literalType :: Literal -> Type
 literalType LitNullAddr       = addrPrimTy
 literalType (LitChar _)       = charPrimTy
 literalType (LitString  _)    = addrPrimTy
-literalType (LitFloat _)      = floatPrimTy
-literalType (LitDouble _)     = doublePrimTy
+literalType (LitFloating LitFloat  _) = floatPrimTy
+literalType (LitFloating LitDouble _) = doublePrimTy
 literalType (LitLabel _ _)    = addrPrimTy
 literalType (LitNumber lt _)  = case lt of
    LitNumBigNat  -> byteArrayPrimTy
@@ -890,9 +873,9 @@ cmpLit :: Literal -> Literal -> Ordering
 cmpLit (LitChar      a)     (LitChar       b)     = a `compare` b
 cmpLit (LitString    a)     (LitString     b)     = a `compare` b
 cmpLit (LitNullAddr)        (LitNullAddr)         = EQ
-cmpLit (LitFloat     a)     (LitFloat      b)     = a `compare` b
-cmpLit (LitDouble    a)     (LitDouble     b)     = a `compare` b
-cmpLit (LitLabel     a _)   (LitLabel      b _)   = a `lexicalCompareFS` b
+cmpLit (LitFloating lft1 a) (LitFloating lft2 b)
+  = (lft1 `compare` lft2) `mappend` (a `compare` b)
+cmpLit (LitLabel     a _) (LitLabel      b _    ) = a `lexicalCompareFS` b
 cmpLit (LitNumber nt1 a)    (LitNumber nt2  b)
   = (nt1 `compare` nt2) `mappend` (a `compare` b)
 cmpLit (LitRubbish tc1 b1)  (LitRubbish tc2 b2)  = (tc1 `compare` tc2) `mappend`
@@ -911,8 +894,14 @@ pprLiteral :: (SDoc -> SDoc) -> Literal -> SDoc
 pprLiteral _       (LitChar c)     = pprPrimChar c
 pprLiteral _       (LitString s)   = pprHsBytes s
 pprLiteral _       (LitNullAddr)   = text "__NULL"
-pprLiteral _       (LitFloat f)    = float (fromRat f) <> primFloatSuffix
-pprLiteral _       (LitDouble d)   = double (fromRat d) <> primDoubleSuffix
+pprLiteral _       (LitFloating ty v) =
+  let
+    !suffix =
+      case ty of
+         LitFloat  -> primFloatSuffix
+         LitDouble -> primDoubleSuffix
+  in
+    pprLitFloating ty v <> suffix
 pprLiteral _       (LitNumber nt i)
    = case nt of
        LitNumBigNat  -> integer i
@@ -927,7 +916,7 @@ pprLiteral _       (LitNumber nt i)
        LitNumWord32  -> pprPrimWord32 i
        LitNumWord64  -> pprPrimWord64 i
 pprLiteral add_par (LitLabel l fod) =
-    add_par (text "__label" <+> pprHsString l <+> ppr fod)
+    add_par (text "__label" <+> pprHsString (unpackFS l) <+> ppr fod)
 pprLiteral _       (LitRubbish torc rep)
   = text "RUBBISH" <> pp_tc <> parens (ppr rep)
   where
@@ -1013,6 +1002,14 @@ data type. Here are the moving parts:
    but it doesn't seem worth making a new UnivCoProvenance for this purpose.
 
    This is sad, though: see #18983.
+
+   INVARIANT 3: we never make a rubbish literal of a terminating type
+   (isTerminatingType), such as a class dictionary. GHC relies on a value of
+   a terminating type never being bottom, and so may speculatively evaluate
+   a dictionary or select a superclass from it. Either would crash on a
+   rubbish literal (#24934, #25924).
+   See Note [Don't make fillers for constraint types]
+   in GHC.Core.Opt.WorkWrap.Utils.
 
 3. STG: The type app in `RUBBISH[IntRep] @Int# :: Int#` is erased and we get
    the (untyped) 'StgLit' `RUBBISH[IntRep] :: Int#` in STG.

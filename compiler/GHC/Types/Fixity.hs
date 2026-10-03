@@ -1,6 +1,3 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# OPTIONS_GHC -Wno-dodgy-exports #-} -- For re-export of GHC.Hs.Basic instances
-
 -- | Fixity
 module GHC.Types.Fixity
    ( Fixity (..)
@@ -12,14 +9,12 @@ module GHC.Types.Fixity
    , negateFixity
    , funTyFixity
    , compareFixity
-   , module GHC.Hs.Basic
    )
 where
 
 import GHC.Prelude
 
 import Language.Haskell.Syntax.Basic (LexicalFixity(..), FixityDirection(..), Fixity(..) )
-import GHC.Hs.Basic () -- For instances only
 
 ------------------------
 

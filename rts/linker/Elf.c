@@ -76,18 +76,6 @@
  *
  * See bug #781
  * See thread http://www.haskell.org/pipermail/cvs-ghc/2007-September/038458.html
- *
- * Naming Scheme for Symbol Macros
- *
- * SymI_*: symbol is internal to the RTS. It resides in an object
- *         file/library that is statically.
- * SymE_*: symbol is external to the RTS library. It might be linked
- *         dynamically.
- *
- * Sym*_HasProto  : the symbol prototype is imported in an include file
- *                  or defined explicitly
- * Sym*_NeedsProto: the symbol is undefined and we add a dummy
- *                  default proto extern void sym(void);
  */
 #define X86_64_ELF_NONPIC_HACK (!RtsFlags.MiscFlags.linkerAlwaysPic)
 
@@ -205,7 +193,7 @@ ocInit_ELF(ObjectCode * oc)
     oc->info->sectionHeader = (Elf_Shdr *) ((uint8_t*)oc->image
                                             + oc->info->elfHeader->e_shoff);
     oc->info->sectionHeaderStrtab = (char*)((uint8_t*)oc->image +
-            oc->info->sectionHeader[oc->info->elfHeader->e_shstrndx].sh_offset);
+            oc->info->sectionHeader[elf_shstrndx(oc->info->elfHeader)].sh_offset);
 
     oc->n_sections = elf_shnum(oc->info->elfHeader);
 
@@ -961,7 +949,11 @@ ocGetNames_ELF ( ObjectCode* oc )
            for (size_t j = 0; j < symTab->n_symbols; j++) {
                ElfSymbol *symbol = &symTab->symbols[j];
                if (SHN_COMMON == symTab->symbols[j].elf_sym->st_shndx) {
-                   common_size += symbol->elf_sym->st_size;
+                   /* Skip COMMON symbols already defined by a previously-loaded
+                    * object; we will reuse the existing allocation. */
+                   if (!lookupStrHashTable(symhash, symTab->symbols[j].name)) {
+                       common_size += symbol->elf_sym->st_size;
+                   }
                }
            }
       }
@@ -1006,17 +998,35 @@ ocGetNames_ELF ( ObjectCode* oc )
                /* Figure out if we want to add it; if so, set ad to its
                   address.  Otherwise leave ad == NULL. */
 
+               bool common_already_defined = false;
                if (shndx == SHN_COMMON) {
                    isLocal = false;
-                   CHECK(common_used < common_size);
-                   CHECK(common_mem);
-                   symbol->addr = (void*)((uintptr_t)common_mem + common_used);
-                   common_used += symbol->elf_sym->st_size;
-                   CHECK(common_used <= common_size);
-
-                   IF_DEBUG(linker_verbose,
-                            debugBelch("COMMON symbol, size %llu name %s allocated at %p\n",
-                                       (long long unsigned int) symbol->elf_sym->st_size, nm, symbol->addr));
+                   RtsSymbolInfo *existing = lookupStrHashTable(symhash, nm);
+                   if (existing != NULL) {
+                       /* COMMON symbol already allocated by a previously-loaded
+                        * object; reuse that address so relocations resolve to
+                        * the same storage. */
+                       if(symbol->elf_sym->st_size > existing->size) {
+                           barf("linker: trying to link COMMON symbols %s with incompatible sizes: previous size %llu, new size %llu\n",
+                                   nm,
+                                   (long long unsigned int) existing->size,
+                                   (long long unsigned int) symbol->elf_sym->st_size);
+                       }
+                       symbol->addr = existing->value;
+                       common_already_defined = true;
+                       IF_DEBUG(linker_verbose,
+                                debugBelch("COMMON symbol, size %llu name %s reusing address %p\n",
+                                           (long long unsigned int) symbol->elf_sym->st_size, nm, symbol->addr));
+                   } else {
+                       CHECK(common_used < common_size);
+                       CHECK(common_mem);
+                       symbol->addr = (void*)((uintptr_t)common_mem + common_used);
+                       common_used += symbol->elf_sym->st_size;
+                       CHECK(common_used <= common_size);
+                       IF_DEBUG(linker_verbose,
+                                debugBelch("COMMON symbol, size %llu name %s allocated at %p\n",
+                                           (long long unsigned int) symbol->elf_sym->st_size, nm, symbol->addr));
+                   }
 
                    /* Pointless to do addProddableBlock() for this area,
                       since the linker should never poke around in it. */
@@ -1080,13 +1090,13 @@ ocGetNames_ELF ( ObjectCode* oc )
                if (symbol->addr != NULL) {
                    CHECK(nm != NULL);
                    /* Acquire! */
-                   if (!isLocal) {
+                   if (!isLocal && !common_already_defined) {
 
                        if (isWeak == HS_BOOL_TRUE) {
                            setWeakSymbol(oc, nm);
                        }
                        if (!ghciInsertSymbolTable(oc->fileName, symhash,
-                                                  nm, symbol->addr, isWeak, sym_type, oc)
+                                                  nm, symbol->addr, isWeak, sym_type, symbol->elf_sym->st_size, oc)
                            ) {
                            goto fail;
                        }
@@ -1286,6 +1296,16 @@ do_Elf_Rel_relocations ( ObjectCode* oc, char* ehdrC,
        case COMPAT_R_386_NONE:                  break;
        case COMPAT_R_386_32:   *pP = value;     break;
        case COMPAT_R_386_PC32: *pP = value - P; break;
+       case COMPAT_R_386_PLT32: *pP = value - P; break;
+       case COMPAT_R_386_GOTOFF: *pP = value - (Elf_Addr)oc->info->got_start; break;
+       case COMPAT_R_386_GOTPC:  *pP = (Elf_Addr)oc->info->got_start + A - P; break;
+       case COMPAT_R_386_GOT32:
+       case COMPAT_R_386_GOT32X:
+           CHECK(symbol);
+           CHECK(symbol->got_addr);
+           *pP = (Elf_Addr)symbol->got_addr
+               - (Elf_Addr)oc->info->got_start + A;
+           break;
 #        endif
 
 #        if defined(arm_HOST_ARCH)

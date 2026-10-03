@@ -37,6 +37,7 @@
 #include "win32/AsyncWinIO.h"
 #endif
 #include "Trace.h"
+#include "eventlog/EventLog.h"
 #include "RaiseAsync.h"
 #include "Threads.h"
 #include "Timer.h"
@@ -146,7 +147,6 @@ static void acquireAllCapabilities(Capability *cap, Task *task);
 static void startWorkerTasks (uint32_t from USED_IF_THREADS,
                               uint32_t to USED_IF_THREADS);
 #endif
-static void scheduleStartSignalHandlers (Capability *cap);
 static void scheduleCheckBlockedThreads (Capability *cap);
 static void scheduleProcessInbox(Capability **cap);
 static void scheduleDetectDeadlock (Capability **pcap, Task *task);
@@ -174,6 +174,14 @@ static void deleteAllThreads (void);
 #if defined(FORKPROCESS_PRIMOP_SUPPORTED)
 static void deleteThread_(StgTSO *tso);
 #endif
+
+#if defined(FORKPROCESS_PRIMOP_SUPPORTED)
+static void truncateRunQueue(Capability *cap);
+#endif
+static StgTSO *popRunQueue (Capability *cap);
+
+static inline EventThreadStatus eventlogThreadStatus(StgThreadReturnCode ret_code);
+static inline EventThreadStatus eventlogThreadStatusBlocked(StgThreadWhyBlocked why_blocked);
 
 /* ---------------------------------------------------------------------------
    Main scheduling loop.
@@ -327,7 +335,7 @@ schedule (Capability *initialCapability, Task *task)
         /* TODO: see if we can rationalise these two awaitCompletedTimeoutsOrIO
          *       calls before and after scheduleDetectDeadlock().
          */
-        awaitCompletedTimeoutsOrIO(cap);
+        awaitCompletedTimeoutsOrIO(cap->iomgr);
 #else
         ASSERT(getSchedState() >= SCHED_INTERRUPTING);
 #endif
@@ -410,7 +418,7 @@ schedule (Capability *initialCapability, Task *task)
      */
     if (RtsFlags.ConcFlags.ctxtSwitchTicks == 0 &&
         (!emptyRunQueue(cap) ||
-          anyPendingTimeoutsOrIO(cap))) {
+          anyPendingTimeoutsOrIO(cap->iomgr))) {
         RELAXED_STORE(&cap->context_switch, 1);
     }
 
@@ -455,7 +463,7 @@ run_thread:
         prev = setRecentActivity(ACTIVITY_YES);
         if (prev == ACTIVITY_DONE_GC) {
 #if !defined(PROFILING)
-            startTimer();
+            unpauseTimer();
 #endif
         }
         break;
@@ -523,20 +531,21 @@ run_thread:
 #endif
 
     if (ret == ThreadBlocked) {
-        uint16_t why_blocked = ACQUIRE_LOAD(&t->why_blocked);
+        StgThreadWhyBlocked why_blocked = ACQUIRE_LOAD(&t->why_blocked);
+        EventThreadStatus status = eventlogThreadStatusBlocked(why_blocked);
+        StgWord32 status_detail = 0;
         if (why_blocked == BlockedOnBlackHole) {
             StgTSO *owner = blackHoleOwner(t->block_info.bh->bh);
-            traceEventStopThread(cap, t, t->why_blocked + 6,
-                                 owner != NULL ? owner->id : 0);
-        } else {
-            traceEventStopThread(cap, t, t->why_blocked + 6, 0);
+            status_detail = owner != NULL ? owner->id : 0;
         }
+        traceEventStopThread(cap, t, status, status_detail);
     } else {
+        EventThreadStatus status = eventlogThreadStatus(ret);
+        StgWord32 status_detail = 0;
         if (ret == StackOverflow) {
-          traceEventStopThread(cap, t, ret, t->tot_stack_size);
-        } else {
-          traceEventStopThread(cap, t, ret, 0);
+            status_detail = t->tot_stack_size;
         }
+        traceEventStopThread(cap, t, status, status_detail);
     }
 
     ASSERT_FULL_CAPABILITY_INVARIANTS(cap,task);
@@ -593,38 +602,6 @@ run_thread:
 }
 
 /* -----------------------------------------------------------------------------
- * Run queue operations
- * -------------------------------------------------------------------------- */
-
-static void
-removeFromRunQueue (Capability *cap, StgTSO *tso)
-{
-    if (tso->block_info.prev == END_TSO_QUEUE) {
-        ASSERT(cap->run_queue_hd == tso);
-        cap->run_queue_hd = tso->_link;
-    } else {
-        setTSOLink(cap, tso->block_info.prev, tso->_link);
-    }
-    if (tso->_link == END_TSO_QUEUE) {
-        ASSERT(cap->run_queue_tl == tso);
-        cap->run_queue_tl = tso->block_info.prev;
-    } else {
-        setTSOPrev(cap, tso->_link, tso->block_info.prev);
-    }
-    tso->_link = tso->block_info.prev = END_TSO_QUEUE;
-    cap->n_run_queue--;
-
-    IF_DEBUG(sanity, checkRunQueue(cap));
-}
-
-void
-promoteInRunQueue (Capability *cap, StgTSO *tso)
-{
-    removeFromRunQueue(cap, tso);
-    pushOnRunQueue(cap, tso);
-}
-
-/* -----------------------------------------------------------------------------
  * scheduleFindWork()
  *
  * Search for work to do, and handle messages from elsewhere.
@@ -636,7 +613,9 @@ scheduleFindWork (Capability **pcap)
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
     queueIOThread();
 #endif
-    scheduleStartSignalHandlers(*pcap);
+#if defined(RTS_USER_SIGNALS)
+    startPendingSignalHandlers(*pcap);
+#endif
 
     scheduleProcessInbox(pcap);
 
@@ -889,26 +868,6 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
 }
 
 /* ----------------------------------------------------------------------------
- * Start any pending signal handlers
- * ------------------------------------------------------------------------- */
-
-#if defined(RTS_USER_SIGNALS) && !defined(THREADED_RTS)
-static void
-scheduleStartSignalHandlers(Capability *cap)
-{
-    if (RtsFlags.MiscFlags.install_signal_handlers && signals_pending()) {
-        // safe outside the lock
-        startSignalHandlers(cap);
-    }
-}
-#else
-static void
-scheduleStartSignalHandlers(Capability *cap STG_UNUSED)
-{
-}
-#endif
-
-/* ----------------------------------------------------------------------------
  * Check for blocked threads that can be woken up.
  * ------------------------------------------------------------------------- */
 
@@ -942,14 +901,14 @@ scheduleCheckBlockedThreads(Capability *cap USED_IF_NOT_THREADS)
      * awaitCompletedTimeoutsOrIO below for the case of !defined(THREADED_RTS)
      * && defined(mingw32_HOST_OS).
      */
-    if (anyPendingTimeoutsOrIO(cap))
+    if (anyPendingTimeoutsOrIO(cap->iomgr))
     {
         if (emptyRunQueue(cap)) {
             // block and wait
-            awaitCompletedTimeoutsOrIO(cap);
+            awaitCompletedTimeoutsOrIO(cap->iomgr);
         } else {
             // poll but do not wait
-            pollCompletedTimeoutsOrIO(cap);
+            pollCompletedTimeoutsOrIO(cap->iomgr);
         }
     }
 #endif
@@ -969,7 +928,7 @@ scheduleDetectDeadlock (Capability **pcap, Task *task)
      * other tasks are waiting for work, we must have a deadlock of
      * some description.
      */
-    if ( emptyRunQueue(cap) && !anyPendingTimeoutsOrIO(cap) )
+    if ( emptyRunQueue(cap) && !anyPendingTimeoutsOrIO(cap->iomgr) )
     {
 #if defined(THREADED_RTS)
         /*
@@ -1115,7 +1074,7 @@ schedulePostRunThread (Capability *cap, StgTSO *t)
     //
     // and a is never equal to b given a consistent view of memory.
     //
-    if (t -> trec != NO_TREC && t -> why_blocked == NotBlocked) {
+    if (t -> trec != NO_TREC && RELAXED_LOAD(&t->why_blocked) == NotBlocked) {
         if (!stmValidateNestOfTransactions(cap, t -> trec, true)) {
             debugTrace(DEBUG_sched | DEBUG_stm,
                        "trec %p found wasting its time", t);
@@ -1198,8 +1157,9 @@ scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
 
 #if defined(DEBUG)
         debugTrace(DEBUG_sched,
-                   "--<< thread %ld (%s) stopped: requesting a large block (size %ld)\n",
-                   (long)t->id, what_next_strs[t->what_next], blocks);
+                   "--<< thread %" FMT_StgThreadID " (%s) stopped: "
+                   "requesting a large block (size %" FMT_Word ")\n",
+                   t->id, what_next_strs[t->what_next], blocks);
 #endif
 
         // don't do this if the nursery is (nearly) full, we'll GC first.
@@ -1954,7 +1914,7 @@ delete_threads_and_gc:
             // it will get re-enabled if we run any threads after the GC.
             setRecentActivity(ACTIVITY_DONE_GC);
 #if !defined(PROFILING)
-            stopTimer();
+            pauseTimer();
 #endif
             break;
         }
@@ -2119,23 +2079,30 @@ forkProcess(HsStablePtr *entry
     ACQUIRE_LOCK(&all_tasks_mutex);
 #endif
 
-    stopTimer(); // See #4074
-
 #if defined(TRACING)
-    flushAllCapsEventsBufs(); // so that child won't inherit dirty file buffers
+#if defined(HAVE_PREEMPTION)
+    // We must hold the eventlog global mutex over the fork to prevent the
+    // timer thread from trying to post events. While holding the mutex we need
+    // to flush the eventlogs (global and per-cap) so that child won't inherit
+    // dirty eventlog buffers or file buffers.
+    ACQUIRE_LOCK_ALWAYS(&eventBufMutex);
+#endif
+    flushAllCapsEventsBufs_();
 #endif
 
     pid = fork();
 
     if (pid) { // parent
 
-        startTimer(); // #4074
-
         RELEASE_LOCK(&sched_mutex);
         RELEASE_LOCK(&sm_mutex);
         RELEASE_LOCK(&stable_ptr_mutex);
         RELEASE_LOCK(&stable_name_mutex);
         RELEASE_LOCK(&task->lock);
+
+#if defined(TRACING) && defined(HAVE_PREEMPTION)
+        RELEASE_LOCK_ALWAYS(&eventBufMutex);
+#endif
 
 #if defined(THREADED_RTS)
         /* N.B. releaseCapability_ below may need to take all_tasks_mutex */
@@ -2210,7 +2177,15 @@ forkProcess(HsStablePtr *entry
             // bound threads for which the corresponding Task does not
             // exist.
             truncateRunQueue(cap);
-            cap->n_run_queue = 0;
+
+            // Reset and re-initialise the capability's I/O manager,
+            // to get the I/O manager ready again.
+            //
+            // Any threads waiting on I/O or timers should have been
+            // removed from I/O manager queues by deleteThread_ above.
+            // TODO: but we could assert that here.
+            freeCapabilityIOManager(cap->iomgr);
+            initCapabilityIOManager(cap->iomgr);
 
             // Any suspended C-calling Tasks are no more, their OS threads
             // don't exist now:
@@ -2227,7 +2202,7 @@ forkProcess(HsStablePtr *entry
             cap->n_returning_tasks = 0;
 #endif
 
-            // Release all caps except 0, we'll use that for starting
+            // Release all caps except 0, we'll use that for restarting
             // the IO manager and running the client action below.
             if (cap->no != 0) {
                 task->cap = cap;
@@ -2243,19 +2218,19 @@ forkProcess(HsStablePtr *entry
             generations[g].threads = END_TSO_QUEUE;
         }
 
-        // On Unix, all timers are reset in the child, so we need to start
-        // the timer again.
+        // The timer thread is not present in the child process, so we need
+        // to initialise the timer again.
         initTimer();
 
         // TODO: need to trace various other things in the child
         // like startup event, capabilities, process info etc
         traceTaskCreate(task, cap);
 
-        initIOManagerAfterFork(&cap);
+        restartIOManager(cap->iomgr, &cap);
 
         // start timer after the IOManager is initialized
         // (the idle GC may wake up the IOManager)
-        startTimer();
+        unpauseTimer();
 
         // Install toplevel exception handlers, so interruption
         // signal will be sent to the main thread.
@@ -2322,12 +2297,6 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
     cap = rts_lock();
     task = cap->running_task;
 
-
-    // N.B. We must stop the interval timer while we are changing the
-    // capabilities array lest handle_tick may try to context switch
-    // an old capability. See #17289.
-    stopTimer();
-
     stopAllCapabilities(&cap, task);
 
     if (new_n_capabilities < enabled_capabilities)
@@ -2356,6 +2325,10 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
         // the capability; we don't have to worry about GC data
         // structures, the nursery, etc.
         //
+        // This approach also handles threads blocked on I/O. Such threads
+        // remain blocked, and when I/O completes and threads become runnable
+        // then they are migrated away.
+        //
         for (n = new_n_capabilities; n < enabled_capabilities; n++) {
             getCapability(n)->disabled = true;
             traceCapDisable(getCapability(n));
@@ -2383,9 +2356,7 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
             tracingAddCapabilities(n_capabilities, new_n_capabilities);
 #endif
 
-            // Resize the capabilities array
-            // NB. after this, capabilities points somewhere new.  Any pointers
-            // of type (Capability *) are now invalid.
+            // Allocate and initialise the extra capabilities
             moreCapabilities(n_capabilities, new_n_capabilities);
 
             // Resize and update storage manager data structures
@@ -2411,9 +2382,7 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
     }
 
     // Notify IO manager that the number of capabilities has changed.
-    notifyIOManagerCapabilitiesChanged(&cap);
-
-    startTimer();
+    notifyIOManagerCapabilitiesChanged(cap->iomgr, &cap);
 
     rts_unlock(cap);
 
@@ -2531,17 +2500,18 @@ suspendThread (StgRegTable *reg, bool interruptible)
   task = cap->running_task;
   tso = cap->r.rCurrentTSO;
 
-  traceEventStopThread(cap, tso, THREAD_SUSPENDED_FOREIGN_CALL, 0);
+  traceEventStopThread(cap, tso, STOP_THREAD_ForeignCall, 0);
 
   // XXX this might not be necessary --SDM
   RELAXED_STORE(&tso->what_next, ThreadRunGHC);
 
   threadPaused(cap,tso);
 
+  tso->block_info.unused = END_TSO_QUEUE;
   if (interruptible) {
-    tso->why_blocked = BlockedOnCCall_Interruptible;
+    RELEASE_STORE(&tso->why_blocked, BlockedOnCCall_Interruptible);
   } else {
-    tso->why_blocked = BlockedOnCCall;
+    RELEASE_STORE(&tso->why_blocked, BlockedOnCCall);
   }
 
   // Hand back capability
@@ -2599,16 +2569,25 @@ resumeThread (void *task_)
     tso = incall->suspended_tso;
     incall->suspended_tso = NULL;
     incall->suspended_cap = NULL;
+
+    // we set why_blocked previously in suspendThread
+    ASSERT(tso->why_blocked == BlockedOnCCall ||
+           tso->why_blocked == BlockedOnCCall_Interruptible);
+
     // we will modify tso->_link
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
         updateRemembSetPushClosure(cap, (StgClosure *)tso->_link);
     }
     tso->_link = END_TSO_QUEUE;
+    // but no need to modify tso->block_info.prev as coincidentally
+    // it has the value we want already (since in suspendThread we set
+    // tso->block_info.unused to END_TSO_QUEUE for BlockedOnCCall).
+    ASSERT(tso->block_info.prev == END_TSO_QUEUE);
 
     traceEventRunThread(cap, tso);
 
     /* Reset blocking status */
-    tso->why_blocked  = NotBlocked;
+    RELEASE_STORE(&tso->why_blocked, NotBlocked);
 
     if ((tso->flags & TSO_BLOCKEX) == 0) {
         // avoid locking the TSO if we don't have to
@@ -2906,8 +2885,8 @@ performBlockingMajorGC(void)
 }
 
 /* ---------------------------------------------------------------------------
-   Interrupt execution.
-   Might be called inside a signal handler so it mustn't do anything fancy.
+   Interrupt execution in response to ctl-c.
+   On posix, ctl-c is a signal, while on Win32 it is a console event.
    ------------------------------------------------------------------------ */
 
 void
@@ -2917,17 +2896,37 @@ interruptStgRts(void)
     setSchedState(SCHED_INTERRUPTING);
     interruptAllCapabilities();
 #if defined(THREADED_RTS)
+    /* It may be that all capabilities are idle. If so, we must wake one up. */
+#if defined(mingw32_HOST_OS)
+    /* On win32, console handlers are invoked in a proper thread, so we can
+     * directly call wakeUpRts. Although it is an OS thread, it is not one
+     * we created or control necessarily, so it may have no associated Task.
+     */
     wakeUpRts();
+#else
+    /* On posix on the other hand, signal handlers are very limited in what
+     * they can do. We cannot directly call wakeUpRts below because it is not
+     * signal safe (it uses cond vars to wake up a task). So instead we proxy
+     * it: we interrupt the ticker thread and ask the ticker thread to call
+     * wakeUpRts below. The ticker thread is a proper thread and so can call
+     * wakeUpRts. We can interrupt the ticker thread from signal handler
+     * context safely because it only involves writing to a pipe/eventfd.
+     */
+    wakeUpRtsViaTicker();
+#endif
 #endif
 }
 
 /* -----------------------------------------------------------------------------
    Wake up the RTS
 
-   This function causes at least one OS thread to wake up and run the
-   scheduler loop.  It is invoked when the RTS might be deadlocked, or
-   an external event has arrived that may need servicing (eg. a
-   keyboard interrupt).
+   This function causes at least one task to wake up and run the scheduler
+   loop on at least one capability.
+
+   It is invoked:
+   1. as part of the idle GC scheme: when the RTS has been idle for long enough
+      and it is time to go back to the scheduler which will invoke idle GC; or
+   2. when a ctl-c occurs (posix sigint signal or win32 console event)
 
    In the single-threaded RTS we don't do anything here; we only have
    one thread anyway, and the event that caused us to want to wake up
@@ -2937,10 +2936,11 @@ interruptStgRts(void)
 #if defined(THREADED_RTS)
 void wakeUpRts(void)
 {
-    // This forces the IO Manager thread to wakeup, which will
-    // in turn ensure that some OS thread wakes up and runs the
-    // scheduler loop, which will cause a GC and deadlock check.
-    wakeupIOManager();
+    /* Our current thread may not have a Task, in particular it will not when
+     * called from interruptStgRts or via wakeUpRtsViaTicker. This is ok,
+     * prodOneCapability does not require one.
+     */
+    prodOneCapability();
 }
 #endif
 
@@ -2960,8 +2960,9 @@ deleteThread (StgTSO *tso)
     // The TSO must be on the run queue of the Capability we own, or
     // we must own all Capabilities.
 
-    if (tso->why_blocked != BlockedOnCCall &&
-        tso->why_blocked != BlockedOnCCall_Interruptible) {
+    StgThreadWhyBlocked why_blocked = RELAXED_LOAD(&tso->why_blocked);
+    if (why_blocked != BlockedOnCCall &&
+        why_blocked != BlockedOnCCall_Interruptible) {
         throwToSingleThreaded(tso->cap,tso,NULL);
     }
 }
@@ -2972,10 +2973,12 @@ deleteThread_(StgTSO *tso)
 { // for forkProcess only:
   // like deleteThread(), but we delete threads in foreign calls, too.
 
-    if (tso->why_blocked == BlockedOnCCall ||
-        tso->why_blocked == BlockedOnCCall_Interruptible) {
+    StgThreadWhyBlocked why_blocked = RELAXED_LOAD(&tso->why_blocked);
+    if (why_blocked == BlockedOnCCall ||
+        why_blocked == BlockedOnCCall_Interruptible) {
         tso->what_next = ThreadKilled;
         appendToRunQueue(tso->cap, tso);
+        RELEASE_STORE(&tso->why_blocked, NotBlocked);
     } else {
         deleteThread(tso);
     }
@@ -3016,7 +3019,7 @@ pushOnRunQueue (Capability *cap, StgTSO *tso)
     cap->n_run_queue++;
 }
 
-StgTSO *popRunQueue (Capability *cap)
+static StgTSO *popRunQueue (Capability *cap)
 {
     ASSERT(cap->n_run_queue > 0);
     StgTSO *t = cap->run_queue_hd;
@@ -3034,6 +3037,45 @@ StgTSO *popRunQueue (Capability *cap)
     }
     cap->n_run_queue--;
     return t;
+}
+
+#if defined(FORKPROCESS_PRIMOP_SUPPORTED)
+static void truncateRunQueue(Capability *cap)
+{
+    // Can only be called by the task owning the capability.
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->run_queue_hd, "truncateRunQueue");
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->run_queue_tl, "truncateRunQueue");
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->n_run_queue, "truncateRunQueue");
+    cap->run_queue_hd = END_TSO_QUEUE;
+    cap->run_queue_tl = END_TSO_QUEUE;
+    cap->n_run_queue = 0;
+}
+#endif
+
+static void removeFromRunQueue (Capability *cap, StgTSO *tso)
+{
+    if (tso->block_info.prev == END_TSO_QUEUE) {
+        ASSERT(cap->run_queue_hd == tso);
+        cap->run_queue_hd = tso->_link;
+    } else {
+        setTSOLink(cap, tso->block_info.prev, tso->_link);
+    }
+    if (tso->_link == END_TSO_QUEUE) {
+        ASSERT(cap->run_queue_tl == tso);
+        cap->run_queue_tl = tso->block_info.prev;
+    } else {
+        setTSOPrev(cap, tso->_link, tso->block_info.prev);
+    }
+    tso->_link = tso->block_info.prev = END_TSO_QUEUE;
+    cap->n_run_queue--;
+
+    IF_DEBUG(sanity, checkRunQueue(cap));
+}
+
+void promoteInRunQueue (Capability *cap, StgTSO *tso)
+{
+    removeFromRunQueue(cap, tso);
+    pushOnRunQueue(cap, tso);
 }
 
 
@@ -3107,14 +3149,9 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
             return STOP_FRAME;
 
         case CATCH_RETRY_FRAME: {
-            StgTRecHeader *trec = tso -> trec;
-            StgTRecHeader *outer = trec -> enclosing_trec;
             debugTrace(DEBUG_stm,
                        "found CATCH_RETRY_FRAME at %p during raise", p);
-            debugTrace(DEBUG_stm, "trec=%p outer=%p", trec, outer);
-            stmAbortTransaction(cap, trec);
-            stmFreeAbortedTRec(cap, trec);
-            tso -> trec = outer;
+            stmAbortNestedCatchRetryTransaction(cap, tso, (StgCatchRetryFrame *)p);
             p = next;
             continue;
         }
@@ -3128,6 +3165,11 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
             } else if (*p == (StgWord)&stg_maskUninterruptiblezh_ret_info) {
                 tso->flags |= TSO_BLOCKEX;
                 tso->flags &= ~TSO_INTERRUPTIBLE;
+            }
+            // see Note [GHCi unboxed tuples stack spills] in
+            // StgMiscClosures.cmm
+            if (*p == (StgWord)&stg_ctoi_t_info) {
+                tso->ctoi_tuple_spill_words = p[CTOI_OLD_TUPLE_SPILL_WORDS_OFFSET]; // restore old_spill
             }
             p = next;
             continue;
@@ -3230,6 +3272,10 @@ findRetryFrameHelper (Capability *cap, StgTSO *tso)
     default:
       ASSERT(info->i.type != CATCH_FRAME);
       ASSERT(info->i.type != STOP_FRAME);
+      // see Note [GHCi unboxed tuples stack spills] in StgMiscClosures.cmm
+      if (*p == (StgWord)&stg_ctoi_t_info) {
+          tso->ctoi_tuple_spill_words = p[CTOI_OLD_TUPLE_SPILL_WORDS_OFFSET]; // restore old_spill
+      }
       p = next;
       continue;
     }
@@ -3262,14 +3308,9 @@ findAtomicallyFrameHelper (Capability *cap, StgTSO *tso)
         return ATOMICALLY_FRAME;
 
     case CATCH_RETRY_FRAME: {
-        StgTRecHeader *trec = tso -> trec;
-        StgTRecHeader *outer = trec -> enclosing_trec;
         debugTrace(DEBUG_stm,
                    "found CATCH_RETRY_FRAME at %p while aborting after orElse", p);
-        debugTrace(DEBUG_stm, "trec=%p outer=%p", trec, outer);
-        stmAbortTransaction(cap, trec);
-        stmFreeAbortedTRec(cap, trec);
-        tso -> trec = outer;
+        stmAbortNestedCatchRetryTransaction(cap, tso, (StgCatchRetryFrame *)p);
         p = next;
         continue;
     }
@@ -3296,6 +3337,10 @@ findAtomicallyFrameHelper (Capability *cap, StgTSO *tso)
     default:
       ASSERT(info->i.type != CATCH_FRAME);
       ASSERT(info->i.type != STOP_FRAME);
+      // see Note [GHCi unboxed tuples stack spills] in StgMiscClosures.cmm
+      if (*p == (StgWord)&stg_ctoi_t_info) {
+          tso->ctoi_tuple_spill_words = p[CTOI_OLD_TUPLE_SPILL_WORDS_OFFSET]; // restore old_spill
+      }
       p = next;
       continue;
     }
@@ -3331,7 +3376,7 @@ resurrectThreads (StgTSO *threads)
         // Wake up the thread on the Capability it was last on
         cap = tso->cap;
 
-        switch (tso->why_blocked) {
+        switch (UntagWhyBlocked(RELAXED_LOAD(&tso->why_blocked))) {
         case BlockedOnMVar:
         case BlockedOnMVarRead:
             /* Called by GC - sched_mutex lock is currently held. */
@@ -3369,4 +3414,41 @@ void setAllocLimitKill(bool shouldKill, bool shouldHook)
 {
    allocLimitKill = shouldKill;
    allocLimitRunHook = shouldHook;
+}
+
+/* Map from the internal thread return codes and the tso->why_blocked values to
+ * the external eventlog STOP_THREAD status codes. See issue #9003 for what
+ * goes wrong if we do not handle this mapping in an intentional fashion.
+ *
+ * For the internal values see Constants.h
+ * For the external values see rts/include/rts/EventLogFormat.h and
+ * docs/users_guide/eventlog-formats.rst
+ */
+static const unsigned char thread_stop_code[] = {
+    [HeapOverflow]   = STOP_THREAD_HeapOverflow,
+    [StackOverflow]  = STOP_THREAD_StackOverflow,
+    [ThreadYielding] = STOP_THREAD_ThreadYielding,
+    [ThreadFinished] = STOP_THREAD_ThreadFinished
+};
+
+static const unsigned char thread_blocked_code[] = {
+    [BlockedOnMVar]                = STOP_THREAD_BlockedOnMVar,
+    [BlockedOnMVarRead]            = STOP_THREAD_BlockedOnMVarRead,
+    [BlockedOnBlackHole]           = STOP_THREAD_BlockedOnBlackHole,
+    [BlockedOnRead]                = STOP_THREAD_BlockedOnRead,
+    [BlockedOnWrite]               = STOP_THREAD_BlockedOnWrite,
+    [BlockedOnDelay]               = STOP_THREAD_BlockedOnDelay,
+    [BlockedOnSTM]                 = STOP_THREAD_BlockedOnSTM,
+    [BlockedOnDoProc]              = STOP_THREAD_BlockedOnDoProc,
+    [BlockedOnMsgThrowTo]          = STOP_THREAD_BlockedOnMsgThrowTo,
+};
+
+static inline EventThreadStatus eventlogThreadStatus(StgThreadReturnCode ret_code)
+{
+    return thread_stop_code[ret_code];
+}
+
+static inline EventThreadStatus eventlogThreadStatusBlocked(StgThreadWhyBlocked why_blocked)
+{
+    return thread_blocked_code[UntagWhyBlocked(why_blocked)];
 }

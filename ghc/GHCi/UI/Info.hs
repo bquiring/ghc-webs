@@ -1,7 +1,4 @@
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
 
 {-# OPTIONS -fno-warn-name-shadowing #-}
@@ -49,6 +46,8 @@ import           GHC.Utils.Outputable
 import           GHC.Types.SrcLoc
 import           GHC.Types.Var
 import qualified GHC.Data.Strict as Strict
+import           GHC.Runtime.Loader (initializePlugins)
+import           Data.Containers.ListUtils (nubOrd)
 
 import           GHCi.UI.Exception
 
@@ -171,6 +170,7 @@ findName infos span0 mi string =
       Just name ->
         case getSrcSpan name of
           UnhelpfulSpan {} -> tryExternalModuleResolution
+          GeneratedSrcSpan {} -> tryExternalModuleResolution
           RealSrcSpan   {} -> return (getName name)
   where
     rdrs = modInfo_rdrs mi
@@ -304,8 +304,15 @@ srcFilePath modSum = fromMaybe obj_fp src_fp
 getModInfo :: (GhcMonad m) => Module -> m ModInfo
 getModInfo m = do
     mod_summary <- getModSummary m
+
+    -- Update the session plugins from the module summary
+    -- and initialize them (#23110).
+    modifySession $ hscUpdateFlags $ \dynFlags -> dynFlags
+      { pluginModNames = nubOrd $ pluginModNames dynFlags ++ pluginModNames (ms_hspp_opts mod_summary) }
+    modifySessionM (liftIO . initializePlugins)
+
     p <- parseModule mod_summary
-    typechecked <- typecheckModule p
+    typechecked <- typecheckModule StartAndStopTcMPlugins p
     let allTypes = processAllTypeCheckedModule typechecked
     let !rdr_env = tcg_rdr_env (fst $ tm_internals_ typechecked)
     ts <- liftIO $ getModificationTime $ srcFilePath mod_summary
@@ -386,7 +393,8 @@ processAllTypeCheckedModule tcm
     toSpanInfo :: (Maybe Id,SrcSpan,Type) -> Maybe SpanInfo
     toSpanInfo (n,RealSrcSpan spn _,typ)
         = Just $ spanInfoFromRealSrcSpan spn (Just typ) n
-    toSpanInfo _ = Nothing
+    toSpanInfo (_, GeneratedSrcSpan{}, _) = Nothing
+    toSpanInfo (_, UnhelpfulSpan{}, _) = Nothing
 
 -- helper stolen from @syb@ package
 type GenericQ r = forall a. Data a => a -> r

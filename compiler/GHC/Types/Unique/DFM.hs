@@ -14,12 +14,9 @@ See Note [Unique Determinism] in GHC.Types.Unique for explanation why @Unique@ o
 is not deterministic.
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+
 {-# OPTIONS_GHC -Wall #-}
 
 module GHC.Types.Unique.DFM (
@@ -38,7 +35,9 @@ module GHC.Types.Unique.DFM (
         delListFromUDFM,
         adjustUDFM,
         adjustUDFM_Directly,
+        upsertUDFM,
         alterUDFM,
+        alterUDFM_L,
         mapUDFM,
         mapMaybeUDFM,
         mapMUDFM,
@@ -83,6 +82,9 @@ import Data.Functor.Classes (Eq1 (..))
 import Data.List (sortBy)
 import Data.Function (on)
 import GHC.Types.Unique.FM (UniqFM, nonDetUFMToList, ufmToIntMap, unsafeIntMapToUFM)
+import GHC.Data.SmallArray
+import GHC.Exts (State#, build)
+import GHC.ST (ST(..), runST)
 import Unsafe.Coerce
 import qualified GHC.Data.Word64Set as W
 
@@ -95,10 +97,15 @@ import qualified GHC.Data.Word64Set as W
 -- If the client of the map performs operations on the map in deterministic
 -- order then `udfmToList` returns them in deterministic order.
 --
--- There is an implementation cost: each element is given a serial number
--- as it is added, and `udfmToList` sorts its result by this serial
--- number. So you should only use `UniqDFM` if you need the deterministic
--- property.
+-- The order does not depend on how existing entries were
+-- updated. Updating an existing entry keeps it original position in the order
+-- This means `alterUDFM` consistent with `addToUDFM` and `adjustUDFM`,
+-- so that for example `alterUDFM id k = id` and `alterUDFM (fmap f) k = adjustUDFM f k`
+--
+-- There is an implementation cost: each element is given an insertion tag
+-- as it is added, and functions like `udfmToList` or `eltsUDFM` order their
+-- results by this tag (see Note [Cost of deterministic iteration]). So you
+-- should only use `UniqDFM` if you need the deterministic property.
 --
 -- `foldUDFM` also preserves determinism.
 --
@@ -111,12 +118,20 @@ import qualified GHC.Data.Word64Set as W
 --
 --
 -- There's more than one way to implement this. The implementation here tags
--- every value with the insertion time that can later be used to sort the
+-- every value with its insertion tag that can later be used to sort the
 -- values when asked to convert to a list.
+--
+-- Updating an existing key keeps the old tag. This keeps the order stable for
+-- maps whose entries are updated many times. The instance environments are
+-- the main example: inserting an instance updates the entry of its class in a
+-- DNameEnv, and when updates moved keys to the end the order of instances shown
+-- by :info depended on the order in which interfaces happened to be loaded
+-- (#27532). Now a class keeps its place once its first instance is added, so
+-- loading further interfaces cannot change the order.
 --
 -- An alternative would be to have
 --
---   data UniqDFM ele = UDFM (M.IntMap ele) [ele]
+--   data UniqDFM ele = UDFM (Word64Map ele) [ele]
 --
 -- where the list determines the order. This makes deletion tricky as we'd
 -- only accumulate elements in that list, but makes merging easier as you
@@ -124,11 +139,11 @@ import qualified GHC.Data.Word64Set as W
 -- Deletion can probably be done in amortized fashion when the size of the
 -- list is twice the size of the set.
 
--- | A type of values tagged with insertion time
+-- | A type of values carrying an insertion tag
 data TaggedVal val =
   TaggedVal
     !val
-    {-# UNPACK #-} !Int -- ^ insertion time
+    {-# UNPACK #-} !Int -- ^ insertion tag
   deriving stock (Data, Functor, Foldable, Traversable)
 
 taggedFst :: TaggedVal val -> val
@@ -150,18 +165,30 @@ instance Eq val => Eq (TaggedVal val) where
 data UniqDFM key ele =
   UDFM
     !(M.Word64Map (TaggedVal ele)) -- A map where keys are Unique's values and
-                                -- values are tagged with insertion time.
-                                -- The invariant is that all the tags will
-                                -- be distinct within a single map
-    {-# UNPACK #-} !Int         -- Upper bound on the values' insertion
-                                -- time. See Note [Overflow on plusUDFM]
+                                   -- values carry an insertion tag.
+    {-# UNPACK #-} !Int            -- Upper bound on the values' insertion
+                                   -- tags. See Note [Overflow on plusUDFM]
+  -- See Note [UDFM invariants]
   deriving (Data, Functor)
 
--- | Deterministic, in O(n log n).
+{- Note [UDFM invariants]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+In a map (UDFM m ub):
+
+ (a) The insertion tags of the elements of m are distinct.
+ (b) Every tag lies in [0, ub).
+
+Consequently ub >= size m.
+
+The tags determine the order of deterministic iteration (eltsUDFM,
+udfmToList). See Note [Sorting a UDFM].
+-}
+
+-- | Deterministic. See Note [Cost of deterministic iteration].
 instance Foldable (UniqDFM key) where
   foldr = foldUDFM
 
--- | Deterministic, in O(n log n).
+-- | Deterministic. See Note [Cost of deterministic iteration].
 instance Traversable (UniqDFM key) where
   traverse f = fmap listToUDFM_Directly
              . traverse (\(u,a) -> (u,) <$> f a)
@@ -173,11 +200,13 @@ emptyUDFM = UDFM M.empty 0
 unitUDFM :: Uniquable key => key -> elt -> UniqDFM key elt
 unitUDFM k v = UDFM (M.singleton (getKey $ getUnique k) (TaggedVal v 0)) 1
 
--- The new binding always goes to the right of existing ones
+-- A new key goes to the right of existing ones
+-- Overwriting an existing key keeps its position in the iteration order
 addToUDFM :: Uniquable key => UniqDFM key elt -> key -> elt  -> UniqDFM key elt
 addToUDFM m k v = addToUDFM_Directly m (getUnique k) v
 
--- The new binding always goes to the right of existing ones
+-- A new key goes to the right of existing ones
+-- Overwriting an existing key keeps its position in the iteration order
 addToUDFM_Directly :: UniqDFM key elt -> Unique -> elt -> UniqDFM key elt
 addToUDFM_Directly (UDFM m i) u v
   = UDFM (MS.insertWith tf (getKey u) (TaggedVal v i) m) (i + 1)
@@ -253,8 +282,8 @@ plusUDFM_CK f udfml@(UDFM _ i) udfmr@(UDFM _ j)
 -- Note [Overflow on plusUDFM]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- There are multiple ways of implementing plusUDFM.
--- The main problem that needs to be solved is overlap on times of
--- insertion between different keys in two maps.
+-- The main problem that needs to be solved is overlap on insertion
+-- tags between different keys in two maps.
 -- Consider:
 --
 -- A = fromList [(a, (x, 1))]
@@ -314,13 +343,27 @@ elemUDFM :: Uniquable key => key -> UniqDFM key elt -> Bool
 elemUDFM k (UDFM m _i) = M.member (getKey $ getUnique k) m
 
 -- | Performs a deterministic fold over the UniqDFM.
--- It's O(n log n) while the corresponding function on `UniqFM` is O(n).
+--
+-- O(n) in the common case, with an O(n log n) fallback.
+--
+-- See Note [Cost of deterministic iteration].
 foldUDFM :: (elt -> a -> a) -> a -> UniqDFM key elt -> a
 {-# INLINE foldUDFM #-}
--- This INLINE prevents a regression in !10568
-foldUDFM k z m = foldr k z (eltsUDFM m)
+-- Specialises k and z into M.foldr on the small-map path.
+foldUDFM k z (UDFM m ub)
+  | M.sizeAtMost m 1 = M.foldr (k . taggedFst) z m
+  | otherwise        = fold_udfm k z m ub
 
--- | Like 'foldUDFM' but the function also receives a key
+fold_udfm :: (elt -> a -> a) -> a -> M.Word64Map (TaggedVal elt) -> Int -> a
+{-# NOINLINE fold_udfm #-}
+-- Kept out of line so that foldUDFM's consumers don't inline the sort machinery.
+fold_udfm k z m ub
+  | usePigeonholeSort m ub = foldr k z (pigeonholeSort ub (\_ tv -> tv) m)
+  | otherwise              = foldr k z (map taggedFst (sort_it m))
+
+-- | Like 'foldUDFM' but the function also receives a key.
+--
+-- See Note [Cost of deterministic iteration].
 foldWithKeyUDFM :: (Unique -> elt -> a -> a) -> a -> UniqDFM key elt -> a
 {-# INLINE foldWithKeyUDFM #-}
 -- This INLINE was copied from foldUDFM
@@ -335,13 +378,112 @@ nonDetStrictFoldUDFM k z (UDFM m _i) = foldl' k' z m
   where
     k' acc (TaggedVal v _) = k v acc
 
+{- Note [Cost of deterministic iteration]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Deterministic iteration -- foldUDFM, eltsUDFM, udfmToList, and everything
+built on them -- orders elements by insertion tag. The element with the
+smallest tag can sit anywhere in the map, so every tag must be inspected,
+and, given a @UDFM m ub@ on the pigeonhole-sort path, an array with ub slots
+must be filled, before the first element can be emitted (see
+Note [Sorting a UDFM]). So beyond maps of a single element, deterministic
+iteration cannot stream: demanding any of the result processes the whole
+map. #27459 shows that cost hitting a consumer that only needed to know
+whether the result was non-empty.
+
+So: to test for emptiness, use isNullUDFM rather than null on eltsUDFM;
+for order-oblivious queries, prefer short-circuiting anyUDFM/allUDFM; and
+if you don't need the deterministic order at all, use nonDetStrictFoldUDFM.
+-}
+
+-- | Deterministic, in order of insertion.
+--
+-- See Note [Sorting a UDFM] and Note [Cost of deterministic iteration].
 eltsUDFM :: UniqDFM key elt -> [elt]
-{-# INLINE eltsUDFM #-}
--- The INLINE makes it a good producer (from the map)
-eltsUDFM (UDFM m _i) = map taggedFst (sort_it m)
+{-# INLINE eltsUDFM #-}  -- so the small case is a good producer
+                         -- This matters for T13719.
+eltsUDFM (UDFM m ub)
+  | M.sizeAtMost m 1 = build (\c n -> M.foldr (c . taggedFst) n m)
+  | otherwise        = elts_udfm m ub
+
+elts_udfm :: M.Word64Map (TaggedVal elt) -> Int -> [elt]
+{-# NOINLINE elts_udfm #-}
+-- Kept out of line so that eltsUDFM's consumers don't inline the sort machinery.
+elts_udfm m ub
+  | usePigeonholeSort m ub = pigeonholeSort ub (\_ tv -> tv) m
+  | otherwise              = map taggedFst (sort_it m)
 
 sort_it :: M.Word64Map (TaggedVal elt) -> [TaggedVal elt]
 sort_it m = sortBy (compare `on` taggedSnd) (M.elems m)
+
+
+{- Note [Sorting a UDFM]
+~~~~~~~~~~~~~~~~~~~~~~~~
+Deterministic iteration must yield a map's elements in order of their
+insertion tags. The obvious way is to sort on the tags, but we can do better:
+in (UDFM m ub) the tags are distinct indices into [0, ub) (see
+Note [UDFM invariants]), so each element can simply be placed at its own
+tag in an ub-slot array, which is then read back in index order. This is
+pigeonhole sort, with one element per hole.
+
+Cost: writing the elements is O(n) for n = M.size m, while allocating the
+array and reading it back are O(ub). Since n <= ub the total is O(ub). No
+comparisons are made.
+
+So the method wins only while the array stays dense, and ub never shrinks
+(overwrites keep bumping it, delete/filter shrink n but not ub).
+usePigeonholeSort therefore takes this path only when ub <= 4 * n, which
+bounds its cost at O(n), and falls back to the O(n log n) comparison sort
+otherwise.
+
+Unfilled slots contain a TaggedVal with tag -1 and value
+@unsafeCoerce () :: r@. This is safe because the value is never used: only
+slots with non-negative tags are read.
+
+pigeonholeSort also avoids intermediate lists: it fills the array by
+traversing the map directly, and emits its readout with 'build', so the foldr
+in fold_udfm fuses with it. This contributes significantly to the allocation
+reductions in InstanceMatching1 in !16292.
+-}
+
+-- | @ub <= 4 * size m@, computed without a full 'M.size' traversal.
+usePigeonholeSort :: M.Word64Map a -> Int -> Bool
+usePigeonholeSort m ub = M.compareSize m ceil_ub_div_4 /= LT
+  where
+    ceil_ub_div_4 = (ub + 3) `div` 4  -- ceil(ub/4): ub <= 4*n iff n >= ceil(ub/4)
+
+-- | Order the map's elements by tag. The tags must be distinct and in
+-- @[0, ub)@, and @mk@ must preserve them. See Note [Sorting a UDFM].
+pigeonholeSort :: forall e r. Int
+              -> (M.Key -> TaggedVal e -> TaggedVal r)
+              -> M.Word64Map (TaggedVal e)
+              -> [r]
+{-# INLINE pigeonholeSort #-}  -- Specialise mk and enable foldr/build fusion.
+pigeonholeSort ub mk m = build gen
+  where
+    -- The tag -1 marks unfilled slots; the value field is never read, but it
+    -- is strict, so it needs a WHNF value of type r. See Note [Sorting a UDFM].
+    hole :: TaggedVal r
+    hole = TaggedVal (unsafeCoerce ()) (-1)
+
+    fill :: SmallMutableArray s (TaggedVal r) -> State# s -> (# State# s, () #)
+    fill marr s = case M.traverseWithKey_ write m of ST st -> st s
+      where
+        write k tv = ST (\s' ->
+          (# writeSmallArray marr (taggedSnd tv) (mk k tv) s', () #))
+
+    gen :: forall b. (r -> b -> b) -> b -> b
+    gen cons nil = runST (ST (\s0 ->
+      case newSmallArray ub hole s0 of
+        (# s1, marr #) -> case fill marr s1 of
+          (# s2, () #) -> case unsafeFreezeSmallArray marr s2 of
+            (# s3, arr #) -> (# s3, readout arr 0 #)))
+      where
+        readout :: SmallArray (TaggedVal r) -> Int -> b
+        readout arr j
+          | j >= ub   = nil
+          | t < 0     = readout arr (j + 1)
+          | otherwise = cons v (readout arr (j + 1))
+          where TaggedVal v t = indexSmallArray arr j
 
 filterUDFM :: (elt -> Bool) -> UniqDFM key elt -> UniqDFM key elt
 filterUDFM p (UDFM m i) = UDFM (M.filter (\(TaggedVal v _) -> p v) m) i
@@ -360,11 +502,22 @@ udfmRestrictKeysSet (UDFM val_set i) set =
   in UDFM (M.restrictKeys val_set key_set) i
 
 -- | Converts `UniqDFM` to a list, with elements in deterministic order.
--- It's O(n log n) while the corresponding function on `UniqFM` is O(n).
+--
+-- O(n) in the common case, with an O(n log n) fallback.
+--
+-- See Note [Cost of deterministic iteration].
 udfmToList :: UniqDFM key elt -> [(Unique, elt)]
-udfmToList (UDFM m _i) =
-  [ (mkUniqueGrimily k, taggedFst v)
-  | (k, v) <- sortBy (compare `on` (taggedSnd . snd)) $ M.toList m ]
+-- NB: no INLINE, unlike eltsUDFM. udfmToList's one hot consumer is
+-- traverseUSDFM in the pattern-match checker, which doesn't fuse. Inlining
+-- the size dispatch into it regresses T17836.
+udfmToList (UDFM m ub)
+  | M.sizeAtMost m 1 =
+      M.foldrWithKey (\k tv r -> (mkUniqueGrimily k, taggedFst tv) : r) [] m
+  | usePigeonholeSort m ub = pigeonholeSort ub
+      (\k tv -> TaggedVal (mkUniqueGrimily k, taggedFst tv) (taggedSnd tv)) m
+  | otherwise =
+      [ (mkUniqueGrimily k, taggedFst v)
+      | (k, v) <- sortBy (compare `on` (taggedSnd . snd)) $ M.toList m ]
 
 -- Determines whether two 'UniqDFM's contain the same keys.
 equalKeysUDFM :: UniqDFM key a -> UniqDFM key b -> Bool
@@ -436,23 +589,69 @@ adjustUDFM f (UDFM m i) k = UDFM (M.adjust (fmap f) (getKey $ getUnique k) m) i
 adjustUDFM_Directly :: (elt -> elt) -> UniqDFM key elt -> Unique -> UniqDFM key elt
 adjustUDFM_Directly f (UDFM m i) k = UDFM (M.adjust (fmap f) (getKey k) m) i
 
--- | The expression (alterUDFM f k map) alters value x at k, or absence
--- thereof. alterUDFM can be used to insert, delete, or update a value in
+-- | The expression (@'alterUDFM' f map k@) alters value x at k, or absence
+-- thereof. 'alterUDFM' can be used to insert, delete, or update a value in
 -- UniqDFM. Use addToUDFM, delFromUDFM or adjustUDFM when possible, they are
--- more efficient.
+-- more efficient. Updating an existing key keeps its position in the
+-- deterministic iteration order.
+--
+-- 'alterUDFM' is non-strict in @k@.
 alterUDFM
   :: Uniquable key
-  => (Maybe elt -> Maybe elt)  -- How to adjust
-  -> UniqDFM key elt               -- old
-  -> key                       -- new
-  -> UniqDFM key elt               -- result
+  => (Maybe elt -> Maybe elt)  -- ^ How to adjust the element
+  -> UniqDFM key elt           -- ^ Old 'UniqDFM'
+  -> key                       -- ^ @key@ of the element to adjust
+  -> UniqDFM key elt           -- ^ New element at @key@ and modified 'UniqDFM'
 alterUDFM f (UDFM m i) k =
   UDFM (M.alter alterf (getKey $ getUnique k) m) (i + 1)
   where
-  alterf Nothing = inject $ f Nothing
-  alterf (Just (TaggedVal v _)) = inject $ f (Just v)
-  inject Nothing = Nothing
-  inject (Just v) = Just $ TaggedVal v i
+  alterf Nothing = inject i $ f Nothing
+  alterf (Just (TaggedVal v old_i)) = inject old_i $ f (Just v)
+  inject _ Nothing = Nothing
+  inject tag (Just v) = Just $ TaggedVal v tag
+
+-- | The expression (@'upsertUDFM' f map k@) updates the value at @k@ or inserts
+-- a new value if @k@ is absent.
+--
+-- Updating an existing entry keeps its original tag, so its position in
+-- deterministic iteration order is unchanged and does not depend on update order.
+upsertUDFM
+  :: Uniquable key
+  => (Maybe elt -> elt)  -- ^ How to adjust the element
+  -> UniqDFM key elt     -- ^ Old 'UniqDFM'
+  -> key                 -- ^ @key@ of the element to adjust
+  -> UniqDFM key elt     -- ^ New element at @key@ and modified 'UniqDFM'
+upsertUDFM f (UDFM m i) k =
+  UDFM (MS.upsert upsertf (getKey $ getUnique k) m) (i + 1)
+  where
+    upsertf Nothing = TaggedVal (f Nothing) i
+    upsertf (Just (TaggedVal v old_i)) = TaggedVal (f (Just v)) old_i
+
+-- | The expression (@'alterUDFM_L' f map k@) alters value @x@ at @k@, or absence
+-- thereof and returns the new element at @k@ if there is any.
+-- 'alterUDFM_L' can be used to insert, delete, or update a value in
+-- UniqDFM. Use addToUDFM, delFromUDFM or adjustUDFM when possible, they are
+-- more efficient. Updating an existing key keeps its position in the
+-- deterministic iteration order.
+--
+-- Note, 'alterUDFM_L' is strict in @k@.
+alterUDFM_L
+  :: forall key elt . Uniquable key
+  => (Maybe elt -> Maybe elt)      -- ^ How to adjust the element
+  -> UniqDFM key elt               -- ^ Old 'UniqDFM'
+  -> key                           -- ^ @key@ of the element to adjust
+  -> (Maybe elt, UniqDFM key elt)  -- ^ New element at @key@ and modified 'UniqDFM'
+alterUDFM_L f (UDFM m i) k =
+  let
+    (mElt, udfm) = M.alterLookup alterf (getKey $ getUnique k) m
+  in
+    (fmap taggedFst mElt, UDFM udfm (i + 1))
+  where
+  alterf :: Maybe (TaggedVal elt) -> (Maybe (TaggedVal elt))
+  alterf Nothing = inject i $ f Nothing
+  alterf (Just (TaggedVal v old_i)) = inject old_i $ f (Just v)
+  inject _ Nothing = Nothing
+  inject tag (Just v) = Just $ TaggedVal v tag
 
 -- | Map a function over every value in a UniqDFM
 mapUDFM :: (elt1 -> elt2) -> UniqDFM key elt1 -> UniqDFM key elt2

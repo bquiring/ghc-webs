@@ -12,23 +12,28 @@ module Oracles.Flavour
 import Base
 import Flavour
 import Settings (flavour)
+import Oracles.Setting
 
 newtype DynGhcPrograms =
-  DynGhcPrograms () deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+  DynGhcPrograms Stage deriving (Show, Eq, Hashable, Binary, NFData, Typeable)
+
 type instance RuleResult DynGhcPrograms = Bool
 
 newtype GhcProfiled =
-  GhcProfiled Stage deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+  GhcProfiled Stage deriving (Show, Eq, Hashable, Binary, NFData)
 type instance RuleResult GhcProfiled = Bool
 
 oracles :: Rules ()
 oracles = do
-  void $ addOracle $ \(DynGhcPrograms _) -> dynamicGhcPrograms =<< flavour
+  void $ addOracle $ \(DynGhcPrograms stage) -> do
+    cross <- crossStage stage
+    from_flavour <- flip dynamicGhcPrograms stage =<< flavour
+    return (from_flavour && not cross)
   void $ addOracle $ \(GhcProfiled stage) ->
     ghcProfiled <$> flavour <*> pure (succStage stage)
 
-askDynGhcPrograms :: Action Bool
-askDynGhcPrograms = askOracle $ DynGhcPrograms ()
+askDynGhcPrograms :: Stage -> Action Bool
+askDynGhcPrograms s = askOracle $ DynGhcPrograms s
 
 askGhcProfiled :: Stage -> Action Bool
 askGhcProfiled s = askOracle $ GhcProfiled s

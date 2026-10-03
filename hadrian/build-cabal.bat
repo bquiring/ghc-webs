@@ -34,18 +34,22 @@ for /F "delims=. tokens=1,2,3,4" %%a in ("%CABVERSTR%") do (
     set CABPATCH=%%d
 )
 
-set "_cabal_ok=0"
-if %CABMAJOR% gtr 2 set _cabal_ok=1
-if %CABMAJOR% equ 2 (
-    if %CABMINOR% geq 2 set _cabal_ok=1
-)
-if %_cabal_ok% equ 1 (
-    "%CABAL%" --project-file=%PROJ% new-build %CABFLAGS% -j exe:hadrian
-    rem use new-exec instead of new-run to make sure that the build-tools (alex & happy) are in PATH
-    "%CABAL%" --project-file=%PROJ% new-exec  %CABFLAGS%    hadrian -- ^
-        --directory "%CD%" ^
-        %*
-) else (
-    echo Cabal version is too old; you need at least cabal-install 2.2
+if %CABMAJOR% lss 3 (
+    echo Cabal version is too old; you need at least cabal-install 3.0
     exit /B 2
 )
+
+"%CABAL%" --with-compiler=%GHC% path --output-format=key-value > "%TEMP%\ghc_cabal_path.txt" 2>NUL
+for /F "tokens=*" %%a in ('findstr /B "remote-repo-cache:" "%TEMP%\ghc_cabal_path.txt"') do set REMOTE_REPO_CACHE=%%a
+del "%TEMP%\ghc_cabal_path.txt" 2>NUL
+set REMOTE_REPO_CACHE=%REMOTE_REPO_CACHE:remote-repo-cache: =%
+if not exist "%REMOTE_REPO_CACHE%\hackage.haskell.org" (
+    echo Please run 'cabal update' first
+    exit /B 2
+)
+
+"%CABAL%" --project-file=%PROJ% new-build %CABFLAGS% -j exe:hadrian
+rem use new-exec instead of new-run to make sure that the build-tools (alex & happy) are in PATH
+"%CABAL%" --project-file=%PROJ% new-exec  %CABFLAGS%    hadrian -- ^
+    --directory "%CD%" ^
+    %*

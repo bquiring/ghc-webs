@@ -20,12 +20,13 @@ module GHC.Internal.Event.Internal
     , exchangePtr
     ) where
 
+import GHC.Internal.Base
 import GHC.Internal.Foreign.C.Error (eINTR, getErrno, throwErrno)
 import GHC.Internal.System.Posix.Types (Fd)
-import GHC.Internal.Base
+import GHC.Internal.Maybe (Maybe)
 import GHC.Internal.Num (Num(..))
 import GHC.Internal.Event.Internal.Types
-
+import GHC.Internal.Prim (atomicExchangeAddrAddr#)
 import GHC.Internal.Ptr (Ptr(..))
 
 -- | Event notification backend.

@@ -1,9 +1,3 @@
-
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs             #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE DisambiguateRecordFields #-}
-
 -- | Desugaring step of the
 -- [Lower Your Guards paper](https://dl.acm.org/doi/abs/10.1145/3408989).
 --
@@ -18,16 +12,18 @@ import GHC.Prelude
 
 import GHC.HsToCore.Pmc.Types
 import GHC.HsToCore.Pmc.Utils
-import GHC.Core (Expr(Var,App))
-import GHC.Data.FastString (unpackFS, lengthFS)
+import GHC.Core (CoreExpr, Expr(Var,App))
+import GHC.Core.Utils (stripTicksTopE)
+import GHC.Data.FastString (unpackFS, lengthFS, mkFastStringShortText)
 import GHC.Driver.DynFlags
 import GHC.Hs
 import GHC.Tc.Utils.TcMType (shortCutLit)
 import GHC.Types.Id
 import GHC.Core.ConLike
 import GHC.Types.Name
-import GHC.Builtin.Types
-import GHC.Builtin.Names (rationalTyConName, toListName)
+import GHC.Builtin.WiredIn.Types
+import GHC.Builtin.KnownKeys ( toListClassOpKey )
+import GHC.Builtin.KnownOccs ( rationalTyConOcc )
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -44,12 +40,64 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Type
 import GHC.Data.Maybe
-import GHC.Types.SourceText (FractionalLit(..))
 import Control.Monad (zipWithM, replicateM)
 import Data.List (elemIndex)
 import Data.List.NonEmpty ( NonEmpty(..) )
 
--- import GHC.Driver.Ppr
+{- Note [Desugaring HsExpr during pattern-match checking]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+During patterm-match checking, we need do some simple analysis of /expressions/
+not just /patterns/.  Examples in pattern guards
+   let x = I# 3#      -- Now we know what `x` looks like
+   let x = Just 'z'   -- Info can be nested
+
+And we do some simple CSE:
+   let ys = reverse xs
+   let zs = reverse xs
+Here we can spot that ys~zs.   Example of the need for this CSE:
+   safeLast :: [a] -> Maybe a
+   safeLast xs
+     | []    <- reverse xs = Nothing
+     | (x:_) <- reverse xs = Just x
+
+   safeLast2 :: [a] -> Maybe a
+   safeLast2 (reverse -> [])    = Nothing
+   safeLast2 (reverse -> (x:_)) = Just x
+
+To achieve this "simple analysis" we make an auxiliary call the Hs desugarer to
+get the Core of a let-binding or where-clause.  In implementation terms:
+
+ * The "auxiliary desugaring" is done in this module, GHC.HsToCore.Pmc.Desugar,
+   by `desugarPatBind`, `desugarGRHSs` etc
+
+ * They often make a `PmLet` which contains a `CoreExpr`, the desugared version of the
+   `HsExpr`.
+
+ * This `CoreExpr` is ultimately absorbed into the solver by
+   `GHC.HsToCore.Pmc.Solver.addCoreCt`, which
+      - runs `simpleOptExpr` to remove any junk
+      - deals with the CSE stuff in `representCoreExpr`
+      - does simple analysis of the Core expression
+
+Wrinkles
+
+(DPM1) We don't want to run the coverage checker recursively when doint this
+  auxiliary desugaring!  Efficiency is one concern, but also a lack of properly
+  set up long-distance information might trigger warnings that we normally
+  wouldn't emit.
+
+  So the global field `dsl_nablas :: LdiNablas` where
+     data LdiNablas = NoPmc | Ldi Nablas
+  records whether we are in the coverage checker:
+
+  - If dsl_nablas = NoPmc, that means we are in one of these auxiliary calls; so
+    we want to do no pattern-match checking whatsoever.  We won't need to carry
+    any long-distance info around; we are simply degsugaring to Core.
+
+  - If dsl_nablas = Ldi nablas, then we do want to do pattern-match checking,
+    and the long-distance context is given by `nablas`
+-}
+
 
 -- | Smart constructor that eliminates trivial lets
 mkPmLetVar :: Id -> Id -> GrdDag
@@ -119,6 +167,7 @@ desugarPat x pat = case pat of
   SigPat _ p _ty -> desugarLPat x p
   EmbTyPat _ _ -> pure GdEnd
   InvisPat _ _ -> pure GdEnd
+  ModifiedPat _ _ p -> desugarLPat x p
 
   XPat ext -> case ext of
 
@@ -137,11 +186,18 @@ desugarPat x pat = case pat of
           , tc == listTyCon
           -- `pat` looks like `coerce toList -> [p1,...,pn]`.
           -- Now take care of -XRebindableSyntax:
-          , let is_to_list (HsVar _ (L _ to_list)) = idName to_list == toListName
+          , let is_to_list (HsVar _ (L _ to_list)) = to_list `hasKnownKey` toListClassOpKey
                 is_to_list (XExpr (WrapExpr _ e))  = is_to_list e
                 is_to_list _                       = False
           , is_to_list (unLoc lrhs)
           -> desugarLPat x pat
+
+        QualLitPat _ QualLit{ql_val}
+          | ViewPat ty _ _ <- expansion
+          -> case ql_val of
+            -- Desugar qualified string literals the same as RebindableSyntax
+            -- See Note [Implementation of QualifiedStrings]
+            HsQualString _ s -> mkPmLitGrds x $ PmLit ty (PmLitOverString (mkFastStringShortText s))
 
         _ -> desugarPat x expansion
 
@@ -199,7 +255,7 @@ desugarPat x pat = case pat of
         , (HsFractional f) <- val
         , negates <- if fl_neg f then 1 else 0
         -> do
-            rat_tc <- dsLookupTyCon rationalTyConName
+            rat_tc <- dsLookupKnownOccTyCon rationalTyConOcc
             let rat_ty = mkTyConTy rat_tc
             return $ Just $ PmLit rat_ty (PmLitOverRat negates f)
         | otherwise
@@ -227,6 +283,9 @@ desugarPat x pat = case pat of
     core_expr <- dsLit lit
     let lit = expectJust (coreExprAsPmLit core_expr)
     mkPmLitGrds x lit
+
+  -- Uninhabited in the GhcTc phase
+  QualLitPat _ lit -> case lit of
 
   TuplePat _tys pats boxity -> do
     (vars, grdss) <- mapAndUnzipM desugarLPatV pats
@@ -270,9 +329,9 @@ desugarListPat x pats = do
 desugarConPatOut :: Id -> ConLike -> [Type] -> [TyVar]
                  -> [EvVar] -> HsConPatDetails GhcTc -> DsM GrdDag
 desugarConPatOut x con univ_tys ex_tvs dicts = \case
-    PrefixCon ps                            -> go_field_pats (zip [0..] ps)
-    InfixCon  p1 p2                         -> go_field_pats (zip [0..] [p1,p2])
-    RecCon    (HsRecFields NoExtField fs _) -> go_field_pats (rec_field_ps fs)
+    PrefixCon _ ps                   -> go_field_pats (zip [0..] ps)
+    InfixCon  _ p1 p2                -> go_field_pats (zip [0..] [p1,p2])
+    RecCon    _ (HsRecFields _ fs _) -> go_field_pats (rec_field_ps fs)
   where
     -- The actual argument types (instantiated)
     arg_tys     = map scaledThing $ conLikeInstOrigArgTys con (univ_tys ++ mkTyVarTys ex_tvs)
@@ -317,16 +376,18 @@ desugarConPatOut x con univ_tys ex_tvs dicts = \case
 
 desugarPatBind :: SrcSpan -> Id -> Pat GhcTc -> DsM (PmPatBind Pre)
 -- See 'GrdPatBind' for how this simply repurposes GrdGRHS.
-desugarPatBind loc var pat =
+-- See Note [Suppress warnings in PMC desugaring]
+desugarPatBind loc var pat = discardWarningsDs $
   PmPatBind . flip PmGRHS (SrcInfo (L loc (ppr pat))) <$> desugarPat var pat
 
 desugarEmptyCase :: Id -> DsM PmEmptyCase
 desugarEmptyCase var = pure PmEmptyCase { pe_var = var }
 
 -- | Desugar the non-empty 'Match'es of a 'MatchGroup'.
+-- See Note [Suppress warnings in PMC desugaring]
 desugarMatches :: [Id] -> NonEmpty (LMatch GhcTc (LHsExpr GhcTc))
                -> DsM (PmMatchGroup Pre)
-desugarMatches vars matches =
+desugarMatches vars matches = discardWarningsDs $
   PmMatchGroup <$> traverse (desugarMatch vars) matches
 
 -- Desugar a single match
@@ -340,8 +401,9 @@ desugarMatch vars (L match_loc (Match { m_pats = L _ pats, m_grhss = grhss })) =
   -- tracePm "desugarMatch" (vcat [ppr pats, ppr pats', ppr grhss'])
   return PmMatch { pm_pats = pats', pm_grhss = grhss' }
 
+-- See Note [Suppress warnings in PMC desugaring]
 desugarGRHSs :: SrcSpan -> SDoc -> GRHSs GhcTc (LHsExpr GhcTc) -> DsM (PmGRHSs Pre)
-desugarGRHSs match_loc pp_pats grhss = do
+desugarGRHSs match_loc pp_pats grhss = discardWarningsDs $ do
   lcls <- desugarLocalBinds (grhssLocalBinds grhss)
   grhss' <- traverse (desugarLGRHS match_loc pp_pats) (grhssGRHSs grhss)
   return PmGRHSs { pgs_lcls = lcls, pgs_grhss = grhss' }
@@ -380,8 +442,8 @@ sequenceGrdDagMapM f as = sequenceGrdDags <$> traverse f as
 -- recursion, pattern bindings etc.
 -- See Note [Long-distance information for HsLocalBinds].
 desugarLocalBinds :: HsLocalBinds GhcTc -> DsM GrdDag
-desugarLocalBinds (HsValBinds _ (XValBindsLR (NValBinds binds _))) =
-  sequenceGrdDagMapM (sequenceGrdDagMapM go) (map snd binds)
+desugarLocalBinds (HsValBinds _ (XValBindsLR (HsVBG grps _))) =
+  sequenceGrdDagMapM go (hsValBindGroupsBinds grps)
   where
     go :: LHsBind GhcTc -> DsM GrdDag
     go (L _ FunBind{fun_id = L _ x, fun_matches = mg})
@@ -414,24 +476,28 @@ desugarLocalBinds _binds = return GdEnd
 -- | Desugar a pattern guard
 --   @pat <- e ==>  let x = e;  <guards for pat <- x>@
 desugarBind :: LPat GhcTc -> LHsExpr GhcTc -> DsM GrdDag
-desugarBind p e = dsLExpr e >>= \case
-  Var y
-    | Nothing <- isDataConId_maybe y
-    -- RHS is a variable, so that will allow us to omit the let
-    -> desugarLPat y p
-  rhs -> do
-    (x, grds) <- desugarLPatV p
-    pure (PmLet x rhs `consGrdDag` grds)
+desugarBind p e =
+  dsLExpr_stripTicks e >>= \case
+    Var y
+      | Nothing <- isDataConId_maybe y
+      -- RHS is a variable, so that will allow us to omit the let
+      -> desugarLPat y p
+    rhs -> do
+      (x, grds) <- desugarLPatV p
+      pure (PmLet x rhs `consGrdDag` grds)
 
 -- | Desugar a boolean guard
 --   @e ==>  let x = e; True <- x@
 desugarBoolGuard :: LHsExpr GhcTc -> DsM GrdDag
 desugarBoolGuard e
-  | isJust (isTrueLHsExpr e) = return GdEnd
+  | isJust (isTrueLHsExpr e) -- NB: looks through ticks
     -- The formal thing to do would be to generate (True <- True)
     -- but it is trivial to solve so instead we give back an empty
     -- GrdDag for efficiency
-  | otherwise = dsLExpr e >>= \case
+  = return GdEnd
+
+  | otherwise
+  = dsLExpr_stripTicks e >>= \case
       Var y
         | Nothing <- isDataConId_maybe y
         -- Omit the let by matching on y
@@ -439,6 +505,19 @@ desugarBoolGuard e
       rhs -> do
         x <- mkPmId boolTy
         pure $ sequencePmGrds [PmLet x rhs, vanillaConGrd x trueDataCon []]
+
+-- | Desugar an expression, stripping off top-level ticks from the resulting
+-- Core expression.
+--
+-- This function is used instead of 'dsLExpr' when we are immediately going to
+-- inspect the Core (as we do in e.g. 'desugarBoolGuard' or 'desugarBind') to
+-- make sure we properly look through intervening ticks (fixing #27360).
+--
+-- It's not needed when all we do is stash the resulting 'CoreExpr' into a
+-- 'GrdDag', as the rest of the machinery (such as 'GHC.HsToCore.Pmc.Solver.addCoreCt')
+-- looks through ticks.
+dsLExpr_stripTicks :: LHsExpr GhcTc -> DsM CoreExpr
+dsLExpr_stripTicks e = stripTicksTopE (const True) <$> dsLExpr e
 
 {- Note [Field match order for RecCon]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -534,6 +613,17 @@ the whole point.
 The place to store the 'PmLet' guards for @where@ clauses (which are per
 'GRHSs') is as a field of 'PmGRHSs'. For plain @let@ guards as in the guards of
 @x@, we can simply add them to the 'pg_grds' field of 'PmGRHS'.
+
+Note [Suppress warnings in PMC desugaring]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This module uses 'dsLExpr', 'dsExpr', and 'dsSyntaxExpr' to desugar
+expressions into Core for pattern match checking. The main desugaring
+pass in GHC.HsToCore processes these same expressions too, so without
+suppression any warnings would be emitted twice (#25996).
+
+To avoid this, the exported functions ('desugarPatBind', 'desugarMatches',
+'desugarGRHSs') are wrapped in 'discardWarningsDs', covering all internal
+desugarer calls without having to wrap each one individually.
 
 Note [Desugaring -XStrict matches in Pmc]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
