@@ -487,6 +487,8 @@ data DumpFlag
    | Opt_D_dump_webs_dead_params -- ^ Web pipeline: dead-parameter elimination verdicts
    | Opt_D_dump_webs_uncurry     -- ^ Web pipeline: uncurrying verdicts
    | Opt_D_dump_webs_arity_raise -- ^ Web pipeline: arity raising verdicts
+   | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and
+                                  --   after the Core pipeline
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
    | Opt_D_dump_stg_unarised  -- ^ STG after unarise
    | Opt_D_dump_stg_cg        -- ^ STG (after stg2stg)
@@ -644,6 +646,7 @@ data GeneralFlag
    | Opt_CoreWebsDeadParams -- ^ Web pipeline: dead-parameter elimination
    | Opt_CoreWebsUncurry    -- ^ Web pipeline: uncurrying
    | Opt_CoreWebsArityRaise -- ^ Web pipeline: arity raising
+   | Opt_CoreWebsEarly      -- ^ Also run the web pipeline before the main simplifier
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -918,6 +921,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDeadParams
    , Opt_CoreWebsUncurry
    , Opt_CoreWebsArityRaise
+   , Opt_CoreWebsEarly
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

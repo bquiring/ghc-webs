@@ -81,8 +81,10 @@ erasing the annotated program gives back the original program.  With
 equal types, and alpha-equivalent right-hand sides, and must contain no webs.
 -}
 
-webPass :: ModGuts -> CoreM ModGuts
-webPass guts
+-- | Run the web pipeline.  The Bool says whether this is the early run,
+-- before the main simplifier (-fcore-webs-early); see Note [Early webs].
+webPass :: Bool -> ModGuts -> CoreM ModGuts
+webPass early guts
   = do { dflags <- getDynFlags
        ; logger <- getLogger
        ; us     <- liftIO (mkSplitUniqSupply webUniqueTag)
@@ -91,7 +93,7 @@ webPass guts
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
-             (binds1, sigs1) = annotateProgram us (mg_rules guts) binds0
+             (binds1, sigs1) = annotateProgram early us (mg_rules guts) binds0
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -116,7 +118,7 @@ webPass guts
        ; checkSolved "renaming" res2
 
          -- Transformations
-       ; (binds_t, transformed) <- runTransforms logger dflags cfg sigs2 binds2
+       ; (binds_t, transformed) <- runTransforms early logger dflags cfg sigs2 binds2
 
        ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
            pprWebSummary (ws_exposed sigs2) binds_t
@@ -135,6 +137,7 @@ webPass guts
            checkRoundTrip binds0 binds3
 
        ; return (guts { mg_binds = binds3 }) }
+
 
 -- | After renaming, the only constraints left must be with arrows without
 -- webs, whose classes are exposed (Note [Arrows without webs] in
@@ -202,9 +205,9 @@ changes _        = False
 
 -- | The web transformations, in the order they run
 -- See GHC.WebCore.Transform.*
-runTransforms :: Logger -> DynFlags -> LintConfig -> WebSigs
+runTransforms :: Bool -> Logger -> DynFlags -> LintConfig -> WebSigs
               -> CoreProgram -> CoreM (CoreProgram, Bool)
-runTransforms logger dflags cfg sigs binds0
+runTransforms early logger dflags cfg sigs binds0
   = foldM step (binds0, False) transforms
   where
     exposed = ws_exposed sigs
@@ -221,6 +224,8 @@ runTransforms logger dflags cfg sigs binds0
                        (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) ) ]
 
     step (binds, changed) (flag, name, dump_flag, do_round)
+      | early, flag == Opt_CoreWebsUncurry
+      = return (binds, changed)   -- See Note [No early uncurrying]
       | gopt flag dflags
       = do { (binds', changed') <- runTransform name dump_flag do_round
                                                 logger dflags cfg sigs binds
@@ -387,3 +392,37 @@ pprWebSummary exposed binds
 dump :: Logger -> DumpFlag -> String -> SDoc -> CoreM ()
 dump logger flag hdr doc
   = liftIO $ putDumpFileMaybe logger flag hdr FormatCore doc
+
+{- Note [No early uncurrying]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The early run does not uncurry.  Uncurrying before demand analysis loses
+GHC's call-by-value for strict arguments: the simplifier evaluates a strict
+argument before a call (using the callee's demand signature), but not a
+strict *component* of an unboxed-tuple argument.  So after uncurrying the
+accumulator loop
+    go (x:xs) acc = go xs (if x > acc then x else acc)
+into  go (# xs, acc #), each call builds a thunk for the accumulator, and the
+chain overflows the stack when forced (testsuite: simplCore/should_run/T10830,
+maximumBy over [1..10000] with a 100k stack).  After demand analysis and
+worker/wrapper (the late run) the arguments are already evaluated where they
+need to be.
+-}
+
+{- Note [Early webs]
+~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-early the web pipeline also runs before the main simplifier
+phases (GHC.Core.Opt.Pipeline.getCoreToDo), so that the simplifier, the
+inliner and worker/wrapper see the transformed program.
+
+Demand analysis has not run yet at that point, so arity raising only finds
+the lambdas whose strictness is evident syntactically (see isStrictIn in
+GHC.WebCore.Transform.ArityRaise).  We deliberately do not run demand
+analysis just for this pass: it would change what the rest of the pipeline
+sees, and confound the experiment (does an early web pass change what the
+inliner does?).
+
+Before the simplifier, INLINE and INLINABLE functions have stable unfoldings
+that the inliner relies on.  Annotation treats them as interface Ids
+(ws_interface_ids), so their types never change and their unfoldings are
+kept.
+-}

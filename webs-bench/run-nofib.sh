@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Run nofib with one compiler configuration and collect the web experiment
+# dumps.
+#
+#   webs-bench/run-nofib.sh NAME "EXTRA GHC OPTIONS"
+#
+# Uses the stage-2 compiler of this tree (_build/stage1/bin/ghc).  Results go
+# to webs-bench/results/NAME/:
+#   nofib.log      the nofib log (runtimes, allocations, compile times;
+#                  compare logs with nofib/nofib-analyse)
+#   dumps/         per-module dumps, mirroring the nofib tree:
+#                    *.dump-first-class-stats   (GHC.WebCore.FirstClass)
+#                    *.dump-simpl-stats         (simplifier/inliner ticks)
+# Set NOFIB_MODE (default fast) and NOFIB_DIRS (default: nofib's own default
+# set of benchmark directories) to change what runs.
+set -u
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+GHC=$ROOT/_build/stage1/bin/ghc
+NAME=$1
+OPTS=${2:-}
+MODE=${NOFIB_MODE:-fast}
+OUT=$ROOT/webs-bench/results/$NAME
+DUMPDIR=webs-dumps-$NAME
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+cd "$ROOT/nofib"
+
+DIRS_ARG=()
+if [ -n "${NOFIB_DIRS:-}" ]; then DIRS_ARG=("NoFibSubDirs=$NOFIB_DIRS"); fi
+
+echo "[$NAME] cleaning"
+make clean "${DIRS_ARG[@]}" > "$OUT/clean.log" 2>&1
+find . -type d -name "webs-dumps-*" -prune -exec rm -rf {} +
+
+echo "[$NAME] boot"
+make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&1
+
+echo "[$NAME] build and run (options: $OPTS)"
+make -k WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
+     EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats" \
+     > "$OUT/nofib.log" 2>&1
+echo "[$NAME] make exit code: $?" | tee "$OUT/exit-code"
+
+echo "[$NAME] collecting dumps"
+find . -type d -name "$DUMPDIR" | while read -r d; do
+  bench=$(dirname "$d" | sed 's|^\./||')
+  mkdir -p "$OUT/dumps/$bench"
+  cp "$d"/*.dump-first-class-stats "$d"/*.dump-simpl-stats "$OUT/dumps/$bench/" 2>/dev/null
+done
+echo "[$NAME] done: $OUT"

@@ -65,7 +65,12 @@ data CoreToDo           -- These are diff core-to-core passes,
   | CorePrep
   | CoreAddCallerCcs
   | CoreAddLateCcs
-  | CoreDoWebs     -- ^ The web pipeline; see GHC.WebCore.Pipeline
+  | CoreDoWebs Bool  -- ^ The web pipeline; see GHC.WebCore.Pipeline.
+                     --   True: the early run, before the main simplifier
+  | CoreDoFirstClassStats String
+                     -- ^ Count first-class function behaviour; see
+                     --   GHC.WebCore.FirstClass.  The String names the point
+                     --   in the pipeline
 
 instance Outputable CoreToDo where
   ppr (CoreDoSimplify _)       = text "Simplifier"
@@ -88,7 +93,8 @@ instance Outputable CoreToDo where
   ppr CoreTidy                 = text "Tidy Core"
   ppr CoreAddCallerCcs         = text "Add caller cost-centres"
   ppr CoreAddLateCcs           = text "Add late core cost-centres"
-  ppr CoreDoWebs               = text "Webs"
+  ppr (CoreDoWebs early)       = text (if early then "Webs (early)" else "Webs")
+  ppr (CoreDoFirstClassStats p) = text "First-class function statistics" <+> parens (text p)
   ppr CorePrep                 = text "CorePrep"
   ppr CoreDoPrintCore          = text "Print core"
   ppr (CoreDoRuleCheck {})     = text "Rule check"

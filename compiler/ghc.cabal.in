@@ -1025,6 +1025,7 @@ Library
         GHC.WebCore.Annotate
         GHC.WebCore.Compare
         GHC.WebCore.Erase
+        GHC.WebCore.FirstClass
         GHC.WebCore.Lint
         GHC.WebCore.Pipeline
         GHC.WebCore.Rename

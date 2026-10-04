@@ -176,7 +176,7 @@ analyse binds = foldr go_bind emptyUFM binds
     go_lam can_be_partial w p e acc
       = go_bndr p $
         note w (noInfo { i_lams    = [p]
-                       , i_lazy    = not (isStrUsedDmd (idDemandInfo p))
+                       , i_lazy    = not (isStrictIn p e)
                        , i_curried = can_be_partial && is_lam e
                        , i_covar   = isCoVar p }) acc
 
@@ -503,6 +503,20 @@ rewriteProgram todo keep_unf binds
         , length vals == dataConRepArity dc
         -> Just (dc, ty_args, vals)
       _ -> Nothing
+
+-- | Is a lambda strict in its parameter p?  Yes if demand analysis says so,
+-- or if the body evidently evaluates p first: it is a case on p, perhaps
+-- under ticks and lets.  The second test matters when demand analysis has not
+-- run (the early web pipeline; see Note [Early webs] in GHC.WebCore.Pipeline).
+isStrictIn :: Id -> CoreExpr -> Bool
+isStrictIn p body = isStrUsedDmd (idDemandInfo p) || go body
+  where
+    go (Case (Var v) _ _ _) = v == p
+    go (Case scrut _ _ _)   = go scrut
+    go (Tick _ e)           = go e
+    go (Let _ e)            = go e
+    go (Cast e _)           = go e
+    go _                    = False
 
 -- | Replace  case p of b { K ys -> rhs }  by  let b = p; ys = xs in rhs
 -- (and  case p of b { DEFAULT -> rhs }  by  let b = p in rhs)

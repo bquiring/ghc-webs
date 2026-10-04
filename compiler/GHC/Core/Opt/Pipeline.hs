@@ -45,6 +45,7 @@ import GHC.Core.Opt.WorkWrap     ( wwTopBinds )
 import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
 import GHC.Core.LateCC.TopLevelBinds (topLevelBindsCCMG)
 import GHC.WebCore.Pipeline ( webPass )
+import GHC.WebCore.FirstClass ( firstClassStats, pprFirstClassStats )
 import GHC.Core.Seq (seqBinds)
 import GHC.Core.FamInstEnv
 
@@ -201,8 +202,13 @@ getCoreToDo dflags hpt_rule_base extra_vars
     add_late_ccs =
         runWhen (profiling && gopt Opt_ProfLateInlineCcs dflags) $ CoreAddLateCcs
 
+    first_class_stats = dopt Opt_D_dump_first_class_stats dflags
+
     core_todo =
      [
+        -- See Note [First-class function statistics] in GHC.WebCore.FirstClass
+        runWhen first_class_stats (CoreDoFirstClassStats "before"),
+
     -- We want to do the static argument transform before full laziness as it
     -- may expose extra opportunities to float things outwards. However, to fix
     -- up the output of the transformation we need at do at least one simplify
@@ -244,6 +250,11 @@ getCoreToDo dflags hpt_rule_base extra_vars
            -- forms to the top level. See Note [Grand plan for static forms] in
            -- GHC.Iface.Tidy.StaticPtrTable.
            static_ptrs_float_outwards,
+
+        -- The early run of the web pipeline (-fcore-webs-early): web
+        -- transformations before the main simplifier, so that it (and
+        -- worker/wrapper) see their result.  See GHC.WebCore.Pipeline
+        runWhen (gopt Opt_CoreWebsEarly dflags) (CoreDoWebs True),
 
         -- Run the simplifier phases 2,1,0 to allow rewrite rules to fire
         runWhen do_simpl3
@@ -352,7 +363,10 @@ getCoreToDo dflags hpt_rule_base extra_vars
 
         -- The web pipeline runs after all Core optimisations.
         -- See GHC.WebCore.Pipeline
-        runWhen (gopt Opt_CoreWebs dflags) CoreDoWebs
+        runWhen (gopt Opt_CoreWebs dflags) (CoreDoWebs False),
+
+        -- See Note [First-class function statistics] in GHC.WebCore.FirstClass
+        runWhen first_class_stats (CoreDoFirstClassStats "after")
      ]
 
     -- Remove 'CoreDoNothing' and flatten 'CoreDoPasses' for clarity.
@@ -531,8 +545,15 @@ doCorePass pass guts = do
     CoreAddLateCcs            -> {-# SCC "AddLateCcs" #-}
                                  topLevelBindsCCMG guts
 
-    CoreDoWebs                -> {-# SCC "Webs" #-}
-                                 webPass guts
+    CoreDoWebs early          -> {-# SCC "Webs" #-}
+                                 webPass early guts
+
+    CoreDoFirstClassStats phase -> {-# SCC "FirstClassStats" #-}
+                                 do { liftIO $ Logger.putDumpFileMaybe logger
+                                        Opt_D_dump_first_class_stats
+                                        "First-class function statistics" FormatText
+                                        (pprFirstClassStats phase (firstClassStats (mg_binds guts)))
+                                    ; return guts }
 
     CoreDoPrintCore           -> {-# SCC "PrintCore" #-}
                                  liftIO $ printCore logger (mg_binds guts) >> return guts

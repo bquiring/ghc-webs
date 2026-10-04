@@ -20,11 +20,11 @@ import GHC.Types.Id
 import GHC.Types.Id.Info ( isEmptyRuleInfo )
 import GHC.Types.Tickish
 import GHC.Types.Unique.Supply
-import GHC.Types.Unique.Set ( unionManyUniqSets, nonDetEltsUniqSet )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Core.FVs ( rulesFreeVars, bndrRuleAndUnfoldingVarsDSet )
+import GHC.Core.FVs ( rulesFreeVars, stableUnfoldingVars )
 import GHC.Types.Web
 
 import GHC.Utils.Misc ( HasDebugCallStack )
@@ -36,6 +36,7 @@ import GHC.WebCore.Traverse ( typeWebs )
 
 import Data.Array ( bounds, listArray )
 import Data.Maybe ( fromMaybe )
+import Control.Monad ( when )
 
 {- Note [Initial annotation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -75,58 +76,92 @@ Details:
   * Not annotated: RULES and unfoldings.  Web Lint does not look at them.
 -}
 
--- | Annotate a program.  The webs in the types of exported binders, and of
--- binders whose unfoldings or rules may reach the interface, are exposed.
+-- | Annotate a program.  The webs in the types of the binders whose
+-- unfoldings or rules must survive (keptIds) are exposed.
 -- See Note [Exposed webs] in GHC.WebCore.Sigs
-annotateProgram :: UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
-annotateProgram us rules binds
-  = case unAnnM (ann_top binds) us emptyWebSigs of
+annotateProgram :: Bool   -- ^ Keep stable unfoldings (the early run; see
+                          --   Note [Early webs] in GHC.WebCore.Pipeline)
+                -> UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
+annotateProgram keep_stable us rules binds
+  = case unAnnM (ann_top binds) us init_sigs of
       (binds', _, sigs) -> (binds', sigs)
   where
-    iface_ids = interfaceIds rules binds
+    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable rules binds }
 
     ann_top bs
       = do { -- All top-level binders are in scope everywhere
              -- c.f. lintCoreBindings
              (env, _) <- annBndrs emptyVarEnv (bindersOfBinds bs)
-           ; bs' <- mapM (ann_top_bind env) bs
-           ; exposeExported bs'
-           ; modifySigs (\sigs -> sigs { ws_interface_ids = iface_ids })
-           ; return bs' }
+           ; mapM (ann_top_bind env) bs }
 
     ann_top_bind env (NonRec b rhs)
       = NonRec (lookupBndr env b) <$> annExpr env rhs
     ann_top_bind env (Rec prs)
       = Rec <$> sequence [ (,) (lookupBndr env b) <$> annExpr env rhs | (b, rhs) <- prs ]
 
-    exposeExported bs'
-      = modifySigs $ addExposedWebs $
-        unionManyUniqSets [ typeWebs (idType b) | b <- bindersOfBinds bs'
-                                                , b `elemVarSet` iface_ids ]
-
--- | The local top-level Ids whose unfoldings or rules may reach the interface
--- file: the exported Ids, the Ids free in the RULES, and the top-level Ids
--- that have rules of their own (Tidy may keep those, e.g. with
--- -fkeep-auto-rules), closed over the Ids free in their stable unfoldings and
--- rules.  Vanilla unfoldings need no care: Tidy rebuilds them from the final
--- right-hand side, i.e. from the transformed program (see tidyTopUnfolding
--- in GHC.Iface.Tidy), so they agree with the new calling conventions.
-interfaceIds :: [CoreRule] -> CoreProgram -> VarSet
-interfaceIds rules binds = go emptyVarSet roots
+-- | The local Ids whose types must not change, because unannotated Core that
+-- the web transformations do not rewrite refers to them:
+--
+--   * the exported Ids (their types are in the interface)
+--   * the Ids free in the RULES for imported Ids
+--   * the binders, at any level, that have rules of their own, and the local
+--     Ids free in those rules (Tidy may keep the rules of top-level Ids,
+--     e.g. with -fkeep-auto-rules, and Core Lint checks all of them)
+--   * in the early run (keep_stable), the binders that have stable unfoldings
+--     (INLINE and INLINABLE functions, which the simplifier that runs
+--     afterwards relies on)
+--
+-- closed over the local Ids free in their stable unfoldings and rules.  Their
+-- unfoldings and rules are kept (see zapLocalUnfolding).  Vanilla unfoldings
+-- need no care: Tidy rebuilds them from the final right-hand side, i.e. from
+-- the transformed program (see tidyTopUnfolding in GHC.Iface.Tidy), and the
+-- simplifier rebuilds them too.  In the late run nothing inlines afterwards,
+-- so zapping other unfoldings is harmless.
+keptIds :: Bool -> [CoreRule] -> CoreProgram -> VarSet
+keptIds keep_stable rules binds = go emptyVarSet roots
   where
-    top_bndrs = mkVarSet (bindersOfBinds binds)
-    roots     = filter isExportedId (bindersOfBinds binds)
-             ++ filter (not . isEmptyRuleInfo . idSpecialisation) (bindersOfBinds binds)
-             ++ nonDetEltsUniqSet (rulesFreeVars rules `intersectVarSet` top_bndrs)
+    bndrs = allLetBinders binds
+    roots = filter isExportedId (bindersOfBinds binds)
+         ++ filter (not . isEmptyRuleInfo . idSpecialisation) bndrs
+         ++ filter isLocalId (nonDetEltsUniqSet (rulesFreeVars rules))
+         ++ (if keep_stable then filter (isStableUnfolding . realIdUnfolding) bndrs else [])
+
+    -- Look at the binders' own IdInfo: occurrences may carry stale copies.
+    -- Several binders can share a Unique (shadowing; e.g. a join point the
+    -- simplifier duplicated into several branches, each copy with its own
+    -- rules), so keep them all.
+    bndr_env = foldr (\b env -> extendVarEnv_C (++) env b [b]) emptyVarEnv bndrs
 
     go acc []     = acc
     go acc (v:vs)
       | v `elemVarSet` acc = go acc vs
       | otherwise
-      = go (acc `extendVarSet` v)
-           (dVarSetElems (bndrRuleAndUnfoldingVarsDSet v) `filter_top` vs)
+      = go (acc `extendVarSet` v) (filter isLocalId (deps v) ++ vs)
 
-    filter_top new vs = [ v | v <- new, v `elemVarSet` top_bndrs ] ++ vs
+    -- The free variables of the binder's rules and stable unfolding,
+    -- recomputed from the rules (the cached ruleInfoFreeVars can be stale)
+    deps v = concat [ nonDetEltsUniqSet (rulesFreeVars (idCoreRules b))
+                      ++ maybe [] nonDetEltsUniqSet (stableUnfoldingVars (realIdUnfolding b))
+                    | b <- lookupVarEnv bndr_env v `orElse` [] ]
+
+-- | All the let-bound (and top-level) binders of a program
+allLetBinders :: CoreProgram -> [Id]
+allLetBinders binds = foldr go_bind [] binds
+  where
+    go_bind bind acc = foldr go_pair acc (flattenBinds [bind])
+    go_pair (b, rhs) acc = b : go rhs acc
+
+    go :: CoreExpr -> [Id] -> [Id]
+    go expr acc = case expr of
+      Let bind body -> go_bind bind (go body acc)
+      Lam _ e       -> go e acc
+      WebLam _ _ e  -> go e acc
+      App f a       -> go f (go a acc)
+      WebApp _ f a  -> go f (go a acc)
+      Case e _ _ as -> go e (foldr (\(Alt _ _ rhs) -> go rhs) acc as)
+      Cast e _      -> go e acc
+      Tick _ e      -> go e acc
+      _             -> acc
 
 ------------------------------------------------------------------
 --      The annotation monad
@@ -172,6 +207,10 @@ annBndr env b
   | isId b
   = do { ty' <- annType env (idType b)
        ; let b' = setIdType b ty'
+         -- The webs of kept binders are exposed; see keptIds
+       ; sigs <- getSigs
+       ; when (b `elemVarSet` ws_interface_ids sigs) $
+           modifySigs (addExposedWebs (typeWebs ty'))
        ; return (extendVarEnv env b b', b') }
   | otherwise   -- Type variable: unchanged
   = return (env, b)

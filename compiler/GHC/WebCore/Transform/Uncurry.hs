@@ -164,9 +164,16 @@ analyse binds = foldr go_bind emptyUFM binds
     go_lam last_join w a e acc
       = go_bndr a $
         note w (case innerLam e of
-                  Just (_, w2, _, _) -> noInfo { i_lams = [a], i_inner = unitUniqSet w2
+                  Just (_, w2, b, _) -> noInfo { i_lams = [a], i_inner = unitUniqSet w2
                                                , i_covar = isCoVar a
-                                               , i_join_res = last_join }
+                                               , i_join_res = last_join
+                                                 -- The binders become the components
+                                                 -- of an unboxed tuple; the arrow
+                                                 -- types may not be visible anywhere
+                                               , i_constraint = not (isTypeLike (idType a)
+                                                                     && isTypeLike (idType b))
+                                               , i_rep_poly = not (typeHasFixedRuntimeRep (idType a)
+                                                                   && typeHasFixedRuntimeRep (idType b)) }
                   Nothing            -> noInfo { i_lams = [a], i_not_direct = True
                                                , i_covar = isCoVar a }) acc
 

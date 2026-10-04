@@ -2,6 +2,7 @@
 
 ==================== Webs: arity raising ====================
 raised: ds
+raised: p
 rejected (argument not a product): f
 rejected (argument not a product): ww
 rejected (argument not a product): ww
@@ -9,7 +10,6 @@ rejected (exposed): e1
 rejected (exposed): eta1
 rejected (exposed): s
 rejected (exposed): s s
-rejected (lazy in its argument): p
 
 
 [2 of 2] Linking arityraise011
