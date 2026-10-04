@@ -107,7 +107,10 @@ annotateProgram us rules binds
 -- | The local top-level Ids whose unfoldings or rules may reach the interface
 -- file: the exported Ids, the Ids free in the RULES, and the top-level Ids
 -- that have rules of their own (Tidy may keep those, e.g. with
--- -fkeep-auto-rules), closed over the Ids free in their unfoldings and rules.
+-- -fkeep-auto-rules), closed over the Ids free in their stable unfoldings and
+-- rules.  Vanilla unfoldings need no care: Tidy rebuilds them from the final
+-- right-hand side, i.e. from the transformed program (see tidyTopUnfolding
+-- in GHC.Iface.Tidy), so they agree with the new calling conventions.
 interfaceIds :: [CoreRule] -> CoreProgram -> VarSet
 interfaceIds rules binds = go emptyVarSet roots
   where

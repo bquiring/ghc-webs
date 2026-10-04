@@ -1,0 +1,12 @@
+[1 of 2] Compiling Main             ( arityraise003.hs, arityraise003.o )
+
+==================== Webs: arity raising ====================
+rejected (argument not a product): c
+rejected (argument not a product): f
+rejected (exposed): eta
+rejected (exposed): r r
+rejected (lazy in its argument): p
+rejected (lazy in its argument): p
+
+
+[2 of 2] Linking arityraise003

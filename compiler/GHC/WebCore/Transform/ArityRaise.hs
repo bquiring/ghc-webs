@@ -1,0 +1,539 @@
+-- | Arity raising over webs: pass a product argument as its components.
+--
+-- See Note [Arity raising] and WEBS-ARITY-RAISING.md.
+module GHC.WebCore.Transform.ArityRaise
+  ( arityRaiseRound
+  ) where
+
+import GHC.Prelude
+
+import GHC.Builtin.Types ( mkTupleTy, tupleDataCon, tupleTyCon )
+import GHC.Core
+import GHC.Core.Coercion
+import GHC.Core.DataCon
+import GHC.Core.Make ( mkCoreUnboxedTuple, mkCoreConApps )
+import GHC.Core.TyCo.Rep
+import GHC.Core.TyCon
+import GHC.Core.Type
+import GHC.Core.Utils ( exprType )
+
+import GHC.Data.FastString ( fsLit )
+
+import GHC.Types.Basic ( Boxity(..) )
+import GHC.Types.Demand ( isStrUsedDmd )
+import GHC.Types.Id
+import GHC.Types.Tickish
+import GHC.Types.Unique ( getKey )
+import GHC.Types.Unique.FM
+import GHC.Types.Unique.Set
+import GHC.Types.Unique.Supply
+import GHC.Types.Var.Env
+import GHC.Types.Var.Set
+import GHC.Types.Web
+
+import GHC.Data.Pair
+import GHC.Utils.Outputable
+import GHC.Utils.Panic ( pprPanic )
+
+import GHC.WebCore.Transform.Common
+
+import Data.List ( sortOn )
+import Data.Maybe ( fromMaybe, isJust )
+
+{- Note [Arity raising]
+~~~~~~~~~~~~~~~~~~~~~~~
+A web w whose arrows all take a product (a single-constructor data type
+without existentials), and whose lambdas are all strict in that argument,
+passes the product's components instead:
+
+    T ts -{w}-> C         becomes   (# c1, .., cn #) -{w}-> C
+                                     where c1..cn are the constructor's
+                                     representation argument types
+    \^w p. e              becomes   \^w t. case t of (# x1, .., xn #) ->
+                                       e  with  case p of K ys -> rhs
+                                       replaced by  let ys = xs in rhs,
+                                       and  let p = K xs  if p is still used
+    f @^w (K es)          becomes   f @^w (# es #)
+    f @^w x               becomes   case x of K ys -> f @^w (# ys #)
+
+The unboxed tuple encodes a multi-argument arrow (Unarise splits it).
+
+Laziness (WEBS-ARITY-RAISING.md §2): the caller now evaluates the argument,
+so every lambda of the web must be strict in it (its demand, from the demand
+analysis that runs just before the web pipeline, is strict).  A lambda that
+is lazy, or strict only on some paths, rejects the web.  So does a lambda
+whose body is another lambda (unless it is a join point's): the demand on its
+argument describes full applications, but a partial application  f undefined
+is a value that never forces the argument, and raising would force it at the
+call.  The components stay
+lazy: building and matching an unboxed tuple evaluates nothing.
+
+A web is also rejected if it is exposed, if some arrow's argument is not a
+product (e.g. a type variable), if the product type differs between arrows,
+if a component has no fixed representation, or if the web appears in a
+coercion we cannot rewrite.
+-}
+
+data Verdict = Raised | Rejected Reason
+
+data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
+
+instance Outputable Verdict where
+  ppr Raised       = text "raised"
+  ppr (Rejected r) = text "rejected" <+> parens (ppr r)
+
+instance Outputable Reason where
+  ppr Exposed    = text "exposed"
+  ppr NotProduct = text "argument not a product"
+  ppr Lazy       = text "lazy in its argument"
+  ppr Curried    = text "curried: may be partially applied"
+  ppr RepPoly    = text "representation-polymorphic component"
+  ppr Coercion'  = text "complex coercion"
+  ppr CoVarParam = text "coercion parameter"
+
+-- | The product types we raise: boxed, single-constructor data types without
+-- existentials or constraints, that are not classes
+productCon :: Type -> Maybe (TyCon, [Type], DataCon)
+productCon ty
+  | Just (tc, args) <- splitTyConApp_maybe ty
+  , isAlgTyCon tc
+  , not (isNewTyCon tc)
+  , not (isClassTyCon tc)
+  , not (isUnboxedTupleTyCon tc)
+  , not (isUnboxedSumTyCon tc)
+  , Just dc <- tyConSingleDataCon_maybe tc
+  , isVanillaDataCon dc
+  = Just (tc, args, dc)
+  | otherwise
+  = Nothing
+
+-- | The type arguments and data constructor of a type that analysis has
+-- found to be a product
+productOf :: Type -> ([Type], DataCon)
+productOf ty = case productCon (coreFullView ty) of
+  Just (_, args, dc) -> (args, dc)
+  Nothing            -> pprPanic "ArityRaise.productOf" (ppr ty)
+
+-- | The component types of a product type
+components :: DataCon -> [Type] -> [Type]
+components dc args = map scaledThing (dataConInstArgTys dc args)
+
+------------------------------------------------------------------
+--      Analysis
+------------------------------------------------------------------
+
+data Info = Info
+  { i_lams      :: [Id]
+  , i_lazy      :: Bool
+  , i_curried   :: Bool   -- A (non-join) lambda whose body is another lambda
+  , i_covar     :: Bool
+  , i_not_prod  :: Bool
+  , i_tycons    :: [TyCon]
+  , i_rep_poly  :: Bool
+  , i_coercion  :: Bool }
+
+noInfo :: Info
+noInfo = Info [] False False False False [] False False
+
+plusInfo :: Info -> Info -> Info
+plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
+                    , i_lazy     = i_lazy a     || i_lazy b
+                    , i_curried  = i_curried a  || i_curried b
+                    , i_covar    = i_covar a    || i_covar b
+                    , i_not_prod = i_not_prod a || i_not_prod b
+                    , i_tycons   = i_tycons a ++ i_tycons b
+                    , i_rep_poly = i_rep_poly a || i_rep_poly b
+                    , i_coercion = i_coercion a || i_coercion b }
+
+type Infos = UniqFM WebId Info
+
+note :: WebId -> Info -> Infos -> Infos
+note w i infos
+  | isPlaceholderWeb w = infos
+  | otherwise          = addToUFM_C plusInfo infos w i
+
+analyse :: CoreProgram -> Infos
+analyse binds = foldr go_bind emptyUFM binds
+  where
+    go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
+    go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
+
+    go_rhs b e acc
+      | JoinPoint arity <- idJoinPointHood b = go_join arity e acc
+      | otherwise                            = go e acc
+
+    -- The first 'arity' lambdas of a join point: jumps are always saturated,
+    -- so these lambdas may be curried
+    go_join :: Int -> CoreExpr -> Infos -> Infos
+    go_join 0 e acc = go e acc
+    go_join n (Lam b e) acc = go_bndr b (go_join (n-1) e acc)
+    go_join n (WebLam w p e) acc = go_lam False w p e (go_join (n-1) e acc)
+    go_join _ e acc = go e acc
+
+    -- A lambda that returns another lambda may be partially applied, and
+    -- its argument's demand describes full applications only; raising would
+    -- force the argument of a partial application.  See Note [Arity raising]
+    go_lam can_be_partial w p e acc
+      = go_bndr p $
+        note w (noInfo { i_lams    = [p]
+                       , i_lazy    = not (isStrUsedDmd (idDemandInfo p))
+                       , i_curried = can_be_partial && is_lam e
+                       , i_covar   = isCoVar p }) acc
+
+    is_lam (Tick _ e)     = is_lam e
+    is_lam (Lam {})       = True
+    is_lam (WebLam {})    = True
+    is_lam _              = False
+
+    go :: CoreExpr -> Infos -> Infos
+    go (Var {}) acc = acc
+    go (Lit {}) acc = acc
+    go (App f (Type t)) acc = go f (go_ty t acc)
+    go (App f a) acc = go f (go a acc)
+    go (WebApp _ f a) acc = go f (go a acc)
+    go (Lam b e) acc = go_bndr b (go e acc)
+    go (WebLam w p e) acc = go_lam True w p e (go e acc)
+    go (Let bind body) acc = go_bind bind (go body acc)
+    go (Case scrut b ty alts) acc
+      = go scrut $ go_bndr b $ go_ty ty $
+        foldr (\(Alt _ bs rhs) a -> foldr go_bndr (go rhs a) bs) acc alts
+    go (Cast e co) acc = go e (go_co co acc)
+    go (Tick _ e) acc = go e acc
+    go (Type t) acc = go_ty t acc
+    go (Coercion co) acc = go_co co acc
+
+    go_bndr b acc
+      | isId b    = go_ty (idType b) acc
+      | otherwise = acc
+
+    go_ty :: Type -> Infos -> Infos
+    go_ty ty acc = case ty of
+      FunTy { ft_web = w, ft_arg = a, ft_res = r }
+        -> let acc' = go_ty a (go_ty r acc)
+           in case productCon (coreFullView a) of
+                Just (tc, args, dc)
+                  | all typeHasFixedRuntimeRep (components dc args)
+                  -> note w (noInfo { i_tycons = [tc] }) acc'
+                  | otherwise
+                  -> note w (noInfo { i_tycons = [tc], i_rep_poly = True }) acc'
+                Nothing -> note w (noInfo { i_not_prod = True }) acc'
+      TyConApp _ tys -> foldr go_ty acc tys
+      AppTy t1 t2    -> go_ty t1 (go_ty t2 acc)
+      ForAllTy _ t   -> go_ty t acc
+      CastTy t co    -> go_ty t (go_co co acc)
+      CoercionTy co  -> go_co co acc
+      _              -> acc
+
+    go_co :: Coercion -> Infos -> Infos
+    go_co co acc = case co of
+      Refl t                 -> go_ty t acc
+      GRefl _ t _            -> go_ty t acc
+      TyConAppCo _ _ cos     -> foldr go_co acc cos
+      AppCo c1 c2            -> go_co c1 (go_co c2 acc)
+      ForAllCo { fco_body = c } -> go_co c acc
+      FunCo { fco_web = w, fco_arg = c1, fco_res = c2 }
+        | Nothing <- splitArgCo c1
+        -> note w (noInfo { i_coercion = True }) (go_co c1 (go_co c2 acc))
+        | otherwise
+        -> go_co c1 (go_co c2 acc)
+      AxiomCo _ cos          -> foldr go_co acc cos
+      SymCo c                -> go_co c acc
+      TransCo c1 c2          -> go_co c1 (go_co c2 acc)
+      SubCo c                -> go_co c acc
+      _                      -> acc   -- complexCoWebs deals with the others
+
+-- | Split the coercion between two product types into the coercions between
+-- their type arguments: a Refl, or a TyConAppCo of the product type
+splitArgCo :: Coercion -> Maybe (TyCon, [Coercion])
+splitArgCo co = case co of
+  TyConAppCo _ tc cos | isJust (productCon (mkTyConApp tc (map coercionLKind cos)))
+                      -> Just (tc, cos)
+  Refl t | Just (tc, args, _) <- productCon (coreFullView t)
+         -> Just (tc, map mkNomReflCo args)
+  GRefl r t MRefl | Just (tc, args, _) <- productCon (coreFullView t)
+         -> Just (tc, zipWith mkReflCo (tyConRoleListX r tc) args)
+  _ -> Nothing
+
+verdict :: WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict exposed complex w i
+  | w `elementOfUniqSet` exposed = Rejected Exposed
+  | i_covar i                    = Rejected CoVarParam
+  | w `elementOfUniqSet` complex = Rejected Coercion'
+  | i_coercion i                 = Rejected Coercion'
+  | i_not_prod i                 = Rejected NotProduct
+  | not (same_tycon (i_tycons i)) = Rejected NotProduct
+  | i_rep_poly i                 = Rejected RepPoly
+  | i_lazy i                     = Rejected Lazy
+  | i_curried i                  = Rejected Curried
+  | otherwise                    = Raised
+  where
+    same_tycon (tc:tcs) = all (== tc) tcs
+    same_tycon []       = False
+
+------------------------------------------------------------------
+--      One round
+------------------------------------------------------------------
+
+-- | Analyse the program and raise the webs that qualify.  Each raised web
+-- loses its product arrows, so one round is enough; webs in 'done' have
+-- already been raised and are not considered again.
+arityRaiseRound :: UniqSupply
+                -> WebSet      -- ^ Exposed webs
+                -> VarSet      -- ^ Binders whose unfoldings must be kept
+                -> WebSet      -- ^ Webs already raised
+                -> CoreProgram
+                -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
+arityRaiseRound us exposed keep_unf done binds
+  | isEmptyUniqSet todo = (Nothing, dump)
+  | otherwise           = (Just (initUs_ us (rewriteProgram todo keep_unf binds), todo), dump)
+  where
+    infos   = analyse binds
+    complex = complexCoWebs binds
+    verdicts = [ (w, verdict exposed complex w i, i)
+               | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
+               , let w = mkWebId u
+               , not (null (i_lams i))
+               , not (w `elementOfUniqSet` done) ]
+    todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
+    dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
+
+------------------------------------------------------------------
+--      The rewrite
+------------------------------------------------------------------
+
+type Env = IdEnv Id
+
+raiseType :: WebSet -> Type -> Type
+raiseType todo = go
+  where
+    go ty = case ty of
+      FunTy { ft_web = w, ft_mult = m, ft_arg = a, ft_res = r }
+        | w `elementOfUniqSet` todo
+        , Just (_, args, dc) <- productCon (coreFullView a)
+        -> let tup = mkTupleTy Unboxed (components dc (map go args))
+               r'  = go r
+           in mkWebFunTy w (chooseFunTyFlag tup r') m tup r'
+        | otherwise -> ty { ft_arg = go a, ft_res = go r }
+      TyConApp tc tys -> TyConApp tc (map go tys)
+      AppTy t1 t2     -> AppTy (go t1) (go t2)
+      ForAllTy b t    -> ForAllTy b (go t)
+      CastTy t co     -> CastTy (go t) (raiseCo todo co)
+      CoercionTy co   -> CoercionTy (raiseCo todo co)
+      _               -> ty
+
+raiseCo :: WebSet -> Coercion -> Coercion
+raiseCo todo = go
+  where
+    goTy = raiseType todo
+    go co = case co of
+      Refl t              -> Refl (goTy t)
+      GRefl r t mco       -> GRefl r (goTy t) mco
+      TyConAppCo r tc cos -> TyConAppCo r tc (map go cos)
+      AppCo c1 c2         -> AppCo (go c1) (go c2)
+      ForAllCo { fco_body = c } -> co { fco_body = go c }
+      FunCo { fco_role = r, fco_web = w, fco_mult = m, fco_arg = ca, fco_res = cr }
+        | w `elementOfUniqSet` todo
+        , Just (_, arg_cos) <- splitArgCo ca
+        , Just (_, _, dc) <- productCon (coercionLKind ca)
+        -> let arg_cos' = map go arg_cos
+               -- The coercions between the components: lift the
+               -- components' types over the coercions between the type
+               -- arguments
+               comp_cos = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos')
+                              (map scaledThing (dataConRepArgTys dc))
+               reps     = map (mkNomReflCo . getRuntimeRep . coercionLKind) comp_cos
+               n        = length comp_cos
+               tup      = mkTyConAppCo r (tupleTyCon Unboxed n) (reps ++ comp_cos)
+               cr'      = go cr
+               Pair lt rt = coercionKind tup
+               Pair lc rc = coercionKind cr'
+           in mkWebFunCo2 w r (chooseFunTyFlag lt lc) (chooseFunTyFlag rt rc) m tup cr'
+        | otherwise -> co { fco_arg = go ca, fco_res = go cr }
+      AxiomCo ax cos      -> AxiomCo ax (map go cos)
+      SymCo c             -> SymCo (go c)
+      TransCo c1 c2       -> TransCo (go c1) (go c2)
+      SubCo c             -> SubCo (go c)
+      _                   -> co
+
+rewriteProgram :: WebSet -> VarSet -> CoreProgram -> UniqSM CoreProgram
+rewriteProgram todo keep_unf binds
+  = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
+       ; mapM (rw_top env) binds }
+  where
+    upTy = raiseType todo
+    upCo = raiseCo todo
+    is_todo w = w `elementOfUniqSet` todo
+
+    rw_top env (NonRec b e) = NonRec (lookup_bndr env b) <$> rw env e
+    rw_top env (Rec prs)    = Rec <$> sequence [ (,) (lookup_bndr env b) <$> rw env e
+                                               | (b, e) <- prs ]
+
+    lookup_bndr env v = fromMaybe v (lookupVarEnv env v)
+
+    -- The arity does not change: one product argument becomes one
+    -- unboxed-tuple argument
+    rw_bndr :: Var -> Var
+    rw_bndr b
+      | not (isId b)         = b
+      | not (changed old_ty) = zapLocalUnfolding keep_unf b
+      | otherwise            = zapLocalUnfolding keep_unf $
+                               fixBinderInfo b new_ty (\_ n -> n)
+      where
+        old_ty = idType b
+        new_ty = upTy old_ty
+
+    changed ty = case ty of
+      FunTy { ft_web = w, ft_arg = a, ft_res = r } -> is_todo w || changed a || changed r
+      TyConApp _ tys -> any changed tys
+      AppTy t1 t2    -> changed t1 || changed t2
+      ForAllTy _ t   -> changed t
+      CastTy t _     -> changed t
+      _              -> False
+
+    rw_bndr1 env b = (extendVarEnv env b b', b') where b' = rw_bndr b
+
+    rw_bndrs env bs = (extendVarEnvList env (zip bs bs'), bs')
+      where bs' = map rw_bndr bs
+
+    ---------------
+    rw :: Env -> CoreExpr -> UniqSM CoreExpr
+    rw env expr = case expr of
+      Var v        -> return (Var (lookup_bndr env v))
+      Lit l        -> return (Lit l)
+      App f a      -> App <$> rw env f <*> rw env a
+      Lam b e      -> let (env', b') = rw_bndr1 env b in Lam b' <$> rw env' e
+
+      WebLam w p e
+        | is_todo w  -> rw_raised_lam env w p e
+        | otherwise  -> let (env', p') = rw_bndr1 env p in WebLam w p' <$> rw env' e
+
+      WebApp {}    -> do { (wrap, e') <- rw_spine env expr; return (wrap e') }
+
+      Let (NonRec b rhs) body
+        -> do { rhs' <- rw env rhs
+              ; let (env', b') = rw_bndr1 env b
+              ; Let (NonRec b' rhs') <$> rw env' body }
+      Let (Rec prs) body
+        -> do { let (env', bs') = rw_bndrs env (map fst prs)
+              ; rhss' <- mapM (rw env' . snd) prs
+              ; Let (Rec (zip bs' rhss')) <$> rw env' body }
+
+      Case scrut b ty alts
+        -> do { scrut' <- rw env scrut
+              ; let (env', b') = rw_bndr1 env b
+              ; alts' <- sequence [ Alt con bs' <$> rw env'' rhs
+                                  | Alt con bs rhs <- alts
+                                  , let (env'', bs') = rw_bndrs env' bs ]
+              ; return (Case scrut' b' (upTy ty) alts') }
+
+      Cast e co    -> (\e' -> Cast e' (upCo co)) <$> rw env e
+      Tick t e     -> Tick (rw_tick env t) <$> rw env e
+      Type t       -> return (Type (upTy t))
+      Coercion co  -> return (Coercion (upCo co))
+
+    -- An application spine.  The cases that take raised arguments apart
+    -- wrap the whole spine, so that a jump stays in tail position:
+    --   jump j x y  ==>  case x of K ys -> jump j (# ys #) y
+    rw_spine :: Env -> CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
+    rw_spine env expr = case expr of
+      WebApp w f x
+        -> do { (wrap, f') <- rw_spine env f
+              ; x' <- rw env x
+              ; if is_todo w
+                then do { (wrap', call) <- rw_raised_call w f' x'
+                        ; return (wrap . wrap', call) }
+                else return (wrap, WebApp w f' x') }
+      App f a
+        -> do { (wrap, f') <- rw_spine env f
+              ; a' <- rw env a
+              ; return (wrap, App f' a') }
+      _ -> do { e' <- rw env expr; return (id, e') }
+
+    rw_tick env t@(Breakpoint { breakpointFVs = ids })
+      = t { breakpointFVs = map (lookup_bndr env) ids }
+    rw_tick _ t = t
+
+    -- \^w p. e  ==>  \^w t. case t of (# xs #) -> [let p = K xs in] e'
+    -- where e' replaces  case p of b { K ys -> rhs }  by  let ys = xs in rhs
+    rw_raised_lam env w p e
+      = do { let (env1, p') = rw_bndr1 env p
+                 p_ty = idType p'
+                 (args, dc) = productOf p_ty
+                 comp_tys = components dc args
+           ; xs <- mapM (\ty -> do { u <- getUniqueM
+                                   ; return (mkSysLocal (fsLit "x") u ManyTy ty) }) comp_tys
+           ; e1 <- rw env1 e
+             -- Unpack under any further lambdas; see splitLeadingLams
+           ; let (lams, body) = splitLeadingLams e1
+                 e2 = replaceCases p' dc xs body
+                 e3 | p' `elemVarSet` exprOccurrences e2
+                    = Let (NonRec p' (mkCoreConApps dc (map Type args ++ map Var xs))) e2
+                    | otherwise = e2
+                 tup_ty = mkTupleTy Unboxed comp_tys
+           ; u <- getUniqueM
+           ; let t = mkSysLocal (fsLit "ut") u ManyTy tup_ty
+           ; wild <- mkWild tup_ty
+           ; return (WebLam w t (lams (Case (Var t) wild (exprType e3)
+                                         [Alt (DataAlt (tupleDataCon Unboxed (length xs))) xs e3]))) }
+
+    -- f @^w (K es)  ==>  f @^w (# es #)
+    -- f @^w x       ==>  case x of b { K ys -> f @^w (# ys #) }
+    -- Returns the case (to wrap around the whole spine) and the call
+    rw_raised_call w f' x'
+      | Just (dc, _, vals) <- conApp x'
+      , Just (_, _, dc') <- productCon (coreFullView (exprType x'))
+      , dc == dc'
+      = return (id, WebApp w f' (mkCoreUnboxedTuple vals))
+      | otherwise
+      = do { let x_ty = exprType x'
+                 (args, dc) = productOf x_ty
+           ; ys <- mapM (\ty -> do { u <- getUniqueM
+                                   ; return (mkSysLocal (fsLit "y") u ManyTy ty) })
+                        (components dc args)
+           ; b <- mkWild x_ty
+           ; let call = WebApp w f' (mkCoreUnboxedTuple (map Var ys))
+                 wrap body = Case x' b (exprType body) [Alt (DataAlt dc) ys body]
+           ; return (wrap, call) }
+
+    -- A saturated application of a data constructor's worker
+    conApp e = case collectArgs e of
+      (Var v, args)
+        | Just dc <- isDataConWorkId_maybe v
+        , let (ty_args, vals) = span isTypeArg args
+        , length vals == dataConRepArity dc
+        -> Just (dc, ty_args, vals)
+      _ -> Nothing
+
+-- | Replace  case p of b { K ys -> rhs }  by  let b = p; ys = xs in rhs
+-- (and  case p of b { DEFAULT -> rhs }  by  let b = p in rhs)
+replaceCases :: Id -> DataCon -> [Id] -> CoreExpr -> CoreExpr
+replaceCases p dc xs = go
+  where
+    go expr = case expr of
+      Case (Var v) b _ [Alt (DataAlt dc') ys rhs]
+        | v == p, dc' == dc
+        -> let rhs' = go rhs
+           in mkLets (alias b rhs' ++ zipWith (\y x -> NonRec y (Var x)) ys xs) rhs'
+      Case (Var v) b _ [Alt DEFAULT [] rhs]
+        | v == p
+        -> let rhs' = go rhs in mkLets (alias b rhs') rhs'
+      Var {}            -> expr
+      Lit {}            -> expr
+      App f a           -> App (go f) (go a)
+      WebApp w f a      -> WebApp w (go f) (go a)
+      Lam b e           -> Lam b (go e)
+      WebLam w b e      -> WebLam w b (go e)
+      Let bind body     -> Let (go_bind bind) (go body)
+      Case e b ty alts  -> Case (go e) b ty [ Alt con bs (go rhs) | Alt con bs rhs <- alts ]
+      Cast e co         -> Cast (go e) co
+      Tick t e          -> Tick t (go e)
+      Type {}           -> expr
+      Coercion {}       -> expr
+
+    go_bind (NonRec b e) = NonRec b (go e)
+    go_bind (Rec prs)    = Rec [ (b, go e) | (b, e) <- prs ]
+
+    -- The case binder is p itself; bind it only if it is used, so that p
+    -- need not be re-boxed
+    alias b rhs | b `elemVarSet` exprOccurrences rhs = [NonRec b (Var p)]
+                | otherwise                          = []

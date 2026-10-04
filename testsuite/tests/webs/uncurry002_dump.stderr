@@ -1,0 +1,18 @@
+[1 of 2] Compiling Main             ( uncurry002.hs, uncurry002.o )
+
+==================== Webs: uncurrying ====================
+deferred (inner web): b b
+deferred (inner web): ww
+deferred (inner web): ww
+rejected (exposed): eta
+rejected (exposed): r r
+rejected (result not an arrow): c c
+rejected (result not an arrow): f
+rejected (result not an arrow): ww
+rejected (result not an arrow): ww
+uncurried: ut
+uncurried: ut
+uncurried: ut ut
+
+
+[2 of 2] Linking uncurry002

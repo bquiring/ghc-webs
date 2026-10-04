@@ -1,7 +1,23 @@
 # Design: Arity Raising over Webs
 
-Status: design only. It builds on the web pipeline and shares its encoding of
-multi-argument arrows with uncurrying (`WEBS-UNCURRYING.md`).
+Status: **implemented** in `GHC/WebCore/Transform/ArityRaise.hs`, behind
+`-fcore-webs-arity-raise` (dump: `-ddump-webs-arity-raise`). Tests are
+`testsuite/tests/webs/arityraise*`. Where the implementation differs from the
+design below:
+
+- "Product" includes `Int`, `Char`, `Double` and so on (single-constructor
+  types such as `I# Int#`). A web of lambdas strict in an `Int` is raised to
+  take `(# Int# #)`: worker/wrapper unboxing, but for unknown functions.
+  Class dictionaries and newtypes are excluded.
+- A case binder of `case p of b { K ys -> rhs }` is bound to `p` only if it
+  is used, so that `p` is re-boxed only when needed.
+- A function passed to a polymorphic function whose own arrow is in the web
+  (`app :: (a -> b) -> a -> b`) is rejected (argument not a product). One
+  passed only as a value (`opaque :: a -> Int`) is raised, with the type
+  argument rewritten. See `arityraise008`. Raising the first case would need
+  `app` to be specialised to the product type first.
+- The laziness tests (002, 003, 004) were checked against a version of the
+  pass that ignores strictness; all three then crash.
 
 ## 1. The transformation
 

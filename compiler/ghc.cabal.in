@@ -1030,7 +1030,10 @@ Library
         GHC.WebCore.Rename
         GHC.WebCore.Sigs
         GHC.WebCore.Solve
+        GHC.WebCore.Transform.ArityRaise
+        GHC.WebCore.Transform.Common
         GHC.WebCore.Transform.DeadParams
+        GHC.WebCore.Transform.Uncurry
         GHC.WebCore.Traverse
         Language.Haskell.Syntax
         Language.Haskell.Syntax.Basic

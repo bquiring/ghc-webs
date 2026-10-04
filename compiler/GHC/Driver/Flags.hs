@@ -485,6 +485,8 @@ data DumpFlag
    | Opt_D_dump_webs_stats    -- ^ Web pipeline: web statistics
    | Opt_D_dump_webs_summary  -- ^ Web pipeline: top-level types, arrows labelled by web class
    | Opt_D_dump_webs_dead_params -- ^ Web pipeline: dead-parameter elimination verdicts
+   | Opt_D_dump_webs_uncurry     -- ^ Web pipeline: uncurrying verdicts
+   | Opt_D_dump_webs_arity_raise -- ^ Web pipeline: arity raising verdicts
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
    | Opt_D_dump_stg_unarised  -- ^ STG after unarise
    | Opt_D_dump_stg_cg        -- ^ STG (after stg2stg)
@@ -640,6 +642,8 @@ data GeneralFlag
    | Opt_LateSpecialise
    | Opt_CoreWebs        -- ^ Run the web pipeline; see GHC.WebCore.Pipeline
    | Opt_CoreWebsDeadParams -- ^ Web pipeline: dead-parameter elimination
+   | Opt_CoreWebsUncurry    -- ^ Web pipeline: uncurrying
+   | Opt_CoreWebsArityRaise -- ^ Web pipeline: arity raising
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -912,6 +916,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_LateSpecialise
    , Opt_CoreWebs
    , Opt_CoreWebsDeadParams
+   , Opt_CoreWebsUncurry
+   , Opt_CoreWebsArityRaise
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

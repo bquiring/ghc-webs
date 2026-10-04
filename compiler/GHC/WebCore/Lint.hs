@@ -1397,6 +1397,9 @@ checkArgWeb (WebArg mb_w arg) fun_ty
         | Just w <- mb_w
         -> recordWebPair w fw   -- fw may be placeholderWeb:
                                 -- see Note [Arrows without webs]
+        | isPlaceholderWeb fw
+        -> return ()            -- A plain call of an arrow without a web, e.g.
+                                -- a data constructor built by a transformation
         | otherwise
         -> addErrL (hang (text "Call without a web against a web-annotated arrow:")
                        2 (ppr fun_ty $$ ppr arg))
@@ -1677,9 +1680,12 @@ lintCoreAlt case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt con) args rh
       -- The type of the data constructor comes from its exposed signature
       -- See Note [Exposed webs] in GHC.WebCore.Sigs
     ; sigs <- getWebSigs
-    ; con_rep_ty <- case lookupDataConSig sigs con of
-        Just ty -> return ty
-        Nothing -> failWithL (text "No exposed signature for data constructor" <+> ppr con)
+    ; let con_rep_ty = case lookupDataConSig sigs con of
+            Just ty -> ty
+            -- A data constructor introduced by a transformation (e.g. an
+            -- unboxed tuple): its own arrows have no webs, which is fine
+            -- because they are only split, never compared
+            Nothing -> dataConRepType con
 
       -- Instantiate the universally quantified
       -- type variables of the data constructor

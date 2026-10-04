@@ -1,0 +1,15 @@
+[1 of 2] Compiling Main             ( arityraise012.hs, arityraise012.o )
+
+==================== Webs: arity raising ====================
+raised: c
+rejected (argument not a product): f
+rejected (argument not a product): f
+rejected (argument not a product): ww
+rejected (argument not a product): ww
+rejected (argument not a product): ww
+rejected (curried: may be partially applied): ds
+rejected (exposed): eta
+rejected (exposed): r eta
+
+
+[2 of 2] Linking arityraise012

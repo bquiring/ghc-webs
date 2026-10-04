@@ -1,7 +1,29 @@
 # Design: Uncurrying over Webs
 
-Status: design only. It builds on the web pipeline and on dead-parameter
-elimination (`WEBS-DEAD-PARAMS.md`, `GHC/WebCore/Transform/DeadParams.hs`).
+Status: **implemented** in `GHC/WebCore/Transform/Uncurry.hs`, behind
+`-fcore-webs-uncurry` (dump: `-ddump-webs-uncurry`). Tests are
+`testsuite/tests/webs/uncurry*`. Where the implementation differs from the
+design below:
+
+- Partial applications evaluate the function first:
+  `case f of g { __DEFAULT -> let v = x in \^w2 b. g @^w1 (# v, b #) }`.
+  The original partial application `f x` evaluates `f` when it is forced, and
+  the eta-expanded lambda would not.
+- Chains are uncurried one web per round, from the outside in. A web that is
+  the inner web of another web being uncurried is "deferred" to the next
+  round. In that round the outer lambda's body starts with
+  `case t of (# a, b #) -> ...`, which costs nothing, so it still counts as
+  "directly a lambda".
+- The new arrow has multiplicity `Many`.
+- Web Lint accepts a plain `App` against an arrow without a web, and falls
+  back to `dataConRepType` for data constructors without an exposed
+  signature. Both are needed for the unboxed tuples that transformations
+  build.
+- The laziness tests (003, 009) were checked against deliberately broken
+  versions of the pass. An eta-expansion that doesn't bind the argument
+  traces it 4 times instead of 2, and moving an unlifted argument under the
+  new lambda loses the exception. Tests 004 and 005 are protected by the
+  analysis (the pass can only rewrite direct lambdas).
 
 ## 1. The transformation
 

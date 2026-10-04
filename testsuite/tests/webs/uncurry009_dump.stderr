@@ -1,0 +1,17 @@
+[1 of 2] Compiling Main             ( uncurry009.hs, uncurry009.o )
+
+==================== Webs: uncurrying ====================
+rejected (exposed): e1
+rejected (exposed): eta1
+rejected (exposed): s
+rejected (exposed): s s
+rejected (not directly a lambda): ww
+rejected (result not an arrow): eta
+rejected (result not an arrow): ww
+rejected (result not an arrow): ww
+uncurried: a
+uncurried: a
+uncurried: f
+
+
+[2 of 2] Linking uncurry009

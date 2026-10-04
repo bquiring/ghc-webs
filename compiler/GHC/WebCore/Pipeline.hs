@@ -18,7 +18,7 @@ import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, nonDetEltsUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
@@ -38,7 +38,11 @@ import GHC.WebCore.Lint
 import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
 import GHC.WebCore.Solve
-import GHC.WebCore.Transform.DeadParams
+import GHC.WebCore.Transform.ArityRaise
+import GHC.WebCore.Transform.Common ( pprWebVerdicts )
+import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
+import GHC.WebCore.Transform.Uncurry
+import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
 import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
@@ -112,10 +116,7 @@ webPass guts
        ; checkSolved "renaming" res2
 
          -- Transformations
-       ; (binds_t, transformed)
-           <- if gopt Opt_CoreWebsDeadParams dflags
-              then runDeadParams logger dflags cfg sigs2 binds2
-              else return (binds2, False)
+       ; (binds_t, transformed) <- runTransforms logger dflags cfg sigs2 binds2
 
        ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
            pprWebSummary (ws_exposed sigs2) binds_t
@@ -147,40 +148,85 @@ checkSolved what res
     unsolved = filterBag (\(w1, w2) -> not (isPlaceholderWeb w1 || isPlaceholderWeb w2))
                          (wlr_pairs res)
 
--- | Dead-parameter elimination: run rounds until nothing changes, linting
--- after each.  See Note [Dead-parameter elimination] in
--- GHC.WebCore.Transform.DeadParams.  Returns whether the program changed.
-runDeadParams :: Logger -> DynFlags -> LintConfig -> WebSigs -> CoreProgram
-              -> CoreM (CoreProgram, Bool)
-runDeadParams logger dflags cfg sigs binds0 = go (1 :: Int) emptyUniqSet binds0 emptyUFM
+-- | One round of a web transformation: given a unique supply, the webs it
+-- has already handled, and the program, return the new program and the webs
+-- it handled this round (or Nothing if nothing changed), and one verdict per
+-- web for the dump: the verdict, whether it changed the program, and the
+-- web's lambda binders.
+type TransformRound = UniqSupply -> WebSet -> CoreProgram
+                   -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
+
+-- | Run a web transformation in rounds until nothing changes, running Web
+-- Lint after each round: the transformation must keep the program
+-- well-typed.  Returns whether the program changed.
+runTransform :: String -> DumpFlag -> TransformRound
+             -> Logger -> DynFlags -> LintConfig -> WebSigs
+             -> CoreProgram -> CoreM (CoreProgram, Bool)
+runTransform name dump_flag do_round logger dflags cfg sigs binds0
+  = go (1 :: Int) emptyUniqSet binds0 emptyUFM False
   where
     max_rounds = 10
 
-    go n done binds verdicts
-      | n > max_rounds = finish binds verdicts
+    go n done binds verdicts changed
+      | n > max_rounds = finish binds verdicts changed
       | otherwise
       = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
-           ; case deadParamsRound us (ws_exposed sigs) (ws_interface_ids sigs) done binds of
-               (Nothing, vs) -> finish binds (record vs verdicts)
-               (Just (binds', unit), vs) ->
-                 do { let what = "dead-parameter elimination, round " ++ show n
+           ; case do_round us done binds of
+               (Nothing, vs) -> finish binds (record vs verdicts) changed
+               (Just (binds', handled), vs) ->
+                 do { let what = name ++ ", round " ++ show n
                           res  = lintWebProgram cfg sigs binds'
                     ; reportWebLint logger dflags what binds' res
                     ; checkSolved what res
-                    ; go (n + 1) (done `unionUniqSets` unit) binds' (record vs verdicts) } }
+                    ; go (n + 1) (done `unionUniqSets` handled) binds'
+                         (record vs verdicts) True } }
 
-    -- The last verdict for each web wins
-    record vs acc = foldl' (\m (w, v, bs) -> addToUFM m w (v, bs)) acc vs
+    -- The last verdict for each web wins, except that a verdict that changed
+    -- the program is not overwritten by a later one that did not (e.g. an
+    -- uncurried web is no longer curried in the next round)
+    record vs acc = foldl' (\m (w, v, ch, bs) -> addToUFM_C keep m w (v, ch, bs)) acc vs
+    keep old@(_, old_ch, _) new@(_, new_ch, _)
+      | old_ch && not new_ch = old
+      | otherwise            = new
 
-    finish binds verdicts
-      = do { dump logger Opt_D_dump_webs_dead_params "Webs: dead parameters" $
-               pprVerdicts (nonDetEltsUFM verdicts)
-           ; return (binds, binds_changed) }
-      where
-        binds_changed = anyChanged verdicts
+    finish binds verdicts changed
+      = do { dump logger dump_flag ("Webs: " ++ name) $
+               pprWebVerdicts [ (v, bs) | (v, _, bs) <- nonDetEltsUFM verdicts ]
+           ; return (binds, changed) }
 
-    anyChanged verdicts = or [ case v of { Delete -> True; Unit {} -> True; _ -> False }
-                             | (v, _) <- nonDetEltsUFM verdicts ]
+-- | Did a dead-parameter verdict change the program?
+changes :: Verdict -> Bool
+changes Delete   = True
+changes (Unit _) = True
+changes _        = False
+
+-- | The web transformations, in the order they run
+-- See GHC.WebCore.Transform.*
+runTransforms :: Logger -> DynFlags -> LintConfig -> WebSigs
+              -> CoreProgram -> CoreM (CoreProgram, Bool)
+runTransforms logger dflags cfg sigs binds0
+  = foldM step (binds0, False) transforms
+  where
+    exposed = ws_exposed sigs
+    keep    = ws_interface_ids sigs
+
+    transforms =
+      [ ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
+        , \us done b -> arityRaiseRound us exposed keep done b )
+      , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
+        , \us done b -> case deadParamsRound us exposed keep done b of
+                          (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
+      , ( Opt_CoreWebsUncurry, "uncurrying", Opt_D_dump_webs_uncurry
+        , \us _ b -> case uncurryRound us exposed keep b of
+                       (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) ) ]
+
+    step (binds, changed) (flag, name, dump_flag, do_round)
+      | gopt flag dflags
+      = do { (binds', changed') <- runTransform name dump_flag do_round
+                                                logger dflags cfg sigs binds
+           ; return (binds', changed || changed') }
+      | otherwise
+      = return (binds, changed)
 
 -- | Lint configuration for Web Lint
 webLintConfig :: DynFlags -> LintConfig
