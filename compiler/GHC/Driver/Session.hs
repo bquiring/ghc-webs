@@ -1526,6 +1526,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_solved)
   , make_ord_flag defGhcFlag "ddump-webs-stats"
         (setDumpFlag Opt_D_dump_webs_stats)
+  , make_ord_flag defGhcFlag "ddump-webs-summary"
+        (setDumpFlag Opt_D_dump_webs_summary)
   , make_ord_flag defGhcFlag "ddump-stg-from-core"
         (setDumpFlag Opt_D_dump_stg_from_core)
   , make_ord_flag defGhcFlag "ddump-stg-unarised"

@@ -1,0 +1,60 @@
+[1 of 3] Compiling Webs004A         ( Webs004A.hs, Webs004A.o )
+
+==================== Webs: summary ====================
+Webs004A.opFun :: Webs004A.Ops -{E}->
+                  GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+Webs004A.opName :: Webs004A.Ops -{E}-> GHC.Internal.Base.String
+$wapplyOp :: (GHC.Internal.Types.Int -{E}->
+              GHC.Internal.Types.Int) -{1}->
+             GHC.Internal.Types.Int -{2}-> GHC.Internal.Types.Int
+Webs004A.applyOp :: Webs004A.Ops -{E}->
+                    GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$wmkOps :: GHC.Internal.Base.String -{3}->
+           (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int) -{4}->
+           (#,#) GHC.Internal.Types.LiftedRep
+                 GHC.Internal.Types.LiftedRep
+                 GHC.Internal.Base.String
+                 (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int)
+Webs004A.mkOps :: GHC.Internal.Base.String -{E}->
+                  (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int) -{E}->
+                  Webs004A.Ops
+Webs004A.twice :: (GHC.Internal.Types.Int -{E}->
+                   GHC.Internal.Types.Int) -{E}->
+                  GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+Webs004A.applyAll :: [] (GHC.Internal.Types.Int -{E}->
+                         GHC.Internal.Types.Int) -{E}->
+                     GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+
+
+[2 of 3] Compiling Main             ( webs004.hs, webs004.o )
+
+==================== Webs: summary ====================
+Main.localApply :: (GHC.Internal.Types.Int -{2}->
+                    GHC.Internal.Types.Int) -{1}->
+                   GHC.Internal.Types.Int -{3}-> GHC.Internal.Types.Int
+$wuseOps :: (GHC.Internal.Types.Int -{E}->
+             GHC.Internal.Types.Int) -{4}->
+            GHC.Internal.Types.Int -{5}-> GHC.Internal.Types.Int
+$waddTen :: GHC.Internal.Prim.Int# -{6}-> GHC.Internal.Prim.Int#
+Main.addTen :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$wtriple :: GHC.Internal.Prim.Int# -{7}-> GHC.Internal.Prim.Int#
+Main.triple :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$wsquare :: GHC.Internal.Prim.Int# -{8}-> GHC.Internal.Prim.Int#
+Main.square :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$whalve :: GHC.Internal.Prim.Int# -{9}-> GHC.Internal.Prim.Int#
+Main.halve :: GHC.Internal.Types.Int -{2}-> GHC.Internal.Types.Int
+lvl :: [] (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int)
+lvl :: [] (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int)
+main :: GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld -{E}->
+        (#,#) GHC.Internal.Types.ZeroBitRep
+              GHC.Internal.Types.LiftedRep
+              (GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld)
+              ()
+main :: GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld -{E}->
+        (#,#) GHC.Internal.Types.ZeroBitRep
+              GHC.Internal.Types.LiftedRep
+              (GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld)
+              ()
+
+
+[3 of 3] Linking webs004

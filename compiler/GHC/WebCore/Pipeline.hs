@@ -18,7 +18,7 @@ import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
@@ -38,7 +38,9 @@ import GHC.WebCore.Lint
 import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
 import GHC.WebCore.Solve
-import GHC.WebCore.Traverse ( programWebs )
+import GHC.WebCore.Traverse ( programWebs, typeWebs )
+import GHC.Core.TyCo.Rep
+import GHC.Types.Var ( VarBndr(..), isTyVar )
 
 import Control.Monad
 
@@ -113,6 +115,9 @@ webPass guts
        ; unless (isEmptyBag unsolved) $
            pprPanic "webPass: renamed program still has web constraints"
                     (ppr (bagToList unsolved))
+
+       ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
+           pprWebSummary (ws_exposed sigs2) binds2
 
        ; dump logger Opt_D_dump_webs_stats "Webs: statistics" $
            pprWebStats (sizeUniqSet (programWebs binds1)) (sizeUniqSet (programWebs binds2))
@@ -200,6 +205,88 @@ pprWebClasses sol
   where
     ppr_web w | w `elementOfUniqSet` ws_exposed_reps sol = ppr w <> char '*'
               | otherwise                                = ppr w
+
+-- | The types of the top-level binders, with each arrow labelled by its web
+-- class: @-{E}->@ for an exposed class, @-{n}->@ for local class n, where
+-- classes are numbered in order of first appearance.  When the right-hand
+-- side is a cast of web-annotated lambdas (so the binder's type does not show
+-- their webs), their webs are shown too:  @= (\ -{E}-> ...) |> co@.
+-- Contains no Uniques, so tests can use it.
+pprWebSummary :: WebSet -> CoreProgram -> SDoc
+pprWebSummary exposed binds
+  = vcat (go emptyUFM (1 :: Int) [ pr | pr@(b, rhs) <- flattenBinds binds
+                                      , has_webs (idType b) || not (null (cast_lams rhs)) ])
+  where
+    has_webs ty = not (isEmptyUniqSet (typeWebs ty))
+
+    go _   _ []     = []
+    go env n ((b, rhs):prs)
+      = case ppr_ty env n (idType b) of
+          (doc, env1, n1) -> case ppr_lams env1 n1 (cast_lams rhs) of
+            (lam_docs, env2, n2) ->
+              (hang (ppr b <+> dcolon <+> doc) 2 lam_docs) : go env2 n2 prs
+
+    -- The webs of the lambdas under a cast at the top of a right-hand side
+    cast_lams (Tick _ e)        = cast_lams e
+    cast_lams (Lam v e)
+      | isTyVar v               = cast_lams e
+    cast_lams (Cast e _)        = top_lams e
+    cast_lams _                 = []
+
+    top_lams (Tick _ e)         = top_lams e
+    top_lams (WebLam w _ e)     = w : top_lams e
+    top_lams _                  = []
+
+    ppr_lams env n [] = (empty, env, n)
+    ppr_lams env n ws = let (lbls, env1, n1) = labels env n ws
+                        in ( text "= (" <> hsep [ text ("\\ -{" ++ l ++ "}->") | l <- lbls ]
+                             <+> text "...) |> co"
+                           , env1, n1 )
+
+    labels env n []     = ([], env, n)
+    labels env n (w:ws) = let (l, env1, n1)  = label env n w
+                              (ls, env2, n2) = labels env1 n1 ws
+                          in (l:ls, env2, n2)
+
+    -- Returns the document, and the updated numbering
+    ppr_ty env n ty = case ty of
+      FunTy { ft_web = w, ft_arg = arg, ft_res = res }
+        -> let (lbl, env1, n1) = label env n w
+               (d_arg, env2, n2) = ppr_ty env1 n1 arg
+               (d_res, env3, n3) = ppr_ty env2 n2 res
+           in (sep [ paren_if (is_compound arg) d_arg <+> text ("-{" ++ lbl ++ "}->"), d_res ]
+              , env3, n3)
+      ForAllTy (Bndr tv _) body
+        -> let (d, env1, n1) = ppr_ty env n body
+           in (text "forall" <+> ppr tv <> dot <+> d, env1, n1)
+      TyConApp tc tys
+        -> let (ds, env1, n1) = ppr_args env n tys
+           in (if null tys then ppr tc else ppr tc <+> sep ds, env1, n1)
+      AppTy t1 t2
+        -> let (ds, env1, n1) = ppr_args env n [t1, t2]
+           in (sep ds, env1, n1)
+      CastTy t _ -> ppr_ty env n t
+      _          -> (ppr ty, env, n)
+
+    ppr_args env n []     = ([], env, n)
+    ppr_args env n (t:ts) = let (d, env1, n1)  = ppr_ty env n t
+                                (ds, env2, n2) = ppr_args env1 n1 ts
+                            in (paren_if (is_compound t || is_app t) d : ds, env2, n2)
+
+    label env n w
+      | isPlaceholderWeb w || w `elementOfUniqSet` exposed = ("E", env, n)
+      | Just k <- lookupUFM env w                         = (show k, env, n)
+      | otherwise                                          = (show n, addToUFM env w n, n + 1)
+
+    is_compound (FunTy {})    = True
+    is_compound (ForAllTy {}) = True
+    is_compound _             = False
+    is_app (TyConApp _ (_:_)) = True
+    is_app (AppTy {})         = True
+    is_app _                  = False
+
+    paren_if True  d = parens d
+    paren_if False d = d
 
 dump :: Logger -> DumpFlag -> String -> SDoc -> CoreM ()
 dump logger flag hdr doc

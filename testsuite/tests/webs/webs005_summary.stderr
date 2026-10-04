@@ -1,0 +1,38 @@
+[1 of 2] Compiling Main             ( webs005.hs, webs005.o )
+
+==================== Webs: summary ====================
+Main.runFn :: Main.Fn -{1}->
+              GHC.Internal.Types.Int -{2}-> GHC.Internal.Types.Int
+Main.useEndo :: GHC.Internal.Data.Semigroup.Internal.Endo GHC.Internal.Types.Int -{3}->
+                GHC.Internal.Types.Int
+Main.useRes :: Main.Res GHC.Internal.Types.Bool -{4}->
+               GHC.Internal.Types.Int
+Main.useOpen :: Main.Open GHC.Internal.Types.Int -{5}->
+                GHC.Internal.Types.Int
+Main.callPlain :: (GHC.Internal.Types.Int -{7}->
+                   GHC.Internal.Types.Int) -{6}->
+                  GHC.Internal.Types.Int
+$wplain :: GHC.Internal.Prim.Int# -{8}-> GHC.Internal.Prim.Int#
+Main.plain :: GHC.Internal.Types.Int -{7}-> GHC.Internal.Types.Int
+$wviaOpen :: GHC.Internal.Prim.Int# -{9}-> GHC.Internal.Prim.Int#
+viaOpen :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$wviaClosed :: GHC.Internal.Prim.Int# -{10}->
+               GHC.Internal.Prim.Int#
+viaClosed :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$wtimes3 :: GHC.Internal.Prim.Int# -{11}-> GHC.Internal.Prim.Int#
+Main.times3 :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+$winc :: GHC.Internal.Prim.Int# -{12}-> GHC.Internal.Prim.Int#
+Main.inc :: GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
+main :: GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld -{E}->
+        (#,#) GHC.Internal.Types.ZeroBitRep
+              GHC.Internal.Types.LiftedRep
+              (GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld)
+              ()
+main :: GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld -{E}->
+        (#,#) GHC.Internal.Types.ZeroBitRep
+              GHC.Internal.Types.LiftedRep
+              (GHC.Internal.Prim.State# GHC.Internal.Prim.RealWorld)
+              ()
+
+
+[2 of 2] Linking webs005
