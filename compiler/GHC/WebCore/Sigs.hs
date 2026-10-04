@@ -22,6 +22,7 @@ import GHC.Types.Unique ( getUnique )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
 import GHC.Types.Web
 
 import GHC.Utils.Outputable
@@ -43,6 +44,11 @@ out of it by a case).
 
 The webs of exposed signatures are /exposed/, as are the webs in the types of
 exported top-level binders, since those types are visible to other modules.
+The same goes for local top-level binders whose unfoldings or rules may reach
+the interface file (ws_interface_ids): Tidy exposes the Ids mentioned in the
+unfoldings of exported Ids, and in RULES.  Those unfoldings are unannotated
+Core that a transformation does not rewrite, so the types of the Ids they
+mention must not change.
 Every web involved in a coercion axiom is exposed.  A web class that contains
 an exposed web must keep its calling convention.
 
@@ -71,13 +77,19 @@ data WebSigs = WebSigs
       -- ^ CoAxiom -> (original axiom, clone whose branches have exposed signatures)
   , ws_exposed :: WebSet
       -- ^ All exposed webs
+  , ws_interface_ids :: VarSet
+      -- ^ Local top-level Ids whose unfoldings or rules may reach the
+      -- interface file: the exported Ids, the Ids free in RULES, and
+      -- (transitively) the Ids free in their unfoldings and rules.  Their
+      -- types are exposed, and transformations must keep their unfoldings.
   }
 
 emptyWebSigs :: WebSigs
 emptyWebSigs = WebSigs { ws_ids     = emptyVarEnv
                        , ws_dcs     = emptyUFM
                        , ws_axioms  = emptyUFM
-                       , ws_exposed = emptyUniqSet }
+                       , ws_exposed = emptyUniqSet
+                       , ws_interface_ids = emptyVarSet }
 
 lookupGlobalIdSig :: WebSigs -> Id -> Maybe (Id, Id)
 lookupGlobalIdSig sigs v = lookupVarEnv (ws_ids sigs) v

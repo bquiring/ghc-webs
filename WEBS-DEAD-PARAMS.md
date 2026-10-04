@@ -1,7 +1,27 @@
 # Design: Dead-Parameter Elimination over Webs
 
-Status: design only, not implemented. It builds on the web pipeline on branch
-`webs` (`GHC/WebCore/`).
+Status: **implemented** in `GHC/WebCore/Transform/DeadParams.hs`, behind
+`-fcore-webs-dead-params` (dump: `-ddump-webs-dead-params`). Tests are
+`testsuite/tests/webs/deadparam*`. Where the implementation differs from the
+design below:
+
+- Condition 6 (unfoldings and RULES) is handled in annotation:
+  `ws_interface_ids` holds the exported Ids, the Ids free in RULES, and the
+  top-level Ids that have rules of their own (Tidy keeps those with
+  `-fkeep-auto-rules`), closed over the Ids free in their unfoldings and
+  rules. Their types are exposed, and their unfoldings and rules are kept.
+- Webs made up only of join-point lambdas are always deleted, never turned
+  into unit webs: join points are never values, so conditions 3 and 4 don't
+  apply to them.
+- An effectful dropped argument of unboxed-tuple or unboxed-sum type rejects
+  the web, because it can't be scrutinised with a DEFAULT alternative.
+- GHC's worker/wrapper adds a `(# #)` argument to workers whose arguments are
+  all absent. Those lambdas qualify too: they are kept as unit webs when the
+  result is unlifted, and otherwise deleted.
+- The laziness tests (003, 006, 012) were checked against a deliberately
+  broken version of the pass: they fail when the "forced" and "type argument"
+  conditions are ignored, or when evaluation of a dropped unlifted argument
+  is not kept.
 
 ## 1. The transformation
 

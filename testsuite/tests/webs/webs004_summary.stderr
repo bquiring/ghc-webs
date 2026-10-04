@@ -5,12 +5,12 @@ Webs004A.opFun :: Webs004A.Ops -{E}->
                   GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
 Webs004A.opName :: Webs004A.Ops -{E}-> GHC.Internal.Base.String
 $wapplyOp :: (GHC.Internal.Types.Int -{E}->
-              GHC.Internal.Types.Int) -{1}->
-             GHC.Internal.Types.Int -{2}-> GHC.Internal.Types.Int
+              GHC.Internal.Types.Int) -{E}->
+             GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
 Webs004A.applyOp :: Webs004A.Ops -{E}->
                     GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int
-$wmkOps :: GHC.Internal.Base.String -{3}->
-           (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int) -{4}->
+$wmkOps :: GHC.Internal.Base.String -{E}->
+           (GHC.Internal.Types.Int -{E}-> GHC.Internal.Types.Int) -{E}->
            (#,#) GHC.Internal.Types.LiftedRep
                  GHC.Internal.Types.LiftedRep
                  GHC.Internal.Base.String

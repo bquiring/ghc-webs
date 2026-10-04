@@ -18,7 +18,7 @@ import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, nonDetEltsUFM )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
@@ -38,6 +38,7 @@ import GHC.WebCore.Lint
 import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
 import GHC.WebCore.Solve
+import GHC.WebCore.Transform.DeadParams
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
 import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
@@ -86,7 +87,7 @@ webPass guts
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
-             (binds1, sigs1) = annotateProgram us binds0
+             (binds1, sigs1) = annotateProgram us (mg_rules guts) binds0
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -108,16 +109,16 @@ webPass guts
 
        ; let res2 = lintWebProgram cfg sigs2 binds2
        ; reportWebLint logger dflags "renaming" binds2 res2
-         -- After renaming, the only constraints left are with arrows without
-         -- webs, whose classes are exposed
-       ; let unsolved = filterBag (\(w1, w2) -> not (isPlaceholderWeb w1 || isPlaceholderWeb w2))
-                                  (wlr_pairs res2)
-       ; unless (isEmptyBag unsolved) $
-           pprPanic "webPass: renamed program still has web constraints"
-                    (ppr (bagToList unsolved))
+       ; checkSolved "renaming" res2
+
+         -- Transformations
+       ; (binds_t, transformed)
+           <- if gopt Opt_CoreWebsDeadParams dflags
+              then runDeadParams logger dflags cfg sigs2 binds2
+              else return (binds2, False)
 
        ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
-           pprWebSummary (ws_exposed sigs2) binds2
+           pprWebSummary (ws_exposed sigs2) binds_t
 
        ; dump logger Opt_D_dump_webs_stats "Webs: statistics" $
            pprWebStats (sizeUniqSet (programWebs binds1)) (sizeUniqSet (programWebs binds2))
@@ -125,12 +126,61 @@ webPass guts
                        (lengthBag pairs) sol
 
          -- 4. Erasure
-       ; let binds3 = eraseProgram sigs2 binds2
+       ; let binds3 = eraseProgram sigs2 binds_t
 
-       ; when (gopt Opt_DoCoreLinting dflags) $
+         -- If a transformation changed the program, it is not the original;
+         -- Core Lint (endPass, with -dcore-lint) still checks the result
+       ; when (gopt Opt_DoCoreLinting dflags && not transformed) $
            checkRoundTrip binds0 binds3
 
        ; return (guts { mg_binds = binds3 }) }
+
+-- | After renaming, the only constraints left must be with arrows without
+-- webs, whose classes are exposed (Note [Arrows without webs] in
+-- GHC.WebCore.Lint)
+checkSolved :: String -> WebLintResult -> CoreM ()
+checkSolved what res
+  = unless (isEmptyBag unsolved) $
+      pprPanic ("webPass: web constraints left after " ++ what)
+               (ppr (bagToList unsolved))
+  where
+    unsolved = filterBag (\(w1, w2) -> not (isPlaceholderWeb w1 || isPlaceholderWeb w2))
+                         (wlr_pairs res)
+
+-- | Dead-parameter elimination: run rounds until nothing changes, linting
+-- after each.  See Note [Dead-parameter elimination] in
+-- GHC.WebCore.Transform.DeadParams.  Returns whether the program changed.
+runDeadParams :: Logger -> DynFlags -> LintConfig -> WebSigs -> CoreProgram
+              -> CoreM (CoreProgram, Bool)
+runDeadParams logger dflags cfg sigs binds0 = go (1 :: Int) emptyUniqSet binds0 emptyUFM
+  where
+    max_rounds = 10
+
+    go n done binds verdicts
+      | n > max_rounds = finish binds verdicts
+      | otherwise
+      = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
+           ; case deadParamsRound us (ws_exposed sigs) (ws_interface_ids sigs) done binds of
+               (Nothing, vs) -> finish binds (record vs verdicts)
+               (Just (binds', unit), vs) ->
+                 do { let what = "dead-parameter elimination, round " ++ show n
+                          res  = lintWebProgram cfg sigs binds'
+                    ; reportWebLint logger dflags what binds' res
+                    ; checkSolved what res
+                    ; go (n + 1) (done `unionUniqSets` unit) binds' (record vs verdicts) } }
+
+    -- The last verdict for each web wins
+    record vs acc = foldl' (\m (w, v, bs) -> addToUFM m w (v, bs)) acc vs
+
+    finish binds verdicts
+      = do { dump logger Opt_D_dump_webs_dead_params "Webs: dead parameters" $
+               pprVerdicts (nonDetEltsUFM verdicts)
+           ; return (binds, binds_changed) }
+      where
+        binds_changed = anyChanged verdicts
+
+    anyChanged verdicts = or [ case v of { Delete -> True; Unit {} -> True; _ -> False }
+                             | (v, _) <- nonDetEltsUFM verdicts ]
 
 -- | Lint configuration for Web Lint
 webLintConfig :: DynFlags -> LintConfig

@@ -17,11 +17,14 @@ import GHC.Core.Type
 import GHC.Core.Utils ( exprType, mkLamType )
 
 import GHC.Types.Id
+import GHC.Types.Id.Info ( isEmptyRuleInfo )
 import GHC.Types.Tickish
 import GHC.Types.Unique.Supply
-import GHC.Types.Unique.Set ( unionManyUniqSets )
+import GHC.Types.Unique.Set ( unionManyUniqSets, nonDetEltsUniqSet )
 import GHC.Types.Var
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
+import GHC.Core.FVs ( rulesFreeVars, bndrRuleAndUnfoldingVarsDSet )
 import GHC.Types.Web
 
 import GHC.Utils.Misc ( HasDebugCallStack )
@@ -72,19 +75,23 @@ Details:
   * Not annotated: RULES and unfoldings.  Web Lint does not look at them.
 -}
 
--- | Annotate a program.  The webs in the types of exported binders are
--- exposed.
-annotateProgram :: UniqSupply -> CoreProgram -> (CoreProgram, WebSigs)
-annotateProgram us binds
+-- | Annotate a program.  The webs in the types of exported binders, and of
+-- binders whose unfoldings or rules may reach the interface, are exposed.
+-- See Note [Exposed webs] in GHC.WebCore.Sigs
+annotateProgram :: UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
+annotateProgram us rules binds
   = case unAnnM (ann_top binds) us emptyWebSigs of
       (binds', _, sigs) -> (binds', sigs)
   where
+    iface_ids = interfaceIds rules binds
+
     ann_top bs
       = do { -- All top-level binders are in scope everywhere
              -- c.f. lintCoreBindings
              (env, _) <- annBndrs emptyVarEnv (bindersOfBinds bs)
            ; bs' <- mapM (ann_top_bind env) bs
            ; exposeExported bs'
+           ; modifySigs (\sigs -> sigs { ws_interface_ids = iface_ids })
            ; return bs' }
 
     ann_top_bind env (NonRec b rhs)
@@ -94,7 +101,29 @@ annotateProgram us binds
 
     exposeExported bs'
       = modifySigs $ addExposedWebs $
-        unionManyUniqSets [ typeWebs (idType b) | b <- bindersOfBinds bs', isExportedId b ]
+        unionManyUniqSets [ typeWebs (idType b) | b <- bindersOfBinds bs'
+                                                , b `elemVarSet` iface_ids ]
+
+-- | The local top-level Ids whose unfoldings or rules may reach the interface
+-- file: the exported Ids, the Ids free in the RULES, and the top-level Ids
+-- that have rules of their own (Tidy may keep those, e.g. with
+-- -fkeep-auto-rules), closed over the Ids free in their unfoldings and rules.
+interfaceIds :: [CoreRule] -> CoreProgram -> VarSet
+interfaceIds rules binds = go emptyVarSet roots
+  where
+    top_bndrs = mkVarSet (bindersOfBinds binds)
+    roots     = filter isExportedId (bindersOfBinds binds)
+             ++ filter (not . isEmptyRuleInfo . idSpecialisation) (bindersOfBinds binds)
+             ++ nonDetEltsUniqSet (rulesFreeVars rules `intersectVarSet` top_bndrs)
+
+    go acc []     = acc
+    go acc (v:vs)
+      | v `elemVarSet` acc = go acc vs
+      | otherwise
+      = go (acc `extendVarSet` v)
+           (dVarSetElems (bndrRuleAndUnfoldingVarsDSet v) `filter_top` vs)
+
+    filter_top new vs = [ v | v <- new, v `elemVarSet` top_bndrs ] ++ vs
 
 ------------------------------------------------------------------
 --      The annotation monad

@@ -1528,6 +1528,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_stats)
   , make_ord_flag defGhcFlag "ddump-webs-summary"
         (setDumpFlag Opt_D_dump_webs_summary)
+  , make_ord_flag defGhcFlag "ddump-webs-dead-params"
+        (setDumpFlag Opt_D_dump_webs_dead_params)
   , make_ord_flag defGhcFlag "ddump-stg-from-core"
         (setDumpFlag Opt_D_dump_stg_from_core)
   , make_ord_flag defGhcFlag "ddump-stg-unarised"
@@ -2526,6 +2528,7 @@ fFlagsDeps = [
   flagSpec "late-dmd-anal"                    Opt_LateDmdAnal,
   flagSpec "late-specialise"                  Opt_LateSpecialise,
   flagSpec "core-webs"                        Opt_CoreWebs,
+  flagSpec "core-webs-dead-params"            Opt_CoreWebsDeadParams,
   flagSpec "liberate-case"                    Opt_LiberateCase,
   flagHiddenSpec "llvm-fill-undef-with-garbage" Opt_LlvmFillUndefWithGarbage,
   flagSpec "loopification"                    Opt_Loopification,

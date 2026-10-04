@@ -1,0 +1,12 @@
+[1 of 2] Compiling Main             ( deadparam011.hs, deadparam011.o )
+
+==================== Webs: dead parameters ====================
+deleted: ds ds
+rejected (exposed): eta
+rejected (used parameter): g
+unit (unlifted result): void
+unit (unlifted result): void
+unit (unlifted result): x
+
+
+[2 of 2] Linking deadparam011

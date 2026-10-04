@@ -26,3 +26,16 @@ test('webs004_summary', [extra_files(['Webs004A.hs', 'webs004.hs'])],
 test('webs005', [], compile_and_run, [webs_opts])
 test('webs005_summary', [extra_files(['webs005.hs'])],
      multimod_compile, ['webs005', summary_opts])
+
+# Dead-parameter elimination (GHC.WebCore.Transform.DeadParams).  Each test
+# runs the program, and checks the verdicts (-ddump-webs-dead-params).
+# deadparam003, 006, 010 and 012 fail if laziness is not handled correctly.
+dp_opts = webs_opts + ' -fcore-webs-dead-params'
+
+def deadparam(name):
+    test(name, [], compile_and_run, [dp_opts])
+    test(name + '_dump', [extra_files([name + '.hs'])],
+         multimod_compile, [name, dp_opts + ' -ddump-webs-dead-params -dsuppress-uniques'])
+
+for n in range(1, 13):
+    deadparam('deadparam%03d' % n)

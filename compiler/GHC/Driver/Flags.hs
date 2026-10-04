@@ -484,6 +484,7 @@ data DumpFlag
    | Opt_D_dump_webs_solved   -- ^ Web pipeline: program after renaming webs
    | Opt_D_dump_webs_stats    -- ^ Web pipeline: web statistics
    | Opt_D_dump_webs_summary  -- ^ Web pipeline: top-level types, arrows labelled by web class
+   | Opt_D_dump_webs_dead_params -- ^ Web pipeline: dead-parameter elimination verdicts
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
    | Opt_D_dump_stg_unarised  -- ^ STG after unarise
    | Opt_D_dump_stg_cg        -- ^ STG (after stg2stg)
@@ -638,6 +639,7 @@ data GeneralFlag
                                --   N.B. See Note [RHS Floating]
    | Opt_LateSpecialise
    | Opt_CoreWebs        -- ^ Run the web pipeline; see GHC.WebCore.Pipeline
+   | Opt_CoreWebsDeadParams -- ^ Web pipeline: dead-parameter elimination
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -909,6 +911,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_FloatIn
    , Opt_LateSpecialise
    , Opt_CoreWebs
+   , Opt_CoreWebsDeadParams
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise
