@@ -258,6 +258,10 @@ exprFVs (App fun arg) fv_cand in_scope acc =
   (exprFVs fun `unionFV` exprFVs arg) fv_cand in_scope acc
 exprFVs (Lam bndr body) fv_cand in_scope acc =
   addBndrFV bndr (exprFVs body) fv_cand in_scope acc
+exprFVs (WebApp _ fun arg) fv_cand in_scope acc =
+  (exprFVs fun `unionFV` exprFVs arg) fv_cand in_scope acc
+exprFVs (WebLam _ bndr body) fv_cand in_scope acc =
+  addBndrFV bndr (exprFVs body) fv_cand in_scope acc
 exprFVs (Cast expr co) fv_cand in_scope acc =
   (exprFVs expr `unionFV` tyCoFVsOfCo co) fv_cand in_scope acc
 
@@ -337,7 +341,7 @@ orphNamesOfType (TyConApp tycon tys) = func
                        arg:_ | tycon == fUNTyCon -> orph_names_of_fun_ty_con arg
                        _ -> emptyNameSet
 
-orphNamesOfType (FunTy af w arg res) =  func
+orphNamesOfType (FunTy af w _ arg res) =  func
                                        `unionNameSet` unitNameSet fun_tc
                                        `unionNameSet` orphNamesOfType w
                                        `unionNameSet` orphNamesOfType arg
@@ -396,6 +400,8 @@ orphNamesOfExpr e
     go (Coercion _co)       = emptyNameSet -- See wrinkle (ON1) of Note [Finding orphan names]
     go (App e1 e2)          = go e1 `unionNameSet` go e2
     go (Lam v e)            = go e `delFromNameSet` idName v
+    go (WebApp _ e1 e2)     = go e1 `unionNameSet` go e2
+    go (WebLam _ v e)       = go e `delFromNameSet` idName v
     go (Tick _ e)           = go e
     go (Cast e _co)         = go e  -- See wrinkle (ON1) of Note [Finding orphan names]
     go (Let (NonRec _ r) e) = go e `unionNameSet` go r
@@ -695,6 +701,8 @@ freeVars :: CoreExpr -> CoreExprWithFVs
 freeVars = go
   where
     go :: CoreExpr -> CoreExprWithFVs
+    go (WebLam {}) = webFormPanic "freeVars"
+    go (WebApp {}) = webFormPanic "freeVars"
     go (Var v)
       | isLocalVar v = (aFreeVar v `unionFVs` ty_fvs `unionFVs` mult_vars, AnnVar v)
       | otherwise    = (emptyDVarSet,                 AnnVar v)

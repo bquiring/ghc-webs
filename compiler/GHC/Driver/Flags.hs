@@ -480,6 +480,9 @@ data DumpFlag
    | Opt_D_dump_spec_constr
    | Opt_D_dump_prep
    | Opt_D_dump_late_cc
+   | Opt_D_dump_webs          -- ^ Web pipeline: program after annotation
+   | Opt_D_dump_webs_solved   -- ^ Web pipeline: program after renaming webs
+   | Opt_D_dump_webs_stats    -- ^ Web pipeline: web statistics
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
    | Opt_D_dump_stg_unarised  -- ^ STG after unarise
    | Opt_D_dump_stg_cg        -- ^ STG (after stg2stg)
@@ -633,6 +636,7 @@ data GeneralFlag
                                --   top level in the simplifier
                                --   N.B. See Note [RHS Floating]
    | Opt_LateSpecialise
+   | Opt_CoreWebs        -- ^ Run the web pipeline; see GHC.WebCore.Pipeline
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -903,6 +907,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_FullLaziness
    , Opt_FloatIn
    , Opt_LateSpecialise
+   , Opt_CoreWebs
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

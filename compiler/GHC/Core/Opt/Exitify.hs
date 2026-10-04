@@ -69,6 +69,8 @@ exitifyProgram binds = map goTopLvl binds
     in_scope_toplvl = emptyInScopeSet `extendInScopeSetBndrs` binds
 
     go :: InScopeSet -> CoreExpr -> CoreExpr
+    go _    (WebLam {})   = webFormPanic "exitify"
+    go _    (WebApp {})   = webFormPanic "exitify"
     go _    e@(Var{})       = e
     go _    e@(Lit {})      = e
     go _    e@(Type {})     = e

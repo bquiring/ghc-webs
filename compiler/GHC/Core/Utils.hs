@@ -22,7 +22,7 @@ module GHC.Core.Utils (
 
         -- * Properties of expressions
         exprType, coreAltType, coreAltsType,
-        mkLamType, mkLamTypes,
+        mkLamType, mkLamTypes, mkWebLamType,
         mkFunctionType,
         exprIsTrivial, getIdFromTrivialExpr, getIdFromTrivialExpr_maybe,
         trivial_expr_fold,
@@ -86,6 +86,7 @@ import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofIdKey, unsafeReflD
 import GHC.Builtin.PrimOps
 
 import GHC.Types.Var
+import GHC.Types.Web
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
@@ -145,6 +146,8 @@ exprType e@(App _ _)
   = case collectArgs e of
         (fun, args) -> applyTypeToArgs (exprType fun) args
 exprType (Type ty) = pprPanic "exprType" (ppr ty)
+exprType (WebLam w binder expr) = mkWebLamType w binder (exprType expr)
+exprType (WebApp _ fun _)       = funResultTy (exprType fun)
 
 coreAltType :: CoreAlt -> Type
 -- ^ Returns the type of the alternatives right hand side
@@ -184,6 +187,13 @@ mkLamType v body_ty
    = mkFunctionType (idMult v) (idType v) body_ty
 
 mkLamTypes vs ty = foldr mkLamType ty vs
+
+-- | The type of a web-annotated value lambda: like 'mkLamType' on an Id, but
+-- the arrow carries the given web.  See Note [Webs] in GHC.Types.Web
+mkWebLamType :: HasDebugCallStack => WebId -> Id -> Type -> Type
+mkWebLamType w v body_ty
+  = assertPpr (isId v) (ppr v) $
+    setFunTyWeb w (mkFunctionType (idMult v) (idType v) body_ty)
 
 {-
 Note [Type bindings]
@@ -1518,6 +1528,8 @@ exprIsCheapX ok_app expandable e
     ok e = go 0 e
 
     -- n is the number of value arguments
+    go _ (WebLam {})                = webFormPanic "exprIsOk"
+    go _ (WebApp {})                = webFormPanic "exprIsOk"
     go n (Var v)                      = ok_app v n
     go _ (Lit {})                     = True
     go _ (Type {})                    = True

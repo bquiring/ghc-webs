@@ -507,6 +507,8 @@ collectCostCentres mod_name binds rules
   = {-# SCC collectCostCentres #-} foldl' go_bind (go_rules S.empty) binds
   where
     go cs e = case e of
+      WebLam{} -> webFormPanic "collectCostCentres"
+      WebApp{} -> webFormPanic "collectCostCentres"
       Var{} -> cs
       Lit{} -> cs
       App e1 e2 -> go (go cs e1) e2

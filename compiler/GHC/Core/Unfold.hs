@@ -554,6 +554,8 @@ sizeExpr :: UnfoldingOpts
 sizeExpr opts !bOMB_OUT_SIZE top_args expr
   = size_up expr
   where
+    size_up (WebLam {}) = webFormPanic "sizeExpr"
+    size_up (WebApp {}) = webFormPanic "sizeExpr"
     size_up (Cast e _) = size_up e
     size_up (Tick _ e) = size_up e
     size_up (Type _)   = sizeZero           -- Types cost nothing

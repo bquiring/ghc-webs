@@ -1189,6 +1189,8 @@ specVar env@(SE { se_subst = Core.Subst in_scope ids _ _ }) v
 specExpr :: SpecEnv -> CoreExpr -> SpecM (CoreExpr, UsageDetails)
 
 ---------------- First the easy cases --------------------
+specExpr _ (WebLam {})   = webFormPanic "specExpr"
+specExpr _ (WebApp {})   = webFormPanic "specExpr"
 specExpr env (Var v)       = specVar env v
 specExpr env (Type ty)     = return (Type     (substTy env ty), emptyUDs)
 specExpr env (Coercion co) = return (Coercion (substCo env co), emptyUDs)

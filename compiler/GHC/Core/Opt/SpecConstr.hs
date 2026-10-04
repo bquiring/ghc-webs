@@ -1515,6 +1515,8 @@ scExpr, scExpr' :: ScEnv -> CoreExpr -> UniqSM (ScUsage, CoreExpr, SpecFailWarni
 
 scExpr env e = scExpr' env e
 
+scExpr' _ (WebLam {}) = webFormPanic "scExpr"
+scExpr' _ (WebApp {}) = webFormPanic "scExpr"
 scExpr' env (Var v)      = case scSubstId env v of
                             Var v' -> return (mkVarUsage env v' [], Var v', [])
                             e'     -> scExpr (zapScSubst env) e'

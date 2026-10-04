@@ -849,7 +849,7 @@ synifyType _ vs ty@(AppTy{}) =
             ty_args
    in
     foldl (\t1 t2 -> noLocA $ HsAppTy noExtField t1 t2) ty_head' ty_args'
-synifyType s vs funty@(FunTy af w t1 t2)
+synifyType s vs funty@(FunTy af w _ t1 t2)
   | isInvisibleFunArg af = synifySigmaType s vs funty
   | otherwise = noLocA $ HsFunTy noExtField w' s1 s2
   where
@@ -1004,7 +1004,7 @@ noKindTyVars ts ty
             _ -> noKindTyVars ts f
        in unionVarSets (func : args)
 noKindTyVars ts (ForAllTy _ t) = noKindTyVars ts t
-noKindTyVars ts (FunTy _ w t1 t2) =
+noKindTyVars ts (FunTy _ w _ t1 t2) =
   noKindTyVars ts w
     `unionVarSet` noKindTyVars ts t1
     `unionVarSet` noKindTyVars ts t2
@@ -1195,6 +1195,6 @@ tcSplitPhiTyPreserveSynonyms ty0 = split ty0 []
 
 -- | See Note [Invariant: Never expand type synonyms]
 tcSplitPredFunTyPreserveSynonyms_maybe :: Type -> Maybe (PredType, Type)
-tcSplitPredFunTyPreserveSynonyms_maybe (FunTy af _ arg res)
+tcSplitPredFunTyPreserveSynonyms_maybe (FunTy af _ _ arg res)
   | isInvisibleFunArg af = Just (arg, res)
 tcSplitPredFunTyPreserveSynonyms_maybe _ = Nothing

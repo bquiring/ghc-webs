@@ -83,6 +83,8 @@ exprStats (Case e b _ as) = exprStats e `plusCS` bndrStats b
                                         `plusCS` sumCS altStats as
 exprStats (Cast e co)     = coStats co `plusCS` exprStats e
 exprStats (Tick _ e)      = exprStats e
+exprStats (WebApp _ f a)  = exprStats f `plusCS` exprStats a
+exprStats (WebLam _ b e)  = bndrStats b `plusCS` exprStats e
 
 altStats :: CoreAlt -> CoreStats
 altStats (Alt _ bs r) = altBndrStats bs `plusCS` exprStats r
@@ -116,6 +118,8 @@ exprSize (Cast e _)      = 1 + exprSize e
 exprSize (Tick n e)      = tickSize n + exprSize e
 exprSize (Type _)        = 1
 exprSize (Coercion _)    = 1
+exprSize (WebApp _ f a)  = exprSize f + exprSize a
+exprSize (WebLam _ b e)  = bndrSize b + exprSize e
 
 tickSize :: CoreTickish -> Int
 tickSize (ProfNote _ _ _) = 1

@@ -206,6 +206,8 @@ computeCbvInfo fun_id rhs
 
 ------------  Expressions  --------------
 tidyExpr :: TidyEnv -> CoreExpr -> CoreExpr
+tidyExpr _ (WebLam {})   = webFormPanic "tidyExpr"
+tidyExpr _ (WebApp {})   = webFormPanic "tidyExpr"
 tidyExpr env (Var v)       = Var (tidyVarOcc env v)
 tidyExpr env (Type ty)     = Type (tidyType env ty)
 tidyExpr env (Coercion co) = Coercion (tidyCo env co)

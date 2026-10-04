@@ -465,6 +465,8 @@ callArityAnal ::
         -- and the expression with IdInfo updated
 
 -- The trivial base cases
+callArityAnal _     _   (WebLam {}) = webFormPanic "callArityAnal"
+callArityAnal _     _   (WebApp {}) = webFormPanic "callArityAnal"
 callArityAnal _     _   e@(Lit _)
     = (emptyArityRes, e)
 callArityAnal _     _   e@(Type _)

@@ -706,6 +706,8 @@ cseOneExpr e = cseExpr env e
     env = emptyCSEnv (mkInScopeSet (exprFreeVars e))
 
 cseExpr :: CSEnv -> InExpr -> OutExpr
+cseExpr _ (WebLam {})          = webFormPanic "cseExpr"
+cseExpr _ (WebApp {})          = webFormPanic "cseExpr"
 cseExpr env (Type t)              = Type (substTyUnchecked (csEnvSubst env) t)
 cseExpr env (Coercion c)          = Coercion (substCo (csEnvSubst env) c)
 cseExpr _   (Lit lit)             = Lit lit

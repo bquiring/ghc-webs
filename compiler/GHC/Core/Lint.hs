@@ -873,6 +873,9 @@ lintCoreExpr :: InExpr -> LintM (OutType, UsageEnv)
 -- If you edit this function, you may need to update the GHC formalism
 -- See Note [GHC Formalism]
 
+lintCoreExpr e@(WebLam {}) = failWithL (text "Web-annotated lambda outside the web pipeline:" <+> ppr e)
+lintCoreExpr e@(WebApp {}) = failWithL (text "Web-annotated call outside the web pipeline:" <+> ppr e)
+
 lintCoreExpr (Var var)
   = do {  var_pair@(var_ty, _) <- lintIdOcc var 0
            -- See Note [Linting representation-polymorphic builtins]
@@ -1991,7 +1994,7 @@ lintType ty@(TyConApp tc tys)
 
 -- arrows can related *unlifted* kinds, so this has to be separate from
 -- a dependent forall.
-lintType ty@(FunTy af tw t1 t2)
+lintType ty@(FunTy af tw _ t1 t2)
   = do { lintType t1
        ; lintType t2
        ; lintType tw
@@ -2179,7 +2182,7 @@ lintApp msg lint_forall_arg lint_arrow_arg !orig_fun_ty all_args acc
                                 2 (ppr arg' <+> dcolon <+> ppr karg'))
                       ; go subst' body_ty acc args }
 
-               go subst fun_ty@(FunTy _ mult exp_arg_ty res_ty) acc (arg:args)
+               go subst fun_ty@(FunTy _ mult _ exp_arg_ty res_ty) acc (arg:args)
                  = do { (arg_ty, acc') <- lint_arrow_arg arg (substTy subst mult) acc
                       ; ensureEqTys (substTy subst exp_arg_ty) arg_ty $
                         lint_app_fail_msg msg orig_fun_ty all_args

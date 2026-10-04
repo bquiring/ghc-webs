@@ -46,7 +46,7 @@ module GHC.Core (
         collectArgs, collectValArgs, stripNArgs, collectArgsTicks, flattenBinds,
         collectFunSimple,
 
-        exprToType,
+        exprToType, webFormPanic,
         wrapLamBody,
 
         isValArg, isTypeArg, isCoArg, isTyCoArg, valArgCount, valBndrCount,
@@ -97,6 +97,7 @@ import GHC.Platform
 
 import GHC.Types.Var.Env( InScopeSet )
 import GHC.Types.Var
+import GHC.Types.Web
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Core.Rules.Config ( RuleOpts )
@@ -262,6 +263,10 @@ data Expr b
   | Tick  CoreTickish (Expr b)
   | Type  Type
   | Coercion Coercion
+  | WebLam WebId b (Expr b)       -- ^ Web-annotated value lambda.  Only exists inside
+                                  -- the web pipeline; see Note [Webs] in GHC.Types.Web
+  | WebApp WebId (Expr b) (Arg b) -- ^ Web-annotated value application.  Only exists
+                                  -- inside the web pipeline
   deriving Data
 
 -- | Type synonym for expressions that occur in function argument positions.
@@ -1930,6 +1935,12 @@ type TaggedAlt  t = Alt  (TaggedBndr t)
 instance Outputable b => Outputable (TaggedBndr b) where
   ppr (TB b l) = char '<' <> ppr b <> comma <> ppr l <> char '>'
 
+-- | Panic for passes that meet a 'WebLam' or 'WebApp'.  These forms exist only
+-- inside the web pipeline (GHC.WebCore.Pipeline) and never escape it.
+-- See Note [Webs] in GHC.Types.Web
+webFormPanic :: HasDebugCallStack => String -> a
+webFormPanic fn = panic (fn ++ ": web-annotated form (WebLam/WebApp) outside the web pipeline")
+
 deTagExpr :: TaggedExpr t -> CoreExpr
 deTagExpr (Var v)                   = Var v
 deTagExpr (Lit l)                   = Lit l
@@ -1941,6 +1952,8 @@ deTagExpr (Let bind body)           = Let (deTagBind bind) (deTagExpr body)
 deTagExpr (Case e (TB b _) ty alts) = Case (deTagExpr e) b ty (map deTagAlt alts)
 deTagExpr (Tick t e)                = Tick t (deTagExpr e)
 deTagExpr (Cast e co)               = Cast (deTagExpr e) co
+deTagExpr (WebLam w (TB b _) e)     = WebLam w b (deTagExpr e)
+deTagExpr (WebApp w e1 e2)          = WebApp w (deTagExpr e1) (deTagExpr e2)
 
 deTagBind :: TaggedBind t -> CoreBind
 deTagBind (NonRec (TB b _) rhs) = NonRec b (deTagExpr rhs)

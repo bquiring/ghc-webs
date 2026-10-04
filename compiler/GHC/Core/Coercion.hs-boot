@@ -10,6 +10,7 @@ import {-# SOURCE #-} GHC.Core.TyCon
 import GHC.Types.Basic ( LeftOrRight )
 import GHC.Core.Coercion.Axiom
 import GHC.Types.Var
+import GHC.Types.Web ( WebId )
 import GHC.Data.Pair
 import GHC.Utils.Misc
 
@@ -20,6 +21,7 @@ mkForAllCo :: HasDebugCallStack => TyCoVar -> ForAllTyFlag -> ForAllTyFlag -> Co
 mkFunCo      :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkNakedFunCo :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkFunCo2     :: Role -> FunTyFlag -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
+mkWebFunCo2  :: WebId -> Role -> FunTyFlag -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkCoVarCo :: CoVar -> Coercion
 mkPhantomCo :: Coercion -> Type -> Type -> Coercion
 mkUnivCo :: UnivCoProvenance -> [Coercion] -> Role -> Type -> Type -> Coercion

@@ -227,6 +227,8 @@ libCase :: LibCaseEnv
         -> CoreExpr
         -> CoreExpr
 
+libCase _ (WebLam {})         = webFormPanic "libCase"
+libCase _ (WebApp {})         = webFormPanic "libCase"
 libCase env (Var v)             = libCaseApp env v []
 libCase _   (Lit lit)           = Lit lit
 libCase _   (Type ty)           = Type ty

@@ -951,6 +951,7 @@ Library
         GHC.Types.Unique.Set
         GHC.Types.Unique.Supply
         GHC.Types.Var
+        GHC.Types.Web
         GHC.Types.Var.Env
         GHC.Types.Var.Set
         GHC.Unit
@@ -1021,6 +1022,15 @@ Library
         GHC.CmmToAsm.Wasm.Types
         GHC.CmmToAsm.Wasm.Utils
 
+        GHC.WebCore.Annotate
+        GHC.WebCore.Compare
+        GHC.WebCore.Erase
+        GHC.WebCore.Lint
+        GHC.WebCore.Pipeline
+        GHC.WebCore.Rename
+        GHC.WebCore.Sigs
+        GHC.WebCore.Solve
+        GHC.WebCore.Traverse
         Language.Haskell.Syntax
         Language.Haskell.Syntax.Basic
         Language.Haskell.Syntax.Binds

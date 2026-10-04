@@ -974,6 +974,8 @@ representCoreExpr nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_reps = reps } } e
 --
 -- See Note [Unique dictionaries in the TmOracle CoreMap]
 makeDictsCoherent :: CoreExpr -> CoreExpr
+makeDictsCoherent (WebLam {}) = webFormPanic "makeDictsCoherent"
+makeDictsCoherent (WebApp {}) = webFormPanic "makeDictsCoherent"
 makeDictsCoherent var@(Var v)
   | let ty = idType v
   , typeDeterminesValue ty

@@ -40,6 +40,7 @@ module GHC.Core.Coercion (
         mkSelCo, mkSelCoResRole, getNthFun, selectFromType, mkLRCo,
         mkInstCo, mkAppCo, mkAppCos, mkTyConAppCo,
         mkFunCo, mkFunCo2, mkFunCoNoFTF, mkFunResCo,
+        mkWebFunCo, mkWebFunCo2,
         mkNakedFunCo,
         mkNakedForAllCo, mkForAllCo, mkForAllVisCos, mkHomoForAllCos,
         mkPhantomCo,
@@ -141,6 +142,7 @@ import GHC.Core.TyCon
 import GHC.Core.TyCon.RecWalk
 import GHC.Core.Coercion.Axiom
 import GHC.Types.Var
+import GHC.Types.Web
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Name hiding ( varName )
@@ -840,16 +842,26 @@ mkNakedFunCo = mkFunCo
 mkFunCo2 :: Role -> FunTyFlag -> FunTyFlag
          -> CoercionN -> Coercion -> Coercion -> Coercion
 -- This is the smart constructor for FunCo; it checks invariants
-mkFunCo2 r afl afr w arg_co res_co
+mkFunCo2 = mkWebFunCo2 placeholderWeb
+
+-- | Like 'mkFunCo', but with a web.  See Note [Webs] in GHC.Types.Web
+mkWebFunCo :: WebId -> Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
+mkWebFunCo web r af w arg_co res_co
+  = mkWebFunCo2 web r af af w arg_co res_co
+
+-- | Like 'mkFunCo2', but with a web.  See Note [Webs] in GHC.Types.Web
+mkWebFunCo2 :: WebId -> Role -> FunTyFlag -> FunTyFlag
+            -> CoercionN -> Coercion -> Coercion -> Coercion
+mkWebFunCo2 web r afl afr w arg_co res_co
   -- See Note [No assertion check on mkFunCo]
   | Just (ty1, _) <- isReflCo_maybe arg_co
   , Just (ty2, _) <- isReflCo_maybe res_co
   , Just (w, _)   <- isReflCo_maybe w
-  = mkReflCo r (mkFunTy afl w ty1 ty2)  -- See Note [Refl invariant]
+  = mkReflCo r (mkWebFunTy web afl w ty1 ty2)  -- See Note [Refl invariant]
 
   | otherwise
   = FunCo { fco_role = r, fco_afl = afl, fco_afr = afr
-          , fco_mult = w, fco_arg = arg_co, fco_res = res_co }
+          , fco_mult = w, fco_web = web, fco_arg = arg_co, fco_res = res_co }
 
 
 {- Note [No assertion check on mkFunCo]
@@ -1199,7 +1211,7 @@ mkSelCo_maybe cs co
       -- If co :: (forall a1:t1 ~ t2. t1) ~ (forall a2:t3 ~ t4. t2)
       -- then (nth SelForAll co :: (t1 ~ t2) ~N (t3 ~ t4))
 
-    go (SelFun fs) (FunCo _ _ _ w arg res)
+    go (SelFun fs) (FunCo _ _ _ w _ arg res)
       = Just (getNthFun fs w arg res)
 
     go (SelTyCon i r) (TyConAppCo r0 tc arg_cos)
@@ -2166,7 +2178,7 @@ ty_co_subst !lc role ty
                               liftCoSubstTyVar lc r tv
     go r (AppTy ty1 ty2)    = mkAppCo (go r ty1) (go Nominal ty2)
     go r (TyConApp tc tys)  = mkTyConAppCo r tc (zipWith go (tyConRoleListX r tc) tys)
-    go r (FunTy af w t1 t2) = mkFunCo r af (go Nominal w) (go r t1) (go r t2)
+    go r (FunTy af w web t1 t2) = mkWebFunCo web r af (go Nominal w) (go r t1) (go r t2)
     go r t@(ForAllTy (Bndr v vis) ty)
        = let (lc', v', h) = liftCoSubstVarBndr lc v
              body_co = ty_co_subst lc' r ty in
@@ -2428,7 +2440,7 @@ seqCo (AxiomCo _ cs)        = seqCos cs
 seqCo (ForAllCo tv visL visR k co)
   = seqType (varType tv) `seq` rnf visL `seq` rnf visR `seq`
     seqCo k `seq` seqCo co
-seqCo (FunCo r af1 af2 w co1 co2)
+seqCo (FunCo r af1 af2 w _ co1 co2)
   = r `seq` af1 `seq` af2 `seq` seqCo w `seq` seqCo co1 `seq` seqCo co2
 seqCo (UnivCo { uco_prov = p, uco_role = r
               , uco_lty = t1, uco_rty = t2, uco_deps = deps })
@@ -2516,10 +2528,10 @@ coercion_lr_kind which orig_co
     go (UnivCo { uco_lty = lty, uco_rty = rty})
       = pickLR which (lty, rty)
     go (FunCo { fco_afl = afl, fco_afr = afr, fco_mult = mult
-              , fco_arg = arg, fco_res = res})
+              , fco_web = web, fco_arg = arg, fco_res = res})
       = -- See Note [FunCo]
         FunTy { ft_af = pickLR which (afl, afr), ft_mult = go mult
-              , ft_arg = go arg, ft_res = go res }
+              , ft_web = web, ft_arg = go arg, ft_res = go res }
 
     go co@(ForAllCo { fco_tcv = tv1, fco_visL = visL, fco_visR = visR
                     , fco_kind = k_co, fco_body = co1 })
@@ -2709,10 +2721,10 @@ buildCoercion orig_ty1 orig_ty2 = go orig_ty1 orig_ty2
                   ; _           -> False      }) $
         mkNomReflCo ty1
 
-    go (FunTy { ft_af = af1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
+    go (FunTy { ft_af = af1, ft_mult = w1, ft_web = web, ft_arg = arg1, ft_res = res1 })
        (FunTy { ft_af = af2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
       = assert (af1 == af2) $
-        mkFunCo Nominal af1 (go w1 w2) (go arg1 arg2) (go res1 res2)
+        mkWebFunCo web Nominal af1 (go w1 w2) (go arg1 arg2) (go res1 res2)
 
     go (TyConApp tc1 args1) (TyConApp tc2 args2)
       = assertPpr (tc1 == tc2) (vcat [ ppr tc1 <+> ppr tc2

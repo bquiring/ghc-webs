@@ -9,6 +9,7 @@ module GHC.Tc.Solver.Equality(
 
 
 import GHC.Prelude
+import GHC.Types.Web ( placeholderWeb )
 
 import {-# SOURCE #-} GHC.Tc.Solver.Solve( trySolveImplication )
 
@@ -174,12 +175,12 @@ zonkEqTypes ev eq_rel ty1 ty2
     -- so we may run into an unzonked type variable while trying to compute the
     -- RuntimeReps of the argument and result types. This can be observed in
     -- testcase tc269.
-    go (FunTy af1 w1 arg1 res1) (FunTy af2 w2 arg2 res2)
+    go (FunTy af1 w1 _ arg1 res1) (FunTy af2 w2 _ arg2 res2)
       | af1 == af2
       , eqType w1 w2
       = do { res_a <- go arg1 arg2
            ; res_b <- go res1 res2
-           ; return $ combine_rev (FunTy af1 w1) res_b res_a }
+           ; return $ combine_rev (\a r -> FunTy af1 w1 placeholderWeb a r) res_b res_a }
 
     go ty1@(FunTy {}) ty2 = bale_out ty1 ty2
     go ty1 ty2@(FunTy {}) = bale_out ty1 ty2

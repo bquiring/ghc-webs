@@ -1951,6 +1951,8 @@ ruleCheckBind env (Rec prs)    = (env', unionManyBags (map (ruleCheck env') rhss
                                  env' = env `extendInScopeListRC` bs
 
 ruleCheck :: RuleCheckEnv -> CoreExpr -> Bag SDoc
+ruleCheck _   (WebLam {})   = webFormPanic "ruleCheck"
+ruleCheck _   (WebApp {})   = webFormPanic "ruleCheck"
 ruleCheck _   (Var _)         = emptyBag
 ruleCheck _   (Lit _)         = emptyBag
 ruleCheck _   (Type _)        = emptyBag

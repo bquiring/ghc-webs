@@ -65,6 +65,7 @@ data CoreToDo           -- These are diff core-to-core passes,
   | CorePrep
   | CoreAddCallerCcs
   | CoreAddLateCcs
+  | CoreDoWebs     -- ^ The web pipeline; see GHC.WebCore.Pipeline
 
 instance Outputable CoreToDo where
   ppr (CoreDoSimplify _)       = text "Simplifier"
@@ -87,6 +88,7 @@ instance Outputable CoreToDo where
   ppr CoreTidy                 = text "Tidy Core"
   ppr CoreAddCallerCcs         = text "Add caller cost-centres"
   ppr CoreAddLateCcs           = text "Add late core cost-centres"
+  ppr CoreDoWebs               = text "Webs"
   ppr CorePrep                 = text "CorePrep"
   ppr CoreDoPrintCore          = text "Print core"
   ppr (CoreDoRuleCheck {})     = text "Rule check"

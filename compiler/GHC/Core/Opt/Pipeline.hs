@@ -44,6 +44,7 @@ import GHC.Core.Opt.Exitify      ( exitifyProgram )
 import GHC.Core.Opt.WorkWrap     ( wwTopBinds )
 import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
 import GHC.Core.LateCC.TopLevelBinds (topLevelBindsCCMG)
+import GHC.WebCore.Pipeline ( webPass )
 import GHC.Core.Seq (seqBinds)
 import GHC.Core.FamInstEnv
 
@@ -347,7 +348,11 @@ getCoreToDo dflags hpt_rule_base extra_vars
         maybe_rule_check FinalPhase,
 
         add_caller_ccs,
-        add_late_ccs
+        add_late_ccs,
+
+        -- The web pipeline runs after all Core optimisations.
+        -- See GHC.WebCore.Pipeline
+        runWhen (gopt Opt_CoreWebs dflags) CoreDoWebs
      ]
 
     -- Remove 'CoreDoNothing' and flatten 'CoreDoPasses' for clarity.
@@ -525,6 +530,9 @@ doCorePass pass guts = do
 
     CoreAddLateCcs            -> {-# SCC "AddLateCcs" #-}
                                  topLevelBindsCCMG guts
+
+    CoreDoWebs                -> {-# SCC "Webs" #-}
+                                 webPass guts
 
     CoreDoPrintCore           -> {-# SCC "PrintCore" #-}
                                  liftIO $ printCore logger (mg_binds guts) >> return guts

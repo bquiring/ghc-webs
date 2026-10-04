@@ -814,6 +814,8 @@ cpeRhsE :: CorePrepEnv -> CoreExpr -> UniqSM (Floats, CpeRhs)
 -- For example
 --      f (g x)   ===>   ([v = g x], f v)
 
+cpeRhsE _ (WebLam {}) = webFormPanic "cpeRhsE"
+cpeRhsE _ (WebApp {}) = webFormPanic "cpeRhsE"
 cpeRhsE env (Type ty)
   = return (emptyFloats, Type (cpSubstTy env ty))
 cpeRhsE env (Coercion co)

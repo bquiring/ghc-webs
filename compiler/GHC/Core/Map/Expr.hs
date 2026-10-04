@@ -338,6 +338,8 @@ fdE k m
 lkE :: DeBruijn CoreExpr -> CoreMapX a -> Maybe a
 lkE (D env expr) cm = go expr cm
   where
+    go (WebLam {})        = webFormPanic "lkE"
+    go (WebApp {})        = webFormPanic "lkE"
     go (Var v)              = cm_var  >.> lkVar env v
     go (Lit l)              = cm_lit  >.> lookupTM l
     go (Type t)             = cm_type >.> lkG (D env t)
@@ -361,6 +363,8 @@ lkE (D env expr) cm = go expr cm
                               >=> lkList (lkA (extendCME env b)) as
 
 xtE :: DeBruijn CoreExpr -> XT a -> CoreMapX a -> CoreMapX a
+xtE (D _ (WebLam {}))          _ _ = webFormPanic "xtE"
+xtE (D _ (WebApp {}))          _ _ = webFormPanic "xtE"
 xtE (D env (Var v))              f m = m { cm_var  = cm_var m
                                                  |> xtVar env v f }
 xtE (D env (Type t))             f m = m { cm_type = cm_type m

@@ -998,6 +998,8 @@ interestingArg :: SimplEnv -> CoreExpr -> ArgSummary
 interestingArg env e = go env 0 e
   where
     -- n is # value args to which the expression is applied
+    go _ _ (WebLam {}) = webFormPanic "interestingArg"
+    go _ _ (WebApp {}) = webFormPanic "interestingArg"
     go env n (Var v)
        = case substId env v of
            DoneId v'            -> go_var n v'

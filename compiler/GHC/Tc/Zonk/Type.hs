@@ -1770,6 +1770,8 @@ zonkEvTerm (EvFun { et_tvs = tvs, et_given = evs
                      , et_binds = new_ev_binds, et_body = new_body_id }) }
 
 zonkCoreExpr :: CoreExpr -> ZonkTcM CoreExpr
+zonkCoreExpr (WebLam {}) = webFormPanic "zonkCoreExpr"
+zonkCoreExpr (WebApp {}) = webFormPanic "zonkCoreExpr"
 zonkCoreExpr (Var v)
     | isCoVar v
     = Coercion <$> zonkCoVarOcc v

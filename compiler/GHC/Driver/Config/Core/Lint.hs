@@ -96,6 +96,7 @@ coreDumpFlag CorePrep                 = Just Opt_D_dump_prep
 
 coreDumpFlag CoreAddCallerCcs         = Nothing
 coreDumpFlag CoreAddLateCcs           = Nothing
+coreDumpFlag CoreDoWebs               = Nothing
 coreDumpFlag CoreDoPrintCore          = Nothing
 coreDumpFlag (CoreDoRuleCheck {})     = Nothing
 coreDumpFlag CoreDoNothing            = Nothing

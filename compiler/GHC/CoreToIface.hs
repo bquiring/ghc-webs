@@ -559,6 +559,8 @@ toIfaceBooleanFormula = go
 -}
 
 toIfaceExpr :: CoreExpr -> IfaceExpr
+toIfaceExpr (WebLam {})  = webFormPanic "toIfaceExpr"
+toIfaceExpr (WebApp {})  = webFormPanic "toIfaceExpr"
 toIfaceExpr (Var v)         = toIfaceVar v
 toIfaceExpr (Lit (LitRubbish tc r)) = IfaceLitRubbish tc (toIfaceType r)
 toIfaceExpr (Lit l)         = IfaceLit l

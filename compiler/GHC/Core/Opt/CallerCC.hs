@@ -65,6 +65,8 @@ doBind env (Rec bs) = Rec <$> mapM doPair bs
     doPair (b,rhs) = (b,) <$> doExpr (addParent b env) rhs
 
 doExpr :: Env -> CoreExpr -> M CoreExpr
+doExpr _ (WebLam {}) = webFormPanic "doExpr"
+doExpr _ (WebApp {}) = webFormPanic "doExpr"
 doExpr env e@(Var v)
   | needsCallSiteCostCentre env v = do
     let nameDoc :: SDoc

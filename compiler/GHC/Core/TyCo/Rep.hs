@@ -45,7 +45,7 @@ module GHC.Core.TyCo.Rep (
         mkNakedTyConTy, mkTyVarTy, mkTyVarTys,
         mkTyCoVarTy, mkTyCoVarTys,
         mkFunTy, mkNakedFunTy,
-        mkVisFunTy, mkScaledFunTys,
+        mkVisFunTy, mkScaledFunTys, mkWebFunTy, setFunTyWeb,
         mkInvisFunTy, mkInvisFunTys,
         tcMkVisFunTy, tcMkInvisFunTy, tcMkScaledFunTy, tcMkScaledFunTys,
         mkForAllTy, mkForAllTys, mkInvisForAllTys,
@@ -77,6 +77,7 @@ import {-# SOURCE #-} GHC.Core.Type( chooseFunTyFlag, typeKind, typeTypeOrConstr
 
 -- friends:
 import GHC.Types.Var
+import GHC.Types.Web
 import GHC.Types.Var.Set( elemVarSet )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
@@ -171,6 +172,8 @@ data Type
                                  -- Note [FunTyFlag] in GHC.Types.Var
 
      , ft_mult :: Mult           -- Multiplicity; always Many for (=>) and (==>)
+     , ft_web  :: !WebId         -- The web of this arrow; see Note [Webs] in GHC.Types.Web
+                                 -- Always placeholderWeb outside the web pipeline
      , ft_arg  :: Type           -- Argument type
      , ft_res  :: Type }         -- Result type
 
@@ -683,11 +686,16 @@ mkNakedFunTy :: FunTyFlag -> Kind -> Kind -> Kind
 -- See Note [Naked FunTy] in GHC.Builtin.Types
 -- Always Many multiplicity; kinds have no linearity
 mkNakedFunTy af arg res
- =  FunTy { ft_af   = af, ft_mult = manyDataConTy
+ =  FunTy { ft_af   = af, ft_mult = manyDataConTy, ft_web = placeholderWeb
           , ft_arg  = arg, ft_res  = res }
 
 mkFunTy :: HasDebugCallStack => FunTyFlag -> Mult -> Type -> Type -> Type
-mkFunTy af mult arg res
+mkFunTy af mult arg res = mkWebFunTy placeholderWeb af mult arg res
+
+-- | Make a function type with the given web.
+-- See Note [Webs] in GHC.Types.Web
+mkWebFunTy :: HasDebugCallStack => WebId -> FunTyFlag -> Mult -> Type -> Type -> Type
+mkWebFunTy web af mult arg res
   = assertPpr (af == chooseFunTyFlag arg res) (vcat
       [ text "af" <+> ppr af
       , text "chooseAAF" <+> ppr (chooseFunTyFlag arg res)
@@ -695,8 +703,15 @@ mkFunTy af mult arg res
       , text "res" <+> ppr res <+> dcolon <+> ppr (typeKind res) ]) $
     FunTy { ft_af   = af
           , ft_mult = mult
+          , ft_web  = web
           , ft_arg  = arg
           , ft_res  = res }
+
+-- | Set the web of a 'FunTy' (without looking through synonyms).
+-- Panics on anything else.  See Note [Webs] in GHC.Types.Web
+setFunTyWeb :: HasDebugCallStack => WebId -> Type -> Type
+setFunTyWeb web ty@(FunTy {}) = ty { ft_web = web }
+setFunTyWeb _   ty            = pprPanic "setFunTyWeb" (ppr ty)
 
 mkInvisFunTy :: HasDebugCallStack => Type -> Type -> Type
 mkInvisFunTy arg res
@@ -778,7 +793,7 @@ tcMkVisFunTy :: Mult -> Type -> Type -> Type
 -- Does not have the assert-checking in mkFunTy: used by the typechecker
 -- to avoid looking at the result kind, which may not be zonked
 tcMkVisFunTy mult arg res
-  = FunTy { ft_af = visArgTypeLike, ft_mult = mult
+  = FunTy { ft_af = visArgTypeLike, ft_mult = mult, ft_web = placeholderWeb
           , ft_arg = arg, ft_res = res }
 
 tcMkInvisFunTy :: TypeOrConstraint -> Type -> Type -> Type
@@ -786,7 +801,7 @@ tcMkInvisFunTy :: TypeOrConstraint -> Type -> Type -> Type
 -- Does not have the assert-checking in mkFunTy: used by the typechecker
 -- to avoid looking at the result kind, which may not be zonked
 tcMkInvisFunTy res_torc arg res
-  = FunTy { ft_af = invisArg res_torc, ft_mult = manyDataConTy
+  = FunTy { ft_af = invisArg res_torc, ft_mult = manyDataConTy, ft_web = placeholderWeb
           , ft_arg = arg, ft_res = res }
 
 tcMkScaledFunTys :: [Scaled Type] -> Type -> Type
@@ -863,6 +878,7 @@ data Coercion
         , fco_afl          :: FunTyFlag   -- Arrow for coercionLKind
         , fco_afr          :: FunTyFlag   -- Arrow for coercionRKind
         , fco_mult         :: CoercionN
+        , fco_web          :: !WebId      -- Web of both sides; see Note [Webs] in GHC.Types.Web
         , fco_arg, fco_res :: Coercion }
        -- (if the role "e" is Phantom, the first coercion is, too)
        -- the first coercion is for the multiplicity
@@ -1896,7 +1912,7 @@ foldTyCo (TyCoFolder { tcf_view       = view
     go_ty _   (LitTy {})        = mempty
     go_ty env (CastTy ty co)    = go_ty env ty `mappend` go_co env co
     go_ty env (CoercionTy co)   = go_co env co
-    go_ty env (FunTy _ w arg res) = go_ty env w `mappend` go_ty env arg `mappend` go_ty env res
+    go_ty env (FunTy _ w _ arg res) = go_ty env w `mappend` go_ty env arg `mappend` go_ty env res
     go_ty env (TyConApp _ tys)  = go_tys env tys
     go_ty env (ForAllTy (Bndr tv vis) inner)
       = let !env' = tycobinder env tv vis  -- Avoid building a thunk here
@@ -1967,7 +1983,7 @@ typeSize :: Type -> Int
 typeSize (LitTy {})                 = 1
 typeSize (TyVarTy {})               = 1
 typeSize (AppTy t1 t2)              = typeSize t1 + typeSize t2
-typeSize (FunTy _ _ t1 t2)          = typeSize t1 + typeSize t2
+typeSize (FunTy _ _ _ t1 t2)          = typeSize t1 + typeSize t2
 typeSize (ForAllTy (Bndr tv _) t)   = typeSize (varType tv) + typeSize t
 typeSize (TyConApp _ ts)            = 1 + typesSize ts
 typeSize (CastTy ty co)             = typeSize ty + coercionSize co
@@ -1984,7 +2000,7 @@ coercionSize (TyConAppCo _ _ args) = 1 + sum (map coercionSize args)
 coercionSize (AppCo co arg)        = coercionSize co + coercionSize arg
 coercionSize (ForAllCo { fco_kind = h, fco_body = co })
                                    = 1 + coercionSize co + coercionSize h
-coercionSize (FunCo _ _ _ w c1 c2) = 1 + coercionSize c1 + coercionSize c2
+coercionSize (FunCo _ _ _ w _ c1 c2) = 1 + coercionSize c1 + coercionSize c2
                                                          + coercionSize w
 coercionSize (CoVarCo _)         = 1
 coercionSize (HoleCo _)          = 1

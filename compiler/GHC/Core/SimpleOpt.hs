@@ -277,6 +277,8 @@ simple_opt_expr env expr
     in_scope_env = ISE in_scope alwaysActiveUnfoldingFun
 
     ---------------
+    go (WebLam {}) = webFormPanic "simple_opt_expr"
+    go (WebApp {}) = webFormPanic "simple_opt_expr"
     go (Var v)
        | Just clo <- lookupVarEnv (soe_inl env) v
        = simple_opt_clo in_scope clo

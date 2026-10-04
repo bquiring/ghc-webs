@@ -67,6 +67,8 @@ seqExpr (Cast e co)     = seqExpr e `seq` seqCo co
 seqExpr (Tick n e)      = seqTickish n `seq` seqExpr e
 seqExpr (Type t)        = seqType t
 seqExpr (Coercion co)   = seqCo co
+seqExpr (WebApp w f a)  = w `seq` seqExpr f `seq` seqExpr a
+seqExpr (WebLam w b e)  = w `seq` seqBndr b `seq` seqExpr e
 
 seqExprs :: [CoreExpr] -> ()
 seqExprs [] = ()

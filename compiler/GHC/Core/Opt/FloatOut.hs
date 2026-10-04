@@ -343,6 +343,8 @@ expression is entered since the tick still scopes over the RHS.
 
 floatExpr :: LevelledExpr
           -> (FloatStats, FloatBinds, CoreExpr)
+floatExpr (WebLam {}) = webFormPanic "floatExpr"
+floatExpr (WebApp {}) = webFormPanic "floatExpr"
 floatExpr (Var v)   = (zeroStats, emptyFloats, Var v)
 floatExpr (Type ty) = (zeroStats, emptyFloats, Type ty)
 floatExpr (Coercion co) = (zeroStats, emptyFloats, Coercion co)

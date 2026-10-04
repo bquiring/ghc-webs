@@ -56,7 +56,7 @@ import {-# SOURCE #-} GHC.Core.Type
 import {-# SOURCE #-} GHC.Core.Coercion
    ( mkCoVarCo, mkKindCo, mkSelCo, mkTransCo
    , mkNomReflCo, mkSubCo, mkSymCo
-   , mkFunCo2, mkForAllCo, mkUnivCo
+   , mkWebFunCo2, mkForAllCo, mkUnivCo
    , mkAxiomCo, mkAppCo, mkGReflCo
    , mkInstCo, mkLRCo, mkTyConAppCo
    , mkCoercionType
@@ -891,7 +891,7 @@ subst_co subst co
       = case substForAllCoBndrUnchecked subst tv kind_co of
          (subst', tv', kind_co') ->
           ((mkForAllCo $! tv') visL visR $! kind_co') $! subst_co subst' co
-    go (FunCo r afl afr w co1 co2)   = ((mkFunCo2 r afl afr $! go w) $! go co1) $! go co2
+    go (FunCo r afl afr w web co1 co2) = ((mkWebFunCo2 web r afl afr $! go w) $! go co1) $! go co2
     go (CoVarCo cv)          = substCoVar subst cv
     go (UnivCo { uco_prov = p, uco_role = r
                , uco_lty = t1, uco_rty = t2, uco_deps = deps })

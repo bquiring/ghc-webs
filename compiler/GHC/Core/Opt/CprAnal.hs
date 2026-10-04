@@ -215,6 +215,8 @@ cprAnal, cprAnal'
 cprAnal env e = -- pprTraceWith "cprAnal" (\res -> ppr (fst (res)) $$ ppr e) $
                 cprAnal' env e
 
+cprAnal' _ (WebLam {}) = webFormPanic "cprAnal"
+cprAnal' _ (WebApp {}) = webFormPanic "cprAnal"
 cprAnal' _ (Lit lit)     = (topCprType, Lit lit)
 cprAnal' _ (Type ty)     = (topCprType, Type ty)      -- Doesn't happen, in fact
 cprAnal' _ (Coercion co) = (topCprType, Coercion co)

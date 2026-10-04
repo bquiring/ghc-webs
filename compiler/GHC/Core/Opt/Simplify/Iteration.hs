@@ -1173,6 +1173,8 @@ simplExprF1 :: HasDebugCallStack
             => SimplEnv -> InExpr -> SimplCont
             -> SimplM (SimplFloats, OutExpr)
 
+simplExprF1 _ (WebLam {}) _ = webFormPanic "simplExprF1"
+simplExprF1 _ (WebApp {}) _ = webFormPanic "simplExprF1"
 simplExprF1 _ (Type ty) cont
   = pprPanic "simplExprF: type" (ppr ty <+> text"cont: " <+> ppr cont)
     -- simplExprF does only with term-valued expressions

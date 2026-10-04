@@ -5805,7 +5805,7 @@ checkValidRoles tc
       =  check_ty_roles env role    ty1
       >> check_ty_roles env Nominal ty2
 
-    check_ty_roles env role (FunTy _ w ty1 ty2)
+    check_ty_roles env role (FunTy _ w _ ty1 ty2)
       =  check_ty_roles env Nominal w
       >> check_ty_roles env role ty1
       >> check_ty_roles env role ty2

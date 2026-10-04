@@ -365,6 +365,7 @@ Allocation of unique supply characters:
         r       Hsc name cache
         s       simplifier
         u       Cmm pipeline
+        w       webs (GHC.WebCore.Pipeline); W 0 is placeholderWeb (GHC.Types.Web)
         y       GHCi bytecode generator
         z       anonymous sums
 

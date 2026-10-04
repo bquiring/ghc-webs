@@ -110,6 +110,8 @@ matching by looking for strict arguments of the correct type.
 
 wwExpr :: WwOpts -> CoreExpr -> UniqSM CoreExpr
 
+wwExpr _ (WebLam {}) = webFormPanic "wwExpr"
+wwExpr _ (WebApp {}) = webFormPanic "wwExpr"
 wwExpr _ e@(Type {}) = return e
 wwExpr _ e@(Coercion {}) = return e
 wwExpr _ e@(Lit  {}) = return e

@@ -184,6 +184,8 @@ satTopLevelExpr expr interesting_ids = do
     return (expr', finalizeApp expr_app sat_info_expr)
 
 satExpr :: CoreExpr -> IdSet -> SatM (CoreExpr, IdSATInfo, Maybe IdAppInfo)
+satExpr (WebLam {}) _ = webFormPanic "satExpr"
+satExpr (WebApp {}) _ = webFormPanic "satExpr"
 satExpr var@(Var v) interesting_ids = do
     let app_info = if v `elementOfUniqSet` interesting_ids
                    then Just (v, [])

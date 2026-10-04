@@ -436,6 +436,8 @@ dmdAnal, dmdAnal' :: AnalEnv
 dmdAnal env d e = -- pprTrace "dmdAnal" (ppr d <+> ppr e) $
                   dmdAnal' env d e
 
+dmdAnal' _ _ (WebLam {}) = webFormPanic "dmdAnal"
+dmdAnal' _ _ (WebApp {}) = webFormPanic "dmdAnal"
 dmdAnal' _ _ (Lit lit)     = WithDmdType nopDmdType (Lit lit)
 dmdAnal' _ _ (Type ty)     = WithDmdType nopDmdType (Type ty) -- Doesn't happen, in fact
 dmdAnal' _ _ (Coercion co)

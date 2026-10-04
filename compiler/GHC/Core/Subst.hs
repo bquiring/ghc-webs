@@ -271,6 +271,11 @@ substExpr subst expr
                        where
                          (subst', bndr') = substBndr subst bndr
 
+    go (WebApp w fun arg)   = WebApp w (go fun) (go arg)
+    go (WebLam w bndr body) = WebLam w bndr' (substExpr subst' body)
+                            where
+                              (subst', bndr') = substBndr subst bndr
+
     go (Let bind body) = Let bind' (substExpr subst' body)
                        where
                          (subst', bind') = substBind subst bind

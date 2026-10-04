@@ -1954,6 +1954,8 @@ cheapExprSize e
     go n e | n >= maxExprSize = n
            | otherwise        = go1 n e
 
+    go1 _ (WebLam {})   = webFormPanic "cheapSize"
+    go1 _ (WebApp {})   = webFormPanic "cheapSize"
     go1 n (Var {})        = n+1
     go1 n (Lit {})        = n+1
     go1 n (Type {})       = n
@@ -2428,6 +2430,8 @@ occAnal :: OccEnv
         -> CoreExpr
         -> WithUsageDetails CoreExpr       -- Gives info only about the "interesting" Ids
 
+occAnal !_   (WebLam {}) = webFormPanic "occAnal"
+occAnal !_   (WebApp {}) = webFormPanic "occAnal"
 occAnal !_   expr@(Lit _)  = WUD emptyDetails expr
 
 occAnal env expr@(Var _) = occAnalApp env (expr, [], [])

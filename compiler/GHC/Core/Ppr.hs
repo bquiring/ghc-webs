@@ -239,6 +239,24 @@ ppr_expr add_par expr@(App {})
         _ -> parens (hang (pprParendExpr fun) 2 pp_args)
     }
 
+-- Web-annotated forms; see Note [Webs] in GHC.Types.Web
+--   \^w1 x ->  e        for  WebLam w1 x e
+--   f @^w1 a            for  WebApp w1 f a
+ppr_expr add_par (WebLam w bndr body)
+  = add_par $
+    hang (text "\\^" <> ppr w <+> pprBndr LambdaBind bndr <+> arrow)
+         2 (pprCoreExpr body)
+
+ppr_expr add_par expr@(WebApp {})
+  = add_par $ hang (pprParendExpr fun) 2 (sep (map pp_arg args))
+  where
+    (fun, args) = go expr []
+    go (WebApp w f a) as = go f ((Just w, a) : as)
+    go (App f a)      as = go f ((Nothing, a) : as)
+    go f              as = (f, as)
+    pp_arg (Just w, a)  = text "@^" <> ppr w <+> pprArg a
+    pp_arg (Nothing, a) = pprArg a
+
 ppr_expr add_par (Case expr _ ty []) -- Empty Case
   = add_par $ sep [text "case"
                       <+> pprCoreExpr expr

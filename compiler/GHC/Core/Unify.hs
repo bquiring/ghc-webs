@@ -2386,8 +2386,8 @@ pushRefl co =
   case (isReflCo_maybe co) of
     Just (AppTy ty1 ty2, Nominal)
       -> Just (AppCo (mkReflCo Nominal ty1) (mkNomReflCo ty2))
-    Just (FunTy af w ty1 ty2, r)
-      ->  Just (FunCo r af af (mkReflCo r w) (mkReflCo r ty1) (mkReflCo r ty2))
+    Just (FunTy af w web ty1 ty2, r)
+      ->  Just (FunCo r af af (mkReflCo r w) web (mkReflCo r ty1) (mkReflCo r ty2))
     Just (TyConApp tc tys, r)
       -> Just (TyConAppCo r tc (zipWith mkReflCo (tyConRoleListX r tc) tys))
     Just (ForAllTy (Bndr tv vis) ty, r)

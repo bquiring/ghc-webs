@@ -1741,6 +1741,8 @@ exprIsDeadEnd e
   where
     go :: Arity -> CoreExpr -> Bool
     -- (go n e) = True <=> expr applied to n value args is bottom
+    go _ (WebLam {})           = webFormPanic "exprBotStrictness"
+    go _ (WebApp {})           = webFormPanic "exprBotStrictness"
     go _ (Lit {})                = False
     go _ (Type {})               = False
     go _ (Coercion {})           = False
