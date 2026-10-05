@@ -40,7 +40,8 @@ import GHC.Utils.Monad
 import GHC.Core.DataCon
 import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, catMaybes )
 import qualified Data.Map as Map
-import GHC.Core.Make ( mkWildValBinder )
+import GHC.Core.Make ( mkWildValBinder, mkCoreUnboxedTuple )
+import GHC.Builtin.Types ( mkTupleTy, tupleDataCon )
 import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
 import GHC.Types.Var.Env
 import GHC.Core.Opt.DmdAnal ( DmdAnalOpts(..), dmdAnalProgram )
@@ -1252,6 +1253,10 @@ one of
       going down).  unwrap rewrites a lambda so that q's calls pass
       (C.unwrap e) at position r; wrap l' = \as -> l' .. (adapter a_q) ..
       with  adapter = \cs -> a_q .. (C.wrap c_r) .. .
+  (C) the values are applications of one constructor D (no strict fields,
+      no existentials): unwrap (D e1 .. em) = (# e1, .., em #) (just e1 when
+      m = 1), wrap c = case c of (# f1, .., fm #) -> D f1 .. fm.  See
+      (Constructed).
 The function h itself is split by a conversion of kind (B) for its own
 right-hand side: the worker is  unwrap rhs  and the wrapper  wrap $wh; the
 conversions are collated into h's wrapper only there, at the definition.
@@ -1275,6 +1280,27 @@ part (with the type variables in scope; the types it builds may mention
 them), the worker is  /\a -> unwrap (\g n -> ..),  and the wrapper is
 /\a -> wrap (work_id @a).  (Type parameters after value parameters are not
 handled.)
+
+(Constructed) A continuation parameter called with constructed data,
+
+    h = \k n -> ... k (I# (n# +# 1#)) (x, y) ...      -- at every call of k
+
+is the dual of CPR: k is unknown inside h, so we cannot unbox on k's
+strictness, but every call builds the same constructor, so (C) passes the
+fields instead and the adapter rebuilds the constructor:
+
+    $wh = \k' n -> ... k' (n# +# 1#) (# x, y #) ...
+    h   = \k n -> $wh (\c1 c2 -> k (I# c1) (case c2 of (# f1, f2 #) -> (f1, f2))) n
+
+The code generator passes the unboxed tuple as two arguments.  At a call of
+h with a known k, the adapter meets k's body and the constructors cancel
+against k's case expressions.  Laziness is unchanged: the same field
+expressions are passed, unevaluated, and wrap (unwrap v) = v is just
+rebuilding D.  Strict fields are excluded, since the rebuilt D's fields
+would not be known to be evaluated (Note [Strict fields in Core]), and so
+are constructors without fields (nothing to gain) and unboxed tuples (the
+result of an earlier (C) split, which would otherwise be split again by
+the worker's next round).
 
 We do not split a function with a NOINLINE pragma (its wrapper could not be
 inlined, so the adapter would only cost), nor look deeper than
@@ -1644,6 +1670,46 @@ functionsConv ww_opts fn_id v0 vs
     finalise d | isStrictDmd d = d
                | otherwise     = trimBoxity d
 
+-- | (C): every value is an application of the same constructor D, with no
+-- strict fields and no existentials.  The new value is its fields, as an
+-- unboxed tuple (or the field itself when there is one), which the code
+-- generator passes as separate arguments.
+-- See (Constructed) in Note [Worker/wrapper for function arguments]
+conConv :: Type -> [CoreExpr] -> Maybe Conv
+conConv arg_ty vals
+  | Just dcs <- mapM valCon vals
+  , dc : _ <- dcs
+  , all (== dc) dcs
+  , isVanillaDataCon dc
+  , not (isUnboxedTupleDataCon dc)      -- already a converted value
+  , not (any isMarkedStrict (dataConRepStrictness dc))
+  , Just (tc, univ_tys) <- splitTyConApp_maybe arg_ty
+  , dataConTyCon dc == tc
+  , let field_tys = map scaledThing (dataConInstArgTys dc univ_tys)
+  , not (null field_tys)
+  , all (\v -> length (fields v) == length field_tys) vals
+  = let new_ty = case field_tys of
+                   [t] -> t
+                   ts  -> mkTupleTy Unboxed ts
+        unwrap e = return (case fields e of
+                             [f] -> f
+                             fs  -> mkCoreUnboxedTuple fs)
+        con_app fs = mkConApp dc (map Type univ_tys ++ map Var fs)
+        wrap c = case field_tys of
+          [_] -> return (con_app [c])
+          ts  -> do { fs <- mapM (\t -> do { u <- getUniqueM
+                                          ; return (mkSysLocal (fsLit "cf") u ManyTy t) }) ts
+                    ; return (Case (Var c) (mkWildValBinder ManyTy new_ty) arg_ty
+                                   [Alt (DataAlt (tupleDataCon Unboxed (length ts))) fs (con_app fs)]) }
+    in Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap, cv_new_ty = new_ty, cv_depth = 1 })
+  | otherwise = Nothing
+  where
+    strip = stripTicksTopE (const True)
+    valCon e = case collectArgs (strip e) of
+                 (Var d, _) | Just dc <- isDataConWorkId_maybe d -> Just dc
+                 _                                             -> Nothing
+    fields e = filter isValArg (snd (collectArgs (strip e)))
+
 -- | (B): the values are lambda groups, one of whose parameters is a function
 -- that is only called, with values at some position that have a conversion
 lambdaConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
@@ -1684,7 +1750,17 @@ lambdaConv ww_opts fn_id depth vals
            ; case mb_c of
                Just c  -> mkLambdaConv qi ri m lams c
                Nothing -> try_positions ris qi calls lams m }
+        -- (C): the same constructor at every call
+      | Just arg_ty <- posType qi ri lams
+      , Just c <- conConv arg_ty [ args !! ri | (_, args) <- calls ]
+      = mkLambdaConv qi ri m lams c
       | otherwise = try_positions ris qi calls lams m
+
+    -- The type of parameter qi's argument ri
+    posType qi ri ((_, _, bs0) : _)
+      | Just (q_args, _) <- splitValArgs (ri + 1) (idType (bs0 !! qi))
+      = Just (snd (q_args !! ri))
+    posType _ _ _ = Nothing
 
     headVal (v : _) = v
     headVal []      = panic "lambdaConv"

@@ -64,19 +64,69 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
    definition (one `let` per level). Up to depth 4.
 7. **Function arguments are "conversions"**: a closed unwrap/wrap pair for
    the values reaching an argument position. Either (A) an ordinary
-   `mkWwBodies` split of the functions passed there, or (B) for lambdas whose
-   function parameter is only called, a nested conversion (going down).
+   `mkWwBodies` split of the functions passed there, (B) for lambdas whose
+   function parameter is only called, a nested conversion (going down), or
+   (C) for values that are the same constructor at every call, its fields
+   (an unboxed tuple), the dual of CPR for continuations.
    The user's framing: track wrappers per parameter, collate at the
    definition.
 8. **Data structures of functions are out of scope.** They would rely on
    downstream fusion.
+
+## Current state (2026-10-05)
+
+- **Just implemented: (C), continuations called with constructed data**
+  ((Constructed) in Note [Worker/wrapper for function arguments];
+  `conConv`, used from `lambdaConv`'s `try_positions`). If every call of a
+  function parameter `k` passes the same constructor `D e1 .. em` at some
+  position (no strict fields, no existentials, not an unboxed tuple, at
+  least one field), the worker passes `(# e1, .., em #)` (or `e1` alone)
+  and the wrapper's adapter rebuilds `D`. Unboxed tuples are excluded
+  because the worker's next round would otherwise convert its own
+  `(# .. #)` again (`step` was split 4 times before that rule).
+  - Tests `wwcont001`, `wwcont002` (multi-module CPS evaluator),
+    `wwcont_dump`; mutation-checked (forcing the fields makes both run
+    tests fail). `dmdanal`: 157 passes.
+  - Core for `step` in `wwcont_dump`: the worker calls `q (-# a b) (# x, y #)`
+    with no `I#` or pair allocated; a known continuation receives the
+    fields directly.
+  - Seen in `wwcont_dump`: a small worker can be inlined back into its
+    wrapper, because the wrapper passes it a lambda (an interesting
+    argument), and the adapter then cancels (`findK`). Harmless there
+    (callers inline `findK` whole), but watch for it.
+  - **Was running when this was written:** the smoke suite with the flag
+    on (see below). (C) is committed, but this check was not finished:
+    rerun it, then measure (C) on nofib.
+- **Analysis of the argument rejections** (base, nofib rebuilt without
+  running; details in `WW-HIGHER-ORDER.md` §7, finer reasons committed in
+  `fedcaa9b2e`):
+  - "parameter not only called" (270 at pre-ww): 162 pass the parameter to
+    a recursive call (a static argument), 44 to a global function (recursive
+    combinators that do not inline: `sequence2`, `thenP`, `pgZeroOrMore`,
+    `unpackFoldrCString#`, ...), 31 to a local function, 29 return it.
+  - The recursive case is **not** handled by GHC already: the static
+    argument transformation is off at every -O level, and even with
+    `-fstatic-argument-transformation` it requires more than one static
+    value argument. Written in SAT form by hand (`go` local, `g` free),
+    `wwhoarg008` is split by our code with the same output.
+  - "not given known functions" (156): 154 call the parameter only with
+    data (first-order use, as in `map f`), which the split does not target.
+  - Continuations called with data: 54 of the 154 take 2 or more arguments;
+    31 have some argument constructed at every call (16 with 2 or more
+    arguments). That is the pool (C) targets.
+- **Benchmark optimisation level:** every nofib run so far was at `-O2`
+  (nofib's default `NoFibHcOpts`). `run-nofib.sh` / `run-all.sh` now take
+  `NOFIB_OPT` (results then go to `base-O1`, `funres-O1`, `report-O1.md`);
+  `-O0` was dropped (no demand analysis or worker/wrapper runs there) and
+  an `-O1` run was started and then cancelled by the user.
 
 ## What is implemented (all in `compiler/GHC/Core/Opt/WorkWrap.hs`)
 
 Notes to read: **[Worker/wrapper for function results]** (with sub-points
 (Depth), (Casts), (Demands), (Calls), (LetOrCase), (EtaFirst), (Small),
 (Boxity), (BoringOk)), **[Worker/wrapper for function arguments]** (with
-(TypeParams)), and **[Higher-order worker/wrapper statistics]**.
+(TypeParams) and (Constructed)), and **[Higher-order worker/wrapper
+statistics]**.
 
 - `tryWW` calls `splitHigherOrder`, which tries argument splits
   (`splitFunArg`, chained up to 4 parameters), then result splits
@@ -90,8 +140,8 @@ Notes to read: **[Worker/wrapper for function results]** (with sub-points
   - Calls of other result-split functions are expanded via their wrapper:
     `expandCall` uses `wo_fr_wrappers`, threaded through `wwTopBinds`.
 - **Argument splits:** `funArgConv` / `lambdaConv` / `functionsConv` /
-  `paramCalls` / `rewriteCalls` / `mkFunArgPairs`. They handle leading type
-  parameters and class dictionaries.
+  `conConv` / `paramCalls` / `rewriteCalls` / `mkFunArgPairs`. They handle
+  leading type parameters and class dictionaries.
 - **Statistics:** `-ddump-ww-ho-stats` (pass `CoreDoHoStats` in
   `GHC/Core/Opt/Pipeline.hs`) runs at three points: early (before the main
   simplifier), pre-ww (where worker/wrapper decides) and final. It counts
@@ -110,15 +160,17 @@ Notes to read: **[Worker/wrapper for function results]** (with sub-points
   - `wwreturn001-003`: GHC without the flag. These deliberately differ when
     the flag is forced on everywhere.
   - `wwreturn002_funres`, `wwreturn003_funres`, `wwfunres005`,
-    `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`, and
-  `wwhostats001` (the statistics terminate on a never-called parameter).
+    `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`,
+    `wwhostats001` (the statistics terminate on a never-called parameter),
+    and `wwcont_dump` (which functions (C) splits).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
-  `wwcast001-002`, `wwpoly001`, `wwcompose001-002`. Each output was taken
+  `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`. Each
+  output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 154 passes. A smoke suite of about 3,060 tests
+- Last results: `dmdanal` 157 passes. A smoke suite of about 3,060 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
-  differences and no Core Lint errors.
+  differences and no Core Lint errors (before (C); rerun pending).
 
 ## How to build, test and measure
 
@@ -130,14 +182,15 @@ cd ~/projects/ghc-ww-higher-order
 EXTRA_HC_OPTS="-fworker-wrapper-function-results -dcore-lint" ./hadrian/build -j20 --flavour=quick --freeze1 test \
   --test-root-dirs=testsuite/tests/{callarity,dmdanal,cpranal,simplCore/should_run,simplCore/should_compile,typecheck/should_run,deriving/should_run,codeGen/should_run,indexed-types/should_run,gadt,linear/should_run,programs,numeric/should_run,concurrent/should_run,polykinds,typecheck/should_compile,th} --test-speed=fast
 # nofib (about 2 hours; do not rebuild the compiler while it runs):
-ww-bench/run-all.sh          # -> ww-bench/results/report.md (base vs funres)
+ww-bench/run-all.sh          # -> ww-bench/results/report.md (base vs funres), at -O2
+NOFIB_OPT=-O1 ww-bench/run-all.sh   # -> ww-bench/results/report-O1.md
 ```
 
 Accepting new dump goldens: run with `--test-accept --only=NAME`, then
 filter the `.stderr` to the lines matching the test's `grep_errmsg` pattern.
 That keeps the goldens readable; the driver compares filtered output only.
 
-## Results so far (nofib, 115 benchmarks; `ww-bench/report-latest.md`)
+## Results so far (nofib at -O2, 115 benchmarks; `ww-bench/report-latest.md`)
 
 Third run, with type parameters and calls of split functions (details in
 `WW-HIGHER-ORDER.md` §7):
@@ -181,24 +234,32 @@ Third run, with type parameters and calls of split functions (details in
 
 ## What is left to do
 
-1. **Push** the commits after `5d4c77536d` when the user asks.
-2. **Remaining big rejection pools:**
-   - "parameter not only called": includes recursive functions passing the
-     parameter on (`wwhoarg008`). The recursive call could pass the
-     converted `g'`.
-   - "result tail is a local variable": continuation parameters. Needs the
-     argument and result conversions combined.
+1. **Finish (C):** check the smoke suite, then measure on nofib
+   (how many of the 31 candidates split, and allocation).
+2. **Push** the commits after `5d4c77536d` when the user asks.
+3. **Remaining big rejection pools:**
+   - **Static arguments (162):** recursive functions passing the function
+     parameter on unchanged (`wwhoarg008`). Either a SAT-style step in our
+     split (the worker's recursive call passes the converted `g'`), or SAT
+     for a single static function argument before worker/wrapper. The hand
+     SAT form already splits.
+   - "result tail is a local variable" / parameter returned (29):
+     continuation parameters. Needs the argument and result conversions
+     combined.
+   - Passed to global recursive combinators (44): would need the callee
+     changed; out of reach locally.
    - "small": by design.
-3. Type parameters *after* value parameters (argument split).
-4. Calls of *other* functions in result tails, beyond result-split wrappers.
-5. **An interaction to keep in mind:** the eta-expansion rule (EtaFirst)
+4. **Optionally an `-O1` nofib run** (`NOFIB_OPT=-O1`); cancelled once.
+5. Type parameters *after* value parameters (argument split).
+6. Calls of *other* functions in result tails, beyond result-split wrappers.
+7. **An interaction to keep in mind:** the eta-expansion rule (EtaFirst)
    assumes GHC will eta-expand, which it does not under `-fpedantic-bottoms`
    with a bottoming branch (found in `wwcast002`).
-6. **Before proposing upstream:** measure runtime (`NoFibRuns=5` on a quiet
+8. **Before proposing upstream:** measure runtime (`NoFibRuns=5` on a quiet
    machine); the timings on this machine are unreliable. Also measure
    compile time, and run the full testsuite (not just the smoke subset)
    with the flag on.
-7. **Housekeeping:** `build-setup.log` and the `ww-bench/results*`
+9. **Housekeeping:** `build-setup.log` and the `ww-bench/results*`
    directories are untracked or ignored.
 
 ## Related work on the `webs` branch (`~/projects/ghc-webs`)

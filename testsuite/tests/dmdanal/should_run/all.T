@@ -108,3 +108,9 @@ test('wwpoly001', normal, compile_and_run, ['-O -fworker-wrapper-function-result
 test('wwcompose001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 test('wwcompose002', [extra_files(['WWComposeA.hs'])], multimod_compile_and_run,
      ['wwcompose002', '-O -fworker-wrapper-function-results'])
+# wwcont001, wwcont002: continuations called with constructed data, the
+# constructor's fields passed instead ((Constructed) in Note [Worker/wrapper
+# for function arguments]); laziness of the fields is traced
+test('wwcont001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+test('wwcont002', [extra_files(['WWContA.hs'])], multimod_compile_and_run,
+     ['wwcont002', '-O -fworker-wrapper-function-results'])

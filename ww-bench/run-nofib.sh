@@ -12,7 +12,8 @@
 #                    *.dump-first-class-stats   (GHC.WebCore.FirstClass)
 #                    *.dump-simpl-stats         (simplifier/inliner ticks)
 # Set NOFIB_MODE (default fast) and NOFIB_DIRS (default: nofib's own default
-# set of benchmark directories) to change what runs.
+# set of benchmark directories) to change what runs, and NOFIB_OPT (default
+# -O2, nofib's own default) for the optimisation level.
 #
 # Timeouts: each compiler invocation is limited to WEBS_GHC_TIMEOUT seconds
 # (default 300; see ghc-timeout.sh), and the whole build-and-run of one
@@ -26,6 +27,7 @@ CONFIG_TIMEOUT=${WEBS_CONFIG_TIMEOUT:-3600}
 NAME=$1
 OPTS=${2:-}
 MODE=${NOFIB_MODE:-fast}
+OPT=${NOFIB_OPT:--O2}
 OUT=$ROOT/ww-bench/results/$NAME
 DUMPDIR=ww-dumps-$NAME
 
@@ -46,6 +48,7 @@ make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&
 echo "[$NAME] build and run (options: $OPTS)"
 timeout --kill-after=60 "$CONFIG_TIMEOUT" \
 make -k WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
+     NoFibHcOpts="$OPT -Wno-tabs" \
      EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-ww-ho-stats" \
      > "$OUT/nofib.log" 2>&1
 status=$?
