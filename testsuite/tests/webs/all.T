@@ -154,7 +154,11 @@ test('alltransforms003', [extra_files(['alltransforms001.hs'])], multimod_compil
 # approach 2 (splitting the function that returns it) is implemented.
 #   wwreturn001: g inlined, f's body (a call of marker) duplicated per call
 #   wwreturn002: g not inlined; g returns \x _ ->, calls pass the dead argument
+#   wwreturn003: f large and used twice: f split into $wf and a wrapper, which
+#                g returns; calls of the wrapper pass the dead argument
 test('wwreturn001', [grep_errmsg(r'\$wmarker \(|^g |^\$wg ')], compile,
      ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
 test('wwreturn002', [grep_errmsg(r'\\ x _ ->|^\$wg |= g [nm] |h[12] [ab] [ab]')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12] [ab] [ab]|^\$wg$')], compile,
      ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
