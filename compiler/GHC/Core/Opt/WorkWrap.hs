@@ -16,7 +16,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Unfold.Make
-import GHC.Core.Utils  ( exprType, exprIsHNF, mkLamTypes )
+import GHC.Core.Utils  ( exprType, exprIsHNF, mkLamTypes, stripTicksTopE )
 import GHC.Core.Type
 import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Core.SimpleOpt
@@ -38,7 +38,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Monad
 import GHC.Core.DataCon
-import Data.Maybe ( isJust, isNothing )
+import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, catMaybes )
 import qualified Data.Map as Map
 import GHC.Core.Make ( mkWildValBinder )
 import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
@@ -1427,15 +1427,67 @@ argRejectReason ww_opts fn_id rhs
              known cs@((_, a) : _) = let n = foldr (min . length . snd) (length a) cs
                                      in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
                                            | i <- [0 .. n - 1] ]
+             -- Why: the first use of a parameter that is not a call; what the
+             -- calls pass instead of known functions
+             not_called = [ u | q <- fun_params, Just u <- [nonCallUse fn_id q body] ]
+             unknown    = [ u | cs <- callss, Just u <- [unknownArgs cs] ]
          in return $ if null fun_params then "function only under a type"
-                     else if null callss then "parameter not only called"
-                     else if not (any known callss) then "not given known functions"
+                     else if null callss then "parameter not only called: "
+                                              ++ fromMaybe "?" (listToMaybe not_called)
+                     else if not (any known callss) then "not given known functions: "
+                                              ++ fromMaybe "never called" (listToMaybe unknown)
                      else "nothing to gain"
   | otherwise = return "arity above manifest lambdas"
   where
     fn_info  = idInfo fn_id
     ww_arity = workWrapArity fn_id rhs
     uf_opts  = so_uf_opts (wo_simple_opts ww_opts)
+
+-- | The first use of a function parameter that is not a call with value
+-- arguments, described (statistics only)
+nonCallUse :: Id -> Id -> CoreExpr -> Maybe String
+nonCallUse fn_id q = go "returned"
+  where
+    go ctx e = case e of
+      Var v | v == q -> Just ctx
+      _ | (Var v, args) <- collectArgs e, v == q
+        -> if any isValArg args then firstJust (map (go "passed to its own call") args)
+           else Just "applied to types only"
+      _ | (hd, args@(_ : _)) <- collectArgs e
+        -> firstJust (go "in a call's head" hd : map (go (argCtx hd)) args)
+      Lam _ b         -> go "returned from a lambda" b
+      Let bind body   -> firstJust (map (go "in a let right-hand side") (rhssOfBind bind) ++ [go ctx body])
+      Case sc _ _ alts -> firstJust (go "scrutinised (seq)" sc : [ go ctx rhs | Alt _ _ rhs <- alts ])
+      Cast b _        -> go (ctx ++ ", under a cast") b
+      Tick _ b        -> go ctx b
+      _               -> Nothing
+    argCtx hd = case stripTicksTopE (const True) hd of
+      Var f | f == fn_id                   -> "passed to a recursive call"
+            | Just _ <- isDataConWorkId_maybe f -> "stored in a constructor"
+            | isGlobalId f || isExportedId f -> "passed to a global function"
+            | otherwise                     -> "passed to a local function"
+      _                                     -> "passed to a computed function"
+    firstJust = listToMaybe . catMaybes
+
+-- | What the calls of a parameter pass, when no argument position gets a
+-- known function at every call (statistics only)
+unknownArgs :: [(IdEnv Id, [CoreExpr])] -> Maybe String
+unknownArgs [] = Nothing
+unknownArgs cs
+  | null fun_args = Just "only non-function arguments"
+  | otherwise     = Just (case [ what a | (env, a) <- fun_args, isNothing (classifyArg env a) ] of
+                            w : _ -> w
+                            []    -> "known at some calls only")
+  where
+    fun_args = [ (env, a) | (env, args) <- cs, a <- args, isFunTy (exprType a) ]
+    what a = case collectArgs (stripTicksTopE (const True) a) of
+      (Var v, [])   | isGlobalId v || isExportedId v -> "a global function"
+                    | otherwise                       -> "a parameter or lambda-bound variable"
+      (Var v, args) | all isTypeArg args, isGlobalId v || isExportedId v
+                                                      -> "a global function (type-applied)"
+                    | any isValArg args               -> "a partial application"
+      (Cast {}, _)                                    -> "a cast"
+      _                                               -> "another expression"
 
 -- | How many parameters of one function we split.
 -- See Note [Worker/wrapper for function arguments]

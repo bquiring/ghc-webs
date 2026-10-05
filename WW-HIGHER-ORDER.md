@@ -431,6 +431,26 @@ was then rebuilt and rerun alone and spliced into the logs).
 | result: small                              |         70 |        70 |
 
   (The 2 left are type parameters *after* value parameters.)
+
+  The two big argument pools, broken down (base, a rebuild of nofib
+  without running it; `nonCallUse` and `unknownArgs` in `WorkWrap.hs`):
+
+| argument rejection                                      | early | pre-ww | final |
+|---------------------------------------------------------|------:|-------:|------:|
+| not only called: passed to a recursive call             |   134 |    162 |   135 |
+| not only called: passed to a global function            |    58 |     44 |    26 |
+| not only called: passed to a local function             |    26 |     31 |    82 |
+| not only called: returned                               |     8 |     29 |    31 |
+| not only called: stored in a constructor                |     2 |      2 |     7 |
+| not only called: other (seq, returned from a lambda)    |     2 |      2 |     1 |
+| not given known functions: only non-function arguments  |   201 |    154 |   151 |
+| not given known functions: global function, partial app |     3 |      2 |     2 |
+| not given known functions: never called                 |     2 |      0 |     0 |
+
+  "Not given known functions" is almost always a first-order use of the
+  parameter (`f x` with `x` data, as in `map f`), which this split does not
+  target. The real pool is recursive functions that pass the parameter on
+  unchanged (a static argument, as in `wwhoarg008`).
 - **Performance is unchanged:**
 
 | measure                      | funres vs base | over |
