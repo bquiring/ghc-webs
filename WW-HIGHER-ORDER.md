@@ -292,7 +292,7 @@ Results:
 1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.
 2. §3 option 1 (the demand analyser records the result's signature): covers
    `wwreturn002`.
-4. §2.2 (function arguments).
+3. §2.2 (function arguments).
 (§2.3, data structures, is out of scope: see there.)
 
 ## Notes on `WORKING-THE-WORKER-WRAPPER.md`
