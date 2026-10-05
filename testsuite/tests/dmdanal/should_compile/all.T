@@ -138,3 +138,7 @@ test('wwmix002_dump', [grep_errmsg(r'^g = |^\$w\$?wg$')], compile,
 for name in ['wwhoarg001_dump', 'wwhoarg002_dump', 'wwhoarg006_dump']:
     test(name, [grep_errmsg(r'= \\ c -> |^\$w\$wh$|= \$w\$wh ')], compile,
          ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])
+# The statistics pass must terminate on a function parameter that is never
+# called (it once counted through [0 .. maxBound])
+test('wwhostats001', [grep_errmsg(r'ww-ho-reject')], compile,
+     ['-O -ddump-ww-ho-stats'])

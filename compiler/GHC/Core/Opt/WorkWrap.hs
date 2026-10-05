@@ -1421,9 +1421,12 @@ argRejectReason ww_opts fn_id rhs
     then return "type parameters after value parameters"
     else let fun_params = [ q | q <- vals, isFunTy (idType q) ]
              callss     = [ cs | q <- fun_params, Just cs <- [paramCalls emptyVarEnv q body] ]
-             known cs   = let n = foldr (min . length . snd) maxBound cs
-                          in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
-                                | i <- [0 .. n - 1], n /= maxBound ]
+             -- Some argument position known at every call (a parameter
+             -- never called has no such position)
+             known []              = False
+             known cs@((_, a) : _) = let n = foldr (min . length . snd) (length a) cs
+                                     in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
+                                           | i <- [0 .. n - 1] ]
          in return $ if null fun_params then "function only under a type"
                      else if null callss then "parameter not only called"
                      else if not (any known callss) then "not given known functions"
