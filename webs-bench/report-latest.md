@@ -12,21 +12,21 @@
 | | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
 |---|---|---|---|---|---|---|---|---|---|
 | before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13729 | 518 | 5754 | 1130 | 1182 | 70236 | 1504 | 817 | 1915 |
+| after | 13727 | 518 | 5754 | 1130 | 1182 | 70253 | 1499 | 817 | 1915 |
 
 ## early  (115 benchmarks)
 
 | | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
 |---|---|---|---|---|---|---|---|---|---|
 | before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13577 | 479 | 5760 | 1129 | 1182 | 69995 | 1389 | 927 | 1899 |
+| after | 13580 | 479 | 5743 | 1129 | 1182 | 69999 | 1388 | 923 | 1871 |
 
 ## early-late  (115 benchmarks)
 
 | | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
 |---|---|---|---|---|---|---|---|---|---|
 | before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13728 | 518 | 5769 | 1130 | 1182 | 70244 | 1500 | 817 | 1894 |
+| after | 13729 | 518 | 5752 | 1130 | 1182 | 70269 | 1495 | 813 | 1866 |
 
 ## Per benchmark, base: before -> after (returned / passed / stored_data / unknown_calls)
 
@@ -152,62 +152,109 @@
 
 | kind | base | late | early | early-late |
 |---|---|---|---|---|
-| Total ticks | 810502 | 812609 (+0.3%) | 806561 (-0.5%) | 808640 (-0.2%) |
-| PreInlineUnconditionally | 256187 | 257017 (+0.3%) | 254536 (-0.6%) | 255359 (-0.3%) |
-| PostInlineUnconditionally | 19444 | 19453 (+0.0%) | 19868 (+2.2%) | 19876 (+2.2%) |
-| UnfoldingDone | 80032 | 80127 (+0.1%) | 78611 (-1.8%) | 78703 (-1.7%) |
-| RuleFired | 65812 | 66053 (+0.4%) | 65891 (+0.1%) | 66132 (+0.5%) |
-| BetaReduction | 306412 | 307248 (+0.3%) | 304821 (-0.5%) | 305650 (-0.2%) |
-| KnownBranch | 53752 | 53802 (+0.1%) | 54001 (+0.5%) | 54042 (+0.5%) |
-| CaseOfCase | 5247 | 5244 (-0.1%) | 5234 (-0.2%) | 5231 (-0.3%) |
+| Total ticks | 810502 | 812595 (+0.3%) | 805000 (-0.7%) | 807080 (-0.4%) |
+| PreInlineUnconditionally | 256187 | 257012 (+0.3%) | 253885 (-0.9%) | 254708 (-0.6%) |
+| PostInlineUnconditionally | 19444 | 19453 (+0.0%) | 19847 (+2.1%) | 19855 (+2.1%) |
+| UnfoldingDone | 80032 | 80126 (+0.1%) | 78376 (-2.1%) | 78469 (-2.0%) |
+| RuleFired | 65812 | 66053 (+0.4%) | 65928 (+0.2%) | 66169 (+0.5%) |
+| BetaReduction | 306412 | 307244 (+0.3%) | 304336 (-0.7%) | 305165 (-0.4%) |
+| KnownBranch | 53752 | 53799 (+0.1%) | 53864 (+0.2%) | 53905 (+0.3%) |
+| CaseOfCase | 5247 | 5244 (-0.1%) | 5235 (-0.2%) | 5232 (-0.3%) |
 | EtaExpansion | 1690 | 1690 (+0.0%) | 1690 (+0.0%) | 1690 (+0.0%) |
 | EtaReduction | 252 | 245 (-2.8%) | 251 (-0.4%) | 244 (-3.2%) |
 | LetFloatFromLet | 0 | 0 () | 0 () | 0 () |
-| FillInCaseDefault | 3347 | 3347 (+0.0%) | 3344 (-0.1%) | 3344 (-0.1%) |
-| CaseElim | 1415 | 1462 (+3.3%) | 1411 (-0.3%) | 1458 (+3.0%) |
-| CaseIdentity | 455 | 455 (+0.0%) | 454 (-0.2%) | 454 (-0.2%) |
-| CaseMerge | 697 | 698 (+0.1%) | 697 (+0.0%) | 698 (+0.1%) |
+| FillInCaseDefault | 3347 | 3347 (+0.0%) | 3316 (-0.9%) | 3316 (-0.9%) |
+| CaseElim | 1415 | 1462 (+3.3%) | 1408 (-0.5%) | 1455 (+2.8%) |
+| CaseIdentity | 455 | 455 (+0.0%) | 421 (-7.5%) | 421 (-7.5%) |
+| CaseMerge | 697 | 698 (+0.1%) | 698 (+0.1%) | 699 (+0.3%) |
 | AltMerge | 55 | 55 (+0.0%) | 55 (+0.0%) | 55 (+0.0%) |
-| $w workers (final Core) | 1926 | 1915 (-0.6%) | 1899 (-1.4%) | 1894 (-1.7%) |
+| $w workers (final Core) | 1926 | 1915 (-0.6%) | 1871 (-2.9%) | 1866 (-3.1%) |
 
 ## UnfoldingDone per benchmark (largest changes vs base)
 
 | benchmark | base | late | early | early-late |
 |---|---|---|---|---|
-| real/veritas | 6244 | 6244 | 5742 | 5742 |
+| real/veritas | 6244 | 6244 | 5733 | 5733 |
 | real/anna | 6439 | 6464 | 6167 | 6192 |
-| real/reptile | 2236 | 2236 | 2124 | 2124 |
-| spectral/hartel/transform | 1199 | 1199 | 1130 | 1130 |
-| real/fem | 1309 | 1361 | 1303 | 1355 |
-| spectral/boyer2 | 380 | 380 | 330 | 330 |
-| spectral/rewrite | 710 | 710 | 672 | 672 |
-| spectral/minimax | 472 | 472 | 437 | 437 |
-| real/scs | 1899 | 1899 | 1866 | 1866 |
+| spectral/hartel/transform | 1199 | 1199 | 1055 | 1055 |
+| real/reptile | 2236 | 2236 | 2115 | 2115 |
+| spectral/boyer2 | 380 | 380 | 312 | 312 |
+| real/fem | 1309 | 1361 | 1301 | 1353 |
+| real/bspt | 3100 | 3101 | 3055 | 3056 |
+| spectral/rewrite | 710 | 710 | 671 | 671 |
+| real/gg | 1819 | 1819 | 1784 | 1784 |
+| real/symalg | 1268 | 1268 | 1233 | 1233 |
+| spectral/minimax | 472 | 473 | 437 | 438 |
+| real/scs | 1899 | 1899 | 1867 | 1867 |
 | spectral/multiplier | 829 | 829 | 798 | 798 |
-| real/gg | 1819 | 1819 | 1795 | 1795 |
-| real/symalg | 1268 | 1268 | 1245 | 1245 |
-| real/bspt | 3100 | 3101 | 3078 | 3079 |
-| spectral/clausify | 197 | 197 | 175 | 175 |
-| real/fluid | 3158 | 3161 | 3139 | 3139 |
-| spectral/expert | 483 | 483 | 466 | 466 |
-| spectral/circsim | 706 | 706 | 690 | 690 |
-| real/hpg | 1219 | 1219 | 1205 | 1205 |
+| spectral/clausify | 197 | 197 | 172 | 172 |
+| spectral/expert | 483 | 483 | 462 | 462 |
+| spectral/hartel/comp_lab_zift | 531 | 531 | 512 | 512 |
+| real/compress2 | 358 | 363 | 341 | 346 |
+| real/linear | 2446 | 2453 | 2456 | 2463 |
+| spectral/hartel/solid | 436 | 436 | 419 | 419 |
+| real/compress | 400 | 400 | 384 | 384 |
+| real/grep | 738 | 738 | 754 | 754 |
 | spectral/integer | 151 | 151 | 137 | 137 |
-| real/linear | 2446 | 2453 | 2433 | 2440 |
+| real/fluid | 3158 | 3161 | 3145 | 3145 |
 | spectral/cryptarithm1 | 97 | 97 | 84 | 84 |
-| spectral/mate | 870 | 870 | 883 | 883 |
-| spectral/simple | 2236 | 2236 | 2248 | 2248 |
-| real/pic | 767 | 767 | 758 | 758 |
-| spectral/para | 1127 | 1127 | 1135 | 1135 |
+| spectral/mate | 870 | 868 | 883 | 883 |
 
 # Compile and run performance (from the nofib logs)
 
 | measure | late | early | early-late |
 |---|---|---|---|
-| compiler allocation vs base | +15.93% (geomean over 117) | +7.76% (geomean over 117) | +22.75% (geomean over 117) |
-| program allocation vs base | +0.27% (geomean over 113) | +0.01% (geomean over 113) | +0.26% (geomean over 113) |
+| compiler allocation vs base | +20.97% (geomean over 117) | +11.78% (geomean over 117) | +30.76% (geomean over 117) |
+| program allocation vs base | +0.26% (geomean over 113) | -0.01% (geomean over 113) | +0.23% (geomean over 113) |
 
 Times are not reported: they are not reliable on this machine (see report.py).
+
+# Code size (from size(1) in the nofib logs)
+
+If the web transformations reduce inlining and worker/wrapper, the code
+of the benchmarks' own modules should shrink.  The executable also
+contains the RTS and the libraries, which do not change.
+
+| measure | base | late | early | early-late |
+|---|---|---|---|---|
+| object code (text), total | 7239220 | 7366251 (+1.8%; geomean +1.97%) | 7250324 (+0.2%; geomean +0.37%) | 7368297 (+1.8%; geomean +2.12%) |
+| object files (text+data+bss), total | 8533500 | 8661987 (+1.5%; geomean +1.47%) | 8545548 (+0.1%; geomean +0.30%) | 8664921 (+1.5%; geomean +1.64%) |
+| executable (text), total | 520418811 | 520538107 (+0.0%; geomean +0.02%) | 520435131 (+0.0%; geomean +0.00%) | 520546235 (+0.0%; geomean +0.02%) |
+
+## Object code (text) per benchmark (largest changes vs base)
+
+| benchmark | base | late | early | early-late |
+|---|---|---|---|---|
+| wave4main | 26566 | +12.6% | +33.4% | +46.5% |
+| nucleic2 | 54117 | +41.7% | +13.0% | +41.6% |
+| fish | 23443 | +16.2% | +0.0% | +16.2% |
+| scc | 3641 | +15.5% | +0.0% | +15.5% |
+| mkhprog | 24386 | +15.4% | -1.0% | +13.2% |
+| bernouilli | 8658 | +8.6% | +1.2% | +9.8% |
+| dom-lt | 69377 | +8.5% | +0.4% | +8.5% |
+| gamteb | 50290 | +7.9% | +0.0% | +7.9% |
+| circsim | 50034 | +3.2% | +6.0% | +6.7% |
+| rewrite | 60256 | +4.6% | +2.5% | +6.7% |
+| typecheck | 31667 | +6.6% | -2.8% | +3.7% |
+| puzzle | 75841 | -6.4% | +0.0% | -6.4% |
+| comp_lab_zift | 78839 | +5.4% | +1.4% | +6.1% |
+| fibheaps | 23713 | +4.9% | +0.0% | +4.9% |
+| fft | 25220 | +4.4% | +0.4% | +2.0% |
+| primetest | 23199 | +3.9% | +0.1% | +3.9% |
+| fasta | 6432 | +3.9% | +0.0% | +3.9% |
+| fannkuch-redux | 14913 | +3.6% | +0.0% | +3.6% |
+| reptile | 255588 | +1.1% | -3.6% | -2.6% |
+| fluid | 396657 | +3.4% | -0.7% | +2.6% |
+| fft2 | 30556 | +3.3% | +0.0% | +3.3% |
+| listcompr | 15365 | +3.2% | -1.4% | +1.8% |
+| linear | 129332 | +3.1% | +0.1% | +3.1% |
+| listcopy | 15661 | +3.1% | -1.3% | +1.8% |
+| symalg | 110683 | +1.2% | +2.0% | +3.1% |
+| integrate | 8740 | +2.6% | +0.0% | +2.6% |
+| anna | 856210 | +1.9% | +0.6% | +2.5% |
+| ansi | 13702 | +2.5% | +2.3% | +2.5% |
+| transform | 149700 | +2.4% | -1.3% | +2.3% |
+| boyer2 | 42555 | +1.3% | -2.4% | -0.9% |
 
 ## Program allocation per benchmark (bytes; change vs base)
 
@@ -221,7 +268,7 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | VSD | 50336 | +0.0% | +0.0% | +0.0% |
 | VSM | 400050304 | +0.0% | +0.0% | +0.0% |
 | anna | 195002328 | +0.0% | +0.0% | +0.0% |
-| ansi | 1265690552 | +0.0% | +0.0% | +0.0% |
+| ansi | 1265690552 | -0.0% | +0.0% | -0.0% |
 | atom | 537524528 | +0.0% | +0.0% | +0.0% |
 | awards | 486399944 | +0.0% | +0.0% | +0.0% |
 | banner | 613288616 | +0.0% | +0.0% | +0.0% |
@@ -238,14 +285,14 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | clausify | 299615688 | +0.0% | +0.0% | +0.0% |
 | comp_lab_zift | 452726128 | +4.4% | +0.0% | +4.4% |
 | compress | 533552896 | +0.0% | +0.0% | +0.0% |
-| compress2 | 599413952 | -8.1% | +0.0% | -8.1% |
+| compress2 | 599413952 | -8.4% | +0.0% | -8.4% |
 | constraints | 1254410000 | +0.0% | +0.0% | +0.0% |
 | cryptarithm1 | 1993762888 | +0.0% | +0.0% | +0.0% |
 | cryptarithm2 | 370194224 | +0.0% | +0.0% | +0.0% |
 | cse | 388280528 | +0.5% | +0.0% | +0.5% |
 | digits-of-e1 | 101892648 | +0.0% | +0.0% | +0.0% |
 | digits-of-e2 | 226018856 | +0.0% | +0.0% | +0.0% |
-| dom-lt | 541748184 | +11.6% | +0.0% | +11.6% |
+| dom-lt | 541748184 | +12.2% | +0.0% | +12.2% |
 | eliza | 409884800 | +0.0% | +0.0% | +0.0% |
 | event | 321891624 | +0.0% | +0.0% | +0.0% |
 | exact-reals | 89758928 | +0.0% | +0.0% | +0.0% |
@@ -257,7 +304,7 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | fft | 309653712 | +0.0% | -0.0% | -0.0% |
 | fft2 | 211347480 | -1.6% | +0.0% | -1.6% |
 | fibheaps | 652742424 | +4.7% | +0.0% | +4.7% |
-| fish | 626063816 | +0.1% | +0.0% | +0.1% |
+| fish | 626063816 | -0.0% | +0.0% | -0.0% |
 | fluid | 215121992 | +0.1% | +0.0% | +0.2% |
 | fulsom | 506338968 | +0.0% | +0.0% | +0.0% |
 | gamteb | 473334440 | -2.1% | +0.0% | -2.1% |
@@ -271,10 +318,10 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | ida | 348109296 | +0.0% | +0.0% | +0.0% |
 | infer | 221641496 | +0.1% | +0.0% | +0.1% |
 | integer | 308020648 | +0.0% | +0.0% | +0.0% |
-| integrate | 342470848 | +0.0% | +0.0% | +0.0% |
+| integrate | 342470848 | -0.5% | +0.0% | -0.5% |
 | k-nucleotide | 0 |  |  |  |
 | kahan | 49080 | +0.0% | +0.0% | +0.0% |
-| knights | 130041032 | -0.4% | +0.0% | -0.4% |
+| knights | 130041032 | -0.4% | -1.2% | -1.6% |
 | lambda | 291501944 | +0.0% | +0.0% | +0.0% |
 | last-piece | 743567088 | +0.0% | +0.0% | +0.0% |
 | lcss | 669846936 | +0.0% | +0.0% | +0.0% |
@@ -286,12 +333,12 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | maillist | 809998896 | +0.0% | +0.0% | +0.0% |
 | mandel | 175337024 | +0.0% | +0.0% | +0.0% |
 | mandel2 | 2298992 | +0.0% | +0.0% | +0.0% |
-| mate | 60655328 | +0.1% | +0.1% | +0.2% |
+| mate | 60655328 | +0.1% | -0.2% | -0.7% |
 | minimax | 291353088 | +0.0% | +0.0% | +0.0% |
 | mkhprog | 1100077760 | +0.0% | +0.0% | +0.0% |
 | multiplier | 379885160 | +0.0% | +0.0% | +0.0% |
 | n-body | 163144 | +0.0% | +0.0% | +0.0% |
-| nucleic2 | 338159128 | +0.8% | +0.0% | +0.8% |
+| nucleic2 | 338159128 | -0.1% | -0.9% | -0.1% |
 | para | 501836112 | +0.0% | +0.0% | +0.0% |
 | paraffins | 407532528 | +0.0% | +0.0% | +0.0% |
 | parser | 240605560 | +0.0% | +0.0% | +0.0% |
@@ -312,7 +359,7 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | rsa | 173873872 | +0.0% | +0.0% | +0.0% |
 | scc | 57968 | +0.3% | +0.0% | +0.3% |
 | sched | 337602760 | +0.0% | +0.0% | +0.0% |
-| scs | 408726016 | -0.0% | +0.0% | +0.0% |
+| scs | 408726016 | -0.0% | +0.0% | -0.0% |
 | simple | 82104688 | +0.0% | +0.0% | +0.0% |
 | smallpt | 0 |  |  |  |
 | solid | 640379584 | +0.0% | +0.0% | +0.0% |
@@ -324,7 +371,7 @@ Times are not reported: they are not reliable on this machine (see report.py).
 | transform | 394676944 | +0.0% | +0.0% | +0.0% |
 | treejoin | 465764632 | +0.7% | +0.0% | +0.7% |
 | typecheck | 262950712 | +0.0% | +0.1% | +0.1% |
-| veritas | 419856696 | +0.0% | +0.0% | +0.0% |
+| veritas | 419856696 | -0.0% | -0.0% | -0.0% |
 | wang | 486367736 | +0.0% | +0.0% | +0.0% |
 | wave4main | 305912088 | +13.8% | +0.3% | +12.3% |
 | wheel-sieve1 | 27573136 | +0.0% | +0.0% | +0.0% |

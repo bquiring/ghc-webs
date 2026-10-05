@@ -108,6 +108,47 @@ unboxing and absent-argument removal. The survey (`WEBS-WW-SURVEY.md`) lists
 further worker/wrapper patterns that could move into the early pass, CPR and
 call-by-value in particular. Those would test the hypothesis more strongly.
 
+## 3. All seven transformations (second run)
+
+Same setup, but T is now every transformation: super-beta inlining,
+constant propagation, arity raising, dead parameters, uncurrying (late
+only), result raising (web CPR) and strictness.  The table compares it with
+the first run (only arity raising, dead parameters and uncurrying):
+
+| vs `base` | `early`, 3 passes | `early`, 7 passes | `late`, 3 passes | `late`, 7 passes |
+|---|---|---|---|---|
+| total ticks | −0.5% | **−0.7%** | +0.3% | +0.3% |
+| `UnfoldingDone` (inlinings) | −1.8% | **−2.1%** | +0.1% | +0.1% |
+| `PreInlineUnconditionally` | −0.6% | −0.9% | +0.3% | +0.3% |
+| `$w` workers in the final Core | −1.4% | **−2.9%** | −0.6% | −0.6% |
+| object code (text), geomean | +0.19% | +0.37% | +1.74% | +1.97% |
+| object code (text), total | +0.0% | +0.2% | +1.5% | +1.8% |
+| compiler allocation (geomean) | +7.8% | +11.8% | +15.9% | +21.0% |
+| program allocation (geomean) | +0.01% | −0.01% | +0.27% | +0.26% |
+
+Executables change by at most 0.02%: they are dominated by the RTS and the
+libraries, so code size is measured on the benchmarks' own object files.
+
+- **Worker/wrapper.** Moving CPR (result raising) and call-by-value
+  (strictness) into the early pass doubles the drop in `$w` workers, from
+  −1.4% to −2.9%.  The web passes now do part of worker/wrapper's job.
+- **Inlining.** `UnfoldingDone` falls a little more, from −1.8% to −2.1%.
+- **Code size does not fall.**  The benchmarks' object code grows slightly
+  in `early` (+0.37% geomean; `wave4main` +33%, `nucleic2` +13%,
+  `circsim` +6%; `reptile` −3.6%, `typecheck` −2.8%).  Fewer workers and
+  inlinings do not give smaller code.  The likely reasons are that the
+  simplifier still inlines the (now smaller) functions, and that unboxed-
+  tuple calling conventions at unknown calls cost code at each call site.
+  The hypothesis holds for the inliner's work but not for code size, at
+  least for these transformations.
+- **Runtime allocation** is unchanged in `early` (−0.01%).  In `late` the
+  outliers are the same as before (`wave4main` +13.8%, `dom-lt` +12.2%,
+  `compress2` −8.4%), so the new passes did not cause them.
+- **Compile cost** grows by 4–5 points per configuration: each pass adds
+  rounds, each round runs Web Lint.
+- No configuration introduces a build or run failure (the same four
+  pre-existing failures as `base`).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
@@ -137,5 +178,6 @@ The remaining outliers are `wave4main` +13.8% and `dom-lt` +11.6%, against
 - Look at the `late` outliers (`wave4main`, `dom-lt`).
 - Profile the web pipeline itself (+8–16% compiler allocation): Web Lint
   runs once per round of each transformation.
-- Move more worker/wrapper patterns into the early pass (`WEBS-WW-SURVEY.md`:
-  CPR, call-by-value) and measure again.
+- Find out why code size grows in `early` (`wave4main`, `nucleic2`).
+- Count how often each new pass fires on nofib (verdict dumps).
+- Web-based defunctionalization.
