@@ -654,7 +654,8 @@ data GeneralFlag
    | Opt_CoreWebsResultRaise -- ^ Web pipeline: result raising (web CPR)
    | Opt_CoreWebsConstProp  -- ^ Web pipeline: constant propagation
    | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
-   | Opt_CoreWebsEarly      -- ^ Also run the web pipeline before the main simplifier
+   | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
+                            --   before worker/wrapper (needs -fstrictness)
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise

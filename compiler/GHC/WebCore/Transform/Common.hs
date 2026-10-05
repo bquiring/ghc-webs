@@ -198,11 +198,37 @@ fixBinderInfo b new_ty new_arity fates
   = setIdCprSig (setIdDmdSig (fix_join (setIdArity b' (new_arity False (idArity b))))
                              (reshapeDmdSig fates (idDmdSig b)))
                 topCprSig
+    -- The binder's usage demand and call arity describe how it was called
+    -- with its old arity: "called with two arguments" of a function that
+    -- now takes one (uncurried) would let the simplifier eta-expand it,
+    -- making a partial application of a bottoming function a value (see
+    -- Note [Usage information after a transformation])
+    `setIdDemandInfo` topDmd
+    `setIdCallArity` 0
   where
     b' = setIdType b new_ty
     fix_join b'' = case idJoinPointHood b of
       JoinPoint ar -> asJoinId b'' (new_arity True ar)
       NotJoinPoint -> b''
+
+{- Note [Usage information after a transformation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Demand analysis records on a binder how it is used (idDemandInfo, e.g.
+LC(S,C(1,L)): called with two arguments), and Call Arity records how many
+arguments it is always called with.  The simplifier eta-expands a binder up
+to that many arguments.  After a transformation changes the binder's type,
+both are stale.  In the early run (a simplifier runs afterwards) this
+was a miscompilation: uncurrying
+
+    applyToN :: Int -> Tricky -> Tricky      -- Tricky = (# #) -> Tricky
+into  applyToN :: (# Int, Tricky #) -> Tricky
+
+kept the usage "called with two arguments, then the result once more", so
+the simplifier eta-expanded the uncurried applyToN to arity two, and
+applyToN (# n, t #), which must diverge, became a value
+(testsuite: codeGen/should_run/T24295b, with -fpedantic-bottoms).
+fixBinderInfo resets both.
+-}
 
 {- Note [Unfoldings and rules after a transformation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -175,9 +175,20 @@ getCoreToDo dflags hpt_rule_base extra_vars
     dmd_cpr_ww = if ww_on then [CoreDoDemand True,CoreDoCpr,CoreDoWorkerWrapper]
                           else [CoreDoDemand False] -- NB: No CPR! See Note [Don't change boxity without worker/wrapper]
 
+    -- The early run of the web pipeline (-fcore-webs-early) goes between
+    -- demand analysis and CPR/worker-wrapper: after the main simplifier
+    -- (inlining, contraction) and with demand information, but before
+    -- worker/wrapper, so that it and the later simplifier runs see its
+    -- result.  See Note [Early webs] in GHC.WebCore.Pipeline
+    webs_early = gopt Opt_CoreWebsEarly dflags
+    dmd_webs_cpr_ww
+      | webs_early = case dmd_cpr_ww of
+                       dmd : rest -> dmd : CoreDoWebs True : rest
+                       []         -> []
+      | otherwise  = dmd_cpr_ww
 
     demand_analyser = (CoreDoPasses (
-                           dmd_cpr_ww ++
+                           dmd_webs_cpr_ww ++
                            [simplify "post-worker-wrapper"]
                            ))
 
@@ -250,11 +261,6 @@ getCoreToDo dflags hpt_rule_base extra_vars
            -- forms to the top level. See Note [Grand plan for static forms] in
            -- GHC.Iface.Tidy.StaticPtrTable.
            static_ptrs_float_outwards,
-
-        -- The early run of the web pipeline (-fcore-webs-early): web
-        -- transformations before the main simplifier, so that it (and
-        -- worker/wrapper) see their result.  See GHC.WebCore.Pipeline
-        runWhen (gopt Opt_CoreWebsEarly dflags) (CoreDoWebs True),
 
         -- Run the simplifier phases 2,1,0 to allow rewrite rules to fire
         runWhen do_simpl3

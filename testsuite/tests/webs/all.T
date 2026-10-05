@@ -137,3 +137,12 @@ test('alltransforms002', [extra_files(['alltransforms001.hs'])], multimod_compil
      ['alltransforms001', all_opts])
 test('webs007', [extra_files(['Webs006A.hs', 'webs006.hs'])], multimod_compile_and_run,
      ['webs006', all_opts])
+
+# The early run (after demand analysis, before worker/wrapper); webs008 checks
+# that stale usage information does not let the simplifier eta-expand an
+# uncurried function (-fpedantic-bottoms)
+early_opts = '-O -fcore-webs-early -dcore-lint'
+test('webs008', [], compile_and_run,
+     [early_opts + ' -fcore-webs-uncurry -floopification -fpedantic-bottoms'])
+test('alltransforms003', [extra_files(['alltransforms001.hs'])], multimod_compile_and_run,
+     ['alltransforms001', all_opts.replace('-fcore-webs ', '-fcore-webs-early ')])

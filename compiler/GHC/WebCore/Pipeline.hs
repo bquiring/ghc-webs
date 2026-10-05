@@ -86,7 +86,7 @@ equal types, and alpha-equivalent right-hand sides, and must contain no webs.
 -}
 
 -- | Run the web pipeline.  The Bool says whether this is the early run,
--- before the main simplifier (-fcore-webs-early); see Note [Early webs].
+-- before worker/wrapper (-fcore-webs-early); see Note [Early webs].
 webPass :: Bool -> ModGuts -> CoreM ModGuts
 webPass early guts
   = do { dflags <- getDynFlags
@@ -237,8 +237,6 @@ runTransforms early logger dflags cfg sigs binds0
         , \us done b -> strictnessRound us exposed done b ) ]
 
     step (binds, changed) (flag, name, dump_flag, do_round)
-      | early, flag == Opt_CoreWebsUncurry
-      = return (binds, changed)   -- See Note [No early uncurrying]
       | gopt flag dflags
       = do { (binds', changed') <- runTransform name dump_flag do_round
                                                 logger dflags cfg sigs binds
@@ -406,36 +404,24 @@ dump :: Logger -> DumpFlag -> String -> SDoc -> CoreM ()
 dump logger flag hdr doc
   = liftIO $ putDumpFileMaybe logger flag hdr FormatCore doc
 
-{- Note [No early uncurrying]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The early run does not uncurry.  Uncurrying before demand analysis loses
-GHC's call-by-value for strict arguments: the simplifier evaluates a strict
-argument before a call (using the callee's demand signature), but not a
-strict *component* of an unboxed-tuple argument.  So after uncurrying the
-accumulator loop
-    go (x:xs) acc = go xs (if x > acc then x else acc)
-into  go (# xs, acc #), each call builds a thunk for the accumulator, and the
-chain overflows the stack when forced (testsuite: simplCore/should_run/T10830,
-maximumBy over [1..10000] with a 100k stack).  After demand analysis and
-worker/wrapper (the late run) the arguments are already evaluated where they
-need to be.
--}
-
 {- Note [Early webs]
 ~~~~~~~~~~~~~~~~~~~~
-With -fcore-webs-early the web pipeline also runs before the main simplifier
-phases (GHC.Core.Opt.Pipeline.getCoreToDo), so that the simplifier, the
-inliner and worker/wrapper see the transformed program.
+With -fcore-webs-early the web pipeline runs in the middle of the Core
+pipeline (GHC.Core.Opt.Pipeline.getCoreToDo): after the main simplifier
+phases, call arity and demand analysis, and before CPR analysis and
+worker/wrapper.  So the transformations see a program that the inliner has
+already contracted, with demand information on its binders; and
+worker/wrapper, and the simplifier runs after it, see their result.  The
+experiment (WEBS-EXPERIMENTS.md) asks whether they then have less to do.
 
-Demand analysis has not run yet at that point, so arity raising only finds
-the lambdas whose strictness is evident syntactically (see isStrictIn in
-GHC.WebCore.Transform.ArityRaise).  We deliberately do not run demand
-analysis just for this pass: it would change what the rest of the pipeline
-sees, and confound the experiment (does an early web pass change what the
-inliner does?).
+Earlier versions ran before the main simplifier, with only syntactic
+strictness (isStrictIn) and without uncurrying (which, before demand
+analysis, lost call-by-value for strict arguments: simplCore/should_run/
+T10830 overflowed its stack).
 
-Before the simplifier, INLINE and INLINABLE functions have stable unfoldings
-that the inliner relies on.  Annotation treats them as interface Ids
-(ws_interface_ids), so their types never change and their unfoldings are
-kept.
+The simplifier runs afterwards, so INLINE and INLINABLE functions, whose
+stable unfoldings it relies on, are treated as interface Ids
+(ws_interface_ids): their types never change and their unfoldings are kept.
+Stale vanilla unfoldings are zapped (Note [Unfoldings and rules after a
+transformation] in GHC.WebCore.Transform.Common).
 -}
