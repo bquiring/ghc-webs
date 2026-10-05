@@ -117,7 +117,7 @@ wrapper expects. That is a property of `h`'s body (it passes only `f'`),
 established by analysis. The adapter is closed; it mentions only its own
 binders.
 
-### 2.3 Data structures
+### 2.3 Data structures (out of scope)
 
 ```haskell
 g n lst = let f x y = e in f : lst                     -- y dead
@@ -130,10 +130,14 @@ $wg n lst = let f' x = e in f' : lst                   -- a list of workers
 
 This is the same idea through a type constructor: worker/wrapper on the
 element type of a list. A `map` of the wrapper restores the original list.
-It only pays when the `map` fuses with the consumer (`foldr/build`), so that
-the consumer calls `f'` directly. This is the hardest case. It needs the
-transformation to be type-directed through the data structure, and it
-overlaps with the webs work. It comes last.
+
+**Not pursued.** It only pays when the restoring `map` fuses with the
+consumer (`foldr/build`), so that the consumer calls `f'` directly. Nothing
+guarantees that fusion happens downstream. When it does not, the split costs
+an extra traversal and a new list, so the transformation cannot be relied
+on. A data structure of functions needs a type-directed transformation of
+the element type across all producers and consumers, which is what the webs
+do (`webs` branch), not a local worker/wrapper split.
 
 ### 2.4 Shared partial applications
 
@@ -273,7 +277,7 @@ Results:
 3. §2.4 (shared partial applications): needed for the calls `h a b` to
    benefit.
 4. §2.2 (function arguments).
-5. §2.3 (data structures), probably through fusion.
+(§2.3, data structures, is out of scope: see there.)
 
 ## Notes on `WORKING-THE-WORKER-WRAPPER.md`
 
