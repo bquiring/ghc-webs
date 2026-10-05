@@ -10,6 +10,7 @@ import GHC.Driver.DynFlags
 import GHC.Core.FamInstEnv
 import GHC.Core.Opt.WorkWrap
 import GHC.Unit.Types
+import GHC.Types.Var.Env ( emptyVarEnv )
 
 initWorkWrapOpts :: Module -> DynFlags -> FamInstEnvs -> WwOpts
 initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
@@ -23,4 +24,5 @@ initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
   , wo_dicts_strict      = gopt Opt_DictsStrict dflags
   , wo_dmd_unbox_width   = dmdUnboxWidth dflags
   , wo_max_worker_args   = maxWorkerArgs dflags
+  , wo_fr_wrappers       = emptyVarEnv
   }

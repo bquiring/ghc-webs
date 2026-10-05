@@ -80,7 +80,25 @@ info for exported values).
 wwTopBinds :: WwOpts -> UniqSupply -> CoreProgram -> CoreProgram
 
 wwTopBinds ww_opts us top_binds
-  = initUs_ us $ concatMapM (wwBind ww_opts) top_binds
+  = initUs_ us $ go ww_opts top_binds
+  where
+    -- Remember the function-result wrappers made so far: (Calls) in
+    -- Note [Worker/wrapper for function results]
+    go _    []       = return []
+    go opts (b : bs) = do { bs' <- wwBind opts b
+                          ; let wrappers = [ (v, tmpl) | v <- bindersOfBinds bs'
+                                                       , Just tmpl <- [funResultWrapperTemplate v] ]
+                                opts' = opts { wo_fr_wrappers = extendVarEnvList (wo_fr_wrappers opts) wrappers }
+                          ; (bs' ++) <$> go opts' bs }
+
+-- | The unfolding template of a function-result wrapper (one made by
+-- splitFunResult, here or in another module): a stable unfolding that may
+-- be inlined in a boring context.  See (Calls)
+funResultWrapperTemplate :: Id -> Maybe CoreExpr
+funResultWrapperTemplate v = case realIdUnfolding v of
+  CoreUnfolding { uf_tmpl = tmpl, uf_src = src, uf_guidance = UnfWhen { ug_boring_ok = ok } }
+    | isStableSource src, ok -> Just tmpl
+  _ -> Nothing
 
 {-
 ************************************************************************
@@ -953,6 +971,17 @@ does not know the demand signatures of the lambda's free local functions
 context do; both are sound, so for each argument we keep the more precise
 claim: absent if either says so, else strict if either does (lamDemands).
 
+(Calls) A tail is often a call of another function that returns a function:
+    g = \n -> let k = .. in h (k + n)        where h was itself split:
+    h = \m -> let wf = $wh m in \x y -> wf x
+Such a call is expanded by inlining h's wrapper (which the simplifier would
+do anyway), and the expansion's tails are used: here the lambda \x y -> wf x.
+Within a module, an occurrence of h does not carry its new unfolding, so
+worker/wrapper keeps the wrappers it has made so far (wo_fr_wrappers, top
+level, in order); a wrapper from another module comes with its unfolding.
+The wrappers are recognised by their stable unfolding that may be inlined in
+a boring context (BoringOk).  Only one expansion, not repeated.
+
 (BoringOk) The wrapper is inlined even in a boring context.  The typical use
 is a shared partial application,  let h = g n in ... h a b ... h b a,  and
 h = g n  is a boring context.  Inlined there,
@@ -1070,7 +1099,8 @@ analyseLevels ww_opts fn_id ww_arity fn_dmd body
         (newtype_co, fun_ty) = case topNormaliseNewType_maybe res_ty of
           Just (co, ty) | isFunTy ty -> (Just co, ty)
           _                          -> (Nothing, res_ty)
-        collect = concat <$> mapM (\(env, e) -> collectTailsWhy (CastTo <$> (fun_ty <$ newtype_co)) env e) exprs
+        collect = concat <$> mapM (\(env, e) -> collectTailsWhy' (Just (expandCall ww_opts))
+                                                                 (CastTo <$> (fun_ty <$ newtype_co)) env e) exprs
 
     foldr1' f (x : xs) = foldr f x xs
     foldr1' _ []       = panic "analyseLevels"
@@ -1085,6 +1115,21 @@ analyseLevels ww_opts fn_id ww_arity fn_dmd body
 -- | Look through casts to this function type in tail position: the level's
 -- values have a newtype type over it.  See (Casts)
 newtype CastTo = CastTo Type
+
+-- | Expand a call of a function-result wrapper in tail position (Calls):
+-- inline the wrapper, so that the function it returns can be seen
+expandCall :: WwOpts -> CoreExpr -> Maybe CoreExpr
+expandCall opts e
+  | (Var h, args) <- collectArgs e
+  , Just tmpl <- lookupVarEnv (wo_fr_wrappers opts) h
+                 `orElse'` (if isGlobalId h then funResultWrapperTemplate h else Nothing)
+  , length (filter isValArg args) >= valBinderCount tmpl
+  = Just (simpleOptExpr (wo_simple_opts opts) (mkApps tmpl args))
+  | otherwise = Nothing
+  where
+    orElse' (Just x) _ = Just x
+    orElse' Nothing  y = y
+    valBinderCount t = length (filter isId (fst (collectBinders t)))
 
 -- | The first n value lambdas of an expression, and its body after them
 splitValLams :: Int -> CoreExpr -> ([Var], CoreExpr)
@@ -1133,7 +1178,7 @@ mkFunResultPairs ww_opts fn_id arg_vars body levels
     -- returns it and the level's new type
     rebuild :: [FrLevel] -> CoreExpr -> (CoreExpr, Type)
     rebuild [] e = (e, exprType e)
-    rebuild (lvl : lvls) e = (rebuildTailsCast cast_to new_ty new_tail e, new_ty)
+    rebuild (lvl : lvls) e = (rebuildTailsCast (Just (expandCall ww_opts)) cast_to new_ty new_tail e, new_ty)
       where
         new_tail t = case splitValLams (frl_arity lvl) t of
           (bs, inner) | length bs == frl_arity lvl, not (null lvls)
@@ -1223,6 +1268,14 @@ definition and at the call alike.  The adapter is a lambda where the caller's
 g might be bottom; but g' is only ever called, never forced on its own, so
 that cannot be observed.
 
+(TypeParams) Most higher-order functions are polymorphic:
+    h = /\a -> \g n -> let f = .. in .. g f ..
+Leading type parameters are kept: the conversion is computed for the value
+part (with the type variables in scope; the types it builds may mention
+them), the worker is  /\a -> unwrap (\g n -> ..),  and the wrapper is
+/\a -> wrap (work_id @a).  (Type parameters after value parameters are not
+handled.)
+
 We do not split a function with a NOINLINE pragma (its wrapper could not be
 inlined, so the adapter would only cost), nor look deeper than
 maxFunResultDepth levels of (B).  One split handles one parameter; the worker
@@ -1281,27 +1334,41 @@ demand analyser on a copy first, since the splits need demand information.
 -- | Count the higher-order splits a program offers.
 -- See Note [Higher-order worker/wrapper statistics]
 higherOrderStats :: WwOpts -> UniqSupply -> CoreProgram -> HoStats
-higherOrderStats ww_opts0 us binds = initUs_ us (sumHo <$> mapM go_bind binds)
+higherOrderStats ww_opts0 us binds = initUs_ us (top (ww_opts0 { wo_fun_results = True }) binds)
   where
-    ww_opts = ww_opts0 { wo_fun_results = True }
+    -- Top level, in order: like worker/wrapper, remember the function-result
+    -- wrappers made so far, so that calls of them can be expanded (Calls)
+    top _ [] = return noHo
+    top opts (bind : rest)
+      = do { here <- go_bind opts bind
+           ; wrappers <- concat <$> mapM (top_wrappers opts) (flattenBinds [bind])
+           ; let opts' = opts { wo_fr_wrappers = extendVarEnvList (wo_fr_wrappers opts) wrappers }
+           ; (here `plusHo`) <$> top opts' rest }
 
-    go_bind bind = sumHo <$> mapM go_pair (flattenBinds [bind])
+    top_wrappers opts (b, rhs)
+      | isId b, not (isJoinId b), idArity b >= 1
+      = do { mb <- splitFunResult opts b rhs
+           ; return [ (v, t) | Just pairs <- [mb], (v, _) <- pairs
+                             , Just t <- [funResultWrapperTemplate v] ] }
+      | otherwise = return []
 
-    go_pair (b, rhs) = do { here <- if isId b && not (isJoinId b) && idArity b >= 1
-                                     then fun_stats b rhs else return noHo
-                          ; inner <- go rhs
-                          ; return (here `plusHo` inner) }
+    go_bind opts bind = sumHo <$> mapM (go_pair opts) (flattenBinds [bind])
 
-    go e = case e of
-      App f a        -> plusHo <$> go f <*> go a
-      Lam _ b        -> go b
-      Let bind body  -> plusHo <$> go_bind bind <*> go body
-      Case s _ _ alts -> plusHo <$> go s <*> (sumHo <$> mapM (\(Alt _ _ rhs) -> go rhs) alts)
-      Cast b _       -> go b
-      Tick _ b       -> go b
+    go_pair opts (b, rhs) = do { here <- if isId b && not (isJoinId b) && idArity b >= 1
+                                          then fun_stats opts b rhs else return noHo
+                               ; inner <- go opts rhs
+                               ; return (here `plusHo` inner) }
+
+    go opts e = case e of
+      App f a        -> plusHo <$> go opts f <*> go opts a
+      Lam _ b        -> go opts b
+      Let bind body  -> plusHo <$> go_bind opts bind <*> go opts body
+      Case s _ _ alts -> plusHo <$> go opts s <*> (sumHo <$> mapM (\(Alt _ _ rhs) -> go opts rhs) alts)
+      Cast b _       -> go opts b
+      Tick _ b       -> go opts b
       _              -> return noHo
 
-    fun_stats fn_id rhs
+    fun_stats ww_opts fn_id rhs
       = do { let ty         = idType fn_id
                  res_is_fun = case collectNValBinders_maybe (workWrapArity fn_id rhs) rhs of
                                 Just (_, body) -> isFunOrNewtypeFun (exprType body)
@@ -1313,7 +1380,7 @@ higherOrderStats ww_opts0 us binds = initUs_ us (sumHo <$> mapM go_bind binds)
                  takes_fun  = any (isFunTy . scaledThing) (fst (splitFunTys (dropForAlls ty)))
            ; e_res  <- funResultLevelsWhy ww_opts fn_id rhs
            ; let mb_res = either (const Nothing) Just e_res
-           ; arg_ns <- count_args maxFunArgSplits fn_id rhs
+           ; arg_ns <- count_args ww_opts maxFunArgSplits fn_id rhs
            ; arg_why <- if takes_fun && null arg_ns then Just <$> argRejectReason ww_opts fn_id rhs
                         else return Nothing
            ; let rejects = [ "r: " ++ why | res_is_fun, Left why <- [e_res] ]
@@ -1331,14 +1398,14 @@ higherOrderStats ww_opts0 us binds = initUs_ us (sumHo <$> mapM go_bind binds)
                              [ line | res == 1 || not (null arg_ns) ] rejects) }
 
     -- The depths of the successive argument splits of one function
-    count_args :: Int -> Id -> CoreExpr -> UniqSM [Int]
-    count_args 0 _ _ = return []
-    count_args fuel fn_id rhs
+    count_args :: WwOpts -> Int -> Id -> CoreExpr -> UniqSM [Int]
+    count_args _ 0 _ _ = return []
+    count_args ww_opts fuel fn_id rhs
       = do { mb <- funArgConv ww_opts fn_id rhs
            ; case mb of
                Nothing   -> return []
-               Just conv -> do { (work_id, work_rhs, _) <- mkFunArgPairs ww_opts fn_id rhs conv
-                               ; (cv_depth conv :) <$> count_args (fuel - 1) work_id work_rhs } }
+               Just tc@(_, conv) -> do { (work_id, work_rhs, _) <- mkFunArgPairs ww_opts fn_id rhs tc
+                                       ; (cv_depth conv :) <$> count_args ww_opts (fuel - 1) work_id work_rhs } }
 
 -- | Why no parameter of a function that takes a function is split (coarse;
 -- for the statistics only)
@@ -1349,9 +1416,10 @@ argRejectReason ww_opts fn_id rhs
   | isNoInlinePragma (inlinePragInfo fn_info)        = return "NOINLINE"
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return "small (inlined whole)"
   | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
-  = if not (all (\v -> isId v && not (isCoVar v)) arg_vars)
-    then return "type parameters"
-    else let fun_params = [ q | q <- arg_vars, isFunTy (idType q) ]
+  = let (_, vals) = span isTyVar arg_vars in
+    if not (all (\v -> isId v && not (isCoVar v)) vals)
+    then return "type parameters after value parameters"
+    else let fun_params = [ q | q <- vals, isFunTy (idType q) ]
              callss     = [ cs | q <- fun_params, Just cs <- [paramCalls emptyVarEnv q body] ]
              known cs   = let n = foldr (min . length . snd) maxBound cs
                           in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
@@ -1424,7 +1492,7 @@ splitFunArg ww_opts fn_id rhs
            Just conv -> Just <$> mkFunArgPairs ww_opts fn_id rhs conv }
 
 -- | The conversion for a function-argument split of this function, if any
-funArgConv :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe Conv)
+funArgConv :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe ([TyVar], Conv))
 funArgConv ww_opts fn_id rhs
   | not (wo_fun_results ww_opts)                     = return Nothing
   | isJoinId fn_id                                   = return Nothing
@@ -1433,19 +1501,22 @@ funArgConv ww_opts fn_id rhs
   | isNoInlinePragma (inlinePragInfo fn_info)        = return Nothing
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return Nothing
   | Just (arg_vars, _) <- collectNValBinders_maybe ww_arity rhs
-  , not (null arg_vars)
-    -- Value parameters only (not yet: type or coercion parameters)
-  , all (\v -> isId v && not (isCoVar v)) arg_vars
-  = lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv rhs arg_vars]
+    -- Type parameters first, then value parameters: see (TypeParams)
+  , let (tvs, vals) = span isTyVar arg_vars
+  , not (null vals)
+  , all (\v -> isId v && not (isCoVar v)) vals
+  , let inner = snd (collectNBinders (length tvs) rhs)
+  = fmap (\c -> (tvs, c)) <$> lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv inner vals]
   | otherwise = return Nothing
   where
     fn_info    = idInfo fn_id
     ww_arity   = workWrapArity fn_id rhs
     uf_opts    = so_uf_opts (wo_simple_opts ww_opts)
 
-mkFunArgPairs :: WwOpts -> Id -> CoreExpr -> Conv -> UniqSM (Id, CoreExpr, (Id, CoreExpr))
-mkFunArgPairs ww_opts fn_id rhs conv
-             = do { work_rhs0 <- cv_unwrap conv rhs
+mkFunArgPairs :: WwOpts -> Id -> CoreExpr -> ([TyVar], Conv) -> UniqSM (Id, CoreExpr, (Id, CoreExpr))
+mkFunArgPairs ww_opts fn_id rhs (tvs, conv)
+             = do { inner_work <- cv_unwrap conv (snd (collectNBinders (length tvs) rhs))
+                ; let work_rhs0 = mkLams tvs inner_work
                 ; let work_rhs = simpleOptExpr simpl_opts work_rhs0
                 ; work_uniq <- getUniqueM
                 ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
@@ -1453,8 +1524,13 @@ mkFunArgPairs ww_opts fn_id rhs conv
                                   `setIdDmdSig`    dmdSigInfo fn_info
                                   `setIdCprSig`    cprSigInfo fn_info
                                   `setInlinePragma` (inlinePragInfo fn_info) { inl_rule = FunLike }
-                ; wrap_rhs0 <- cv_wrap conv work_id
-                ; let wrap_rhs = simpleOptExpr simpl_opts wrap_rhs0
+                  -- The wrapper:  /\tvs -> wrap (work_id @tvs); see (TypeParams)
+                ; inst_uniq <- getUniqueM
+                ; let work_inst = mkTyApps (Var work_id) (mkTyVarTys tvs)
+                      w_inst    = mkSysLocal (fsLit "w") inst_uniq ManyTy (exprType work_inst)
+                ; wrap_inner <- cv_wrap conv w_inst
+                ; let wrap_rhs0 = mkLams tvs (Let (NonRec w_inst work_inst) wrap_inner)
+                      wrap_rhs = simpleOptExpr simpl_opts wrap_rhs0
                       wrap_unf = case mkWrapperUnfolding simpl_opts wrap_rhs (arityInfo fn_info) of
                                    unf@(CoreUnfolding { uf_guidance = g@(UnfWhen {}) })
                                      -> unf { uf_guidance = g { ug_boring_ok = boringCxtOk } }
@@ -1769,17 +1845,22 @@ collectTails bound e = either (const Nothing) Just (collectTailsWhy Nothing boun
 -- | collectTails, saying what kind of tail stopped it; with a CastTo, casts
 -- to that function type in tail position are looked through (Casts)
 collectTailsWhy :: Maybe CastTo -> IdEnv Id -> CoreExpr -> Either String [Tail]
-collectTailsWhy cast_to bound e = case e of
+collectTailsWhy = collectTailsWhy' Nothing
+
+-- | collectTailsWhy, expanding calls of function-result wrappers (Calls)
+collectTailsWhy' :: Maybe (CoreExpr -> Maybe CoreExpr) -> Maybe CastTo -> IdEnv Id -> CoreExpr
+                 -> Either String [Tail]
+collectTailsWhy' mb_expand cast_to bound e = case e of
   Let bind body
     | all isJoinId (bindersOf bind)
-    -> do { jts <- concat <$> mapM (\(j, rhs) -> collectTailsWhy cast_to bound (joinRhsBody j rhs))
+    -> do { jts <- concat <$> mapM (\(j, rhs) -> collectTailsWhy' mb_expand cast_to bound (joinRhsBody j rhs))
                                    (flattenBinds [bind])
-          ; bts <- collectTailsWhy cast_to bound body
+          ; bts <- collectTailsWhy' mb_expand cast_to bound body
           ; return (jts ++ bts) }
     | otherwise
-    -> collectTailsWhy cast_to (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body
-  Case _ _ _ alts -> concat <$> mapM (\(Alt _ _ rhs) -> collectTailsWhy cast_to bound rhs) alts
-  Tick _ body     -> collectTailsWhy cast_to bound body
+    -> collectTailsWhy' mb_expand cast_to (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body
+  Case _ _ _ alts -> concat <$> mapM (\(Alt _ _ rhs) -> collectTailsWhy' mb_expand cast_to bound rhs) alts
+  Tick _ body     -> collectTailsWhy' mb_expand cast_to bound body
   Cast inner _
     | Just (CastTo fun_ty) <- cast_to
     , exprType inner `eqType` fun_ty
@@ -1787,6 +1868,10 @@ collectTailsWhy cast_to bound e = case e of
     , isLiveTail t
     -> Right [t]
   _ | Just t <- classifyTail bound e -> Right [t]
+    | Just expand <- mb_expand
+    , Just e' <- expand e
+    , Right ts <- collectTailsWhy' Nothing cast_to bound e'   -- one expansion only
+    -> Right ts
     | otherwise                      -> Left ("tail: " ++ tailKind e)
   where
     tailKind ex = case ex of
@@ -1813,11 +1898,13 @@ joinRhsSplit j rhs = case idJoinPointHood j of
 -- join points bound on the path return it too (they are retyped, and the
 -- jumps to them changed).  Follows collectTails exactly.
 rebuildTails :: Type -> (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
-rebuildTails = rebuildTailsCast Nothing
+rebuildTails = rebuildTailsCast Nothing Nothing
 
--- | rebuildTails, looking through casts to the given function type (Casts)
-rebuildTailsCast :: Maybe CastTo -> Type -> (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
-rebuildTailsCast cast_to new_ty new_tail = go emptyVarEnv emptyVarEnv
+-- | rebuildTails, looking through casts to the given function type (Casts),
+-- and expanding calls as collectTailsWhy' did (Calls)
+rebuildTailsCast :: Maybe (CoreExpr -> Maybe CoreExpr) -> Maybe CastTo -> Type
+                 -> (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
+rebuildTailsCast mb_expand cast_to new_ty new_tail = go emptyVarEnv emptyVarEnv
   where
     -- bound: let-bound variables (for classifyTail); joins: retyped joins
     go bound joins e = case e of
@@ -1848,7 +1935,10 @@ rebuildTailsCast cast_to new_ty new_tail = go emptyVarEnv emptyVarEnv
              Just (DeadTail _) -> Case e (mkWildValBinder ManyTy (exprType e)) new_ty []
              Just JumpTail     -> retarget joins e
              Just _            -> new_tail e
-             Nothing           -> pprPanic "rebuildTails" (ppr e)
+             Nothing
+               | Just expand <- mb_expand, Just e' <- expand e
+               -> rebuildTailsCast Nothing cast_to new_ty new_tail e'
+               | otherwise     -> pprPanic "rebuildTails" (ppr e)
 
     isRec (Rec {}) = True
     isRec _        = False

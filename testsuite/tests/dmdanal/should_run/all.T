@@ -99,3 +99,12 @@ test('wwlarge002', [extra_files(['WWLarge2A.hs'])], multimod_compile_and_run,
 #   wwcast002: laziness and divergence through a newtype (-fpedantic-bottoms)
 test('wwcast001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 test('wwcast002', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
+
+#   wwpoly001: function arguments of polymorphic functions (type parameters,
+#              a class dictionary); (TypeParams)
+#   wwcompose001, wwcompose002: result splits through calls of other split
+#              functions, in one module and across modules; (Calls)
+test('wwpoly001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+test('wwcompose001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+test('wwcompose002', [extra_files(['WWComposeA.hs'])], multimod_compile_and_run,
+     ['wwcompose002', '-O -fworker-wrapper-function-results'])

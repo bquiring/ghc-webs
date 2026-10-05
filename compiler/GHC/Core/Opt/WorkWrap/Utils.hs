@@ -160,7 +160,11 @@ data WwOpts
     -- See (Demands) in Note [Worker/wrapper for function results]
     wo_dicts_strict      :: !Bool
   , wo_dmd_unbox_width   :: !Int
-  , wo_max_worker_args   :: !Int }
+  , wo_max_worker_args   :: !Int
+  , -- | The unfoldings of the function-result wrappers made so far in this
+    -- module (top level, in order).  See (Calls) in Note [Worker/wrapper for
+    -- function results] in GHC.Core.Opt.WorkWrap
+    wo_fr_wrappers       :: IdEnv CoreExpr }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args
