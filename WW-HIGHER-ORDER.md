@@ -263,6 +263,36 @@ It can be read off the body syntactically: every occurrence of `g` is
   already makes by default when eta-expanding (Note [Dealing with bottom]).
   With `-fpedantic-bottoms` the wrapper uses `case` and is exact
   (`wwfunres001`).
+- **Several levels in one pass:** a function may return a function that
+  returns a function, each level doing work first. Going down (as long as
+  every returned value is a lambda group, up to depth 4), the analysis
+  collects each level's combined demands and decides whether splitting
+  that level gains anything. Coming back up, each level's new type is known
+  from below. The wrapper is introduced once, at the definition, with one
+  `let` per level, so each level's work stays shared:
+  `g = \n -> let wf1 = $wg n in \a -> let wf2 = wf1 a in \b -> ... \x y -> wf3 x`.
+  Levels at which nothing is gained keep their lambdas. Tests: `wwdeep001`
+  (three levels), `wwdeep002` (levels 1 and 3 in one pass), `wwdeep003`
+  (five levels, beyond the depth: unchanged), `wwdeep004` (divergence at
+  level 2, `-fpedantic-bottoms`), `wwdeep_dump`.
+- **Join points:** a returned function can be the body of a join point on
+  the path (GHC turns a local function used in several branches into one).
+  Its body's tails are tails, and it is retyped: new result type, arity
+  capped by the new type, demand and CPR signatures reset (`wwmix002`,
+  `wwmix002_dump`; without the arity fix, Core Lint failed).
+- **Mixed cases** (`wwmix001`-`005`): with the ordinary split of the
+  function's own arguments; returned functions from a lambda, a join point
+  and an error; a partial application that is both called and stored; a
+  join point inside the returned function. Two cases correctly do nothing:
+  a recursive function whose recursive tail passes the dead argument on
+  (`wwmix003`; finding that it is dead needs a fixed point, as demand
+  analysis does), and an overloaded function that GHC inlines and
+  specialises anyway (`wwmix004`).
+- **Function arguments** (`wwhoarg001`, `wwhoarg002`, §2.2): recorded as
+  runnable tests, not split yet. The scheme from the result case applies:
+  going down `h`, track the wrappers associated with each function parameter
+  (what `g` is given), collate them at the definition, and introduce the
+  wrapper there.
 - **Not yet:** the returned lambda's own arguments are not unboxed unless
   the inner function's signature says so (e.g. `wwreturn003`). Demand
   analysis looks at a returned lambda as if it might not be called, so its

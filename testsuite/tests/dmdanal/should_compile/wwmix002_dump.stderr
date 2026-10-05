@@ -1,0 +1,2 @@
+$w$wg
+g = \ n -> let { wf = case n of { I# ww -> $w$wg ww } } in \ fr fr1 _ -> wf fr fr1

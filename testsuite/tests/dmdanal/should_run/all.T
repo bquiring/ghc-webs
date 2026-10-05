@@ -48,3 +48,29 @@ test('T25439', normal, compile_and_run, [''])
 test('wwfunres001', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
 for name in ['wwfunres002', 'wwfunres003', 'wwfunres004']:
     test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+
+# Deeper and mixed cases of -fworker-wrapper-function-results.  Each checks
+# that the program means the same; the dump tests in should_compile
+# (wwdeep_dump, wwmix002_dump) record which splits happen.
+#   wwdeep001: three levels of returned functions, a dead argument at the
+#              deepest; per-level work shared (traces, compared sorted)
+#   wwdeep002: something to gain at two levels (levels 1 and 3), one pass
+#   wwdeep003: five levels, deeper than the split looks
+#   wwdeep004: -fpedantic-bottoms: a level-2 partial application diverges
+#   wwhoarg001, wwhoarg002: a local function with a dead argument passed to
+#              a function argument, at two depths (not split yet: §2.2)
+#   wwmix001: the split together with the ordinary split of g's argument
+#   wwmix002: returned functions from a lambda, a join point and an error
+#   wwmix003: a recursive function returning a function, with CPR
+#   wwmix004: an overloaded function returning a function
+#   wwmix005: a partial application both called and stored; a join point
+#              inside the returned function
+def sorted_lines(s):
+    return ''.join(sorted(s.splitlines(True)))
+
+for name in ['wwdeep001', 'wwdeep002', 'wwdeep003']:
+    test(name, [extra_files(['WWDeepA.hs']), normalise_errmsg_fun(sorted_lines)],
+         multimod_compile_and_run, [name, '-O -fworker-wrapper-function-results'])
+test('wwdeep004', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
+for name in ['wwhoarg001', 'wwhoarg002', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
+    test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])

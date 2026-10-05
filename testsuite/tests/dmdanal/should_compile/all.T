@@ -126,3 +126,10 @@ test('wwreturn003_funres', [extra_files(['wwreturn003.hs']), grep_errmsg(r'^\$w\
      multimod_compile, ['wwreturn003', '-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
 test('wwfunres005', [grep_errmsg(r'^run|wf a|h a')], compile,
      ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])
+# The wrappers made for deep returned functions (-fworker-wrapper-function-results):
+# g3 split at level 3, g4 at levels 1 and 3, g6 (five levels) not at all
+test('wwdeep_dump', [grep_errmsg(r'^g[0-9]+ = \\ |^g[0-9]+$|^\$wg[0-9]+$')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])
+# A split whose returned function is a join point (its result type changes)
+test('wwmix002_dump', [grep_errmsg(r'^g = |^\$w\$?wg$')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])

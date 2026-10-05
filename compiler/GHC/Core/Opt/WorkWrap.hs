@@ -15,7 +15,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Unfold.Make
-import GHC.Core.Utils  ( exprType, exprIsHNF )
+import GHC.Core.Utils  ( exprType, exprIsHNF, mkLamTypes )
 import GHC.Core.Type
 import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Core.SimpleOpt
@@ -37,9 +37,9 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Monad
 import GHC.Core.DataCon
-import Data.Maybe ( isJust )
+import Data.Maybe ( isJust, isNothing )
 import GHC.Core.Make ( mkWildValBinder )
-import GHC.Core.Opt.Arity ( exprIsDeadEnd )
+import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
 import GHC.Types.Var.Env
 
 {-
@@ -906,6 +906,27 @@ when the original did (test dmdanal/should_run/wwfunres001).  Either way,
 $wg n is evaluated at most once per  g n, and calls of  g n  behave as
 before.
 
+(Depth) The function returned may itself return a function, and so on:
+
+    g = \n -> let k1 = .. in \a -> let k2 = .. in \b -> let k3 = .. in \x y -> e   -- y dead
+
+Any level may have something to gain (here only level 3).  One traversal
+handles all of them.  Going down (analyseLevels), as long as every live tail
+at a level is a lambda group, we collect each level's combined demands and
+ask mkWwBodies whether splitting that level's functions gains something.
+Coming back up (mkFunResultPairs), each level's tails are its lambda groups
+with their bodies rebuilt for the levels below, passed through the level's
+worker function if it is split; so each level's new type is known from
+below.  The wrapper has one let (or case) per level; a split level's
+wrapper function converts the original arguments for the worker:
+
+    g = \n -> let wf1 = $wg n in \a -> let wf2 = wf1 a in \b -> let wf3 = wf2 b
+                               in \x y -> wf3 x
+
+so each level's work (k1, k2, k3) is shared by its partial applications
+exactly as before.  We go down at most maxFunResultDepth levels, and not
+through a variable tail (which hides what it returns).
+
 (BoringOk) The wrapper is inlined even in a boring context.  The typical use
 is a shared partial application,  let h = g n in ... h a b ... h b a,  and
 h = g n  is a boring context.  Inlined there,
@@ -926,69 +947,156 @@ splitFunResult ww_opts fn_id rhs
     -- See (Small) in Note [Worker/wrapper for function results]
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return Nothing
   | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
-  , Just tails <- collectTails emptyVarEnv body
-  , t0 : ts <- [ t | t <- tails, not (isDeadTail t) ]
-  , let k = foldr (min . tailArity) (tailArity t0) ts
-  , k >= 1
-  , Just (arg_tys, inner_res_ty) <- splitValArgs k (exprType body)
-    -- See (EtaFirst) in Note [Worker/wrapper for function results]
-  , not (etaExpandable ww_arity k (demandInfo fn_info))
-  = do { let dmds = map finalise (foldr (zipWith lubDmd . tailDemands k) (tailDemands k t0) ts)
-             -- Only strict arguments may be unboxed: see (Boxity) in
-             -- Note [Worker/wrapper for function results]
-             finalise d | isStrictDmd d = d
-                        | otherwise     = trimBoxity d
-       ; xs <- mapM (\(ty, d) -> do { u <- getUniqueM
-                                    ; return (mkSysLocal (fsLit "fr") u ManyTy ty
-                                               `setIdDemandInfo` d) })
-                    (zip arg_tys dmds)
-       ; mb_stuff <- mkWwBodies ww_opts fn_id k xs inner_res_ty dmds topCpr
-       ; case mb_stuff of
-           Nothing -> return Nothing     -- Nothing to gain
-           Just (_, _, wrap_fn, work_fn) ->
-             do { let simpl  = simpleOptExpr (wo_simple_opts ww_opts)
-                      new_tail t = simpl (work_fn t)
-                      new_res_ty = exprType (new_tail (tailExpr t0))
-                      work_body  = rebuildTails new_res_ty new_tail body
-                      work_rhs   = mkLams arg_vars work_body
-                ; work_uniq <- getUniqueM
-                ; wf_uniq   <- getUniqueM
-                ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
-                                  `setIdArity`     arityInfo fn_info
-                                  `setIdDmdSig`    dmdSigInfo fn_info
-                                  `setIdCprSig`    topCprSig
-                                  `setInlinePragma` work_prag
-                      wf      = mkSysLocal (fsLit "wf") wf_uniq ManyTy new_res_ty
-                      -- See (LetOrCase) in Note [Worker/wrapper for function results]
-                      work_call = mkVarApps (Var work_id) arg_vars
-                      wrap_rhs
-                        | wo_pedantic_bottoms ww_opts
-                        = mkLams arg_vars $
-                          Case work_call wf (exprType body) [Alt DEFAULT [] (wrap_fn wf)]
-                        | otherwise
-                        = mkLams arg_vars $
-                          Let (NonRec wf work_call) (wrap_fn wf)
-                      -- Inline the wrapper even in a boring context, such
-                      -- as  let h = g n: see (BoringOk) in
-                      -- Note [Worker/wrapper for function results]
-                      wrap_unf = case mkWrapperUnfolding simpl_opts wrap_rhs (arityInfo fn_info) of
-                                   unf@(CoreUnfolding { uf_guidance = g@(UnfWhen {}) })
-                                     -> unf { uf_guidance = g { ug_boring_ok = boringCxtOk } }
-                                   unf -> unf
-                      wrap_id  = fn_id `setIdUnfolding`  wrap_unf
-                                       `setInlinePragma` mkStrWrapperInlinePrag (inlinePragInfo fn_info) []
-                                       `setIdOccInfo`    noOccInfo
-                  -- The worker may itself be split for its own arguments
-                ; work_pairs <- splitFun ww_opts work_id work_rhs
-                ; return (Just (work_pairs ++ [(wrap_id, wrap_rhs)])) } }
+  = do { levels <- analyseLevels ww_opts fn_id ww_arity (demandInfo fn_info) body
+         -- Levels below the deepest split level need no wrapping
+       ; let levels' = reverse (dropWhile (isNothing . frl_split) (reverse levels))
+       ; if null levels'
+         then return Nothing        -- Nothing to gain at any level
+         else Just <$> mkFunResultPairs ww_opts fn_id arg_vars body levels' }
   | otherwise
   = return Nothing
   where
     fn_info    = idInfo fn_id
     ww_arity   = workWrapArity fn_id rhs
+    uf_opts    = so_uf_opts (wo_simple_opts ww_opts)
+
+-- | How many levels of returned functions we look at.
+-- See (Depth) in Note [Worker/wrapper for function results]
+maxFunResultDepth :: Int
+maxFunResultDepth = 4
+
+-- | One level of returned functions (level 1 is the function the body
+-- returns, level 2 the function that one returns, and so on)
+data FrLevel = FrLevel
+  { frl_arity    :: Arity            -- ^ How many value arguments
+  , frl_args     :: [(Mult, Type)]   -- ^ Their multiplicities and types
+  , frl_rep_tail :: CoreExpr         -- ^ A live tail at this level
+  , frl_split    :: Maybe (Id -> CoreExpr, CoreExpr -> CoreExpr)
+      -- ^ The wrapper and worker functions of mkWwBodies, if splitting the
+      -- functions at this level gains something
+  }
+
+-- | Go down the levels of returned functions, as long as every live tail
+-- is a lambda group, and decide at each level whether to split.
+-- See (Depth) in Note [Worker/wrapper for function results]
+analyseLevels :: WwOpts -> Id -> Arity -> Demand -> CoreExpr -> UniqSM [FrLevel]
+analyseLevels ww_opts fn_id ww_arity fn_dmd body = go 1 [(emptyVarEnv, body)] (exprType body)
+  where
+    go :: Int -> [(IdEnv Id, CoreExpr)] -> Type -> UniqSM [FrLevel]
+    go depth exprs res_ty
+      | depth > maxFunResultDepth = return []
+      | Just tails <- concat <$> mapM (\(env, e) -> collectTails env e) exprs
+      , t0 : ts <- [ t | t <- tails, isLiveTail t ]
+      , let k = foldr (min . tailArity) (tailArity t0) ts
+      , k >= 1
+      , Just (args, inner_res_ty) <- splitValArgs k res_ty
+      = do { let dmds = map finalise (foldr (zipWith lubDmd . tailDemands k) (tailDemands k t0) ts)
+           ; xs <- mapM (\((m, ty), d) -> do { u <- getUniqueM
+                                              ; return (mkSysLocal (fsLit "fr") u m ty
+                                                         `setIdDemandInfo` d) })
+                        (zip args dmds)
+           ; mb_stuff <- if depth == 1 && etaExpandable ww_arity k fn_dmd
+                         then return Nothing   -- See (EtaFirst)
+                         else mkWwBodies ww_opts fn_id k xs inner_res_ty dmds topCpr
+           ; let split = fmap (\(_, _, w, u) -> (w, u)) mb_stuff
+                 this  = FrLevel k args (tailExpr t0) split
+             -- Go down only through lambda groups (a variable tail hides
+             -- what it returns)
+           ; case mapM (peelTail k) (t0 : ts) of
+               Just deeper -> (this :) <$> go (depth + 1) deeper inner_res_ty
+               Nothing     -> return [this] }
+      | otherwise = return []
+
+    -- Only strict arguments may be unboxed: see (Boxity)
+    finalise d | isStrictDmd d = d
+               | otherwise     = trimBoxity d
+
+    peelTail k (LamTail e _) = Just (emptyVarEnv, snd (splitValLams k e))
+    peelTail _ _             = Nothing
+
+-- | The first n value lambdas of an expression, and its body after them
+splitValLams :: Int -> CoreExpr -> ([Var], CoreExpr)
+splitValLams 0 e         = ([], e)
+splitValLams n (Lam b e) = let (bs, e') = splitValLams (n - 1) e in (b : bs, e')
+splitValLams _ e         = ([], e)
+
+-- | Make the worker and the wrapper, in one pass over the levels.
+-- See (Depth) in Note [Worker/wrapper for function results]
+mkFunResultPairs :: WwOpts -> Id -> [Var] -> CoreExpr -> [FrLevel] -> UniqSM [(Id, CoreExpr)]
+mkFunResultPairs ww_opts fn_id arg_vars body levels
+  = do { -- The worker.  Going back up, each level's new tails are its lambda
+         -- groups with their bodies rebuilt for the levels below, then (if
+         -- this level is split) passed through the level's worker function.
+         -- The new type of each level comes from its representative tail.
+         let work_body = fst (rebuild levels body)
+             work_rhs  = mkLams arg_vars work_body
+       ; work_uniq <- getUniqueM
+       ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
+                         `setIdArity`     arityInfo fn_info
+                         `setIdDmdSig`    dmdSigInfo fn_info
+                         `setIdCprSig`    topCprSig
+                         `setInlinePragma` work_prag
+         -- The wrapper: one let (or case) per level
+       ; wrap_body <- mkWrap levels (mkVarApps (Var work_id) arg_vars)
+       ; let wrap_rhs = simpl (mkLams arg_vars wrap_body)
+             -- Inline the wrapper even in a boring context: see (BoringOk)
+             wrap_unf = case mkWrapperUnfolding simpl_opts wrap_rhs (arityInfo fn_info) of
+                          unf@(CoreUnfolding { uf_guidance = g@(UnfWhen {}) })
+                            -> unf { uf_guidance = g { ug_boring_ok = boringCxtOk } }
+                          unf -> unf
+             wrap_id  = fn_id `setIdUnfolding`  wrap_unf
+                              `setInlinePragma` mkStrWrapperInlinePrag (inlinePragInfo fn_info) []
+                              `setIdOccInfo`    noOccInfo
+         -- The worker may itself be split for its own arguments
+       ; work_pairs <- splitFun ww_opts work_id work_rhs
+       ; return (work_pairs ++ [(wrap_id, wrap_rhs)]) }
+  where
+    fn_info    = idInfo fn_id
     simpl_opts = wo_simple_opts ww_opts
-    uf_opts    = so_uf_opts simpl_opts
+    simpl      = simpleOptExpr simpl_opts
     work_prag  = (inlinePragInfo fn_info) { inl_rule = FunLike }
+    pedantic   = wo_pedantic_bottoms ww_opts
+
+    -- Rebuild an expression whose tails are the given level's values;
+    -- returns it and the level's new type
+    rebuild :: [FrLevel] -> CoreExpr -> (CoreExpr, Type)
+    rebuild [] e = (e, exprType e)
+    rebuild (lvl : lvls) e = (rebuildTails new_ty new_tail e, new_ty)
+      where
+        new_tail t = case splitValLams (frl_arity lvl) t of
+          (bs, inner) | length bs == frl_arity lvl, not (null lvls)
+                      -> split_fn (mkLams bs (fst (rebuild lvls inner)))
+          _           -> split_fn t      -- The deepest level: a lambda or variable
+        split_fn t = case frl_split lvl of
+          Just (_, work_fn) -> simpl (work_fn t)
+          Nothing           -> t
+        new_ty = exprType (new_tail (frl_rep_tail lvl))
+
+    -- The wrapper's body for the levels from here down, given the call that
+    -- produces this level's new value
+    mkWrap :: [FrLevel] -> CoreExpr -> UniqSM CoreExpr
+    mkWrap [] call = return call
+    mkWrap (lvl : lvls) call
+      = do { wf <- mk_var "wf" ManyTy (exprType call)
+           ; inner_fun <- case frl_split lvl of
+               -- This level is split: its wrapper function takes the
+               -- original arguments and calls wf with the worker's; what
+               -- that call returns is the next level's new value
+               Just (wrap_fn, _) | null lvls -> return (wrap_fn wf)
+               _ -> do { xs <- mapM (\(m, ty) -> mk_var "fr" m ty) (frl_args lvl)
+                       ; let next_call = case frl_split lvl of
+                               Just (wrap_fn, _) -> mkVarApps (wrap_fn wf) xs   -- beta-reduced by simpl
+                               Nothing           -> mkVarApps (Var wf) xs
+                       ; rest <- mkWrap lvls next_call
+                       ; return (mkLams xs rest) }
+           ; return (bind wf call inner_fun) }
+
+    mk_var str m ty = do { u <- getUniqueM; return (mkSysLocal (fsLit str) u m ty) }
+
+    -- See (LetOrCase) in Note [Worker/wrapper for function results]
+    bind wf call body
+      | pedantic  = Case call wf (exprType body) [Alt DEFAULT [] body]
+      | otherwise = Let (NonRec wf call) body
 
 -- | Is every partial application of a function of the given arity called
 -- at most once, and with at least k more arguments?  Then eta-expansion
@@ -1015,32 +1123,40 @@ data Tail = LamTail CoreExpr [Var]     -- ^ The lambda group, its value binders
           | VarTail CoreExpr Id        -- ^ A let-bound function, perhaps
                                        --   applied to type arguments
           | DeadTail CoreExpr
+          | JumpTail                   -- ^ A jump to a join point bound on
+                                       --   the path (its body's tails count)
 
 tailExpr :: Tail -> CoreExpr
 tailExpr (LamTail e _) = e
 tailExpr (VarTail e _) = e
 tailExpr (DeadTail e)  = e
+tailExpr JumpTail      = panic "tailExpr: jump"
 
-isDeadTail :: Tail -> Bool
-isDeadTail (DeadTail {}) = True
-isDeadTail _             = False
+-- | A tail that returns a function: not a dead end, not a jump
+isLiveTail :: Tail -> Bool
+isLiveTail (LamTail {}) = True
+isLiveTail (VarTail {}) = True
+isLiveTail _            = False
 
 tailArity :: Tail -> Arity
 tailArity (LamTail _ bs) = length bs
 tailArity (VarTail _ v)  = idArity v
 tailArity (DeadTail _)   = 0
+tailArity JumpTail       = 0
 
 -- | The demands on the first k arguments of a tail
 tailDemands :: Arity -> Tail -> [Demand]
 tailDemands k (LamTail _ bs) = map idDemandInfo (take k bs)
 tailDemands k (VarTail _ v)  = take k (fst (splitDmdSig (idDmdSig v)) ++ repeat topDmd)
 tailDemands k (DeadTail _)   = replicate k botDmd
+tailDemands k JumpTail       = replicate k botDmd
 
 -- | Classify an expression in tail position.  'bound' maps the variables
 -- let-bound on the path to it to their binders: an occurrence does not carry
 -- the demand signature, its binder does.  Nothing: not a tail we can split.
 classifyTail :: IdEnv Id -> CoreExpr -> Maybe Tail
 classifyTail bound e = case e of
+  _      | (Var j, _) <- collectArgs e, isJoinId j    -> Just JumpTail
   Lam {} | Just bs <- valueLams e                     -> Just (LamTail e bs)
   _      | (Var v, ty_args) <- collectArgs e
          , all isTypeArg ty_args
@@ -1055,40 +1171,90 @@ classifyTail bound e = case e of
     more (Lam {})                               = Nothing
     more _                                      = Just []
 
--- | The tails of a body (through non-join lets, case alternatives and
--- ticks), or Nothing if some tail is not one we can split
+-- | The tails of a body (through lets, join points, case alternatives and
+-- ticks), or Nothing if some tail is not one we can split.  The bodies of
+-- join points bound on the path are tails; jumps to them are JumpTails.
 collectTails :: IdEnv Id -> CoreExpr -> Maybe [Tail]
 collectTails bound e = case e of
   Let bind body
-    | not (any isJoinId (bindersOf bind))
+    | all isJoinId (bindersOf bind)
+    -> do { jts <- concat <$> mapM (\(j, rhs) -> collectTails bound (joinRhsBody j rhs))
+                                   (flattenBinds [bind])
+          ; bts <- collectTails bound body
+          ; return (jts ++ bts) }
+    | otherwise
     -> collectTails (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body
   Case _ _ _ alts -> concat <$> mapM (\(Alt _ _ rhs) -> collectTails bound rhs) alts
   Tick _ body     -> collectTails bound body
   _               -> (: []) <$> classifyTail bound e
 
+-- | The body of a join point's right-hand side, after its parameters
+joinRhsBody :: Id -> CoreExpr -> CoreExpr
+joinRhsBody j rhs = snd (joinRhsSplit j rhs)
+
+joinRhsSplit :: Id -> CoreExpr -> ([Var], CoreExpr)
+joinRhsSplit j rhs = case idJoinPointHood j of
+  JoinPoint ar -> collectNBinders ar rhs
+  NotJoinPoint -> ([], rhs)
+
 -- | Rebuild a body, replacing each live tail by the given function and each
--- dead end by  case e of {}; case expressions get the new result type.
--- Follows collectTails exactly.
+-- dead end by  case e of {}; case expressions get the new result type, and
+-- join points bound on the path return it too (they are retyped, and the
+-- jumps to them changed).  Follows collectTails exactly.
 rebuildTails :: Type -> (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
-rebuildTails new_ty new_tail = go emptyVarEnv
+rebuildTails new_ty new_tail = go emptyVarEnv emptyVarEnv
   where
-    go bound e = case e of
+    -- bound: let-bound variables (for classifyTail); joins: retyped joins
+    go bound joins e = case e of
       Let bind body
-        | not (any isJoinId (bindersOf bind))
-        -> Let bind (go (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body)
-      Case scrut b _ alts -> Case scrut b new_ty [ Alt c bs (go bound rhs) | Alt c bs rhs <- alts ]
-      Tick t body         -> Tick t (go bound body)
+        | all isJoinId (bindersOf bind)
+        -> let prs    = flattenBinds [bind]
+               js'    = [ retype j (mkLamTypes (fst (joinRhsSplit j rhs)) new_ty) | (j, rhs) <- prs ]
+               joins' = extendVarEnvList joins (zip (map fst prs) js')
+               rhs_env | isRec bind = joins'
+                       | otherwise  = joins
+               new_rhs (j, rhs) = let (ps, jb) = joinRhsSplit j rhs
+                                  in mkLams ps (go bound rhs_env jb)
+               bind' = case bind of
+                         NonRec {} -> NonRec (headOr js') (new_rhs (headOr prs))
+                         Rec {}    -> Rec (zip js' (map new_rhs prs))
+           in Let bind' (go bound joins' body)
+        | otherwise
+        -> Let bind (go (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) joins body)
+      Case scrut b _ alts -> Case scrut b new_ty [ Alt c bs (go bound joins rhs) | Alt c bs rhs <- alts ]
+      Tick t body         -> Tick t (go bound joins body)
       _ -> case classifyTail bound e of
              Just (DeadTail _) -> Case e (mkWildValBinder ManyTy (exprType e)) new_ty []
+             Just JumpTail     -> retarget joins e
              Just _            -> new_tail e
              Nothing           -> pprPanic "rebuildTails" (ppr e)
 
--- | The first k value-argument types of a function type, and the rest
-splitValArgs :: Arity -> Type -> Maybe ([Type], Type)
+    isRec (Rec {}) = True
+    isRec _        = False
+
+    -- A join point whose result type changes: its arity cannot exceed what
+    -- the new type allows, and its demand and CPR signatures describe the
+    -- old result
+    retype j ty = setIdType j ty
+                    `setIdArity`  min (idArity j) (typeArity ty)
+                    `setIdDmdSig` nopSig
+                    `setIdCprSig` topCprSig
+
+    headOr (x : _) = x
+    headOr []      = panic "rebuildTails"
+
+    -- A jump to a retyped join point
+    retarget joins e = case collectArgs e of
+      (Var j, args) | Just j' <- lookupVarEnv joins j -> mkApps (Var j') args
+      _ -> e
+
+-- | The first k value arguments (multiplicity, type) of a function type,
+-- and the rest
+splitValArgs :: Arity -> Type -> Maybe ([(Mult, Type)], Type)
 splitValArgs 0 ty = Just ([], ty)
 splitValArgs n ty = case splitFunTy_maybe ty of
-  Just (af, _, arg, res) | isVisibleFunArg af
-    -> do { (args, r) <- splitValArgs (n - 1) res; return (arg : args, r) }
+  Just (af, m, arg, res) | isVisibleFunArg af
+    -> do { (args, r) <- splitValArgs (n - 1) res; return ((m, arg) : args, r) }
   _ -> Nothing
 
 mkWWBindPair :: WwOpts -> Id -> IdInfo

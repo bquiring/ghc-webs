@@ -1,0 +1,5 @@
+g6
+$wg4
+g4 = \ n -> let { wf = $wg4 n } in \ fr _ -> let { wf1 = wf fr } in \ fr2 -> let { wf2 = wf1 fr2 } in \ fr3 _ -> wf2 fr3
+$wg3
+g3 = \ n -> let { wf = $wg3 n } in \ fr -> let { wf1 = wf fr } in \ fr1 -> let { wf2 = wf1 fr1 } in \ fr2 _ -> wf2 fr2
