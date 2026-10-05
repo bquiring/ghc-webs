@@ -133,3 +133,8 @@ test('wwdeep_dump', [grep_errmsg(r'^g[0-9]+ = \\ |^g[0-9]+$|^\$wg[0-9]+$')], com
 # A split whose returned function is a join point (its result type changes)
 test('wwmix002_dump', [grep_errmsg(r'^g = |^\$w\$?wg$')], compile,
      ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])
+# Worker/wrapper through function arguments: the callers' functions now call
+# the local function's worker, without its dead argument (\ c -> c ...)
+for name in ['wwhoarg001_dump', 'wwhoarg002_dump', 'wwhoarg006_dump']:
+    test(name, [grep_errmsg(r'= \\ c -> |^\$w\$wh$|= \$w\$wh ')], compile,
+         ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])

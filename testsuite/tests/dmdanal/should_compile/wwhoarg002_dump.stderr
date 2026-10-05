@@ -1,0 +1,7 @@
+$w$wh
+main19 = \ c -> c 9#
+main18 = \ c -> c main19
+main15 = \ c -> c 5#
+main14 = \ c -> c main15
+main11 = \ c -> c 1#
+main10 = \ c -> case c main11 of { I# x -> I# (*# x 2#) }

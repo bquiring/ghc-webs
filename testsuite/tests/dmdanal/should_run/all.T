@@ -58,7 +58,16 @@ for name in ['wwfunres002', 'wwfunres003', 'wwfunres004']:
 #   wwdeep003: five levels, deeper than the split looks
 #   wwdeep004: -fpedantic-bottoms: a level-2 partial application diverges
 #   wwhoarg001, wwhoarg002: a local function with a dead argument passed to
-#              a function argument, at two depths (not split yet: §2.2)
+#              a function argument, at two depths (Note [Worker/wrapper for
+#              function arguments])
+#   wwhoarg003: two local functions at the same position (one lazy)
+#   wwhoarg004: the function parameter escapes: no split
+#   wwhoarg005: laziness: g undefined and not called; g ignoring f; the
+#              dead argument undefined
+#   wwhoarg006: function argument and function result together
+#   wwhoarg007: two function parameters, at different argument positions
+#   wwhoarg008: a recursive function passing g on (no split yet)
+#   wwhoarg009: a lambda argument lazy in x (undefined): x must not be unboxed
 #   wwmix001: the split together with the ordinary split of g's argument
 #   wwmix002: returned functions from a lambda, a join point and an error
 #   wwmix003: a recursive function returning a function, with CPR
@@ -72,5 +81,6 @@ for name in ['wwdeep001', 'wwdeep002', 'wwdeep003']:
     test(name, [extra_files(['WWDeepA.hs']), normalise_errmsg_fun(sorted_lines)],
          multimod_compile_and_run, [name, '-O -fworker-wrapper-function-results'])
 test('wwdeep004', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
-for name in ['wwhoarg001', 'wwhoarg002', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
+for name in ['wwhoarg001', 'wwhoarg002', 'wwhoarg003', 'wwhoarg004', 'wwhoarg005',
+             'wwhoarg006', 'wwhoarg007', 'wwhoarg008', 'wwhoarg009', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
     test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])

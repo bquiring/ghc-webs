@@ -41,6 +41,8 @@ import Data.Maybe ( isJust, isNothing )
 import GHC.Core.Make ( mkWildValBinder )
 import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
 import GHC.Types.Var.Env
+import GHC.Types.Name ( mkSystemVarName )
+import GHC.Core.Multiplicity ( Scaled(..) )
 
 {-
 We take Core bindings whose binders have:
@@ -594,11 +596,7 @@ tryWW ww_opts is_rec fn_id rhs
   -- Do this even if there is a NOINLINE pragma
   -- See Note [Worker/wrapper for NOINLINE functions]
   | is_fun
-  = do { mb_pairs <- splitFunResult ww_opts new_fn_id rhs
-         -- See Note [Worker/wrapper for function results]
-       ; case mb_pairs of
-           Just pairs -> return pairs
-           Nothing    -> splitFun ww_opts new_fn_id rhs }
+  = splitHigherOrder maxFunArgSplits ww_opts new_fn_id rhs
 
   -- See Note [Thunk splitting]
   | isNonRec is_rec, is_thunk
@@ -1097,6 +1095,327 @@ mkFunResultPairs ww_opts fn_id arg_vars body levels
     bind wf call body
       | pedantic  = Case call wf (exprType body) [Alt DEFAULT [] body]
       | otherwise = Let (NonRec wf call) body
+
+{- Note [Worker/wrapper for function arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+(See WW-HIGHER-ORDER.md, §2.2.)  A function that passes a local function to
+one of its function parameters,
+
+    h = \g n -> let f = \x y -> e in ... g f ...        -- y dead, x strict
+
+gives g the wrapper of f (or f itself), and every call of f inside g passes
+the dead y and a boxed x.  We split h so that g receives f's worker:
+
+    $wh = \g' n -> let f = .. in ... g' f' ...          -- f' = f's worker
+    h   = \g n -> $wh (\f' -> g (\x y -> case x of I# x# -> f' x#)) n
+
+h's wrapper adapts the caller's g; inlined at a call with a known g, the
+adapter meets g's body and g's calls of f become calls of f'.
+
+The general form is a /conversion/ for the values that flow to one argument
+position: a closed pair of  unwrap  (original value to new value, used where
+the values are made) and  wrap  (new value back to original, used where they
+are consumed), with  wrap (unwrap v) = v  for each value v.  A conversion is
+one of
+  (A) the values are functions (lambda groups, or let-bound functions); their
+      combined argument demands give an ordinary worker/wrapper split
+      (mkWwBodies): unwrap is its worker function, wrap its wrapper;
+  (B) the values are lambda groups, one of whose parameters q is only ever
+      called, always with values at some argument position r for which there
+      is a conversion C (found first, recursively: this is the traversal
+      going down).  unwrap rewrites a lambda so that q's calls pass
+      (C.unwrap e) at position r; wrap l' = \as -> l' .. (adapter a_q) ..
+      with  adapter = \cs -> a_q .. (C.wrap c_r) .. .
+The function h itself is split by a conversion of kind (B) for its own
+right-hand side: the worker is  unwrap rhs  and the wrapper  wrap $wh; the
+conversions are collated into h's wrapper only there, at the definition.
+Deeper nesting (g is given a function that is given f) is (B) inside (B).
+
+Soundness: in the worker, q (now q') occurs only in calls, which pass
+C.unwrap e at position r; the wrapper passes the adapter as q', so each call
+computes  a_q .. C.wrap (C.unwrap e) ..  =  a_q .. e ..  by C's identity.  For
+(A) that identity is the ordinary worker/wrapper one, which holds because each
+value's demands are at least the combined ones (and only strict combined
+demands unbox: (Boxity) in Note [Worker/wrapper for function results]).
+wrap and unwrap mention only their own binders, so they can be used at the
+definition and at the call alike.  The adapter is a lambda where the caller's
+g might be bottom; but g' is only ever called, never forced on its own, so
+that cannot be observed.
+
+We do not split a function with a NOINLINE pragma (its wrapper could not be
+inlined, so the adapter would only cost), nor look deeper than
+maxFunResultDepth levels of (B).  One split handles one parameter; the worker
+is tried again for the others, at most maxFunArgSplits times.
+-}
+
+-- | How many parameters of one function we split.
+-- See Note [Worker/wrapper for function arguments]
+maxFunArgSplits :: Int
+maxFunArgSplits = 4
+
+-- | Worker/wrapper through function arguments, function results, or plain
+-- (in that order); the worker of a higher-order split goes round again.
+splitHigherOrder :: Int -> WwOpts -> Id -> CoreExpr -> UniqSM [(Id, CoreExpr)]
+splitHigherOrder fuel ww_opts fn_id rhs
+  = do { mb_arg <- if fuel > 0 then splitFunArg ww_opts fn_id rhs else return Nothing
+       ; case mb_arg of
+           Just (work_id, work_rhs, wrapper) ->
+             do { work_pairs <- splitHigherOrder (fuel - 1) ww_opts work_id work_rhs
+                ; return (work_pairs ++ [wrapper]) }
+           Nothing ->
+             do { mb_res <- splitFunResult ww_opts fn_id rhs
+                  -- See Note [Worker/wrapper for function results]
+                ; case mb_res of
+                    Just pairs -> return pairs
+                    Nothing    -> splitFun ww_opts fn_id rhs } }
+
+-- | A conversion for the values flowing to one place.
+-- See Note [Worker/wrapper for function arguments]
+data Conv = Conv
+  { cv_unwrap :: CoreExpr -> UniqSM CoreExpr   -- ^ original value to new
+  , cv_wrap   :: Id -> UniqSM CoreExpr         -- ^ new value (bound to the Id) to original
+  , cv_new_ty :: Type }                        -- ^ the type of the new values
+
+-- | A value passed at an argument position
+data ArgVal = ArgLam (IdEnv Id) CoreExpr [Var]
+                -- ^ A lambda group, its value binders, and the let-bound
+                -- variables in scope where it is (for the functions its
+                -- body passes on)
+            | ArgFun CoreExpr Id
+                -- ^ A let-bound function (binder), perhaps applied to type
+                -- arguments
+
+argValExpr :: ArgVal -> CoreExpr
+argValExpr (ArgLam _ e _) = e
+argValExpr (ArgFun e _)   = e
+
+classifyArg :: IdEnv Id -> CoreExpr -> Maybe ArgVal
+classifyArg bound e = case classifyTail bound e of
+  Just (LamTail e' bs)  -> Just (ArgLam bound e' bs)
+  Just (VarTail e' b)   -> Just (ArgFun e' b)
+  _                     -> Nothing
+
+-- | Split a function so that one of its function parameters receives
+-- workers.  Returns the worker (Id and right-hand side) and the wrapper.
+splitFunArg :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe (Id, CoreExpr, (Id, CoreExpr)))
+splitFunArg ww_opts fn_id rhs
+  | not (wo_fun_results ww_opts)                     = return Nothing
+  | isJoinId fn_id                                   = return Nothing
+  | isStableUnfolding (realUnfoldingInfo fn_info)    = return Nothing
+  | not (null (ruleInfoRules (ruleInfo fn_info)))    = return Nothing
+  | isNoInlinePragma (inlinePragInfo fn_info)        = return Nothing
+  | isJust (certainlyWillInline uf_opts fn_info rhs)  = return Nothing
+  | Just (arg_vars, _) <- collectNValBinders_maybe ww_arity rhs
+  , not (null arg_vars)
+    -- Value parameters only (not yet: type or coercion parameters)
+  , all (\v -> isId v && not (isCoVar v)) arg_vars
+  = do { mb_conv <- lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv rhs arg_vars]
+       ; case mb_conv of
+           Nothing -> return Nothing
+           Just conv ->
+             do { work_rhs0 <- cv_unwrap conv rhs
+                ; let work_rhs = simpleOptExpr simpl_opts work_rhs0
+                ; work_uniq <- getUniqueM
+                ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
+                                  `setIdArity`     arityInfo fn_info
+                                  `setIdDmdSig`    dmdSigInfo fn_info
+                                  `setIdCprSig`    cprSigInfo fn_info
+                                  `setInlinePragma` (inlinePragInfo fn_info) { inl_rule = FunLike }
+                ; wrap_rhs0 <- cv_wrap conv work_id
+                ; let wrap_rhs = simpleOptExpr simpl_opts wrap_rhs0
+                      wrap_unf = case mkWrapperUnfolding simpl_opts wrap_rhs (arityInfo fn_info) of
+                                   unf@(CoreUnfolding { uf_guidance = g@(UnfWhen {}) })
+                                     -> unf { uf_guidance = g { ug_boring_ok = boringCxtOk } }
+                                   unf -> unf
+                      wrap_id  = fn_id `setIdUnfolding`  wrap_unf
+                                       `setInlinePragma` mkStrWrapperInlinePrag (inlinePragInfo fn_info) []
+                                       `setIdOccInfo`    noOccInfo
+                ; return (Just (work_id, work_rhs, (wrap_id, wrap_rhs))) } }
+  | otherwise = return Nothing
+  where
+    fn_info    = idInfo fn_id
+    ww_arity   = workWrapArity fn_id rhs
+    simpl_opts = wo_simple_opts ww_opts
+    uf_opts    = so_uf_opts simpl_opts
+
+-- | A conversion for a set of values at one position: (A) if splitting them
+-- as functions gains something, else (B)
+valuesConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
+valuesConv ww_opts fn_id depth vals
+  | depth > maxFunResultDepth = return Nothing
+  | v0 : vs <- vals
+  = do { mb_a <- functionsConv ww_opts fn_id v0 vs
+       ; case mb_a of
+           Just c  -> return (Just c)
+           Nothing -> lambdaConv ww_opts fn_id depth vals }
+  | otherwise = return Nothing
+
+-- | (A): the values are functions; split them with mkWwBodies
+functionsConv :: WwOpts -> Id -> ArgVal -> [ArgVal] -> UniqSM (Maybe Conv)
+functionsConv ww_opts fn_id v0 vs
+  | let k = foldr (min . valArity) (valArity v0) vs
+  , k >= 1
+  , Just (args, inner_res_ty) <- splitValArgs k (exprType (argValExpr v0))
+  = do { let dmds = map finalise (foldr (zipWith lubDmd . valDemands k) (valDemands k v0) vs)
+       ; xs <- mapM (\((m, ty), d) -> do { u <- getUniqueM
+                                          ; return (mkSysLocal (fsLit "fa") u m ty
+                                                     `setIdDemandInfo` d) })
+                    (zip args dmds)
+       ; mb_stuff <- mkWwBodies ww_opts fn_id k xs inner_res_ty dmds topCpr
+       ; case mb_stuff of
+           Nothing -> return Nothing
+           Just (_, _, wrap_fn, work_fn) ->
+             let unwrap e = return (simpleOptExpr simpl_opts (work_fn e))
+             in return (Just (Conv { cv_unwrap = unwrap
+                                   , cv_wrap   = \v -> return (wrap_fn v)
+                                   , cv_new_ty = exprType (simpleOptExpr simpl_opts (work_fn (argValExpr v0))) })) }
+  | otherwise = return Nothing
+  where
+    simpl_opts = wo_simple_opts ww_opts
+    valArity (ArgLam _ _ bs) = length bs
+    valArity (ArgFun _ b)  = idArity b
+    valDemands k (ArgLam _ _ bs) = map idDemandInfo (take k bs)
+    valDemands k (ArgFun _ b)  = take k (fst (splitDmdSig (idDmdSig b)) ++ repeat topDmd)
+    finalise d | isStrictDmd d = d
+               | otherwise     = trimBoxity d
+
+-- | (B): the values are lambda groups, one of whose parameters is a function
+-- that is only called, with values at some position that have a conversion
+lambdaConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
+lambdaConv ww_opts fn_id depth vals
+  | Just lams <- mapM isLam vals
+  , (_, _, bs0) : _ <- lams
+  , let m = minimum' [ length bs | (_, _, bs) <- lams ]
+  , m >= 1
+  = try_params [0 .. m - 1] lams m
+  | otherwise = return Nothing
+  where
+    simpl_opts = wo_simple_opts ww_opts
+    isLam (ArgLam env e bs) = Just (env, e, bs)
+    isLam _                 = Nothing
+    minimum' (x : xs) = foldr min x xs
+    minimum' []       = 0
+
+    try_params [] _ _ = return Nothing
+    try_params (qi : qis) lams m
+      = do { r <- try_param qi lams m
+           ; case r of { Just c -> return (Just c); Nothing -> try_params qis lams m } }
+
+    -- Parameter number qi of every lambda: only called, in every lambda,
+    -- with at least ri value arguments, and the values at ri convertible
+    try_param qi lams m
+      | Just callss <- mapM (\(env, e, bs) -> paramCalls env (bs !! qi) (snd (splitValLams m e))) lams
+      , let calls = concat callss
+      , not (null calls)
+      , let n_args = foldr (min . length . snd) maxBound calls
+      = try_positions [0 .. n_args - 1] qi calls lams m
+      | otherwise = return Nothing
+
+    try_positions [] _ _ _ _ = return Nothing
+    try_positions (ri : ris) qi calls lams m
+      | Just vals' <- mapM (\(env, args) -> classifyArg env (args !! ri)) calls
+      , isFunTy (exprType (argValExpr (headVal vals')))
+      = do { mb_c <- valuesConv ww_opts fn_id (depth + 1) vals'
+           ; case mb_c of
+               Just c  -> mkLambdaConv qi ri m lams c
+               Nothing -> try_positions ris qi calls lams m }
+      | otherwise = try_positions ris qi calls lams m
+
+    headVal (v : _) = v
+    headVal []      = panic "lambdaConv"
+
+    mkLambdaConv qi ri m lams inner
+      | (_, e0, bs0) : _ <- lams
+      , let q0 = bs0 !! qi
+      , Just (q_args, q_res) <- splitValArgs (ri + 1) (idType q0)
+      = do { let q_ty' = mkScaledFunTys [ Scaled mu (if i == ri then cv_new_ty inner else t)
+                                        | (i, (mu, t)) <- zip [0 :: Int ..] q_args ] q_res
+                 -- unwrap: the lambda's parameter qi becomes q', whose calls
+                 -- pass  inner.unwrap e  at position ri
+                 unwrap lam
+                   = do { let (bs, body) = splitValLams m lam
+                              q  = bs !! qi
+                        ; u <- getUniqueM
+                        ; let q' = mkLocalIdOrCoVar (mkSystemVarName u (fsLit "q")) (idMult q) q_ty'
+                                     `setIdDemandInfo` idDemandInfo q
+                        ; body' <- rewriteCalls q q' ri (cv_unwrap inner) body
+                        ; return (mkLams [ if i == qi then q' else b | (i, b) <- zip [0 :: Int ..] bs ] body') }
+                 -- wrap: \as -> l' .. (adapter a_q) ..
+                 wrap l'
+                   = do { as <- mapM (\b -> do { u <- getUniqueM
+                                                ; return (mkSysLocal (fsLit "a") u (idMult b) (idType b)) })
+                                     (take m bs0)
+                        ; let a_q = as !! qi
+                        ; cs <- mapM (\((mu, t), i) -> do { u <- getUniqueM
+                                                         ; return (mkSysLocal (fsLit "c") u mu
+                                                                     (if i == ri then cv_new_ty inner else t)) })
+                                     (zip q_args [0 :: Int ..])
+                        ; let c_r = cs !! ri
+                        ; inner_wrapped <- cv_wrap inner c_r
+                        ; let adapter = mkLams cs (mkApps (Var a_q)
+                                          [ if i == ri then inner_wrapped else Var c | (i, c) <- zip [0 :: Int ..] cs ])
+                              call = mkApps (Var l') [ if i == qi then adapter else Var a | (i, a) <- zip [0 :: Int ..] as ]
+                        ; return (mkLams as call) }
+           ; e0' <- unwrap e0
+           ; return (Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap
+                                , cv_new_ty = exprType (simpleOptExpr simpl_opts e0') })) }
+      | otherwise = return Nothing
+
+-- | The calls of a function parameter in a body: for each, the let-bound
+-- variables in scope (for classifyArg) and its value arguments.  Nothing if
+-- the parameter occurs other than as the head of a call.
+paramCalls :: IdEnv Id -> Id -> CoreExpr -> Maybe [(IdEnv Id, [CoreExpr])]
+paramCalls env0 q = go env0
+  where
+    go env e = case e of
+      _ | (Var v, args) <- collectArgs e, v == q
+        , not (null (filter isValArg args))
+        -> do { rest <- concat <$> mapM (go env) args
+              ; return ((env, filter isValArg args) : rest) }
+      Var v | v == q    -> Nothing
+            | otherwise -> Just []
+      Lit {}           -> Just []
+      Type {}          -> Just []
+      Coercion {}      -> Just []
+      App f a          -> (++) <$> go env f <*> go env a
+      Lam _ b          -> go env b
+      Let bind body    -> let env' = extendVarEnvList env [ (b, b) | b <- bindersOf bind ]
+                          in (++) <$> (concat <$> mapM (go env') (rhssOfBind bind)) <*> go env' body
+      Case s _ _ alts  -> (++) <$> go env s <*> (concat <$> mapM (\(Alt _ _ rhs) -> go env rhs) alts)
+      Cast b _         -> go env b
+      Tick _ b         -> go env b
+
+-- | Rename a function parameter q to q' and convert its calls' argument at
+-- value position ri
+rewriteCalls :: Id -> Id -> Int -> (CoreExpr -> UniqSM CoreExpr) -> CoreExpr -> UniqSM CoreExpr
+rewriteCalls q q' ri conv = go
+  where
+    go e = case e of
+      _ | (Var v, args) <- collectArgs e, v == q, any isValArg args
+        -> do { args' <- mapM go args
+              ; args'' <- convertNth ri args'
+              ; return (mkApps (Var q') args'') }
+      Var {}        -> return e
+      Lit {}        -> return e
+      Type {}       -> return e
+      Coercion {}   -> return e
+      App f a       -> App <$> go f <*> go a
+      Lam b body    -> Lam b <$> go body
+      Let bind body -> Let <$> go_bind bind <*> go body
+      Case s b ty alts -> Case <$> go s <*> pure b <*> pure ty
+                               <*> mapM (\(Alt c bs rhs) -> Alt c bs <$> go rhs) alts
+      Cast body co  -> (\b -> Cast b co) <$> go body
+      Tick t body   -> Tick t <$> go body
+
+    go_bind (NonRec b r) = NonRec b <$> go r
+    go_bind (Rec prs)    = Rec <$> mapM (\(b, r) -> (,) b <$> go r) prs
+
+    -- Convert the ri-th value argument
+    convertNth n (a : as)
+      | isValArg a, n == 0 = (: as) <$> conv a
+      | isValArg a         = (a :) <$> convertNth (n - 1) as
+      | otherwise          = (a :) <$> convertNth n as
+    convertNth _ []        = return []
 
 -- | Is every partial application of a function of the given arity called
 -- at most once, and with at least k more arguments?  Then eta-expansion

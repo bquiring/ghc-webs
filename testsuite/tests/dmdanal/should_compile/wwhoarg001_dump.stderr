@@ -1,0 +1,3 @@
+$w$wh
+main19 = \ c -> case c main21 of { I# x -> case c main20 of { I# y -> I# (*# x y) } }
+main14 = \ c -> case c main16 of { I# x -> case c main15 of { I# y -> I# (+# x y) } }

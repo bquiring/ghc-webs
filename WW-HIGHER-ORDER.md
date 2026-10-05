@@ -1,8 +1,9 @@
 # Design: Higher-Order Worker/Wrapper for GHC
 
-Status: §2.1 implemented behind `-fworker-wrapper-function-results` (Note
-[Worker/wrapper for function results] in `GHC.Core.Opt.WorkWrap`); the rest
-is design. Branch `ww-higher-order`, from `master`. It is independent
+Status: §2.1 (function results) and §2.2 (function arguments) implemented
+behind `-fworker-wrapper-function-results` (Notes [Worker/wrapper for
+function results] and [Worker/wrapper for function arguments] in
+`GHC.Core.Opt.WorkWrap`). Branch `ww-higher-order`, from `master`. It is independent
 of the webs: it is an extension of GHC's
 own demand analysis and worker/wrapper (`GHC.Core.Opt.DmdAnal`,
 `GHC.Core.Opt.WorkWrap`, `GHC.Core.Opt.WorkWrap.Utils`). It is based on the
@@ -288,11 +289,32 @@ It can be read off the body syntactically: every occurrence of `g` is
   (`wwmix003`; finding that it is dead needs a fixed point, as demand
   analysis does), and an overloaded function that GHC inlines and
   specialises anyway (`wwmix004`).
-- **Function arguments** (`wwhoarg001`, `wwhoarg002`, §2.2): recorded as
-  runnable tests, not split yet. The scheme from the result case applies:
-  going down `h`, track the wrappers associated with each function parameter
-  (what `g` is given), collate them at the definition, and introduce the
-  wrapper there.
+- **Function arguments (§2.2):** a *conversion* for the values that flow
+  to one argument position is a closed pair `unwrap` (original value to
+  new) and `wrap` (back), with `wrap (unwrap v) = v`. It is either (A) an
+  ordinary worker/wrapper split of the functions passed there (combined
+  demands, `mkWwBodies`), or (B) for lambdas passed there, one of whose
+  parameters `q` is only ever called, with values at some position that
+  have a conversion found first, recursively, going down: `unwrap` rewrites
+  `q`'s calls, `wrap l' = \as -> l' ... (adapter a_q) ...`. `h` itself is
+  split by a conversion of kind (B) for its own right-hand side, so the
+  wrappers are collated and introduced only at the definition:
+  `h = \g n -> $wh (\c -> g (\x _ -> c x)) n`. Nesting (`g` given a
+  function that is given `f`) is (B) inside (B). One parameter per split;
+  the worker is tried again for the others (up to 4). Not for `NOINLINE`
+  functions, or functions with type parameters (yet).
+
+  Tests: `wwhoarg001` (the README example: the caller's function becomes
+  `\c -> c 1 ...`, calling the worker without the dead argument),
+  `wwhoarg002` (nested: `\c -> c 9#` two levels in), `wwhoarg003` (two
+  local functions at one position), `wwhoarg004` (`g` escapes: no split),
+  `wwhoarg005` (laziness: `g` undefined and not called, `g` ignoring `f`,
+  the dead argument undefined), `wwhoarg006` (argument and result splits
+  composed: `h = \a a1 -> let wf = $w$wh (\c -> a (\fa _ -> c fa)) a1 in
+  \fr _ -> wf fr`), `wwhoarg007` (two parameters), `wwhoarg008` (recursive
+  `h` passing `g` on: not split; the recursive call could pass `g'`),
+  `wwhoarg009` (a lambda argument lazy in `x`: not unboxed; mutation-checked),
+  and the dump tests `wwhoarg001/002/006_dump`.
 - **Not yet:** the returned lambda's own arguments are not unboxed unless
   the inner function's signature says so (e.g. `wwreturn003`). Demand
   analysis looks at a returned lambda as if it might not be called, so its
@@ -322,7 +344,8 @@ Results:
 1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.
 2. §3 option 1 (the demand analyser records the result's signature): covers
    `wwreturn002`.
-3. §2.2 (function arguments).
+3. Done: §2.2 (function arguments). Next: recursive functions that pass a
+   function parameter on (`wwhoarg008`), type parameters.
 (§2.3, data structures, is out of scope: see there.)
 
 ## Notes on `WORKING-THE-WORKER-WRAPPER.md`

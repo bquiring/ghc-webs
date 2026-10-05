@@ -2,7 +2,7 @@
 -- dead argument, is passed to a function that is itself passed to the
 -- argument k, and f is called inside that.  A split would need wrappers
 -- for h, k's argument, that argument's argument, and f.
-module Main (main) where
+module WWHoArg_002 (main, h) where
 
 h :: ((((Int -> Int -> Int) -> Int) -> Int) -> Int) -> Int -> Int
 h k n = let c = sum [1 .. n]

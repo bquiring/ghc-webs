@@ -1,0 +1,5 @@
+$w$wh
+h = \ a a1 -> let { wf = $w$wh (\ c -> a (\ fa _ -> c fa)) a1 } in \ fr _ -> wf fr
+      let { wf = $w$wh (\ c -> case c n of { I# x -> case c main20 of { I# y -> I# (+# x y) } }) n } in
+main13 = \ c -> c main14
+main11 = $w$wh main13 main12

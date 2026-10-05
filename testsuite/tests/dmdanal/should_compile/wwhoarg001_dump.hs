@@ -4,7 +4,7 @@
 -- receives f's wrapper, and every call of f by g passes the dead argument.
 -- Approach 2 would pass f's worker to g, with a wrapper for h adapting the
 -- caller's g (three layers: h, g's argument, f).
-module Main (main) where
+module WWHoArg_001 (main, h) where
 
 h :: ((Int -> Int -> Int) -> Int) -> Int -> Int
 h g n = let k = sum [1 .. n]
