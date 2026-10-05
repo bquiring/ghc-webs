@@ -138,12 +138,12 @@ That keeps the goldens readable; the driver compares filtered output only.
 
 ## Results so far (nofib, 115 benchmarks; `ww-bench/report-latest.md`)
 
-| | early | pre-ww | final |
-|---|---|---|---|
-| functions returning a function | 477 | 367 | 412 |
-| functions taking a function | 626 | 632 | 768 |
-| result splits | 9 | 7 | 10 |
-| argument splits | 0 | 0 | 0 |
+|                                | early | pre-ww | final |
+|--------------------------------|------:|-------:|------:|
+| functions returning a function |   477 |    367 |   412 |
+| functions taking a function    |   626 |    632 |   768 |
+| result splits                  |     9 |      7 |    10 |
+| argument splits                |     0 |      0 |     0 |
 
 - **Performance is unchanged:** program allocation +0.00%, code +0.07%.
 - **The splits that happen:** in `pretty`, `scs`, `hpg` and `anna`.

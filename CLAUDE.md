@@ -132,6 +132,9 @@ rejection reasons, allocation, code size; via `ww-bench/report.py`).
 - Commit at milestones, with messages that explain the why. End commit
   messages with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Results written to `.md` files must read well as plain text: align table
+  columns, with numbers right-aligned. `ww-bench/mdalign.py FILE...` does it
+  in place, and `report.py` output is already aligned.
 - Push only when asked. The remote is `origin`
   (github.com/bquiring/ghc-webs).
 - **Every split must preserve laziness exactly**, except where

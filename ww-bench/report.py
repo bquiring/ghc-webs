@@ -206,4 +206,11 @@ def main(configs):
             print('    ' + line)
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    # Print with the table columns aligned, to read as plain text (mdalign.py)
+    import io, contextlib
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from mdalign import align_text
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(sys.argv[1:])
+    sys.stdout.write(align_text(buf.getvalue()))

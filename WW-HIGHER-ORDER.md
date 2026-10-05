@@ -40,11 +40,11 @@ does depends on whether `f` is still `let`-bound when worker/wrapper runs
 (it runs late, after the main simplifier and demand analysis). The tests
 in `testsuite/tests/dmdanal/should_compile` record each case:
 
-| shape | GHC today | test |
-|---|---|---|
-| `g` cheap, inlinable | inlines `g`, copies `f`'s body to every call | `wwreturn001` |
-| `f` used once (`let f = .. in f`) | the binding is inlined before worker/wrapper runs; `g` returns `\x _ -> e`; no split at all; calls pass `y` and boxed `x` | `wwreturn002` |
-| `f` large, used more than once | `f` is split into `$wf` and a wrapper, and `g` returns the wrapper `\x _ -> case x of I# x# -> $wf x#`; every call of `h` is an unknown call of that wrapper, passing `y` and boxed `x` | `wwreturn003` |
+| shape                             | GHC today                                                                                                                                                                               | test          |
+|-----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `g` cheap, inlinable              | inlines `g`, copies `f`'s body to every call                                                                                                                                            | `wwreturn001` |
+| `f` used once (`let f = .. in f`) | the binding is inlined before worker/wrapper runs; `g` returns `\x _ -> e`; no split at all; calls pass `y` and boxed `x`                                                               | `wwreturn002` |
+| `f` large, used more than once    | `f` is split into `$wf` and a wrapper, and `g` returns the wrapper `\x _ -> case x of I# x# -> $wf x#`; every call of `h` is an unknown call of that wrapper, passing `y` and boxed `x` | `wwreturn003` |
 
 The cost in all three: an unknown call of a closure that takes a dead
 argument and boxed values, while a worker exists, or could, that takes
@@ -345,12 +345,12 @@ Results:
 nofib (115 benchmarks, `fast` mode; `ww-bench/`, report in
 `ww-bench/report-latest.md`), summed over all modules:
 
-| point | function bindings | return a function | take a function | result splits | argument splits |
-|---|---|---|---|---|---|
-| early (before the main simplifier) | 7,567 | 443 | 626 | 8 | 0 |
-| pre-ww (where worker/wrapper decides) | 8,947 | 335 | 632 | 7 | 0 |
-| final, flag off | 10,770 | 369 | 768 | 9 | 0 |
-| final, flag on | 10,778 | 376 | 769 | 2 | 0 |
+| point                                 | function bindings | return a function | take a function | result splits | argument splits |
+|---------------------------------------|------------------:|------------------:|----------------:|--------------:|----------------:|
+| early (before the main simplifier)    |             7,567 |               443 |             626 |             8 |               0 |
+| pre-ww (where worker/wrapper decides) |             8,947 |               335 |             632 |             7 |               0 |
+| final, flag off                       |            10,770 |               369 |             768 |             9 |               0 |
+| final, flag on                        |            10,778 |               376 |             769 |             2 |               0 |
 
 - **Splits are rare.** About 2% of the functions that return a function are
   split. The 7 at pre-ww are in 4 programs: `spectral/pretty` (`ppInt`,
@@ -381,17 +381,17 @@ Splits: 9 early, 7 pre-ww, 10 final (`returns_fun` now also counts newtypes
 over functions: 477 / 367 / 412). Performance is still unchanged (program
 allocation +0.00%, code +0.07%). Why functions are not split, at pre-ww:
 
-| reason | functions |
-|---|---|
-| argument: the function has type parameters | 252 |
-| argument: small (inlined whole) | 174 |
-| argument: the parameter is not only called | 113 |
-| result: a tail is a call | 83 |
-| result: nothing to gain | 80 |
-| result: a tail is a local variable | 79 |
-| result: small | 70 |
-| argument: not given known functions | 65 |
-| result: a tail is a cast it cannot look through | 3 |
+| reason                                          | functions |
+|-------------------------------------------------|----------:|
+| argument: the function has type parameters      |       252 |
+| argument: small (inlined whole)                 |       174 |
+| argument: the parameter is not only called      |       113 |
+| result: a tail is a call                        |        83 |
+| result: nothing to gain                         |        80 |
+| result: a tail is a local variable              |        79 |
+| result: small                                   |        70 |
+| argument: not given known functions             |        65 |
+| result: a tail is a cast it cannot look through |         3 |
 
 Casts and demands were not the obstacle: casts improve 3 functions at most,
 and the analysed demands make existing splits better (strict arguments
