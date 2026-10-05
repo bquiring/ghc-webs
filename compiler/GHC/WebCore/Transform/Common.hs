@@ -9,6 +9,7 @@ module GHC.WebCore.Transform.Common
   , pprWebVerdicts
   , mkWild
   , splitLeadingLams
+  , reorderTopBinds
   ) where
 
 import GHC.Prelude
@@ -39,6 +40,8 @@ import GHC.Core.Type ( coreFullView )
 import GHC.Types.Demand ( DmdSig, splitDmdSig, mkClosedDmdSig, absDmd, topDmd )
 
 import Data.List ( sortOn )
+import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
+import GHC.Core.FVs ( bindFreeVars )
 
 -- | All the variables that occur in the program (not binders), including in
 -- breakpoint ticks
@@ -292,3 +295,38 @@ splitLeadingLams e              = (id, e)
 -- | A fresh case binder
 mkWild :: Type -> UniqSM Id
 mkWild ty = do { u <- getUniqueM; return (mkSysLocal (fsLit "wild") u ManyTy ty) }
+
+{- Note [Top-level binding order]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Top-level bindings must be in dependency order for Tidy, which renames them
+in order (Core Lint itself puts all top-level binders in scope at once).
+Constant propagation and super-beta inlining copy references to top-level
+binders (a constant, or the free variables of an inlined lambda) into other
+top-level bindings, which may come earlier.  So after the transformations,
+the pipeline sorts the top-level bindings again: strongly connected
+components of the dependency graph (including the free variables of
+unfoldings and rules), in dependency order, keeping the original order where
+it is free.
+-}
+
+-- | Sort the top-level bindings into dependency order.
+-- See Note [Top-level binding order]
+reorderTopBinds :: CoreProgram -> CoreProgram
+reorderTopBinds binds
+  | in_order emptyVarSet binds = binds
+  | otherwise                  = map to_bind (stronglyConnCompFromEdgedVerticesUniq nodes)
+  where
+    -- Already in dependency order: each binding mentions only top-level
+    -- binders bound before it (or in its own recursive group)
+    in_order _ [] = True
+    in_order seen (bind : rest)
+      = let seen' = extendVarSetList seen (bindersOf bind)
+            fvs   = bindFreeVars bind `intersectVarSet` tops
+        in fvs `subVarSet` seen' && in_order seen' rest
+
+    prs   = flattenBinds binds
+    tops  = mkVarSet (map fst prs)
+    nodes = [ DigraphNode (b, e) b (nonDetEltsUniqSet (bindFreeVars (NonRec b e) `intersectVarSet` tops))
+            | (b, e) <- prs ]
+    to_bind (AcyclicSCC (b, e)) = NonRec b e
+    to_bind (CyclicSCC prs')    = Rec prs'

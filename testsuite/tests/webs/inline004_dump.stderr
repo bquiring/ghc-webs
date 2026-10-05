@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( inline004.hs, inline004.o )
+
+==================== Webs: super-beta inlining ====================
+inline: x
+not inlined (NOINLINE): f
+not inlined (NOINLINE): f
+not inlined (captures local variables): n
+not inlined (captures local variables): x
+not inlined (exposed): eta
+not inlined (exposed): r r r
+
+
+[2 of 2] Linking inline004

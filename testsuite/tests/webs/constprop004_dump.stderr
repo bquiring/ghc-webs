@@ -1,0 +1,16 @@
+[1 of 2] Compiling Main             ( constprop004.hs, constprop004.o )
+
+==================== Webs: constant propagation ====================
+constant argument GHC.Internal.Types.(##); constant result GHC.Internal.Types.(##): void
+constant argument GHC.Internal.Types.(##); constant result GHC.Internal.Types.(##): void
+constant argument Main.sq; no constant result (not constant): f
+no constant argument (exposed); no constant result (exposed): eta
+no constant argument (exposed); no constant result (exposed): r r
+no constant argument (not constant); no constant result (not constant): f
+no constant argument (not constant); no constant result (not constant): n
+no constant argument (not constant); no constant result (not constant): n n
+no constant argument (not constant); no constant result (not constant): ww
+no constant argument (not constant); no constant result (not constant): x
+
+
+[2 of 2] Linking constprop004

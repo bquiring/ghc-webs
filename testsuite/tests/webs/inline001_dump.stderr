@@ -1,0 +1,12 @@
+[1 of 2] Compiling Main             ( inline001.hs, inline001.o )
+
+==================== Webs: super-beta inlining ====================
+inline: x
+not inlined (NOINLINE): f
+not inlined (captures local variables): n
+not inlined (captures local variables): ww
+not inlined (exposed): eta
+not inlined (loop breaker): x
+
+
+[2 of 2] Linking inline001

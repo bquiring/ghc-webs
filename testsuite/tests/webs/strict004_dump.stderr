@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( strict004.hs, strict004.o )
+
+==================== Webs: strictness ====================
+lazy argument (exposed); no strict result fields (exposed): eta
+lazy argument (exposed); no strict result fields (exposed): r r
+lazy argument (lazy); no strict result fields (unknown call context): n
+lazy argument (lazy); no strict result fields (unknown call context): ww
+lazy argument (lazy); no strict result fields (unknown call context): ww
+strict argument (depth 1); no strict result fields (unknown call context): x x
+strict argument (depth 2); no strict result fields (no calls): f
+
+
+[2 of 2] Linking strict004

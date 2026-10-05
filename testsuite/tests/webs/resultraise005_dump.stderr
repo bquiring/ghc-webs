@@ -1,0 +1,14 @@
+[1 of 2] Compiling Main             ( resultraise005.hs, resultraise005.o )
+
+==================== Webs: result raising ====================
+raised: n n
+rejected (a tail does not construct the result): n
+rejected (exposed): eta
+rejected (exposed): r r r r r r
+rejected (exposed): s s s
+rejected (result not a product): f
+rejected (result not a product): n
+rejected (result not a product): n
+
+
+[2 of 2] Linking resultraise005

@@ -10,7 +10,10 @@ reads webs-bench/results/CONFIG/ (see run-nofib.sh) and prints:
   2. Simplifier/inliner statistics (the "Grand total simplifier statistics"
      of -ddump-simpl-stats): total ticks and the inlining-related tick
      kinds, per configuration, with the change against the first one.
-  3. Which benchmarks failed to build or run.
+  3. Compiler and program allocation, and code size: the text section of
+     the benchmark's own object files (its modules), and of the linked
+     executable (which also contains the RTS and libraries).
+  4. Which benchmarks failed to build or run.
 """
 import os, re, sys, collections
 
@@ -107,6 +110,33 @@ def timings(config):
                 res[bench]['run_mut'] = float(m.group(2))
     return res
 
+def sizes(config):
+    """bench -> {'obj_text', 'obj_total', 'exe_text', 'exe_total'} from the
+    output of size(1) that follows the "size of X follows..." markers.  The
+    object files are the benchmark's own modules (including the shared
+    NofibUtils.o, which is the same in every configuration)."""
+    log = os.path.join(ROOT, config, 'nofib.log')
+    res = collections.defaultdict(collections.Counter)
+    if not os.path.exists(log):
+        return res
+    bench, target = None, None
+    for line in open(log, errors='replace'):
+        m = re.match(r'==nofib== (\S+): size of (\S+) follows', line)
+        if m:
+            bench, target = m.group(1), m.group(2)
+            continue
+        m = re.match(r'\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+(\S+)\s*$', line)
+        if m and bench and target and m.group(5) == target:
+            text, total = int(m.group(1)), int(m.group(4))
+            if target.endswith('.o'):
+                res[bench]['obj_text'] += text
+                res[bench]['obj_total'] += total
+            else:
+                res[bench]['exe_text'] = text
+                res[bench]['exe_total'] = total
+            target = None
+    return res
+
 def geomean_ratio(xs):
     import math
     xs = [x for x in xs if x > 0]
@@ -188,6 +218,39 @@ def main(configs):
         print('| %s vs %s | ' % (name, c0) + ' | '.join(cells) + ' |')
     print()
     print('Times are not reported: they are not reliable on this machine (see report.py).\n')
+
+    print('# Code size (from size(1) in the nofib logs)\n')
+    print('If the web transformations reduce inlining and worker/wrapper, the code')
+    print('of the benchmarks\' own modules should shrink.  The executable also')
+    print('contains the RTS and the libraries, which do not change.\n')
+    sz = {c: sizes(c) for c in configs}
+    print('| measure | ' + ' | '.join(configs) + ' |')
+    print('|---' * (len(configs) + 1) + '|')
+    for k, name in [('obj_text', 'object code (text), total'),
+                    ('obj_total', 'object files (text+data+bss), total'),
+                    ('exe_text', 'executable (text), total')]:
+        base = sum(sz[c0][b][k] for b in sz[c0])
+        cells = [str(base)]
+        for c in configs[1:]:
+            common = [b for b in sz[c0] if sz[c0][b][k] > 0 and sz[c][b][k] > 0]
+            tot = sum(sz[c][b][k] for b in common)
+            tot0 = sum(sz[c0][b][k] for b in common)
+            g = geomean_ratio([sz[c][b][k] / sz[c0][b][k] for b in common])
+            cells.append('%d (%s; geomean %+.2f%%)' % (tot, pct(tot, tot0), 100 * (g - 1)))
+        print('| %s | ' % name + ' | '.join(cells) + ' |')
+    print()
+    if len(configs) > 1:
+        print('## Object code (text) per benchmark (largest changes vs %s)\n' % c0)
+        print('| benchmark | ' + ' | '.join(configs) + ' |')
+        print('|---' * (len(configs) + 1) + '|')
+        def change(b):
+            base = sz[c0][b]['obj_text']
+            return -max(abs(sz[c][b]['obj_text'] - base) / base for c in configs) if base else 0
+        for b in sorted(sz[c0], key=change)[:30]:
+            base = sz[c0][b]['obj_text']
+            cells = [str(base)] + [pct(sz[c][b]['obj_text'], base) for c in configs[1:]]
+            print('| %s | ' % b + ' | '.join(cells) + ' |')
+        print()
     print('## Program allocation per benchmark (bytes; change vs %s)\n' % c0)
     print('| benchmark | ' + ' | '.join(configs) + ' |')
     print('|---' * (len(configs) + 1) + '|')

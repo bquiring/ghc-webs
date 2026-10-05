@@ -1,3 +1,4 @@
 results/
 results-run*/
 run-all.log
+__pycache__/

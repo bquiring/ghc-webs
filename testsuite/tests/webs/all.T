@@ -78,3 +78,62 @@ test('alltransforms001_dump', [extra_files(['alltransforms001.hs'])], multimod_c
 # Interface boundary: Ids reachable from exposed vanilla unfoldings
 test('webs006', [extra_files(['Webs006A.hs'])], multimod_compile_and_run,
      ['webs006', webs_opts + ' -fcore-webs-arity-raise -fcore-webs-dead-params -fcore-webs-uncurry'])
+
+# Web strictness (GHC.WebCore.Transform.Strictness).  strict002, 003, 004,
+# 006 and 007 check laziness and sharing; 004 counts evaluations with
+# Debug.Trace (the expected stderr).
+st_opts = webs_opts + ' -fcore-webs-strictness'
+
+def strict_test(name):
+    test(name, [], compile_and_run, [st_opts])
+    test(name + '_dump', [extra_files([name + '.hs'])],
+         multimod_compile, [name, st_opts + ' -ddump-webs-strictness -dsuppress-uniques'])
+
+for n in range(1, 9):
+    strict_test('strict%03d' % n)
+
+# Result raising (GHC.WebCore.Transform.ResultRaise).  resultraise002
+# checks laziness.
+rr_opts = webs_opts + ' -fcore-webs-result-raise'
+
+def resultraise_test(name):
+    test(name, [], compile_and_run, [rr_opts])
+    test(name + '_dump', [extra_files([name + '.hs'])],
+         multimod_compile, [name, rr_opts + ' -ddump-webs-result-raise -dsuppress-uniques'])
+
+for n in range(1, 6):
+    resultraise_test('resultraise%03d' % n)
+
+# Constant propagation (GHC.WebCore.Transform.ConstProp), followed by
+# dead-parameter elimination.  constprop003 checks that calls with a constant
+# result are still evaluated (Debug.Trace, the expected stderr).
+cp_opts = webs_opts + ' -fcore-webs-const-prop -fcore-webs-dead-params'
+
+def constprop_test(name):
+    test(name, [], compile_and_run, [cp_opts])
+    test(name + '_dump', [extra_files([name + '.hs'])],
+         multimod_compile, [name, cp_opts + ' -ddump-webs-const-prop -dsuppress-uniques'])
+
+for n in range(1, 5):
+    constprop_test('constprop%03d' % n)
+
+# Super-beta inlining (GHC.WebCore.Transform.Inline).  inline002 and 004
+# check laziness and sharing; inline005 checks top-level binding order.
+in_opts = webs_opts + ' -fcore-webs-inline'
+
+def inline_test(name):
+    test(name, [], compile_and_run, [in_opts])
+    test(name + '_dump', [extra_files([name + '.hs'])],
+         multimod_compile, [name, in_opts + ' -ddump-webs-inline -dsuppress-uniques'])
+
+for n in range(1, 7):
+    inline_test('inline%03d' % n)
+
+# Every transformation together
+all_opts = (webs_opts + ' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
+            ' -fcore-webs-dead-params -fcore-webs-uncurry -fcore-webs-result-raise'
+            ' -fcore-webs-strictness')
+test('alltransforms002', [extra_files(['alltransforms001.hs'])], multimod_compile_and_run,
+     ['alltransforms001', all_opts])
+test('webs007', [extra_files(['Webs006A.hs', 'webs006.hs'])], multimod_compile_and_run,
+     ['webs006', all_opts])

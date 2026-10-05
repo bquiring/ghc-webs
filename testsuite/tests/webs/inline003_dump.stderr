@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( inline003.hs, inline003.o )
+
+==================== Webs: super-beta inlining ====================
+not inlined (NOINLINE): f
+not inlined (NOINLINE): ww
+not inlined (captures local variables): n
+not inlined (captures local variables): ww
+not inlined (exposed): eta
+not inlined (exposed): r r
+not inlined (more than one lambda): x x
+
+
+[2 of 2] Linking inline003

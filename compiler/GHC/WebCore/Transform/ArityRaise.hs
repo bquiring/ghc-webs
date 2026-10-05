@@ -3,6 +3,9 @@
 -- See Note [Arity raising] and WEBS-ARITY-RAISING.md.
 module GHC.WebCore.Transform.ArityRaise
   ( arityRaiseRound
+    -- * Products, shared with result raising
+  , productCon, productOf, components, splitArgCo, componentsTupleCo
+  , isStrictIn
   ) where
 
 import GHC.Prelude
@@ -335,15 +338,7 @@ raiseCo todo = go
         | w `elementOfUniqSet` todo
         , Just (_, arg_cos) <- splitArgCo ca
         , Just (_, _, dc) <- productCon (coercionLKind ca)
-        -> let arg_cos' = map go arg_cos
-               -- The coercions between the components: lift the
-               -- components' types over the coercions between the type
-               -- arguments
-               comp_cos = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos')
-                              (map scaledThing (dataConRepArgTys dc))
-               reps     = map (mkNomReflCo . getRuntimeRep . coercionLKind) comp_cos
-               n        = length comp_cos
-               tup      = mkTyConAppCo r (tupleTyCon Unboxed n) (reps ++ comp_cos)
+        -> let tup      = componentsTupleCo r dc (map go arg_cos)
                cr'      = go cr
                Pair lt rt = coercionKind tup
                Pair lc rc = coercionKind cr'
@@ -354,6 +349,17 @@ raiseCo todo = go
       TransCo c1 c2       -> TransCo (go c1) (go c2)
       SubCo c             -> SubCo (go c)
       _                   -> co
+
+-- | The coercion between the unboxed tuples of the components of two
+-- instances of a product type, given the coercions between their type
+-- arguments: lift the components' types over those coercions
+componentsTupleCo :: Role -> DataCon -> [Coercion] -> Coercion
+componentsTupleCo r dc arg_cos
+  = mkTyConAppCo r (tupleTyCon Unboxed (length comp_cos)) (reps ++ comp_cos)
+  where
+    comp_cos = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos)
+                   (map scaledThing (dataConRepArgTys dc))
+    reps     = map (mkNomReflCo . getRuntimeRep . coercionLKind) comp_cos
 
 rewriteProgram :: WebSet -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
 rewriteProgram todo pol binds

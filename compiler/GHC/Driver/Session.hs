@@ -1534,6 +1534,14 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_uncurry)
   , make_ord_flag defGhcFlag "ddump-webs-arity-raise"
         (setDumpFlag Opt_D_dump_webs_arity_raise)
+  , make_ord_flag defGhcFlag "ddump-webs-strictness"
+        (setDumpFlag Opt_D_dump_webs_strictness)
+  , make_ord_flag defGhcFlag "ddump-webs-result-raise"
+        (setDumpFlag Opt_D_dump_webs_result_raise)
+  , make_ord_flag defGhcFlag "ddump-webs-const-prop"
+        (setDumpFlag Opt_D_dump_webs_const_prop)
+  , make_ord_flag defGhcFlag "ddump-webs-inline"
+        (setDumpFlag Opt_D_dump_webs_inline)
   , make_ord_flag defGhcFlag "ddump-first-class-stats"
         (setDumpFlag Opt_D_dump_first_class_stats)
   , make_ord_flag defGhcFlag "ddump-stg-from-core"
@@ -2537,6 +2545,10 @@ fFlagsDeps = [
   flagSpec "core-webs-dead-params"            Opt_CoreWebsDeadParams,
   flagSpec "core-webs-uncurry"                Opt_CoreWebsUncurry,
   flagSpec "core-webs-arity-raise"            Opt_CoreWebsArityRaise,
+  flagSpec "core-webs-strictness"             Opt_CoreWebsStrictness,
+  flagSpec "core-webs-result-raise"           Opt_CoreWebsResultRaise,
+  flagSpec "core-webs-const-prop"             Opt_CoreWebsConstProp,
+  flagSpec "core-webs-inline"                 Opt_CoreWebsInline,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "liberate-case"                    Opt_LiberateCase,
   flagHiddenSpec "llvm-fill-undef-with-garbage" Opt_LlvmFillUndefWithGarbage,

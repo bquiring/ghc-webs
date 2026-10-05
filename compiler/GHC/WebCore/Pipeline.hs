@@ -39,9 +39,13 @@ import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
 import GHC.WebCore.Solve
 import GHC.WebCore.Transform.ArityRaise
-import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..) )
+import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..), reorderTopBinds )
 import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
 import GHC.WebCore.Transform.Uncurry
+import GHC.WebCore.Transform.Strictness ( strictnessRound )
+import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
+import GHC.WebCore.Transform.ConstProp ( constPropRound )
+import GHC.WebCore.Transform.Inline ( inlineRound )
 import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
 import GHC.Core.TyCo.Rep
@@ -129,7 +133,8 @@ webPass early guts
                        (lengthBag pairs) sol
 
          -- 4. Erasure
-       ; let binds3 = eraseProgram sigs2 binds_t
+       ; let binds3 | transformed = reorderTopBinds (eraseProgram sigs2 binds_t)
+                    | otherwise   = eraseProgram sigs2 binds_t
 
          -- If a transformation changed the program, it is not the original;
          -- Core Lint (endPass, with -dcore-lint) still checks the result
@@ -214,14 +219,22 @@ runTransforms early logger dflags cfg sigs binds0
     keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
 
     transforms =
-      [ ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
+      [ ( Opt_CoreWebsInline, "super-beta inlining", Opt_D_dump_webs_inline
+        , \us done b -> inlineRound (unfoldingOpts dflags) us exposed done b )
+      , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
+        , \us done b -> constPropRound us exposed done b )
+      , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
         , \us done b -> arityRaiseRound us exposed keep done b )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
         , \us done b -> case deadParamsRound us exposed keep done b of
                           (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
       , ( Opt_CoreWebsUncurry, "uncurrying", Opt_D_dump_webs_uncurry
         , \us _ b -> case uncurryRound us exposed keep b of
-                       (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) ) ]
+                       (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) )
+      , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
+        , \us done b -> resultRaiseRound us exposed keep done b )
+      , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
+        , \us done b -> strictnessRound us exposed done b ) ]
 
     step (binds, changed) (flag, name, dump_flag, do_round)
       | early, flag == Opt_CoreWebsUncurry

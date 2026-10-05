@@ -1,0 +1,12 @@
+[1 of 2] Compiling Main             ( constprop003.hs, constprop003.o )
+
+==================== Webs: constant propagation ====================
+constant argument Main.noisy; no constant result (not constant): f
+no constant argument (exposed); no constant result (exposed): eta
+no constant argument (exposed); no constant result (exposed): r r
+no constant argument (not constant); constant result GHC.Internal.Types.(##): n
+no constant argument (not constant); constant result GHC.Internal.Types.True: n
+no constant argument (not constant); no constant result (not constant): n
+
+
+[2 of 2] Linking constprop003

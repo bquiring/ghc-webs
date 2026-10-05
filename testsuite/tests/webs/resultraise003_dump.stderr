@@ -1,0 +1,14 @@
+[1 of 2] Compiling Main             ( resultraise003.hs, resultraise003.o )
+
+==================== Webs: result raising ====================
+raised: n
+rejected (exposed): eta
+rejected (join point): eta
+rejected (result not a product): f
+rejected (result not a product): n
+rejected (result not a product): n
+rejected (result not a product): ww
+rejected (result not a product): x
+
+
+[2 of 2] Linking resultraise003

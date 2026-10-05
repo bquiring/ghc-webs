@@ -3,7 +3,11 @@
 # other (they share the nofib tree), then write the report.
 set -u
 cd "$(dirname "$0")/.."
-T="-fcore-webs-arity-raise -fcore-webs-dead-params -fcore-webs-uncurry"
+# Every web transformation (the early run skips uncurrying; see Note [No
+# early uncurrying] in GHC.WebCore.Pipeline)
+T="-fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise -fcore-webs-dead-params
+   -fcore-webs-uncurry -fcore-webs-result-raise -fcore-webs-strictness"
+T=$(echo $T)
 webs-bench/run-nofib.sh base       ""
 webs-bench/run-nofib.sh late       "-fcore-webs $T"
 webs-bench/run-nofib.sh early      "-fcore-webs-early $T"

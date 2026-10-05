@@ -1,0 +1,17 @@
+[1 of 2] Compiling Main             ( strict007.hs, strict007.o )
+
+==================== Webs: strictness ====================
+lazy argument (exposed); no strict result fields (exposed): eta
+lazy argument (lazy); no strict result fields (no calls): f
+lazy argument (lazy); no strict result fields (no calls): f
+lazy argument (lazy); no strict result fields (unknown call context): n
+lazy argument (lazy); no strict result fields (unknown call context): n
+lazy argument (lazy); no strict result fields (unknown call context): n
+lazy argument (lazy); strict result fields (#,#) [1]: n
+lazy argument (lazy); strict result fields (#,#) [1]: n
+lazy argument (lazy); strict result fields (,) [1]: n n
+strict argument (depth 2); no strict result fields (no calls): b
+strict argument (depth 2); no strict result fields (no calls): f
+
+
+[2 of 2] Linking strict007

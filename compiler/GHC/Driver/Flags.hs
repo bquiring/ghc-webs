@@ -487,6 +487,10 @@ data DumpFlag
    | Opt_D_dump_webs_dead_params -- ^ Web pipeline: dead-parameter elimination verdicts
    | Opt_D_dump_webs_uncurry     -- ^ Web pipeline: uncurrying verdicts
    | Opt_D_dump_webs_arity_raise -- ^ Web pipeline: arity raising verdicts
+   | Opt_D_dump_webs_strictness  -- ^ Web pipeline: strictness verdicts
+   | Opt_D_dump_webs_result_raise -- ^ Web pipeline: result raising verdicts
+   | Opt_D_dump_webs_const_prop  -- ^ Web pipeline: constant propagation verdicts
+   | Opt_D_dump_webs_inline      -- ^ Web pipeline: super-beta inlining verdicts
    | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and
                                   --   after the Core pipeline
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
@@ -646,6 +650,10 @@ data GeneralFlag
    | Opt_CoreWebsDeadParams -- ^ Web pipeline: dead-parameter elimination
    | Opt_CoreWebsUncurry    -- ^ Web pipeline: uncurrying
    | Opt_CoreWebsArityRaise -- ^ Web pipeline: arity raising
+   | Opt_CoreWebsStrictness -- ^ Web pipeline: strict arguments and result fields
+   | Opt_CoreWebsResultRaise -- ^ Web pipeline: result raising (web CPR)
+   | Opt_CoreWebsConstProp  -- ^ Web pipeline: constant propagation
+   | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline before the main simplifier
    | Opt_Specialise
    | Opt_SpecialiseAggressively
@@ -921,6 +929,10 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDeadParams
    , Opt_CoreWebsUncurry
    , Opt_CoreWebsArityRaise
+   , Opt_CoreWebsStrictness
+   , Opt_CoreWebsResultRaise
+   , Opt_CoreWebsConstProp
+   , Opt_CoreWebsInline
    , Opt_CoreWebsEarly
    , Opt_Specialise
    , Opt_SpecialiseAggressively
