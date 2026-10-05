@@ -680,6 +680,7 @@ data GeneralFlag
    | Opt_CprAnal
    | Opt_WorkerWrapper
    | Opt_WorkerWrapperUnlift  -- ^ Do W/W split for unlifting even if we won't unbox anything.
+   | Opt_WorkerWrapperFunResults -- ^ W/W through returned functions; see Note [Worker/wrapper for function results]
    | Opt_SolveConstantDicts
    | Opt_AlignmentSanitisation
    | Opt_CatchNonexhaustiveCases
@@ -937,6 +938,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CprAnal
    , Opt_WorkerWrapper
    , Opt_WorkerWrapperUnlift
+   , Opt_WorkerWrapperFunResults
    , Opt_SolveConstantDicts
    , Opt_SpecEval
    , Opt_SpecEvalDictFun

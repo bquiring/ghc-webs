@@ -147,7 +147,10 @@ data WwOpts
     wo_module            :: !Module
   , -- | Generate workers even if the only effect is some args get passed
     -- unlifted. See Note [WW for calling convention]
-    wo_unlift_strict     :: !Bool }
+    wo_unlift_strict     :: !Bool
+  , -- | Worker/wrapper through returned functions.
+    -- See Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap
+    wo_fun_results       :: !Bool }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args

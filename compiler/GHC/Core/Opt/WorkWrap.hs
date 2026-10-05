@@ -37,6 +37,9 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Monad
 import GHC.Core.DataCon
+import GHC.Core.Make ( mkWildValBinder )
+import GHC.Core.Opt.Arity ( exprIsDeadEnd )
+import GHC.Types.Var.Env
 
 {-
 We take Core bindings whose binders have:
@@ -590,7 +593,11 @@ tryWW ww_opts is_rec fn_id rhs
   -- Do this even if there is a NOINLINE pragma
   -- See Note [Worker/wrapper for NOINLINE functions]
   | is_fun
-  = splitFun ww_opts new_fn_id rhs
+  = do { mb_pairs <- splitFunResult ww_opts new_fn_id rhs
+         -- See Note [Worker/wrapper for function results]
+       ; case mb_pairs of
+           Just pairs -> return pairs
+           Nothing    -> splitFun ww_opts new_fn_id rhs }
 
   -- See Note [Thunk splitting]
   | isNonRec is_rec, is_thunk
@@ -808,6 +815,243 @@ splitFun ww_opts fn_id rhs
                     (ppr fn_id <> colon <+> text "ct_arty:" <+> int (ct_arty cpr_ty)
                       <+> text "arityInfo:" <+> ppr (arityInfo fn_info)) $
           ct_cpr cpr_ty
+
+{- Note [Worker/wrapper for function results]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+(See WW-HIGHER-ORDER.md.)  A function that returns a function,
+
+    g = \n -> let k = expensive n in \x y -> e      -- y dead, x strict
+
+cannot be eta-expanded when the partial application  g n  is shared (that
+would recompute k), so the ordinary split never sees the returned
+function's arguments, and every call of  g n  passes the dead y and a
+boxed x.  We split g *through* the returned function: its worker returns
+the returned function's worker,
+
+    $wg = \n -> let k = expensive n in \x# -> e[I# x#/x]
+    g   = \n -> case $wg n of wf { __DEFAULT -> \x y -> case x of I# x# -> wf x# }
+
+The wrapper is the returned function's wrapper (mkWwBodies), applied to the
+result of the worker.  At a saturated call it inlines and the call reaches
+wf directly.
+
+The tails of g's body (through let, case alternatives and ticks) must each
+be one of
+  * a manifest lambda group of at least k value lambdas;
+  * a variable bound by a let on the path to the tail, to a function of
+    arity at least k, perhaps applied to type arguments (typically the
+    wrapper of a local function that was split earlier:
+    let f = \x y -> $wf x in f, or f @Int when f's dead argument got a
+    polymorphic type);
+  * a dead end.
+k is the smallest arity of the non-bottoming tails.  The demand on each of
+the k arguments is the least upper bound over the tails (the binders' demand
+info, or the variable's demand signature), so that every tail is at least
+as strict, and at least as absent, as the split assumes.
+
+Soundness: wrap (unwrap g) = g.
+  * The wrapper scrutinises  $wg n  with a case, so  g n  diverges exactly
+    when the original did (the bodies differ only in the lambdas they
+    return).  A let would make  g n  a lambda even when $wg n diverges.
+  * For each tail t,  wrap (unwrap t) = t  is the ordinary worker/wrapper
+    identity for t, which holds because t's demands are at least the
+    combined ones.  A dead-end tail is kept as a dead end
+    (case e of {}), not turned into a lambda.
+  * Work before the returned lambda stays in  $wg n, and is shared as
+    before.  The returned lambdas are manifest groups of k lambdas, so no
+    work between their lambdas is lost.
+
+(Boxity) Worker/wrapper decides to unbox from a demand's boxity alone; the
+demand analyser's finaliseArgBoxities makes sure that only strict arguments
+of a function are marked unboxed.  It does not finalise the binders of a
+returned lambda, which can be lazy and still marked unboxed (L!P(L)).  So
+a combined demand that is not strict loses its boxity.  (Without this,
+\x y -> k + 2  and  \x y -> x * k  returned from different branches made
+x look unboxable, and  h undefined 5  diverged: test wwfunres003.)
+
+(EtaFirst) If every partial application  g n  is called at most once, with
+all the returned function's arguments (in g's usage demand, the call level
+just below g's arity has cardinality at most one, and there are k more call
+levels), there is no sharing to lose, and the simplifier
+eta-expands g instead (Note [Eta expansion based on demand]); that is
+better than a split, since no closure is built at all.  So we do not split
+then.  (dmdanal/should_compile/T18894b checks that eta-expansion.)
+
+(BoringOk) The wrapper is inlined even in a boring context.  The typical use
+is a shared partial application,  let h = g n in ... h a b ... h b a,  and
+h = g n  is a boring context.  Inlined there,
+    h = case $wg n of wf { __DEFAULT -> \x y -> case x of I# x# -> wf x# }
+and when h is strict (it is always called) the simplifier turns the let
+into a case and inlines the lambda at the calls, which then call wf
+directly.  Inlining the wrapper costs little: it is a case and a small
+lambda.
+-}
+
+-- | See Note [Worker/wrapper for function results]
+splitFunResult :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe [(Id, CoreExpr)])
+splitFunResult ww_opts fn_id rhs
+  | not (wo_fun_results ww_opts)                     = return Nothing
+  | isJoinId fn_id                                   = return Nothing
+  | isStableUnfolding (realUnfoldingInfo fn_info)    = return Nothing
+  | not (null (ruleInfoRules (ruleInfo fn_info)))    = return Nothing
+  | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
+  , Just tails <- collectTails emptyVarEnv body
+  , t0 : ts <- [ t | t <- tails, not (isDeadTail t) ]
+  , let k = foldr (min . tailArity) (tailArity t0) ts
+  , k >= 1
+  , Just (arg_tys, inner_res_ty) <- splitValArgs k (exprType body)
+    -- See (EtaFirst) in Note [Worker/wrapper for function results]
+  , not (etaExpandable ww_arity k (demandInfo fn_info))
+  = do { let dmds = map finalise (foldr (zipWith lubDmd . tailDemands k) (tailDemands k t0) ts)
+             -- Only strict arguments may be unboxed: see (Boxity) in
+             -- Note [Worker/wrapper for function results]
+             finalise d | isStrictDmd d = d
+                        | otherwise     = trimBoxity d
+       ; xs <- mapM (\(ty, d) -> do { u <- getUniqueM
+                                    ; return (mkSysLocal (fsLit "fr") u ManyTy ty
+                                               `setIdDemandInfo` d) })
+                    (zip arg_tys dmds)
+       ; mb_stuff <- mkWwBodies ww_opts fn_id k xs inner_res_ty dmds topCpr
+       ; case mb_stuff of
+           Nothing -> return Nothing     -- Nothing to gain
+           Just (_, _, wrap_fn, work_fn) ->
+             do { let simpl  = simpleOptExpr (wo_simple_opts ww_opts)
+                      new_tail t = simpl (work_fn t)
+                      new_res_ty = exprType (new_tail (tailExpr t0))
+                      work_body  = rebuildTails new_res_ty new_tail body
+                      work_rhs   = mkLams arg_vars work_body
+                ; work_uniq <- getUniqueM
+                ; wf_uniq   <- getUniqueM
+                ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
+                                  `setIdArity`     arityInfo fn_info
+                                  `setIdDmdSig`    dmdSigInfo fn_info
+                                  `setIdCprSig`    topCprSig
+                                  `setInlinePragma` work_prag
+                      wf      = mkSysLocal (fsLit "wf") wf_uniq ManyTy new_res_ty
+                      wrap_rhs = mkLams arg_vars $
+                                 Case (mkVarApps (Var work_id) arg_vars) wf (exprType body)
+                                      [Alt DEFAULT [] (wrap_fn wf)]
+                      -- Inline the wrapper even in a boring context, such
+                      -- as  let h = g n: see (BoringOk) in
+                      -- Note [Worker/wrapper for function results]
+                      wrap_unf = case mkWrapperUnfolding simpl_opts wrap_rhs (arityInfo fn_info) of
+                                   unf@(CoreUnfolding { uf_guidance = g@(UnfWhen {}) })
+                                     -> unf { uf_guidance = g { ug_boring_ok = boringCxtOk } }
+                                   unf -> unf
+                      wrap_id  = fn_id `setIdUnfolding`  wrap_unf
+                                       `setInlinePragma` mkStrWrapperInlinePrag (inlinePragInfo fn_info) []
+                                       `setIdOccInfo`    noOccInfo
+                  -- The worker may itself be split for its own arguments
+                ; work_pairs <- splitFun ww_opts work_id work_rhs
+                ; return (Just (work_pairs ++ [(wrap_id, wrap_rhs)])) } }
+  | otherwise
+  = return Nothing
+  where
+    fn_info    = idInfo fn_id
+    ww_arity   = workWrapArity fn_id rhs
+    simpl_opts = wo_simple_opts ww_opts
+    work_prag  = (inlinePragInfo fn_info) { inl_rule = FunLike }
+
+-- | Is every partial application of a function of the given arity called
+-- at most once, and with at least k more arguments?  Then eta-expansion
+-- loses no sharing.  See (EtaFirst) in Note [Worker/wrapper for function
+-- results]
+etaExpandable :: Arity -> Arity -> Demand -> Bool
+etaExpandable arity k dmd = case dmd of
+  _ :* sd -> go_arity arity sd
+  _       -> False
+  where
+    -- The calls with g's own arguments: any cardinality
+    go_arity 0 sd = go_res True k sd
+    go_arity n sd = go_arity (n - 1) (snd (peelCallDmd sd))
+    -- The calls of the partial application: the first at most once, and k
+    -- of them
+    go_res _ 0 _ = True
+    -- (peelCallDmd gives the top cardinality when there is no call)
+    go_res first n sd = case peelCallDmd sd of
+      (c, sd') | not first || isAtMostOnce c -> go_res False (n - 1) sd'
+               | otherwise                   -> False
+
+-- | A tail of a function body (Note [Worker/wrapper for function results])
+data Tail = LamTail CoreExpr [Var]     -- ^ The lambda group, its value binders
+          | VarTail CoreExpr Id        -- ^ A let-bound function, perhaps
+                                       --   applied to type arguments
+          | DeadTail CoreExpr
+
+tailExpr :: Tail -> CoreExpr
+tailExpr (LamTail e _) = e
+tailExpr (VarTail e _) = e
+tailExpr (DeadTail e)  = e
+
+isDeadTail :: Tail -> Bool
+isDeadTail (DeadTail {}) = True
+isDeadTail _             = False
+
+tailArity :: Tail -> Arity
+tailArity (LamTail _ bs) = length bs
+tailArity (VarTail _ v)  = idArity v
+tailArity (DeadTail _)   = 0
+
+-- | The demands on the first k arguments of a tail
+tailDemands :: Arity -> Tail -> [Demand]
+tailDemands k (LamTail _ bs) = map idDemandInfo (take k bs)
+tailDemands k (VarTail _ v)  = take k (fst (splitDmdSig (idDmdSig v)) ++ repeat topDmd)
+tailDemands k (DeadTail _)   = replicate k botDmd
+
+-- | Classify an expression in tail position.  'bound' maps the variables
+-- let-bound on the path to it to their binders: an occurrence does not carry
+-- the demand signature, its binder does.  Nothing: not a tail we can split.
+classifyTail :: IdEnv Id -> CoreExpr -> Maybe Tail
+classifyTail bound e = case e of
+  Lam {} | Just bs <- valueLams e                     -> Just (LamTail e bs)
+  _      | (Var v, ty_args) <- collectArgs e
+         , all isTypeArg ty_args
+         , Just b <- lookupVarEnv bound v, idArity b >= 1 -> Just (VarTail e b)
+  _      | exprIsDeadEnd e                            -> Just (DeadTail e)
+         | otherwise                                  -> Nothing
+  where
+    -- A lambda group of value lambdas only (no type or coercion lambdas)
+    valueLams (Lam b body) | isId b, not (isCoVar b) = (b :) <$> more body
+    valueLams _ = Nothing
+    more (Lam b body) | isId b, not (isCoVar b) = (b :) <$> more body
+    more (Lam {})                               = Nothing
+    more _                                      = Just []
+
+-- | The tails of a body (through non-join lets, case alternatives and
+-- ticks), or Nothing if some tail is not one we can split
+collectTails :: IdEnv Id -> CoreExpr -> Maybe [Tail]
+collectTails bound e = case e of
+  Let bind body
+    | not (any isJoinId (bindersOf bind))
+    -> collectTails (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body
+  Case _ _ _ alts -> concat <$> mapM (\(Alt _ _ rhs) -> collectTails bound rhs) alts
+  Tick _ body     -> collectTails bound body
+  _               -> (: []) <$> classifyTail bound e
+
+-- | Rebuild a body, replacing each live tail by the given function and each
+-- dead end by  case e of {}; case expressions get the new result type.
+-- Follows collectTails exactly.
+rebuildTails :: Type -> (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
+rebuildTails new_ty new_tail = go emptyVarEnv
+  where
+    go bound e = case e of
+      Let bind body
+        | not (any isJoinId (bindersOf bind))
+        -> Let bind (go (extendVarEnvList bound [ (b, b) | b <- bindersOf bind ]) body)
+      Case scrut b _ alts -> Case scrut b new_ty [ Alt c bs (go bound rhs) | Alt c bs rhs <- alts ]
+      Tick t body         -> Tick t (go bound body)
+      _ -> case classifyTail bound e of
+             Just (DeadTail _) -> Case e (mkWildValBinder ManyTy (exprType e)) new_ty []
+             Just _            -> new_tail e
+             Nothing           -> pprPanic "rebuildTails" (ppr e)
+
+-- | The first k value-argument types of a function type, and the rest
+splitValArgs :: Arity -> Type -> Maybe ([Type], Type)
+splitValArgs 0 ty = Just ([], ty)
+splitValArgs n ty = case splitFunTy_maybe ty of
+  Just (af, _, arg, res) | isVisibleFunArg af
+    -> do { (args, r) <- splitValArgs (n - 1) res; return (arg : args, r) }
+  _ -> Nothing
 
 mkWWBindPair :: WwOpts -> Id -> IdInfo
              -> [Var] -> CoreExpr -> Unique -> Divergence

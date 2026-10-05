@@ -34,3 +34,15 @@ test('T22475b', normal, compile_and_run, [''])
 test('T22549', normal, compile_and_run, ['-fdicts-strict -fno-specialise'])
 test('T23208', exit_code(1), multimod_compile_and_run, ['T23208_Lib', 'T23208'])
 test('T25439', normal, compile_and_run, [''])
+
+# Higher-order worker/wrapper, -fworker-wrapper-function-results
+# (Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap).
+# Each checks that the split does not change the program's meaning:
+#   wwfunres001: g n diverges before returning its function (case, not let,
+#                in the wrapper)
+#   wwfunres002: work before the returned function is shared per partial
+#                application (Debug.Trace)
+#   wwfunres003: an argument lazy in one returned function is not unboxed
+#   wwfunres004: partial applications that escape and are forced
+for name in ['wwfunres001', 'wwfunres002', 'wwfunres003', 'wwfunres004']:
+    test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])

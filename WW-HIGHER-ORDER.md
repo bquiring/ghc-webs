@@ -1,6 +1,8 @@
 # Design: Higher-Order Worker/Wrapper for GHC
 
-Status: design (branch `ww-higher-order`, from `master`). It is independent
+Status: §2.1 implemented behind `-fworker-wrapper-function-results` (Note
+[Worker/wrapper for function results] in `GHC.Core.Opt.WorkWrap`); the rest
+is design. Branch `ww-higher-order`, from `master`. It is independent
 of the webs: it is an extension of GHC's
 own demand analysis and worker/wrapper (`GHC.Core.Opt.DmdAnal`,
 `GHC.Core.Opt.WorkWrap`, `GHC.Core.Opt.WorkWrap.Utils`). It is based on the
@@ -225,7 +227,44 @@ It can be read off the body syntactically: every occurrence of `g` is
 - **nofib:** allocation, the number of unknown calls left after optimisation
   (`-ddump-first-class-stats` on the `webs` branch counts them), code size.
 
-## 6. Order of work
+## 6. Status of the implementation (§2.1)
+
+`splitFunResult` in `GHC.Core.Opt.WorkWrap`, tried before the ordinary split:
+
+- The tails of the body (through `let`, `case`, ticks) must be manifest
+  lambda groups, `let`-bound functions (possibly applied to type arguments,
+  e.g. `f @Int` when `f`'s dead argument got a polymorphic type), or dead
+  ends. The demand on each of the returned function's `k` arguments is the
+  least upper bound over the tails. For a variable tail it is taken from the
+  `let` binder, since occurrences do not carry demand signatures.
+- The worker returns the returned function's worker (`mkWwBodies`). The
+  wrapper is `case $wg args of wf -> <returned function's wrapper of wf>`.
+  Then the ordinary split runs on the worker.
+- **Boxity:** only strict combined demands may unbox. A returned lambda's
+  binders are not finalised by `finaliseArgBoxities`, and can be lazy but
+  marked unboxed (bug found by `wwfunres003`).
+- **No split when eta-expansion is safe:** if each partial application is
+  called at most once with all `k` arguments, GHC eta-expands instead
+  (`T18894b`).
+- **Inline in boring contexts:** the wrapper's unfolding is `boring_ok`, so
+  it inlines into `let h = g n`. When `h` is strict, that is enough for the
+  calls of `h` to reach the worker. §2.4 is still needed for a lazy `h`.
+
+Results:
+
+- `wwreturn002_funres`, `wwreturn003_funres`: `$wg` returns the worker (no
+  dead argument, unboxed `x`), and the calls are `case wf ww of ...`.
+- `wwfunres001`–`004` (dmdanal/should_run): divergence, sharing, a lazy
+  argument, escaping partial applications. `wwfunres001` was
+  mutation-checked: with `let` instead of `case` in the wrapper, it fails.
+- With the flag on everywhere, the smoke suite (about 3,000 tests across
+  dmdanal, cpranal, simplCore, typecheck, codeGen, programs, th, ...) has no
+  Lint errors or wrong results. One expected-output change: `T16038`, where
+  a derived `Eq` method that builds a dictionary before returning its
+  function is now split, so `$fEqHsExpr` leaves the recursive group. It needs
+  a look at what #16038 guards before deciding.
+
+## 7. Order of work
 
 1. §2.1 with option 2 of §3 (the inner function's existing signature):
    smallest change, and covers `wwreturn003`.
