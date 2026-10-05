@@ -339,7 +339,43 @@ Results:
   Lint errors, wrong results, or changed expected output (other than
   `wwreturn002`/`003`, which record the flag-off output).
 
-## 7. Order of work
+## 7. How often it applies: nofib
+
+`-ddump-ww-ho-stats` (Note [Higher-order worker/wrapper statistics]) over
+nofib (115 benchmarks, `fast` mode; `ww-bench/`, report in
+`ww-bench/report-latest.md`), summed over all modules:
+
+| point | function bindings | return a function | take a function | result splits | argument splits |
+|---|---|---|---|---|---|
+| early (before the main simplifier) | 7,567 | 443 | 626 | 8 | 0 |
+| pre-ww (where worker/wrapper decides) | 8,947 | 335 | 632 | 7 | 0 |
+| final, flag off | 10,770 | 369 | 768 | 9 | 0 |
+| final, flag on | 10,778 | 376 | 769 | 2 | 0 |
+
+- **Splits are rare.** About 2% of the functions that return a function are
+  split. The 7 at pre-ww are in 4 programs: `spectral/pretty` (`ppInt`,
+  `ppInteger`, `ppDouble`), `real/fem` (`LinearAlgebra.apply`, `m_mul`,
+  `Matrix.mmatmat`), `real/hpg` (one local function) and `real/scs`.
+- **All are at level 1.** None is deeper, and nofib has no
+  function-argument split at all.
+- **Before and after GHC's own optimisations barely differ** (8 vs 7).
+- **Performance is unchanged:** program allocation +0.00% (geomean; no
+  benchmark changes by more than 0.5%), object code +0.06%, compiler
+  allocation +0.13%. Both configurations fail only on the same
+  pre-existing benchmarks.
+
+Possible reasons, not yet measured (logging a rejection reason per function
+would show which matter):
+- returned functions behind `newtype` constructors (parser and state
+  monads), whose tails are casts;
+- GHC already eta-expanding when the work before the returned lambda is
+  cheap;
+- the returned lambda's argument demands looking lazy, so only absent
+  arguments count (§3 option 1 would fix this);
+- for arguments, the parameter must be only called and only given local
+  functions.
+
+## 8. Order of work
 
 1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.
 2. §3 option 1 (the demand analyser records the result's signature): covers
