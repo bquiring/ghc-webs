@@ -94,9 +94,9 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
     wrapper, because the wrapper passes it a lambda (an interesting
     argument), and the adapter then cancels (`findK`). Harmless there
     (callers inline `findK` whole), but watch for it.
-  - **Was running when this was written:** the smoke suite with the flag
-    on (see below). (C) is committed, but this check was not finished:
-    rerun it, then measure (C) on nofib.
+  - Smoke suite with the flag on everywhere (and Core Lint): 3,064 passes,
+    only the 2 expected `wwreturn002/003` differences. Next: measure (C)
+    on nofib.
 - **Analysis of the argument rejections** (base, nofib rebuilt without
   running; details in `WW-HIGHER-ORDER.md` §7, finer reasons committed in
   `fedcaa9b2e`):
@@ -168,9 +168,9 @@ statistics]**.
   `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`. Each
   output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 157 passes. A smoke suite of about 3,060 tests
+- Last results: `dmdanal` 157 passes. A smoke suite of 3,066 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
-  differences and no Core Lint errors (before (C); rerun pending).
+  differences and no Core Lint errors (with (C)).
 
 ## How to build, test and measure
 
@@ -234,7 +234,7 @@ Third run, with type parameters and calls of split functions (details in
 
 ## What is left to do
 
-1. **Finish (C):** check the smoke suite, then measure on nofib
+1. **Measure (C) on nofib**
    (how many of the 31 candidates split, and allocation).
 2. **Push** the commits after `5d4c77536d` when the user asks.
 3. **Remaining big rejection pools:**
