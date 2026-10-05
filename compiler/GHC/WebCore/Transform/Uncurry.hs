@@ -14,7 +14,8 @@ import GHC.Core.DataCon ( isUnboxedTupleDataCon )
 import GHC.Core.Make ( mkCoreUnboxedTuple )
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
-import GHC.Core.Utils ( exprType, exprIsTrivial )
+import GHC.Core.Utils ( exprType, exprIsTrivial, exprIsHNF )
+import GHC.Types.Demand ( isStrUsedDmd )
 
 import GHC.Data.FastString ( fsLit )
 
@@ -50,7 +51,15 @@ is uncurried:
     f @^w1 x  (partial)       becomes   case f of g { __DEFAULT ->
                                           let v = x in \^w2 b. g @^w1 (# v, b #) }
 The unboxed-tuple argument encodes a two-argument arrow that must be fully
-applied: Unarise turns it into two arguments.  The partial application is
+applied: Unarise turns it into two arguments.
+
+At a saturated call, a component that every lambda of the web is strict in
+is evaluated first:  case x of x' -> f @^w1 (# x', y #).  The callee would
+force it anyway, and it restores call-by-value, which CorePrep would have
+done from the callee's demand signature for an ordinary argument but does not
+do for the components of an unboxed tuple (see Note [Demand signatures after
+a transformation] in GHC.WebCore.Transform.Common, and Note [No early
+uncurrying] in GHC.WebCore.Pipeline).  The partial application is
 eta-expanded; the argument is let-bound so that it is evaluated at most once
 (or case-bound if unlifted), and the function is evaluated first, exactly as
 the original partial application would.  Only w1's arrows change; w2's
@@ -103,10 +112,12 @@ data Info = Info
   , i_rep_poly   :: Bool
   , i_coercion   :: Bool
   , i_constraint :: Bool    -- An argument is a constraint (a dictionary)
-  , i_join_res   :: Bool }  -- A lambda is the last of a join point's lambdas
+  , i_join_res   :: Bool    -- A lambda is the last of a join point's lambdas
+  , i_lazy_a     :: Bool    -- Some lambda is lazy in its first parameter
+  , i_lazy_b     :: Bool }  -- Some lambda is lazy in its second parameter
 
 noInfo :: Info
-noInfo = Info [] emptyUniqSet False False False False False False False
+noInfo = Info [] emptyUniqSet False False False False False False False False False
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams       = i_lams a ++ i_lams b
@@ -117,7 +128,9 @@ plusInfo a b = Info { i_lams       = i_lams a ++ i_lams b
                     , i_rep_poly   = i_rep_poly a   || i_rep_poly b
                     , i_coercion   = i_coercion a   || i_coercion b
                     , i_constraint = i_constraint a || i_constraint b
-                    , i_join_res   = i_join_res a   || i_join_res b }
+                    , i_join_res   = i_join_res a   || i_join_res b
+                    , i_lazy_a     = i_lazy_a a     || i_lazy_a b
+                    , i_lazy_b     = i_lazy_b a     || i_lazy_b b }
 
 type Infos = UniqFM WebId Info
 
@@ -167,6 +180,8 @@ analyse binds = foldr go_bind emptyUFM binds
                   Just (_, w2, b, _) -> noInfo { i_lams = [a], i_inner = unitUniqSet w2
                                                , i_covar = isCoVar a
                                                , i_join_res = last_join
+                                               , i_lazy_a = not (isStrUsedDmd (idDemandInfo a))
+                                               , i_lazy_b = not (isStrUsedDmd (idDemandInfo b))
                                                  -- The binders become the components
                                                  -- of an unboxed tuple; the arrow
                                                  -- types may not be visible anywhere
@@ -273,12 +288,12 @@ verdict exposed complex w i
 -- if nothing changed, and the verdicts (for the dump).
 uncurryRound :: UniqSupply
              -> WebSet      -- ^ Exposed webs
-             -> VarSet      -- ^ Binders whose unfoldings must be kept
+             -> UnfoldingPolicy
              -> CoreProgram
              -> (Maybe CoreProgram, [(WebId, SDoc, Bool, [Id])])
-uncurryRound us exposed keep_unf binds
+uncurryRound us exposed pol binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us (rewriteProgram todo keep_unf binds)), dump)
+  | otherwise           = (Just (initUs_ us (rewriteProgram todo strict pol binds)), dump)
   where
     infos   = analyse binds
     complex = complexCoWebs binds
@@ -290,6 +305,9 @@ uncurryRound us exposed keep_unf binds
     inners = unionManyUniqSets [ i_inner i | (w, Uncurried, i) <- verdicts
                                            , w `elementOfUniqSet` candidates ]
     todo = candidates `minusUniqSet` inners
+    -- Whether all the lambdas of a web are strict in each parameter
+    strict = listToUFM [ (w, (not (i_lazy_a i), not (i_lazy_b i)))
+                       | (w, Uncurried, i) <- verdicts, w `elementOfUniqSet` todo ]
     dump = [ (w, if deferred then text "deferred (inner web)" else ppr v
                , w `elementOfUniqSet` todo, i_lams i)
            | (w, v, i) <- verdicts
@@ -347,8 +365,10 @@ uncurryCo todo = go
       SubCo c             -> SubCo (go c)
       _                   -> co
 
-rewriteProgram :: WebSet -> VarSet -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram todo keep_unf binds
+rewriteProgram :: WebSet
+               -> UniqFM WebId (Bool, Bool) -- ^ Strict in each parameter?
+               -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
+rewriteProgram todo strict pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
@@ -366,12 +386,17 @@ rewriteProgram todo keep_unf binds
     rw_bndr :: Var -> Var
     rw_bndr b
       | not (isId b) = b
-      | not (changed old_ty) = zapLocalUnfolding keep_unf b
-      | otherwise = zapLocalUnfolding keep_unf $
+      | not (changed old_ty) = fixUnfolding pol changed_set b
+      | otherwise = fixUnfolding pol changed_set $
                     fixBinderInfo b new_ty (\is_join n -> n - uncurried is_join n old_ty)
+                                 (argFates (\w r -> if is_todo w && isFunTy r then MergeWithNext else KeepArg) old_ty)
       where
         old_ty = idType b
         new_ty = upTy old_ty
+
+    -- See Note [Unfoldings and rules after a transformation]
+    -- in GHC.WebCore.Transform.Common
+    changed_set = changedBinders changed binds
 
     changed ty = case ty of
       FunTy { ft_web = w, ft_arg = a, ft_res = r } -> is_todo w || changed a || changed r
@@ -406,7 +431,8 @@ rewriteProgram todo keep_unf binds
     rw env expr = case expr of
       Var v        -> return (Var (lookup_bndr env v))
       Lit l        -> return (Lit l)
-      App f a      -> App <$> rw env f <*> rw env a
+      App {}       -> do { (wrap, e') <- rw_spine env expr; return (wrap e') }
+      WebApp {}    -> do { (wrap, e') <- rw_spine env expr; return (wrap e') }
       Lam b e      -> let (env', b') = rw_bndr1 env b in Lam b' <$> rw env' e
 
       WebLam w a body
@@ -414,19 +440,6 @@ rewriteProgram todo keep_unf binds
         -> rw_uncurried_lam env w a frames w2 b e
         | otherwise
         -> let (env', a') = rw_bndr1 env a in WebLam w a' <$> rw env' body
-
-      -- A saturated call:  (f @^w1 x) @^w2 y
-      WebApp _ (WebApp w1 f x) y
-        | is_todo w1
-        -> do { f' <- rw env f; x' <- rw env x; y' <- rw env y
-              ; return (WebApp w1 f' (mkCoreUnboxedTuple [x', y'])) }
-
-      -- A partial call:  f @^w1 x
-      WebApp w1 f x
-        | is_todo w1
-        -> rw_partial env w1 f x
-
-      WebApp w f a -> WebApp w <$> rw env f <*> rw env a
 
       Let (NonRec b rhs) body
         -> do { rhs' <- rw env rhs
@@ -449,6 +462,47 @@ rewriteProgram todo keep_unf binds
       Tick t e     -> Tick (rw_tick env t) <$> rw env e
       Type t       -> return (Type (upTy t))
       Coercion co  -> return (Coercion (upCo co))
+
+    -- An application spine.  Returns a wrapper (the cases that evaluate
+    -- strict components, which must wrap the whole spine so that a jump
+    -- stays in tail position) and the call.
+    rw_spine :: Env -> CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
+    rw_spine env expr = case expr of
+      -- A saturated call:  (f @^w1 x) @^w2 y  ==>  f @^w1 (# x, y #)
+      WebApp _ (WebApp w1 f x) y
+        | is_todo w1
+        -> do { (wrap, f') <- rw_spine env f
+              ; x' <- rw env x
+              ; y' <- rw env y
+              ; let (strict_a, strict_b) = lookupWithDefaultUFM strict (False, False) w1
+              ; (wrap_x, x'') <- eval_if strict_a x'
+              ; (wrap_y, y'') <- eval_if strict_b y'
+              ; return (wrap . wrap_x . wrap_y, WebApp w1 f' (mkCoreUnboxedTuple [x'', y''])) }
+
+      -- A partial call:  f @^w1 x
+      WebApp w1 f x
+        | is_todo w1
+        -> do { e' <- rw_partial env w1 f x; return (id, e') }
+
+      WebApp w f a
+        -> do { (wrap, f') <- rw_spine env f; a' <- rw env a; return (wrap, WebApp w f' a') }
+      App f a
+        -> do { (wrap, f') <- rw_spine env f; a' <- rw env a; return (wrap, App f' a') }
+      _ -> do { e' <- rw env expr; return (id, e') }
+
+    -- Evaluate a component that every lambda of the web is strict in, so
+    -- that it is passed evaluated rather than as a thunk: CorePrep does not
+    -- look inside unboxed-tuple arguments.  See Note [Uncurrying]
+    eval_if :: Bool -> CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
+    eval_if is_strict arg
+      | is_strict
+      , mightBeLiftedType ty
+      , not (exprIsHNF (stripWebForms arg))
+      = do { v <- mkWild ty
+           ; return (\body -> Case arg v (exprType body) [Alt DEFAULT [] body], Var v) }
+      | otherwise
+      = return (id, arg)
+      where ty = exprType arg
 
     rw_tick env t@(Breakpoint { breakpointFVs = ids })
       = t { breakpointFVs = map (lookup_bndr env) ids }

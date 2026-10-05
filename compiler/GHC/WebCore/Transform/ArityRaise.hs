@@ -279,13 +279,13 @@ verdict exposed complex w i
 -- already been raised and are not considered again.
 arityRaiseRound :: UniqSupply
                 -> WebSet      -- ^ Exposed webs
-                -> VarSet      -- ^ Binders whose unfoldings must be kept
+                -> UnfoldingPolicy
                 -> WebSet      -- ^ Webs already raised
                 -> CoreProgram
                 -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
-arityRaiseRound us exposed keep_unf done binds
+arityRaiseRound us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us (rewriteProgram todo keep_unf binds), todo), dump)
+  | otherwise           = (Just (initUs_ us (rewriteProgram todo pol binds), todo), dump)
   where
     infos   = analyse binds
     complex = complexCoWebs binds
@@ -355,8 +355,8 @@ raiseCo todo = go
       SubCo c             -> SubCo (go c)
       _                   -> co
 
-rewriteProgram :: WebSet -> VarSet -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram todo keep_unf binds
+rewriteProgram :: WebSet -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
+rewriteProgram todo pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
@@ -375,12 +375,16 @@ rewriteProgram todo keep_unf binds
     rw_bndr :: Var -> Var
     rw_bndr b
       | not (isId b)         = b
-      | not (changed old_ty) = zapLocalUnfolding keep_unf b
-      | otherwise            = zapLocalUnfolding keep_unf $
-                               fixBinderInfo b new_ty (\_ n -> n)
+      | not (changed old_ty) = fixUnfolding pol changed_set b
+      | otherwise            = fixUnfolding pol changed_set $
+                               fixBinderInfo b new_ty (\_ n -> n) (argFates (\_ _ -> KeepArg) old_ty)
       where
         old_ty = idType b
         new_ty = upTy old_ty
+
+    -- See Note [Unfoldings and rules after a transformation]
+    -- in GHC.WebCore.Transform.Common
+    changed_set = changedBinders changed binds
 
     changed ty = case ty of
       FunTy { ft_web = w, ft_arg = a, ft_res = r } -> is_todo w || changed a || changed r

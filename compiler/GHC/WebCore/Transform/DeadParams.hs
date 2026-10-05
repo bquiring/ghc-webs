@@ -35,6 +35,8 @@ import GHC.Data.Pair
 import GHC.Utils.Outputable
 
 import GHC.WebCore.Traverse ( stripWebForms, typeWebs )
+import GHC.WebCore.Transform.Common ( UnfoldingPolicy, changedBinders, fixUnfolding
+                                    , fixBinderInfo, ArgFate(..), argFates )
 
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe )
@@ -71,9 +73,9 @@ round: the rewrite must keep the program well-typed.  Webs that were turned
 into unit webs are not considered again.
 
 IdInfo: binders whose types change get a new arity (and join arity), and
-their demand and CPR signatures are zapped.  Unfoldings and specialisation
-rules of local binders are zapped, except for those that may reach the
-interface file (ws_interface_ids), whose types are exposed and so unchanged.
+their demand and CPR signatures are zapped.  Stale unfoldings and rules are
+handled as in Note [Unfoldings and rules after a transformation] in
+GHC.WebCore.Transform.Common.
 -}
 
 ------------------------------------------------------------------
@@ -313,14 +315,14 @@ verdict exposed w i
 -- verdicts for every web with a lambda.
 deadParamsRound :: UniqSupply
                 -> WebSet      -- ^ Exposed webs
-                -> VarSet      -- ^ Binders whose unfoldings must be kept
+                -> UnfoldingPolicy
                 -> WebSet      -- ^ Done: webs already turned into unit webs
                 -> CoreProgram
                 -> ( Maybe (CoreProgram, WebSet)
                    , [(WebId, Verdict, [Id])] )
-deadParamsRound us exposed keep_unf done binds
+deadParamsRound us exposed pol done binds
   | isEmptyUniqSet del && isEmptyUniqSet unit = (Nothing, verdicts)
-  | otherwise = ( Just (initUs_ us (rewriteProgram del unit keep_unf binds), unit)
+  | otherwise = ( Just (initUs_ us (rewriteProgram del unit pol binds), unit)
                 , verdicts )
   where
     infos    = analyse binds
@@ -340,9 +342,9 @@ type DropEnv = IdEnv Id
 
 rewriteProgram :: WebSet   -- ^ Webs to delete
                -> WebSet   -- ^ Webs to turn into unit webs
-               -> VarSet   -- ^ Binders whose unfoldings must be kept
+               -> UnfoldingPolicy
                -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram del unit keep_unf binds
+rewriteProgram del unit pol binds
   = do { let env = foldr (\b e -> extendVarEnv e b (rw_bndr b)) emptyVarEnv
                          (bindersOfBinds binds)
        ; mapM (rw_top env) binds }
@@ -356,6 +358,12 @@ rewriteProgram del unit keep_unf binds
     dropTy :: Type -> Type
     dropTy = dropType del unit
 
+    changesType ty = not (isEmptyUniqSet (typeWebs ty `intersectUniqSets` (del `unionUniqSets` unit)))
+
+    -- See Note [Unfoldings and rules after a transformation]
+    -- in GHC.WebCore.Transform.Common
+    changed_set = changedBinders changesType binds
+
     dropCo' :: Coercion -> Coercion
     dropCo' = dropCo del unit
 
@@ -365,27 +373,22 @@ rewriteProgram del unit keep_unf binds
     rw_bndr b
       | not (isId b) = b
       | otherwise
-      = zap_unf $
+      = fixUnfolding pol changed_set $
         if changed then fix_info (setIdType b new_ty) else b
       where
         old_ty  = idType b
         new_ty  = dropTy old_ty
-        changed = not (isEmptyUniqSet (typeWebs old_ty `intersectUniqSets` (del `unionUniqSets` unit)))
+        changed = changesType old_ty
 
-        fix_info b' = setIdCprSig (zapIdDmdSig (fix_join (fix_arity b'))) topCprSig
+        fix_info b' = fixBinderInfo b' (idType b') new_arity
+                                    (argFates fate old_ty)
 
-        fix_arity b' = setIdArity b' (idArity b - deletedArrows False (idArity b) old_ty)
+        new_arity is_join n = n - deletedArrows is_join n old_ty
 
-        fix_join b' = case idJoinPointHood b of
-          JoinPoint ar -> asJoinId b' (ar - deletedArrows True ar old_ty)
-          NotJoinPoint -> b'
+        fate w _ | w `elementOfUniqSet` del  = DropArg
+                 | w `elementOfUniqSet` unit = AbsentArg
+                 | otherwise                 = KeepArg
 
-        -- Unfoldings and rules of local binders may mention the old forms;
-        -- see Note [Dead-parameter elimination]
-        zap_unf b'
-          | b `elemVarSet` keep_unf = b'
-          | isLocalId b             = setIdSpecialisation (zapIdUnfolding b') emptyRuleInfo
-          | otherwise               = b'
 
     -- How many of the first n arrows (and foralls, if count_foralls) of a
     -- type are deleted?

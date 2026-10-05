@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 -- | Counting first-class function behaviour in a Core program.
 --
 -- See Note [First-class function statistics].
@@ -10,7 +11,7 @@ module GHC.WebCore.FirstClass
 import GHC.Prelude
 
 import GHC.Core
-import GHC.Core.DataCon ( dataConTyCon )
+import GHC.Core.DataCon ( dataConTyCon, isUnboxedTupleDataCon, isUnboxedSumDataCon )
 import GHC.Core.TyCon ( isClassTyCon )
 import GHC.Core.Type
 import GHC.Core.Utils ( exprType )
@@ -36,8 +37,9 @@ value whose type, after any foralls, is an arrow (including (=>) arrows).
   passed       function-typed value arguments of calls that are not data
                constructor applications
   stored_data  function-typed value arguments of data constructor
-               applications (not class dictionaries): functions stored in
-               data structures
+               applications (not class dictionaries, and not unboxed tuples
+               or sums, whose components count as passed): functions stored
+               in data structures
   stored_dict  function-typed value arguments of class dictionary
                constructors (instance methods)
 
@@ -163,9 +165,15 @@ firstClassStats binds = sumFCS (go_bind top_env) binds
         head_stats
           | n_val == 0 = noFCS
           | Var v <- fun, Just dc <- isDataConId_maybe v
-          = if isClassTyCon (dataConTyCon dc)
-            then noFCS { fc_stored_dict = fun_args }
-            else noFCS { fc_stored_data = fun_args }
+          = if | isUnboxedTupleDataCon dc || isUnboxedSumDataCon dc
+                 -- Not a data structure: an unboxed tuple is how a
+                 -- multi-argument call passes its arguments (e.g. after
+                 -- uncurrying or arity raising), so count them as passed
+               -> noFCS { fc_passed = fun_args }
+               | isClassTyCon (dataConTyCon dc)
+               -> noFCS { fc_stored_dict = fun_args }
+               | otherwise
+               -> noFCS { fc_stored_data = fun_args }
           | otherwise
           = noFCS { fc_calls = 1, fc_passed = fun_args
                    , fc_unknown_calls = if known then 0 else 1

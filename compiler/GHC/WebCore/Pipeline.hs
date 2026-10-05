@@ -39,7 +39,7 @@ import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
 import GHC.WebCore.Solve
 import GHC.WebCore.Transform.ArityRaise
-import GHC.WebCore.Transform.Common ( pprWebVerdicts )
+import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..) )
 import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
 import GHC.WebCore.Transform.Uncurry
 import GHC.Types.Unique.Supply ( UniqSupply )
@@ -211,7 +211,7 @@ runTransforms early logger dflags cfg sigs binds0
   = foldM step (binds0, False) transforms
   where
     exposed = ws_exposed sigs
-    keep    = ws_interface_ids sigs
+    keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
 
     transforms =
       [ ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise

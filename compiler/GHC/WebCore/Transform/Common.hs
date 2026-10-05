@@ -4,7 +4,8 @@
 module GHC.WebCore.Transform.Common
   ( programOccurrences, exprOccurrences
   , complexCoWebs
-  , fixBinderInfo, zapLocalUnfolding
+  , fixBinderInfo, ArgFate(..), argFates
+  , UnfoldingPolicy(..), changedBinders, fixUnfolding
   , pprWebVerdicts
   , mkWild
   , splitLeadingLams
@@ -33,6 +34,9 @@ import GHC.Data.Pair
 import GHC.Utils.Outputable
 
 import GHC.WebCore.Traverse ( typeWebs )
+import GHC.Core.FVs ( exprFreeVars, rulesFreeVars )
+import GHC.Core.Type ( coreFullView )
+import GHC.Types.Demand ( DmdSig, splitDmdSig, mkClosedDmdSig, absDmd, topDmd )
 
 import Data.List ( sortOn )
 
@@ -131,30 +135,140 @@ complexCoWebs binds = foldr go_bind emptyUniqSet binds
     kind_webs c acc = case coercionKind c of
       Pair l r -> typeWebs l `unionUniqSets` typeWebs r `unionUniqSets` acc
 
+-- | What a transformation does to each value argument of a function, in
+-- order.  See Note [Demand signatures after a transformation]
+data ArgFate
+  = KeepArg         -- ^ Unchanged
+  | DropArg         -- ^ Deleted (dead-parameter elimination)
+  | AbsentArg       -- ^ Replaced by (# #) (dead-parameter elimination)
+  | MergeWithNext   -- ^ Merged with the next argument into an unboxed tuple
+                    --   (uncurrying); the next argument's fate is ignored
+
+{- Note [Demand signatures after a transformation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+CorePrep uses a function's demand signature to decide, at each call, whether
+to evaluate an argument first (strict) or allocate a thunk for it (lazy).  So
+when a transformation changes a function's arguments we reshape its demand
+signature, rather than zap it: zapping makes every argument look lazy, and
+cost up to 25% more allocation in nofib (e.g. imaginary/bernouilli).  A
+deleted argument's demand is dropped, a unit argument becomes absent, and two
+merged arguments become one top (lazy) demand: the strict components of a
+merged argument are evaluated at the call instead (see Note [Uncurrying] in
+GHC.WebCore.Transform.Uncurry).
+-}
+
+-- | The fates of the value arguments of a type, by looking at its arrows
+argFates :: (WebId -> Type -> ArgFate) -> Type -> [ArgFate]
+argFates fate ty = case coreFullView ty of
+  ForAllTy _ t -> argFates fate t
+  FunTy { ft_web = w, ft_res = r }
+    -> case fate w r of
+         MergeWithNext -> case coreFullView r of
+           FunTy { ft_res = r' } -> MergeWithNext : KeepArg : argFates fate r'
+           _                     -> KeepArg : argFates fate r
+         f -> f : argFates fate r
+  _ -> []
+
+reshapeDmdSig :: [ArgFate] -> DmdSig -> DmdSig
+reshapeDmdSig fates sig
+  = case splitDmdSig sig of
+      (dmds, div) -> mkClosedDmdSig (go fates dmds) div
+  where
+    go (KeepArg : fs)              (d : ds)     = d : go fs ds
+    go (DropArg : fs)              (_ : ds)     = go fs ds
+    go (AbsentArg : fs)            (_ : ds)     = absDmd : go fs ds
+    go (MergeWithNext : _ : fs)    (_ : _ : ds) = topDmd : go fs ds
+    go (MergeWithNext : _)         [_]          = [topDmd]
+    go _                           ds           = ds
+
 -- | Fix up the IdInfo of a binder whose type a transformation changed:
--- set the new type and arity (and join arity), and zap the demand and CPR
--- signatures, which describe the old calling convention.
+-- set the new type and arity (and join arity), reshape its demand signature
+-- (Note [Demand signatures after a transformation]), and zap its CPR
+-- signature, which is per-arity.
 fixBinderInfo :: Id
               -> Type                 -- ^ New type
               -> (Bool -> Int -> Int) -- ^ New arity, given whether it is a
                                       --   join arity, and the old arity
+              -> [ArgFate]            -- ^ The fates of the old value arguments
               -> Id
-fixBinderInfo b new_ty new_arity
-  = setIdCprSig (zapIdDmdSig (fix_join (setIdArity b' (new_arity False (idArity b))))) topCprSig
+fixBinderInfo b new_ty new_arity fates
+  = setIdCprSig (setIdDmdSig (fix_join (setIdArity b' (new_arity False (idArity b))))
+                             (reshapeDmdSig fates (idDmdSig b)))
+                topCprSig
   where
     b' = setIdType b new_ty
     fix_join b'' = case idJoinPointHood b of
       JoinPoint ar -> asJoinId b'' (new_arity True ar)
       NotJoinPoint -> b''
 
--- | Zap the unfolding and rules of a local binder, unless it is one whose
--- unfolding may reach the interface.
--- See Note [Exposed webs] in GHC.WebCore.Sigs
-zapLocalUnfolding :: VarSet -> Id -> Id
-zapLocalUnfolding keep b
-  | b `elemVarSet` keep = b
-  | isLocalId b         = setIdSpecialisation (zapIdUnfolding b) emptyRuleInfo
-  | otherwise           = b
+{- Note [Unfoldings and rules after a transformation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A transformation changes the types of some binders.  An unfolding or rule is
+then /stale/ if it belongs to such a binder, or mentions one: its template
+still has the old types and calling convention.  We zap stale stable
+unfoldings and stale rules.  A stale vanilla unfolding is zapped only in the
+early run: in the late run nothing inlines afterwards, and Tidy rebuilds
+vanilla unfoldings from the final right-hand side (tidyTopUnfolding in
+GHC.Iface.Tidy), so they need no care -- and zapping them would hide them
+from the interface file, stopping importing modules from inlining (we saw
+3000x more allocation in nofib/spectral/minimax when we zapped them all).
+
+Unfoldings and rules that are not stale are always kept, and so are those of
+the kept binders (ws_interface_ids), whose types never change.
+-}
+
+-- | What to do with unfoldings and rules; see
+-- Note [Unfoldings and rules after a transformation]
+data UnfoldingPolicy = UnfoldingPolicy
+  { up_keep  :: VarSet   -- ^ Binders whose unfoldings and rules are always kept
+  , up_early :: Bool     -- ^ The early run: the simplifier runs afterwards
+  }
+
+-- | All the binders (let, lambda, case and alternative binders) of a
+-- program whose types satisfy the predicate, i.e. will change
+changedBinders :: (Type -> Bool) -> CoreProgram -> VarSet
+changedBinders changes binds = foldr go_bind emptyVarSet binds
+  where
+    go_bind (NonRec b e) acc = bndr b (go e acc)
+    go_bind (Rec prs)    acc = foldr (\(b, e) -> bndr b . go e) acc prs
+
+    bndr b acc | isId b, changes (idType b) = extendVarSet acc b
+               | otherwise                  = acc
+
+    go expr acc = case expr of
+      Lam b e          -> bndr b (go e acc)
+      WebLam _ b e     -> bndr b (go e acc)
+      App f a          -> go f (go a acc)
+      WebApp _ f a     -> go f (go a acc)
+      Let bind body    -> go_bind bind (go body acc)
+      Case e b _ alts  -> go e $ bndr b $
+                          foldr (\(Alt _ bs rhs) a -> foldr bndr (go rhs a) bs) acc alts
+      Cast e _         -> go e acc
+      Tick _ e         -> go e acc
+      _                -> acc
+
+-- | Zap the stale unfolding and rules of a binder (after its type has been
+-- fixed up).  See Note [Unfoldings and rules after a transformation]
+fixUnfolding :: UnfoldingPolicy -> VarSet -> Id -> Id
+fixUnfolding pol changed b
+  | not (isId b) || b `elemVarSet` up_keep pol = b
+  | otherwise = fix_rules (fix_unf b)
+  where
+    unf = realIdUnfolding b
+    mentions vs = not (isEmptyVarSet (vs `intersectVarSet` changed))
+    own_change  = b `elemVarSet` changed
+
+    stale_unf = own_change || maybe False (mentions . exprFreeVars) (maybeUnfoldingTemplate unf)
+    fix_unf b'
+      | not stale_unf         = b'
+      | isStableUnfolding unf = zapIdUnfolding b'
+      | up_early pol          = zapIdUnfolding b'
+      | otherwise             = b'   -- Tidy rebuilds vanilla unfoldings
+
+    stale_rules = own_change || mentions (rulesFreeVars (idCoreRules b))
+    fix_rules b'
+      | stale_rules = setIdSpecialisation b' emptyRuleInfo
+      | otherwise   = b'
 
 -- | One line per web, without uniques: the verdict and the names of the
 -- web's lambda binders.  Sorted, so tests can check it.

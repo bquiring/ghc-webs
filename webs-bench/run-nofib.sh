@@ -13,9 +13,16 @@
 #                    *.dump-simpl-stats         (simplifier/inliner ticks)
 # Set NOFIB_MODE (default fast) and NOFIB_DIRS (default: nofib's own default
 # set of benchmark directories) to change what runs.
+#
+# Timeouts: each compiler invocation is limited to WEBS_GHC_TIMEOUT seconds
+# (default 300; see ghc-timeout.sh), and the whole build-and-run of one
+# configuration to WEBS_CONFIG_TIMEOUT seconds (default 3600), which also
+# catches benchmarks that do not terminate.  A timeout is recorded in
+# exit-code (124) and the dumps collected so far are kept.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GHC=$ROOT/_build/stage1/bin/ghc
+GHC=$ROOT/webs-bench/ghc-timeout.sh
+CONFIG_TIMEOUT=${WEBS_CONFIG_TIMEOUT:-3600}
 NAME=$1
 OPTS=${2:-}
 MODE=${NOFIB_MODE:-fast}
@@ -37,10 +44,13 @@ echo "[$NAME] boot"
 make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&1
 
 echo "[$NAME] build and run (options: $OPTS)"
+timeout --kill-after=60 "$CONFIG_TIMEOUT" \
 make -k WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
      EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats" \
      > "$OUT/nofib.log" 2>&1
-echo "[$NAME] make exit code: $?" | tee "$OUT/exit-code"
+status=$?
+echo "[$NAME] make exit code: $status" | tee "$OUT/exit-code"
+if [ $status -eq 124 ]; then echo "[$NAME] TIMED OUT after ${CONFIG_TIMEOUT}s"; fi
 
 echo "[$NAME] collecting dumps"
 find . -type d -name "$DUMPDIR" | while read -r d; do
