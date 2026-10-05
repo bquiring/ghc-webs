@@ -8,6 +8,7 @@
 module GHC.Core.Opt.WorkWrap
  ( WwOpts (..)
  , wwTopBinds
+ , HoStats, higherOrderStats, pprHoStats
  )
 where
 
@@ -42,7 +43,7 @@ import GHC.Core.Make ( mkWildValBinder )
 import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
 import GHC.Types.Var.Env
 import GHC.Types.Name ( mkSystemVarName )
-import GHC.Core.Multiplicity ( Scaled(..) )
+import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 
 {-
 We take Core bindings whose binders have:
@@ -938,6 +939,15 @@ lambda.
 -- | See Note [Worker/wrapper for function results]
 splitFunResult :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe [(Id, CoreExpr)])
 splitFunResult ww_opts fn_id rhs
+  = do { mb <- funResultLevels ww_opts fn_id rhs
+       ; case mb of
+           Nothing -> return Nothing
+           Just (arg_vars, body, levels) -> Just <$> mkFunResultPairs ww_opts fn_id arg_vars body levels }
+
+-- | The levels of a function-result split, if there is one: the function's
+-- arguments and body, and the levels down to the deepest split one
+funResultLevels :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe ([Var], CoreExpr, [FrLevel]))
+funResultLevels ww_opts fn_id rhs
   | not (wo_fun_results ww_opts)                     = return Nothing
   | isJoinId fn_id                                   = return Nothing
   | isStableUnfolding (realUnfoldingInfo fn_info)    = return Nothing
@@ -950,7 +960,7 @@ splitFunResult ww_opts fn_id rhs
        ; let levels' = reverse (dropWhile (isNothing . frl_split) (reverse levels))
        ; if null levels'
          then return Nothing        -- Nothing to gain at any level
-         else Just <$> mkFunResultPairs ww_opts fn_id arg_vars body levels' }
+         else return (Just (arg_vars, body, levels')) }
   | otherwise
   = return Nothing
   where
@@ -1148,6 +1158,105 @@ maxFunResultDepth levels of (B).  One split handles one parameter; the worker
 is tried again for the others, at most maxFunArgSplits times.
 -}
 
+-- | Statistics: how many higher-order splits a program offers.
+-- See Note [Higher-order worker/wrapper statistics]
+data HoStats = HoStats
+  { hs_funs        :: !Int   -- ^ function bindings (arity >= 1, not join points)
+  , hs_returns_fun :: !Int   -- ^ ... whose result (after their arity) is a function
+  , hs_takes_fun   :: !Int   -- ^ ... with a parameter of function type
+  , hs_res_splits  :: !Int   -- ^ function-result splits
+  , hs_res_deep    :: !Int   -- ^ ... of which split below level 1
+  , hs_res_levels  :: !Int   -- ^ ... levels split, in total
+  , hs_arg_splits  :: !Int   -- ^ function-argument splits (parameters split)
+  , hs_arg_nested  :: !Int   -- ^ ... of which nested (a conversion of depth > 2)
+  , hs_splits      :: [SDoc] -- ^ one line per function split: its name, and how
+  }
+
+plusHo :: HoStats -> HoStats -> HoStats
+plusHo (HoStats a1 b1 c1 d1 e1 f1 g1 h1 i1) (HoStats a2 b2 c2 d2 e2 f2 g2 h2 i2)
+  = HoStats (a1+a2) (b1+b2) (c1+c2) (d1+d2) (e1+e2) (f1+f2) (g1+g2) (h1+h2) (i1 ++ i2)
+
+noHo :: HoStats
+noHo = HoStats 0 0 0 0 0 0 0 0 []
+
+sumHo :: [HoStats] -> HoStats
+sumHo = foldr plusHo noHo
+
+pprHoStats :: String -> HoStats -> SDoc
+pprHoStats phase st
+  = text "ww-ho-stats" <+> text phase <+> hsep
+      [ text "funs=" <> int (hs_funs st), text "returns_fun=" <> int (hs_returns_fun st)
+      , text "takes_fun=" <> int (hs_takes_fun st), text "res_splits=" <> int (hs_res_splits st)
+      , text "res_deep=" <> int (hs_res_deep st), text "res_levels=" <> int (hs_res_levels st)
+      , text "arg_splits=" <> int (hs_arg_splits st), text "arg_nested=" <> int (hs_arg_nested st) ]
+    $$ vcat [ text "ww-ho-split" <+> text phase <+> d | d <- hs_splits st ]
+
+{- Note [Higher-order worker/wrapper statistics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-ddump-ww-ho-stats counts, for every function binding of a program (top
+level and nested), whether the function-result and function-argument splits
+would apply to it, using the same decision functions as the splits
+themselves (funResultLevels, funArgConv), with the splits enabled whatever
+the flags.  It changes nothing.  GHC.Core.Opt.Pipeline runs it at three
+points: early (before the main simplifier), pre-ww (just before
+worker/wrapper: what the splits would do with
+-fworker-wrapper-function-results), and final.  Early and final run the
+demand analyser on a copy first, since the splits need demand information.
+-}
+
+-- | Count the higher-order splits a program offers.
+-- See Note [Higher-order worker/wrapper statistics]
+higherOrderStats :: WwOpts -> UniqSupply -> CoreProgram -> HoStats
+higherOrderStats ww_opts0 us binds = initUs_ us (sumHo <$> mapM go_bind binds)
+  where
+    ww_opts = ww_opts0 { wo_fun_results = True }
+
+    go_bind bind = sumHo <$> mapM go_pair (flattenBinds [bind])
+
+    go_pair (b, rhs) = do { here <- if isId b && not (isJoinId b) && idArity b >= 1
+                                     then fun_stats b rhs else return noHo
+                          ; inner <- go rhs
+                          ; return (here `plusHo` inner) }
+
+    go e = case e of
+      App f a        -> plusHo <$> go f <*> go a
+      Lam _ b        -> go b
+      Let bind body  -> plusHo <$> go_bind bind <*> go body
+      Case s _ _ alts -> plusHo <$> go s <*> (sumHo <$> mapM (\(Alt _ _ rhs) -> go rhs) alts)
+      Cast b _       -> go b
+      Tick _ b       -> go b
+      _              -> return noHo
+
+    fun_stats fn_id rhs
+      = do { let ty         = idType fn_id
+                 res_is_fun = case collectNValBinders_maybe (workWrapArity fn_id rhs) rhs of
+                                Just (_, body) -> isFunTy (exprType body)
+                                Nothing        -> False
+                 takes_fun  = any (isFunTy . scaledThing) (fst (splitFunTys (dropForAlls ty)))
+           ; mb_res <- funResultLevels ww_opts fn_id rhs
+           ; arg_ns <- count_args maxFunArgSplits fn_id rhs
+           ; let (res, deep, lvls, split_lvls) = case mb_res of
+                   Just (_, _, levels) -> ( 1, if length levels > 1 then 1 else 0
+                                          , length (filter (isJust . frl_split) levels)
+                                          , [ i | (i, l) <- zip [1 :: Int ..] levels, isJust (frl_split l) ] )
+                   Nothing             -> (0, 0, 0, [])
+                 line = ppr (idName fn_id) <> colon
+                        <+> (if res == 1 then text "result at levels" <+> hsep (punctuate comma (map int split_lvls)) else empty)
+                        <+> (if null arg_ns then empty else text "arguments, depths" <+> hsep (punctuate comma (map int arg_ns)))
+           ; return (HoStats 1 (fromEnum res_is_fun) (fromEnum takes_fun) res deep lvls
+                             (length arg_ns) (length (filter (> 2) arg_ns))
+                             [ line | res == 1 || not (null arg_ns) ]) }
+
+    -- The depths of the successive argument splits of one function
+    count_args :: Int -> Id -> CoreExpr -> UniqSM [Int]
+    count_args 0 _ _ = return []
+    count_args fuel fn_id rhs
+      = do { mb <- funArgConv ww_opts fn_id rhs
+           ; case mb of
+               Nothing   -> return []
+               Just conv -> do { (work_id, work_rhs, _) <- mkFunArgPairs ww_opts fn_id rhs conv
+                               ; (cv_depth conv :) <$> count_args (fuel - 1) work_id work_rhs } }
+
 -- | How many parameters of one function we split.
 -- See Note [Worker/wrapper for function arguments]
 maxFunArgSplits :: Int
@@ -1174,7 +1283,8 @@ splitHigherOrder fuel ww_opts fn_id rhs
 data Conv = Conv
   { cv_unwrap :: CoreExpr -> UniqSM CoreExpr   -- ^ original value to new
   , cv_wrap   :: Id -> UniqSM CoreExpr         -- ^ new value (bound to the Id) to original
-  , cv_new_ty :: Type }                        -- ^ the type of the new values
+  , cv_new_ty :: Type                          -- ^ the type of the new values
+  , cv_depth  :: Int }                         -- ^ nesting: 1 for (A), 1 + inner for (B)
 
 -- | A value passed at an argument position
 data ArgVal = ArgLam (IdEnv Id) CoreExpr [Var]
@@ -1199,6 +1309,14 @@ classifyArg bound e = case classifyTail bound e of
 -- workers.  Returns the worker (Id and right-hand side) and the wrapper.
 splitFunArg :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe (Id, CoreExpr, (Id, CoreExpr)))
 splitFunArg ww_opts fn_id rhs
+  = do { mb <- funArgConv ww_opts fn_id rhs
+       ; case mb of
+           Nothing   -> return Nothing
+           Just conv -> Just <$> mkFunArgPairs ww_opts fn_id rhs conv }
+
+-- | The conversion for a function-argument split of this function, if any
+funArgConv :: WwOpts -> Id -> CoreExpr -> UniqSM (Maybe Conv)
+funArgConv ww_opts fn_id rhs
   | not (wo_fun_results ww_opts)                     = return Nothing
   | isJoinId fn_id                                   = return Nothing
   | isStableUnfolding (realUnfoldingInfo fn_info)    = return Nothing
@@ -1209,11 +1327,16 @@ splitFunArg ww_opts fn_id rhs
   , not (null arg_vars)
     -- Value parameters only (not yet: type or coercion parameters)
   , all (\v -> isId v && not (isCoVar v)) arg_vars
-  = do { mb_conv <- lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv rhs arg_vars]
-       ; case mb_conv of
-           Nothing -> return Nothing
-           Just conv ->
-             do { work_rhs0 <- cv_unwrap conv rhs
+  = lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv rhs arg_vars]
+  | otherwise = return Nothing
+  where
+    fn_info    = idInfo fn_id
+    ww_arity   = workWrapArity fn_id rhs
+    uf_opts    = so_uf_opts (wo_simple_opts ww_opts)
+
+mkFunArgPairs :: WwOpts -> Id -> CoreExpr -> Conv -> UniqSM (Id, CoreExpr, (Id, CoreExpr))
+mkFunArgPairs ww_opts fn_id rhs conv
+             = do { work_rhs0 <- cv_unwrap conv rhs
                 ; let work_rhs = simpleOptExpr simpl_opts work_rhs0
                 ; work_uniq <- getUniqueM
                 ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
@@ -1230,13 +1353,10 @@ splitFunArg ww_opts fn_id rhs
                       wrap_id  = fn_id `setIdUnfolding`  wrap_unf
                                        `setInlinePragma` mkStrWrapperInlinePrag (inlinePragInfo fn_info) []
                                        `setIdOccInfo`    noOccInfo
-                ; return (Just (work_id, work_rhs, (wrap_id, wrap_rhs))) } }
-  | otherwise = return Nothing
+                ; return (work_id, work_rhs, (wrap_id, wrap_rhs)) }
   where
     fn_info    = idInfo fn_id
-    ww_arity   = workWrapArity fn_id rhs
     simpl_opts = wo_simple_opts ww_opts
-    uf_opts    = so_uf_opts simpl_opts
 
 -- | A conversion for a set of values at one position: (A) if splitting them
 -- as functions gains something, else (B)
@@ -1267,6 +1387,7 @@ functionsConv ww_opts fn_id v0 vs
            Just (_, _, wrap_fn, work_fn) ->
              let unwrap e = return (simpleOptExpr simpl_opts (work_fn e))
              in return (Just (Conv { cv_unwrap = unwrap
+                                   , cv_depth  = 1
                                    , cv_wrap   = \v -> return (wrap_fn v)
                                    , cv_new_ty = exprType (simpleOptExpr simpl_opts (work_fn (argValExpr v0))) })) }
   | otherwise = return Nothing
@@ -1284,7 +1405,7 @@ functionsConv ww_opts fn_id v0 vs
 lambdaConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
 lambdaConv ww_opts fn_id depth vals
   | Just lams <- mapM isLam vals
-  , (_, _, bs0) : _ <- lams
+  , _ : _ <- lams
   , let m = minimum' [ length bs | (_, _, bs) <- lams ]
   , m >= 1
   = try_params [0 .. m - 1] lams m
@@ -1358,6 +1479,7 @@ lambdaConv ww_opts fn_id depth vals
                         ; return (mkLams as call) }
            ; e0' <- unwrap e0
            ; return (Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap
+                                , cv_depth = 1 + cv_depth inner
                                 , cv_new_ty = exprType (simpleOptExpr simpl_opts e0') })) }
       | otherwise = return Nothing
 
@@ -1424,7 +1546,6 @@ rewriteCalls q q' ri conv = go
 etaExpandable :: Arity -> Arity -> Demand -> Bool
 etaExpandable arity k dmd = case dmd of
   _ :* sd -> go_arity arity sd
-  _       -> False
   where
     -- The calls with g's own arguments: any cardinality
     go_arity 0 sd = go_res True k sd

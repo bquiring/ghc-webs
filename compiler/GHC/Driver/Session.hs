@@ -1577,6 +1577,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_static_argument_transformation)
   , make_ord_flag defGhcFlag "ddump-worker-wrapper"
         (setDumpFlag Opt_D_dump_worker_wrapper)
+  , make_ord_flag defGhcFlag "ddump-ww-ho-stats"
+        (setDumpFlag Opt_D_dump_ww_ho_stats)
   , make_ord_flag defGhcFlag "ddump-rn-trace"
         (setDumpFlag Opt_D_dump_rn_trace)
   , make_ord_flag defGhcFlag "ddump-if-trace"

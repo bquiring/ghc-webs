@@ -84,3 +84,11 @@ test('wwdeep004', normal, compile_and_run, ['-O -fworker-wrapper-function-result
 for name in ['wwhoarg001', 'wwhoarg002', 'wwhoarg003', 'wwhoarg004', 'wwhoarg005',
              'wwhoarg006', 'wwhoarg007', 'wwhoarg008', 'wwhoarg009', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
     test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+
+# Two larger examples mixing cases that are split ([+]) and cases that are
+# not ([-]), with a library module each (so that GHC keeps its functions out
+# of line); -ddump-ww-ho-stats lists the functions split.
+test('wwlarge001', [extra_files(['WWLarge1A.hs'])], multimod_compile_and_run,
+     ['wwlarge001', '-O -fworker-wrapper-function-results'])
+test('wwlarge002', [extra_files(['WWLarge2A.hs'])], multimod_compile_and_run,
+     ['wwlarge002', '-O -fworker-wrapper-function-results'])

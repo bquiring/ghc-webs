@@ -41,7 +41,7 @@ import GHC.Core.Opt.DmdAnal
 import GHC.Core.Opt.CprAnal      ( cprAnalProgram )
 import GHC.Core.Opt.CallArity    ( callArityAnalProgram )
 import GHC.Core.Opt.Exitify      ( exitifyProgram )
-import GHC.Core.Opt.WorkWrap     ( wwTopBinds )
+import GHC.Core.Opt.WorkWrap     ( wwTopBinds, higherOrderStats, pprHoStats )
 import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
 import GHC.Core.LateCC.TopLevelBinds (topLevelBindsCCMG)
 import GHC.Core.Seq (seqBinds)
@@ -170,7 +170,11 @@ getCoreToDo dflags hpt_rule_base extra_vars
     simpl_gently = CoreDoSimplify $ initSimplifyOpts dflags extra_vars max_iter
                                     (initGentleSimplMode dflags) hpt_rule_base
 
-    dmd_cpr_ww = if ww_on then [CoreDoDemand True,CoreDoCpr,CoreDoWorkerWrapper]
+    -- -ddump-ww-ho-stats: see Note [Higher-order worker/wrapper statistics]
+    -- in GHC.Core.Opt.WorkWrap
+    ho_stats phase = runWhen (dopt Opt_D_dump_ww_ho_stats dflags) (CoreDoHoStats phase)
+
+    dmd_cpr_ww = if ww_on then [CoreDoDemand True, ho_stats "pre-ww", CoreDoCpr,CoreDoWorkerWrapper]
                           else [CoreDoDemand False] -- NB: No CPR! See Note [Don't change boxity without worker/wrapper]
 
 
@@ -243,6 +247,8 @@ getCoreToDo dflags hpt_rule_base extra_vars
            -- forms to the top level. See Note [Grand plan for static forms] in
            -- GHC.Iface.Tidy.StaticPtrTable.
            static_ptrs_float_outwards,
+
+        ho_stats "early",
 
         -- Run the simplifier phases 2,1,0 to allow rewrite rules to fire
         runWhen do_simpl3
@@ -347,7 +353,9 @@ getCoreToDo dflags hpt_rule_base extra_vars
         maybe_rule_check FinalPhase,
 
         add_caller_ccs,
-        add_late_ccs
+        add_late_ccs,
+
+        ho_stats "final"
      ]
 
     -- Remove 'CoreDoNothing' and flatten 'CoreDoPasses' for clarity.
@@ -508,6 +516,16 @@ doCorePass pass guts = do
 
     CoreDoCpr                 -> {-# SCC "CprAnal" #-}
                                  updateBindsM (liftIO . cprAnalProgram logger fam_envs)
+
+    CoreDoHoStats phase       -> {-# SCC "HoStats" #-}
+      do { let ww_opts = initWorkWrapOpts (mg_module guts) dflags fam_envs
+               -- Fresh demand information, on a copy (pre-ww has it already)
+         ; binds <- if phase == "pre-ww" then return (mg_binds guts)
+                    else liftIO (dmdAnal logger True dflags fam_envs (mg_rules guts) (mg_binds guts))
+         ; liftIO $ Logger.putDumpFileMaybe logger Opt_D_dump_ww_ho_stats
+             ("Higher-order worker/wrapper statistics: " ++ phase) FormatText
+             (pprHoStats phase (higherOrderStats ww_opts us binds))
+         ; return guts }
 
     CoreDoWorkerWrapper       -> {-# SCC "WorkWrap" #-}
                                  updateBinds (wwTopBinds

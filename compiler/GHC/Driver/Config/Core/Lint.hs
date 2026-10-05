@@ -86,6 +86,7 @@ coreDumpFlag CoreDoExitify            = Just Opt_D_dump_exitify
 coreDumpFlag (CoreDoDemand {})        = Just Opt_D_dump_dmdanal
 coreDumpFlag CoreDoCpr                = Just Opt_D_dump_cpranal
 coreDumpFlag CoreDoWorkerWrapper      = Just Opt_D_dump_worker_wrapper
+coreDumpFlag (CoreDoHoStats {})       = Nothing
 coreDumpFlag CoreDoSpecialising       = Just Opt_D_dump_spec
 coreDumpFlag CoreDoSpecConstr         = Just Opt_D_dump_spec_constr
 coreDumpFlag CoreCSE                  = Just Opt_D_dump_cse

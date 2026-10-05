@@ -503,6 +503,7 @@ data DumpFlag
    | Opt_D_dump_liberate_case
    | Opt_D_dump_static_argument_transformation
    | Opt_D_dump_worker_wrapper
+   | Opt_D_dump_ww_ho_stats  -- ^ Higher-order worker/wrapper statistics
    | Opt_D_dump_rn_trace
    | Opt_D_dump_rn_stats
    | Opt_D_dump_opt_cmm

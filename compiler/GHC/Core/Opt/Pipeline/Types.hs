@@ -49,6 +49,7 @@ data CoreToDo           -- These are diff core-to-core passes,
                        -- See Note [Don't change boxity without worker/wrapper]
   | CoreDoCpr
   | CoreDoWorkerWrapper
+  | CoreDoHoStats String   -- ^ Higher-order worker/wrapper statistics, at this point
   | CoreDoSpecialising
   | CoreDoSpecConstr
   | CoreCSE
@@ -79,6 +80,7 @@ instance Outputable CoreToDo where
   ppr (CoreDoDemand False)     = text "Demand analysis"
   ppr CoreDoCpr                = text "Constructed Product Result analysis"
   ppr CoreDoWorkerWrapper      = text "Worker Wrapper binds"
+  ppr (CoreDoHoStats s)        = text "Higher-order worker/wrapper statistics" <+> text s
   ppr CoreDoSpecialising       = text "Specialise"
   ppr CoreDoSpecConstr         = text "SpecConstr"
   ppr CoreCSE                  = text "Common sub-expression"
