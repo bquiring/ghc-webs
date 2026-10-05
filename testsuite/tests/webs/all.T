@@ -147,3 +147,14 @@ test('webs008', [], compile_and_run,
      [early_opts + ' -fcore-webs-uncurry -floopification -fpedantic-bottoms'])
 test('alltransforms003', [extra_files(['alltransforms001.hs'])], multimod_compile_and_run,
      ['alltransforms001', all_opts.replace('-fcore-webs ', '-fcore-webs-early ')])
+
+# WORKING-THE-WORKER-WRAPPER.md: what GHC's worker/wrapper does today with a
+# returned function whose argument is dead.  Plain GHC (no webs); the
+# expected output records approach 1, so it changes, deliberately, when
+# approach 2 (splitting the function that returns it) is implemented.
+#   wwreturn001: g inlined, f's body (a call of marker) duplicated per call
+#   wwreturn002: g not inlined; g returns \x _ ->, calls pass the dead argument
+test('wwreturn001', [grep_errmsg(r'\$wmarker \(|^g |^\$wg ')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+test('wwreturn002', [grep_errmsg(r'\\ x _ ->|^\$wg |= g [nm] |h[12] [ab] [ab]')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])

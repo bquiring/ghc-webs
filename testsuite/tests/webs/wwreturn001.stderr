@@ -1,0 +1,2 @@
+      case $wmarker (+# (*# ww1 ww1) (*# k ww1)) of ww3 { __DEFAULT ->
+      case $wmarker (+# (*# ww2 ww2) (*# k ww2)) of ww4 { __DEFAULT ->

@@ -1,0 +1,7 @@
+      \ x _ ->
+      let { h1 = g n } in
+      case h1 a b of { I# x ->
+      case h1 b a of { I# y ->
+      let { h2 = g m } in
+      case h2 a b of { I# y1 ->
+      case h2 b a of { I# y2 -> +# (+# (+# x y) y1) y2 }
