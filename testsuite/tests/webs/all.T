@@ -106,7 +106,8 @@ for n in range(1, 6):
 
 # Constant propagation (GHC.WebCore.Transform.ConstProp), followed by
 # dead-parameter elimination.  constprop003 checks that calls with a constant
-# result are still evaluated (Debug.Trace, the expected stderr).
+# result are still evaluated (Debug.Trace, the expected stderr); constprop005
+# that a local variable passed at every call is not propagated.
 cp_opts = webs_opts + ' -fcore-webs-const-prop -fcore-webs-dead-params'
 
 def constprop_test(name):
@@ -114,7 +115,7 @@ def constprop_test(name):
     test(name + '_dump', [extra_files([name + '.hs'])],
          multimod_compile, [name, cp_opts + ' -ddump-webs-const-prop -dsuppress-uniques'])
 
-for n in range(1, 5):
+for n in range(1, 6):
     constprop_test('constprop%03d' % n)
 
 # Super-beta inlining (GHC.WebCore.Transform.Inline).  inline002 and 004

@@ -30,6 +30,16 @@ duplicates no work:
   arguments (`True`, `Nothing @Int`, `I# 3#`);
 - a top-level or imported variable of closed type.
 
+A lambda with no free variables (term or type) would be a constant too, but
+it is not treated as one. Full laziness floats such lambdas to the top level,
+where they are top-level variables. Substituting one inline would also copy
+its code into every lambda of the web.
+
+A *local* variable is never a constant, even when every call passes the
+same one. At the definition it is out of scope, or bound by another
+activation. That would be known-argument elimination, not constant
+propagation (test `constprop005`).
+
 **Types.** The constant's type must equal the parameter's type in every lambda.
 A polymorphic lambda `\(x :: a) -> ...` can receive `True` only at the
 instance `a = Bool`, so the web is rejected ("parameter type").

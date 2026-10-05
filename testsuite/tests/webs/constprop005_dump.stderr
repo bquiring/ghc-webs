@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( constprop005.hs, constprop005.o )
+
+==================== Webs: constant propagation ====================
+no constant argument (exposed); no constant result (exposed): eta
+no constant argument (not constant); no constant result (not constant): f
+no constant argument (not constant); no constant result (not constant): n
+no constant argument (not constant); no constant result (not constant): ww
+no constant argument (not constant); no constant result (not constant): ww
+no constant argument (not constant); no constant result (not constant): x
+no constant argument (not constant); no constant result (not constant): y y
+
+
+[2 of 2] Linking constprop005

@@ -7,26 +7,12 @@
 | before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
 | after | 13762 | 481 | 5745 | 1129 | 1182 | 70686 | 1393 | 927 | 1926 |
 
-## late  (115 benchmarks)
-
-| | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
-|---|---|---|---|---|---|---|---|---|---|
-| before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13727 | 518 | 5754 | 1130 | 1182 | 70253 | 1499 | 817 | 1915 |
-
 ## early  (115 benchmarks)
 
 | | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
 |---|---|---|---|---|---|---|---|---|---|
 | before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13580 | 479 | 5743 | 1129 | 1182 | 69999 | 1388 | 923 | 1871 |
-
-## early-late  (115 benchmarks)
-
-| | lams | returned | passed | stored_data | stored_dict | calls | unknown_calls | partial_apps | ww_workers |
-|---|---|---|---|---|---|---|---|---|---|
-| before | 12571 | 1103 | 11787 | 432 | 1155 | 62717 | 5929 | 4400 | 0 |
-| after | 13729 | 518 | 5752 | 1130 | 1182 | 70269 | 1495 | 813 | 1866 |
+| after | 13554 | 479 | 5756 | 1129 | 1182 | 70344 | 1389 | 926 | 1889 |
 
 ## Per benchmark, base: before -> after (returned / passed / stored_data / unknown_calls)
 
@@ -150,62 +136,62 @@
 
 # Simplifier and inliner statistics (grand totals, summed over modules)
 
-| kind | base | late | early | early-late |
-|---|---|---|---|---|
-| Total ticks | 810502 | 812595 (+0.3%) | 805000 (-0.7%) | 807080 (-0.4%) |
-| PreInlineUnconditionally | 256187 | 257012 (+0.3%) | 253885 (-0.9%) | 254708 (-0.6%) |
-| PostInlineUnconditionally | 19444 | 19453 (+0.0%) | 19847 (+2.1%) | 19855 (+2.1%) |
-| UnfoldingDone | 80032 | 80126 (+0.1%) | 78376 (-2.1%) | 78469 (-2.0%) |
-| RuleFired | 65812 | 66053 (+0.4%) | 65928 (+0.2%) | 66169 (+0.5%) |
-| BetaReduction | 306412 | 307244 (+0.3%) | 304336 (-0.7%) | 305165 (-0.4%) |
-| KnownBranch | 53752 | 53799 (+0.1%) | 53864 (+0.2%) | 53905 (+0.3%) |
-| CaseOfCase | 5247 | 5244 (-0.1%) | 5235 (-0.2%) | 5232 (-0.3%) |
-| EtaExpansion | 1690 | 1690 (+0.0%) | 1690 (+0.0%) | 1690 (+0.0%) |
-| EtaReduction | 252 | 245 (-2.8%) | 251 (-0.4%) | 244 (-3.2%) |
-| LetFloatFromLet | 0 | 0 () | 0 () | 0 () |
-| FillInCaseDefault | 3347 | 3347 (+0.0%) | 3316 (-0.9%) | 3316 (-0.9%) |
-| CaseElim | 1415 | 1462 (+3.3%) | 1408 (-0.5%) | 1455 (+2.8%) |
-| CaseIdentity | 455 | 455 (+0.0%) | 421 (-7.5%) | 421 (-7.5%) |
-| CaseMerge | 697 | 698 (+0.1%) | 698 (+0.1%) | 699 (+0.3%) |
-| AltMerge | 55 | 55 (+0.0%) | 55 (+0.0%) | 55 (+0.0%) |
-| $w workers (final Core) | 1926 | 1915 (-0.6%) | 1871 (-2.9%) | 1866 (-3.1%) |
+| kind | base | early |
+|---|---|---|
+| Total ticks | 810502 | 807017 (-0.4%) |
+| PreInlineUnconditionally | 256187 | 254891 (-0.5%) |
+| PostInlineUnconditionally | 19444 | 19359 (-0.4%) |
+| UnfoldingDone | 80032 | 79568 (-0.6%) |
+| RuleFired | 65812 | 65836 (+0.0%) |
+| BetaReduction | 306412 | 305671 (-0.2%) |
+| KnownBranch | 53752 | 53187 (-1.1%) |
+| CaseOfCase | 5247 | 5143 (-2.0%) |
+| EtaExpansion | 1690 | 1690 (+0.0%) |
+| EtaReduction | 252 | 253 (+0.4%) |
+| LetFloatFromLet | 0 | 0 () |
+| FillInCaseDefault | 3347 | 3272 (-2.2%) |
+| CaseElim | 1415 | 1407 (-0.6%) |
+| CaseIdentity | 455 | 351 (-22.9%) |
+| CaseMerge | 697 | 701 (+0.6%) |
+| AltMerge | 55 | 55 (+0.0%) |
+| $w workers (final Core) | 1926 | 1889 (-1.9%) |
 
 ## UnfoldingDone per benchmark (largest changes vs base)
 
-| benchmark | base | late | early | early-late |
-|---|---|---|---|---|
-| real/veritas | 6244 | 6244 | 5733 | 5733 |
-| real/anna | 6439 | 6464 | 6167 | 6192 |
-| spectral/hartel/transform | 1199 | 1199 | 1055 | 1055 |
-| real/reptile | 2236 | 2236 | 2115 | 2115 |
-| spectral/boyer2 | 380 | 380 | 312 | 312 |
-| real/fem | 1309 | 1361 | 1301 | 1353 |
-| real/bspt | 3100 | 3101 | 3055 | 3056 |
-| spectral/rewrite | 710 | 710 | 671 | 671 |
-| real/gg | 1819 | 1819 | 1784 | 1784 |
-| real/symalg | 1268 | 1268 | 1233 | 1233 |
-| spectral/minimax | 472 | 473 | 437 | 438 |
-| real/scs | 1899 | 1899 | 1867 | 1867 |
-| spectral/multiplier | 829 | 829 | 798 | 798 |
-| spectral/clausify | 197 | 197 | 172 | 172 |
-| spectral/expert | 483 | 483 | 462 | 462 |
-| spectral/hartel/comp_lab_zift | 531 | 531 | 512 | 512 |
-| real/compress2 | 358 | 363 | 341 | 346 |
-| real/linear | 2446 | 2453 | 2456 | 2463 |
-| spectral/hartel/solid | 436 | 436 | 419 | 419 |
-| real/compress | 400 | 400 | 384 | 384 |
-| real/grep | 738 | 738 | 754 | 754 |
-| spectral/integer | 151 | 151 | 137 | 137 |
-| real/fluid | 3158 | 3161 | 3145 | 3145 |
-| spectral/cryptarithm1 | 97 | 97 | 84 | 84 |
-| spectral/mate | 870 | 868 | 883 | 883 |
+| benchmark | base | early |
+|---|---|---|
+| real/veritas | 6244 | 6131 |
+| spectral/hartel/nucleic2 | 2232 | 2336 |
+| spectral/hartel/transform | 1199 | 1123 |
+| real/anna | 6439 | 6390 |
+| real/linear | 2446 | 2400 |
+| spectral/para | 1127 | 1100 |
+| real/reptile | 2236 | 2260 |
+| spectral/rewrite | 710 | 686 |
+| real/bspt | 3100 | 3077 |
+| real/fluid | 3158 | 3138 |
+| spectral/boyer2 | 380 | 362 |
+| real/compress2 | 358 | 341 |
+| spectral/hartel/comp_lab_zift | 531 | 514 |
+| spectral/hartel/parstof | 1526 | 1509 |
+| spectral/simple | 2236 | 2220 |
+| spectral/hartel/solid | 436 | 420 |
+| real/gg | 1819 | 1804 |
+| real/symalg | 1268 | 1256 |
+| spectral/hartel/sched | 246 | 235 |
+| real/compress | 400 | 390 |
+| spectral/treejoin | 102 | 92 |
+| spectral/dom-lt | 1438 | 1429 |
+| real/gamteb | 748 | 740 |
+| real/scs | 1899 | 1891 |
+| spectral/circsim | 706 | 698 |
 
 # Compile and run performance (from the nofib logs)
 
-| measure | late | early | early-late |
-|---|---|---|---|
-| compiler allocation vs base | +20.97% (geomean over 117) | +11.78% (geomean over 117) | +30.76% (geomean over 117) |
-| program allocation vs base | +0.26% (geomean over 113) | -0.01% (geomean over 113) | +0.23% (geomean over 113) |
+| measure | early |
+|---|---|
+| compiler allocation vs base | +9.34% (geomean over 117) |
+| program allocation vs base | -0.47% (geomean over 113) |
 
 Times are not reported: they are not reliable on this machine (see report.py).
 
@@ -215,168 +201,168 @@ If the web transformations reduce inlining and worker/wrapper, the code
 of the benchmarks' own modules should shrink.  The executable also
 contains the RTS and the libraries, which do not change.
 
-| measure | base | late | early | early-late |
-|---|---|---|---|---|
-| object code (text), total | 7239220 | 7366251 (+1.8%; geomean +1.97%) | 7250324 (+0.2%; geomean +0.37%) | 7368297 (+1.8%; geomean +2.12%) |
-| object files (text+data+bss), total | 8533500 | 8661987 (+1.5%; geomean +1.47%) | 8545548 (+0.1%; geomean +0.30%) | 8664921 (+1.5%; geomean +1.64%) |
-| executable (text), total | 520418811 | 520538107 (+0.0%; geomean +0.02%) | 520435131 (+0.0%; geomean +0.00%) | 520546235 (+0.0%; geomean +0.02%) |
+| measure | base | early |
+|---|---|---|
+| object code (text), total | 7239220 | 7275338 (+0.5%; geomean +0.46%) |
+| object files (text+data+bss), total | 8533500 | 8569986 (+0.4%; geomean +0.25%) |
+| executable (text), total | 520418811 | 520455771 (+0.0%; geomean +0.01%) |
 
 ## Object code (text) per benchmark (largest changes vs base)
 
-| benchmark | base | late | early | early-late |
-|---|---|---|---|---|
-| wave4main | 26566 | +12.6% | +33.4% | +46.5% |
-| nucleic2 | 54117 | +41.7% | +13.0% | +41.6% |
-| fish | 23443 | +16.2% | +0.0% | +16.2% |
-| scc | 3641 | +15.5% | +0.0% | +15.5% |
-| mkhprog | 24386 | +15.4% | -1.0% | +13.2% |
-| bernouilli | 8658 | +8.6% | +1.2% | +9.8% |
-| dom-lt | 69377 | +8.5% | +0.4% | +8.5% |
-| gamteb | 50290 | +7.9% | +0.0% | +7.9% |
-| circsim | 50034 | +3.2% | +6.0% | +6.7% |
-| rewrite | 60256 | +4.6% | +2.5% | +6.7% |
-| typecheck | 31667 | +6.6% | -2.8% | +3.7% |
-| puzzle | 75841 | -6.4% | +0.0% | -6.4% |
-| comp_lab_zift | 78839 | +5.4% | +1.4% | +6.1% |
-| fibheaps | 23713 | +4.9% | +0.0% | +4.9% |
-| fft | 25220 | +4.4% | +0.4% | +2.0% |
-| primetest | 23199 | +3.9% | +0.1% | +3.9% |
-| fasta | 6432 | +3.9% | +0.0% | +3.9% |
-| fannkuch-redux | 14913 | +3.6% | +0.0% | +3.6% |
-| reptile | 255588 | +1.1% | -3.6% | -2.6% |
-| fluid | 396657 | +3.4% | -0.7% | +2.6% |
-| fft2 | 30556 | +3.3% | +0.0% | +3.3% |
-| listcompr | 15365 | +3.2% | -1.4% | +1.8% |
-| linear | 129332 | +3.1% | +0.1% | +3.1% |
-| listcopy | 15661 | +3.1% | -1.3% | +1.8% |
-| symalg | 110683 | +1.2% | +2.0% | +3.1% |
-| integrate | 8740 | +2.6% | +0.0% | +2.6% |
-| anna | 856210 | +1.9% | +0.6% | +2.5% |
-| ansi | 13702 | +2.5% | +2.3% | +2.5% |
-| transform | 149700 | +2.4% | -1.3% | +2.3% |
-| boyer2 | 42555 | +1.3% | -2.4% | -0.9% |
+| benchmark | base | early |
+|---|---|---|
+| nucleic2 | 54117 | +46.6% |
+| circsim | 50034 | +5.8% |
+| comp_lab_zift | 78839 | +3.4% |
+| fibheaps | 23713 | +2.7% |
+| CS | 4880 | +2.3% |
+| fluid | 396657 | +1.8% |
+| fish | 23443 | -1.4% |
+| ansi | 13702 | +1.3% |
+| eliza | 21987 | -1.3% |
+| hpg | 142027 | -1.1% |
+| digits-of-e2 | 12257 | -1.1% |
+| solid | 52657 | +1.1% |
+| dom-lt | 69377 | -1.1% |
+| event | 23115 | +1.0% |
+| symalg | 110683 | +1.0% |
+| knights | 65243 | +0.9% |
+| transform | 149700 | -0.9% |
+| calendar | 16368 | +0.9% |
+| constraints | 38846 | +0.8% |
+| genfft | 18325 | +0.8% |
+| multiplier | 52666 | -0.7% |
+| sched | 18830 | -0.6% |
+| mate | 104848 | +0.6% |
+| boyer2 | 42555 | -0.4% |
+| compress2 | 90942 | -0.4% |
+| gg | 165892 | -0.3% |
+| treejoin | 14459 | -0.3% |
+| bspt | 184079 | +0.3% |
+| reptile | 255588 | +0.2% |
+| para | 66005 | -0.2% |
 
 ## Program allocation per benchmark (bytes; change vs base)
 
-| benchmark | base | late | early | early-late |
-|---|---|---|---|---|
-| CS | 160050240 | +0.0% | +0.0% | +0.0% |
-| CSD | 1600050368 | +0.0% | +0.0% | +0.0% |
-| FS | 1760050256 | +0.0% | +0.0% | +0.0% |
-| S | 240050192 | +0.0% | +0.0% | +0.0% |
-| VS | 483117120 | +0.0% | +0.0% | +0.0% |
-| VSD | 50336 | +0.0% | +0.0% | +0.0% |
-| VSM | 400050304 | +0.0% | +0.0% | +0.0% |
-| anna | 195002328 | +0.0% | +0.0% | +0.0% |
-| ansi | 1265690552 | -0.0% | +0.0% | -0.0% |
-| atom | 537524528 | +0.0% | +0.0% | +0.0% |
-| awards | 486399944 | +0.0% | +0.0% | +0.0% |
-| banner | 613288616 | +0.0% | +0.0% | +0.0% |
-| ben-raytrace | 0 |  |  |  |
-| bernouilli | 140977880 | +0.0% | +0.0% | +0.0% |
-| binary-trees | 262397232 | +0.2% | +0.0% | +0.2% |
-| boyer | 622572592 | +0.0% | +0.0% | +0.0% |
-| boyer2 | 123533344 | +0.0% | +0.2% | +0.2% |
-| bspt | 377714288 | +0.0% | +0.0% | +0.0% |
-| cacheprof | 322226000 | +0.0% | +0.0% | +0.0% |
-| calendar | 710378936 | +0.0% | +0.0% | +0.0% |
-| cichelli | 194209544 | +3.4% | +0.0% | +3.4% |
-| circsim | 493903800 | +0.0% | +0.0% | +0.0% |
-| clausify | 299615688 | +0.0% | +0.0% | +0.0% |
-| comp_lab_zift | 452726128 | +4.4% | +0.0% | +4.4% |
-| compress | 533552896 | +0.0% | +0.0% | +0.0% |
-| compress2 | 599413952 | -8.4% | +0.0% | -8.4% |
-| constraints | 1254410000 | +0.0% | +0.0% | +0.0% |
-| cryptarithm1 | 1993762888 | +0.0% | +0.0% | +0.0% |
-| cryptarithm2 | 370194224 | +0.0% | +0.0% | +0.0% |
-| cse | 388280528 | +0.5% | +0.0% | +0.5% |
-| digits-of-e1 | 101892648 | +0.0% | +0.0% | +0.0% |
-| digits-of-e2 | 226018856 | +0.0% | +0.0% | +0.0% |
-| dom-lt | 541748184 | +12.2% | +0.0% | +12.2% |
-| eliza | 409884800 | +0.0% | +0.0% | +0.0% |
-| event | 321891624 | +0.0% | +0.0% | +0.0% |
-| exact-reals | 89758928 | +0.0% | +0.0% | +0.0% |
-| exp3_8 | 597315784 | +0.0% | +0.0% | +0.0% |
-| expert | 212140304 | +0.0% | +0.0% | +0.0% |
-| fannkuch-redux | 65256 | +0.0% | +0.0% | +0.0% |
-| fasta | 0 |  |  |  |
-| fem | 962382032 | +0.1% | +0.0% | +0.1% |
-| fft | 309653712 | +0.0% | -0.0% | -0.0% |
-| fft2 | 211347480 | -1.6% | +0.0% | -1.6% |
-| fibheaps | 652742424 | +4.7% | +0.0% | +4.7% |
-| fish | 626063816 | -0.0% | +0.0% | -0.0% |
-| fluid | 215121992 | +0.1% | +0.0% | +0.2% |
-| fulsom | 506338968 | +0.0% | +0.0% | +0.0% |
-| gamteb | 473334440 | -2.1% | +0.0% | -2.1% |
-| gcd | 205458336 | +0.0% | +0.0% | +0.0% |
-| gen_regexps | 447854800 | +0.0% | +0.0% | +0.0% |
-| genfft | 517071368 | +0.0% | +0.0% | +0.0% |
-| gg | 461011304 | +0.0% | +0.0% | +0.0% |
-| grep | 447848976 | -0.0% | +0.0% | -0.0% |
-| hidden | 349555848 | +0.0% | +0.0% | +0.0% |
-| hpg | 342996448 | +0.0% | +0.0% | +0.0% |
-| ida | 348109296 | +0.0% | +0.0% | +0.0% |
-| infer | 221641496 | +0.1% | +0.0% | +0.1% |
-| integer | 308020648 | +0.0% | +0.0% | +0.0% |
-| integrate | 342470848 | -0.5% | +0.0% | -0.5% |
-| k-nucleotide | 0 |  |  |  |
-| kahan | 49080 | +0.0% | +0.0% | +0.0% |
-| knights | 130041032 | -0.4% | -1.2% | -1.6% |
-| lambda | 291501944 | +0.0% | +0.0% | +0.0% |
-| last-piece | 743567088 | +0.0% | +0.0% | +0.0% |
-| lcss | 669846936 | +0.0% | +0.0% | +0.0% |
-| life | 274775096 | +0.0% | +0.0% | +0.0% |
-| lift | 259816256 | +0.9% | +0.0% | +0.9% |
-| linear | 470144752 | +0.0% | +0.0% | +0.0% |
-| listcompr | 615676680 | +0.0% | +0.0% | +0.0% |
-| listcopy | 675805448 | +0.0% | +0.0% | +0.0% |
-| maillist | 809998896 | +0.0% | +0.0% | +0.0% |
-| mandel | 175337024 | +0.0% | +0.0% | +0.0% |
-| mandel2 | 2298992 | +0.0% | +0.0% | +0.0% |
-| mate | 60655328 | +0.1% | -0.2% | -0.7% |
-| minimax | 291353088 | +0.0% | +0.0% | +0.0% |
-| mkhprog | 1100077760 | +0.0% | +0.0% | +0.0% |
-| multiplier | 379885160 | +0.0% | +0.0% | +0.0% |
-| n-body | 163144 | +0.0% | +0.0% | +0.0% |
-| nucleic2 | 338159128 | -0.1% | -0.9% | -0.1% |
-| para | 501836112 | +0.0% | +0.0% | +0.0% |
-| paraffins | 407532528 | +0.0% | +0.0% | +0.0% |
-| parser | 240605560 | +0.0% | +0.0% | +0.0% |
-| parstof | 154654392 | +0.0% | +0.0% | +0.0% |
-| pic | 310856552 | +0.0% | +0.0% | +0.0% |
-| pidigits | 921309816 | +0.0% | +0.0% | +0.0% |
-| power | 159684144 | +0.0% | +0.0% | +0.0% |
-| pretty | 136560 | +0.0% | +0.0% | +0.0% |
-| primes | 489067504 | +0.0% | +0.0% | +0.0% |
-| primetest | 70431120 | +0.0% | +0.0% | +0.0% |
-| prolog | 258439704 | +0.1% | +0.0% | +0.1% |
-| puzzle | 191279296 | +2.1% | +0.0% | +2.1% |
-| queens | 115735672 | +0.0% | +0.0% | +0.0% |
-| reptile | 44609600 | +0.0% | +0.0% | +0.0% |
-| reverse-complement | 59880 | +0.0% | +0.0% | +0.0% |
-| rewrite | 139306112 | +0.0% | -0.0% | -0.0% |
-| rfib | 106224 | +0.0% | +0.0% | +0.0% |
-| rsa | 173873872 | +0.0% | +0.0% | +0.0% |
-| scc | 57968 | +0.3% | +0.0% | +0.3% |
-| sched | 337602760 | +0.0% | +0.0% | +0.0% |
-| scs | 408726016 | -0.0% | +0.0% | -0.0% |
-| simple | 82104688 | +0.0% | +0.0% | +0.0% |
-| smallpt | 0 |  |  |  |
-| solid | 640379584 | +0.0% | +0.0% | +0.0% |
-| sorting | 241203832 | +0.0% | +0.0% | +0.0% |
-| spectral-norm | 186936 | +0.0% | +0.0% | +0.0% |
-| sphere | 205488456 | +0.4% | +0.0% | +0.4% |
-| symalg | 69364520 | +0.0% | +0.0% | +0.0% |
-| tak | 96872 | +0.0% | +0.0% | +0.0% |
-| transform | 394676944 | +0.0% | +0.0% | +0.0% |
-| treejoin | 465764632 | +0.7% | +0.0% | +0.7% |
-| typecheck | 262950712 | +0.0% | +0.1% | +0.1% |
-| veritas | 419856696 | -0.0% | -0.0% | -0.0% |
-| wang | 486367736 | +0.0% | +0.0% | +0.0% |
-| wave4main | 305912088 | +13.8% | +0.3% | +12.3% |
-| wheel-sieve1 | 27573136 | +0.0% | +0.0% | +0.0% |
-| wheel-sieve2 | 362093904 | +0.0% | +0.0% | +0.0% |
-| x2n1 | 57312 | +0.0% | +0.0% | +0.0% |
+| benchmark | base | early |
+|---|---|---|
+| CS | 160050240 | +0.0% |
+| CSD | 1600050368 | +0.0% |
+| FS | 1760050256 | +0.0% |
+| S | 240050192 | +0.0% |
+| VS | 483117120 | +0.0% |
+| VSD | 50336 | +0.0% |
+| VSM | 400050304 | +0.0% |
+| anna | 195002328 | +0.0% |
+| ansi | 1265690552 | +0.0% |
+| atom | 537524528 | +0.0% |
+| awards | 486399944 | +0.0% |
+| banner | 613288616 | +0.0% |
+| ben-raytrace | 0 |  |
+| bernouilli | 140977880 | +0.0% |
+| binary-trees | 262397232 | +0.0% |
+| boyer | 622572592 | +0.0% |
+| boyer2 | 123533344 | +0.0% |
+| bspt | 377714288 | +0.0% |
+| cacheprof | 322226000 | +0.0% |
+| calendar | 710378936 | +0.0% |
+| cichelli | 194209544 | +0.0% |
+| circsim | 493903800 | +0.0% |
+| clausify | 299615688 | +0.0% |
+| comp_lab_zift | 452726128 | +0.0% |
+| compress | 533552896 | +0.0% |
+| compress2 | 599413952 | -0.0% |
+| constraints | 1254410000 | +0.0% |
+| cryptarithm1 | 1993762888 | +0.0% |
+| cryptarithm2 | 370194224 | +0.0% |
+| cse | 388280528 | +0.0% |
+| digits-of-e1 | 101892648 | +0.0% |
+| digits-of-e2 | 226018856 | +0.0% |
+| dom-lt | 541748184 | -3.1% |
+| eliza | 409884800 | +0.0% |
+| event | 321891624 | +0.0% |
+| exact-reals | 89758928 | +0.0% |
+| exp3_8 | 597315784 | +0.0% |
+| expert | 212140304 | +0.0% |
+| fannkuch-redux | 65256 | +0.0% |
+| fasta | 0 |  |
+| fem | 962382032 | +0.0% |
+| fft | 309653712 | +0.0% |
+| fft2 | 211347480 | +0.0% |
+| fibheaps | 652742424 | -0.7% |
+| fish | 626063816 | -0.0% |
+| fluid | 215121992 | +0.0% |
+| fulsom | 506338968 | +0.0% |
+| gamteb | 473334440 | +0.0% |
+| gcd | 205458336 | +0.0% |
+| gen_regexps | 447854800 | +0.0% |
+| genfft | 517071368 | +0.0% |
+| gg | 461011304 | +0.0% |
+| grep | 447848976 | +0.0% |
+| hidden | 349555848 | +0.0% |
+| hpg | 342996448 | +0.0% |
+| ida | 348109296 | +0.0% |
+| infer | 221641496 | +0.0% |
+| integer | 308020648 | +0.0% |
+| integrate | 342470848 | +0.0% |
+| k-nucleotide | 0 |  |
+| kahan | 49080 | +0.0% |
+| knights | 130041032 | +0.0% |
+| lambda | 291501944 | +0.0% |
+| last-piece | 743567088 | +0.0% |
+| lcss | 669846936 | +0.0% |
+| life | 274775096 | +0.0% |
+| lift | 259816256 | +0.0% |
+| linear | 470144752 | +0.0% |
+| listcompr | 615676680 | +0.0% |
+| listcopy | 675805448 | +0.0% |
+| maillist | 809998896 | +0.0% |
+| mandel | 175337024 | +0.0% |
+| mandel2 | 2298992 | +0.0% |
+| mate | 60655328 | -0.2% |
+| minimax | 291353088 | +0.0% |
+| mkhprog | 1100077760 | +0.0% |
+| multiplier | 379885160 | +0.0% |
+| n-body | 163144 | +0.0% |
+| nucleic2 | 338159128 | +0.0% |
+| para | 501836112 | +0.0% |
+| paraffins | 407532528 | +0.0% |
+| parser | 240605560 | +0.0% |
+| parstof | 154654392 | +0.0% |
+| pic | 310856552 | +0.0% |
+| pidigits | 921309816 | +0.0% |
+| power | 159684144 | +0.0% |
+| pretty | 136560 | +0.0% |
+| primes | 489067504 | +0.0% |
+| primetest | 70431120 | +0.0% |
+| prolog | 258439704 | +0.0% |
+| puzzle | 191279296 | +0.0% |
+| queens | 115735672 | +0.0% |
+| reptile | 44609600 | +0.0% |
+| reverse-complement | 59880 | +0.0% |
+| rewrite | 139306112 | -0.0% |
+| rfib | 106224 | +0.0% |
+| rsa | 173873872 | +0.0% |
+| scc | 57968 | +0.0% |
+| sched | 337602760 | +0.0% |
+| scs | 408726016 | -0.0% |
+| simple | 82104688 | +0.0% |
+| smallpt | 0 |  |
+| solid | 640379584 | -38.6% |
+| sorting | 241203832 | +0.0% |
+| spectral-norm | 186936 | +0.0% |
+| sphere | 205488456 | +0.0% |
+| symalg | 69364520 | +0.0% |
+| tak | 96872 | +0.0% |
+| transform | 394676944 | +0.0% |
+| treejoin | 465764632 | +0.0% |
+| typecheck | 262950712 | +0.0% |
+| veritas | 419856696 | -0.0% |
+| wang | 486367736 | +0.0% |
+| wave4main | 305912088 | +0.0% |
+| wheel-sieve1 | 27573136 | +0.0% |
+| wheel-sieve2 | 362093904 | +0.0% |
+| x2n1 | 57312 | +0.0% |
 
 # Build and run failures
 
@@ -413,73 +399,7 @@ contains the RTS and the libraries, which do not change.
     k-nucleotide: **** expected exit status 0 not seen ; got 139
     k-nucleotide: expected stderr not matched by reality
     k-nucleotide: make[2]: *** [../../mk/target.mk:101: runtests] Error 1
-- late: 32 lines
-    smallpt: make[2]: *** [../../mk/suffix.mk:23: smallpt.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BVH.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BoundingBox.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Colour.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Figure.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Image.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Interval.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Main.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Matrix.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Mesh.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Lehmer64.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Lehmer64Mut.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Wyhash64.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: RandomDist.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Ray.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: STL.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Sampler.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/Naive.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/STRand.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/Unboxed.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Scene1.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Scene2.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Type.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: UnboxedBVH.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Vector.o] Error 1
-    fasta: expected stdout not matched by reality
-    fasta: make[2]: *** [../../mk/target.mk:101: runtests] Error 1
-    k-nucleotide: **** expected exit status 0 not seen ; got 139
-    k-nucleotide: expected stderr not matched by reality
-    k-nucleotide: make[2]: *** [../../mk/target.mk:101: runtests] Error 1
 - early: 32 lines
-    smallpt: make[2]: *** [../../mk/suffix.mk:23: smallpt.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BVH.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BoundingBox.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Colour.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Figure.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Image.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Interval.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Main.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Matrix.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Mesh.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Lehmer64.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Lehmer64Mut.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Random/Wyhash64.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: RandomDist.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Ray.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: STL.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Sampler.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/Naive.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/STRand.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: SamplerMonad/Unboxed.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Scene1.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Scene2.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Scene/Type.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: UnboxedBVH.o] Error 1
-    ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: Vector.o] Error 1
-    fasta: expected stdout not matched by reality
-    fasta: make[2]: *** [../../mk/target.mk:101: runtests] Error 1
-    k-nucleotide: **** expected exit status 0 not seen ; got 139
-    k-nucleotide: expected stderr not matched by reality
-    k-nucleotide: make[2]: *** [../../mk/target.mk:101: runtests] Error 1
-- early-late: 32 lines
     smallpt: make[2]: *** [../../mk/suffix.mk:23: smallpt.o] Error 1
     ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BVH.o] Error 1
     ben-raytrace: make[2]: *** [../../mk/suffix.mk:23: BoundingBox.o] Error 1

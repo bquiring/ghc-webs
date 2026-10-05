@@ -149,6 +149,47 @@ libraries, so code size is measured on the benchmarks' own object files.
 - No configuration introduces a build or run failure (the same four
   pre-existing failures as `base`).
 
+## 4. The early pass after demand analysis (third run)
+
+The late run is no longer measured.  `-fcore-webs-early` now runs after the
+main simplifier, call arity and demand analysis, and before CPR and
+worker/wrapper (Note [Early webs]): the transformations see contracted code
+with demand information, and worker/wrapper and the later simplifier runs
+see their result.  `early` = every transformation except uncurrying.
+
+The first measurement of this placement showed what goes wrong when web
+transformations pre-empt worker/wrapper (program allocation +2.45%; CS
++300%, dom-lt +128%, mate +114%, binary-trees +49%), with `$w` workers −51%:
+
+| cause | benchmarks | fix |
+|---|---|---|
+| uncurrying: worker/wrapper does not unbox the components of an unboxed-tuple argument | binary-trees | no uncurrying in the early run (Note [No early uncurrying]) |
+| arity raising, same reason, for known functions | mate | early: raise only webs with an unknown call (Note [Early arity raising]) |
+| arity raising rebuilt a product the lambda also used whole (46-field state record) | dom-lt | reject when the product is used boxed (both runs) |
+| constant propagation + dead parameters turned a one-argument continuation into a value; SpecConstr and eta-expansion lost the lambda | CS | early: a last dead parameter becomes `(# #)` (Note [Early dead parameters]) |
+
+Along the way: a miscompilation (T24295b, `-fpedantic-bottoms`) from stale
+usage demands, fixed by reshaping usage demands and call arities like
+demand signatures (Note [Usage information after a transformation]).
+
+After the fixes:
+
+| vs `base` | `early` |
+|---|---|
+| total ticks | −0.4% |
+| `UnfoldingDone` (inlinings) | −0.6% |
+| `CaseIdentity` | −22.9% |
+| `$w` workers in the final Core | −1.9% |
+| object code (text), geomean | +0.46% |
+| compiler allocation (geomean) | +9.3% |
+| program allocation (geomean) | **−0.47%** |
+
+No benchmark allocates more than base; `solid` −38.6%, `dom-lt` −3.1%,
+`fibheaps` −0.7%.  The large drop in workers of the first measurement was
+mostly the harmful transformations; what remains is a modest, regression-free
+reduction of the inliner's and worker/wrapper's work, with a small code-size
+increase.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
