@@ -150,7 +150,11 @@ data WwOpts
     wo_unlift_strict     :: !Bool
   , -- | Worker/wrapper through returned functions.
     -- See Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap
-    wo_fun_results       :: !Bool }
+    wo_fun_results       :: !Bool
+  , -- | -fpedantic-bottoms: never make a function-valued expression more
+    -- defined.  See (LetOrCase) in Note [Worker/wrapper for function results]
+    -- in GHC.Core.Opt.WorkWrap
+    wo_pedantic_bottoms  :: !Bool }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args

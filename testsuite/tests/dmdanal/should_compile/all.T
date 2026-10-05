@@ -118,9 +118,11 @@ test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12
      ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
 # The same two programs with -fworker-wrapper-function-results: g is split
 # through its returned function ($wg returns the worker, without the dead
-# argument), its wrapper is inlined at the shared partial applications, and
-# the calls reach the worker (case wf ww of ...).
-test('wwreturn002_funres', [extra_files(['wwreturn002.hs']), grep_errmsg(r'^\$w\$?wg|^g =|of wf|wf ww')],
+# argument), its wrapper is inlined at the shared partial applications
+# (let wf = $wg n), and the calls reach the worker (wf a).
+test('wwreturn002_funres', [extra_files(['wwreturn002.hs']), grep_errmsg(r'^\$w\$?wg$|^g =|wf[0-9]* = |wf[0-9]* [ab] ')],
      multimod_compile, ['wwreturn002', '-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
-test('wwreturn003_funres', [extra_files(['wwreturn003.hs']), grep_errmsg(r'^\$w\$?wg|^g =|of wf|wf ww')],
+test('wwreturn003_funres', [extra_files(['wwreturn003.hs']), grep_errmsg(r'^\$w\$?wg$|^g =|wf[0-9]* = |wf[0-9]* [ab] ')],
      multimod_compile, ['wwreturn003', '-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+test('wwfunres005', [grep_errmsg(r'^run|wf a|h a')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])

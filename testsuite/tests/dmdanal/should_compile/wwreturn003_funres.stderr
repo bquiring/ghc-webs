@@ -1,4 +1,7 @@
 $w$wg
-            case $wf ww1 of ww2 { __DEFAULT -> I# ww2 }
-      case $w$wg ww of wf { __DEFAULT ->
-      case $w$wg ww1 of wf1 { __DEFAULT ->
+      let { wf = $w$wg ww } in
+      case wf a of { I# x ->
+      case wf b of { I# y ->
+      let { wf1 = $w$wg ww1 } in
+      case wf1 a of { I# y1 ->
+      case wf1 b of { I# y2 -> +# (+# (+# x y) y1) y2 }

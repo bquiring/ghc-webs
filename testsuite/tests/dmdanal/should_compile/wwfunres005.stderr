@@ -1,0 +1,3 @@
+run1 = I# 0#
+run = \ n xs -> let { wf = case n of { I# ww -> $w$wg ww } } in map (\ a -> wf a) xs
+run2 = \ n xs -> let { wf = case n of { I# x -> $w$wg (+# x 1#) } } in map (\ a -> wf a) xs

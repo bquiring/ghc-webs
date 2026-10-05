@@ -19,4 +19,5 @@ initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
   , wo_module            = this_mod
   , wo_unlift_strict     = gopt Opt_WorkerWrapperUnlift dflags
   , wo_fun_results       = gopt Opt_WorkerWrapperFunResults dflags
+  , wo_pedantic_bottoms  = gopt Opt_PedanticBottoms dflags
   }

@@ -850,10 +850,9 @@ the k arguments is the least upper bound over the tails (the binders' demand
 info, or the variable's demand signature), so that every tail is at least
 as strict, and at least as absent, as the split assumes.
 
-Soundness: wrap (unwrap g) = g.
-  * The wrapper scrutinises  $wg n  with a case, so  g n  diverges exactly
-    when the original did (the bodies differ only in the lambdas they
-    return).  A let would make  g n  a lambda even when $wg n diverges.
+Soundness: wrap (unwrap g) = g, up to the definedness of g n (LetOrCase).
+  * With a case, g n  diverges exactly when the original did (the bodies
+    differ only in the lambdas they return).
   * For each tail t,  wrap (unwrap t) = t  is the ordinary worker/wrapper
     identity for t, which holds because t's demands are at least the
     combined ones.  A dead-end tail is kept as a dead end
@@ -886,6 +885,26 @@ builds the returned closure at every call.  (A derived Eq method that builds
 a dictionary and returns the comparison was split, and every comparison in
 the importing module then allocated a dictionary and a closure, where
 before the method was inlined: simplCore/should_compile/T16038.)
+
+(LetOrCase) The wrapper binds the worker's result with a let by default:
+
+    g = \n -> let wf = $wg n in \x y -> case x of I# x# -> wf x#
+
+so that  g n  is a lambda.  Inlined at a shared partial application,
+    let h = g n in ... map (\a -> h a a) xs
+the simplifier floats wf out of h's right-hand side, h becomes a lambda and
+is inlined into its uses, which then call wf directly; wf is a thunk, so
+$wg n is still computed once.  With a case instead, h is a thunk whose
+value is the wrapper lambda, and every call through it is an unknown call
+that passes the dead argument.
+    The cost: g n is now a lambda even when $wg n diverges, so
+seq (g n) ()  terminates where it diverged before.  That is the trade GHC
+already makes by default when it eta-expands (Note [Dealing with bottom] in
+GHC.Core.Opt.Arity), and refuses under -fpedantic-bottoms; we follow it:
+with -fpedantic-bottoms the wrapper uses a case, and  g n  diverges exactly
+when the original did (test dmdanal/should_run/wwfunres001).  Either way,
+$wg n is evaluated at most once per  g n, and calls of  g n  behave as
+before.
 
 (BoringOk) The wrapper is inlined even in a boring context.  The typical use
 is a shared partial application,  let h = g n in ... h a b ... h b a,  and
@@ -940,9 +959,15 @@ splitFunResult ww_opts fn_id rhs
                                   `setIdCprSig`    topCprSig
                                   `setInlinePragma` work_prag
                       wf      = mkSysLocal (fsLit "wf") wf_uniq ManyTy new_res_ty
-                      wrap_rhs = mkLams arg_vars $
-                                 Case (mkVarApps (Var work_id) arg_vars) wf (exprType body)
-                                      [Alt DEFAULT [] (wrap_fn wf)]
+                      -- See (LetOrCase) in Note [Worker/wrapper for function results]
+                      work_call = mkVarApps (Var work_id) arg_vars
+                      wrap_rhs
+                        | wo_pedantic_bottoms ww_opts
+                        = mkLams arg_vars $
+                          Case work_call wf (exprType body) [Alt DEFAULT [] (wrap_fn wf)]
+                        | otherwise
+                        = mkLams arg_vars $
+                          Let (NonRec wf work_call) (wrap_fn wf)
                       -- Inline the wrapper even in a boring context, such
                       -- as  let h = g n: see (BoringOk) in
                       -- Note [Worker/wrapper for function results]

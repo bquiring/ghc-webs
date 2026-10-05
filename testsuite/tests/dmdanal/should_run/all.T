@@ -38,11 +38,13 @@ test('T25439', normal, compile_and_run, [''])
 # Higher-order worker/wrapper, -fworker-wrapper-function-results
 # (Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap).
 # Each checks that the split does not change the program's meaning:
-#   wwfunres001: g n diverges before returning its function (case, not let,
-#                in the wrapper)
+#   wwfunres001: g n diverges before returning its function; with
+#                -fpedantic-bottoms, seq (g n) () must still diverge (the
+#                wrapper uses a case, not a let)
 #   wwfunres002: work before the returned function is shared per partial
 #                application (Debug.Trace)
 #   wwfunres003: an argument lazy in one returned function is not unboxed
 #   wwfunres004: partial applications that escape and are forced
-for name in ['wwfunres001', 'wwfunres002', 'wwfunres003', 'wwfunres004']:
+test('wwfunres001', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
+for name in ['wwfunres002', 'wwfunres003', 'wwfunres004']:
     test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])

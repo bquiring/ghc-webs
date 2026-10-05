@@ -251,8 +251,23 @@ It can be read off the body syntactically: every occurrence of `g` is
   called at most once with all `k` arguments, GHC eta-expands instead
   (`T18894b`).
 - **Inline in boring contexts:** the wrapper's unfolding is `boring_ok`, so
-  it inlines into `let h = g n`. When `h` is strict, that is enough for the
-  calls of `h` to reach the worker. §2.4 is still needed for a lazy `h`.
+  it inlines into `let h = g n`.
+- **Shared partial applications (§2.4), via the wrapper:** by default the
+  wrapper binds the worker's result with `let`, not `case`:
+  `g = \n -> let wf = $wg n in \x y -> ... wf ...`. Inlined into
+  `let h = g n`, the simplifier floats `wf` out of `h`, `h` becomes a lambda
+  and is inlined at its uses. So even a lazy `h` captured by a lambda
+  (`map (\a -> h a a) xs`) ends up calling `wf` directly (`wwfunres005`), and
+  `$wg n` is still computed once. No separate pass is needed. The price is
+  definedness: `g n` is a lambda even when `$wg n` diverges, the trade GHC
+  already makes by default when eta-expanding (Note [Dealing with bottom]).
+  With `-fpedantic-bottoms` the wrapper uses `case` and is exact
+  (`wwfunres001`).
+- **Not yet:** the returned lambda's own arguments are not unboxed unless
+  the inner function's signature says so (e.g. `wwreturn003`). Demand
+  analysis looks at a returned lambda as if it might not be called, so its
+  binders' demands are lazy. Recording the result's demands in the analysis
+  (§3 option 1) would fix that.
 
 Results:
 
@@ -274,12 +289,9 @@ Results:
 
 ## 7. Order of work
 
-1. §2.1 with option 2 of §3 (the inner function's existing signature):
-   smallest change, and covers `wwreturn003`.
+1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.
 2. §3 option 1 (the demand analyser records the result's signature): covers
    `wwreturn002`.
-3. §2.4 (shared partial applications): needed for the calls `h a b` to
-   benefit.
 4. §2.2 (function arguments).
 (§2.3, data structures, is out of scope: see there.)
 

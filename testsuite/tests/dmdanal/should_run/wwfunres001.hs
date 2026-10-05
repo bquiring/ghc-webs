@@ -1,7 +1,8 @@
 -- Higher-order worker/wrapper (-fworker-wrapper-function-results).
 -- Divergence: g n diverges before returning its function when n < 0, so
--- seq (g n) () must diverge.  The wrapper scrutinises the worker's result
--- with a case; with a let, g n would be a lambda and this would print False.
+-- seq (g n) () must diverge, under -fpedantic-bottoms.  The wrapper then
+-- scrutinises the worker's result with a case; with a let (the default,
+-- which makes g n a lambda), this would print False.
 import Control.Exception
 
 g :: Int -> (Int -> Int -> Int)
