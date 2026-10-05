@@ -37,7 +37,9 @@ import GHC.Utils.Outputable
 import GHC.WebCore.Traverse ( typeWebs )
 import GHC.Core.FVs ( exprFreeVars, rulesFreeVars )
 import GHC.Core.Type ( coreFullView )
-import GHC.Types.Demand ( DmdSig, splitDmdSig, mkClosedDmdSig, absDmd, topDmd )
+import GHC.Types.Demand ( DmdSig, splitDmdSig, mkClosedDmdSig, absDmd, topDmd
+                         , Demand(..), Card(..), Boxity(..), mkProd
+                         , mkCall, viewCall, multCard, isAbs, topSubDmd )
 
 import Data.List ( sortOn )
 import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
@@ -155,9 +157,14 @@ when a transformation changes a function's arguments we reshape its demand
 signature, rather than zap it: zapping makes every argument look lazy, and
 cost up to 25% more allocation in nofib (e.g. imaginary/bernouilli).  A
 deleted argument's demand is dropped, a unit argument becomes absent, and two
-merged arguments become one top (lazy) demand: the strict components of a
-merged argument are evaluated at the call instead (see Note [Uncurrying] in
-GHC.WebCore.Transform.Uncurry).
+merged arguments become one demand on their unboxed tuple: strict (it is
+unlifted), with the two arguments' demands as its components.  CorePrep does
+not evaluate the strict components of an unboxed-tuple argument, so the
+uncurrying pass evaluates them at the call (see Note [Uncurrying] in
+GHC.WebCore.Transform.Uncurry); in the early run, worker/wrapper reads the
+product demand and unboxes the components.  (With a top demand instead,
+worker/wrapper no longer unboxed them: shootout/binary-trees allocated twice
+as much.)
 -}
 
 -- | The fates of the value arguments of a type, by looking at its arrows
@@ -180,9 +187,54 @@ reshapeDmdSig fates sig
     go (KeepArg : fs)              (d : ds)     = d : go fs ds
     go (DropArg : fs)              (_ : ds)     = go fs ds
     go (AbsentArg : fs)            (_ : ds)     = absDmd : go fs ds
-    go (MergeWithNext : _ : fs)    (_ : _ : ds) = topDmd : go fs ds
-    go (MergeWithNext : _)         [_]          = [topDmd]
+    go (MergeWithNext : _ : fs)    (d1 : d2 : ds) = merged d1 d2 : go fs ds
+    go (MergeWithNext : _)         [_]            = [topDmd]
     go _                           ds           = ds
+
+    -- The unboxed tuple of two merged arguments is always evaluated (it is
+    -- unlifted), and its components have the arguments' demands, so that
+    -- worker/wrapper (which runs after the early web pass) can still unbox
+    -- them
+    merged d1 d2 = C_1N :* mkProd Unboxed [d1, d2]
+
+-- | Reshape a binder's usage demand (how it is called) for the new
+-- arguments.  See Note [Usage information after a transformation]
+reshapeUsage :: [ArgFate] -> Demand -> Demand
+reshapeUsage fates dmd = case dmd of
+  n :* sd -> n :* go fates sd
+  _       -> dmd
+  where
+    go [] sd = sd
+    go (f : fs) sd = case viewCall sd of
+      Nothing -> sd
+      Just (c, sd1)
+        | isAbs c   -> sd                   -- never called this deep
+        | otherwise -> case f of
+            KeepArg       -> mkCall c (go fs sd1)
+            AbsentArg     -> mkCall c (go fs sd1)
+            -- The call that supplied the deleted argument is gone: its
+            -- cardinality multiplies into the next call
+            DropArg       -> go fs (scale c sd1)
+            -- Two calls become one
+            MergeWithNext -> case (fs, viewCall sd1) of
+              (_ : fs', Just (c2, sd2))
+                | not (isAbs c2) -> mkCall (multCard c c2) (go fs' sd2)
+              _ -> topSubDmd
+
+    scale c sd = case viewCall sd of
+      Just (c2, sd2) | let c' = multCard c c2, not (isAbs c') -> mkCall c' sd2
+      _ -> sd
+
+-- | The number of new arguments among the first n old ones
+reshapeCallArity :: [ArgFate] -> Int -> Int
+reshapeCallArity = go
+  where
+    go _ 0 = 0
+    go (KeepArg : fs)           n = 1 + go fs (n - 1)
+    go (AbsentArg : fs)         n = 1 + go fs (n - 1)
+    go (DropArg : fs)           n = go fs (n - 1)
+    go (MergeWithNext : _ : fs) n | n >= 2 = 1 + go fs (n - 2)
+    go _ _ = 0
 
 -- | Fix up the IdInfo of a binder whose type a transformation changed:
 -- set the new type and arity (and join arity), reshape its demand signature
@@ -198,13 +250,11 @@ fixBinderInfo b new_ty new_arity fates
   = setIdCprSig (setIdDmdSig (fix_join (setIdArity b' (new_arity False (idArity b))))
                              (reshapeDmdSig fates (idDmdSig b)))
                 topCprSig
-    -- The binder's usage demand and call arity describe how it was called
-    -- with its old arity: "called with two arguments" of a function that
-    -- now takes one (uncurried) would let the simplifier eta-expand it,
-    -- making a partial application of a bottoming function a value (see
+    -- The binder's usage demand and call arity describe how it is called
+    -- with its old arguments; reshape them for the new ones (see
     -- Note [Usage information after a transformation])
-    `setIdDemandInfo` topDmd
-    `setIdCallArity` 0
+    `setIdDemandInfo` reshapeUsage fates (idDemandInfo b)
+    `setIdCallArity` reshapeCallArity fates (idCallArity b)
   where
     b' = setIdType b new_ty
     fix_join b'' = case idJoinPointHood b of
@@ -216,18 +266,26 @@ fixBinderInfo b new_ty new_arity fates
 Demand analysis records on a binder how it is used (idDemandInfo, e.g.
 LC(S,C(1,L)): called with two arguments), and Call Arity records how many
 arguments it is always called with.  The simplifier eta-expands a binder up
-to that many arguments.  After a transformation changes the binder's type,
-both are stale.  In the early run (a simplifier runs afterwards) this
-was a miscompilation: uncurrying
+to that many arguments.  After a transformation changes the binder's
+arguments, both must be reshaped like its demand signature: a deleted
+argument removes a call (its cardinality multiplies into the next one), and
+two merged arguments make one call.
 
-    applyToN :: Int -> Tricky -> Tricky      -- Tricky = (# #) -> Tricky
-into  applyToN :: (# Int, Tricky #) -> Tricky
+Both mistakes have bitten (in the early run, where the simplifier runs
+afterwards):
 
-kept the usage "called with two arguments, then the result once more", so
-the simplifier eta-expanded the uncurried applyToN to arity two, and
-applyToN (# n, t #), which must diverge, became a value
-(testsuite: codeGen/should_run/T24295b, with -fpedantic-bottoms).
-fixBinderInfo resets both.
+  * Keeping the old usage: uncurrying
+        applyToN :: Int -> Tricky -> Tricky      -- Tricky = (# #) -> Tricky
+    into  applyToN :: (# Int, Tricky #) -> Tricky
+    kept "called with two arguments, then the result once more", so the
+    simplifier eta-expanded the uncurried applyToN once too often, and
+    applyToN (# n, t #), which must diverge, became a value
+    (codeGen/should_run/T24295b, with -fpedantic-bottoms; webs008).
+  * Zapping it: after constant propagation and dead-parameter elimination
+    deleted a parameter of a loop, the simplifier no longer knew that the
+    loop is always called with one more argument, did not eta-expand it,
+    and the loop allocated a closure per iteration (nofib real/eff/CS: 4x
+    the allocation).
 -}
 
 {- Note [Unfoldings and rules after a transformation]

@@ -2,6 +2,8 @@
 -- run must reset the usage demand of the uncurried function, or the
 -- simplifier eta-expands it and a diverging partial application becomes a
 -- value (Note [Usage information after a transformation]).  Prints nothing.
+-- The early run does not uncurry at present (Note [No early uncurrying]), so
+-- this test guards against turning it back on without that fix.
 {-# LANGUAGE GHC2021, UnboxedTuples #-}
 module Main (main) where
 

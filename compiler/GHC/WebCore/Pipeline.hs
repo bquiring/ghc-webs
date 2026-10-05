@@ -237,6 +237,8 @@ runTransforms early logger dflags cfg sigs binds0
         , \us done b -> strictnessRound us exposed done b ) ]
 
     step (binds, changed) (flag, name, dump_flag, do_round)
+      | early, flag == Opt_CoreWebsUncurry
+      = return (binds, changed)   -- See Note [No early uncurrying]
       | gopt flag dflags
       = do { (binds', changed') <- runTransform name dump_flag do_round
                                                 logger dflags cfg sigs binds
@@ -415,9 +417,20 @@ worker/wrapper, and the simplifier runs after it, see their result.  The
 experiment (WEBS-EXPERIMENTS.md) asks whether they then have less to do.
 
 Earlier versions ran before the main simplifier, with only syntactic
-strictness (isStrictIn) and without uncurrying (which, before demand
-analysis, lost call-by-value for strict arguments: simplCore/should_run/
-T10830 overflowed its stack).
+strictness (isStrictIn).
+
+Note [No early uncurrying]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+The early run does not uncurry.  Worker/wrapper runs after it, and does not
+unbox the components of an unboxed-tuple argument.  So after uncurrying
+
+    make :: Int -> Int -> Tree      into      make :: (# Int, Int #) -> Tree
+
+worker/wrapper no longer turns make into $wmake :: Int# -> Int# -> Tree, and
+every call boxes its Ints: shootout/binary-trees allocated 2.2x as much.
+(Before demand analysis, uncurrying also lost call-by-value for strict
+arguments: simplCore/should_run/T10830 overflowed its stack.)  Uncurrying
+belongs after worker/wrapper: the late run (-fcore-webs).
 
 The simplifier runs afterwards, so INLINE and INLINABLE functions, whose
 stable unfoldings it relies on, are treated as interface Ids

@@ -14,6 +14,7 @@ import GHC.Core
 import GHC.Core.Coercion
 import GHC.Core.DataCon ( dataConWorkId )
 import GHC.Core.TyCo.Rep
+
 import GHC.Core.Type
 import GHC.Core.Utils ( exprType, exprOkForSpeculation )
 
@@ -35,7 +36,7 @@ import GHC.Data.Pair
 import GHC.Utils.Outputable
 
 import GHC.WebCore.Traverse ( stripWebForms, typeWebs )
-import GHC.WebCore.Transform.Common ( UnfoldingPolicy, changedBinders, fixUnfolding
+import GHC.WebCore.Transform.Common ( UnfoldingPolicy(..), changedBinders, fixUnfolding
                                     , fixBinderInfo, ArgFate(..), argFates )
 
 import Data.List ( sortOn )
@@ -78,13 +79,24 @@ handled as in Note [Unfoldings and rules after a transformation] in
 GHC.WebCore.Transform.Common.
 -}
 
+{- Note [Early dead parameters]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the early run (-fcore-webs-early), a dead parameter that is a function's
+last one is turned into (# #), not deleted.  Deleting it turns the function
+into a plain value (\_ -> e  becomes  e), and the passes that run afterwards
+(SpecConstr, eta-expansion in the simplifier) rely on the lambda.  In nofib
+real/eff/CS, constant propagation made the argument of a continuation
+\a s -> (a, s) constant, deleting it left a value of type Integer -> ...,
+and the state loop around it was no longer eta-expanded: 4x the allocation.
+-}
+
 ------------------------------------------------------------------
 --      Verdicts
 ------------------------------------------------------------------
 
 data Verdict = Delete | Unit UnitReason | Reject RejectReason
 
-data UnitReason = UnitForced | UnitTypeArg | UnitUnliftedResult
+data UnitReason = UnitForced | UnitTypeArg | UnitUnliftedResult | UnitLastArg
 
 data RejectReason = RejectExposed | RejectUsed | RejectCoVar
                   | RejectCoercion | RejectEffectfulTuple
@@ -98,6 +110,7 @@ instance Outputable UnitReason where
   ppr UnitForced         = text "forced"
   ppr UnitTypeArg        = text "in type argument"
   ppr UnitUnliftedResult = text "unlifted result"
+  ppr UnitLastArg        = text "last argument, early"
 
 instance Outputable RejectReason where
   ppr RejectExposed        = text "exposed"
@@ -130,10 +143,12 @@ data WebInfo = WI
                                -- is not definitely lifted
   , wi_coercion      :: Bool   -- Appears in a coercion we can't rewrite
   , wi_eff_tuple     :: Bool   -- An effectful unboxed-tuple argument
+  , wi_last_arg      :: Bool   -- Some arrow's result is not a function:
+                               -- deleting would leave no lambda
   }
 
 noInfo :: WebInfo
-noInfo = WI [] False False False False False False False False
+noInfo = WI [] False False False False False False False False False
 
 plusInfo :: WebInfo -> WebInfo -> WebInfo
 plusInfo a b = WI { wi_lams         = wi_lams a ++ wi_lams b
@@ -144,7 +159,8 @@ plusInfo a b = WI { wi_lams         = wi_lams a ++ wi_lams b
                   , wi_type_arg     = wi_type_arg a     || wi_type_arg b
                   , wi_unlifted_res = wi_unlifted_res a || wi_unlifted_res b
                   , wi_coercion     = wi_coercion a     || wi_coercion b
-                  , wi_eff_tuple    = wi_eff_tuple a    || wi_eff_tuple b }
+                  , wi_eff_tuple    = wi_eff_tuple a    || wi_eff_tuple b
+                  , wi_last_arg     = wi_last_arg a     || wi_last_arg b }
 
 type Infos = UniqFM WebId WebInfo
 
@@ -228,8 +244,10 @@ analyse binds = foldr go_top_bind emptyUFM binds
     go_ty ty acc = case ty of
       FunTy { ft_web = w, ft_arg = a, ft_res = r }
         -> let acc' = go_ty a (go_ty r acc)
-           in if definitelyLiftedType r then acc'
-              else note w (noInfo { wi_unlifted_res = True }) acc'
+               last_arg = not (isFunTy (coreFullView r))
+           in if definitelyLiftedType r
+              then (if last_arg then note w (noInfo { wi_last_arg = True }) acc' else acc')
+              else note w (noInfo { wi_unlifted_res = True, wi_last_arg = last_arg }) acc'
       TyConApp _ tys -> foldr go_ty acc tys
       AppTy t1 t2    -> go_ty t1 (go_ty t2 acc)
       ForAllTy _ t   -> go_ty t acc
@@ -290,8 +308,8 @@ needsEval :: CoreExpr -> Bool
 needsEval a = mightBeUnliftedType (exprType a)
            && not (exprOkForSpeculation (stripWebForms a))
 
-verdict :: WebSet -> WebId -> WebInfo -> Verdict
-verdict exposed w i
+verdict :: Bool -> WebSet -> WebId -> WebInfo -> Verdict
+verdict early exposed w i
   | w `elementOfUniqSet` exposed = Reject RejectExposed
   | wi_covar i                   = Reject RejectCoVar
   | wi_used i                    = Reject RejectUsed
@@ -301,6 +319,7 @@ verdict exposed w i
   | wi_forced i                  = Unit UnitForced
   | wi_type_arg i                = Unit UnitTypeArg
   | wi_unlifted_res i            = Unit UnitUnliftedResult
+  | early, wi_last_arg i         = Unit UnitLastArg   -- Note [Early dead parameters]
   | otherwise                    = Delete
 
 ------------------------------------------------------------------
@@ -326,7 +345,7 @@ deadParamsRound us exposed pol done binds
                 , verdicts )
   where
     infos    = analyse binds
-    verdicts = [ (w, verdict exposed w i, wi_lams i)
+    verdicts = [ (w, verdict (up_early pol) exposed w i, wi_lams i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , let w = mkWebId u
                , not (null (wi_lams i))

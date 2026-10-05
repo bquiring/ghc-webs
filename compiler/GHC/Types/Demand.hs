@@ -18,7 +18,7 @@ module GHC.Types.Demand (
     Boxity(..),
     Card(C_00, C_01, C_0N, C_10, C_11, C_1N), CardNonAbs, CardNonOnce,
     Demand(AbsDmd, BotDmd, (:*)),
-    SubDemand(Prod, Poly), mkProd, viewProd,
+    SubDemand(Prod, Poly), mkProd, viewProd, mkCall, viewCall,
     -- ** Algebra
     absDmd, topDmd, botDmd, seqDmd, topSubDmd,
     -- *** Least upper bound

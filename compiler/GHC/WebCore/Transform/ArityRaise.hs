@@ -43,6 +43,19 @@ import GHC.WebCore.Transform.Common
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe, isJust )
 
+{- Note [Early arity raising]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the early run (-fcore-webs-early), worker/wrapper runs after the web
+pipeline.  For a known function it does what arity raising does, and more:
+it unboxes a strict product argument into its fields, and then the fields
+themselves (an Int into an Int#).  It does not unbox the components of an
+unboxed-tuple argument, so once a web is raised, its components stay boxed.
+So the early run raises only webs with an unknown call, which worker/wrapper
+cannot help; a web whose calls are all known is left to worker/wrapper.
+(Raising them all doubled the allocation of nofib spectral/dom-lt and
+spectral/mate.)
+-}
+
 {- Note [Arity raising]
 ~~~~~~~~~~~~~~~~~~~~~~~
 A web w whose arrows all take a product (a single-constructor data type
@@ -65,6 +78,8 @@ Laziness (WEBS-ARITY-RAISING.md §2): the caller now evaluates the argument,
 so every lambda of the web must be strict in it (its demand, from the demand
 analysis that runs just before the web pipeline, is strict).  A lambda that
 is lazy, or strict only on some paths, rejects the web.  So does a lambda
+that uses the product other than by taking it apart (Note
+[Early arity raising]): it would have to rebuild it.  So does a lambda
 whose body is another lambda (unless it is a join point's): the demand on its
 argument describes full applications, but a partial application  f undefined
 is a value that never forces the argument, and raising would force it at the
@@ -80,6 +95,7 @@ coercion we cannot rewrite.
 data Verdict = Raised | Rejected Reason
 
 data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
+            | KnownCalls | BoxNeeded
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
@@ -93,6 +109,8 @@ instance Outputable Reason where
   ppr RepPoly    = text "representation-polymorphic component"
   ppr Coercion'  = text "complex coercion"
   ppr CoVarParam = text "coercion parameter"
+  ppr KnownCalls = text "only known calls (early: left to worker/wrapper)"
+  ppr BoxNeeded  = text "the product is used boxed"
 
 -- | The product types we raise: boxed, single-constructor data types without
 -- existentials or constraints, that are not classes
@@ -133,10 +151,12 @@ data Info = Info
   , i_not_prod  :: Bool
   , i_tycons    :: [TyCon]
   , i_rep_poly  :: Bool
-  , i_coercion  :: Bool }
+  , i_coercion  :: Bool
+  , i_unknown   :: Bool    -- Some call of the web is not a known call
+  , i_boxed     :: Bool }  -- Some lambda needs its parameter boxed
 
 noInfo :: Info
-noInfo = Info [] False False False False [] False False
+noInfo = Info [] False False False False [] False False False False
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
@@ -146,7 +166,9 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_not_prod = i_not_prod a || i_not_prod b
                     , i_tycons   = i_tycons a ++ i_tycons b
                     , i_rep_poly = i_rep_poly a || i_rep_poly b
-                    , i_coercion = i_coercion a || i_coercion b }
+                    , i_coercion = i_coercion a || i_coercion b
+                    , i_unknown  = i_unknown a  || i_unknown b
+                    , i_boxed    = i_boxed a    || i_boxed b }
 
 type Infos = UniqFM WebId Info
 
@@ -181,7 +203,8 @@ analyse binds = foldr go_bind emptyUFM binds
         note w (noInfo { i_lams    = [p]
                        , i_lazy    = not (isStrictIn p e)
                        , i_curried = can_be_partial && is_lam e
-                       , i_covar   = isCoVar p }) acc
+                       , i_covar   = isCoVar p
+                       , i_boxed   = not (onlyScrutinised p e) }) acc
 
     is_lam (Tick _ e)     = is_lam e
     is_lam (Lam {})       = True
@@ -193,7 +216,9 @@ analyse binds = foldr go_bind emptyUFM binds
     go (Lit {}) acc = acc
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
-    go (WebApp _ f a) acc = go f (go a acc)
+    go (WebApp w f a) acc
+      | knownHead f = go f (go a acc)
+      | otherwise   = note w (noInfo { i_unknown = True }) (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc = go_lam True w p e (go e acc)
     go (Let bind body) acc = go_bind bind (go body acc)
@@ -245,6 +270,43 @@ analyse binds = foldr go_bind emptyUFM binds
       SubCo c                -> go_co c acc
       _                      -> acc   -- complexCoWebs deals with the others
 
+-- | Does the body use p only as the scrutinee of a case?  Otherwise the
+-- raised lambda must rebuild the product (let p = K xs), which allocates it
+-- at every call: in nofib spectral/dom-lt, a 46-field state record passed
+-- to a continuation was rebuilt on every call, doubling the allocation.
+-- Worker/wrapper's boxity analysis avoids the same trap.
+onlyScrutinised :: Id -> CoreExpr -> Bool
+onlyScrutinised p = go
+  where
+    go expr = case expr of
+      Var v             -> v /= p
+      Lit {}            -> True
+      App f a           -> go f && go a
+      WebApp _ f a      -> go f && go a
+      Lam _ e           -> go e
+      WebLam _ _ e      -> go e
+      Let bind body     -> all go (rhssOfBind bind) && go body
+      Case (Var v) b _ alts
+        | v == p        -> all (\(Alt _ _ rhs) -> go rhs && not (b `elemVarSet` exprOccurrences rhs)) alts
+      Case e _ _ alts   -> go e && all (\(Alt _ _ rhs) -> go rhs) alts
+      Cast e _          -> go e
+      Tick t e          -> go e && not (tick_mentions t)
+      Type {}           -> True
+      Coercion {}       -> True
+
+    tick_mentions (Breakpoint { breakpointFVs = ids }) = p `elem` ids
+    tick_mentions _ = False
+
+-- | Is the function of a call (the head of the spine) a known function: a
+-- variable with an arity, or a join point?
+knownHead :: CoreExpr -> Bool
+knownHead e = case e of
+  App f _      -> knownHead f
+  WebApp _ f _ -> knownHead f
+  Tick _ f     -> knownHead f
+  Var v        -> isJoinId v || idArity v > 0
+  _            -> False
+
 -- | Split the coercion between two product types into the coercions between
 -- their type arguments: a Refl, or a TyConAppCo of the product type
 splitArgCo :: Coercion -> Maybe (TyCon, [Coercion])
@@ -257,9 +319,10 @@ splitArgCo co = case co of
          -> Just (tc, zipWith mkReflCo (tyConRoleListX r tc) args)
   _ -> Nothing
 
-verdict :: WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict exposed complex w i
+verdict :: Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict early exposed complex w i
   | w `elementOfUniqSet` exposed = Rejected Exposed
+  | early, not (i_unknown i)     = Rejected KnownCalls   -- Note [Early arity raising]
   | i_covar i                    = Rejected CoVarParam
   | w `elementOfUniqSet` complex = Rejected Coercion'
   | i_coercion i                 = Rejected Coercion'
@@ -268,6 +331,7 @@ verdict exposed complex w i
   | i_rep_poly i                 = Rejected RepPoly
   | i_lazy i                     = Rejected Lazy
   | i_curried i                  = Rejected Curried
+  | i_boxed i                    = Rejected BoxNeeded
   | otherwise                    = Raised
   where
     same_tycon (tc:tcs) = all (== tc) tcs
@@ -292,7 +356,7 @@ arityRaiseRound us exposed pol done binds
   where
     infos   = analyse binds
     complex = complexCoWebs binds
-    verdicts = [ (w, verdict exposed complex w i, i)
+    verdicts = [ (w, verdict (up_early pol) exposed complex w i, i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , let w = mkWebId u
                , not (null (i_lams i))
