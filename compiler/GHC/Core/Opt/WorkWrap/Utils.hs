@@ -154,7 +154,13 @@ data WwOpts
   , -- | -fpedantic-bottoms: never make a function-valued expression more
     -- defined.  See (LetOrCase) in Note [Worker/wrapper for function results]
     -- in GHC.Core.Opt.WorkWrap
-    wo_pedantic_bottoms  :: !Bool }
+    wo_pedantic_bottoms  :: !Bool
+  , -- | Options for the demand analysis of returned and passed lambdas
+    -- (-fdicts-strict, -fdmd-unbox-width, -fmax-worker-args).
+    -- See (Demands) in Note [Worker/wrapper for function results]
+    wo_dicts_strict      :: !Bool
+  , wo_dmd_unbox_width   :: !Int
+  , wo_max_worker_args   :: !Int }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args

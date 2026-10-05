@@ -20,4 +20,7 @@ initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
   , wo_unlift_strict     = gopt Opt_WorkerWrapperUnlift dflags
   , wo_fun_results       = gopt Opt_WorkerWrapperFunResults dflags
   , wo_pedantic_bottoms  = gopt Opt_PedanticBottoms dflags
+  , wo_dicts_strict      = gopt Opt_DictsStrict dflags
+  , wo_dmd_unbox_width   = dmdUnboxWidth dflags
+  , wo_max_worker_args   = maxWorkerArgs dflags
   }

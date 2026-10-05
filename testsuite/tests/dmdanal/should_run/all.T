@@ -92,3 +92,10 @@ test('wwlarge001', [extra_files(['WWLarge1A.hs'])], multimod_compile_and_run,
      ['wwlarge001', '-O -fworker-wrapper-function-results'])
 test('wwlarge002', [extra_files(['WWLarge2A.hs'])], multimod_compile_and_run,
      ['wwlarge002', '-O -fworker-wrapper-function-results'])
+
+# Through newtypes (casts in tail position; see (Casts) in Note
+# [Worker/wrapper for function results]):
+#   wwcast001: a state-like newtype over a function: split, state unboxed
+#   wwcast002: laziness and divergence through a newtype (-fpedantic-bottoms)
+test('wwcast001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+test('wwcast002', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])

@@ -22,6 +22,32 @@ def benchmarks(config):
     for dirpath, _, files in os.walk(d):
         yield os.path.relpath(dirpath, d), [os.path.join(dirpath, f) for f in files]
 
+def ho_rejects(config):
+    """phase -> reason -> count, summed over all modules"""
+    res = collections.defaultdict(collections.Counter)
+    for bench, files in benchmarks(config):
+        for f in files:
+            if not f.endswith('.dump-ww-ho-stats'):
+                continue
+            for line in open(f, errors='replace'):
+                m = re.match(r'ww-ho-reject (\S+) (\d+) (.*)', line.strip())
+                if m:
+                    res[m.group(1)][m.group(3)] += int(m.group(2))
+    return res
+
+def ho_splits(config, phase):
+    """the functions split at a point: (benchmark, line)"""
+    out = []
+    for bench, files in benchmarks(config):
+        for f in files:
+            if not f.endswith('.dump-ww-ho-stats'):
+                continue
+            for line in open(f, errors='replace'):
+                m = re.match(r'ww-ho-split (\S+) (.*)', line.strip())
+                if m and m.group(1) == phase:
+                    out.append((bench, m.group(2)))
+    return sorted(out)
+
 def ho_stats(config):
     """bench -> phase -> field -> count"""
     res = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
@@ -124,6 +150,18 @@ def main(configs):
     print('|---' * (len(FIELDS) + 1) + '|')
     for p in PHASES:
         print('| %s | ' % p + ' | '.join(str(tot[p][f]) for f in FIELDS) + ' |')
+    print()
+    rej = ho_rejects(c0)
+    print('## Why functions are not split (functions returning (r:) or taking (a:) a function)\n')
+    print('| reason | ' + ' | '.join(PHASES) + ' |')
+    print('|---' * (len(PHASES) + 1) + '|')
+    reasons = sorted(set(r for p in PHASES for r in rej[p]), key=lambda r: -rej['pre-ww'][r])
+    for r in reasons:
+        print('| %s | ' % r + ' | '.join(str(rej[p][r]) for p in PHASES) + ' |')
+    print()
+    print('## Functions split at pre-ww\n')
+    for bench, line in ho_splits(c0, 'pre-ww'):
+        print('- %s: %s' % (bench, line))
     print()
     print('## Per benchmark (benchmarks with any split, early / pre-ww / final)\n')
     print('| benchmark | res_splits | res_deep | arg_splits | arg_nested |')

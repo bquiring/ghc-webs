@@ -1,5 +1,5 @@
 $w$wh
-h = \ a a1 -> let { wf = $w$wh (\ c -> a (\ fa _ -> c fa)) a1 } in \ fr _ -> wf fr
-      let { wf = $w$wh (\ c -> case c n of { I# x -> case c main20 of { I# y -> I# (+# x y) } }) n } in
-main13 = \ c -> c main14
-main11 = $w$wh main13 main12
+h = \ a a1 -> let { wf = $w$wh (\ c -> a (\ fa _ -> case fa of { I# ww -> c ww })) a1 } in \ fr _ -> case fr of { I# ww -> wf ww }
+      let { wf = $w$wh (\ c -> case n of { I# ww -> case c ww of { I# x -> case c 1# of { I# y -> I# (+# x y) } } }) n } in
+main12 = \ c -> c 2#
+main10 = $w$wh main12 main11

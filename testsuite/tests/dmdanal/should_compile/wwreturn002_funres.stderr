@@ -1,6 +1,2 @@
       let { wf = $wg n } in
-      case wf a of { I# x ->
-      case wf b of { I# y ->
       let { wf1 = $wg m } in
-      case wf1 a of { I# y1 ->
-      case wf1 b of { I# y2 -> +# (+# (+# x y) y1) y2 }
