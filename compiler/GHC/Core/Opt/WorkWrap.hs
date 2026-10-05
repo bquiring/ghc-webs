@@ -37,6 +37,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Monad
 import GHC.Core.DataCon
+import Data.Maybe ( isJust )
 import GHC.Core.Make ( mkWildValBinder )
 import GHC.Core.Opt.Arity ( exprIsDeadEnd )
 import GHC.Types.Var.Env
@@ -877,6 +878,15 @@ eta-expands g instead (Note [Eta expansion based on demand]); that is
 better than a split, since no closure is built at all.  So we do not split
 then.  (dmdanal/should_compile/T18894b checks that eta-expansion.)
 
+(Small) A function small enough to be inlined whole (certainlyWillInline)
+is not split, as for the ordinary split (Note [Don't w/w inline small
+non-loop-breaker things]).  Inlined, its returned lambda meets the call's
+arguments directly; split, the call would go through the worker, which
+builds the returned closure at every call.  (A derived Eq method that builds
+a dictionary and returns the comparison was split, and every comparison in
+the importing module then allocated a dictionary and a closure, where
+before the method was inlined: simplCore/should_compile/T16038.)
+
 (BoringOk) The wrapper is inlined even in a boring context.  The typical use
 is a shared partial application,  let h = g n in ... h a b ... h b a,  and
 h = g n  is a boring context.  Inlined there,
@@ -894,6 +904,8 @@ splitFunResult ww_opts fn_id rhs
   | isJoinId fn_id                                   = return Nothing
   | isStableUnfolding (realUnfoldingInfo fn_info)    = return Nothing
   | not (null (ruleInfoRules (ruleInfo fn_info)))    = return Nothing
+    -- See (Small) in Note [Worker/wrapper for function results]
+  | isJust (certainlyWillInline uf_opts fn_info rhs)  = return Nothing
   | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
   , Just tails <- collectTails emptyVarEnv body
   , t0 : ts <- [ t | t <- tails, not (isDeadTail t) ]
@@ -950,6 +962,7 @@ splitFunResult ww_opts fn_id rhs
     fn_info    = idInfo fn_id
     ww_arity   = workWrapArity fn_id rhs
     simpl_opts = wo_simple_opts ww_opts
+    uf_opts    = so_uf_opts simpl_opts
     work_prag  = (inlinePragInfo fn_info) { inl_rule = FunLike }
 
 -- | Is every partial application of a function of the given arity called

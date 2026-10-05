@@ -261,12 +261,16 @@ Results:
 - `wwfunres001`–`004` (dmdanal/should_run): divergence, sharing, a lazy
   argument, escaping partial applications. `wwfunres001` was
   mutation-checked: with `let` instead of `case` in the wrapper, it fails.
+- **Small functions are not split:** a function small enough to be inlined
+  whole (`certainlyWillInline`) is left alone, as in the ordinary split. A
+  derived `Eq` method that builds a dictionary and returns the comparison
+  used to be split, and every comparison in the importing module then
+  allocated a dictionary and a closure, where before the method was inlined
+  (`T16038`'s output changed).
 - With the flag on everywhere, the smoke suite (about 3,000 tests across
   dmdanal, cpranal, simplCore, typecheck, codeGen, programs, th, ...) has no
-  Lint errors or wrong results. One expected-output change: `T16038`, where
-  a derived `Eq` method that builds a dictionary before returning its
-  function is now split, so `$fEqHsExpr` leaves the recursive group. It needs
-  a look at what #16038 guards before deciding.
+  Lint errors, wrong results, or changed expected output (other than
+  `wwreturn002`/`003`, which record the flag-off output).
 
 ## 7. Order of work
 
