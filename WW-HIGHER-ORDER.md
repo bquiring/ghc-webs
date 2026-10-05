@@ -375,6 +375,29 @@ would show which matter):
 - for arguments, the parameter must be only called and only given local
   functions.
 
+### Second run: with casts, analysed demands and rejection reasons
+
+Splits: 9 early, 7 pre-ww, 10 final (`returns_fun` now also counts newtypes
+over functions: 477 / 367 / 412). Performance is still unchanged (program
+allocation +0.00%, code +0.07%). Why functions are not split, at pre-ww:
+
+| reason | functions |
+|---|---|
+| argument: the function has type parameters | 252 |
+| argument: small (inlined whole) | 174 |
+| argument: the parameter is not only called | 113 |
+| result: a tail is a call | 83 |
+| result: nothing to gain | 80 |
+| result: a tail is a local variable | 79 |
+| result: small | 70 |
+| argument: not given known functions | 65 |
+| result: a tail is a cast it cannot look through | 3 |
+
+Casts and demands were not the obstacle: casts improve 3 functions at most,
+and the analysed demands make existing splits better (strict arguments
+unboxed) rather than more frequent. The large pools are polymorphic
+functions (argument split) and tails that are calls (result split).
+
 ## 8. Order of work
 
 1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.
