@@ -398,6 +398,53 @@ and the analysed demands make existing splits better (strict arguments
 unboxed) rather than more frequent. The large pools are polymorphic
 functions (argument split) and tails that are calls (result split).
 
+### Third run: with type parameters and calls of split functions
+
+Commit `0329c549ca` (plus `b1d3210493`, which fixed a loop in the
+statistics that made `real/symalg` time out in both configurations; symalg
+was then rebuilt and rerun alone and spliced into the logs).
+
+| point  | function bindings | return a function | take a function | result splits | argument splits |
+|--------|------------------:|------------------:|----------------:|--------------:|----------------:|
+| early  |             7,567 |               477 |             626 |             9 |               1 |
+| pre-ww |             8,947 |               367 |             632 |             7 |               1 |
+| final  |            10,770 |               412 |             768 |            10 |               0 |
+
+- **The first argument split in nofib:** `StateX.thenSX` in `real/infer`
+  (a state-monad bind, with a nested conversion of depth 2).
+- **Result splits did not change** (9 / 7 / 10). Expanding calls of
+  result-split functions finds nothing new: the tails that are calls call
+  functions that are not themselves split.
+- **Type parameters were the gate, not the obstacle.** The 252 functions
+  rejected for type parameters now reach the later checks, and most fail
+  them there:
+
+| reason at pre-ww                           | second run | third run |
+|--------------------------------------------|-----------:|----------:|
+| argument: the function has type parameters |        252 |         2 |
+| argument: the parameter is not only called |        113 |       270 |
+| argument: small (inlined whole)            |        174 |       174 |
+| argument: not given known functions        |         65 |       156 |
+| result: a tail is a call                   |         83 |        83 |
+| result: nothing to gain                    |         80 |        80 |
+| result: a tail is a local variable         |         79 |        79 |
+| result: small                              |         70 |        70 |
+
+  (The 2 left are type parameters *after* value parameters.)
+- **Performance is unchanged:**
+
+| measure                      | funres vs base | over |
+|------------------------------|---------------:|-----:|
+| program allocation (geomean) |         +0.00% |  113 |
+| object code (text)           |         +0.07% |  115 |
+| compiler allocation          |         +0.17% |  117 |
+
+  No benchmark's allocation changes by more than 0.5%. (An earlier version
+  of this report said +0.08% compiler allocation; that came from symalg's
+  timed-out compiles, which stopped at different points in the two
+  configurations.) Both configurations fail only on the pre-existing
+  `smallpt` and `ben-raytrace`.
+
 ## 8. Order of work
 
 1. Done: §2.1 with option 2 of §3, and §2.4 through the wrapper.

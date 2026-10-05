@@ -110,12 +110,13 @@ Notes to read: **[Worker/wrapper for function results]** (with sub-points
   - `wwreturn001-003`: GHC without the flag. These deliberately differ when
     the flag is forced on everywhere.
   - `wwreturn002_funres`, `wwreturn003_funres`, `wwfunres005`,
-    `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`.
+    `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`, and
+  `wwhostats001` (the statistics terminate on a never-called parameter).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
   `wwcast001-002`, `wwpoly001`, `wwcompose001-002`. Each output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 153 passes. A smoke suite of about 3,060 tests
+- Last results: `dmdanal` 154 passes. A smoke suite of about 3,060 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
   differences and no Core Lint errors.
 
@@ -138,32 +139,49 @@ That keeps the goldens readable; the driver compares filtered output only.
 
 ## Results so far (nofib, 115 benchmarks; `ww-bench/report-latest.md`)
 
+Third run, with type parameters and calls of split functions (details in
+`WW-HIGHER-ORDER.md` §7):
+
 |                                | early | pre-ww | final |
 |--------------------------------|------:|-------:|------:|
 | functions returning a function |   477 |    367 |   412 |
 | functions taking a function    |   626 |    632 |   768 |
 | result splits                  |     9 |      7 |    10 |
-| argument splits                |     0 |      0 |     0 |
+| argument splits                |     1 |      1 |     0 |
 
-- **Performance is unchanged:** program allocation +0.00%, code +0.07%.
-- **The splits that happen:** in `pretty`, `scs`, `hpg` and `anna`.
-- **Rejection reasons at pre-ww** (before the last commit):
-  - type parameters: 252 (now handled);
-  - small: 174;
-  - parameter not only called: 113;
-  - result tail is a call: 83 (calls of split functions now handled);
-  - nothing to gain: 80;
-  - result tail is a local variable: 79.
-- **A nofib run with the last commit (`0329c549ca`) was in progress** when
-  this was written. Check `ww-bench/run-all.log` and
-  `ww-bench/results/report.md`. Previous runs are in `ww-bench/results-run1`
-  and `results-run2`.
+- **Performance is unchanged:**
+
+| measure                      | funres vs base |
+|------------------------------|---------------:|
+| program allocation (geomean) |         +0.00% |
+| object code (text)           |         +0.07% |
+| compiler allocation          |         +0.17% |
+
+- **The splits that happen:** results in `pretty`, `scs`, `hpg`, `anna`
+  (and `fem` at final); the one argument split is `StateX.thenSX` in
+  `real/infer`.
+- **Rejection reasons at pre-ww:**
+
+| reason                                     | functions |
+|--------------------------------------------|----------:|
+| argument: the parameter is not only called |       270 |
+| argument: small (inlined whole)            |       174 |
+| argument: not given known functions        |       156 |
+| result: a tail is a call                   |        83 |
+| result: nothing to gain                    |        80 |
+| result: a tail is a local variable         |        79 |
+| result: small                              |        70 |
+
+  Handling type parameters moved 252 functions on to these later checks;
+  calls of split functions found nothing new.
+- **`real/symalg`** hit a loop in the statistics (fixed in `b1d3210493`,
+  test `wwhostats001`) and was rerun alone; the original logs are kept as
+  `ww-bench/results/*/nofib.log.orig`. Previous runs are in
+  `ww-bench/results-run1` and `results-run2`.
 
 ## What is left to do
 
-1. **Read the latest nofib report.** Did type parameters and call composition
-   raise the counts? Then copy it to `ww-bench/report-latest.md`, add it to
-   `WW-HIGHER-ORDER.md` §7, commit and push.
+1. **Push** the commits after `5d4c77536d` when the user asks.
 2. **Remaining big rejection pools:**
    - "parameter not only called": includes recursive functions passing the
      parameter on (`wwhoarg008`). The recursive call could pass the
