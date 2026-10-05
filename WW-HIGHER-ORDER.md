@@ -1,0 +1,246 @@
+# Design: Higher-Order Worker/Wrapper for GHC
+
+Status: design (branch `ww-higher-order`, from `master`). It is independent
+of the webs: it is an extension of GHC's
+own demand analysis and worker/wrapper (`GHC.Core.Opt.DmdAnal`,
+`GHC.Core.Opt.WorkWrap`, `GHC.Core.Opt.WorkWrap.Utils`). It is based on the
+examples in `WORKING-THE-WORKER-WRAPPER.md`.
+
+## 1. The problem, in GHC today
+
+Worker/wrapper splits a function according to its demand signature, and the
+signature covers only the function's arity (Note [Demand signatures are
+computed for a threshold arity]). A function that **returns** a function,
+**takes** one, or **stores** one in a data structure has a second function
+inside its type whose arguments worker/wrapper cannot see. That second
+function may have dead or strict arguments, or arguments worth unboxing.
+
+GHC's existing answer is eta-expansion. If
+
+```haskell
+g n = let f x y = e in f          -- y dead in e
+```
+
+can be eta-expanded to `g n x y = e`, the ordinary worker/wrapper drops `y`.
+Eta-expansion is not possible when `g` does work before returning the
+function and the partial application `g n` is shared:
+
+```haskell
+g n = let k = expensive n
+          f x y = e[k, x]         -- y dead
+      in f
+run n a b = let h = g n in h a b + h b a      -- k computed once per h
+```
+
+Eta-expanding `g` would recompute `k` at every call of `h`. Then what GHC
+does depends on whether `f` is still `let`-bound when worker/wrapper runs
+(it runs late, after the main simplifier and demand analysis). The tests
+in `testsuite/tests/dmdanal/should_compile` record each case:
+
+| shape | GHC today | test |
+|---|---|---|
+| `g` cheap, inlinable | inlines `g`, copies `f`'s body to every call | `wwreturn001` |
+| `f` used once (`let f = .. in f`) | the binding is inlined before worker/wrapper runs; `g` returns `\x _ -> e`; no split at all; calls pass `y` and boxed `x` | `wwreturn002` |
+| `f` large, used more than once | `f` is split into `$wf` and a wrapper, and `g` returns the wrapper `\x _ -> case x of I# x# -> $wf x#`; every call of `h` is an unknown call of that wrapper, passing `y` and boxed `x` | `wwreturn003` |
+
+The cost in all three: an unknown call of a closure that takes a dead
+argument and boxed values, while a worker exists, or could, that takes
+neither.
+
+## 2. The idea: split the outer function through the inner one
+
+In each case, split the *outer* function so that the inner function's
+worker crosses the boundary instead of its wrapper. Every split is a
+worker/wrapper pair. It is correct when `wrap . unwrap = id` and the two are
+closed, in the sense of `WEBS-WW.md`: `unwrap` is evaluated where the
+function is defined, `wrap` where it is used.
+
+### 2.1 Returned functions (the main case)
+
+```haskell
+g n = let k = expensive n in \x y -> e[k, x]              -- y dead, x strict
+
+==>
+$wg n = let k = expensive n in \x# -> e[k, I# x#]        -- worker returns f's worker
+g n   = case $wg n of f' -> \x y -> case x of I# x# -> f' x#   -- wrapper, INLINE
+```
+
+At a saturated call, the wrapper inlines, and
+`g n a b = case $wg n of f' -> case a of I# a# -> f' a#`: no dead argument,
+no boxing.
+
+For a shared partial application,
+`h = g n = case $wg n of f' -> \x y -> ...`. `k` is still computed once per
+`h`, because `$wg n` is evaluated once, when `h` is forced. But the calls
+`h a b` are still unknown calls of the wrapper lambda. To reach the worker
+there, the binding must be split as well (§2.4).
+
+**Soundness.**
+- **Divergence.** The wrapper uses `case $wg n of f'`, not `let`. So
+  `g n` diverges exactly when `$wg n` does, which is exactly when the
+  original `g n` did: the bodies differ only in the lambda they return.
+  With `let`, `g n` would always be a lambda, which is more defined.
+- **The identity.** `wrap (unwrap f) = \x y -> case x of I# x# -> f (I# x#) ⊥`
+  equals `f` when `f` ignores `y`, is strict in `x`, and is a lambda of
+  arity at least 2 that does no work between its lambdas. That is what the
+  analysis (§3) must establish for every value `g n` can return.
+- **Sharing.** Work in `g`'s body before the returned lambda (`k`) stays in
+  `$wg n` and is shared as before. Work between the returned lambda's own
+  arguments would not be shared after the split, so the returned lambda
+  must be a manifest lambda group of the required arity.
+
+### 2.2 Function arguments
+
+```haskell
+h g = let f x y = ... in                 -- y dead
+      ... f 1 2 ... + g f                -- f used locally (big) and passed to g
+
+==> (after the ordinary split of f)
+h g = let f' x = ... in ... f' 1 ... + g (\x y -> f' x)
+
+==>
+$wh g' = let f' x = ... in ... f' 1 ... + g' f'
+h g    = $wh (\f' -> g (\x y -> f' x))       -- wrapper, INLINE
+```
+
+At a call `h (\q -> q 3 4)`, the wrapper inlines, and the argument becomes
+`\f' -> (\q -> q 3 4) (\x y -> f' x)`, which simplifies to `\f' -> f' 3`.
+The consumer now calls the worker directly. This is worker/wrapper on the
+*argument's* argument (contravariant): `$wh` passes `f'` to `g'`, and the
+wrapper adapts the caller's `g`.
+
+**Soundness.** `$wh (\f' -> g (wrapF f')) = h g`, with `wrapF f' = \x y -> f' x`,
+when every function `$wh` passes to `g'` is a worker of the shape the
+wrapper expects. That is a property of `h`'s body (it passes only `f'`),
+established by analysis. The adapter is closed; it mentions only its own
+binders.
+
+### 2.3 Data structures
+
+```haskell
+g n lst = let f x y = e in f : lst                     -- y dead
+... foldr g [] xs ...
+
+==>
+$wg n lst = let f' x = e in f' : lst                   -- a list of workers
+... map (\f' -> \x y -> f' x) (foldr $wg [] xs) ...
+```
+
+This is the same idea through a type constructor: worker/wrapper on the
+element type of a list. A `map` of the wrapper restores the original list.
+It only pays when the `map` fuses with the consumer (`foldr/build`), so that
+the consumer calls `f'` directly. This is the hardest case. It needs the
+transformation to be type-directed through the data structure, and it
+overlaps with the webs work. It comes last.
+
+### 2.4 Shared partial applications
+
+For `h = g n` used as `h a b`, the wrapper inlines to
+`h = case $wg n of f' -> \x y -> f' x#`. The calls of `h` reach the worker
+only if the binding itself is split (thunk splitting for a function-valued
+`let`):
+
+```haskell
+let h = case $wg n of f' -> \x y -> body[f']
+in ... h a b ...
+
+==>
+let h' = $wg n                      -- the worker closure, shared
+in ... (case h' of f' -> body[f']) a b ...      -- then beta: case h' of f' -> f' a#
+```
+
+This is valid when `h` is only ever *called* (its usage demand is a call
+demand). Then evaluating `h'` at each call is the same as evaluating `h`
+once, because `h'` is shared. Demand analysis knows the usage: `h` above has
+usage `C(1,C(1,L))`. If `h` is `seq`ed or escapes, keep it.
+
+## 3. The analysis
+
+For §2.1 we need, for a binder `g` of arity `n`, a **result-function
+signature**: every value its body returns after `n` arguments is a manifest
+lambda group of arity at least `k`, with argument demands `ds` (absent,
+strict, unboxable). This is to functions what CPR is to products, so call it
+"constructed lambda result". Two ways to compute it:
+
+1. **In the demand analyser.** When the body's tails, through `let`,
+   `case` and join points, are manifest lambdas, analyse them under a call
+   demand of depth `k` and record their argument demands. The demand
+   analyser already analyses a lambda body under the incoming call demand.
+   What is missing is to *record* it in `g`'s signature beyond `g`'s
+   arity. That would be a new field of `DmdSig` (a nested signature for the
+   result), analogous to nested CPR.
+2. **From the inner function's signature.** When the tail is a variable `f`
+   bound locally to a lambda (the `wwreturn003` shape), use `f`'s own demand
+   signature. The `wwreturn002` shape (the lambda inlined into the tail) needs
+   option 1.
+
+The depth `k` of the call demand to use comes from the usage: the binder's
+usage demand (idDemandInfo) says how many arguments the result is applied
+to (`h a b`: two).
+
+For §2.2: an analysis that a function parameter is applied only to
+particular known local functions (here `f`). This is a much narrower fact.
+It can be read off the body syntactically: every occurrence of `g` is
+`g f` with the same local `f`.
+
+## 4. Where it goes in GHC
+
+- **`GHC.Types.Demand`:** a result-function signature in `DmdSig` (or a
+  separate signature on the binder, like `CprSig`).
+- **`GHC.Core.Opt.DmdAnal`:** compute it (§3). Interface files must carry it
+  so that wrappers work across modules: `GHC.Iface.Syntax`,
+  `GHC.CoreToIface`, `GHC.IfaceToCore`.
+- **`GHC.Core.Opt.WorkWrap.Utils`:** `mkWwBodies` builds wrapper and worker
+  bodies from argument demands. Extend it to wrap the *result*: the worker's
+  tails become the inner lambda's worker (reusing `mkWwBodies` for the inner
+  lambda), and the wrapper's body becomes
+  `case worker args of f' -> <inner wrapper of f'>`. The CPR machinery
+  (`mkWWcpr_entry`) is the model for changing a result.
+- **`GHC.Core.Opt.WorkWrap`:** `tryWW` decides when to split. It splits when
+  the result-function signature has something to gain (an absent argument,
+  or an unboxable strict one), and the inner function would not be exposed
+  by eta-expansion anyway (the binder's arity is below the manifest arity
+  of its use).
+- **§2.4:** in the simplifier, or as a small pass after worker/wrapper:
+  a `let` whose right-hand side is `case w args of f' -> \xs -> body`, and
+  whose usage demand is a call demand, is split as above.
+- A flag, `-fworker-wrapper-function-results`, off by default until it is
+  measured.
+
+## 5. Tests
+
+- **Expected output:** `wwreturn002` and `wwreturn003`, which record GHC
+  today, change to show `$wg` returning the worker and the calls passing
+  `a#` with no dead argument. `wwreturn001` should not change (eta-expansion
+  and inlining already handle it).
+- **Laziness:**
+  1. `g n` diverges before returning its lambda; `seq (g n) ()` must still
+     diverge (checks the `case`, not `let`, in the wrapper).
+  2. `k` traced with `Debug.Trace`: one trace per partial application `h`,
+     not one per call (sharing).
+  3. The returned function is lazy in `x` on some path: no unboxing.
+  4. `h` is `seq`ed: the `let` split of §2.4 must not happen.
+- **Cross-module:** `g` exported and used from another module; its wrapper
+  must inline there, through the interface file.
+- **nofib:** allocation, the number of unknown calls left after optimisation
+  (`-ddump-first-class-stats` on the `webs` branch counts them), code size.
+
+## 6. Order of work
+
+1. §2.1 with option 2 of §3 (the inner function's existing signature):
+   smallest change, and covers `wwreturn003`.
+2. §3 option 1 (the demand analyser records the result's signature): covers
+   `wwreturn002`.
+3. §2.4 (shared partial applications): needed for the calls `h a b` to
+   benefit.
+4. §2.2 (function arguments).
+5. §2.3 (data structures), probably through fusion.
+
+## Notes on `WORKING-THE-WORKER-WRAPPER.md`
+
+- In the first example, the wrapper should be `f = fun x y -> f' x` (`f'`
+  takes only `x`). The final result passes the live arguments:
+  `((g' 1) 2) + ((g' 4) 5)`.
+- The wrapper for `g` should be `case g' n of f' -> ...`, not
+  `let f' = g' n`. With `let`, `g n` becomes a lambda even when `g'` diverges
+  before returning (§2.1).

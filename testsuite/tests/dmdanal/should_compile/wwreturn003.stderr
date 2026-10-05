@@ -1,0 +1,9 @@
+$wg
+        $wf
+          \ x _ ->
+          \ x _ ->
+            case x of { I# ww1 -> case $wf ww1 of ww2 { __DEFAULT -> I# ww2 } }
+      case h1 a b of { I# x ->
+      case h1 b a of { I# y ->
+      case h2 a b of { I# y1 ->
+      case h2 b a of { I# y2 -> +# (+# (+# x y) y1) y2 }

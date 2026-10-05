@@ -100,3 +100,19 @@ test('T23398', normal, compile, ['-dsuppress-uniques -ddump-simpl -dno-typeable-
 test('T24623', normal, compile, [''])
 test('T25196', [ req_th, collect_compiler_stats('bytes allocated', 10) ],
                multimod_compile, ['T25196', '-v0'])
+
+# Worker/wrapper for functions that return functions (WW-HIGHER-ORDER.md,
+# WORKING-THE-WORKER-WRAPPER.md).  The expected output records what GHC does
+# today, so it changes, deliberately, when higher-order worker/wrapper is
+# implemented:
+#   wwreturn001: g cheap: inlined, f's body (a call of marker) copied per call
+#   wwreturn002: f used once: inlined into g before w/w runs; g returns
+#                \x _ -> ..., and calls pass the dead argument, boxed
+#   wwreturn003: f large and used twice: f split into $wf and a wrapper, which
+#                g returns; calls of the wrapper pass the dead argument, boxed
+test('wwreturn001', [grep_errmsg(r'\$wmarker \(|^g |^\$wg ')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+test('wwreturn002', [grep_errmsg(r'\\ x _ ->|^\$wg |= g [nm] |h[12] [ab] [ab]')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12] [ab] [ab]|^\$wg$')], compile,
+     ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
