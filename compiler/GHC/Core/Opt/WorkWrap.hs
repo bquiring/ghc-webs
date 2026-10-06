@@ -16,7 +16,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Unfold.Make
-import GHC.Core.Utils  ( exprType, exprIsHNF, mkLamTypes, stripTicksTopE )
+import GHC.Core.Utils  ( exprType, exprIsHNF, mkLamTypes, stripTicksTopE, cheapEqExpr )
 import GHC.Core.Type
 import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Core.SimpleOpt
@@ -42,8 +42,10 @@ import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, catMaybes )
 import qualified Data.Map as Map
 import GHC.Core.Make ( mkWildValBinder, mkCoreUnboxedTuple )
 import GHC.Builtin.Types ( mkTupleTy, tupleDataCon )
-import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity )
+import GHC.Core.Opt.Arity ( exprIsDeadEnd, typeArity, isOneShotBndr )
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, unionVarSets, emptyVarSet )
+import GHC.Core.Ppr ( pprParendExpr )
 import GHC.Core.Opt.DmdAnal ( DmdAnalOpts(..), dmdAnalProgram )
 import GHC.Core.Coercion ( Coercion, topNormaliseNewType_maybe, mkSymCo, coercionRKind )
 import GHC.Core.TyCo.Compare ( eqType )
@@ -1348,14 +1350,15 @@ data HoStats = HoStats
   , hs_arg_nested  :: !Int   -- ^ ... of which nested (a conversion of depth > 2)
   , hs_splits      :: [SDoc] -- ^ one line per function split: its name, and how
   , hs_rejects     :: [String] -- ^ why a function returning (r) or taking (a) a function is not split
+  , hs_param_apps  :: [SDoc]   -- ^ applications of a parameter to parameters (see paramApps)
   }
 
 plusHo :: HoStats -> HoStats -> HoStats
-plusHo (HoStats a1 b1 c1 d1 e1 f1 g1 h1 i1 j1) (HoStats a2 b2 c2 d2 e2 f2 g2 h2 i2 j2)
-  = HoStats (a1+a2) (b1+b2) (c1+c2) (d1+d2) (e1+e2) (f1+f2) (g1+g2) (h1+h2) (i1 ++ i2) (j1 ++ j2)
+plusHo (HoStats a1 b1 c1 d1 e1 f1 g1 h1 i1 j1 k1) (HoStats a2 b2 c2 d2 e2 f2 g2 h2 i2 j2 k2)
+  = HoStats (a1+a2) (b1+b2) (c1+c2) (d1+d2) (e1+e2) (f1+f2) (g1+g2) (h1+h2) (i1 ++ i2) (j1 ++ j2) (k1 ++ k2)
 
 noHo :: HoStats
-noHo = HoStats 0 0 0 0 0 0 0 0 [] []
+noHo = HoStats 0 0 0 0 0 0 0 0 [] [] []
 
 sumHo :: [HoStats] -> HoStats
 sumHo = foldr plusHo noHo
@@ -1368,6 +1371,7 @@ pprHoStats phase st
       , text "res_deep=" <> int (hs_res_deep st), text "res_levels=" <> int (hs_res_levels st)
       , text "arg_splits=" <> int (hs_arg_splits st), text "arg_nested=" <> int (hs_arg_nested st) ]
     $$ vcat [ text "ww-ho-split" <+> text phase <+> d | d <- hs_splits st ]
+    $$ vcat [ text "ww-ho-papp" <+> text phase <+> d | d <- hs_param_apps st ]
     $$ vcat [ text "ww-ho-reject" <+> text phase <+> int n <+> text r
             | (r, n) <- Map.toList (Map.fromListWith (+) [ (r, 1 :: Int) | r <- hs_rejects st ]) ]
 
@@ -1382,6 +1386,19 @@ points: early (before the main simplifier), pre-ww (just before
 worker/wrapper: what the splits would do with
 -fworker-wrapper-function-results), and final.  Early and final run the
 demand analyser on a copy first, since the splits need demand information.
+
+It also lists (ww-ho-papp lines, paramApps) the applications that are
+invariant within a call of a function: an unknown function (a parameter, or
+a lambda- or case-bound variable from outside the body) applied to
+parameters, variables from outside, globals or literals.  The wrapper could
+compute such an application and pass the result to the worker; in a
+recursive function that passes them unchanged ("static"), once for the
+whole recursion.  On nofib (-O2, pre-ww) there are 211, nearly all a parser
+or state action applied to its input (computed once per call either way)
+or a continuation applied to a constant; the 9 static ones are partial
+applications of comparison or combining functions (qpart's  le x  in
+spectral/knights), which save no work, or are already specialised by
+SpecConstr (real/eff).  See PLAN.md.
 -}
 
 -- | Count the higher-order splits a program offers.
@@ -1391,6 +1408,7 @@ higherOrderStats ww_opts0 us binds
   = initUs_ us (top (ww_opts0 { wo_fun_results = True
                               , wo_call_lams = Just (callLambdas binds) }) binds)
   where
+    top_set = mkVarSet (bindersOfBinds binds)
     -- Top level, in order: like worker/wrapper, remember the function-result
     -- wrappers made so far, so that calls of them can be expanded (Calls)
     top _ [] = return noHo
@@ -1450,7 +1468,8 @@ higherOrderStats ww_opts0 us binds
                         <+> (if null arg_ns then empty else text "arguments, depths" <+> hsep (punctuate comma (map int arg_ns)))
            ; return (HoStats 1 (fromEnum res_is_fun) (fromEnum takes_fun) res deep lvls
                              (length arg_ns) (length (filter (> 2) arg_ns))
-                             [ line | res == 1 || not (null arg_ns) ] rejects) }
+                             [ line | res == 1 || not (null arg_ns) ] rejects
+                             (paramApps top_set fn_id rhs)) }
 
     -- The depths of the successive argument splits of one function
     count_args :: WwOpts -> Int -> Id -> CoreExpr -> UniqSM [Int]
@@ -1461,6 +1480,123 @@ higherOrderStats ww_opts0 us binds
                Nothing   -> return []
                Just tc@(_, conv) -> do { (work_id, work_rhs, _) <- mkFunArgPairs ww_opts fn_id rhs tc
                                        ; (cv_depth conv :) <$> count_args (inheritCallLams fn_id work_id ww_opts) (fuel - 1) work_id work_rhs } }
+
+-- | Applications that are invariant within a call of the function: the head
+-- is a parameter or a local variable in scope at the definition (not bound
+-- in the body), and every argument is one of those, a global name or a
+-- literal.  Candidates for computing the application in a wrapper and
+-- passing the result to the worker.  One line per distinct application,
+-- with
+--   n=K       its occurrences
+--   rec       the function calls itself
+--   static    ... and every self-call passes the parameters involved unchanged
+--   only      the head parameter is used nowhere else
+--   underlam  some occurrence is under a (not one-shot) lambda
+--   call/pap  as many arguments as the head's call demand (a call that does
+--             work), or fewer (a partial application); only for a parameter head
+--   prefix    some occurrence is a partial application inside a longer call
+--             whose other arguments vary (g f in  g f y)
+--   freeonly  no parameter is involved: invariant over all calls of the
+--             function, which full laziness should already float out
+-- Statistics only; see Note [Higher-order worker/wrapper statistics]
+paramApps :: VarSet -> Id -> CoreExpr -> [SDoc]
+paramApps top fn_id rhs
+  | Just (bndrs, body) <- collectNValBinders_maybe (workWrapArity fn_id rhs) rhs
+  , let params = filter isId bndrs
+  , not (null params)
+  = let pset   = mkVarSet params
+        inner  = boundIn body
+        apps   = collect pset inner False body
+        groups = foldr insert [] apps
+        insert a gs = case break (same a) gs of
+          (pre, g : post) -> pre ++ (a : g) : post
+          (_, [])         -> [a] : gs
+        same (p, vargs, _, _) ((q, ws, _, _) : _) = q == p && length vargs == length ws
+                                              && and (zipWith cheapEqExpr vargs ws)
+        same _ [] = False
+        self_calls = [ filter isValArg args | (Var f, args) <- calls body, f == fn_id ]
+        position q = lookup q (zip params [0 :: Int ..])
+        static qs = not (null self_calls) && and [ passes q vargs | vargs <- self_calls, q <- qs ]
+        passes q vargs = case position q of
+          Just i | Var q' : _ <- map strip (drop i vargs) -> q' == q
+          _                                               -> False
+        head_count p = length [ () | (q, _, _, _) <- apps, q == p ]
+        line grp@((p, vargs, _, _) : _)
+          = ppr (idName fn_id) <> colon <+> hsep (ppr p : map (pprParendExpr . strip) vargs)
+            <+> hsep (map text (
+                  [ "n=" ++ show (length grp) ]
+               ++ [ "rec"      | not (null self_calls) ]
+               ++ [ "static"   | static (p : [ q | Var q <- map strip vargs, q `elemVarSet` pset ]) ]
+               ++ [ "only"     | occs p body == head_count p ]
+               ++ [ "underlam" | or [ u | (_, _, u, _) <- grp ] ]
+               ++ [ "prefix"   | or [ x | (_, _, _, x) <- grp ] ]
+               ++ [ if length vargs < callDepth p then "pap" else "call" | p `elemVarSet` pset ]
+               ++ [ "freeonly" | not (any (`elemVarSet` pset) (p : [ q | Var q <- map strip vargs ])) ]))
+        line [] = empty
+    in map line groups
+  | otherwise = []
+  where
+    strip = stripTicksTopE (const True)
+    -- Not bound in the body: a parameter, a variable in scope at the
+    -- definition, or a global; with literals, the invariant atoms
+    invariant inner a = case strip a of
+      Var v    -> not (v `elemVarSet` inner)
+      Lit _    -> True
+      e | (Var v, targs) <- collectArgs e, all isTypeArg targs
+               -> not (v `elemVarSet` inner)
+      _        -> False
+    -- The head: an unknown function, a parameter or a lambda- or case-bound
+    -- variable from outside (arity 0, not top level); a global or let-bound
+    -- head is an ordinary known call
+    invariantHead inner v = isId v && not (isGlobalId v) && idArity v == 0
+                            && not (v `elemVarSet` top) && not (v `elemVarSet` inner)
+    -- The longest invariant prefix of an application (a partial application
+    -- inside a call, as in  g f y  with y varying), then the other arguments
+    collect pset inner under e = case e of
+      _ | (Var p, args) <- collectArgs e, invariantHead inner p
+        , let vargs = filter isValArg args
+              (pre, rest) = span (invariant inner) vargs
+        , not (null pre)
+        -> (p, pre, under, not (null rest)) : concatMap (collect pset inner under) rest
+      App {} | (f, args) <- collectArgs e -> concatMap (collect pset inner under) (f : args)
+      Lam b e'         -> collect pset inner (under || (isId b && not (isOneShotBndr b))) e'
+      Let bind b       -> concat [ collect pset inner under (if isJoinId x then snd (collectNBinders (idJoinArity x) r) else r)
+                                 | (x, r) <- flattenBinds [bind] ]
+                          ++ collect pset inner under b
+      Case sc _ _ alts -> collect pset inner under sc ++ concat [ collect pset inner under r | Alt _ _ r <- alts ]
+      Cast e' _        -> collect pset inner under e'
+      Tick _ e'        -> collect pset inner under e'
+      _                -> []
+    -- Every variable bound in an expression
+    boundIn e = case e of
+      App f a          -> boundIn f `unionVarSets2` boundIn a
+      Lam b e'         -> mkVarSet [b] `unionVarSets2` boundIn e'
+      Let bind b       -> unionVarSets (mkVarSet (bindersOf bind) : boundIn b : map boundIn (rhssOfBind bind))
+      Case sc b _ alts -> unionVarSets (mkVarSet [b] : boundIn sc
+                                        : [ mkVarSet xs `unionVarSets2` boundIn r | Alt _ xs r <- alts ])
+      Cast e' _        -> boundIn e'
+      Tick _ e'        -> boundIn e'
+      _                -> emptyVarSet
+    unionVarSets2 a b = unionVarSets [a, b]
+    -- every application (head, arguments) in an expression
+    calls e = case e of
+      App {} | (f, args) <- collectArgs e -> (f, args) : concatMap calls (f : args)
+      Lam _ b          -> calls b
+      Let bind b       -> concatMap calls (rhssOfBind bind) ++ calls b
+      Case sc _ _ alts -> calls sc ++ concat [ calls r | Alt _ _ r <- alts ]
+      Cast b _         -> calls b
+      Tick _ b         -> calls b
+      _                -> []
+    occs v e = case e of
+      Var w            -> if v == w then 1 else 0 :: Int
+      App f a          -> occs v f + occs v a
+      Lam _ b          -> occs v b
+      Let bind b       -> sum (map (occs v) (rhssOfBind bind)) + occs v b
+      Case sc _ _ alts -> occs v sc + sum [ occs v r | Alt _ _ r <- alts ]
+      Cast b _         -> occs v b
+      Tick _ b         -> occs v b
+      _                -> 0
+    callDepth p = case idDemandInfo p of _ :* sd -> length (callCards sd)
 
 -- | Why no parameter of a function that takes a function is split (coarse;
 -- for the statistics only)

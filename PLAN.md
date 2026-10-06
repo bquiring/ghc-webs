@@ -150,6 +150,33 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
   - Continuations called with data: 54 of the 154 take 2 or more arguments;
     31 have some argument constructed at every call (16 with 2 or more
     arguments). That is the pool (C) targets.
+- **Invariant applications (the user's idea: the wrapper computes `g f`
+  and the worker takes the result)**: statistic `ww-ho-papp` in
+  `-ddump-ww-ho-stats` (`paramApps`). It lists applications whose head is an
+  unknown function (a parameter, or a lambda- or case-bound variable from
+  outside the body) and whose arguments are parameters, variables from
+  outside, globals or literals; also invariant prefixes (`g f` in
+  `g f y`). Flags: static (recursive, passed unchanged), prefix, underlam,
+  only (the head is used nowhere else), call/pap, freeonly (no parameter).
+  - nofib, pre-ww (`ww-bench/results/papp`): 211 in all; 173 calls, 137
+    "only", 45 prefixes, 9 static, 7 under a lambda, 16 free-only.
+  - Nearly all are a parser or state action applied to its input
+    (`thenP`'s `xP a`, `sequence2`'s `p1 x0`, veritas's `f xin`), computed
+    once per call either way, or a continuation applied to a constant (a
+    tail call). Moving them to the wrapper saves no work; at best the
+    worker loses an argument.
+  - The 9 static ones save nothing either: partial applications of
+    comparison or combining functions (`qpart`'s `le x` in knights,
+    `segments`' `cellop In` in bspt, `f_tree_member`), a self-call through
+    a shared stream (atom), or base cases of loops SpecConstr has already
+    specialised (eff's Church-encoded state monad, whose comment asks for
+    SAT).
+  - Free-only prefixes (`iop ds` in integer, `leq y` in anna): full
+    laziness does not float partial applications; again no work, since the
+    functions have arity 2.
+  - Where it would pay (small examples): a static *full* call, as in
+    `k g c (y:ys) = g c * y + k g c ys`, recomputed at every iteration
+    today. nofib has none.
 - **Benchmark optimisation level:** every nofib run so far was at `-O2`
   (nofib's default `NoFibHcOpts`). `run-nofib.sh` / `run-all.sh` now take
   `NOFIB_OPT` (results then go to `base-O1`, `funres-O1`, `report-O1.md`);
