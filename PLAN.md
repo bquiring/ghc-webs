@@ -73,30 +73,66 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
 8. **Data structures of functions are out of scope.** They would rely on
    downstream fusion.
 
-## Current state (2026-10-05)
+## Current state (2026-10-06)
 
-- **Just implemented: (C), continuations called with constructed data**
+- **(C), continuations called with constructed data**, is implemented
   ((Constructed) in Note [Worker/wrapper for function arguments];
   `conConv`, used from `lambdaConv`'s `try_positions`). If every call of a
   function parameter `k` passes the same constructor `D e1 .. em` at some
   position (no strict fields, no existentials, not an unboxed tuple, at
   least one field), the worker passes `(# e1, .., em #)` (or `e1` alone)
-  and the wrapper's adapter rebuilds `D`. Unboxed tuples are excluded
-  because the worker's next round would otherwise convert its own
-  `(# .. #)` again (`step` was split 4 times before that rule).
-  - Tests `wwcont001`, `wwcont002` (multi-module CPS evaluator),
-    `wwcont_dump`; mutation-checked (forcing the fields makes both run
-    tests fail). `dmdanal`: 157 passes.
-  - Core for `step` in `wwcont_dump`: the worker calls `q (-# a b) (# x, y #)`
-    with no `I#` or pair allocated; a known continuation receives the
-    fields directly.
-  - Seen in `wwcont_dump`: a small worker can be inlined back into its
-    wrapper, because the wrapper passes it a lambda (an interesting
-    argument), and the adapter then cancels (`findK`). Harmless there
-    (callers inline `findK` whole), but watch for it.
-  - Smoke suite with the flag on everywhere (and Core Lint): 3,064 passes,
-    only the 2 expected `wwreturn002/003` differences. Next: measure (C)
-    on nofib.
+  and the wrapper's adapter rebuilds `D`.
+  - **Fourth nofib run (C, no consumer check; `ww-bench/results-run4`):**
+    argument splits at pre-ww went from 1 to 25 (13 in `hpg`, 3 each in
+    `fem` and `boyer`). Program allocation -0.07% (geomean), `pic` -3.9%,
+    `wave4main` -3.3%; code +0.03%, compiler allocation +0.17%.
+  - **But (C) lost in `hpg`** (+0.1% allocation, measured by hand). Reading
+    its Core: every continuation passed only stores the value
+    (`\e -> ec (Apply_exp e1 e)`) or is unknown (`eta`), so the adapter
+    rebuilds `D` and each call pays one more closure.
+  - **Fixed by (Consumed)**, in two steps:
+    - `bb84aba77b` required a consumer among the calls in the module. The
+      fifth run (`ww-bench/results-run5`) showed it too strict: argument
+      splits at pre-ww fell from 25 to 4, and `pic` lost its -3.9%
+      (allocation -0.03% geomean, only `wave4main` -3.3% left). `pic`'s
+      `applyOpToMesh` (in `Utils`) builds a list at every call of its
+      operator, and the operators taking it apart are in `Potential`.
+    - `26fa0e8d19`: the module's occurrences of the function decide. One
+      passing a consumer (a lambda or function variable with a strict,
+      unboxing demand on that argument) allows the split. If all of them
+      pass something else, are partial applications or use the function
+      as a value, it is rejected. No occurrence at all (external callers
+      only, or inlined everywhere) allows it. Collected per module by
+      `callLambdas` (`CallArg`, `wo_call_lams`); a worker split again
+      inherits them (`inheritCallLams`). Not tried below the top level.
+      New rejection reason: "constructed data, no consumer at the calls".
+    - By hand: `pic` -3.1% again, `hpg` at base (+0.0009%), `veritas`
+      unchanged. `wwcont_dump`: `storeK` not split, `findK` split.
+      `dmdanal` 157 passes; smoke suite only the 2 expected differences.
+  - **Sixth nofib run, with the revised (Consumed)** (`ww-bench/report-latest.md`):
+    allocation -0.07% again, `pic` -3.9% and `wave4main` -3.3%; see Results.
+- **Reading the optimised Core** (`hpg`, `infer`, `lift`, `anna`,
+  `veritas`, `power`, `scs`, `exact-reals`, at -O2 with the flag; method:
+  copy a benchmark to a scratch directory, `-ddump-simpl`, and compare
+  allocation with `+RTS -s` with and without the flag):
+  - The big remaining rejection pools mostly have **nothing to gain** for
+    worker/wrapper: `lift`'s "tail: local variable" and "returned" cases
+    are a difference-list pretty printer (`Iseq = Oseq -> Oseq`, returned
+    lambdas only pass their argument on); `anna`'s static-argument cases
+    are `map`/`zipWith`/`any`-like loops calling the parameter with list
+    elements.
+  - Parser combinators (`infer`'s `thenP`, `scs`'s `sequence2`; lists of
+    successes) lose to intermediate tuple lists and to `thenP` never
+    meeting its known continuation: that needs fusion or specialisation on
+    function arguments, not worker/wrapper.
+  - **(Cpr), CPR for the deepest returned lambda** (state-monad actions in
+    `veritas`, `x_set_tactic t = let g = .. in \xin -> (.., ..)`): tried and
+    **measured a loss**: veritas splits 54 functions and allocates 0.13%
+    more, because callers bind the pair with lazy patterns (it is rebuilt
+    at once) and each partial application gets one more closure. Kept as
+    commit `e5fa74a35d` on the local branch `ww-ho-cpr-experiment` (with
+    tests `wwcpr001`, `wwcpr_dump`), not on this branch. It would need a
+    consumer check like (Consumed).
 - **Analysis of the argument rejections** (base, nofib rebuilt without
   running; details in `WW-HIGHER-ORDER.md` §7, finer reasons committed in
   `fedcaa9b2e`):
@@ -125,7 +161,7 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
 Notes to read: **[Worker/wrapper for function results]** (with sub-points
 (Depth), (Casts), (Demands), (Calls), (LetOrCase), (EtaFirst), (Small),
 (Boxity), (BoringOk)), **[Worker/wrapper for function arguments]** (with
-(TypeParams) and (Constructed)), and **[Higher-order worker/wrapper
+(TypeParams), (Constructed) and (Consumed)), and **[Higher-order worker/wrapper
 statistics]**.
 
 - `tryWW` calls `splitHigherOrder`, which tries argument splits
@@ -152,7 +188,7 @@ statistics]**.
   - `WwOpts` fields (in `GHC/Core/Opt/WorkWrap/Utils.hs`; set in
     `GHC/Driver/Config/Core/Opt/WorkWrap.hs`): `wo_fun_results`,
     `wo_pedantic_bottoms`, `wo_dicts_strict`, `wo_dmd_unbox_width`,
-    `wo_max_worker_args`, `wo_fr_wrappers`.
+    `wo_max_worker_args`, `wo_fr_wrappers`, `wo_call_lams`.
 
 ## Tests (`testsuite/tests/dmdanal/`)
 
@@ -162,7 +198,7 @@ statistics]**.
   - `wwreturn002_funres`, `wwreturn003_funres`, `wwfunres005`,
     `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`,
     `wwhostats001` (the statistics terminate on a never-called parameter),
-    and `wwcont_dump` (which functions (C) splits).
+    and `wwcont_dump` (which functions (C) splits, with (Consumed)).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
   `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`. Each
@@ -192,41 +228,46 @@ That keeps the goldens readable; the driver compares filtered output only.
 
 ## Results so far (nofib at -O2, 115 benchmarks; `ww-bench/report-latest.md`)
 
-Third run, with type parameters and calls of split functions (details in
-`WW-HIGHER-ORDER.md` §7):
+Sixth run, with (C) and the revised (Consumed) (the third run, before (C),
+is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
 
 |                                | early | pre-ww | final |
 |--------------------------------|------:|-------:|------:|
 | functions returning a function |   477 |    367 |   412 |
 | functions taking a function    |   626 |    632 |   768 |
 | result splits                  |     9 |      7 |    10 |
-| argument splits                |     1 |      1 |     0 |
+| argument splits                |     9 |     13 |     6 |
 
-- **Performance is unchanged:**
+- **Performance:**
 
-| measure                      | funres vs base |
-|------------------------------|---------------:|
-| program allocation (geomean) |         +0.00% |
-| object code (text)           |         +0.07% |
-| compiler allocation          |         +0.17% |
+| measure                      | run 3 (no C) | run 4 (C) | run 5 (strict check) | run 6 (revised check) |
+|------------------------------|-------------:|----------:|---------------------:|----------------------:|
+| program allocation (geomean) |       +0.00% |    -0.07% |               -0.03% |                -0.07% |
+| object code (text)           |       +0.07% |    +0.03% |               +0.11% |                +0.10% |
+| compiler allocation          |       +0.17% |    +0.17% |               +0.17% |                +0.18% |
 
-- **The splits that happen:** results in `pretty`, `scs`, `hpg`, `anna`
-  (and `fem` at final); the one argument split is `StateX.thenSX` in
-  `real/infer`.
-- **Rejection reasons at pre-ww:**
+  Over 0.5%: `pic` -3.9% (`Utils.applyOpToMesh`) and `wave4main` -3.3%
+  (`Main.tabulate`). hpg's losing (C) splits (+0.1% in run 4, by hand) are
+  gone. The code size difference between runs 4 and 6 (+0.03% vs +0.10%)
+  is not explained yet.
+- **The splits that happen (pre-ww):** results in `pretty`, `scs`, `hpg`,
+  `anna`; arguments ((C)) in `fem` (3), `hpg` (5), `fluid`, `pic`, `fft`,
+  `wave4main`, and `StateX.thenSX` in `infer`.
+- **Rejection reasons at pre-ww (run 6):**
 
-| reason                                     | functions |
-|--------------------------------------------|----------:|
-| argument: the parameter is not only called |       270 |
-| argument: small (inlined whole)            |       174 |
-| argument: not given known functions        |       156 |
-| result: a tail is a call                   |        83 |
-| result: nothing to gain                    |        80 |
-| result: a tail is a local variable         |        79 |
-| result: small                              |        70 |
+| reason                                                          | functions |
+|-----------------------------------------------------------------|----------:|
+| argument: the parameter is not only called                      |       270 |
+| argument: small (inlined whole)                                 |       174 |
+| argument: not given known functions (131 only call with data)   |       134 |
+| result: a tail is a call                                        |        83 |
+| result: nothing to gain                                         |        80 |
+| result: a tail is a local variable                              |        79 |
+| result: small                                                   |        70 |
+| argument: constructed data, no consumer at the calls (Consumed) |        11 |
 
-  Handling type parameters moved 252 functions on to these later checks;
-  calls of split functions found nothing new.
+  Reading the Core (above) suggests most of the large pools have nothing
+  for worker/wrapper to gain.
 - **`real/symalg`** hit a loop in the statistics (fixed in `b1d3210493`,
   test `wwhostats001`) and was rerun alone; the original logs are kept as
   `ww-bench/results/*/nofib.log.orig`. Previous runs are in
@@ -234,9 +275,10 @@ Third run, with type parameters and calls of split functions (details in
 
 ## What is left to do
 
-1. **Measure (C) on nofib**
-   (how many of the 31 candidates split, and allocation).
-2. **Push** the commits after `5d4c77536d` when the user asks.
+1. **Push** the commits after `5d4c77536d` when the user asks.
+2. **(Cpr) with a consumer check**, if worth it: only where a call through
+   the returned level has its result taken apart (often through a
+   let-bound partial application, which makes the check harder).
 3. **Remaining big rejection pools:**
    - **Static arguments (162):** recursive functions passing the function
      parameter on unchanged (`wwhoarg008`). Either a SAT-style step in our
@@ -260,7 +302,8 @@ Third run, with type parameters and calls of split functions (details in
    compile time, and run the full testsuite (not just the smoke subset)
    with the flag on.
 9. **Housekeeping:** `build-setup.log` and the `ww-bench/results*`
-   directories are untracked or ignored.
+   directories are untracked or ignored (`results-run3`: third run;
+   `results-run4`: (C) without the consumer check).
 
 ## Related work on the `webs` branch (`~/projects/ghc-webs`)
 
