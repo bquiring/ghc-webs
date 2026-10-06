@@ -142,7 +142,8 @@ for name in ['wwhoarg001_dump', 'wwhoarg002_dump', 'wwhoarg006_dump']:
 # called (it once counted through [0 .. maxBound])
 test('wwhostats001', [grep_errmsg(r'ww-ho-reject')], compile,
      ['-O -ddump-ww-ho-stats'])
-# Which functions (Constructed) splits: step and findK's go, not pick
-# (different constructors) or strictK (strict fields)
+# Which functions (Constructed) splits: step (twice), not pick (different
+# constructors), strictK (strict fields), storeK or findK (no call in the
+# module passes a continuation that takes the pair apart: (Consumed))
 test('wwcont_dump', [grep_errmsg(r'ww-ho-split pre-ww')], compile,
      ['-O -fworker-wrapper-function-results -ddump-ww-ho-stats'])

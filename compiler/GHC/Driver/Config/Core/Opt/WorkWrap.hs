@@ -2,7 +2,7 @@ module GHC.Driver.Config.Core.Opt.WorkWrap
   ( initWorkWrapOpts
   ) where
 
-import GHC.Prelude ()
+import GHC.Prelude ( Maybe(Nothing) )
 
 import GHC.Driver.Config (initSimpleOpts)
 import GHC.Driver.DynFlags
@@ -25,4 +25,5 @@ initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
   , wo_dmd_unbox_width   = dmdUnboxWidth dflags
   , wo_max_worker_args   = maxWorkerArgs dflags
   , wo_fr_wrappers       = emptyVarEnv
+  , wo_call_lams         = Nothing
   }

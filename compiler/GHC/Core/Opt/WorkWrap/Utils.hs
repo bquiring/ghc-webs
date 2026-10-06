@@ -164,7 +164,12 @@ data WwOpts
   , -- | The unfoldings of the function-result wrappers made so far in this
     -- module (top level, in order).  See (Calls) in Note [Worker/wrapper for
     -- function results] in GHC.Core.Opt.WorkWrap
-    wo_fr_wrappers       :: IdEnv CoreExpr }
+    wo_fr_wrappers       :: IdEnv CoreExpr
+  , -- | The lambdas passed to each function in this module: the value
+    -- argument position and the demands on the lambda's value binders.
+    -- 'Nothing' skips the check that uses them.  See (Consumed) in
+    -- Note [Worker/wrapper for function arguments] in GHC.Core.Opt.WorkWrap
+    wo_call_lams         :: Maybe (IdEnv [(Int, [Demand])]) }
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args

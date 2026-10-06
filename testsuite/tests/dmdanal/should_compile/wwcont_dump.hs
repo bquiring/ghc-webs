@@ -16,7 +16,9 @@ step !a !b k
   | a < 0       = k (a - b * 2) (undefined, b)
   | otherwise   = k (a - b) (trace "lazy field (a < b)" (a - 1), b * 5 + a)
 
--- [+] A pair at every call, from a local loop (k is free in go)
+-- [-] A pair at every call, from a local loop (k is free in go); but GHC
+-- inlines findK at its calls here, so no call is left to show a
+-- continuation that takes the pair apart ((Consumed))
 findK :: (Int -> Bool) -> [Int] -> ((Int, Int) -> r) -> r
 findK p xs0 k = go 0 xs0
   where
@@ -36,6 +38,14 @@ data SP = SP !Int !Int deriving Show
 strictK :: Int -> (SP -> r) -> r
 strictK n k | n > 3     = k (SP (n * n + 1) (n - 3))
             | otherwise = k (SP (n + 100) (n * 2 + 5))
+
+-- [-] A pair at every call of k, but no continuation passed in this module
+-- takes it apart: they store it, or are unknown ((Consumed): the adapter
+-- would only cost a closure)
+storeK :: Int -> ((Int, Int) -> r) -> r
+storeK n k | n > 100   = k (n * n + 1, n - 3)
+           | n > 10    = k (n - 7, n * 3 + 2)
+           | otherwise = k (n + 100, n * 2 + 5)
 
 -- Unknown continuations, chosen at run time
 conts :: [Int -> (Int, Int) -> Int]
@@ -57,3 +67,4 @@ main0 = do
   print (findK odd [2, 4, 9] fst)
   print (pick 12 (maybe 0 (+ 1)), pick 7 (maybe 0 (+ 2)), pick 1 (maybe 0 (+ 3)))
   print (strictK 5 (\(SP x y) -> x + y), strictK 2 show)
+  print (length (storeK 50 (: []) ++ storeK 5 (\p -> [p, p])), storeK 200 Just)

@@ -81,7 +81,7 @@ info for exported values).
 wwTopBinds :: WwOpts -> UniqSupply -> CoreProgram -> CoreProgram
 
 wwTopBinds ww_opts us top_binds
-  = initUs_ us $ go ww_opts top_binds
+  = initUs_ us $ go (ww_opts { wo_call_lams = Just (callLambdas top_binds) }) top_binds
   where
     -- Remember the function-result wrappers made so far: (Calls) in
     -- Note [Worker/wrapper for function results]
@@ -1302,6 +1302,25 @@ are constructors without fields (nothing to gain) and unboxed tuples (the
 result of an earlier (C) split, which would otherwise be split again by
 the worker's next round).
 
+(Consumed) (C) only pays when some continuation takes the constructor apart.
+The worker saves building D, but the adapter builds it again, and the
+wrapper allocates the adapter, a closure, at each call.  The two cancel only
+where the wrapper is inlined at a call with a known continuation that
+scrutinises its argument.  In real/hpg (nofib), every continuation passed
+just stores the value (\e -> ec (Apply_exp e1 e)) or is unknown (an eta
+parameter), and each call paid one more closure.  So (C) needs evidence: some
+call of h in this module (including h's own recursive calls, as in a CPS
+evaluator) passes, for the parameter, a lambda whose binder for the argument
+has a strict demand that does not use the box (unboxesDmd: demand analysis
+has put it on the binder).  A function variable counts too, with its demand
+signature: full laziness floats a closed continuation to the top level, so
+the call passes a variable.  The calls are collected once for the module
+(callLambdas, in wo_call_lams); the worker of a split, split again for
+another argument, inherits the function's calls (inheritCallLams).  Calls
+from other modules are not seen, so this is conservative.  Below the top (a parameter of a lambda passed to h,
+a depth of (B) more than one) the calls are not h's, and (C) is not tried.
+Test: wwcont_dump ([-] storeK).
+
 We do not split a function with a NOINLINE pragma (its wrapper could not be
 inlined, so the adapter would only cost), nor look deeper than
 maxFunResultDepth levels of (B).  One split handles one parameter; the worker
@@ -1360,7 +1379,9 @@ demand analyser on a copy first, since the splits need demand information.
 -- | Count the higher-order splits a program offers.
 -- See Note [Higher-order worker/wrapper statistics]
 higherOrderStats :: WwOpts -> UniqSupply -> CoreProgram -> HoStats
-higherOrderStats ww_opts0 us binds = initUs_ us (top (ww_opts0 { wo_fun_results = True }) binds)
+higherOrderStats ww_opts0 us binds
+  = initUs_ us (top (ww_opts0 { wo_fun_results = True
+                              , wo_call_lams = Just (callLambdas binds) }) binds)
   where
     -- Top level, in order: like worker/wrapper, remember the function-result
     -- wrappers made so far, so that calls of them can be expanded (Calls)
@@ -1431,7 +1452,7 @@ higherOrderStats ww_opts0 us binds = initUs_ us (top (ww_opts0 { wo_fun_results 
            ; case mb of
                Nothing   -> return []
                Just tc@(_, conv) -> do { (work_id, work_rhs, _) <- mkFunArgPairs ww_opts fn_id rhs tc
-                                       ; (cv_depth conv :) <$> count_args ww_opts (fuel - 1) work_id work_rhs } }
+                                       ; (cv_depth conv :) <$> count_args (inheritCallLams fn_id work_id ww_opts) (fuel - 1) work_id work_rhs } }
 
 -- | Why no parameter of a function that takes a function is split (coarse;
 -- for the statistics only)
@@ -1445,24 +1466,28 @@ argRejectReason ww_opts fn_id rhs
   = let (_, vals) = span isTyVar arg_vars in
     if not (all (\v -> isId v && not (isCoVar v)) vals)
     then return "type parameters after value parameters"
-    else let fun_params = [ q | q <- vals, isFunTy (idType q) ]
-             callss     = [ cs | q <- fun_params, Just cs <- [paramCalls emptyVarEnv q body] ]
-             -- Some argument position known at every call (a parameter
-             -- never called has no such position)
-             known []              = False
-             known cs@((_, a) : _) = let n = foldr (min . length . snd) (length a) cs
-                                     in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
-                                           | i <- [0 .. n - 1] ]
-             -- Why: the first use of a parameter that is not a call; what the
-             -- calls pass instead of known functions
-             not_called = [ u | q <- fun_params, Just u <- [nonCallUse fn_id q body] ]
-             unknown    = [ u | cs <- callss, Just u <- [unknownArgs cs] ]
-         in return $ if null fun_params then "function only under a type"
-                     else if null callss then "parameter not only called: "
-                                              ++ fromMaybe "?" (listToMaybe not_called)
-                     else if not (any known callss) then "not given known functions: "
-                                              ++ fromMaybe "never called" (listToMaybe unknown)
-                     else "nothing to gain"
+    else do
+      { -- Would (C) split it, but for the (Consumed) check?
+        unconsumed <- isJust <$> funArgConv (ww_opts { wo_call_lams = Nothing }) fn_id rhs
+      ; let fun_params = [ q | q <- vals, isFunTy (idType q) ]
+            callss     = [ cs | q <- fun_params, Just cs <- [paramCalls emptyVarEnv q body] ]
+            -- Some argument position known at every call (a parameter
+            -- never called has no such position)
+            known []              = False
+            known cs@((_, a) : _) = let n = foldr (min . length . snd) (length a) cs
+                                    in or [ all (\(env, args) -> isJust (classifyArg env (args !! i))) cs
+                                          | i <- [0 .. n - 1] ]
+            -- Why: the first use of a parameter that is not a call; what the
+            -- calls pass instead of known functions
+            not_called = [ u | q <- fun_params, Just u <- [nonCallUse fn_id q body] ]
+            unknown    = [ u | cs <- callss, Just u <- [unknownArgs cs] ]
+      ; return $ if null fun_params then "function only under a type"
+                 else if null callss then "parameter not only called: "
+                                          ++ fromMaybe "?" (listToMaybe not_called)
+                 else if unconsumed then "constructed data, no consumer at the calls"
+                 else if not (any known callss) then "not given known functions: "
+                                          ++ fromMaybe "never called" (listToMaybe unknown)
+                 else "nothing to gain" }
   | otherwise = return "arity above manifest lambdas"
   where
     fn_info  = idInfo fn_id
@@ -1527,7 +1552,8 @@ splitHigherOrder fuel ww_opts fn_id rhs
   = do { mb_arg <- if fuel > 0 then splitFunArg ww_opts fn_id rhs else return Nothing
        ; case mb_arg of
            Just (work_id, work_rhs, wrapper) ->
-             do { work_pairs <- splitHigherOrder (fuel - 1) ww_opts work_id work_rhs
+             do { work_pairs <- splitHigherOrder (fuel - 1) (inheritCallLams fn_id work_id ww_opts)
+                                                 work_id work_rhs
                 ; return (work_pairs ++ [wrapper]) }
            Nothing ->
              do { mb_res <- splitFunResult ww_opts fn_id rhs
@@ -1710,6 +1736,56 @@ conConv arg_ty vals
                  _                                             -> Nothing
     fields e = filter isValArg (snd (collectArgs (strip e)))
 
+-- | A strict demand that takes the value apart (its box is not used): a
+-- continuation with this demand on an argument cancels a rebuilt
+-- constructor.  See (Consumed) in Note [Worker/wrapper for function arguments]
+unboxesDmd :: Demand -> Bool
+unboxesDmd d@(_ :* sd) = isStrictDmd d && case sd of
+  Poly Unboxed _ -> True
+  Prod Unboxed _ -> True
+  _              -> False
+
+-- | The worker of a function-argument split has the function's parameters,
+-- in the same order, and its calls are the function's (through the
+-- wrapper): it gets the function's entries of wo_call_lams.  See (Consumed)
+-- in Note [Worker/wrapper for function arguments]
+inheritCallLams :: Id -> Id -> WwOpts -> WwOpts
+inheritCallLams fn_id work_id opts = case wo_call_lams opts of
+  Just env | Just lams <- lookupVarEnv env fn_id
+    -> opts { wo_call_lams = Just (extendVarEnv env work_id lams) }
+  _ -> opts
+
+-- | For each function, the functions passed to it in the program: the value
+-- argument position, and the demands on the function's arguments: a
+-- lambda's value binders (put there by demand analysis), or a function
+-- variable's demand signature (full laziness floats closed lambdas to the
+-- top level).  See (Consumed) in
+-- Note [Worker/wrapper for function arguments]
+callLambdas :: CoreProgram -> IdEnv [(Int, [Demand])]
+callLambdas binds = foldl' go emptyVarEnv (concatMap rhssOfBind binds)
+  where
+    go env e = case e of
+      App {} | (f, args) <- collectArgs e
+             -> let env1 = case strip f of
+                             Var v | lams@(_ : _) <- argLams args -> extendVarEnv_C (++) env v lams
+                             _                                    -> env
+                in foldl' go (go env1 f) args
+      Lam _ b          -> go env b
+      Let bind b       -> foldl' go (go env b) (rhssOfBind bind)
+      Case sc _ _ alts -> foldl' go (go env sc) [ rhs | Alt _ _ rhs <- alts ]
+      Cast b _         -> go env b
+      Tick _ b         -> go env b
+      _                -> env
+    argLams args = [ (i, dmds) | (i, a) <- zip [0 :: Int ..] (filter isValArg args)
+                               , Just dmds <- [argDmds (strip a)] ]
+    argDmds a = case collectArgs a of
+      (Var v, targs) | all isTypeArg targs, idArity v > 0
+                     -> Just (fst (splitDmdSig (idDmdSig v)))
+      _ | let bs = filter isId (fst (collectBinders a)), not (null bs)
+                     -> Just (map idDemandInfo bs)
+      _              -> Nothing
+    strip = stripTicksTopE (const True)
+
 -- | (B): the values are lambda groups, one of whose parameters is a function
 -- that is only called, with values at some position that have a conversion
 lambdaConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
@@ -1750,11 +1826,21 @@ lambdaConv ww_opts fn_id depth vals
            ; case mb_c of
                Just c  -> mkLambdaConv qi ri m lams c
                Nothing -> try_positions ris qi calls lams m }
-        -- (C): the same constructor at every call
+        -- (C): the same constructor at every call, and a consumer
       | Just arg_ty <- posType qi ri lams
       , Just c <- conConv arg_ty [ args !! ri | (_, args) <- calls ]
+      , consumed qi ri
       = mkLambdaConv qi ri m lams c
       | otherwise = try_positions ris qi calls lams m
+
+    -- See (Consumed) in Note [Worker/wrapper for function arguments]: at
+    -- the top (the function's own parameters), some call of the function in
+    -- this module passes a lambda at qi that takes its argument ri apart
+    consumed qi ri = case wo_call_lams ww_opts of
+      Nothing  -> True
+      Just env -> depth == 1
+                  && or [ unboxesDmd d | (i, dmds) <- fromMaybe [] (lookupVarEnv env fn_id)
+                                       , i == qi, d : _ <- [drop ri dmds] ]
 
     -- The type of parameter qi's argument ri
     posType qi ri ((_, _, bs0) : _)
