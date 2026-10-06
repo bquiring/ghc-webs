@@ -1308,18 +1308,26 @@ wrapper allocates the adapter, a closure, at each call.  The two cancel only
 where the wrapper is inlined at a call with a known continuation that
 scrutinises its argument.  In real/hpg (nofib), every continuation passed
 just stores the value (\e -> ec (Apply_exp e1 e)) or is unknown (an eta
-parameter), and each call paid one more closure.  So (C) needs evidence: some
-call of h in this module (including h's own recursive calls, as in a CPS
-evaluator) passes, for the parameter, a lambda whose binder for the argument
-has a strict demand that does not use the box (unboxesDmd: demand analysis
-has put it on the binder).  A function variable counts too, with its demand
-signature: full laziness floats a closed continuation to the top level, so
-the call passes a variable.  The calls are collected once for the module
-(callLambdas, in wo_call_lams); the worker of a split, split again for
-another argument, inherits the function's calls (inheritCallLams).  Calls
-from other modules are not seen, so this is conservative.  Below the top (a parameter of a lambda passed to h,
-a depth of (B) more than one) the calls are not h's, and (C) is not tried.
-Test: wwcont_dump ([-] storeK).
+parameter, or the function is stored in a list), and each call paid one more
+closure: +0.1% allocation.  So we look at h's occurrences in this module
+(callLambdas, collected once, in wo_call_lams), including h's own recursive
+calls, as in a CPS evaluator:
+  * a call passing, for the parameter, a lambda whose binder for the
+    argument has a strict demand that does not use the box (unboxesDmd), or
+    a function variable with such a demand signature (full laziness floats a
+    closed continuation to the top level), is a consumer;
+  * a call passing anything else there, a partial application, or h used as
+    a value is not.
+We split if some occurrence is a consumer, or if h has no occurrence at all
+(it is only called from other modules, or inlined at all its calls here).
+That last case is a bet: in real/pic, applyOpToMesh (in Utils) calls its
+operator with a list built at every call, and the operators that take it
+apart are in another module (Potential); the split saves 3.9% allocation.
+Requiring a consumer in the module lost it.  The worker of a split, split
+again for another argument, inherits h's occurrences (inheritCallLams).
+Below the top (a parameter of a lambda passed to h, a depth of (B) more than
+one) the occurrences are not h's, and (C) is not tried.
+Test: wwcont_dump ([-] storeK, [+] findK).
 
 We do not split a function with a NOINLINE pragma (its wrapper could not be
 inlined, so the adapter would only cost), nor look deeper than
@@ -1755,29 +1763,37 @@ inheritCallLams fn_id work_id opts = case wo_call_lams opts of
     -> opts { wo_call_lams = Just (extendVarEnv env work_id lams) }
   _ -> opts
 
--- | For each function, the functions passed to it in the program: the value
--- argument position, and the demands on the function's arguments: a
--- lambda's value binders (put there by demand analysis), or a function
--- variable's demand signature (full laziness floats closed lambdas to the
--- top level).  See (Consumed) in
+-- | For each let-bound or top-level function, what its occurrences in the
+-- program pass it: at each value argument position, the demands on the
+-- arguments of a lambda (on its value binders, put there by demand analysis)
+-- or of a function variable (its demand signature: full laziness floats
+-- closed lambdas to the top level); NoCallArgs for an occurrence with fewer
+-- value arguments than its arity.  See (Consumed) in
 -- Note [Worker/wrapper for function arguments]
-callLambdas :: CoreProgram -> IdEnv [(Int, [Demand])]
+callLambdas :: CoreProgram -> IdEnv [CallArg]
 callLambdas binds = foldl' go emptyVarEnv (concatMap rhssOfBind binds)
   where
     go env e = case e of
+      Var v            -> occ env v []
       App {} | (f, args) <- collectArgs e
              -> let env1 = case strip f of
-                             Var v | lams@(_ : _) <- argLams args -> extendVarEnv_C (++) env v lams
-                             _                                    -> env
-                in foldl' go (go env1 f) args
+                             Var v -> occ env v args
+                             f'    -> go env f'
+                in foldl' go env1 args
       Lam _ b          -> go env b
       Let bind b       -> foldl' go (go env b) (rhssOfBind bind)
       Case sc _ _ alts -> foldl' go (go env sc) [ rhs | Alt _ _ rhs <- alts ]
       Cast b _         -> go env b
       Tick _ b         -> go env b
       _                -> env
-    argLams args = [ (i, dmds) | (i, a) <- zip [0 :: Int ..] (filter isValArg args)
-                               , Just dmds <- [argDmds (strip a)] ]
+    -- Lambda-bound variables have arity 0: not recorded
+    occ env v args
+      | isId v, idArity v > 0
+      = let vargs = filter isValArg args
+            uses  = [ CallArg i (argDmds (strip a)) | (i, a) <- zip [0 :: Int ..] vargs ]
+                    ++ [ NoCallArgs | length vargs < idArity v ]
+        in extendVarEnv_C (++) env v uses
+      | otherwise = env
     argDmds a = case collectArgs a of
       (Var v, targs) | all isTypeArg targs, idArity v > 0
                      -> Just (fst (splitDmdSig (idDmdSig v)))
@@ -1834,13 +1850,19 @@ lambdaConv ww_opts fn_id depth vals
       | otherwise = try_positions ris qi calls lams m
 
     -- See (Consumed) in Note [Worker/wrapper for function arguments]: at
-    -- the top (the function's own parameters), some call of the function in
-    -- this module passes a lambda at qi that takes its argument ri apart
+    -- the top (the function's own parameters), no occurrence of the function
+    -- in this module, or one that passes at qi a function taking its
+    -- argument ri apart
     consumed qi ri = case wo_call_lams ww_opts of
       Nothing  -> True
       Just env -> depth == 1
-                  && or [ unboxesDmd d | (i, dmds) <- fromMaybe [] (lookupVarEnv env fn_id)
-                                       , i == qi, d : _ <- [drop ri dmds] ]
+                  && (null uses || any consumes uses)
+        where
+          uses = [ u | u <- fromMaybe [] (lookupVarEnv env fn_id), at qi u ]
+          at q (CallArg i _) = i == q
+          at _ NoCallArgs    = True
+          consumes (CallArg _ (Just dmds)) | d : _ <- drop ri dmds = unboxesDmd d
+          consumes _                                               = False
 
     -- The type of parameter qi's argument ri
     posType qi ri ((_, _, bs0) : _)

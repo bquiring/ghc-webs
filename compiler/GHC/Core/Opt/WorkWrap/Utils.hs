@@ -8,7 +8,7 @@ A library for the ``worker\/wrapper'' back-end to the strictness analyser
 {-# LANGUAGE ViewPatterns #-}
 
 module GHC.Core.Opt.WorkWrap.Utils
-   ( WwOpts(..), mkWwBodies, mkWWstr, mkWWstr_one
+   ( WwOpts(..), CallArg(..), mkWwBodies, mkWWstr, mkWWstr_one
    , needsVoidWorkerArg
    , DataConPatContext(..)
    , UnboxingDecision(..), canUnboxArg
@@ -165,11 +165,20 @@ data WwOpts
     -- module (top level, in order).  See (Calls) in Note [Worker/wrapper for
     -- function results] in GHC.Core.Opt.WorkWrap
     wo_fr_wrappers       :: IdEnv CoreExpr
-  , -- | The lambdas passed to each function in this module: the value
-    -- argument position and the demands on the lambda's value binders.
+  , -- | What the occurrences of each function in this module pass it.
     -- 'Nothing' skips the check that uses them.  See (Consumed) in
     -- Note [Worker/wrapper for function arguments] in GHC.Core.Opt.WorkWrap
-    wo_call_lams         :: Maybe (IdEnv [(Int, [Demand])]) }
+    wo_call_lams         :: Maybe (IdEnv [CallArg]) }
+
+-- | What one occurrence of a function passes it.  See (Consumed) in
+-- Note [Worker/wrapper for function arguments] in GHC.Core.Opt.WorkWrap
+data CallArg
+  = CallArg !Int (Maybe [Demand])
+      -- ^ At this value argument position: if it is a lambda or a function
+      -- variable, the demands on its arguments
+  | NoCallArgs
+      -- ^ An occurrence that does not show all the arguments (a partial
+      -- application, or the function used as a value)
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args

@@ -16,9 +16,9 @@ step !a !b k
   | a < 0       = k (a - b * 2) (undefined, b)
   | otherwise   = k (a - b) (trace "lazy field (a < b)" (a - 1), b * 5 + a)
 
--- [-] A pair at every call, from a local loop (k is free in go); but GHC
--- inlines findK at its calls here, so no call is left to show a
--- continuation that takes the pair apart ((Consumed))
+-- [+] A pair at every call, from a local loop (k is free in go).  GHC
+-- inlines findK at its calls here, so it has no occurrence left in the
+-- module, and (Consumed) lets the split go ahead (for callers elsewhere)
 findK :: (Int -> Bool) -> [Int] -> ((Int, Int) -> r) -> r
 findK p xs0 k = go 0 xs0
   where
@@ -39,9 +39,9 @@ strictK :: Int -> (SP -> r) -> r
 strictK n k | n > 3     = k (SP (n * n + 1) (n - 3))
             | otherwise = k (SP (n + 100) (n * 2 + 5))
 
--- [-] A pair at every call of k, but no continuation passed in this module
--- takes it apart: they store it, or are unknown ((Consumed): the adapter
--- would only cost a closure)
+-- [-] A pair at every call of k, but the calls in this module pass
+-- continuations that store it or are unknown, and none that takes it apart
+-- ((Consumed): the adapter would only cost a closure)
 storeK :: Int -> ((Int, Int) -> r) -> r
 storeK n k | n > 100   = k (n * n + 1, n - 3)
            | n > 10    = k (n - 7, n * 3 + 2)
