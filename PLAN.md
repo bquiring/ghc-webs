@@ -177,6 +177,25 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
   - Where it would pay (small examples): a static *full* call, as in
     `k g c (y:ys) = g c * y + k g c ys`, recomputed at every iteration
     today. nofib has none.
+- **Benchmarks outside nofib** (built with this GHC via cabal, head.hackage
+  and `allow-newer`; scratch setup, statistics on the projects' own
+  modules only):
+  - `haskell-parser-benchmarks` (Parsec, Megaparsec, Attoparsec,
+    Flatparse, uu-parsinglib, Earley, Alex/Happy; Parsley removed:
+    `parsley-core` does not build with GHC 9.15): 17 modules, **no splits**.
+    Invariant applications are CPS continuations applied to constants or
+    the input (`eok Expr.Mul`, Attoparsec's `lose t'`); none static. 9
+    Attoparsec loops pass a continuation to their recursive call.
+  - `effectful` (library and benchmarks, vs mtl; polysemy, fused-effects,
+    cleff and freer-simple are disabled for GHC 9.15 by effectful
+    itself): 84 modules, 474 functions taking a function, **no splits**
+    (273 small, 63 static arguments). The only static full calls (62) are
+    tasty-bench's own measuring loop (`funcToBenchLoop`), which must
+    recompute `f x`; the others are `Eff` actions applied to the
+    environment.
+  - `effect-zoo` does not build: it needs `loopbreaker`, a GHC plugin
+    written for the GHC API of 2019.
+  - So far the static full call is only in benchmark harnesses.
 - **Benchmark optimisation level:** every nofib run so far was at `-O2`
   (nofib's default `NoFibHcOpts`). `run-nofib.sh` / `run-all.sh` now take
   `NOFIB_OPT` (results then go to `base-O1`, `funres-O1`, `report-O1.md`);
