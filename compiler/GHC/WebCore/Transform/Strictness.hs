@@ -12,10 +12,11 @@ import GHC.Core
 import GHC.Core.DataCon
 import GHC.Core.Type
 import GHC.Types.Var ( isCoVar )
-import GHC.Core.Utils ( exprType, exprIsHNF )
+import GHC.Core.Utils ( exprType, exprIsHNF, exprIsTrivial )
 
 import GHC.Types.Demand ( isStrUsedDmd, splitDmdSig )
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
 import GHC.Types.Id
 import GHC.Types.Unique ( getKey )
 import GHC.Types.Unique.FM
@@ -88,6 +89,81 @@ starts with "every field strict" and is lowered by its contexts until
 nothing changes.  Join points are lambdas whose calls (jumps) are in tail
 positions, so a join point's result fields come from the lambda it is in.
 -}
+
+{- Note [Only evaluate what would be a thunk]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Evaluating a strict argument at the call (or a strict field before the
+constructor is built) pays when the argument would otherwise be a thunk:
+CorePrep allocates a thunk for a non-trivial argument, and the case avoids
+it.  A variable is a pointer either way, and the callee, being strict,
+evaluates it anyway; a case at the call is a second tag test, in the
+caller.  In nofib spectral/hartel/ida such cases in the inner search loop
+(case sc of wild { F_SEARCH .. -> $sf_foldl (##) wild .. }) cost 2.7% more
+instructions.
+
+One kind of variable is the exception: one let-bound to a non-value (a
+thunk), as in  let x = e in f x.  Evaluated at the call, the simplifier
+that runs after the early web pass can turn the let into a case
+(case e of x' -> f x'), and the thunk is never built.  So we evaluate an
+argument only if it is not trivial, or is such a let-bound variable
+('thunkLets').  Uniques of nested binders may be shadowed; that only makes
+the choice less precise, never wrong: evaluating a strict argument is
+always correct.
+
+Strict result fields are the exception: a field is evaluated before the
+constructor is built even if it is a variable.  The case is redundant
+where it is, but in the next round it makes the call it scrutinises strict
+in that field, so the demand reaches the producer (in testsuite strict005,
+the worker $wp1 then evaluates g n instead of building a thunk for it).
+Arguments need no such help: passing a variable to a strict web already
+makes the lambda strict in it, within the same fixpoint.
+
+Inside a thunk the opposite holds: a call in a thunk's body (a lazy
+argument, a constructor field, a non-value let) evaluates even a variable
+argument first.  In nofib spectral/ansi the tails of lazy lists are thunks
+(c : prog cs); evaluating cs there, before the call, is worth 3.9% fewer
+instructions, and the runtime spends far less time walking chains of
+update frames (threadPaused).  So the rewrite tracks whether it is inside
+a thunk ('lz'): a lambda body is not; a non-value argument or right-hand
+side is; a join point is where it is bound.
+-}
+
+-- | The local (non-top-level) let-bound Ids whose right-hand side is not a
+-- value, i.e. thunks.  See Note [Only evaluate what would be a thunk]
+thunkLets :: CoreProgram -> VarSet
+thunkLets binds = foldr top emptyVarSet binds
+  where
+    top (NonRec _ e) acc = go e acc
+    top (Rec prs)    acc = foldr (go . snd) acc prs
+
+    go :: CoreExpr -> VarSet -> VarSet
+    go expr acc = case expr of
+      Let bind body  -> foldr pair (go body acc) (flattenBinds [bind])
+      Lam _ e        -> go e acc
+      WebLam _ _ e   -> go e acc
+      App f a        -> go f (go a acc)
+      WebApp _ f a   -> go f (go a acc)
+      Case e _ _ as  -> go e (foldr (\(Alt _ _ rhs) -> go rhs) acc as)
+      Cast e _       -> go e acc
+      Tick _ e       -> go e acc
+      _              -> acc
+
+    pair (b, rhs) acc
+      | not (isJoinId b)
+      , not (exprIsHNF (stripWebForms rhs)) = go rhs (extendVarSet acc b)
+      | otherwise                           = go rhs acc
+
+-- | Would this (erased) argument be allocated as a thunk if passed lazily?
+-- See Note [Only evaluate what would be a thunk]
+wouldBeThunk :: VarSet -> CoreExpr -> Bool
+wouldBeThunk thunks a = case strip a of
+  Var v -> v `elemVarSet` thunks
+  e     -> not (exprIsTrivial e)
+  where
+    strip (Tick _ e) = strip e
+    strip (Cast e _) = strip e
+    strip (App f (Type _)) = strip f
+    strip e          = e
 
 -- | Webs with strict arguments (assumed, during the fixpoint), with depth
 type StrictWebs = UniqFM WebId Int
@@ -375,34 +451,46 @@ strictnessRound us exposed done binds
 rewriteProgram :: UniqFM WebId Int                     -- ^ Strict-argument webs, with depth
                -> UniqFM WebId (DataCon, [Int])        -- ^ Strict-result-field webs
                -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram arg_webs res_webs binds = mapM rw_bind binds
+rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
   where
-    rw_bind (NonRec b e) = NonRec b <$> rw e
-    rw_bind (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) b <$> rw e) prs
+    -- See Note [Only evaluate what would be a thunk]
+    thunks = thunkLets binds
 
-    rw :: CoreExpr -> UniqSM CoreExpr
-    rw expr = case expr of
+    -- lz: are we inside a thunk (the code runs when a thunk is forced)?
+    -- See Note [Only evaluate what would be a thunk]
+    rw_bind lz (NonRec b e) = NonRec b <$> rw (rhs_lz lz b e) e
+    rw_bind lz (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) b <$> rw (rhs_lz lz b e) e) prs
+
+    -- A join point runs where it is bound; any other non-value right-hand
+    -- side is a thunk; a value's lambdas reset lz anyway
+    rhs_lz lz b e | isJoinId b = lz
+                  | otherwise  = not (exprIsHNF (stripWebForms e))
+
+    rw :: Bool -> CoreExpr -> UniqSM CoreExpr
+    rw lz expr = case expr of
       WebLam w x e
         | Just (dc, fs) <- lookupUFM res_webs w
-        -> WebLam w x <$> (rw e >>= tails dc fs)
+        -> WebLam w x <$> (rw False e >>= tails dc fs)
         | otherwise
-        -> WebLam w x <$> rw e
-      Lam b e       -> Lam b <$> rw e
-      App {}        -> rw_app expr
-      WebApp {}     -> rw_app expr
-      Let bind body -> Let <$> rw_bind bind <*> rw body
+        -> WebLam w x <$> rw False e
+      Lam b e
+        | isTyVar b -> Lam b <$> rw lz e
+        | otherwise -> Lam b <$> rw False e
+      App {}        -> rw_app lz expr
+      WebApp {}     -> rw_app lz expr
+      Let bind body -> Let <$> rw_bind lz bind <*> rw lz body
       Case e b ty alts
-        -> Case <$> rw e <*> pure b <*> pure ty
-                <*> mapM (\(Alt c bs rhs) -> Alt c bs <$> rw rhs) alts
-      Cast e co     -> (\e' -> Cast e' co) <$> rw e
-      Tick t e      -> Tick t <$> rw e
+        -> Case <$> rw lz e <*> pure b <*> pure ty
+                <*> mapM (\(Alt c bs rhs) -> Alt c bs <$> rw lz rhs) alts
+      Cast e co     -> (\e' -> Cast e' co) <$> rw lz e
+      Tick t e      -> Tick t <$> rw lz e
       _             -> return expr
 
     -- An application spine: evaluate the strict arguments first.  At a call
     -- of a known function (or a jump), an argument that its demand
     -- signature makes strict is left alone: CorePrep already passes it by
     -- value.  See Note [Web strictness]
-    rw_app expr = do { (wrap, e') <- go expr 0; return (wrap e') }
+    rw_app lz expr = do { (wrap, e') <- go expr 0; return (wrap e') }
       where
         sig_strict = case collect_head expr of
           Var v | isJoinId v || idArity v > 0
@@ -410,23 +498,26 @@ rewriteProgram arg_webs res_webs binds = mapM rw_bind binds
           _     -> []
         n_args = count_args expr
 
+        -- An argument is a thunk's body, unless it is trivial
+        rw_arg a = rw (not (exprIsTrivial (stripWebForms a))) a
+
         -- n = the number of value arguments applied after this node
         go (WebApp w f a) n
-          = do { a' <- rw a
+          = do { a' <- rw_arg a
                ; (wrap_a, a'') <- case lookupUFM arg_webs w of
                    Just k | n + 1 >= k
-                          , not (by_sig (n_args - 1 - n)) -> eval a'
+                          , not (by_sig (n_args - 1 - n)) -> eval lz a'
                    _                                      -> return (id, a')
                ; (wrap_f, f') <- go f (n + 1)
                ; return (wrap_f . wrap_a, WebApp w f' a'') }
         go (App f a) n
-          = do { a' <- rw a
+          = do { a' <- if isValArg a then rw_arg a else rw lz a
                ; (wrap_f, f') <- go f (if isValArg a then n + 1 else n)
                ; return (wrap_f, App f' a') }
         go (Tick t e) n
           = do { (wrap, e') <- go e n; return (wrap, Tick t e') }
         go e _
-          = do { e' <- rw e; return (id, e') }
+          = do { e' <- rw lz e; return (id, e') }
 
         by_sig i = i >= 0 && i < length sig_strict && sig_strict !! i
 
@@ -440,11 +531,14 @@ rewriteProgram arg_webs res_webs binds = mapM rw_bind binds
     collect_head (Tick _ f)     = collect_head f
     collect_head f              = f
 
-    -- Evaluate an argument (if lifted and not already a value)
-    eval :: CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
-    eval a
+    -- Evaluate an argument (if lifted, not already a value, and, unless the
+    -- Bool says always, it would otherwise be a thunk: Note [Only evaluate
+    -- what would be a thunk])
+    eval :: Bool -> CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
+    eval lz a
       | definitelyLiftedType ty
-      , not (exprIsHNF (stripWebForms a))
+      , not (exprIsHNF a0)
+      , lz || wouldBeThunk thunks a0
       = do { v <- mkWild ty
              -- The evaluated unfolding stops a second evaluation of v
              -- (exprIsHNF), e.g. by the tails of an enclosing lambda
@@ -453,6 +547,7 @@ rewriteProgram arg_webs res_webs binds = mapM rw_bind binds
       | otherwise
       = return (id, a)
       where ty = exprType a
+            a0 = stripWebForms a
 
     -- The tail positions of a lambda's body: evaluate the strict fields of
     -- the constructor applications returned there
@@ -472,7 +567,7 @@ rewriteProgram arg_webs res_webs binds = mapM rw_bind binds
           Tick t e  -> Tick t <$> go e
           _ | Just (vals, mk) <- conApp expr
             -> do { (wraps, vals') <- unzip <$> sequence
-                                        [ if n `elem` fs then eval v else return (id, v)
+                                        [ if n `elem` fs then eval True v else return (id, v)
                                         | (n, v) <- zip [0..] vals ]
                   ; return (foldr (.) id wraps (mk vals')) }
             | otherwise -> return expr
