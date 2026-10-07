@@ -3,12 +3,12 @@
 ==================== Webs: strictness ====================
 lazy argument (exposed); no strict result fields (exposed): eta
 lazy argument (exposed); no strict result fields (exposed): r r
-lazy argument (lazy); strict result fields (#,#) [1]: n
-lazy argument (lazy); strict result fields (#,#) [1]: n
-lazy argument (lazy); strict result fields (,) [1]: n
-lazy argument (lazy); strict result fields (,) [1]: n n
 strict argument (depth 1); no strict result fields (unknown call context): n
 strict argument (depth 1); no strict result fields (unknown call context): n
+strict argument (depth 1); strict result fields (#,#) [1]: n
+strict argument (depth 1); strict result fields (#,#) [1]: n
+strict argument (depth 1); strict result fields (,) [1]: n
+strict argument (depth 1); strict result fields (,) [1]: n n
 strict argument (depth 2); no strict result fields (no calls): f
 strict argument (depth 2); no strict result fields (no calls): f
 strict argument (depth 2); no strict result fields (no calls): f

@@ -83,6 +83,24 @@ Result fields are the dual.  A call of a web has a context:
   * anything else (a lazy let, an argument, a cast, a case with DEFAULT
     alternatives): unknown.
 
+A case alternative is strict in a field binder if it evaluates it, or if
+the case is a tail of a lambda of a web w' and every tail of the
+alternative returns the binder in a field of w''s result that is strict
+(under the current assumption).  So in
+
+    \^w' n. case f @^w n of (# a, b #) -> (a, b)
+
+if w''s callers force the first field, so is w's first field forced.
+
+The two fixpoints feed each other.  If every call of a web forces field j
+of its result, a lambda that returns its parameter x in field j (in every
+tail) is strict in x, although evaluating the lambda to WHNF does not
+evaluate x: every call forces it.  So in testsuite strict006,
+bad n = (error "..", n) is strict in n, since every caller forces the
+second field, and so are the callers that pass n on.  We iterate: argument
+strictness, then result fields, then argument strictness again with them,
+until the strict-argument webs stop growing.
+
 The strict fields of a web are the intersection over its calls' contexts.
 Tail contexts make this a fixpoint too, again computed from the top: a web
 starts with "every field strict" and is lowered by its contexts until
@@ -110,13 +128,15 @@ argument only if it is not trivial, or is such a let-bound variable
 the choice less precise, never wrong: evaluating a strict argument is
 always correct.
 
-Strict result fields are the exception: a field is evaluated before the
-constructor is built even if it is a variable.  The case is redundant
-where it is, but in the next round it makes the call it scrutinises strict
-in that field, so the demand reaches the producer (in testsuite strict005,
-the worker $wp1 then evaluates g n instead of building a thunk for it).
-Arguments need no such help: passing a variable to a strict web already
-makes the lambda strict in it, within the same fixpoint.
+The same goes for strict result fields: a variable field is not evaluated
+before the constructor is built.  Doing so would cost space as well as a
+tag test: the constructor's other fields stay alive while the field is
+evaluated.  In nofib real/pic, timeStep's base case returned (dt, phi,
+heap) with dt evaluated first; forcing dt's long lazy chain there, instead
+of in the consumer after phi and heap were dead, made the GC copy 3.4%
+more (1.1% more instructions).  The demand still reaches the producer: a
+field returned in a strict field of the enclosing web's result is strict
+(Note [Web strictness fixpoints]).
 
 Inside a thunk the opposite holds: a call in a thunk's body (a lazy
 argument, a constructor field, a non-value let) evaluates even a variable
@@ -234,7 +254,8 @@ valueLams _              = 0
 
 -- | The context of a call's result.  See Note [Web strictness fixpoints]
 data Ctxt
-  = CScrut DataCon [Var] CoreExpr   -- ^ case <call> of K ys -> rhs
+  = CScrut DataCon [Var] CoreExpr Ctxt
+      -- ^ case <call> of K ys -> rhs, and the context of the case itself
   | CTail WebId                     -- ^ a tail of a lambda of this web
   | CUnknown
 
@@ -287,7 +308,7 @@ analyse binds = foldr go_bind emptyUFM binds
       Case scrut _ _ alts
         | [Alt (DataAlt dc) ys rhs] <- alts
         , isSpine scrut
-        -> go_spine (CScrut dc ys rhs) scrut $ go ctxt rhs acc
+        -> go_spine (CScrut dc ys rhs ctxt) scrut $ go ctxt rhs acc
         | otherwise
         -> go CUnknown scrut $ foldr (\(Alt _ _ rhs) -> go ctxt rhs) acc alts
       Cast e _ -> go CUnknown e acc
@@ -320,8 +341,8 @@ analyse binds = foldr go_bind emptyUFM binds
 
 -- | The webs with strict arguments: the greatest fixpoint.
 -- See Note [Web strictness fixpoints]
-strictArgWebs :: WebSet -> Infos -> StrictWebs
-strictArgWebs exposed infos = loop initial
+strictArgWebs :: WebSet -> UniqFM WebId Fields -> Infos -> StrictWebs
+strictArgWebs exposed rfs infos = loop initial
   where
     initial = mapUFM i_depth (filterUFM_Directly candidate infos)
     candidate u i = not (mkWebId u `elementOfUniqSet` exposed)
@@ -332,8 +353,25 @@ strictArgWebs exposed infos = loop initial
       where sw' = filterUFM_Directly (\u _ -> all_strict sw u) sw
 
     all_strict sw u = case lookupUFM_Directly infos u of
-      Just i  -> all (\(x, body) -> isStrictInBody sw x body) (i_lams i)
+      Just i  -> all (\(x, body) -> isStrictInBody sw x body
+                                   || returnsForced sw (lookupUFM_Directly rfs u) x body)
+                     (i_lams i)
       Nothing -> False
+
+-- | Does every tail of the lambda's body return x (or something strict in
+-- x) in a field of the result that every call of the web forces?
+-- See Note [Web strictness fixpoints]
+returnsForced :: StrictWebs -> Maybe Fields -> Id -> CoreExpr -> Bool
+returnsForced sw (Just (FFields dc fs)) x body = allTails ok (peel body)
+  where
+    ok e | Just (dc', vals) <- conAppVals e, dc' == dc
+         = or [ f && strictIn sw x v | (f, v) <- zip fs vals ]
+         | otherwise
+         = isStrictIn sw x e
+    peel (Lam _ e)      = peel e
+    peel (WebLam _ _ e) = peel e
+    peel e              = e
+returnsForced _ _ _ _ = False
 
 -- | The strict result fields of a web, during the fixpoint
 data Fields = FTop                   -- ^ No context seen yet: every field
@@ -371,12 +409,67 @@ strictResultFields exposed sw infos = loop initial
       Just i  -> foldr (meetFields . ctxt st) FTop (i_calls i)
       Nothing -> FNone "no calls"
 
-    ctxt _  (CScrut dc ys rhs) = FFields dc [ isId y && isStrictIn sw y rhs | y <- ys ]
+    ctxt st (CScrut dc ys rhs outer)
+      = FFields dc [ isId y && (isStrictIn sw y rhs || returned st outer y rhs) | y <- ys ]
     ctxt st (CTail w)          = case lookupUFM st w of
                                    Just (FNone _) -> FNone "unknown call context"
                                    Just f         -> f
                                    Nothing        -> FNone "unknown call context"
     ctxt _  CUnknown           = FNone "unknown call context"
+
+    -- The case is a tail of a lambda of web w, and every tail of rhs
+    -- returns y in a field of w's result that w's callers force (or is
+    -- strict in y itself).  See Note [Web strictness fixpoints]
+    returned st (CTail w) y rhs = case lookupUFM st w of
+      Just FTop            -> allTails (tail_ok Nothing) rhs
+      Just (FFields dc fs) -> allTails (tail_ok (Just (dc, fs))) rhs
+      _                    -> False
+      where
+        tail_ok mb e
+          | Just (dc', vals) <- conAppVals e
+          , ok_con mb dc'
+          = or [ strict_field mb j && strictIn sw y v | (j, v) <- zip [0..] vals ]
+          | otherwise
+          = isStrictIn sw y e
+        ok_con Nothing          _   = True
+        ok_con (Just (dc, _)) dc'   = dc == dc'
+        strict_field Nothing        _ = True
+        strict_field (Just (_, fs)) j = j < length fs && fs !! j
+    returned _ _ _ _ = False
+
+-- | Does p hold of every tail of the expression (through lets, case
+-- alternatives, ticks and join points bound in tail position)?
+allTails :: (CoreExpr -> Bool) -> CoreExpr -> Bool
+allTails p = go
+  where
+    go expr = case expr of
+      Let (NonRec j rhs) body
+        | isJoinId j -> go (under_lams rhs) && go body
+      Let (Rec prs) body
+        | all (isJoinId . fst) prs -> all (go . under_lams . snd) prs && go body
+      Let _ body       -> go body
+      Case _ _ _ alts  -> all (\(Alt _ _ rhs) -> go rhs) alts
+      Tick _ e         -> go e
+      _                -> p expr
+    under_lams (Lam _ e)      = under_lams e
+    under_lams (WebLam _ _ e) = under_lams e
+    under_lams e              = e
+
+-- | A saturated application of a data constructor's worker, and its value
+-- arguments
+conAppVals :: CoreExpr -> Maybe (DataCon, [CoreExpr])
+conAppVals e = case collect e [] of
+  (Var v, args)
+    | Just dc <- isDataConWorkId_maybe v
+    , let vals = [ a | a <- args, isValArg a ]
+    , length vals == dataConRepArity dc
+    -> Just (dc, vals)
+  _ -> Nothing
+  where
+    collect (App f a)      as = collect f (a : as)
+    collect (WebApp _ f a) as = collect f (a : as)
+    collect (Tick _ f)     as = collect f as
+    collect f              as = (f, as)
 
 ------------------------------------------------------------------
 --      Verdicts
@@ -432,8 +525,13 @@ strictnessRound us exposed done binds
                 , dump )
   where
     infos = analyse binds
-    sw    = strictArgWebs exposed infos
-    rfs   = strictResultFields exposed sw infos
+    -- The two fixpoints feed each other (Note [Web strictness fixpoints]):
+    -- iterate until the strict-argument webs stop growing
+    (sw, rfs) = joint (strictArgWebs exposed emptyUFM infos)
+    joint sw0 | sizeUFM sw1 == sizeUFM sw0 = (sw0, rfs0)
+              | otherwise                  = joint sw1
+      where rfs0 = strictResultFields exposed sw0 infos
+            sw1  = strictArgWebs exposed rfs0 infos
     verdicts = [ (w, verdict exposed sw rfs w i, i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , let w = mkWebId u
@@ -567,7 +665,7 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
           Tick t e  -> Tick t <$> go e
           _ | Just (vals, mk) <- conApp expr
             -> do { (wraps, vals') <- unzip <$> sequence
-                                        [ if n `elem` fs then eval True v else return (id, v)
+                                        [ if n `elem` fs then eval False v else return (id, v)
                                         | (n, v) <- zip [0..] vals ]
                   ; return (foldr (.) id wraps (mk vals')) }
             | otherwise -> return expr
