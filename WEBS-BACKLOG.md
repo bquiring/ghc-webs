@@ -64,15 +64,26 @@ a heuristic.
 - **Flow-directed code layout.** Webs give a call graph that includes
   unknown calls. Uses: order procedures so that hot callers and callees are
   adjacent, align hot entry points, and let a call fall through into its
-  continuation. Motivation: `knights` is 42% front-end bound, and identical
-  Core differed by 8% in cycles depending on placement, through fetch
-  bandwidth (top-down: fetch bandwidth 24% → 31%, cache misses down).
+  continuation. Motivation, measured 2026-10-07:
+  - nofib (`base`) loses a median **30%** of pipeline slots in the front
+    end; 54 of 112 benchmarks lose at least 30% (`tak` 60%). The back end
+    loses a median 9% (`webs-bench/topdown-nofib.py`,
+    `results/topdown-base.md`).
+  - Identical Core differed by 8% in cycles depending on placement
+    (`knights`, `early-fix` vs `early-bnd`), through fetch bandwidth
+    (24% → 31% of slots; cache misses went down). With
+    `-fproc-alignment=64` the gap disappears (4.48G vs 4.49G cycles):
+    alignment alone moves `knights` by -5% to +2%.
 - **Tag information at unknown calls.** Tell the code generator that an
   argument passed at an unknown call is already evaluated. Today GHC marks
   that only at known calls.
 
 ## Measurement notes
 
+- **Building every configuration with `-fproc-alignment=64`** would take
+  placement luck out of cycle and time comparisons (it removed `knights`'s
+  8% gap), at some cost in code size. Worth trying in `run-nofib.sh` as an
+  option.
 - Instruction counts are nearly deterministic (max 0.018% run to run).
   Paired time cancels machine drift but not code layout; see the layout rule
   in `time-nofib.py`.
@@ -81,13 +92,6 @@ a heuristic.
 - In `norm` mode, nofib's harness fails `fasta`, `k-nucleotide` and `awards`
   under every configuration (expected output, input file). They are
   dropped from timing.
-
-## Running experiments
-
-- **Top-down level 1 across nofib.** Is front-end-bound common? (For
-  layout, later.)
-- **`-fproc-alignment=64` on `knights`.** Does the 8% gap between
-  `early-fix` and `early-bnd` disappear? (For layout, later.)
 
 ## Done
 
