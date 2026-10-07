@@ -171,10 +171,30 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
     `veritas`, `x_set_tactic t = let g = .. in \xin -> (.., ..)`): tried and
     **measured a loss**: veritas splits 54 functions and allocates 0.13%
     more, because callers bind the pair with lazy patterns (it is rebuilt
-    at once) and each partial application gets one more closure. Kept as
-    commit `e5fa74a35d` on the local branch `ww-ho-cpr-experiment` (with
-    tests `wwcpr001`, `wwcpr_dump`), not on this branch. It would need a
-    consumer check like (Consumed).
+    at once) and each partial application gets one more closure. The
+    experiment is commit `e5fa74a35d` on the local branch
+    `ww-ho-cpr-experiment`.
+  - **(CprConsumed), the consumer check** (`3c232e8ff9`, on this branch):
+    CPR at a level only if some call in the module, with exactly the value
+    arguments down to the level, is scrutinised by a case with a
+    constructor alternative (`resultUses`, `ResUse`, `wo_res_uses`;
+    let-bound and top-level partial applications are followed; `let ds =
+    m s` is no consumer). Unlike (Consumed), **no local occurrence means no
+    CPR**: veritas's commands called only from `Main`'s table were the
+    whole loss. By hand on veritas: 40 splits and +0.125% with the
+    allowance, 8 splits and **-0.03%** without. Tests `wwcpr001`,
+    `wwcpr_dump` (mutation-checked); `wwhoarg006_dump` back to its old
+    golden. dmdanal 161 passes; smoke suite (run with the allowance) only
+    the 2 expected differences.
+  - **nofib, flag on (`ww-bench/results/funres-cpr`, report
+    `ww-bench/results/report-cpr.md`, against run 6's `base`): a small
+    win, kept.** It adds exactly 8 pre-ww splits, all in veritas
+    (`Display.show_com`/`show_obj`, `Goals.get_tree`/`show_goal`,
+    `Tacticals.subtrst'`, `X_interface.x_form`/`x_multi_send`/
+    `x_send_info`); veritas allocation -0.029%. Against `funres-static`:
+    program allocation -0.00%, code +0.00%, compiler allocation +0.01%;
+    nothing else changes. Against base: allocation -0.07%, code +0.11%,
+    compiler +0.58% (the statistics pass included, as for (Static)).
 - **Analysis of the argument rejections** (base, nofib rebuilt without
   running; details in `WW-HIGHER-ORDER.md` §7, finer reasons committed in
   `fedcaa9b2e`):
@@ -248,7 +268,7 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
 
 Notes to read: **[Worker/wrapper for function results]** (with sub-points
 (Depth), (Casts), (Demands), (Calls), (LetOrCase), (EtaFirst), (Small),
-(Boxity), (BoringOk)), **[Worker/wrapper for function arguments]** (with
+(Boxity), (BoringOk), (Cpr), (CprConsumed)), **[Worker/wrapper for function arguments]** (with
 (TypeParams), (Constructed) and (Consumed)), and **[Higher-order worker/wrapper
 statistics]**.
 
@@ -276,7 +296,7 @@ statistics]**.
   - `WwOpts` fields (in `GHC/Core/Opt/WorkWrap/Utils.hs`; set in
     `GHC/Driver/Config/Core/Opt/WorkWrap.hs`): `wo_fun_results`,
     `wo_pedantic_bottoms`, `wo_dicts_strict`, `wo_dmd_unbox_width`,
-    `wo_max_worker_args`, `wo_fr_wrappers`, `wo_call_lams`.
+    `wo_max_worker_args`, `wo_fr_wrappers`, `wo_call_lams`, `wo_res_uses`.
 
 ## Tests (`testsuite/tests/dmdanal/`)
 
@@ -288,14 +308,15 @@ statistics]**.
     `wwhostats001` (the statistics terminate on a never-called parameter),
     `wwcont_dump` (which functions (C) splits, with (Consumed)), and
     `wwstatic_dump` (which static-argument functions split; the worker
-    calls itself).
+    calls itself), and `wwcpr_dump` (which returned lambdas get CPR, with
+    (CprConsumed)).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
   `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`,
-  `wwstatic001`. Each
+  `wwstatic001`, `wwcpr001`. Each
   output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 159 passes. A smoke suite of 3,066 tests
+- Last results: `dmdanal` 161 passes. A smoke suite of 3,066 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
   differences and no Core Lint errors (with (Static)).
 
@@ -367,9 +388,8 @@ is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
 ## What is left to do
 
 1. **Push** the commits after `5d4c77536d` when the user asks.
-2. **(Cpr) with a consumer check**, if worth it: only where a call through
-   the returned level has its result taken apart (often through a
-   let-bound partial application, which makes the check harder).
+2. **(Cpr) with a consumer check: done** ((CprConsumed)); veritas
+   -0.03%, nothing else in nofib changes.
 3. **Remaining big rejection pools:**
    - **Static arguments: done** ((Static)), but nofib gains nothing:
      the parameters are only called with data. 24 remain (swapped
