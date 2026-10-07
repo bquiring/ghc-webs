@@ -66,8 +66,10 @@ for name in ['wwfunres002', 'wwfunres003', 'wwfunres004']:
 #              dead argument undefined
 #   wwhoarg006: function argument and function result together
 #   wwhoarg007: two function parameters, at different argument positions
-#   wwhoarg008: a recursive function passing g on (no split yet)
+#   wwhoarg008: a recursive function passing g on: split, (Static)
 #   wwhoarg009: a lambda argument lazy in x (undefined): x must not be unboxed
+#   wwstatic001: (Static): static function parameters, with traces, undefined
+#              continuations, swapped parameters and polymorphic recursion
 #   wwmix001: the split together with the ordinary split of g's argument
 #   wwmix002: returned functions from a lambda, a join point and an error
 #   wwmix003: a recursive function returning a function, with CPR
@@ -82,7 +84,7 @@ for name in ['wwdeep001', 'wwdeep002', 'wwdeep003']:
          multimod_compile_and_run, [name, '-O -fworker-wrapper-function-results'])
 test('wwdeep004', normal, compile_and_run, ['-O -fworker-wrapper-function-results -fpedantic-bottoms'])
 for name in ['wwhoarg001', 'wwhoarg002', 'wwhoarg003', 'wwhoarg004', 'wwhoarg005',
-             'wwhoarg006', 'wwhoarg007', 'wwhoarg008', 'wwhoarg009', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
+             'wwhoarg006', 'wwhoarg007', 'wwhoarg008', 'wwhoarg009', 'wwstatic001', 'wwmix001', 'wwmix002', 'wwmix003', 'wwmix004', 'wwmix005']:
     test(name, normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 
 # Two larger examples mixing cases that are split ([+]) and cases that are

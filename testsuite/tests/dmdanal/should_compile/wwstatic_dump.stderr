@@ -1,0 +1,4 @@
+ww-ho-split pre-ww loopK: arguments, depths 2
+ww-ho-split pre-ww hS: arguments, depths 2
+        __DEFAULT -> $w$wloopK q (case acc of { I# x -> I# (+# x wild) }) (-# wild 1#);
+        __DEFAULT -> let { k = *# ww 3# } in case q (\ ww1 -> I# (+# (+# (*# (+# ww1 k) (-# ww1 1#)) (*# (+# (*# ww1 2#) k) (-# ww1 2#))) (*# (+# (*# ww1 3#) k) (-# ww1 3#)))) of { I# x -> case $w$whS q (-# ww 1#) of ww1 { __DEFAULT -> +# x ww1 } };

@@ -1331,6 +1331,31 @@ Below the top (a parameter of a lambda passed to h, a depth of (B) more than
 one) the occurrences are not h's, and (C) is not tried.
 Test: wwcont_dump ([-] storeK, [+] findK).
 
+(Static) A recursive function usually passes its function parameter on
+unchanged (a static argument):
+
+    h = \g n -> let f = \x y -> e in ... g f ... h g (n - 1) ...
+
+q = g is then not only called.  Going through the wrapper would be sound but
+useless: the worker's  h g' (n-1)  would become  $wh (adapter g') (n-1), one
+more adapter per level, and g's calls would never meet the converted f'.
+Instead, at the top (the function's own parameters), a recursive call
+h @tvs .. q ..  passing q at its own position, with the function's own type
+arguments, is allowed, and the worker calls itself there with q':
+
+    $wh = \g' n -> let f = .. in ... g' f' ... $wh g' (n - 1) ...
+
+By induction on the recursion,  $wh .. (adapter g) .. = h .. g ..,  so the
+recursive call means what it did.  unwrap rewrites those calls to a
+placeholder  self  (rewriteCalls; the worker does not exist yet), and
+mkFunArgPairs binds  self = $wh @tvs  inside the worker's type lambdas.  The
+type arguments must be exactly tvs, so that q' (whose type mentions them) has
+the right type; polymorphic recursion is not split.  In the (Consumed)
+check such a call says nothing about what reaches q, so callLambdas does not
+record it.  GHC's own static argument transformation (off by default) would
+make g free in a local loop, which this split already handles; it also needs
+two static arguments.  Test: wwhoarg008 (and wwstatic001).
+
 We do not split a function with a NOINLINE pragma (its wrapper could not be
 inlined, so the adapter would only cost), nor look deeper than
 maxFunResultDepth levels of (B).  One split handles one parameter; the worker
@@ -1607,14 +1632,15 @@ argRejectReason ww_opts fn_id rhs
   | isNoInlinePragma (inlinePragInfo fn_info)        = return "NOINLINE"
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return "small (inlined whole)"
   | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
-  = let (_, vals) = span isTyVar arg_vars in
+  = let (tvs, vals) = span isTyVar arg_vars in
     if not (all (\v -> isId v && not (isCoVar v)) vals)
     then return "type parameters after value parameters"
     else do
       { -- Would (C) split it, but for the (Consumed) check?
         unconsumed <- isJust <$> funArgConv (ww_opts { wo_call_lams = Nothing }) fn_id rhs
-      ; let fun_params = [ q | q <- vals, isFunTy (idType q) ]
-            callss     = [ cs | q <- fun_params, Just cs <- [paramCalls emptyVarEnv q body] ]
+      ; let fun_params = [ (q, i) | (q, i) <- zip vals [0 ..], isFunTy (idType q) ]
+            callss     = [ cs | (q, i) <- fun_params
+                              , Just cs <- [paramCalls (Just (SelfCall fn_id tvs i)) emptyVarEnv q body] ]
             -- Some argument position known at every call (a parameter
             -- never called has no such position)
             known []              = False
@@ -1623,7 +1649,7 @@ argRejectReason ww_opts fn_id rhs
                                           | i <- [0 .. n - 1] ]
             -- Why: the first use of a parameter that is not a call; what the
             -- calls pass instead of known functions
-            not_called = [ u | q <- fun_params, Just u <- [nonCallUse fn_id q body] ]
+            not_called = [ u | (q, _) <- fun_params, Just u <- [nonCallUse fn_id q body] ]
             unknown    = [ u | cs <- callss, Just u <- [unknownArgs cs] ]
       ; return $ if null fun_params then "function only under a type"
                  else if null callss then "parameter not only called: "
@@ -1712,7 +1738,9 @@ data Conv = Conv
   { cv_unwrap :: CoreExpr -> UniqSM CoreExpr   -- ^ original value to new
   , cv_wrap   :: Id -> UniqSM CoreExpr         -- ^ new value (bound to the Id) to original
   , cv_new_ty :: Type                          -- ^ the type of the new values
-  , cv_depth  :: Int }                         -- ^ nesting: 1 for (A), 1 + inner for (B)
+  , cv_depth  :: Int                          -- ^ nesting: 1 for (A), 1 + inner for (B)
+  , cv_self   :: Maybe Id }                    -- ^ at the top: the placeholder that
+                                               -- unwrap calls for the worker (Static)
 
 -- | A value passed at an argument position
 data ArgVal = ArgLam (IdEnv Id) CoreExpr [Var]
@@ -1757,7 +1785,7 @@ funArgConv ww_opts fn_id rhs
   , not (null vals)
   , all (\v -> isId v && not (isCoVar v)) vals
   , let inner = snd (collectNBinders (length tvs) rhs)
-  = fmap (\c -> (tvs, c)) <$> lambdaConv ww_opts fn_id 1 [ArgLam emptyVarEnv inner vals]
+  = fmap (\c -> (tvs, c)) <$> lambdaConv ww_opts fn_id (Just tvs) 1 [ArgLam emptyVarEnv inner vals]
   | otherwise = return Nothing
   where
     fn_info    = idInfo fn_id
@@ -1767,14 +1795,18 @@ funArgConv ww_opts fn_id rhs
 mkFunArgPairs :: WwOpts -> Id -> CoreExpr -> ([TyVar], Conv) -> UniqSM (Id, CoreExpr, (Id, CoreExpr))
 mkFunArgPairs ww_opts fn_id rhs (tvs, conv)
              = do { inner_work <- cv_unwrap conv (snd (collectNBinders (length tvs) rhs))
-                ; let work_rhs0 = mkLams tvs inner_work
-                ; let work_rhs = simpleOptExpr simpl_opts work_rhs0
                 ; work_uniq <- getUniqueM
-                ; let work_id = mkWorkerId work_uniq fn_id (exprType work_rhs)
+                ; let work_id = mkWorkerId work_uniq fn_id (exprType (mkLams tvs inner_work))
                                   `setIdArity`     arityInfo fn_info
                                   `setIdDmdSig`    dmdSigInfo fn_info
                                   `setIdCprSig`    cprSigInfo fn_info
                                   `setInlinePragma` (inlinePragInfo fn_info) { inl_rule = FunLike }
+                  -- (Static): the recursive calls passing the parameter on
+                  -- call the worker itself
+                      work_rhs0 = mkLams tvs $ case cv_self conv of
+                        Just self -> Let (NonRec self (mkTyApps (Var work_id) (mkTyVarTys tvs))) inner_work
+                        Nothing   -> inner_work
+                      work_rhs = simpleOptExpr simpl_opts work_rhs0
                   -- The wrapper:  /\tvs -> wrap (work_id @tvs); see (TypeParams)
                 ; inst_uniq <- getUniqueM
                 ; let work_inst = mkTyApps (Var work_id) (mkTyVarTys tvs)
@@ -1803,7 +1835,7 @@ valuesConv ww_opts fn_id depth vals
   = do { mb_a <- functionsConv ww_opts fn_id v0 vs
        ; case mb_a of
            Just c  -> return (Just c)
-           Nothing -> lambdaConv ww_opts fn_id depth vals }
+           Nothing -> lambdaConv ww_opts fn_id Nothing depth vals }
   | otherwise = return Nothing
 
 -- | (A): the values are functions; split them with mkWwBodies
@@ -1825,6 +1857,7 @@ functionsConv ww_opts fn_id v0 vs
              let unwrap e = return (simpleOptExpr simpl_opts (work_fn e))
              in return (Just (Conv { cv_unwrap = unwrap
                                    , cv_depth  = 1
+                                   , cv_self   = Nothing
                                    , cv_wrap   = \v -> return (wrap_fn v)
                                    , cv_new_ty = exprType (simpleOptExpr simpl_opts (work_fn (argValExpr v0))) })) }
   | otherwise = return Nothing
@@ -1871,7 +1904,8 @@ conConv arg_ty vals
                                           ; return (mkSysLocal (fsLit "cf") u ManyTy t) }) ts
                     ; return (Case (Var c) (mkWildValBinder ManyTy new_ty) arg_ty
                                    [Alt (DataAlt (tupleDataCon Unboxed (length ts))) fs (con_app fs)]) }
-    in Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap, cv_new_ty = new_ty, cv_depth = 1 })
+    in Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap, cv_new_ty = new_ty, cv_depth = 1
+                  , cv_self = Nothing })
   | otherwise = Nothing
   where
     strip = stripTicksTopE (const True)
@@ -1907,26 +1941,38 @@ inheritCallLams fn_id work_id opts = case wo_call_lams opts of
 -- value arguments than its arity.  See (Consumed) in
 -- Note [Worker/wrapper for function arguments]
 callLambdas :: CoreProgram -> IdEnv [CallArg]
-callLambdas binds = foldl' go emptyVarEnv (concatMap rhssOfBind binds)
+callLambdas binds = foldl' (go_bind emptyVarEnv) emptyVarEnv binds
   where
-    go env e = case e of
-      Var v            -> occ env v []
+    -- selves: the functions whose right-hand side we are in, with their
+    -- value parameters
+    go_bind selves env bind
+      = foldl' (\acc (b, rhs) -> go (extendVarEnv selves b (filter isId (fst (collectBinders rhs)))) acc rhs)
+               env (flattenBinds [bind])
+    go selves env e = case e of
+      Var v            -> occ selves env v []
       App {} | (f, args) <- collectArgs e
              -> let env1 = case strip f of
-                             Var v -> occ env v args
-                             f'    -> go env f'
-                in foldl' go env1 args
-      Lam _ b          -> go env b
-      Let bind b       -> foldl' go (go env b) (rhssOfBind bind)
-      Case sc _ _ alts -> foldl' go (go env sc) [ rhs | Alt _ _ rhs <- alts ]
-      Cast b _         -> go env b
-      Tick _ b         -> go env b
+                             Var v -> occ selves env v args
+                             f'    -> go selves env f'
+                in foldl' (go selves) env1 args
+      Lam _ b          -> go selves env b
+      Let bind b       -> go_bind selves (go selves env b) bind
+      Case sc _ _ alts -> foldl' (go selves) (go selves env sc) [ rhs | Alt _ _ rhs <- alts ]
+      Cast b _         -> go selves env b
+      Tick _ b         -> go selves env b
       _                -> env
-    -- Lambda-bound variables have arity 0: not recorded
-    occ env v args
+    -- Lambda-bound variables have arity 0: not recorded.  A recursive call
+    -- passing a parameter on at its own position says nothing about what
+    -- reaches it: not recorded either (Static)
+    occ selves env v args
       | isId v, idArity v > 0
       = let vargs = filter isValArg args
-            uses  = [ CallArg i (argDmds (strip a)) | (i, a) <- zip [0 :: Int ..] vargs ]
+            own   = lookupVarEnv selves v
+            passed_on i a = case (own, strip a) of
+              (Just ps, Var x) | p : _ <- drop i ps -> x == p
+              _                                    -> False
+            uses  = [ CallArg i (argDmds (strip a)) | (i, a) <- zip [0 :: Int ..] vargs
+                                                    , not (passed_on i a) ]
                     ++ [ NoCallArgs | length vargs < idArity v ]
         in extendVarEnv_C (++) env v uses
       | otherwise = env
@@ -1939,9 +1985,12 @@ callLambdas binds = foldl' go emptyVarEnv (concatMap rhssOfBind binds)
     strip = stripTicksTopE (const True)
 
 -- | (B): the values are lambda groups, one of whose parameters is a function
--- that is only called, with values at some position that have a conversion
-lambdaConv :: WwOpts -> Id -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
-lambdaConv ww_opts fn_id depth vals
+-- that is only called, with values at some position that have a conversion.
+-- At the top (the function's own right-hand side, under its type variables
+-- top_tvs), the parameter may also be passed on by recursive calls: see
+-- (Static) in Note [Worker/wrapper for function arguments]
+lambdaConv :: WwOpts -> Id -> Maybe [TyVar] -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
+lambdaConv ww_opts fn_id top_tvs depth vals
   | Just lams <- mapM isLam vals
   , _ : _ <- lams
   , let m = minimum' [ length bs | (_, _, bs) <- lams ]
@@ -1963,7 +2012,7 @@ lambdaConv ww_opts fn_id depth vals
     -- Parameter number qi of every lambda: only called, in every lambda,
     -- with at least ri value arguments, and the values at ri convertible
     try_param qi lams m
-      | Just callss <- mapM (\(env, e, bs) -> paramCalls env (bs !! qi) (snd (splitValLams m e))) lams
+      | Just callss <- mapM (\(env, e, bs) -> paramCalls (selfCall qi) env (bs !! qi) (snd (splitValLams m e))) lams
       , let calls = concat callss
       , not (null calls)
       , let n_args = foldr (min . length . snd) maxBound calls
@@ -2000,6 +2049,8 @@ lambdaConv ww_opts fn_id depth vals
           consumes (CallArg _ (Just dmds)) | d : _ <- drop ri dmds = unboxesDmd d
           consumes _                                               = False
 
+    selfCall qi = fmap (\tvs -> SelfCall fn_id tvs qi) top_tvs
+
     -- The type of parameter qi's argument ri
     posType qi ri ((_, _, bs0) : _)
       | Just (q_args, _) <- splitValArgs (ri + 1) (idType (bs0 !! qi))
@@ -2015,6 +2066,17 @@ lambdaConv ww_opts fn_id depth vals
       , Just (q_args, q_res) <- splitValArgs (ri + 1) (idType q0)
       = do { let q_ty' = mkScaledFunTys [ Scaled mu (if i == ri then cv_new_ty inner else t)
                                         | (i, (mu, t)) <- zip [0 :: Int ..] q_args ] q_res
+             -- (Static): the worker, instantiated at top_tvs, for the
+             -- recursive calls that pass q on
+           ; mb_self <- case selfCall qi of
+               Nothing -> return Nothing
+               Just sc -> do { u <- getUniqueM
+                             ; let self_ty = mkScaledFunTys
+                                     [ Scaled (idMult b) (if i == qi then q_ty' else idType b)
+                                     | (i, b) <- zip [0 :: Int ..] (take m bs0) ]
+                                     (exprType (snd (splitValLams m e0)))
+                             ; return (Just (sc, mkSysLocal (fsLit "self") u ManyTy self_ty)) }
+           ; let
                  -- unwrap: the lambda's parameter qi becomes q', whose calls
                  -- pass  inner.unwrap e  at position ri
                  unwrap lam
@@ -2023,7 +2085,7 @@ lambdaConv ww_opts fn_id depth vals
                         ; u <- getUniqueM
                         ; let q' = mkLocalIdOrCoVar (mkSystemVarName u (fsLit "q")) (idMult q) q_ty'
                                      `setIdDemandInfo` idDemandInfo q
-                        ; body' <- rewriteCalls q q' ri (cv_unwrap inner) body
+                        ; body' <- rewriteCalls mb_self q q' ri (cv_unwrap inner) body
                         ; return (mkLams [ if i == qi then q' else b | (i, b) <- zip [0 :: Int ..] bs ] body') }
                  -- wrap: \as -> l' .. (adapter a_q) ..
                  wrap l'
@@ -2044,20 +2106,47 @@ lambdaConv ww_opts fn_id depth vals
            ; e0' <- unwrap e0
            ; return (Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap
                                 , cv_depth = 1 + cv_depth inner
+                                , cv_self = fmap snd mb_self
                                 , cv_new_ty = exprType (simpleOptExpr simpl_opts e0') })) }
       | otherwise = return Nothing
 
+-- | A recursive call that passes a parameter on unchanged: the function,
+-- its leading type variables, and the parameter's value position.
+-- See (Static) in Note [Worker/wrapper for function arguments]
+data SelfCall = SelfCall Id [TyVar] Int
+
+-- | Is this a call of the function passing the parameter q at its own
+-- position (with the function's own type arguments)?  Then its other value
+-- arguments, with the position of q.
+selfCallArgs :: Maybe SelfCall -> Id -> CoreExpr -> Maybe ([CoreExpr], Int)
+selfCallArgs (Just (SelfCall fn_id tvs qi)) q e
+  | (Var f, args) <- collectArgs e
+  , f == fn_id
+  , let (targs, rest) = splitAt (length tvs) args
+  , and (zipWith sameTv targs tvs), length targs == length tvs
+  , all isValArg rest
+  , Var v : _ <- drop qi rest
+  , v == q
+  = Just (rest, qi)
+  where
+    sameTv (Type ty) tv | Just tv' <- getTyVar_maybe ty = tv' == tv
+    sameTv _ _ = False
+selfCallArgs _ _ _ = Nothing
+
 -- | The calls of a function parameter in a body: for each, the let-bound
 -- variables in scope (for classifyArg) and its value arguments.  Nothing if
--- the parameter occurs other than as the head of a call.
-paramCalls :: IdEnv Id -> Id -> CoreExpr -> Maybe [(IdEnv Id, [CoreExpr])]
-paramCalls env0 q = go env0
+-- the parameter occurs other than as the head of a call, or (with a
+-- SelfCall) passed on unchanged by a recursive call.
+paramCalls :: Maybe SelfCall -> IdEnv Id -> Id -> CoreExpr -> Maybe [(IdEnv Id, [CoreExpr])]
+paramCalls self env0 q = go env0
   where
     go env e = case e of
       _ | (Var v, args) <- collectArgs e, v == q
         , not (null (filter isValArg args))
         -> do { rest <- concat <$> mapM (go env) args
               ; return ((env, filter isValArg args) : rest) }
+      _ | Just (vargs, qi) <- selfCallArgs self q e
+        -> concat <$> mapM (go env) [ a | (i, a) <- zip [0 :: Int ..] vargs, i /= qi ]
       Var v | v == q    -> Nothing
             | otherwise -> Just []
       Lit {}           -> Just []
@@ -2072,15 +2161,22 @@ paramCalls env0 q = go env0
       Tick _ b         -> go env b
 
 -- | Rename a function parameter q to q' and convert its calls' argument at
--- value position ri
-rewriteCalls :: Id -> Id -> Int -> (CoreExpr -> UniqSM CoreExpr) -> CoreExpr -> UniqSM CoreExpr
-rewriteCalls q q' ri conv = go
+-- value position ri.  With a SelfCall and the worker placeholder, a
+-- recursive call passing q on becomes a call of the worker passing q'.
+rewriteCalls :: Maybe (SelfCall, Id) -> Id -> Id -> Int -> (CoreExpr -> UniqSM CoreExpr)
+             -> CoreExpr -> UniqSM CoreExpr
+rewriteCalls mb_self q q' ri conv = go
   where
     go e = case e of
       _ | (Var v, args) <- collectArgs e, v == q, any isValArg args
         -> do { args' <- mapM go args
               ; args'' <- convertNth ri args'
               ; return (mkApps (Var q') args'') }
+      _ | Just (self, work) <- mb_self
+        , Just (vargs, qi) <- selfCallArgs (Just self) q e
+        -> do { vargs' <- sequence [ if i == qi then return (Var q') else go a
+                                   | (i, a) <- zip [0 :: Int ..] vargs ]
+              ; return (mkApps (Var work) vargs') }
       Var {}        -> return e
       Lit {}        -> return e
       Type {}       -> return e

@@ -148,3 +148,7 @@ test('wwhostats001', [grep_errmsg(r'ww-ho-reject')], compile,
 # that takes the pair apart: (Consumed))
 test('wwcont_dump', [grep_errmsg(r'ww-ho-split pre-ww')], compile,
      ['-O -fworker-wrapper-function-results -ddump-ww-ho-stats'])
+# (Static): which recursive functions passing their function parameter on
+# are split, and the worker's recursive calls pass the converted parameter
+test('wwstatic_dump', [grep_errmsg(r'ww-ho-split pre-ww|\$w\$w\w+ q ')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-ww-ho-stats -ddump-simpl -dsuppress-all -dsuppress-uniques -dppr-cols=400'])
