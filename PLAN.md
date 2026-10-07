@@ -88,10 +88,15 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
   passes Core Lint). Tests `wwpoly002` (late, loop, nest, mkP),
   `wwpoly_dump`. dmdanal 163 passes; smoke suite only the 2 expected
   differences.
-  - **nofib: no new splits** (checked on the 3 affected modules). eff's
-    and dom-lt's functions now fail on the next condition: "only
-    non-function arguments", and eff's interesting parameters (`>>=`,
-    `pure`) are polymorphic (`forall a b. ..`), which no conversion handles.
+  - **nofib: one new split, no effect.** The 3 functions rejected for this
+    reason before (eff's VS and VSM, dom-lt) now fail on the next
+    condition, "only non-function arguments", and eff's interesting
+    parameters (`>>=`, `pure`) are polymorphic (`forall a b. ..`), which no
+    conversion handles. But real/eff/CS's `go = \ ds @r k1 k2 k3 -> ..`,
+    which the statistics did not even count before (its parameters are
+    hidden from its type), now splits: one continuation receives a lambda
+    that unboxes its argument. CS's allocation is unchanged to the byte
+    (norm run below).
   - **Statistics change:** `takes_fun` now also counts functions with a
     manifest value binder of function type (hidden from the type by a later
     `forall` or a newtype): eff 4 -> 8. Later runs' `takes_fun` is not
@@ -356,13 +361,41 @@ EXTRA_HC_OPTS="-fworker-wrapper-function-results -dcore-lint" ./hadrian/build -j
 # nofib (about 2 hours; do not rebuild the compiler while it runs):
 ww-bench/run-all.sh          # -> ww-bench/results/report.md (base vs funres), at -O2
 NOFIB_OPT=-O1 ww-bench/run-all.sh   # -> ww-bench/results/report-O1.md
+# run times (norm mode; pinned to a performance core, configurations
+# interleaved, perf instruction counts when kernel.perf_event_paranoid <= 2):
+ww-bench/run-timing.sh build        # -> results/{base,funres}-norm, report-norm.md, bins/
+ww-bench/run-timing.sh time 10 4    # -> results/timing-norm.md (resumable)
 ```
+
+The time phase needs a quiet machine: no builds, and not while the `webs`
+branch's own benchmarks run (`~/projects/ghc-webs`, `time-nofib.py`).
 
 Accepting new dump goldens: run with `--test-accept --only=NAME`, then
 filter the `.stderr` to the lines matching the test's `grep_errmsg` pattern.
 That keeps the goldens readable; the driver compares filtered output only.
 
 ## Results so far (nofib at -O2, 115 benchmarks; `ww-bench/report-latest.md`)
+
+**Seventh run, norm mode** (2026-10-07; everything up to (TypeParams);
+`ww-bench/results/report-norm.md`, configurations `base-norm` and
+`funres-norm`, built for the timing harness). nofib's norm inputs are
+larger than the fast ones used before, so the numbers are not directly
+comparable with earlier runs:
+
+| measure                      | run 7 (norm) |
+|------------------------------|-------------:|
+| program allocation (geomean) |       -0.11% |
+| object code (text)           |       +0.14% |
+| compiler allocation          |       +0.19% |
+
+Over 0.5%: `wave4main` -9.3% (-3.3% in fast mode) and `pic` -3.1%. Pre-ww
+splits: 15 results (8 of them (Cpr) in veritas), 14 arguments (the new one
+is eff/CS's `go`). Run times: still to measure (`run-timing.sh time`).
+Both configurations compile with the statistics dumps on, so compiler
+allocation compares like with like here; the +0.58% of earlier runs
+compared a newer compiler against run 6's base.
+
+Sixth run and before (fast mode):
 
 Sixth run, with (C) and the revised (Consumed) (the third run, before (C),
 is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
@@ -428,6 +461,7 @@ is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
      changed; out of reach locally.
    - "small": by design.
 4. **Optionally an `-O1` nofib run** (`NOFIB_OPT=-O1`); cancelled once.
+
 5. Type parameters after value parameters: **done**. Polymorphic function
    parameters (`bind :: forall a b. ..`, called at several types) remain:
    the conversion would have to be polymorphic.
@@ -435,10 +469,14 @@ is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
 7. **An interaction to keep in mind:** the eta-expansion rule (EtaFirst)
    assumes GHC will eta-expand, which it does not under `-fpedantic-bottoms`
    with a bottoming branch (found in `wwcast002`).
-8. **Before proposing upstream:** measure runtime (`NoFibRuns=5` on a quiet
-   machine); the timings on this machine are unreliable. Also measure
-   compile time, and run the full testsuite (not just the smoke subset)
-   with the flag on.
+8. **Before proposing upstream:** measure run time; the harness is ready
+   (`ww-bench/timing.py`, `run-timing.sh`, `perf-wrap.sh`; `perf` was
+   unblocked with `kernel.perf_event_paranoid = 2`). Tested on veritas:
+   instruction counts vary by under 0.0001% between runs, MUT time by
+   about 1.3%. The norm-mode builds (`base-norm`, `funres-norm`) are done
+   and stashed; the timing phase (`run-timing.sh time`) is still to run, on
+   a quiet machine. Also measure compile time, and run the full testsuite
+   (not just the smoke subset) with the flag on.
 9. **Housekeeping:** `build-setup.log` and the `ww-bench/results*`
    directories are untracked or ignored (`results-run3`: third run;
    `results-run4`: (C) without the consumer check).
