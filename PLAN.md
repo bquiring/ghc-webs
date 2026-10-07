@@ -73,7 +73,49 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
 8. **Data structures of functions are out of scope.** They would rely on
    downstream fusion.
 
-## Current state (2026-10-06)
+## Current state (2026-10-07)
+
+- **(Static), static function parameters** (`8ad8e9769a`; (Static) in
+  Note [Worker/wrapper for function arguments]): a recursive call
+  `h @tvs .. q ..` passing the parameter on at its own position, with the
+  function's own type arguments, no longer blocks the split. The worker
+  calls itself there with `q'`, via a placeholder bound to `$wh @tvs`
+  (`SelfCall`, `selfCallArgs`, `cv_self`). For (Consumed) such a call is
+  not recorded. Tests `wwstatic001` (mutation-checked: without the type
+  argument check, polymorphic recursion fails Core Lint), `wwstatic_dump`;
+  `wwhoarg008` now splits.
+  - **nofib (flag on only, `ww-bench/results/funres-static`, against run 6's
+    `base`): no new splits, no change** (allocation -0.07%, code +0.10%).
+    Of the 162 "passed to a recursive call" rejections, 138 now fail on
+    the next condition, "not given known functions: only non-function
+    arguments" (131 -> 267): `map`/`zipWith`-like loops calling the
+    parameter with data, as the Core reading predicted. 24 remain
+    (parameters swapped, as in minimax's `repTree f g = .. repTree g f ..`,
+    polymorphic recursion, or q also used elsewhere).
+  - Compiler allocation reads +0.57% against base, against +0.18% in run 6,
+    but run 6 predates the `ww-ho-papp` statistic. Measured directly (old and
+    new compiler, 4 programs): (Static) costs at most +0.1% with
+    `-ddump-ww-ho-stats` and about +0.01% without. The statistics pass
+    itself costs about 3% of compiler allocation, in every configuration.
+- **Inliner sweep** (`-funfolding-use-threshold` 45, 20, 0 instead of the
+  default 90, flag on; `ww-bench/results/inl{45,20,0}`, statistics only;
+  the pipeline before pre-ww is gentle simplifier, specialise, float out,
+  main simplifier phases 2-0, float in, call arity, demand analysis):
+
+  | threshold                   | 90       | 45       | 20      | 0      |
+  |-----------------------------|---------:|---------:|--------:|-------:|
+  | functions taking a function |      632 |      644 |     733 |    722 |
+  | argument splits (pre-ww)    |       13 |       18 |      23 |     24 |
+  | result splits (pre-ww)      |        7 |        4 |       4 |      4 |
+  | "small" rejections (a / r)  | 174 / 70 | 122 / 50 | 97 / 31 | 37 / 6 |
+  | program allocation vs 90    |          |    +2.6% |   +9.9% | +16.1% |
+
+  The new splits are one-line accessors the inliner removes anyway
+  (infer's `getSX`/`putSX`/`returnSX`, hpg's `push_lambda`). Most of the
+  functions no longer "small" fail elsewhere: callers stop passing known
+  lambdas ("not given known functions" 131 -> 243, result "tail: call"
+  83 -> 165). Inlining creates our opportunities more than it hides them,
+  and the static pool hardly moves (162 -> 134).
 
 - **(C), continuations called with constructed data**, is implemented
   ((Constructed) in Note [Worker/wrapper for function arguments];
@@ -244,15 +286,18 @@ statistics]**.
   - `wwreturn002_funres`, `wwreturn003_funres`, `wwfunres005`,
     `wwdeep_dump`, `wwmix002_dump`, `wwhoarg001/002/006_dump`,
     `wwhostats001` (the statistics terminate on a never-called parameter),
-    and `wwcont_dump` (which functions (C) splits, with (Consumed)).
+    `wwcont_dump` (which functions (C) splits, with (Consumed)), and
+    `wwstatic_dump` (which static-argument functions split; the worker
+    calls itself).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
-  `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`. Each
+  `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`,
+  `wwstatic001`. Each
   output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 157 passes. A smoke suite of 3,066 tests
+- Last results: `dmdanal` 159 passes. A smoke suite of 3,066 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
-  differences and no Core Lint errors (with (C)).
+  differences and no Core Lint errors (with (Static)).
 
 ## How to build, test and measure
 
@@ -326,11 +371,12 @@ is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
    the returned level has its result taken apart (often through a
    let-bound partial application, which makes the check harder).
 3. **Remaining big rejection pools:**
-   - **Static arguments (162):** recursive functions passing the function
-     parameter on unchanged (`wwhoarg008`). Either a SAT-style step in our
-     split (the worker's recursive call passes the converted `g'`), or SAT
-     for a single static function argument before worker/wrapper. The hand
-     SAT form already splits.
+   - **Static arguments: done** ((Static)), but nofib gains nothing:
+     the parameters are only called with data. 24 remain (swapped
+     parameters, polymorphic recursion).
+   - "only non-function arguments" (267 with (Static)): first-order uses
+     of the parameter (`map f`); not a worker/wrapper target, except by
+     (C) when the data is constructed at every call.
    - "result tail is a local variable" / parameter returned (29):
      continuation parameters. Needs the argument and result conversions
      combined.
