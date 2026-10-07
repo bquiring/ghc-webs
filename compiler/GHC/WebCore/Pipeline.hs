@@ -33,6 +33,7 @@ import GHC.Utils.Panic
 import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
+import GHC.WebCore.Boundary ( splitBoundary )
 import GHC.WebCore.Erase
 import GHC.WebCore.Lint
 import GHC.WebCore.Rename
@@ -93,7 +94,13 @@ webPass early guts
        ; logger <- getLogger
        ; us     <- liftIO (mkSplitUniqSupply webUniqueTag)
 
-       ; let binds0 = mg_binds guts
+       ; us0    <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let -- 0. Split exposed webs at the module boundary (early run only)
+             -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
+             binds0 | early, gopt Opt_CoreWebsBoundary dflags
+                    = splitBoundary (unfoldingOpts dflags) us0 (mg_rules guts) (mg_binds guts)
+                    | otherwise
+                    = mg_binds guts
              cfg    = webLintConfig dflags
 
              -- 1. Annotation

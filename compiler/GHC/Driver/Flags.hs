@@ -656,6 +656,8 @@ data GeneralFlag
    | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
+   | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
+                            --   module boundary by eta-expansion
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -935,6 +937,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsConstProp
    , Opt_CoreWebsInline
    , Opt_CoreWebsEarly
+   , Opt_CoreWebsBoundary
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

@@ -1023,6 +1023,7 @@ Library
         GHC.CmmToAsm.Wasm.Utils
 
         GHC.WebCore.Annotate
+        GHC.WebCore.Boundary
         GHC.WebCore.Compare
         GHC.WebCore.Erase
         GHC.WebCore.FirstClass

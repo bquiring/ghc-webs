@@ -1,0 +1,17 @@
+[1 of 2] Compiling Main             ( boundary002.hs, boundary002.o )
+
+==================== Webs: dead parameters ====================
+rejected (exposed): eta
+rejected (used parameter): _ys
+rejected (used parameter): ds
+rejected (used parameter): eta
+rejected (used parameter): f
+rejected (used parameter): k
+rejected (used parameter): n
+rejected (used parameter): x
+rejected (used parameter): xs
+rejected (used parameter): y
+unit (last argument, early): ds
+
+
+[2 of 2] Linking boundary002

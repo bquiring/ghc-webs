@@ -163,3 +163,16 @@ test('wwreturn002', [grep_errmsg(r'\\ x _ ->|^\$wg |= g [nm] |h[12] [ab] [ab]')]
      ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
 test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12] [ab] [ab]|^\$wg$')], compile,
      ['-O -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds'])
+
+# Note [Splitting webs at the boundary] (GHC.WebCore.Boundary,
+# -fcore-webs-boundary).  boundary001 splits an exported function, 002
+# eta-expands the argument of an imported one; their dumps show the dead
+# parameter going.  003 checks sharing (the trace appears once).  004 does
+# not split a small exported function; its dump shows the web exposed.
+bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params'
+            ' -fcore-webs-strictness')
+for n in range(1, 5):
+    test('boundary%03d' % n, [], compile_and_run, [bnd_opts])
+for n in [1, 2, 4]:
+    test('boundary%03d_dump' % n, [extra_files(['boundary%03d.hs' % n])],
+         multimod_compile, ['boundary%03d' % n, bnd_opts + ' -ddump-webs-dead-params -dsuppress-uniques'])
