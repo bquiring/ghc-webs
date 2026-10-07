@@ -14,10 +14,10 @@ a heuristic.
 
 ## Now
 
-- **Regression audit of the early pass.** On user-space instructions against
-  `base` (`results/timing-boundary4.md`): `ida` +2.7%, `pic` +1.1%,
-  `transform` +0.5%. Method: bisect by module, as for `gamteb`, then trace
-  to a pass and a verdict.
+- **Regression audit of the early pass.** `ida` and `pic` are fixed (see
+  Done). Left: `transform` +0.5% instructions. Re-check the full list after
+  the validation run (`results/timing-audit.md`). Method: turn passes off
+  one at a time, bisect by module, then diff the Core.
 - **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
   solving, renaming and erasure, with statistics only. Measure how many
   data webs are local on nofib, per type constructor.
@@ -99,3 +99,9 @@ a heuristic.
 - Boundary split, with its heuristics and fixes: `52d79ed9f2`.
 - Early result raising leaves known-call webs to worker/wrapper: `0c771d56b2`.
 - Runtime measurement (`time-nofib.py`): `8aa66dad95`.
+- Strictness evaluates an argument at the call only if it would otherwise be
+  a thunk, or inside a thunk (`ida` +2.7% → 0.0%, `ansi` keeps −3.9%):
+  `5e800f524b`.
+- Strict result fields propagate through the analysis instead of extra
+  cases; argument and result-field strictness are one fixpoint (`pic`
+  +1.1% → 0.0%): `7d6e45b09c`.
