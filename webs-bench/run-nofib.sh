@@ -11,6 +11,10 @@
 #   dumps/         per-module dumps, mirroring the nofib tree:
 #                    *.dump-first-class-stats   (GHC.WebCore.FirstClass)
 #                    *.dump-simpl-stats         (simplifier/inliner ticks)
+#                    *.dump-webs-*              (verdicts of each web transformation)
+#   bin/           each benchmark's executable, mirroring the nofib tree
+#   runs.tsv       how to run each one in TIMING_MODE (default norm), for
+#                  time-nofib.py: benchmark, directory, runstdtest command
 # Set NOFIB_MODE (default fast) and NOFIB_DIRS (default: nofib's own default
 # set of benchmark directories) to change what runs.
 #
@@ -28,6 +32,9 @@ OPTS=${2:-}
 MODE=${NOFIB_MODE:-fast}
 OUT=$ROOT/webs-bench/results/$NAME
 DUMPDIR=webs-dumps-$NAME
+VERDICTS="-ddump-webs-inline -ddump-webs-const-prop -ddump-webs-arity-raise -ddump-webs-dead-params
+          -ddump-webs-uncurry -ddump-webs-result-raise -ddump-webs-strictness"
+VERDICTS=$(echo $VERDICTS)
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -46,7 +53,7 @@ make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&
 echo "[$NAME] build and run (options: $OPTS)"
 timeout --kill-after=60 "$CONFIG_TIMEOUT" \
 make -k WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
-     EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats" \
+     EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats $VERDICTS" \
      > "$OUT/nofib.log" 2>&1
 status=$?
 echo "[$NAME] make exit code: $status" | tee "$OUT/exit-code"
@@ -56,6 +63,25 @@ echo "[$NAME] collecting dumps"
 find . -type d -name "$DUMPDIR" | while read -r d; do
   bench=$(dirname "$d" | sed 's|^\./||')
   mkdir -p "$OUT/dumps/$bench"
-  cp "$d"/*.dump-first-class-stats "$d"/*.dump-simpl-stats "$OUT/dumps/$bench/" 2>/dev/null
+  cp "$d"/*.dump-first-class-stats "$d"/*.dump-simpl-stats "$d"/*.dump-webs-* "$OUT/dumps/$bench/" 2>/dev/null
 done
+
+# Keep the executables, which the next configuration's clean deletes, so
+# time-nofib.py can time the configurations against each other later.  The
+# run command comes from nofib itself (make -n), in TIMING_MODE.
+TIMING_MODE=${TIMING_MODE:-norm}
+echo "[$NAME] keeping executables (run commands for mode $TIMING_MODE)"
+: > "$OUT/runs.tsv"
+find . -type d -name "$DUMPDIR" | sort | while read -r d; do
+  dir=$(dirname "$d" | sed 's|^\./||')
+  cmd=$(cd "$dir" && make -n -s runtests mode="$TIMING_MODE" NoFibRuns=1 WithNofibHc="$GHC" 2>/dev/null \
+        | grep -m1 'runstdtest ' | sed 's/;[[:space:]]*$//')
+  exe=$(echo "$cmd" | awk '{print $2}')
+  if [ -n "$cmd" ] && [ -x "$dir/$exe" ]; then
+    mkdir -p "$OUT/bin/$dir"
+    cp "$dir/$exe" "$OUT/bin/$dir/"
+    printf '%s\t%s\t%s\n' "$(basename "$dir")" "$dir" "$cmd" >> "$OUT/runs.tsv"
+  fi
+done
+echo "[$NAME] kept $(wc -l < "$OUT/runs.tsv") executables"
 echo "[$NAME] done: $OUT"
