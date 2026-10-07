@@ -6,10 +6,10 @@ lazy argument (lazy); no strict result fields (no calls): f
 lazy argument (lazy); no strict result fields (no calls): f
 lazy argument (lazy); no strict result fields (unknown call context): n
 lazy argument (lazy); no strict result fields (unknown call context): n
-lazy argument (lazy); no strict result fields (unknown call context): n
 lazy argument (lazy); strict result fields (#,#) [1]: n
 lazy argument (lazy); strict result fields (#,#) [1]: n
 lazy argument (lazy); strict result fields (,) [1]: n n
+strict argument (depth 1); no strict result fields (unknown call context): n
 strict argument (depth 2); no strict result fields (no calls): b
 strict argument (depth 2); no strict result fields (no calls): f
 

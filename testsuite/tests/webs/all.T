@@ -80,7 +80,8 @@ test('webs006', [extra_files(['Webs006A.hs'])], multimod_compile_and_run,
      ['webs006', webs_opts + ' -fcore-webs-arity-raise -fcore-webs-dead-params -fcore-webs-uncurry'])
 
 # Web strictness (GHC.WebCore.Transform.Strictness).  strict002, 003, 004,
-# 006 and 007 check laziness and sharing; 004 counts evaluations with
+# 006, 007, 010 and 012 check laziness and sharing; 009 and 011 check the
+# fixpoints across webs; 004 counts evaluations with
 # Debug.Trace (the expected stderr).
 st_opts = webs_opts + ' -fcore-webs-strictness'
 
@@ -89,7 +90,7 @@ def strict_test(name):
     test(name + '_dump', [extra_files([name + '.hs'])],
          multimod_compile, [name, st_opts + ' -ddump-webs-strictness -dsuppress-uniques'])
 
-for n in range(1, 9):
+for n in range(1, 13):
     strict_test('strict%03d' % n)
 
 # Result raising (GHC.WebCore.Transform.ResultRaise).  resultraise002
