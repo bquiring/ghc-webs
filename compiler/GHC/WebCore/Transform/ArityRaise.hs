@@ -4,7 +4,7 @@
 module GHC.WebCore.Transform.ArityRaise
   ( arityRaiseRound
     -- * Products, shared with result raising
-  , productCon, productOf, components, splitArgCo, componentsTupleCo
+  , productCon, productOf, components, splitArgCo, componentsTupleCo, knownHead
   , isStrictIn
   ) where
 

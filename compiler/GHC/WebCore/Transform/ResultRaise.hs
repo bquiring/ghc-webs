@@ -38,7 +38,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
 import GHC.WebCore.Transform.ArityRaise ( productCon, productOf, components
-                                        , splitArgCo, componentsTupleCo )
+                                        , splitArgCo, componentsTupleCo, knownHead )
 import GHC.WebCore.Transform.Common
 import GHC.WebCore.Traverse ( stripWebForms )
 
@@ -75,9 +75,25 @@ that re-boxes it is inside the thunk).  Webs of join-point lambdas are
 rejected: their calls are jumps, which cannot be scrutinised.
 -}
 
+{- Note [Early result raising]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+As for arity raising (Note [Early arity raising] in
+GHC.WebCore.Transform.ArityRaise): in the early run, worker/wrapper runs
+after the web pipeline, and for a web whose calls are all known it does what
+result raising does, and more.  Its CPR is nested (a Double field of the
+result is returned as a Double#), and it unboxes strict arguments in the
+same worker; a function whose result is raised here no longer gets either.
+So the early run raises only webs with an unknown call.  (Splitting webs at
+the boundary, Note [Splitting webs at the boundary] in GHC.WebCore.Boundary,
+makes many such webs: the local copy of an exported function is called only
+by known calls.  In nofib real/gamteb, raising PhotoElec.photoElec's that
+way left its worker taking a boxed particle and returning a boxed one:
++0.8% allocation.)
+-}
+
 data Verdict = Raised | Rejected Reason
 
-data Reason = Exposed | NotProduct | RepPoly | Coercion' | JoinLam
+data Reason = Exposed | NotProduct | RepPoly | Coercion' | JoinLam | KnownCalls
             | Unconstructed | NoConstruction
 
 instance Outputable Verdict where
@@ -92,6 +108,7 @@ instance Outputable Reason where
   ppr JoinLam        = text "join point"
   ppr Unconstructed  = text "a tail does not construct the result"
   ppr NoConstruction = text "no tail constructs the result"
+  ppr KnownCalls     = text "only known calls (early: left to worker/wrapper)"
 
 ------------------------------------------------------------------
 --      Analysis
@@ -105,10 +122,11 @@ data Info = Info
   , i_rep_poly  :: Bool
   , i_coercion  :: Bool
   , i_bad_tail  :: Bool
-  , i_con_tails :: Int }
+  , i_con_tails :: Int
+  , i_unknown   :: Bool }   -- Some call of the web is not a known call
 
 noInfo :: Info
-noInfo = Info [] False False [] False False False 0
+noInfo = Info [] False False [] False False False 0 False
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
@@ -118,7 +136,8 @@ plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
                     , i_rep_poly  = i_rep_poly a || i_rep_poly b
                     , i_coercion  = i_coercion a || i_coercion b
                     , i_bad_tail  = i_bad_tail a || i_bad_tail b
-                    , i_con_tails = i_con_tails a + i_con_tails b }
+                    , i_con_tails = i_con_tails a + i_con_tails b
+                    , i_unknown   = i_unknown a  || i_unknown b }
 
 type Infos = UniqFM WebId Info
 
@@ -208,7 +227,9 @@ analyse binds = foldr go_bind emptyUFM binds
     go (Var {}) acc = acc
     go (Lit {}) acc = acc
     go (App f a) acc = go f (go a acc)
-    go (WebApp _ f a) acc = go f (go a acc)
+    go (WebApp w f a) acc
+      | knownHead f = go f (go a acc)
+      | otherwise   = note w (noInfo { i_unknown = True }) (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc
       = go_bndr p $ go e $
@@ -263,10 +284,11 @@ analyse binds = foldr go_bind emptyUFM binds
       SubCo c                -> go_co c acc
       _                      -> acc   -- complexCoWebs deals with the others
 
-verdict :: WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict exposed complex w i
+verdict :: Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict early exposed complex w i
   | w `elementOfUniqSet` exposed  = Rejected Exposed
   | i_join i                      = Rejected JoinLam
+  | early, not (i_unknown i)      = Rejected KnownCalls   -- Note [Early result raising]
   | w `elementOfUniqSet` complex  = Rejected Coercion'
   | i_coercion i                  = Rejected Coercion'
   | i_not_prod i                  = Rejected NotProduct
@@ -293,7 +315,7 @@ resultRaiseRound us exposed pol done binds
   where
     infos    = analyse binds
     complex  = complexCoWebs binds
-    verdicts = [ (w, verdict exposed complex w i, i)
+    verdicts = [ (w, verdict (up_early pol) exposed complex w i, i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , let w = mkWebId u
                , not (null (i_lams i))
