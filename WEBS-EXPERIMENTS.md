@@ -234,6 +234,29 @@ How the regressions were fixed (each in a Note):
   constructor's other fields alive (same Note; the demand now propagates
   through the analysis, Note [Web strictness fixpoints]).
 
+## 6. Defunctionalisation (first version)
+
+`early-df` is `early-fix` plus `-fcore-webs-defunc` (`WEBS-DEFUNC.md`), built
+with `-dcore-lint`: no Core Lint or Web Lint errors on nofib. Verdicts over
+all webs (`results/verdicts-defunc.md`):
+
+| verdict | webs |
+|---|---|
+| exposed | 7,782 |
+| no unknown calls | 3,668 |
+| polymorphic | 1,134 |
+| in a coercion | 34 |
+| known calls | 14 |
+| shared lambda binders | 4 |
+| **defunctionalised** | **22** (17 benchmarks) |
+
+Of the local webs with unknown calls (about 1,200), 94% are rejected for
+being polymorphic. That is the next step (a GADT encoding).
+
+Against `early-fix`, in instructions: `mate` −4.7% (−8.0% against `base`;
+time −11.8% against `base`), `treejoin` +0.3% (cycles −1.2%); every other
+benchmark within ±0.1%.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

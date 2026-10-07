@@ -14,10 +14,12 @@ a heuristic.
 
 ## Now
 
-- **Defunctionalisation** (Survey §13; design in `WEBS-DEFUNC.md`): a local
-  web with a small set of lambdas becomes a data type, one constructor per
-  lambda holding its free variables; every call becomes a call of an apply
-  function that cases on it. Unknown calls disappear.
+- **Defunctionalisation, polymorphic webs** (`WEBS-DEFUNC.md`): 94% of the
+  local webs with unknown calls are rejected as polymorphic (1,134 on
+  nofib). Needs a GADT encoding, `D_w a b`, with an equality per
+  constructor.
+- **Defunctionalisation, webs with known calls** (14 on nofib): keep the
+  function for its known calls, and the constructor where it escapes.
 
 ## Next
 
@@ -124,3 +126,6 @@ a heuristic.
 - Regression audit of the early pass: no benchmark worse than +0.3%
   instructions; `CS` −5.3%, `solid` −5.1%, `dom-lt` −4.7%, `ansi` −3.9%,
   `mate` −3.5% (`WEBS-EXPERIMENTS.md` §5).
+- Defunctionalisation, first version (monomorphic webs, unknown calls only):
+  22 webs on nofib; `mate` −4.7% instructions more, −11.8% time against
+  `base` (`WEBS-EXPERIMENTS.md` §6): `8737fb55c4`.
