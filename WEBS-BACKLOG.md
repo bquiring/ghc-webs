@@ -14,6 +14,13 @@ a heuristic.
 
 ## Now
 
+- **Defunctionalisation** (Survey §13; design in `WEBS-DEFUNC.md`): a local
+  web with a small set of lambdas becomes a data type, one constructor per
+  lambda holding its free variables; every call becomes a call of an apply
+  function that cases on it. Unknown calls disappear.
+
+## Next
+
 - **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
   solving, renaming and erasure, with statistics only. Measure how many
   data webs are local on nofib, per type constructor.
@@ -25,11 +32,23 @@ a heuristic.
 - **Local newtypes** (Survey §14): a newtype that is not exported gets
   ordinary webs on its axiom, so functions in a local `State` monad become
   transformable.
-- **Defunctionalisation** (Survey §13): a local web with few lambdas becomes
-  a data type, with a `case` at each call.
+- **Constructed-argument raising** (Survey §8): if every call of a web
+  passes an explicit constructor application, unbox it even if a lambda is
+  lazy in it (each lambda rebuilds it, a value). What SpecConstr does by
+  copying. A second eligibility rule in `ArityRaise.hs`.
+- **Nested unboxing** (Survey §1): arity raising unboxes one level; GHC
+  unboxes a pair of pairs recursively.
+- **Uncurrying in the early run** (Survey §11): off there today (Note [No
+  early uncurrying]: worker/wrapper does not unbox tuple components, and
+  T10830 overflows its stack). Also: uncurry across cheap work between the
+  lambdas, as GHC's arity analysis allows.
+- **Constants of non-closed type** (Survey §9, §10): constant propagation
+  handles closed constants, including global dictionaries; a constant whose
+  type mentions the web's type variables needs specialisation. The static
+  argument transformation is the recursive-call case. Low priority.
 - **Boundary split: imported functions.** Eta-expand an imported function
   used as a value in local higher-order code, not only the arguments passed
-  to one. Deferred on purpose: measure the current split first.
+  to one. (The current split is measured now: `WEBS-EXPERIMENTS.md` §5.)
 - **Richer demands in web strictness.** Nested demands (strict in a field of
   a product argument), call demands (an argument always called with n
   arguments), cardinality.
@@ -38,6 +57,7 @@ a heuristic.
   float work into lambdas and to eta-expand.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
+- **Call demands and cardinality** are under "Richer demands" above.
 - **Compile time.** The early pipeline costs +10–11% compiler allocation on
   nofib. Web Lint runs once per round of each transformation.
 

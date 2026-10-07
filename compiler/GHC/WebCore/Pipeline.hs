@@ -24,6 +24,8 @@ import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
 
 import GHC.Unit.Module.ModGuts
+import GHC.Unit.Module ( Module )
+import GHC.Core.TyCon ( TyCon )
 
 import GHC.Data.Bag
 import GHC.Utils.Error ( DiagOpts, MessageClass(..), pprMessageBag, ghcExit )
@@ -47,6 +49,7 @@ import GHC.WebCore.Transform.Strictness ( strictnessRound )
 import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
 import GHC.WebCore.Transform.ConstProp ( constPropRound )
 import GHC.WebCore.Transform.Inline ( inlineRound )
+import GHC.WebCore.Transform.Defunc ( defuncProgram )
 import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
 import GHC.Core.TyCo.Rep
@@ -129,7 +132,16 @@ webPass early guts
        ; checkSolved "renaming" res2
 
          -- Transformations
-       ; (binds_t, transformed) <- runTransforms early logger dflags cfg sigs2 binds2
+       ; (binds_t0, transformed0) <- runTransforms early logger dflags cfg sigs2 binds2
+
+         -- Defunctionalisation runs last: it changes the arrow types of the
+         -- webs it handles into new data types
+         -- See Note [Defunctionalisation] in GHC.WebCore.Transform.Defunc
+       ; (binds_t, new_tcs, defunced) <-
+           if gopt Opt_CoreWebsDefunc dflags
+           then runDefunc early logger dflags cfg (mg_module guts) sigs2 binds_t0
+           else return (binds_t0, [], False)
+       ; let transformed = transformed0 || defunced
 
        ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
            pprWebSummary (ws_exposed sigs2) binds_t
@@ -148,7 +160,27 @@ webPass early guts
        ; when (gopt Opt_DoCoreLinting dflags && not transformed) $
            checkRoundTrip binds0 binds3
 
-       ; return (guts { mg_binds = binds3 }) }
+       ; return (guts { mg_binds = binds3, mg_tcs = mg_tcs guts ++ new_tcs }) }
+
+-- | Defunctionalise, check the result with Web Lint, and dump the verdicts.
+-- Returns the new program, the new type constructors, and whether anything
+-- changed.
+runDefunc :: Bool -> Logger -> DynFlags -> LintConfig -> Module -> WebSigs -> CoreProgram
+          -> CoreM (CoreProgram, [TyCon], Bool)
+runDefunc early logger dflags cfg this_mod sigs binds
+  = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let pol = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
+             (res, vs) = defuncProgram this_mod pol us (ws_exposed sigs) binds
+       ; dump logger Opt_D_dump_webs_defunc "Webs: defunctionalisation" $
+           pprWebVerdicts [ (v, bs) | (_, v, _, bs) <- vs ]
+       ; case res of
+           Nothing -> return (binds, [], False)
+           Just (binds', tcs) ->
+             do { let what = "defunctionalisation"
+                      lres = lintWebProgram cfg sigs binds'
+                ; reportWebLint logger dflags what binds' lres
+                ; checkSolved what lres
+                ; return (binds', tcs, True) } }
 
 
 -- | After renaming, the only constraints left must be with arrows without

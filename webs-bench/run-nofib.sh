@@ -32,7 +32,7 @@ OPTS=${2:-}
 MODE=${NOFIB_MODE:-fast}
 OUT=$ROOT/webs-bench/results/$NAME
 DUMPDIR=webs-dumps-$NAME
-VERDICTS="-ddump-webs-inline -ddump-webs-const-prop -ddump-webs-arity-raise -ddump-webs-dead-params
+VERDICTS="-ddump-webs-inline -ddump-webs-const-prop -ddump-webs-arity-raise -ddump-webs-dead-params -ddump-webs-defunc
           -ddump-webs-uncurry -ddump-webs-result-raise -ddump-webs-strictness"
 VERDICTS=$(echo $VERDICTS)
 

@@ -491,6 +491,7 @@ data DumpFlag
    | Opt_D_dump_webs_result_raise -- ^ Web pipeline: result raising verdicts
    | Opt_D_dump_webs_const_prop  -- ^ Web pipeline: constant propagation verdicts
    | Opt_D_dump_webs_inline      -- ^ Web pipeline: super-beta inlining verdicts
+   | Opt_D_dump_webs_defunc      -- ^ Web pipeline: defunctionalisation verdicts
    | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and
                                   --   after the Core pipeline
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
@@ -654,6 +655,7 @@ data GeneralFlag
    | Opt_CoreWebsResultRaise -- ^ Web pipeline: result raising (web CPR)
    | Opt_CoreWebsConstProp  -- ^ Web pipeline: constant propagation
    | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
+   | Opt_CoreWebsDefunc     -- ^ Web pipeline: defunctionalisation
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
    | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
@@ -936,6 +938,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsResultRaise
    , Opt_CoreWebsConstProp
    , Opt_CoreWebsInline
+   , Opt_CoreWebsDefunc
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
    , Opt_Specialise

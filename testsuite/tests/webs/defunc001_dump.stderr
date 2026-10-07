@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( defunc001.hs, defunc001.o )
+
+==================== Webs: defunctionalisation ====================
+defunctionalised (2 constructors): y y
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): r r
+not defunctionalised (no unknown calls): f
+not defunctionalised (no unknown calls): x
+
+
+[2 of 2] Linking defunc001

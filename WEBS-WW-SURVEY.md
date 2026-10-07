@@ -58,8 +58,9 @@ to `compiler/`.
 - **Laziness:** the call is already evaluated where its result is demanded,
   and the re-box is in the same place, so nothing is forced earlier. A lazy
   call (`let r = f x in ..`) stays a thunk whose body is the case.
-- **Status:** not done. **High value**, and the natural next pass: it
-  complements arity raising (arguments ↔ results).
+- **Status:** done: result raising (`WEBS-RESULT-RAISING.md`,
+  `Transform/ResultRaise.hs`). In the early run, webs whose calls are all
+  known are left to GHC's worker/wrapper (Note [Early result raising]).
 
 ## 4. Calling-convention unlifting (call-by-value arguments)
 
@@ -78,8 +79,8 @@ to `compiler/`.
   strict in their argument (and not curried, as in arity raising §2), evaluate
   the argument at every call (`case a of a' -> f @^w a'`) and mark the
   lambdas' binders as evaluated (CBV marks, after Tidy).
-- **Status:** not done. **High value:** it is the case the GHC Note calls out
-  as blocked on knowing all call sites.
+- **Status:** done: web strictness (`WEBS-STRICTNESS.md`,
+  `Transform/Strictness.hs`), with fixpoints across webs.
 
 ## 5. Thunk splitting
 

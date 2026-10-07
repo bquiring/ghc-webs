@@ -1,0 +1,15 @@
+[1 of 2] Compiling Main             ( defunc004.hs, defunc004.o )
+
+==================== Webs: defunctionalisation ====================
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): r eta r
+not defunctionalised (exposed): y
+not defunctionalised (known calls): i
+not defunctionalised (no unknown calls): f
+not defunctionalised (no unknown calls): m
+not defunctionalised (no unknown calls): x
+not defunctionalised (polymorphic): f
+not defunctionalised (polymorphic): x
+
+
+[2 of 2] Linking defunc004

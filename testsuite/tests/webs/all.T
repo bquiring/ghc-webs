@@ -176,3 +176,14 @@ for n in range(1, 5):
 for n in [1, 2, 4]:
     test('boundary%03d_dump' % n, [extra_files(['boundary%03d.hs' % n])],
          multimod_compile, ['boundary%03d' % n, bnd_opts + ' -ddump-webs-dead-params -dsuppress-uniques'])
+
+# Note [Defunctionalisation] (GHC.WebCore.Transform.Defunc,
+# -fcore-webs-defunc).  001 is the basic case, 002 checks laziness and
+# sharing (the trace appears once, the error never), 003 curried lambdas
+# (two webs), 004 webs that are rejected (polymorphic; known calls).  Their
+# dumps show the verdicts.
+df_opts = early_opts + ' -fcore-webs-defunc'
+for n in range(1, 5):
+    test('defunc%03d' % n, [], compile_and_run, [df_opts])
+    test('defunc%03d_dump' % n, [extra_files(['defunc%03d.hs' % n])],
+         multimod_compile, ['defunc%03d' % n, df_opts + ' -ddump-webs-defunc -dsuppress-uniques'])
