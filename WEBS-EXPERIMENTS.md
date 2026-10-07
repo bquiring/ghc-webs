@@ -215,10 +215,4 @@ The remaining outliers are `wave4main` +13.8% and `dom-lt` +11.6%, against
 
 ## Next steps
 
-- Repeat with `NoFibRuns=5` on a quiet machine to get runtimes.
-- Look at the `late` outliers (`wave4main`, `dom-lt`).
-- Profile the web pipeline itself (+8–16% compiler allocation): Web Lint
-  runs once per round of each transformation.
-- Find out why code size grows in `early` (`wave4main`, `nucleic2`).
-- Count how often each new pass fires on nofib (verdict dumps).
-- Web-based defunctionalization.
+See `WEBS-BACKLOG.md`, which collects what to implement and what to test.
