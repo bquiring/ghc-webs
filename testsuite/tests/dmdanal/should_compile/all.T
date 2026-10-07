@@ -152,3 +152,12 @@ test('wwcont_dump', [grep_errmsg(r'ww-ho-split pre-ww')], compile,
 # are split, and the worker's recursive calls pass the converted parameter
 test('wwstatic_dump', [grep_errmsg(r'ww-ho-split pre-ww|\$w\$w\w+ q ')], compile,
      ['-O -fworker-wrapper-function-results -ddump-ww-ho-stats -ddump-simpl -dsuppress-all -dsuppress-uniques -dppr-cols=400'])
+
+# (Cpr): the wrappers of step and setMsg rebuild the pair their worker's
+# returned lambda returns unboxed (setMsg is split for that alone); pick's
+# (a sum type) does not.  (CprConsumed): lazyTick's only call binds the pair
+# lazily, and stored is only kept in a table, so neither returns it unboxed
+# (lazyTick is still split for its argument).  A copy of
+# should_run/wwcpr001.hs
+test('wwcpr_dump', [grep_errmsg(r'^(step|setMsg|pick|lazyTick|stored) = ')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])

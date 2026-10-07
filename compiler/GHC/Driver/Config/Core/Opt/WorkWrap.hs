@@ -26,4 +26,5 @@ initWorkWrapOpts this_mod dflags fam_envs = MkWwOpts
   , wo_max_worker_args   = maxWorkerArgs dflags
   , wo_fr_wrappers       = emptyVarEnv
   , wo_call_lams         = Nothing
+  , wo_res_uses          = Nothing
   }

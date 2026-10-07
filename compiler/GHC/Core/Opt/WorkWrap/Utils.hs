@@ -8,7 +8,7 @@ A library for the ``worker\/wrapper'' back-end to the strictness analyser
 {-# LANGUAGE ViewPatterns #-}
 
 module GHC.Core.Opt.WorkWrap.Utils
-   ( WwOpts(..), CallArg(..), mkWwBodies, mkWWstr, mkWWstr_one
+   ( WwOpts(..), CallArg(..), ResUse(..), mkWwBodies, mkWWstr, mkWWstr_one
    , needsVoidWorkerArg
    , DataConPatContext(..)
    , UnboxingDecision(..), canUnboxArg
@@ -168,7 +168,17 @@ data WwOpts
   , -- | What the occurrences of each function in this module pass it.
     -- 'Nothing' skips the check that uses them.  See (Consumed) in
     -- Note [Worker/wrapper for function arguments] in GHC.Core.Opt.WorkWrap
-    wo_call_lams         :: Maybe (IdEnv [CallArg]) }
+    wo_call_lams         :: Maybe (IdEnv [CallArg])
+  , -- | How the occurrences of each function in this module use its result.
+    -- 'Nothing' skips the check that uses them.  See (CprConsumed) in
+    -- Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap
+    wo_res_uses          :: Maybe (IdEnv [ResUse]) }
+
+-- | One call of a function: how many value arguments it is given (counting
+-- those given to a let-bound partial application of it), and whether the
+-- result is taken apart by a case.  See (CprConsumed) in
+-- Note [Worker/wrapper for function results] in GHC.Core.Opt.WorkWrap
+data ResUse = ResUse !Int !Bool
 
 -- | What one occurrence of a function passes it.  See (Consumed) in
 -- Note [Worker/wrapper for function arguments] in GHC.Core.Opt.WorkWrap

@@ -1,0 +1,4 @@
+setMsg = \ m -> let { wf = $wsetMsg m } in \ fr -> case wf fr of { (# ww, ww1 #) -> (ww, ww1) }
+lazyTick = \ a -> let { wf = $wlazyTick a } in \ fr -> case fr of { I# ww -> wf ww }
+pick = \ a b -> let { wf = $wpick a b } in \ fr -> case fr of { I# ww -> wf ww }
+step = \ a b -> let { wf = $wstep a b } in \ fr -> case fr of { I# ww -> case wf ww of { (# ww1, ww2 #) -> (ww1, ww2) } }

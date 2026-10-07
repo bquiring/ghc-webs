@@ -116,3 +116,7 @@ test('wwcompose002', [extra_files(['WWComposeA.hs'])], multimod_compile_and_run,
 test('wwcont001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 test('wwcont002', [extra_files(['WWContA.hs'])], multimod_compile_and_run,
      ['wwcont002', '-O -fworker-wrapper-function-results'])
+# wwcpr001: the deepest returned lambda builds a pair, which the worker
+# returns unboxed ((Cpr) in Note [Worker/wrapper for function results]);
+# lazy fields, shared work and seq on the partial application are traced
+test('wwcpr001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])

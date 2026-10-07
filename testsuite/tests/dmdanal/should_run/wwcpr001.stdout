@@ -1,0 +1,12 @@
+(131,-129)
+5
+400
+130
+[131,135,150]
+"partial application is a value"
+((6,["ab","ba","ab!","ab","ba","ab!"]),"set:abbaab!","set:abbaab!")
+"set:xxx!"
+(Just 76,Just 75,Nothing)
+1097
+45479
+[42,4]

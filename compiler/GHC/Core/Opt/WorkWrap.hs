@@ -38,6 +38,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Monad
 import GHC.Core.DataCon
+import GHC.Core.TyCon ( tyConSingleDataCon_maybe )
 import Data.Maybe ( isJust, isNothing, fromMaybe, listToMaybe, catMaybes )
 import qualified Data.Map as Map
 import GHC.Core.Make ( mkWildValBinder, mkCoreUnboxedTuple )
@@ -83,7 +84,8 @@ info for exported values).
 wwTopBinds :: WwOpts -> UniqSupply -> CoreProgram -> CoreProgram
 
 wwTopBinds ww_opts us top_binds
-  = initUs_ us $ go (ww_opts { wo_call_lams = Just (callLambdas top_binds) }) top_binds
+  = initUs_ us $ go (ww_opts { wo_call_lams = Just (callLambdas top_binds)
+                              , wo_res_uses  = Just (resultUses top_binds) }) top_binds
   where
     -- Remember the function-result wrappers made so far: (Calls) in
     -- Note [Worker/wrapper for function results]
@@ -993,6 +995,49 @@ and when h is strict (it is always called) the simplifier turns the let
 into a case and inlines the lambda at the calls, which then call wf
 directly.  Inlining the wrapper costs little: it is a case and a small
 lambda.
+
+(Cpr) The deepest level may also be split for its result, as GHC does for a
+function's own result.  A state-monad action that does work first,
+
+    set t = let g = send (t : []) in \s -> (fst (g s), "..." ++ snd (g s))
+
+returns a lambda that builds a pair, and the caller's  case set t s of
+(s', o) -> ..  takes it apart.  The split's worker returns (# .., .. #) at
+that level, and the wrapper's level rebuilds the pair, where it meets the
+caller's case.  CPR analysis does not give the returned lambdas a
+signature, so resultCon looks at their bodies: every value must be built
+with the same constructor of a product type (worker applications only, so
+no strict fields; through lets, cases and join points; dead ends and jumps
+agree with anything).  Laziness is unchanged: CPR's worker evaluates the
+body only when the level's function is called, as before.  Found in
+real/veritas (nofib).  Test: wwcpr001.
+
+(CprConsumed) (Cpr) pays only where a call through the level takes the
+result apart.  The worker saves building the pair, but the wrapper's level
+builds it again, and each partial application gets one more closure (the
+wrapper's lambda).  They cancel only where the wrapper meets a case on the
+result.  In real/veritas (nofib), without this check, 54 functions were
+split and the program allocated 0.13% more: the callers bind the pair with a
+lazy pattern (let ds = m s in .. case ds of (a, _) -> a ..), so the pair
+was rebuilt at once.  So we look at the function's calls in this module
+(resultUses, collected once, in wo_res_uses), following let-bound and
+top-level partial applications (let g = set t in .. g s ..; full laziness
+floats them to the top level):
+  * a call with exactly the value arguments down to the level, scrutinised
+    by a case with a constructor alternative, is a consumer;
+  * a call with those arguments in any other context (a let, an argument,
+    a case with only a default alternative) is not, and neither is a
+    partial application or the function used as a value (passed to a
+    combinator, or stored, as veritas's commands are in a table).  A
+    partial application used with no more arguments was called where it
+    was bound: let ds = m s  is no consumer, whatever takes ds apart.
+We use CPR at the level only if some call is a consumer.  Unlike (Consumed)
+in Note [Worker/wrapper for function arguments], a function with no
+occurrence in the module (only external callers) does not get it: in
+real/veritas, the commands called only from Main's table (show_comment and
+the like) then accounted for the whole loss (40 splits, +0.125%; with this
+rule 8 splits, -0.03%).  An unknown caller builds the partial application,
+so it pays the extra closure without meeting the wrapper's case.
 -}
 
 -- | See Note [Worker/wrapper for function results]
@@ -1062,14 +1107,15 @@ data FrLevel = FrLevel
 -- See (Depth) in Note [Worker/wrapper for function results]
 analyseLevels :: WwOpts -> Id -> Arity -> Demand -> CoreExpr -> UniqSM (Either String [FrLevel])
 analyseLevels ww_opts fn_id ww_arity fn_dmd body
-  = do { r <- go 1 [(emptyVarEnv, body)] (exprType body)
+  = do { r <- go 1 ww_arity [(emptyVarEnv, body)] (exprType body)
        ; return $ case r of
            (_, []) | Just why <- fst r -> Left why
            (_, lvls)                   -> Right lvls }
   where
-    -- Returns why it stopped at level 1 (if it did), and the levels
-    go :: Int -> [(IdEnv Id, CoreExpr)] -> Type -> UniqSM (Maybe String, [FrLevel])
-    go depth exprs res_ty
+    -- Returns why it stopped at level 1 (if it did), and the levels.
+    -- nargs: the value arguments of the levels above (and of the function)
+    go :: Int -> Int -> [(IdEnv Id, CoreExpr)] -> Type -> UniqSM (Maybe String, [FrLevel])
+    go depth nargs exprs res_ty
       | depth > maxFunResultDepth = return (Just "too deep", [])
       | otherwise
       = case collect of
@@ -1087,13 +1133,14 @@ analyseLevels ww_opts fn_id ww_arity fn_dmd body
                                (zip args dmds)
                   ; mb_stuff <- if depth == 1 && etaExpandable ww_arity k fn_dmd
                                 then return Nothing   -- See (EtaFirst)
-                                else mkWwBodies ww_opts fn_id k xs inner_res_ty dmds topCpr
+                                else mkWwBodies ww_opts fn_id k xs inner_res_ty dmds
+                                                (levelCpr (nargs + k) k inner_res_ty (t0 : ts))
                   ; let split = fmap (\(_, _, w, u) -> (w, u)) mb_stuff
                         this  = FrLevel k args (tailExpr t0) split newtype_co
                     -- Go down only through lambda groups (a variable tail hides
                     -- what it returns)
                   ; case mapM (peelTail k) (t0 : ts) of
-                      Just deeper -> do { (_, rest) <- go (depth + 1) deeper inner_res_ty
+                      Just deeper -> do { (_, rest) <- go (depth + 1) (nargs + k) deeper inner_res_ty
                                         ; return (Nothing, this : rest) }
                       Nothing     -> return (Nothing, [this]) }
             | otherwise -> return (Just (if any isLiveTail tails then "returned arity 0" else "no live tail"), [])
@@ -1114,6 +1161,61 @@ analyseLevels ww_opts fn_id ww_arity fn_dmd body
 
     peelTail k (LamTail e _) = Just (emptyVarEnv, snd (splitValLams k e))
     peelTail _ _             = Nothing
+
+    -- See (Cpr): the deepest level's lambdas all build the same product,
+    -- and some call (with n value arguments) takes it apart: (CprConsumed)
+    levelCpr n k inner_res_ty tails
+      | not (isFunTy (fun_part inner_res_ty))
+      , Just bodies <- mapM (\t -> snd <$> peelTail k t) tails
+      , Just dc <- resultCon bodies
+      , cprConsumed n
+      = flatConCpr (dataConTag dc)
+      | otherwise = topCpr
+    cprConsumed n = case wo_res_uses ww_opts of
+      Nothing  -> True
+      Just env -> or [ scrut && m == n | ResUse m scrut <- uses ]
+        where uses = fromMaybe [] (lookupVarEnv env fn_id)
+    fun_part ty = case topNormaliseNewType_maybe ty of
+                    Just (_, ty') -> ty'
+                    Nothing       -> ty
+
+-- | The constructor of a product type with which every value of these
+-- expressions is built, looking through lets, cases and join points (dead
+-- ends and jumps agree with any constructor).  Syntactic: the returned
+-- lambdas have no CPR signature.  See (Cpr) in
+-- Note [Worker/wrapper for function results]
+resultCon :: [CoreExpr] -> Maybe DataCon
+resultCon es = case foldr (combine . go) (Just Nothing) es of
+                 Just (Just dc) -> Just dc
+                 _              -> Nothing
+  where
+    -- Nothing: no single constructor; Just Nothing: no value (a dead end or
+    -- a jump)
+    go :: CoreExpr -> Maybe (Maybe DataCon)
+    go e0 = case stripTicksTopE (const True) e0 of
+      e | exprIsDeadEnd e -> Just Nothing
+      Let (NonRec b r) body
+        | isJoinId b      -> combine (go (joinBody b r)) (go body)
+      Let (Rec prs) body
+        | all (isJoinId . fst) prs
+                          -> foldr (combine . go . uncurry joinBody) (go body) prs
+      Let _ body          -> go body
+      Case _ _ _ alts     -> foldr (combine . go) (Just Nothing) [ rhs | Alt _ _ rhs <- alts ]
+      e | (Var v, args) <- collectArgs e
+        -> if isJoinId v then Just Nothing
+           else case isDataConWorkId_maybe v of
+             Just dc | isVanillaDataCon dc
+                     , not (isUnboxedTupleDataCon dc)
+                     , Just _ <- tyConSingleDataCon_maybe (dataConTyCon dc)
+                     , length (filter isValArg args) == dataConRepArity dc
+                     -> Just (Just dc)
+             _       -> Nothing
+      _                   -> Nothing
+    combine (Just Nothing) r = r
+    combine r (Just Nothing) = r
+    combine (Just (Just a)) (Just (Just b)) | a == b = Just (Just a)
+    combine _ _ = Nothing
+    joinBody b r = snd (collectNBinders (idJoinArity b) r)
 
 -- | Look through casts to this function type in tail position: the level's
 -- values have a newtype type over it.  See (Casts)
@@ -1431,7 +1533,8 @@ SpecConstr (real/eff).  See PLAN.md.
 higherOrderStats :: WwOpts -> UniqSupply -> CoreProgram -> HoStats
 higherOrderStats ww_opts0 us binds
   = initUs_ us (top (ww_opts0 { wo_fun_results = True
-                              , wo_call_lams = Just (callLambdas binds) }) binds)
+                              , wo_call_lams = Just (callLambdas binds)
+                              , wo_res_uses  = Just (resultUses binds) }) binds)
   where
     top_set = mkVarSet (bindersOfBinds binds)
     -- Top level, in order: like worker/wrapper, remember the function-result
@@ -1982,6 +2085,72 @@ callLambdas binds = foldl' (go_bind emptyVarEnv) emptyVarEnv binds
       _ | let bs = filter isId (fst (collectBinders a)), not (null bs)
                      -> Just (map idDemandInfo bs)
       _              -> Nothing
+    strip = stripTicksTopE (const True)
+
+-- | For each let-bound or top-level function, its calls in the program: the
+-- number of value arguments, and whether a case takes the result apart (a
+-- case with a constructor alternative).  A let-bound or top-level partial
+-- application  g = f a  is followed: a call  g s  is a call of f with two
+-- arguments.
+-- See (CprConsumed) in Note [Worker/wrapper for function results]
+resultUses :: CoreProgram -> IdEnv [ResUse]
+resultUses binds = snd (foldl' top (emptyVarEnv, emptyVarEnv) binds)
+  where
+    -- A top-level partial application (floated by full laziness, as
+    -- f = step 2 9 ) is followed like a let-bound one
+    top (aliases, env) (NonRec x rhs)
+      | Just (alias, args) <- aliasOf aliases rhs
+      = (extendVarEnv aliases x alias, foldl' (go aliases) env args)
+    top (aliases, env) bind = (aliases, foldl' (go aliases) env (rhssOfBind bind))
+    -- A partial application of a function (or of an alias): the function,
+    -- the number of value arguments it is given, and the arguments
+    aliasOf aliases rhs
+      | (Var f, args) <- collectArgs (strip rhs)
+      , Just (f', n) <- target aliases f
+      , let k = length (filter isValArg args)
+      , k >= 1
+      = Just ((f', n + k), args)
+      | otherwise = Nothing
+    -- aliases: let-bound partial applications, to their function and the
+    -- number of value arguments they already have
+    go :: IdEnv (Id, Int) -> IdEnv [ResUse] -> CoreExpr -> IdEnv [ResUse]
+    go aliases env e = case e of
+      Case sc _ _ alts
+        | (Var v, args) <- collectArgs (strip sc)
+        -> let env1 = use aliases env v args (any isConAlt alts)
+           in foldl' (go aliases) (foldl' (go aliases) env1 args) [ rhs | Alt _ _ rhs <- alts ]
+        | otherwise
+        -> foldl' (go aliases) (go aliases env sc) [ rhs | Alt _ _ rhs <- alts ]
+      Var v            -> use aliases env v [] False
+      App {} | (f, args) <- collectArgs e
+             -> let env1 = case strip f of
+                             Var v -> use aliases env v args False
+                             f'    -> go aliases env f'
+                in foldl' (go aliases) env1 args
+      Lam _ b          -> go aliases env b
+      Let (NonRec x rhs) b
+        | Just (alias, args) <- aliasOf aliases rhs
+        -> go (extendVarEnv aliases x alias) (foldl' (go aliases) env args) b
+      Let bind b       -> foldl' (go aliases) (go aliases env b) (rhssOfBind bind)
+      Cast b _         -> go aliases env b
+      Tick _ b         -> go aliases env b
+      _                -> env
+    -- A function (arity at least 1, not lambda-bound) or a partial
+    -- application of one
+    target aliases v
+      | Just a <- lookupVarEnv aliases v = Just a
+      | isId v, idArity v > 0            = Just (v, 0)
+      | otherwise                        = Nothing
+    -- An alias used with no more arguments was called at its let (a lazy
+    -- binding of the result, as  let ds = m s ), so it is no consumer
+    use aliases env v args scrut
+      | Just (f, n) <- target aliases v
+      , let k = length (filter isValArg args)
+            scrut' = scrut && (k > 0 || not (v `elemVarEnv` aliases))
+      = extendVarEnv_C (++) env f [ResUse (n + k) scrut']
+      | otherwise = env
+    isConAlt (Alt (DataAlt _) _ _) = True
+    isConAlt _                     = False
     strip = stripTicksTopE (const True)
 
 -- | (B): the values are lambda groups, one of whose parameters is a function
