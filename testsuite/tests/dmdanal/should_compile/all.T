@@ -161,3 +161,9 @@ test('wwstatic_dump', [grep_errmsg(r'ww-ho-split pre-ww|\$w\$w\w+ q ')], compile
 # should_run/wwcpr001.hs
 test('wwcpr_dump', [grep_errmsg(r'^(step|setMsg|pick|lazyTick|stored) = ')], compile,
      ['-O -fworker-wrapper-function-results -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds -dppr-cols=400'])
+
+# (TypeParams): functions with a type parameter after value parameters (rank-2
+# types, a newtype over one, polymorphic recursion) are split.  A copy of
+# should_run/wwpoly002.hs
+test('wwpoly_dump', [grep_errmsg(r'ww-ho-split pre-ww')], compile,
+     ['-O -fworker-wrapper-function-results -ddump-ww-ho-stats -dsuppress-uniques'])

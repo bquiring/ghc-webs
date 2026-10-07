@@ -107,6 +107,10 @@ test('wwcast002', normal, compile_and_run, ['-O -fworker-wrapper-function-result
 #   wwcompose001, wwcompose002: result splits through calls of other split
 #              functions, in one module and across modules; (Calls)
 test('wwpoly001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
+#   wwpoly002: a type parameter after value parameters (rank-2 types, a
+#              newtype over one, and a recursive call passing the parameter
+#              on); (TypeParams)
+test('wwpoly002', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 test('wwcompose001', normal, compile_and_run, ['-O -fworker-wrapper-function-results'])
 test('wwcompose002', [extra_files(['WWComposeA.hs'])], multimod_compile_and_run,
      ['wwcompose002', '-O -fworker-wrapper-function-results'])

@@ -75,6 +75,29 @@ Everything is behind **`-fworker-wrapper-function-results`** (off by default).
 
 ## Current state (2026-10-07)
 
+- **Type parameters after value parameters** ((TypeParams) in Note
+  [Worker/wrapper for function arguments]): argument splits now handle
+  parameter lists like `\ @s @a @b m1 m2 @m pure bind get put`, which
+  rank-2 types and newtypes over them (effect encodings) give once
+  eta-expanded. Parameter numbers in `lambdaConv` count the type variables
+  (skipped as candidates); (Consumed) uses value positions (`valPos`); the
+  wrapper rebinds the type variables; `SelfCall` carries the parameter
+  list, and a recursive call may pass a later type argument that differs
+  only if its variable is not in q's type (the first, conservative rule
+  was shown unnecessary by mutation: polymorphic recursion splits and
+  passes Core Lint). Tests `wwpoly002` (late, loop, nest, mkP),
+  `wwpoly_dump`. dmdanal 163 passes; smoke suite only the 2 expected
+  differences.
+  - **nofib: no new splits** (checked on the 3 affected modules). eff's
+    and dom-lt's functions now fail on the next condition: "only
+    non-function arguments", and eff's interesting parameters (`>>=`,
+    `pure`) are polymorphic (`forall a b. ..`), which no conversion handles.
+  - **Statistics change:** `takes_fun` now also counts functions with a
+    manifest value binder of function type (hidden from the type by a later
+    `forall` or a newtype): eff 4 -> 8. Later runs' `takes_fun` is not
+    comparable with earlier ones. The rejection "type parameters after
+    value parameters" is gone ("coercion parameters" remains).
+
 - **(Static), static function parameters** (`8ad8e9769a`; (Static) in
   Note [Worker/wrapper for function arguments]): a recursive call
   `h @tvs .. q ..` passing the parameter on at its own position, with the
@@ -308,15 +331,16 @@ statistics]**.
     `wwhostats001` (the statistics terminate on a never-called parameter),
     `wwcont_dump` (which functions (C) splits, with (Consumed)), and
     `wwstatic_dump` (which static-argument functions split; the worker
-    calls itself), and `wwcpr_dump` (which returned lambdas get CPR, with
-    (CprConsumed)).
+    calls itself), `wwcpr_dump` (which returned lambdas get CPR, with
+    (CprConsumed)), and `wwpoly_dump` (type parameters after value
+    parameters).
 - `should_run`: `wwfunres001-004`, `wwdeep001-004`, `wwhoarg001-009`,
   `wwmix001-005`, `wwlarge001-002` (larger examples with `[+]`/`[-]` marks),
   `wwcast001-002`, `wwpoly001`, `wwcompose001-002`, `wwcont001-002`,
-  `wwstatic001`, `wwcpr001`. Each
+  `wwstatic001`, `wwcpr001`, `wwpoly002`. Each
   output was taken
   from plain GHC, so the tests check that meaning is unchanged.
-- Last results: `dmdanal` 161 passes. A smoke suite of 3,066 tests
+- Last results: `dmdanal` 163 passes. A smoke suite of 3,066 tests
   with the flag on everywhere has only the 2 expected `wwreturn002/003`
   differences and no Core Lint errors (with (Static)).
 
@@ -404,7 +428,9 @@ is in `WW-HIGHER-ORDER.md` §7 and `ww-bench/results-run3`):
      changed; out of reach locally.
    - "small": by design.
 4. **Optionally an `-O1` nofib run** (`NOFIB_OPT=-O1`); cancelled once.
-5. Type parameters *after* value parameters (argument split).
+5. Type parameters after value parameters: **done**. Polymorphic function
+   parameters (`bind :: forall a b. ..`, called at several types) remain:
+   the conversion would have to be polymorphic.
 6. Calls of *other* functions in result tails, beyond result-split wrappers.
 7. **An interaction to keep in mind:** the eta-expansion rule (EtaFirst)
    assumes GHC will eta-expand, which it does not under `-fpedantic-bottoms`

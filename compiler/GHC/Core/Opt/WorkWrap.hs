@@ -1382,8 +1382,28 @@ that cannot be observed.
 Leading type parameters are kept: the conversion is computed for the value
 part (with the type variables in scope; the types it builds may mention
 them), the worker is  /\a -> unwrap (\g n -> ..),  and the wrapper is
-/\a -> wrap (work_id @a).  (Type parameters after value parameters are not
-handled.)
+/\a -> wrap (work_id @a).
+
+Type parameters may also come after value parameters.  Rank-2 types and
+newtypes over them, as in effect encodings, give them once eta-expanded:
+
+    newtype VS s a = VS (forall m. (forall x. x -> m x) -> .. -> m a)
+    $c*> = \ @s @a @b m1 m2 @m pure bind get put -> ..
+
+Below the leading type parameters, the top lambda group's binders then
+include type variables.  lambdaConv numbers parameters over all of them,
+skipping the type variables as candidates; (Consumed)'s positions count
+value parameters only (valPos).  The wrapper's lambda group binds the same
+type variables again (the other binders' types mention them) and passes
+them on, and the (Static) placeholder's type quantifies over them
+(mkLamTypes).  A recursive call passes the parameter on only with the
+function's own leading type arguments, since the placeholder is
+$wh @tvs; a later type argument may differ only if its type variable does
+not occur in q's type, so that q' has the same type at the call
+(polymorphic recursion, as in  nest @b .. g ..  calling  nest @[b] .. g ..).
+Found in real/eff and spectral/dom-lt (nofib), where no split follows: the
+parameters after the type variable are polymorphic (bind above, not
+handled) or only called with data.  Tests: wwpoly002, wwpoly_dump.
 
 (Constructed) A continuation parameter called with constructed data,
 
@@ -1571,14 +1591,19 @@ higherOrderStats ww_opts0 us binds
 
     fun_stats ww_opts fn_id rhs
       = do { let ty         = idType fn_id
-                 res_is_fun = case collectNValBinders_maybe (workWrapArity fn_id rhs) rhs of
+                 mb_params  = collectNValBinders_maybe (workWrapArity fn_id rhs) rhs
+                 res_is_fun = case mb_params of
                                 Just (_, body) -> isFunOrNewtypeFun (exprType body)
                                 Nothing        -> False
                  -- A function type, or a newtype over one (Casts)
                  isFunOrNewtypeFun t = isFunTy t || case topNormaliseNewType_maybe t of
                                                       Just (_, t') -> isFunTy t'
                                                       Nothing      -> False
+                 -- By its type, or by its binders: a type parameter after
+                 -- value parameters, or a newtype over a function type,
+                 -- hides the later parameters from the type (TypeParams)
                  takes_fun  = any (isFunTy . scaledThing) (fst (splitFunTys (dropForAlls ty)))
+                              || any (\b -> isId b && isFunTy (idType b)) (maybe [] fst mb_params)
            ; e_res  <- funResultLevelsWhy ww_opts fn_id rhs
            ; let mb_res = either (const Nothing) Just e_res
            ; arg_ns <- count_args ww_opts maxFunArgSplits fn_id rhs
@@ -1736,14 +1761,14 @@ argRejectReason ww_opts fn_id rhs
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return "small (inlined whole)"
   | Just (arg_vars, body) <- collectNValBinders_maybe ww_arity rhs
   = let (tvs, vals) = span isTyVar arg_vars in
-    if not (all (\v -> isId v && not (isCoVar v)) vals)
-    then return "type parameters after value parameters"
+    if any isCoVar vals
+    then return "coercion parameters"
     else do
       { -- Would (C) split it, but for the (Consumed) check?
         unconsumed <- isJust <$> funArgConv (ww_opts { wo_call_lams = Nothing }) fn_id rhs
-      ; let fun_params = [ (q, i) | (q, i) <- zip vals [0 ..], isFunTy (idType q) ]
+      ; let fun_params = [ (q, i) | (q, i) <- zip vals [0 ..], isId q, isFunTy (idType q) ]
             callss     = [ cs | (q, i) <- fun_params
-                              , Just cs <- [paramCalls (Just (SelfCall fn_id tvs i)) emptyVarEnv q body] ]
+                              , Just cs <- [paramCalls (Just (SelfCall fn_id tvs vals i)) emptyVarEnv q body] ]
             -- Some argument position known at every call (a parameter
             -- never called has no such position)
             known []              = False
@@ -1883,10 +1908,11 @@ funArgConv ww_opts fn_id rhs
   | isNoInlinePragma (inlinePragInfo fn_info)        = return Nothing
   | isJust (certainlyWillInline uf_opts fn_info rhs)  = return Nothing
   | Just (arg_vars, _) <- collectNValBinders_maybe ww_arity rhs
-    -- Type parameters first, then value parameters: see (TypeParams)
+    -- Leading type parameters, then the others (with type parameters
+    -- among them, but no coercions): see (TypeParams)
   , let (tvs, vals) = span isTyVar arg_vars
-  , not (null vals)
-  , all (\v -> isId v && not (isCoVar v)) vals
+  , any isId vals
+  , not (any isCoVar vals)
   , let inner = snd (collectNBinders (length tvs) rhs)
   = fmap (\c -> (tvs, c)) <$> lambdaConv ww_opts fn_id (Just tvs) 1 [ArgLam emptyVarEnv inner vals]
   | otherwise = return Nothing
@@ -2157,7 +2183,9 @@ resultUses binds = snd (foldl' top (emptyVarEnv, emptyVarEnv) binds)
 -- that is only called, with values at some position that have a conversion.
 -- At the top (the function's own right-hand side, under its type variables
 -- top_tvs), the parameter may also be passed on by recursive calls: see
--- (Static) in Note [Worker/wrapper for function arguments]
+-- (Static) in Note [Worker/wrapper for function arguments].  There the
+-- binder lists may contain type variables after value binders (TypeParams);
+-- parameter numbers count them, argument positions (ri) do not.
 lambdaConv :: WwOpts -> Id -> Maybe [TyVar] -> Int -> [ArgVal] -> UniqSM (Maybe Conv)
 lambdaConv ww_opts fn_id top_tvs depth vals
   | Just lams <- mapM isLam vals
@@ -2175,6 +2203,9 @@ lambdaConv ww_opts fn_id top_tvs depth vals
 
     try_params [] _ _ = return Nothing
     try_params (qi : qis) lams m
+      | not (all (\(_, _, bs) -> isId (bs !! qi)) lams)   -- a type parameter
+      = try_params qis lams m
+      | otherwise
       = do { r <- try_param qi lams m
            ; case r of { Just c -> return (Just c); Nothing -> try_params qis lams m } }
 
@@ -2212,13 +2243,20 @@ lambdaConv ww_opts fn_id top_tvs depth vals
       Just env -> depth == 1
                   && (null uses || any consumes uses)
         where
-          uses = [ u | u <- fromMaybe [] (lookupVarEnv env fn_id), at qi u ]
+          uses = [ u | u <- fromMaybe [] (lookupVarEnv env fn_id), at (valPos qi) u ]
           at q (CallArg i _) = i == q
           at _ NoCallArgs    = True
           consumes (CallArg _ (Just dmds)) | d : _ <- drop ri dmds = unboxesDmd d
           consumes _                                               = False
 
-    selfCall qi = fmap (\tvs -> SelfCall fn_id tvs qi) top_tvs
+    selfCall qi = case (top_tvs, vals) of
+      (Just tvs, [ArgLam _ _ bs]) -> Just (SelfCall fn_id tvs bs qi)
+      _                           -> Nothing
+
+    -- Parameter qi's position among the value parameters (CallArg's)
+    valPos qi = case vals of
+      ArgLam _ _ bs : _ -> length (filter isId (take qi bs))
+      _                 -> qi
 
     -- The type of parameter qi's argument ri
     posType qi ri ((_, _, bs0) : _)
@@ -2240,9 +2278,10 @@ lambdaConv ww_opts fn_id top_tvs depth vals
            ; mb_self <- case selfCall qi of
                Nothing -> return Nothing
                Just sc -> do { u <- getUniqueM
-                             ; let self_ty = mkScaledFunTys
-                                     [ Scaled (idMult b) (if i == qi then q_ty' else idType b)
-                                     | (i, b) <- zip [0 :: Int ..] (take m bs0) ]
+                             ; q_u <- getUniqueM
+                             ; let q_new   = mkSysLocal (fsLit "q") q_u (idMult q0) q_ty'
+                                   self_ty = mkLamTypes
+                                     [ if i == qi then q_new else b | (i, b) <- zip [0 :: Int ..] (take m bs0) ]
                                      (exprType (snd (splitValLams m e0)))
                              ; return (Just (sc, mkSysLocal (fsLit "self") u ManyTy self_ty)) }
            ; let
@@ -2256,9 +2295,12 @@ lambdaConv ww_opts fn_id top_tvs depth vals
                                      `setIdDemandInfo` idDemandInfo q
                         ; body' <- rewriteCalls mb_self q q' ri (cv_unwrap inner) body
                         ; return (mkLams [ if i == qi then q' else b | (i, b) <- zip [0 :: Int ..] bs ] body') }
-                 -- wrap: \as -> l' .. (adapter a_q) ..
+                 -- wrap: \as -> l' .. (adapter a_q) ..  The type variables
+                 -- among the binders (TypeParams) are bound again as they are:
+                 -- the other binders' types mention them
                  wrap l'
-                   = do { as <- mapM (\b -> do { u <- getUniqueM
+                   = do { as <- mapM (\b -> if isTyVar b then return b else
+                                             do { u <- getUniqueM
                                                 ; return (mkSysLocal (fsLit "a") u (idMult b) (idType b)) })
                                      (take m bs0)
                         ; let a_q = as !! qi
@@ -2270,7 +2312,8 @@ lambdaConv ww_opts fn_id top_tvs depth vals
                         ; inner_wrapped <- cv_wrap inner c_r
                         ; let adapter = mkLams cs (mkApps (Var a_q)
                                           [ if i == ri then inner_wrapped else Var c | (i, c) <- zip [0 :: Int ..] cs ])
-                              call = mkApps (Var l') [ if i == qi then adapter else Var a | (i, a) <- zip [0 :: Int ..] as ]
+                              call = mkApps (Var l') [ if i == qi then adapter else varToCoreExpr a
+                                                     | (i, a) <- zip [0 :: Int ..] as ]
                         ; return (mkLams as call) }
            ; e0' <- unwrap e0
            ; return (Just (Conv { cv_unwrap = unwrap, cv_wrap = wrap
@@ -2280,26 +2323,33 @@ lambdaConv ww_opts fn_id top_tvs depth vals
       | otherwise = return Nothing
 
 -- | A recursive call that passes a parameter on unchanged: the function,
--- its leading type variables, and the parameter's value position.
+-- its leading type variables, its other parameters (which may include type
+-- variables: (TypeParams)), and the parameter's position among them.
 -- See (Static) in Note [Worker/wrapper for function arguments]
-data SelfCall = SelfCall Id [TyVar] Int
+data SelfCall = SelfCall Id [TyVar] [Var] Int
 
 -- | Is this a call of the function passing the parameter q at its own
--- position (with the function's own type arguments)?  Then its other value
--- arguments, with the position of q.
+-- position, with the function's own leading type arguments?  A later type
+-- argument may differ only if its type variable does not occur in q's type
+-- (then q' has the same type at the call): (TypeParams).  Then its
+-- arguments after the leading type arguments, with the position of q among
+-- them.
 selfCallArgs :: Maybe SelfCall -> Id -> CoreExpr -> Maybe ([CoreExpr], Int)
-selfCallArgs (Just (SelfCall fn_id tvs qi)) q e
+selfCallArgs (Just (SelfCall fn_id tvs params qi)) q e
   | (Var f, args) <- collectArgs e
   , f == fn_id
   , let (targs, rest) = splitAt (length tvs) args
   , and (zipWith sameTv targs tvs), length targs == length tvs
-  , all isValArg rest
+  , and (zipWith argFits rest (params ++ repeat q))   -- then value arguments
   , Var v : _ <- drop qi rest
   , v == q
   = Just (rest, qi)
   where
     sameTv (Type ty) tv | Just tv' <- getTyVar_maybe ty = tv' == tv
     sameTv _ _ = False
+    argFits a b | isTyVar b = sameTv a b
+                              || (isTypeArg a && not (b `elemVarSet` tyCoVarsOfType (idType q)))
+                | otherwise = isValArg a
 selfCallArgs _ _ _ = Nothing
 
 -- | The calls of a function parameter in a body: for each, the let-bound
