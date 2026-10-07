@@ -190,6 +190,50 @@ mostly the harmful transformations; what remains is a modest, regression-free
 reduction of the inliner's and worker/wrapper's work, with a small code-size
 increase.
 
+## 5. Runtime: strictness fixpoints, boundary split, regression audit
+
+Configurations: `base` (no webs), `early-fix` (the early pass with all seven
+transformations, after the strictness fixes of 2026-10-07), `early-bnd`
+(`early-fix` plus `-fcore-webs-boundary`). Measured with
+`webs-bench/time-nofib.py`: 3 interleaved rounds, pinned to one performance
+core, user-space instructions and cycles from perf, paired ratios against
+`base` (`results/timing-audit.md`). Instruction counts vary by at most
+0.018% from run to run.
+
+Every benchmark that changes by more than 0.3% in instructions:
+
+| benchmark | instructions | cycles | time (every round agrees) |
+|---|---|---|---|
+| `CS` | −5.3% | −7.6% | −9.7% |
+| `solid` | −5.1% | −8.9% | −7.7% |
+| `dom-lt` | −4.7% | −3.6% | −3.5% |
+| `ansi` | −3.9% | −9.1% | −6.0% |
+| `mate` | −3.5% | −5.1% | −4.8% |
+
+That is `early-fix`; `early-bnd` is the same, plus `cse` −1.7%, `prolog`
+−1.0% and `constraints` −0.9% instructions. **No benchmark gets worse by more
+than 0.3% in instructions in either configuration.** Geomeans: −0.21%
+instructions and −0.33% time (`early-fix`); −0.24% and −0.31% (`early-bnd`).
+
+`cse` is 1.7% fewer instructions but 3.7% more time under `early-bnd`: code
+layout. Identical or near-identical Core moved cycles by up to 8%
+(`knights`, `mkhprog`), through front-end fetch bandwidth; with
+`-fproc-alignment=64` the `knights` gap disappears. A time change without an
+instruction change is reported as layout only.
+
+How the regressions were fixed (each in a Note):
+
+* `infer` +11% allocation, `gamteb` +1.2%, `VS` +16% code: the boundary
+  split's reflexive cast, missing wrapper demands, and small or INLINE
+  functions (Note [Splitting webs at the boundary], Note [Small functions are
+  not split]); early result raising leaves known-call webs to
+  worker/wrapper (Note [Early result raising]).
+* `ida` +2.7% instructions: strictness evaluated variable arguments at
+  calls in strict code (Note [Only evaluate what would be a thunk]).
+* `pic` +1.1%: evaluating a strict result field early kept the
+  constructor's other fields alive (same Note; the demand now propagates
+  through the analysis, Note [Web strictness fixpoints]).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

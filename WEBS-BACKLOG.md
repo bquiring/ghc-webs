@@ -14,10 +14,6 @@ a heuristic.
 
 ## Now
 
-- **Regression audit of the early pass.** `ida` and `pic` are fixed (see
-  Done). Left: `transform` +0.5% instructions. Re-check the full list after
-  the validation run (`results/timing-audit.md`). Method: turn passes off
-  one at a time, bisect by module, then diff the Core.
 - **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
   solving, renaming and erasure, with statistics only. Measure how many
   data webs are local on nofib, per type constructor.
@@ -105,3 +101,6 @@ a heuristic.
 - Strict result fields propagate through the analysis instead of extra
   cases; argument and result-field strictness are one fixpoint (`pic`
   +1.1% → 0.0%): `7d6e45b09c`.
+- Regression audit of the early pass: no benchmark worse than +0.3%
+  instructions; `CS` −5.3%, `solid` −5.1%, `dom-lt` −4.7%, `ansi` −3.9%,
+  `mate` −3.5% (`WEBS-EXPERIMENTS.md` §5).
