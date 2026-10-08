@@ -106,8 +106,13 @@ Plan (2026-10-08):
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
 - **Call demands and cardinality** are under "Richer demands" above.
-- **Compile time.** The early pipeline costs +10–11% compiler allocation on
-  nofib. Web Lint runs once per round of each transformation.
+- **Compile time** (deferred until the transformations give good results,
+  the user's call, 2026-10-08). The early pipeline costs +10–11% compiler
+  allocation on nofib; Web Lint runs once per round of each transformation.
+  Data splitting doubles compiler allocation (+100% against base): every
+  occurrence gets a real TyCon with DataCons (~580,000 copies over nofib).
+  Fix: cheap placeholders per occurrence during annotation and Data Lint,
+  real types only for the final split classes.
 
 ## Ideas to test
 
