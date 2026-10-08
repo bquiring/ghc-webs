@@ -8,4 +8,12 @@ not defunctionalised (exposed): r r
 not defunctionalised (no unknown calls): op
 
 
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 = [GHC.Internal.Types.Int,
+                                           Main.Defun2
+                                             GHC.Internal.Types.Int GHC.Internal.Types.Int]
+Main.Defun2: not specialised
+
+
 [2 of 2] Linking defunc003

@@ -50,6 +50,7 @@ import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
 import GHC.WebCore.Transform.ConstProp ( constPropRound )
 import GHC.WebCore.Transform.Inline ( inlineRound )
 import GHC.WebCore.Transform.Defunc ( defuncProgram )
+import GHC.WebCore.Transform.SpecIndex ( Indexed(..), specialiseIndexed )
 import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
 import GHC.Core.TyCo.Rep
@@ -137,7 +138,7 @@ webPass early guts
          -- Defunctionalisation runs last: it changes the arrow types of the
          -- webs it handles into new data types
          -- See Note [Defunctionalisation] in GHC.WebCore.Transform.Defunc
-       ; (binds_t, new_tcs, defunced) <-
+       ; (binds_t, new_ixs, defunced) <-
            if gopt Opt_CoreWebsDefunc dflags
            then runDefunc early logger dflags cfg (mg_module guts) sigs2 binds_t0
            else return (binds_t0, [], False)
@@ -160,13 +161,23 @@ webPass early guts
        ; when (gopt Opt_DoCoreLinting dflags && not transformed) $
            checkRoundTrip binds0 binds3
 
-       ; return (guts { mg_binds = binds3, mg_tcs = mg_tcs guts ++ new_tcs }) }
+         -- Specialise the new types to their uses
+         -- See Note [Specialising indexed types] in GHC.WebCore.Transform.SpecIndex
+       ; us_s <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let (binds4, replaced, spec_dump)
+               | null new_ixs = (binds3, [], [])
+               | otherwise    = specialiseIndexed us_s [ Indexed tc (Just ap) | (tc, ap) <- new_ixs ] binds3
+             new_tcs = [ maybe tc id (lookup tc replaced) | (tc, _) <- new_ixs ]
+       ; unless (null spec_dump) $
+           dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
+
+       ; return (guts { mg_binds = binds4, mg_tcs = mg_tcs guts ++ new_tcs }) }
 
 -- | Defunctionalise, check the result with Web Lint, and dump the verdicts.
 -- Returns the new program, the new type constructors, and whether anything
 -- changed.
 runDefunc :: Bool -> Logger -> DynFlags -> LintConfig -> Module -> WebSigs -> CoreProgram
-          -> CoreM (CoreProgram, [TyCon], Bool)
+          -> CoreM (CoreProgram, [(TyCon, Id)], Bool)
 runDefunc early logger dflags cfg this_mod sigs binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let pol = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }

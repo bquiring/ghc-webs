@@ -388,12 +388,14 @@ mkDWeb this_mod todo us n ka kb lams plans
 ------------------------------------------------------------------
 
 -- | Defunctionalise the webs that qualify.  Returns the new program (if
--- anything changed), the new type constructors, and the verdicts.
+-- anything changed), the new type constructors with their apply functions,
+-- and the verdicts.
 defuncProgram :: Module -> UnfoldingPolicy -> UniqSupply -> WebSet -> CoreProgram
-              -> (Maybe (CoreProgram, [TyCon]), [(WebId, SDoc, Bool, [Id])])
+              -> (Maybe (CoreProgram, [(TyCon, Id)]), [(WebId, SDoc, Bool, [Id])])
 defuncProgram this_mod pol us exposed binds
   | isNullUFM todo = (Nothing, dump)
-  | otherwise      = (Just (binds' ++ [Rec applies], map d_tycon (nonDetEltsUFM todo)), dump)
+  | otherwise      = ( Just (binds' ++ [Rec applies], [ (d_tycon d, d_apply d) | d <- nonDetEltsUFM todo ])
+                     , dump )
   where
     (us1, us2) = splitUniqSupply us
     tops  = mkVarSet (bindersOfBinds binds)

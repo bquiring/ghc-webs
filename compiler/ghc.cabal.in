@@ -1037,6 +1037,7 @@ Library
         GHC.WebCore.Transform.ConstProp
         GHC.WebCore.Transform.DeadParams
         GHC.WebCore.Transform.Defunc
+        GHC.WebCore.Transform.SpecIndex
         GHC.WebCore.Transform.Inline
         GHC.WebCore.Transform.ResultRaise
         GHC.WebCore.Transform.Strictness

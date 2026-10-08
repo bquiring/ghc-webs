@@ -7,4 +7,10 @@ not defunctionalised (no unknown calls): f
 not defunctionalised (no unknown calls): x
 
 
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 = [GHC.Internal.Types.Int,
+                                           GHC.Internal.Types.Int]
+
+
 [2 of 2] Linking defunc002
