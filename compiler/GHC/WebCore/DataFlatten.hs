@@ -33,6 +33,7 @@ import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Basic ( Boxity(..) )
 import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd )
+import GHC.Builtin.PrimOps ( primOpOkForSpeculation )
 import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.Core.FVs ( exprFreeVarsList )
 
@@ -67,6 +68,21 @@ fields (K, i).  A field stays unboxable while
 
 Start from every candidate field and remove the ones that fail, until
 nothing changes.  A removed field stays a pointer to a boxed value.
+-}
+
+{- Note [Strict binders are values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A binder that demand analysis says is strictly demanded in its scope -- a
+lambda's parameter, a let, a case alternative's pattern variable -- will be
+evaluated whenever its scope's value is: so evaluating it at a construction
+inside that scope only moves its evaluation earlier.  That is what
+worker/wrapper does for a strict argument and let-to-case for a strict let
+(with the same latitude about which exception is raised first), so for
+unboxing such a variable counts as a value.  So does a case or a primop
+application that is cheap and cannot fail, given that its scrutinees and
+arguments are values, evaluated, or strict (spec_ok): x + y on boxed Ints,
+inlined, with x and y strict.  Demand analysis runs just before the early web
+pipeline, so the demands are fresh.
 -}
 
 {- Note [Bounding unboxing]
@@ -410,6 +426,18 @@ flattenFields opts this_mod us tcs binds
     -- Where each variable is bound (for the dump), and the let-bound variables
     -- whose right-hand side is a value: they are values too (annotation
     -- zaps unfoldings, so exprIsHNF does not see it)
+    -- Note [Strict binders are values]
+    strict_binders = mkVarSet [ b | b <- concatMap all_bndrs binds, isId b, isLocalId b
+                                  , isStrUsedDmd (idDemandInfo b) ]
+    all_bndrs bind = concatMap (\(b, e) -> b : expr_bndrs e) (flattenBinds [bind])
+    expr_bndrs e = case e of
+      Lam b x       -> b : expr_bndrs x
+      App f a       -> expr_bndrs f ++ expr_bndrs a
+      Let bind x    -> all_bndrs bind ++ expr_bndrs x
+      Case x b _ as -> b : expr_bndrs x ++ concat [ bs ++ expr_bndrs r | Alt _ bs r <- as ]
+      Cast x _      -> expr_bndrs x
+      Tick _ x      -> expr_bndrs x
+      _             -> []
     (sites, let_values) = foldr site_bind (emptyVarEnv, emptyVarSet) binds
       where
         site_bind bind acc = foldr site_pair acc (flattenBinds [bind])
@@ -549,12 +577,33 @@ flattenFields opts this_mod us tcs binds
       , Just (_, args, pdc) <- productCon (coreFullView t)
       = Flatten pdc args
       | otherwise = Keep
-    value ev a = exprIsHNF a || exprOkForSpeculation a || evald ev a
+    value ev a = exprIsHNF a || exprOkForSpeculation a || evald ev a || spec_ok ev a
     evald ev a = case a of
       Var v     -> v `elemVarSet` ev || v `elemVarSet` let_values
+                   || v `elemVarSet` strict_binders   -- Note [Strict binders are values]
       Tick _ e  -> evald ev e
       Cast e _  -> evald ev e
       _         -> False
+    -- Cheap and safe to evaluate early, given what is evaluated or strict:
+    -- primops that are ok for speculation, and cases on such things
+    spec_ok ev e = case e of
+      Var _    -> evald ev e || exprIsHNF e
+      Lit {}   -> True
+      Type {}  -> True
+      Coercion {} -> True
+      App {} | (Var f, args) <- collectArgs e
+             , Just op <- isPrimOpId_maybe f
+             , primOpOkForSpeculation op
+             -> all (spec_ok ev) [ a | a <- args, not (isTypeArg a) ]
+             | (Var f, args) <- collectArgs e
+             , isJust (isDataConWorkId_maybe f)
+             -> all (spec_ok ev) [ a | a <- args, not (isTypeArg a) ]
+      Case scrut b _ alts
+               -> spec_ok ev scrut
+                  && all (\(Alt _ _ rhs) -> spec_ok (extendVarSet ev b) rhs) alts
+      Tick _ x -> spec_ok ev x
+      Cast x _ -> spec_ok ev x
+      _        -> False
     is_flat (Flatten {}) = True
     is_flat Keep         = False
 
