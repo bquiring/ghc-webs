@@ -2,10 +2,10 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 69, classes: 7, exposed: 6, split: 1, exposed only by casts: 0, pinned binders: 10
-Main.Tree_s7 = Main.Tree with Main.Leaf_s7, Main.Node_s7 (built [1,
+copies: 75, classes: 8, exposed: 7, split: 1, exposed only by casts: 0, pinned binders: 10
+Main.Tree_s8 = Main.Tree with Main.Leaf_s8, Main.Node_s8 (built [1,
                                                                  2], matched [1, 2])
-Main.Node_s7 field 1: unboxed
+Main.Node_s8 field 1: unboxed
 
 
 [2 of 2] Linking datasplit003

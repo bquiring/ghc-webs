@@ -1,9 +1,8 @@
 -- Copies in coercions (Note [Copies in coercions]): the list inside the
 -- local newtype Stack reaches pushN and sumS through casts.  The casts'
--- coercions get copies too.  But the newtype's axiom, Stack ~R# [Int],
--- names the list type itself (not through a type argument), and axioms keep
--- their original types, so the list is still exposed: it needs copies of the
--- newtype (with their own axioms), not yet done.  The dump shows it.
+-- coercions get copies too, and so does the newtype (Note [Splitting
+-- newtypes]): each copy of Stack has its own axiom, Stack_c ~R# List_c Int,
+-- with a fresh list copy, so the list is split.
 module Main (main) where
 
 newtype Stack = Stack [Int]

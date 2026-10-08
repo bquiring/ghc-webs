@@ -2,21 +2,21 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 34, classes: 6, exposed: 4, split: 2, exposed only by casts: 0, pinned binders: 3
-Main.Tuple2_s5 = (,) with Main.Con1_s5 (built [1], matched [1])
-Main.List_s6 = [] with Main.Con1_s6, Main.Con2_s6 (built [1,
+copies: 40, classes: 7, exposed: 5, split: 2, exposed only by casts: 0, pinned binders: 3
+Main.Tuple2_s6 = (,) with Main.Con1_s6 (built [1], matched [1])
+Main.List_s7 = [] with Main.Con1_s7, Main.Con2_s7 (built [1,
                                                           2], matched [1, 2])
-Main.Tuple2_s5: specialised to Main.Tuple2_s5 = [GHC.Internal.Types.Int,
+Main.Tuple2_s6: specialised to Main.Tuple2_s6 = [GHC.Internal.Types.Int,
                                                  GHC.Internal.Types.Int]
-Main.List_s6: specialised to Main.List_s6 = [Main.Tuple2_s5
+Main.List_s7: specialised to Main.List_s7 = [Main.Tuple2_s6
                                                GHC.Internal.Types.Int GHC.Internal.Types.Int]
-Main.Con1_s5 field 0: boxed (its type is unpacked into another this round)
-Main.Con1_s5 field 1: boxed (its type is unpacked into another this round)
-Main.Con2_s6 field 0: unboxed
-Main.Con1_s5 field 0: unboxed
-Main.Con1_s5 field 1: unboxed
-Main.Con2_s6 field 0: unboxed
-Main.Con2_s6 field 1: unboxed
+Main.Con1_s6 field 0: boxed (its type is unpacked into another this round)
+Main.Con1_s6 field 1: boxed (its type is unpacked into another this round)
+Main.Con2_s7 field 0: unboxed
+Main.Con1_s6 field 0: unboxed
+Main.Con1_s6 field 1: unboxed
+Main.Con2_s7 field 0: unboxed
+Main.Con2_s7 field 1: unboxed
 
 
 [2 of 2] Linking dataunbox005

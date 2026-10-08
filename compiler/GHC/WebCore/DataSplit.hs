@@ -20,6 +20,9 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Coercion ( coercionLKind, isCoVar )
+import GHC.Core.Coercion.Axiom ( CoAxiomRule(..), coAxiomTyCon )
+import GHC.Core.FamInstEnv ( mkNewTypeCoAxiom )
+import Data.Functor.Identity ( runIdentity )
 import GHC.Core.Utils ( exprType )
 
 import GHC.Data.Bag
@@ -141,9 +144,83 @@ eligible tc
       [dc] -> all (isUnliftedType . scaledThing) (dataConOrigArgTys dc)
       _    -> False
 
+-- | A newtype whose representation mentions a type we copy
+-- (Note [Splitting newtypes])
+eligibleNewtype :: TyCon -> Bool
+eligibleNewtype tc
+  =  isNewTyCon tc && not (isClassTyCon tc) && not (isFamInstTyCon tc)
+  && all ok_binder (tyConBinders tc)
+  && any (\t -> t /= tc && (eligible t || (isNewTyCon t && not (isClassTyCon t))))
+         (nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs tc))))
+  where
+    ok_binder b = not (isNamedTyConBinder b) && noFreeVarsOfType (tyVarKind (binderVar b))
+
+-- | What annotation copies: data types and newtypes
+copyable :: TyCon -> Bool
+copyable tc = eligible tc || eligibleNewtype tc
+
+{- Note [Splitting newtypes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A local newtype N = MkN [Int] is a cast: its axiom N ~R# [Int] names the
+list type itself, so if the axiom kept its type, every list that goes into
+an N would meet the original [] and be exposed.  So newtypes are copied too.
+A copy N_c gets fresh copies of the types its representation mentions (its
+children; occurrences of N itself are N_c), and its own axiom N_c ~R# rep_c
+(with those fresh copies).  An occurrence of N's axiom in a coercion becomes
+the axiom of a fresh copy of N.
+
+Two copies of N that are unified must have their representations unified
+too: solving is a congruence closure.  When N_c1 and N_c2 are in one class,
+their children are paired position by position; when a copy of N meets N
+itself, its children meet their originals (they are exposed).  Repeat until
+nothing changes.
+
+A non-exposed class of copies of N becomes one new newtype, whose
+representation maps the children to their classes' types, with its axiom.
+Specialisation and flattening do not rebuild newtypes yet, so the data
+types a split newtype's representation reaches are left out of them.
+-}
+
 ------------------------------------------------------------------
 --      Copies
 ------------------------------------------------------------------
+
+-- | A copy of a newtype with the given representation (in terms of the
+-- newtype's own type variables), and its axiom
+mkNewtypeCopy :: UniqSupply -> (Unique -> OccName -> Name) -> OccName -> TyCon -> Type -> TyCon
+mkNewtypeCopy us mk_name tc_occ tc rhs = tycon
+  where
+    (u_tc, u_ax, u_dc, u_wk) = case uniqsFromSupply us of
+                                 (a : b : c : d : _) -> (a, b, c, d)
+                                 _                   -> panic "mkNewtypeCopy"
+    tvs     = tyConTyVars tc
+    tc_name = mk_name u_tc tc_occ
+    ax_name = mk_name u_ax (mkNewTyCoOcc tc_occ)
+    odc     = case tyConDataCons tc of
+                [dc'] -> dc'
+                _     -> pprPanic "mkNewtypeCopy" (ppr tc)
+    fixed   = case algTyConRhs tc of
+                NewTyCon { nt_fixed_rep = fr } -> fr
+                _                              -> True
+    ax      = mkNewTypeCoAxiom ax_name tycon tvs (tyConRoles tc) rhs
+    tycon   = mkAlgTyCon tc_name (tyConBinders tc) (tyConResKind tc) (tyConRoles tc)
+                         Nothing [] new_rhs
+                         (VanillaAlgTyCon (mkPrelTyConRepName tc_name)) False
+    new_rhs = NewTyCon { data_con = dc, nt_rhs = rhs, nt_etad_rhs = (tvs, rhs)
+                       , nt_co = ax, nt_fixed_rep = fixed }
+    univs   = dataConUnivTyVars odc
+    field   = substTy (zipTvSubst tvs (mkTyVarTys univs)) rhs
+    mult    = case dataConOrigArgTys odc of
+                (Scaled m _ : _) -> m
+                []               -> ManyTy
+    no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
+    dc_name = mk_name u_dc (getOccName odc)
+    wk_name = mk_name u_wk (mkDataConWorkerOcc (getOccName odc))
+    dc = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
+           [no_bang] [HsLazy] [NotMarkedStrict]
+           [] univs [] emptyNameEnv (dataConUserTyVarBinders odc) [] []
+           [Scaled mult field] (mkTyConApp tycon (mkTyVarTys univs))
+           NoPromInfo tycon 1 [] (mkDataConWorkId wk_name dc) NoDataConRep
 
 -- | A copy of a data type with some of its constructors (by tag, in order).
 -- Every occurrence of the type in the constructors' fields is the copy.
@@ -300,7 +377,7 @@ mapTyConsCo want f = go
       ForAllCo { fco_body = b } -> (\b' -> co { fco_body = b' }) <$> go b
       FunCo { fco_arg = a, fco_res = r }
                            -> (\a' r' -> co { fco_arg = a', fco_res = r' }) <$> go a <*> go r
-      AxiomCo ax cos       -> AxiomCo ax <$> mapM go cos
+      AxiomCo ax cos       -> AxiomCo <$> axiom ax <*> mapM go cos
       UnivCo { uco_lty = l, uco_rty = r, uco_deps = ds }
                            -> (\l' r' ds' -> co { uco_lty = l', uco_rty = r', uco_deps = ds' })
                               <$> ty l <*> ty r <*> mapM go ds
@@ -311,6 +388,15 @@ mapTyConsCo want f = go
       InstCo c a           -> InstCo <$> go c <*> go a
       SubCo c              -> SubCo <$> go c
       _                    -> return co   -- CoVarCo, KindCo, HoleCo
+    -- A newtype's axiom: the axiom of its copy (Note [Splitting newtypes] in
+    -- GHC.WebCore.DataSplit)
+    axiom rule@(UnbranchedAxiom ax)
+      | let tc = coAxiomTyCon ax
+      , isNewTyCon tc, want tc
+      , Just ax0 <- newTyConCo_maybe tc, getUnique ax0 == getUnique ax
+      = do { tc' <- f tc
+           ; return (maybe rule UnbranchedAxiom (newTyConCo_maybe tc')) }
+    axiom rule = return rule
 
 {- Note [Copies in coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -333,13 +419,45 @@ data AnnState = AnnState
   , as_us      :: UniqSupply
   , as_copies  :: Copies
   , as_all     :: [TyCon]           -- ^ every copy
+  , as_children :: UniqFM TyCon [TyCon]  -- ^ a newtype copy's children (Note [Splitting newtypes])
   , as_built   :: [(TyCon, Int)]    -- ^ copy, tag of a constructor built there
   , as_matched :: [(TyCon, Int)] }  -- ^ copy, tag of a constructor matched there
 
 type AnnM = State AnnState
 
 newCopy :: TyCon -> AnnM TyCon
-newCopy tc = do
+newCopy tc
+  | isNewTyCon tc = newNewtypeCopy tc
+  | otherwise     = newDataCopy tc
+
+-- | A copy of a newtype: fresh copies of the types in its representation,
+-- then the copy itself (its own occurrences in the representation are it)
+newNewtypeCopy :: TyCon -> AnnM TyCon
+newNewtypeCopy tc = do
+  { let (_, rhs) = newTyConRhs tc
+  ; rhs0 <- mapTyCons (\t -> copyable t && t /= tc) newCopy rhs
+  ; s <- get
+  ; let (us1, us2) = splitUniqSupply (as_us s)
+        selfTo c' = runIdentity . mapTyCons (== tc) (\_ -> return c')
+        c = mkNewtypeCopy us1 (\u occ -> mkExternalName u (as_mod s) occ noSrcSpan) (getOccName tc)
+                          tc (selfTo c rhs0)
+        children = [ t | t <- tyConsInOrder rhs0, t `elemUFM` as_copies s ]
+  ; put s { as_us = us2, as_copies = addToUFM (as_copies s) c tc, as_all = c : as_all s
+          , as_children = addToUFM (as_children s) c children }
+  ; return c }
+
+-- | The type constructors of a type, left to right, with repetitions
+tyConsInOrder :: Type -> [TyCon]
+tyConsInOrder ty = case ty of
+  TyConApp tc tys -> tc : concatMap tyConsInOrder tys
+  FunTy { ft_arg = a, ft_res = r } -> tyConsInOrder a ++ tyConsInOrder r
+  AppTy t1 t2  -> tyConsInOrder t1 ++ tyConsInOrder t2
+  ForAllTy _ t -> tyConsInOrder t
+  CastTy t _   -> tyConsInOrder t
+  _            -> []
+
+newDataCopy :: TyCon -> AnnM TyCon
+newDataCopy tc = do
   { s <- get
   ; let (us1, us2) = splitUniqSupply (as_us s)
         c = mkCopy us1 (\u occ -> mkExternalName u (as_mod s) occ noSrcSpan) (getOccName tc)
@@ -362,9 +480,9 @@ annMapper pinned = Mapper
         -> do { modify (\s -> s { as_matched = (c, dataConTag dc) : as_matched s })
               ; return (Just (con c dc)) }
       _ -> return (Just dc)
-  , m_co   = mapTyConsCo eligible newCopy }    -- Note [Copies in coercions]
+  , m_co   = mapTyConsCo copyable newCopy }    -- Note [Copies in coercions]
   where
-    ann_ty = mapTyCons eligible newCopy
+    ann_ty = mapTyCons copyable newCopy
     con c dc = fromMaybe (pprPanic "DataSplit: constructor" (ppr dc)) (conWithTag c (dataConTag dc))
     -- Vanilla unfoldings may mention binders whose types change; the
     -- simplifier rebuilds them
@@ -450,9 +568,9 @@ splitDataTypes unbox cfg this_mod us rules binds
       | not changed = (binds, [], empty)
       | Just eager <- unbox
                     = let (us4, us5) = splitUniqSupply us3
-                          (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 new_tcs split_binds
+                          (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
                           (fl_binds, fl_tcs, fl_dump) = flatten_rounds eager (3 :: Int) us5 sp_tcs sp_binds
-                      in (fl_binds, fl_tcs, sp_dump $$ fl_dump)
+                      in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump)
       | otherwise   = (split_binds, new_tcs, empty)
 
     -- Each round unpacks one more level (Note [Flattening fields])
@@ -473,7 +591,7 @@ splitDataTypes unbox cfg this_mod us rules binds
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
     (ann_binds, st) = runState (mapProgram (annMapper pinned) binds)
-                               (AnnState this_mod us1 emptyUFM [] [] [])
+                               (AnnState this_mod us1 emptyUFM [] emptyUFM [] [])
     copies   = as_copies st
     lint_res = lintDataProgram cfg copies ann_binds
     ok       = isEmptyBag (dlr_errs lint_res)
@@ -491,7 +609,27 @@ splitDataTypes unbox cfg this_mod us rules binds
     exposed_by_cast ms = not (any (\m -> rep_nc m `elementOfUniqSet` nc_exposed) ms)
 
     -- Classes: representative -> members
-    rep_of = components (as_all st) (dlr_pairs lint_res)
+    -- with congruence for newtype copies' children (Note [Splitting newtypes])
+    rep_of = congruence (as_all st) (dlr_pairs lint_res)
+    children c = lookupUFM (as_children st) c
+    congruence nodes prs = go_cong (0 :: Int) prs
+      where
+        go_cong n ps
+          | null new || n > 20 = r
+          | otherwise          = go_cong (n + 1) (ps `unionBags` listToBag new)
+          where
+            r = components nodes ps
+            repr c = lookupWithDefaultUFM r c c
+            cls = foldl (\m c -> addToUFM_C (++) m (repr c) [c]) emptyUFM
+                        (nubTc (nodes ++ concat [ [a, b] | (a, b) <- bagToList ps ]))
+            -- a pair already in the same class adds nothing
+            new = [ p | p@(a, b) <- concatMap child_pairs (nonDetEltsUFM cls)
+                      , repr a /= repr b ]
+        child_pairs ms = case [ ch | m <- ms, Just ch <- [children m] ] of
+          (ch0 : rest) -> concat [ zip ch0 ch | ch <- rest ]
+                          ++ (if any (not . is_copy) ms
+                              then [ (c, copyOriginal copies c) | c <- ch0 ] else [])
+          []           -> []
     rep c  = lookupWithDefaultUFM rep_of c c
     members :: UniqFM TyCon [TyCon]
     members = foldl (\m c -> addToUFM_C (++) m (rep c) [c]) emptyUFM
@@ -512,6 +650,7 @@ splitDataTypes unbox cfg this_mod us rules binds
     fates = [ (ms, orig, fate, bs, mts)
             | (n, (orig, ms, bs, mts)) <- zip [1 :: Int ..] classes
             , let fate | any (not . is_copy) ms = Exposed
+                       | isNewTyCon orig        = mk_split_nt n orig ms
                        | null bs                = Bottom
                        | otherwise              = mk_split n orig bs ]
 
@@ -523,6 +662,14 @@ splitDataTypes unbox cfg this_mod us rules binds
                     (mkTcOcc (occNameString (getOccName orig) ++ "_s" ++ show n))
                     (\dc _ -> mkDataOcc (con_base dc ++ "_s" ++ show n))
                     orig [ dc | dc <- tyConDataCons orig, dataConTag dc `elem` tags ]
+    -- A newtype class: its representation, from one member, with the
+    -- children mapped to their classes' types (lazily)
+    mk_split_nt n orig ms = Split tc []
+      where
+        member = head [ m | m <- ms, is_copy m ]
+        tc = mkNewtypeCopy (split_us !! n) (\u occ -> mkExternalName u this_mod occ noSrcSpan)
+                           (mkTcOcc (occNameString (getOccName orig) ++ "_s" ++ show n))
+                           orig (evalState (rw_ty (snd (newTyConRhs member))) ())
     -- Constructors with alphanumeric names keep them; [], (:) and tuples
     -- become Con<tag>
     con_base dc = case occNameString (getOccName dc) of
@@ -533,6 +680,22 @@ splitDataTypes unbox cfg this_mod us rules binds
     fate_of = listToUFM [ (m, f) | (ms, _, f, _, _) <- fates, m <- ms ]
 
     new_tcs = [ tc | (_, _, Split tc _, _, _) <- fates ]
+
+    -- Specialisation and flattening rebuild data types, not newtypes: they
+    -- leave out the split newtypes and every split type their
+    -- representations reach (Note [Splitting newtypes])
+    nt_reach = go_reach [] [ t | nt <- new_tcs, isNewTyCon nt
+                               , t <- nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs nt))) ]
+    go_reach seen [] = seen
+    go_reach seen (t : ts)
+      | t `elem` seen || t `notElem` new_tcs = go_reach seen ts
+      | otherwise = go_reach (t : seen) (field_tcs t ++ ts)
+    field_tcs t
+      | isNewTyCon t = nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs t)))
+      | otherwise    = [ t' | dc <- tyConDataCons t, Scaled _ ft <- dataConOrigArgTys dc
+                            , t' <- nonDetEltsUniqSet (tyConsOfType ft) ]
+    data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), tc `notElem` nt_reach ]
+    kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elem` nt_reach ]
     changed = ok && not (null new_tcs)
 
     -- The type constructor a copy becomes, and a constructor (by original tag)
@@ -575,7 +738,10 @@ splitDataTypes unbox cfg this_mod us rules binds
                                then comma <+> text "dropped" <+> ppr [ dataConTag dc | dc <- tyConDataCons orig
                                                                     , dataConTag dc `notElem` bs ]
                                else empty))
-             | (_, orig, Split tc _, bs, ms) <- fates ] ]
+             | (_, orig, Split tc _, bs, ms) <- fates, not (isNewTyCon orig) ]
+      , vcat [ ppr tc <+> text "= newtype" <+> ppr orig <+> text "~R#"
+               <+> ppr (snd (newTyConRhs tc))
+             | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ] ]
 
 -- | The pairs of copies that casts force together: a cast's coercion has the
 -- original types, so its kind against the expression's type

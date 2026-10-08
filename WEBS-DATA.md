@@ -26,6 +26,32 @@ constructors), 7,779 binders pinned. Split most often: `Int` 502, `(,)`
 439, `[]` 416, `(,,)` 95, `Double` 85, `Float` 52. Instruction counts not
 measured yet.
 
+Phase 3, unboxing (2026-10-08, `-fcore-webs-data-unbox`): split types are
+specialised to the most general instance of their uses (Note [Specialising
+split types]), and product fields are unpacked in rounds where every
+construction passes a value and every use is a projection, an argument a
+callee unboxes, or an argument to another unboxable field (Note [Unboxable
+fields], a greatest fixpoint). Copies also go into coercions (Note [Copies in
+coercions]), and newtypes are copied with fresh axioms, unified by
+congruence (Note [Splitting newtypes]). A local [(Int, Int)] becomes a list
+of cells holding two Int#s.
+
+nofib instructions against `early-fix` (112 benchmarks; before newtype
+splitting):
+
+| | geomean | >0.5% better | >0.5% worse | within 0.1% |
+|---|---|---|---|---|
+| split only | +0.03% | 1 | 4 | 95 |
+| split + unbox | −0.30% | 11 | 2 | 84 |
+| + eager (`-fcore-webs-data-unbox-eager`) | −0.53% | 19 | 2 | 77 |
+
+Best, split + unbox: cryptarithm2 −15.1%, puzzle −4.3%, comp_lab_zift −3.5%,
+fft −2.8%, fulsom −2.2%, pic −2.2%. With eager: linear −12.2%, cryptarithm2
+−11.8%, solid −5.1%. Worse: cichelli +1.7% (from splitting alone), x2n1
++1.0%. Allocation (split + unbox, before coercions): cryptarithm2 −22.7%,
+rewrite −6.6%, fulsom −5.4%, fft −4.0%. Splitting `Int` (now excluded) cost
+multiplier +10.2%. Compiler allocation roughly doubles (deferred).
+
 Open: whether recursive fields could be separate copies (polymorphic
 recursion in copies; edge cases), copies for fields of other data types
 (section 2, step 3; phase 4), strict and unpacked fields (types with
