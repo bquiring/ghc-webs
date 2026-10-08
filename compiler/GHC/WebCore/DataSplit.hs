@@ -13,6 +13,7 @@ import GHC.Prelude
 import GHC.Core
 import GHC.Core.DataCon
 import GHC.Core.FVs ( rulesFreeVars, idRuleVars, idUnfoldingVars )
+import GHC.Core.SimpleOpt ( simpleOptExpr, defaultSimpleOpts )
 import GHC.Core.Multiplicity ( Scaled(..) )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
@@ -42,6 +43,7 @@ import GHC.Utils.Panic ( panic, pprPanic )
 import GHC.WebCore.DataCopy
 import GHC.WebCore.DataLint ( LintConfig, DataLintResult(..), lintDataProgram )
 import {-# SOURCE #-} GHC.WebCore.DataFlatten ( flattenFields )
+import GHC.WebCore.DataSpec ( specialiseSplit )
 
 import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
@@ -388,8 +390,28 @@ splitDataTypes unbox cfg this_mod us rules binds
     -- GHC.WebCore.DataFlatten)
     (final_binds, final_tcs, flat_dump)
       | not changed = (binds, [], empty)
-      | unbox       = flattenFields this_mod us3 new_tcs split_binds
+      | unbox       = let (us4, us5) = splitUniqSupply us3
+                          (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 new_tcs split_binds
+                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds (3 :: Int) us5 sp_tcs sp_binds
+                      in (fl_binds, fl_tcs, sp_dump $$ fl_dump)
       | otherwise   = (split_binds, new_tcs, empty)
+
+    -- Each round unpacks one more level (Note [Flattening fields])
+    flatten_rounds 0 _ tcs bs = (bs, tcs, empty)
+    -- Between rounds, the simple optimiser inlines the aliases a round leaves
+    -- (let x = y) and takes apart the cases on constructors it builds, so
+    -- that the next round sees the fields' real uses
+    flatten_rounds n u tcs bs
+      = let (u1, u2) = splitUniqSupply u
+            (bs', tcs', d) = flattenFields this_mod u1 tcs bs
+            changed_round = map getUnique tcs' /= map getUnique tcs
+            bs_opt | changed_round = map simple_bind bs'
+                   | otherwise     = bs'
+            (bs'', tcs'', d') | changed_round = flatten_rounds (n - 1) u2 tcs' bs_opt
+                              | otherwise     = (bs', tcs', empty)
+        in (bs'', tcs'', d $$ d')
+    simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
+    simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
     (ann_binds, st) = runState (mapProgram (annMapper pinned) binds)
                                (AnnState this_mod us1 emptyUFM [] [] [])

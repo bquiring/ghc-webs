@@ -5,6 +5,7 @@
 module GHC.WebCore.Transform.SpecIndex
   ( Indexed(..)
   , specialiseIndexed
+  , antiUnify
   ) where
 
 import GHC.Prelude

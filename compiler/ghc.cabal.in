@@ -1028,6 +1028,7 @@ Library
         GHC.WebCore.DataCopy
         GHC.WebCore.DataFlatten
         GHC.WebCore.DataLint
+        GHC.WebCore.DataSpec
         GHC.WebCore.DataSplit
         GHC.WebCore.Erase
         GHC.WebCore.FirstClass

@@ -224,3 +224,10 @@ for n in range(1, 4):
 for n in [2, 3]:
     test('dataunbox%03d_dump' % n, [extra_files(['datasplit%03d.hs' % n])],
          multimod_compile, ['datasplit%03d' % n, ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+
+# dataunbox004: a local [(Int, Int)] is specialised to its element type, the
+# pairs are unpacked into the cons cells, and then their Ints into Int#s
+# (Note [Specialising split types], Note [Flattening fields])
+test('dataunbox004', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunbox004_dump', [extra_files(['dataunbox004.hs'])],
+     multimod_compile, ['dataunbox004', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])

@@ -8,8 +8,11 @@ Main.Shape_s8 = Main.Shape with Main.Square_s8, Main.Tri_s8 (built [2,
                                                                                  3], dropped [1])
 Main.Shape_s9 = Main.Shape with Main.Circle_s9 (built [1], matched [1,
                                                                     2, 3], dropped [2, 3])
-Main.Shape_s8: Main.Tri_s8 field 0 unboxed, Main.Tri_s8 field 1 unboxed
-Main.Shape_s9: Main.Circle_s9 field 0 unboxed
+Main.Square_s8 field 0: boxed (a match uses it boxed)
+Main.Tri_s8 field 0: unboxed
+Main.Tri_s8 field 1: unboxed
+Main.Circle_s9 field 0: unboxed
+Main.Square_s8 field 0: boxed (a match uses it boxed)
 
 
 [2 of 2] Linking datasplit002

@@ -16,7 +16,7 @@ import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Utils ( exprIsHNF, exprType, mkSingleAltCase )
+import GHC.Core.Utils ( exprIsHNF, exprOkForSpeculation, mkSingleAltCase )
 
 import GHC.Data.FastString ( fsLit )
 
@@ -30,6 +30,7 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
+import GHC.Types.Var.Set
 
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable
@@ -50,7 +51,9 @@ is a product P (one constructor P, no existentials, no wrapper: Int, a pair,
 ...) holds P's components instead, when
 
   * every occurrence of K's worker is saturated, and passes a value (exprIsHNF:
-    a constructor application, or a variable bound to one) in the field; and
+    a constructor application, or a variable bound to one) in the field, or an
+    expression that is cheap and cannot fail (exprOkForSpeculation), which can
+    be evaluated early without changing the program's meaning; and
   * every case alternative on K uses the field only as the scrutinee of
     cases (onlyScrutinised): nothing needs the boxed value.
 
@@ -82,68 +85,91 @@ flattenFields this_mod us tcs binds
   where
     (us1, us2) = splitUniqSupply us
     cands = mkUniqSet tcs
+    _ = cands
 
     -- Candidate fields: products, not recursive
     candidate :: DataCon -> Int -> Bool
     candidate dc i = case drop i (dataConOrigArgTys dc) of
       (Scaled _ t : _)
         | Just (ptc, _, pdc) <- productCon (coreFullView t)
-        , not (ptc `elementOfUniqSet` cands)
+        , ptc /= dataConTyCon dc
         , isNothing (dataConWrapId_maybe pdc)
         , all (typeHasFixedRuntimeRep . scaledThing) (dataConOrigArgTys pdc)
         -> True
       _ -> False
 
-    -- Bad (constructor, field) pairs, and constructors with a bad occurrence
-    bad :: UniqFM DataCon [Int]
-    bad = foldr go_bind emptyUFM binds
+    -- Bad (constructor, field) pairs, with why
+    bad :: UniqFM DataCon [(Int, String)]
+    bad = foldr (go_bind emptyVarSet) emptyUFM binds
 
     is_cand_con dc = dataConTyCon dc `elementOfUniqSet` cands
     all_fields dc = [0 .. dataConRepArity dc - 1]
-    mark dc is m = addToUFM_C (++) m dc is
+    mark why dc is m = addToUFM_C (++) m dc [ (i, why) | i <- is ]
 
-    go_bind bind acc = foldr (\(_, e) -> go e) acc (flattenBinds [bind])
+    go_bind ev bind acc = foldr (\(_, e) -> go ev e) acc (flattenBinds [bind])
 
-    go :: CoreExpr -> UniqFM DataCon [Int] -> UniqFM DataCon [Int]
-    go expr acc = case expr of
+    -- ev: variables known to be evaluated (case binders)
+    go :: VarSet -> CoreExpr -> UniqFM DataCon [(Int, String)] -> UniqFM DataCon [(Int, String)]
+    go ev expr acc = case expr of
       App {}
         | (Var v, args) <- collectArgs expr
         , Just dc <- isDataConWorkId_maybe v, is_cand_con dc
         -> let vals = [ a | a <- args, not (isTypeArg a) ]
-               acc' = foldr go acc args
+               acc' = foldr (go ev) acc args
            in if length vals == dataConRepArity dc
-              then mark dc [ i | (i, a) <- zip [0 ..] vals, not (exprIsHNF a) ] acc'
-              else mark dc (all_fields dc) acc'
+              then mark "a construction passes a non-value" dc
+                        [ i | (i, a) <- zip [0 ..] vals, not (value ev a) ] acc'
+              else mark "unsaturated constructor" dc (all_fields dc) acc'
       Var v
         | Just dc <- isDataConWorkId_maybe v, is_cand_con dc
         , dataConRepArity dc > 0
-        -> mark dc (all_fields dc) acc
-      App f a     -> go f (go a acc)
-      Lam _ e     -> go e acc
-      Let bind e  -> go_bind bind (go e acc)
-      Case e _ _ alts
-        -> go e $ foldr (\(Alt con bs rhs) a -> go rhs (alt con bs rhs a)) acc alts
-      Cast e _    -> go e acc
-      Tick _ e    -> go e acc
+        -> mark "unsaturated constructor" dc (all_fields dc) acc
+      App f a     -> go ev f (go ev a acc)
+      Lam _ e     -> go ev e acc
+      Let bind e  -> go_bind ev bind (go ev e acc)
+      Case e b _ alts
+        -> let ev' = extendVarSet ev b
+           in go ev e $ foldr (\(Alt con bs rhs) a -> go ev' rhs (alt con bs rhs a)) acc alts
+      Cast e _    -> go ev e acc
+      Tick _ e    -> go ev e acc
       _           -> acc
 
     alt (DataAlt dc) bs rhs acc
       | is_cand_con dc
-      = mark dc [ i | (i, b) <- zip [0 ..] (filter isId bs), not (onlyScrutinised b rhs) ] acc
+      = mark "a match uses it boxed" dc
+             [ i | (i, b) <- zip [0 ..] (filter isId bs), not (onlyScrutinised b rhs) ] acc
     alt _ _ _ acc = acc
 
+    -- Outer structures first: a split type that is unpacked into another
+    -- type's field this round keeps its own fields (its constructor must stay
+    -- as it is); flattenFields runs again, and the next round can unbox the
+    -- fields the container now holds.
+    unpacked = mkUniqSet [ dataConTyCon pdc | (_, cons) <- nonDetUFMToList plans0
+                                            , (_, fs) <- cons, Flatten pdc _ <- fs ]
     plans :: Plans
-    plans = listToUFM
+    plans = filterUFM (any (\(_, fs) -> any is_flat fs)) $
+            mapUFM_Directly (\u cons -> if u `elemUniqSet_Directly` unpacked
+                                        then [ (dc, map (const Keep) fs) | (dc, fs) <- cons ]
+                                        else cons) plans0
+
+    plans0 :: Plans
+    plans0 = listToUFM
       [ (tc, cons)
       | tc <- tcs
       , let cons = [ (dc, [ plan dc i | i <- all_fields dc ]) | dc <- tyConDataCons tc ]
       , any (\(_, fs) -> any is_flat fs) cons ]
     plan dc i
-      | candidate dc i, i `notElem` lookupWithDefaultUFM bad [] dc
+      | candidate dc i, i `notElem` map fst (lookupWithDefaultUFM bad [] dc)
       , Scaled _ t : _ <- drop i (dataConOrigArgTys dc)
       , Just (_, args, pdc) <- productCon (coreFullView t)
       = Flatten pdc args
       | otherwise = Keep
+    value ev a = exprIsHNF a || exprOkForSpeculation a || evald ev a
+    evald ev a = case a of
+      Var v     -> v `elemVarSet` ev
+      Tick _ e  -> evald ev e
+      Cast e _  -> evald ev e
+      _         -> False
     is_flat (Flatten {}) = True
     is_flat Keep         = False
 
@@ -231,6 +257,12 @@ flattenFields this_mod us tcs binds
       where
         sub = zipTvSubst (dataConUnivTyVars dc') ty_args
         step (wrap, acc) (Keep, v) = return (wrap, v : acc)
+        step (wrap, acc) (Flatten pdc _, v)
+          | (Var w, args) <- collectArgs v
+          , Just pdc' <- isDataConWorkId_maybe w, pdc' == pdc
+          , let vs = [ a | a <- args, not (isTypeArg a) ]
+          , length vs == dataConRepArity pdc
+          = return (wrap, reverse vs ++ acc)
         step (wrap, acc) (Flatten pdc as, v)
           = do { let comps = map scaledThing (dataConInstArgTys pdc (substTys sub as))
                ; ys <- mapM (fresh "y") comps
@@ -272,7 +304,10 @@ flattenFields this_mod us tcs binds
 
     fresh fs t = do { u <- getUniqueM; return (mkSysLocal (fsLit fs) u ManyTy t) }
 
-    dump = vcat [ ppr tc <> colon <+> hsep (punctuate comma
-                    [ ppr dc <+> text "field" <+> int i <+> text "unboxed"
-                    | (dc, fs) <- cons, (i, Flatten {}) <- zip [0 :: Int ..] fs ])
-                | (tc, cons) <- [ (tc, c) | tc <- tcs, Just c <- [lookupUFM plans tc] ] ]
+    dump = vcat [ ppr dc <+> text "field" <+> int i <> colon <+> verdict
+                | tc <- tcs, dc <- tyConDataCons tc, i <- all_fields dc, candidate dc i
+                , let verdict
+                        | Just fs <- field_plan dc, Flatten {} : _ <- drop i fs = text "unboxed"
+                        | (why : _) <- [ w | (j, w) <- lookupWithDefaultUFM bad [] dc, j == i ]
+                        = text "boxed" <+> parens (text why)
+                        | otherwise = text "boxed (its type is unpacked into another this round)" ]
