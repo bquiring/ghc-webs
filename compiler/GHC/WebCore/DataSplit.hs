@@ -202,11 +202,18 @@ mkNewtypeCopy us mk_name tc_occ tc rhs = tycon
     fixed   = case algTyConRhs tc of
                 NewTyCon { nt_fixed_rep = fr } -> fr
                 _                              -> True
-    ax      = mkNewTypeCoAxiom ax_name tycon tvs (tyConRoles tc) rhs
+    -- Eta-reduced as the original is (Note [Newtype eta] in GHC.Core.TyCon):
+    -- an occurrence of the original's axiom has its number of arguments
+    (etad_tvs0, _) = newTyConEtadRhs tc
+    k         = length tvs - length etad_tvs0
+    etad_tvs  = take (length tvs - k) tvs
+    etad_rhs  = case splitAppTys rhs of
+                  (h, args) -> mkAppTys h (take (length args - k) args)
+    ax      = mkNewTypeCoAxiom ax_name tycon etad_tvs (take (length etad_tvs) (tyConRoles tc)) etad_rhs
     tycon   = mkAlgTyCon tc_name (tyConBinders tc) (tyConResKind tc) (tyConRoles tc)
                          Nothing [] new_rhs
                          (VanillaAlgTyCon (mkPrelTyConRepName tc_name)) False
-    new_rhs = NewTyCon { data_con = dc, nt_rhs = rhs, nt_etad_rhs = (tvs, rhs)
+    new_rhs = NewTyCon { data_con = dc, nt_rhs = rhs, nt_etad_rhs = (etad_tvs, etad_rhs)
                        , nt_co = ax, nt_fixed_rep = fixed }
     univs   = dataConUnivTyVars odc
     field   = substTy (zipTvSubst tvs (mkTyVarTys univs)) rhs
