@@ -166,7 +166,7 @@ webPass early guts
        ; us_s <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let (binds4, replaced, spec_dump)
                | null new_ixs = (binds3, [], [])
-               | otherwise    = specialiseIndexed us_s [ Indexed tc (Just ap) | (tc, ap) <- new_ixs ] binds3
+               | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3
              new_tcs = [ maybe tc id (lookup tc replaced) | (tc, _) <- new_ixs ]
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
@@ -177,11 +177,12 @@ webPass early guts
 -- Returns the new program, the new type constructors, and whether anything
 -- changed.
 runDefunc :: Bool -> Logger -> DynFlags -> LintConfig -> Module -> WebSigs -> CoreProgram
-          -> CoreM (CoreProgram, [(TyCon, Id)], Bool)
+          -> CoreM (CoreProgram, [(TyCon, Maybe Id)], Bool)
 runDefunc early logger dflags cfg this_mod sigs binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let pol = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
-             (res, vs) = defuncProgram this_mod pol us (ws_exposed sigs) binds
+             (res, vs) = defuncProgram (gopt Opt_CoreWebsDefuncLifted dflags)
+                                       this_mod pol us (ws_exposed sigs) binds
        ; dump logger Opt_D_dump_webs_defunc "Webs: defunctionalisation" $
            pprWebVerdicts [ (v, bs) | (_, v, _, bs) <- vs ]
        ; case res of

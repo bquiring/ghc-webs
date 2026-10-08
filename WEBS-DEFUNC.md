@@ -1,8 +1,14 @@
 # Design: Defunctionalisation over Webs
 
 Status: implemented in `GHC/WebCore/Transform/Defunc.hs`
-(`-fcore-webs-defunc`, dump `-ddump-webs-defunc`). Version 1: monomorphic
-webs whose calls are all unknown. Survey §13.
+(`-fcore-webs-defunc`, dump `-ddump-webs-defunc`). Survey §13. Since this
+document was written, polymorphic webs are handled too: the data type has
+two parameters, `D_w a b`, and each constructor fixes them with equalities
+(Note [Defunctionalisation]); a post-pass specialises each type to its uses
+(Note [Specialising indexed types] in `GHC/WebCore/Transform/SpecIndex.hs`);
+and `-fcore-webs-defunc-lifted` lifts the lambdas' bodies into top-level
+functions instead of an apply function (Note [Lifted bodies]). Open issues:
+`WEBS-BACKLOG.md`, "Now".
 
 An unknown call (a call of a parameter, a field, the result of another call)
 is an indirect jump through `stg_ap_*`, which GHC cannot inline or

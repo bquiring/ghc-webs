@@ -14,12 +14,36 @@ a heuristic.
 
 ## Now
 
-- **Defunctionalisation, polymorphic webs** (`WEBS-DEFUNC.md`): 94% of the
-  local webs with unknown calls are rejected as polymorphic (1,134 on
-  nofib). Needs a GADT encoding, `D_w a b`, with an equality per
-  constructor.
-- **Defunctionalisation, webs with known calls** (14 on nofib): keep the
-  function for its known calls, and the constructor where it escapes.
+Plan for the next session (2026-10-08):
+
+1. **Fix the Core Lint errors in polymorphic defunctionalisation.** The
+   nofib run `early-df` (`webs-bench/run-defunc.sh`, built with
+   `-dcore-lint`) fails to compile four benchmarks, so they are missing from
+   the results: `real/eff/CS`, `spectral/dom-lt`, `spectral/hartel/transform`,
+   `real/veritas` (see `results/early-df/nofib.log`, "Core Lint errors").
+   - Three are "type variable out of scope" in an apply function's
+     alternative: a field's type mentions a type variable that is not among
+     the constructor's existentials (e.g. `k :: Defun1 s o` with `s` free).
+     Suspect: the field types are computed after rewriting nested arrows to
+     other webs' types, or a field's type mentions a type variable that
+     `exprFreeVars` of the lambda does not report.
+   - One is in the specialisation post-pass (`SpecIndex`), with nested
+     specialised types and an unlifted argument kind: "Expected arg type:
+     Defun4 Int (Defun5 r r), Actual: Defun4 r" in `$apply3`. Some use of
+     the old type is not rewritten, probably in the eliminator's body.
+   - `spectral/circsim` and `spectral/hartel/solid` are also missing from
+     the timing: find out why.
+   - `verdicts.py` counts the specialisation dump lines ("Main.Defun1:
+     specialised ...") as verdicts: skip them.
+2. **Test lifted bodies** (`-fcore-webs-defunc-lifted`, Note [Lifted bodies]
+   in `GHC.WebCore.Transform.Defunc`). It compiles but has not run yet: run
+   the webs tests with it (add `-fcore-webs-defunc-lifted` variants of the
+   `defunc` tests), then nofib against the apply-function version.
+3. **Then measure.** Partial results so far, with the four benchmarks
+   missing (`results/timing-defunc.md`): 71 webs defunctionalised (49 with
+   one constructor), against 22 for the monomorphic version; `mate`
+   −13.1% time against `base`, `event` +6.5% time (check its
+   instructions).
 
 ## Next
 
@@ -136,3 +160,7 @@ a heuristic.
 - Defunctionalisation, first version (monomorphic webs, unknown calls only):
   22 webs on nofib; `mate` −4.7% instructions more, −11.8% time against
   `base` (`WEBS-EXPERIMENTS.md` §6): `8737fb55c4`.
+- Polymorphic webs: `D_w a b` with equalities in the constructors' contexts
+  (`d2d8f7f9cb`); specialisation of the new types to the most general
+  unifier of their uses, as a post-pass (`57e6903316`). Core Lint errors on
+  four nofib benchmarks remain (see Now).

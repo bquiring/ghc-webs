@@ -656,6 +656,7 @@ data GeneralFlag
    | Opt_CoreWebsConstProp  -- ^ Web pipeline: constant propagation
    | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
    | Opt_CoreWebsDefunc     -- ^ Web pipeline: defunctionalisation
+   | Opt_CoreWebsDefuncLifted -- ^ Defunctionalisation: lift the lambdas' bodies, no apply function
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
    | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
@@ -939,6 +940,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsConstProp
    , Opt_CoreWebsInline
    , Opt_CoreWebsDefunc
+   , Opt_CoreWebsDefuncLifted
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
    , Opt_Specialise

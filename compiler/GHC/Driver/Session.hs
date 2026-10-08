@@ -2552,6 +2552,7 @@ fFlagsDeps = [
   flagSpec "core-webs-const-prop"             Opt_CoreWebsConstProp,
   flagSpec "core-webs-inline"                 Opt_CoreWebsInline,
   flagSpec "core-webs-defunc"                 Opt_CoreWebsDefunc,
+  flagSpec "core-webs-defunc-lifted"          Opt_CoreWebsDefuncLifted,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,
   flagSpec "liberate-case"                    Opt_LiberateCase,

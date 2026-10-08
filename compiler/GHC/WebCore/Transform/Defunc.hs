@@ -17,7 +17,7 @@ import GHC.Core.Predicate ( mkNomEqPred )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Utils ( exprType )
+import GHC.Core.Utils ( exprType, exprIsTrivial )
 import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Data.FastString ( fsLit, mkFastString )
@@ -25,7 +25,7 @@ import GHC.Data.Pair ( Pair(..) )
 
 import GHC.Types.Basic ( Arity )
 import GHC.Types.Cpr ( topCprSig )
-import GHC.Types.Demand ( Demand(..), splitDmdSig, mkClosedDmdSig, nopSig, topSubDmd )
+import GHC.Types.Demand ( Demand(..), splitDmdSig, mkClosedDmdSig, nopSig, topSubDmd, topDmd, topDiv )
 import GHC.Types.Id
 import GHC.Types.Id.Make ( mkDataConWorkId )
 import GHC.Types.Name
@@ -37,7 +37,7 @@ import GHC.Types.Unique ( getKey, getUnique )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
-import GHC.Types.Var ( isCoVar, mkTyVar, mkCoVar )
+import GHC.Types.Var ( CoVar, isCoVar, mkTyVar, mkCoVar )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Web
@@ -48,10 +48,10 @@ import GHC.Utils.Panic ( pprPanic )
 
 import GHC.WebCore.Transform.ArityRaise ( knownHead )
 import GHC.WebCore.Transform.Common ( UnfoldingPolicy, changedBinders, fixUnfolding )
-import GHC.WebCore.Traverse ( typeWebs )
+import GHC.WebCore.Traverse ( typeWebs, stripWebForms )
 
 import Control.Monad ( forM )
-import Data.List ( sortOn, nub )
+import Data.List ( sortOn, nub, zip5 )
 import Data.Maybe ( isJust )
 
 {- Note [Defunctionalisation]
@@ -287,17 +287,34 @@ verdict tops exposed w i
 --      The new types
 ------------------------------------------------------------------
 
+-- | A lambda's body, and the variables it is rewritten over: the lifted
+-- function's parameters (or, with an apply function, the alternative's
+-- binders, which are the same variables)
+data LamFun = LamFun
+  { lf_dc   :: DataCon      -- ^ the lambda's constructor
+  , lf_plan :: LamPlan
+  , lf_id   :: Id           -- ^ the lifted function $lam_i
+  , lf_tvs  :: [TyVar]      -- ^ the lambda's free type variables, renamed
+  , lf_ys   :: [Id]         -- ^ its free variables, renamed
+  , lf_x    :: Id           -- ^ its parameter, renamed
+  , lf_res  :: Type         -- ^ its result type
+  , lf_webs :: [WebId]      -- ^ the webs of $lam_i's arrows
+  , lf_c1   :: CoVar        -- ^ in $apply_w's alternative:  a ~# A_i
+  , lf_c2   :: CoVar        -- ^                             b ~# B_i
+  }
+
 -- | What we build for a web
 data DWeb = DWeb
   { d_tycon :: TyCon
-  , d_cons  :: UniqFM Id (DataCon, LamPlan)  -- ^ lambda binder -> constructor
-  , d_apply :: Id                            -- ^ $apply_w
-  , d_atvs  :: [TyVar]                       -- ^ its type parameters, a and b
-  , d_fd    :: Id                            -- ^ its first parameter (D_w a b)
-  , d_x     :: Id                            -- ^ its second parameter (a)
-  , d_w1    :: WebId                         -- ^ the webs of its arrows
+  , d_lams  :: UniqFM Id LamFun   -- ^ lambda binder -> its constructor and body
+  , d_order :: [LamFun]           -- ^ in constructor order
+  , d_apply :: Id                 -- ^ $apply_w (unless the bodies are lifted)
+  , d_atvs  :: [TyVar]            -- ^ its type parameters, a and b
+  , d_fd    :: Id                 -- ^ its first parameter (D_w a b)
+  , d_x     :: Id                 -- ^ its second parameter (a)
+  , d_w1    :: WebId              -- ^ the webs of its arrows
   , d_w2    :: WebId
-  , d_wild  :: Id                            -- ^ the case binder in $apply_w
+  , d_wild  :: Id                 -- ^ the case binder in $apply_w
   }
 
 -- | Rewrite the arrows of the defunctionalised webs to their data types
@@ -314,23 +331,26 @@ mapTy todo = go
       CastTy t co     -> CastTy (go t) co
       _               -> ty
 
--- | Make the data type, constructors and apply function of a web.  Lazy in
--- 'todo' (field types may mention other new types): see the knot in
--- 'defuncProgram'
+-- | Make the data type, constructors, lifted bodies and apply function of a
+-- web.  Lazy in 'todo' (field types may mention other new types): see the
+-- knot in 'defuncProgram'
 mkDWeb :: Module -> UniqFM WebId DWeb -> UniqSupply -> Int -> Kind -> Kind -> [Lam] -> [LamPlan]
        -> DWeb
 mkDWeb this_mod todo us n ka kb lams plans
   = DWeb { d_tycon = tycon
-         , d_cons = listToUFM (zip (map l_bndr lams) (zip cons plans))
+         , d_lams  = listToUFM (zip (map l_bndr lams) funs)
+         , d_order = funs
          , d_apply = apply, d_atvs = [aa, ab], d_fd = fd, d_x = x, d_w1 = w1, d_w2 = w2
          , d_wild = wild }
   where
     k = show n
-    (us1, us2) = splitUniqSupply us
+    (us1, us23) = splitUniqSupply us
+    (us2, us3)  = splitUniqSupply us23
     uniqs = uniqsFromSupply us1
     nth i = uniqs !! i
-    (u_tc, u_ap, u_fd, u_x, u_w1)          = (nth 0, nth 1, nth 2, nth 3, nth 4)
-    (u_w2, u_wild, u_ta, u_tb, u_aa, u_ab) = (nth 5, nth 6, nth 7, nth 8, nth 9, nth 10)
+    (u_tc, u_ta, u_tb, u_ap, u_fd)    = (nth 0, nth 1, nth 2, nth 3, nth 4)
+    (u_x, u_w1, u_w2, u_wild, u_aa)   = (nth 5, nth 6, nth 7, nth 8, nth 9)
+    u_ab = nth 10
 
     -- The type constructor:  D_w (a :: ka) (b :: kb)
     ta = mkTyVar (mkSystemName u_ta (mkTyVarOccFS (fsLit "a"))) ka
@@ -369,6 +389,42 @@ mkDWeb this_mod todo us n ka kb lams plans
                (map unrestricted arg_tys) (mkTyConApp tycon [mkTyVarTy ta, mkTyVarTy tb])
                NoPromInfo tycon tag [] (mkDataConWorkId wk_name dc) NoDataConRep
 
+    -- The bodies:  $lam_i :: forall ds. t_i1 -> .. -> t_ik -> A_i -> B_i
+    funs = [ mk_fun tag l p dc us_f
+           | (tag, l, p, dc, us_f) <- zip5 [1 :: Int ..] lams plans cons (listSplitUniqSupply us3) ]
+
+    mk_fun tag l p dc us_f
+      = LamFun { lf_dc = dc, lf_plan = p, lf_id = fun, lf_tvs = tvs', lf_ys = ys, lf_x = x'
+               , lf_res = res, lf_webs = webs, lf_c1 = c1, lf_c2 = c2 }
+      where
+        uf = uniqsFromSupply us_f
+        tvs' = [ mkTyVar (mkSystemName u (getOccName tv)) (tyVarKind tv)
+               | (tv, u) <- zip (lp_tvs p) uf ]
+        uf1  = drop (length tvs') uf
+        sub  = zipTvSubst (lp_tvs p) (mkTyVarTys tvs')
+        inst t = mapTy todo (substTyUnchecked sub t)
+        ys   = [ mkSysLocal (occNameFS (getOccName v)) u ManyTy (inst (idType v))
+               | (v, u) <- zip (lp_fields p) uf1 ]
+        uf2  = drop (length ys) uf1
+        -- The argument keeps the lambda's demand on it, and the lifted
+        -- function gets a demand signature built from it: demand analysis
+        -- has run already, and CorePrep and worker/wrapper read signatures
+        x'   = mkSysLocal (occNameFS (getOccName (l_bndr l))) (uf2 !! 0) ManyTy (inst (lp_arg p))
+                 `setIdDemandInfo` idDemandInfo (l_bndr l)
+        res  = inst (lp_res p)
+        c1   = mkCoVar (mkSystemName (uf2 !! 1) (mkVarOccFS (fsLit "co")))
+                       (mkNomEqPred (mkTyVarTy aa) (idType x'))
+        c2   = mkCoVar (mkSystemName (uf2 !! 2) (mkVarOccFS (fsLit "co")))
+                       (mkNomEqPred (mkTyVarTy ab) res)
+        webs = map mkWebId (take (length ys + 1) (drop 4 uf2))
+        fun_ty = mkSpecForAllTys tvs' $
+                 foldr (\(w, t) r -> setFunTyWeb w (mkVisFunTyMany t r)) res
+                       (zip webs (map idType (ys ++ [x'])))
+        fun  = mkSysLocal (mkFastString ("$lam" ++ k ++ "_" ++ show tag)) (uf2 !! 3) ManyTy fun_ty
+                 `setIdArity` (length ys + 1)
+                 `setIdDmdSig` mkClosedDmdSig (map (const topDmd) ys ++ [idDemandInfo (l_bndr l)])
+                                              topDiv
+
     -- The apply function:  forall a b. D_w a b -> a -> b
     aa = mkTyVar (mkSystemName u_aa (mkTyVarOccFS (fsLit "a"))) ka
     ab = mkTyVar (mkSystemName u_ab (mkTyVarOccFS (fsLit "b"))) kb
@@ -387,15 +443,22 @@ mkDWeb this_mod todo us n ka kb lams plans
 --      The program
 ------------------------------------------------------------------
 
--- | Defunctionalise the webs that qualify.  Returns the new program (if
--- anything changed), the new type constructors with their apply functions,
--- and the verdicts.
-defuncProgram :: Module -> UnfoldingPolicy -> UniqSupply -> WebSet -> CoreProgram
-              -> (Maybe (CoreProgram, [(TyCon, Id)]), [(WebId, SDoc, Bool, [Id])])
-defuncProgram this_mod pol us exposed binds
+-- | Defunctionalise the webs that qualify.  The Bool says whether to lift
+-- the lambdas' bodies (Note [Lifted bodies]) rather than put them in an
+-- apply function.  Returns the new program (if anything changed), the new
+-- type constructors with their apply functions (if any), and the verdicts.
+defuncProgram :: Bool -> Module -> UnfoldingPolicy -> UniqSupply -> WebSet -> CoreProgram
+              -> (Maybe (CoreProgram, [(TyCon, Maybe Id)]), [(WebId, SDoc, Bool, [Id])])
+defuncProgram lifted this_mod pol us exposed binds
   | isNullUFM todo = (Nothing, dump)
-  | otherwise      = ( Just (binds' ++ [Rec applies], [ (d_tycon d, d_apply d) | d <- nonDetEltsUFM todo ])
-                     , dump )
+  | lifted
+  = ( Just (binds' ++ [Rec [ (lf_id lf, mk_lifted lf body) | (_, lf, body) <- bodies ]]
+           , [ (d_tycon d, Nothing) | d <- nonDetEltsUFM todo ])
+    , dump )
+  | otherwise
+  = ( Just (binds' ++ [Rec [ (d_apply d, mk_apply d u) | (u, d) <- nonDetUFMToList todo ]]
+           , [ (d_tycon d, Just (d_apply d)) | d <- nonDetEltsUFM todo ])
+    , dump )
   where
     (us1, us2) = splitUniqSupply us
     tops  = mkVarSet (bindersOfBinds binds)
@@ -416,43 +479,72 @@ defuncProgram this_mod pol us exposed binds
 
     changed = changedBinders (\ty -> any (`elemUFM` todo) (nonDetEltsUniqSet (typeWebs ty))) binds
 
-    (binds', alts) = initUs_ us2 (rewrite pol todo changed binds)
+    (binds', bodies) = initUs_ us2 (rewrite lifted pol todo changed binds)
 
-    applies = [ (d_apply d, mk_apply d (lookupWithDefaultUFM alts [] (mkWebId u)))
-              | (u, d) <- nonDetUFMToList todo ]
+    -- $lam_i = /\ds. \ys x. body
+    mk_lifted lf body
+      = mkLams (lf_tvs lf) $
+        foldr (\(w, v) e -> WebLam w v e) body (zip (lf_webs lf) (lf_ys lf ++ [lf_x lf]))
 
-    mk_apply d as
+    -- $apply_w = /\a b. \fd x. case fd of { C_i ds c1 c2 ys -> let xi = x |> c1 in body |> sym c2 }
+    mk_apply d u
       = mkLams (d_atvs d) $
         WebLam (d_w1 d) (d_fd d) $ WebLam (d_w2 d) (d_x d) $
         Case (Var (d_fd d)) (d_wild d) (mkTyVarTy (d_atvs d !! 1))
-             (sortOn alt_tag [ Alt (DataAlt dc) bs rhs | (dc, bs, rhs) <- as ])
-    alt_tag (Alt (DataAlt dc) _ _) = dataConTag dc
-    alt_tag _                      = 0
+             [ Alt (DataAlt (lf_dc lf)) (lf_tvs lf ++ [lf_c1 lf, lf_c2 lf] ++ lf_ys lf)
+                   (Cast (bind_x lf (Cast (Var (d_x d)) (mkSubCo (mkCoVarCo (lf_c1 lf)))) body)
+                         (mkSubCo (mkSymCo (mkCoVarCo (lf_c2 lf)))))
+             | (w, lf, body) <- sortOn (\(_, lf, _) -> dataConTag (lf_dc lf)) bodies
+             , w == mkWebId u ]
+
+    bind_x lf arg body
+      | isUnliftedType (idType (lf_x lf)) = Case arg (lf_x lf) (lf_res lf) [Alt DEFAULT [] body]
+      | otherwise                         = Let (NonRec (lf_x lf) arg) body
+
+{- Note [Lifted bodies]
+~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-defunc-lifted, no apply function is made.  Each lambda's
+body becomes a top-level function of its free variables and its argument,
+
+    $lam_i = /\ds. \yi1 .. yik x. ei
+
+and each call does the dispatch itself:
+
+    f @^w a   ==>   let x = a in
+                    case f of { C_i ds c1 c2 zs -> $lam_i @ds zs (x |> c1) |> sym c2 ; ... }
+
+The case is small, so copying it to every call costs little, and each
+alternative is a known call, which GHC inlines body by body.  With an apply
+function, the bodies are all inside $apply_w: inlining it copies every body
+to every call, and GHC does so only when that is small.  ($lam_i's
+argument keeps the lambda's demand on it, and $lam_i a demand signature
+built from it, since demand analysis has already run.)
+-}
 
 ------------------------------------------------------------------
 --      The rewrite
 ------------------------------------------------------------------
 
--- | For each web, the alternatives of its apply function
-type Alts = UniqFM WebId [(DataCon, [Var], CoreExpr)]
+-- | The rewritten bodies of the lambdas
+type Bodies = [(WebId, LamFun, CoreExpr)]
 
 -- | The rewrite's environment: the new versions of binders, and a type
--- substitution (inside a lambda body moved into $apply_w, the lambda's free
--- type variables become the alternative's existentials)
+-- substitution (inside a lambda body, the lambda's free type variables
+-- become the lifted function's, or the alternative's)
 data Env = Env { e_ids :: VarEnv Id, e_tsub :: Subst }
 
-rewrite :: UnfoldingPolicy -> UniqFM WebId DWeb -> VarSet -> CoreProgram
-        -> UniqSM (CoreProgram, Alts)
-rewrite pol todo changed binds
+rewrite :: Bool -> UnfoldingPolicy -> UniqFM WebId DWeb -> VarSet -> CoreProgram
+        -> UniqSM (CoreProgram, Bodies)
+rewrite lifted pol todo changed binds
   = do { let env0 = Env (mkVarEnv [ (b, fixBndr (mapTy todo (idType b)) b)
                                   | b <- bindersOfBinds binds ]) emptySubst
        ; rs <- mapM (rw_top env0) binds
-       ; return (map fst rs, foldr (plusUFM_C (++) . snd) emptyUFM rs) }
+       ; return (map fst rs, concatMap snd rs) }
   where
-    rw_top env (NonRec b e) = do { (e', as) <- rw env e; return (NonRec (lk env b) e', as) }
+    rw_top env (NonRec b e) = do { (e', bs) <- rw env e; return (NonRec (lk env b) e', bs) }
     rw_top env (Rec prs)
-      = do { rs <- mapM (\(b, e) -> do { (e', as) <- rw env e; return ((lk env b, e'), as) }) prs
-           ; return (Rec (map fst rs), foldr (plusUFM_C (++) . snd) emptyUFM rs) }
+      = do { rs <- mapM (\(b, e) -> do { (e', bs) <- rw env e; return ((lk env b, e'), bs) }) prs
+           ; return (Rec (map fst rs), concatMap snd rs) }
 
     lk env v = lookupVarEnv (e_ids env) v `orElse` v
     orElse (Just x) _ = x
@@ -511,93 +603,106 @@ rewrite pol todo changed binds
 
     fresh_tv tv = do { u <- getUniqueM
                      ; return (mkTyVar (mkSystemName u (getOccName tv)) (tyVarKind tv)) }
+    fresh_id fs t = do { u <- getUniqueM; return (mkSysLocal fs u ManyTy t) }
+    fresh_co t = do { u <- getUniqueM
+                    ; return (mkCoVar (mkSystemName u (mkVarOccFS (fsLit "co"))) t) }
 
-    rw :: Env -> CoreExpr -> UniqSM (CoreExpr, Alts)
+    rw :: Env -> CoreExpr -> UniqSM (CoreExpr, Bodies)
     rw env expr = case expr of
-      Var v -> return (Var (lk env v), emptyUFM)
-      Lit {} -> return (expr, emptyUFM)
-      Type t -> return (Type (ty env t), emptyUFM)
-      Coercion co -> return (Coercion (substCoUnchecked (e_tsub env) co), emptyUFM)
-      App f a -> do { (f', as1) <- rw env f; (a', as2) <- rw env a
-                    ; return (App f' a', plus as1 as2) }
+      Var v -> return (Var (lk env v), [])
+      Lit {} -> return (expr, [])
+      Type t -> return (Type (ty env t), [])
+      Coercion co -> return (Coercion (substCoUnchecked (e_tsub env) co), [])
+      App f a -> do { (f', bs1) <- rw env f; (a', bs2) <- rw env a
+                    ; return (App f' a', bs1 ++ bs2) }
       WebApp w f a
         | Just d <- lookupUFM todo w
-        -> do { (f', as1) <- rw env f; (a', as2) <- rw env a
+        -> do { (f', bs1) <- rw env f; (a', bs2) <- rw env a
               ; let fun_ty = sty env (exprType f)
                     (arg_t, res_t) = case coreFullView fun_ty of
-                      FunTy { ft_arg = at, ft_res = rt } -> (at, rt)
+                      FunTy { ft_arg = at, ft_res = rt } -> (mapTy todo at, mapTy todo rt)
                       t -> pprPanic "Defunc: call of a non-function" (ppr t)
-                    apply_at = mkTyApps (Var (d_apply d)) [mapTy todo arg_t, mapTy todo res_t]
-              ; return ( WebApp (d_w2 d) (WebApp (d_w1 d) apply_at f') a'
-                       , plus as1 as2 ) }
+              ; call <- if lifted then dispatch d f' a' arg_t res_t
+                        else return (WebApp (d_w2 d)
+                                       (WebApp (d_w1 d) (mkTyApps (Var (d_apply d)) [arg_t, res_t]) f')
+                                       a')
+              ; return (call, bs1 ++ bs2) }
         | otherwise
-        -> do { (f', as1) <- rw env f; (a', as2) <- rw env a
-              ; return (WebApp w f' a', plus as1 as2) }
+        -> do { (f', bs1) <- rw env f; (a', bs2) <- rw env a
+              ; return (WebApp w f' a', bs1 ++ bs2) }
       WebLam w x e
         | Just d <- lookupUFM todo w
-        , Just (dc, p) <- lookupUFM (d_cons d) x
-        -> do { -- The alternative of $apply_w: fresh existentials,
-                -- coercions and fields.  See Note [Defunctionalisation]
-                exs <- mapM fresh_tv (lp_tvs p)
-              ; let body_env0 = Env (e_ids env) (zipTvSubst (lp_tvs p) (mkTyVarTys exs))
-                    arg_i = ty body_env0 (lp_arg p)
-                    res_i = ty body_env0 (lp_res p)
-                    (ta, tb) = case d_atvs d of
-                      [a', b'] -> (mkTyVarTy a', mkTyVarTy b')
-                      _        -> pprPanic "Defunc: apply parameters" (ppr (d_atvs d))
-              ; u1 <- getUniqueM; u2 <- getUniqueM; u3 <- getUniqueM
-              ; let c1 = mkCoVar (mkSystemName u1 (mkVarOccFS (fsLit "co"))) (mkNomEqPred ta arg_i)
-                    c2 = mkCoVar (mkSystemName u2 (mkVarOccFS (fsLit "co"))) (mkNomEqPred tb res_i)
-                    xi = mkSysLocal (occNameFS (getOccName x)) u3 ManyTy arg_i
-              ; ys <- forM (lp_fields p) $ \v ->
-                        do { u <- getUniqueM
-                           ; return (mkSysLocal (occNameFS (getOccName v)) u ManyTy
-                                                (ty body_env0 (idType v))) }
-              ; let body_env = body_env0 { e_ids = extendVarEnvList (e_ids env)
-                                                     ((x, xi) : zip (lp_fields p) ys) }
-              ; (e', as) <- rw body_env e
-              ; let x_in  = Cast (Var (d_x d)) (mkSubCo (mkCoVarCo c1))
-                    bound | isUnliftedType arg_i = Case x_in xi res_i [Alt DEFAULT [] e']
-                          | otherwise            = Let (NonRec xi x_in) e'
-                    rhs   = Cast bound (mkSubCo (mkSymCo (mkCoVarCo c2)))
+        , Just lf <- lookupUFM (d_lams d) x
+        -> do { -- The body, over the lifted function's parameters
+                -- (Note [Defunctionalisation], Note [Lifted bodies])
+                let p = lf_plan lf
+                    body_env = Env (extendVarEnvList (e_ids env) ((x, lf_x lf) : zip (lp_fields p) (lf_ys lf)))
+                                   (zipTvSubst (lp_tvs p) (mkTyVarTys (lf_tvs lf)))
+              ; (e', bs) <- rw body_env e
                 -- The constructor, where the lambda was
-                    arg_l = ty env (lp_arg p)
+              ; let arg_l = ty env (lp_arg p)
                     res_l = ty env (lp_res p)
-                    con0  = mkTyApps (Var (dataConWorkId dc))
+                    con0  = mkTyApps (Var (dataConWorkId (lf_dc lf)))
                                      ([arg_l, res_l] ++ map (ty env . mkTyVarTy) (lp_tvs p))
                     con1  = foldl (\f co -> WebApp placeholderWeb f (Coercion co)) con0
                                   [mkNomReflCo arg_l, mkNomReflCo res_l]
                     con   = foldl (\f v -> WebApp placeholderWeb f (Var (lk env v))) con1 (lp_fields p)
-              ; return (con, plus as (unitUFM w [(dc, exs ++ [c1, c2] ++ ys, rhs)])) }
+              ; return (con, (w, lf, e') : bs) }
         | otherwise
-        -> do { (env', x') <- bndr env x; (e', as) <- rw env' e
-              ; return (WebLam w x' e', as) }
-      Lam b e -> do { (env', b') <- bndr env b; (e', as) <- rw env' e
-                    ; return (Lam b' e', as) }
+        -> do { (env', x') <- bndr env x; (e', bs) <- rw env' e
+              ; return (WebLam w x' e', bs) }
+      Lam b e -> do { (env', b') <- bndr env b; (e', bs) <- rw env' e
+                    ; return (Lam b' e', bs) }
       Let (NonRec b rhs) body
-        -> do { (rhs', as1) <- rw env rhs
+        -> do { (rhs', bs1) <- rw env rhs
               ; (env', b') <- bndr env b
-              ; (body', as2) <- rw env' body
-              ; return (Let (NonRec b' rhs') body', plus as1 as2) }
+              ; (body', bs2) <- rw env' body
+              ; return (Let (NonRec b' rhs') body', bs1 ++ bs2) }
       Let (Rec prs) body
         -> do { (env', bs') <- bndrs env (map fst prs)
               ; rs <- mapM (rw env' . snd) prs
-              ; (body', as2) <- rw env' body
+              ; (body', bs2) <- rw env' body
               ; return ( Let (Rec (zip bs' (map fst rs))) body'
-                       , foldr (plus . snd) as2 rs ) }
+                       , concatMap snd rs ++ bs2 ) }
       Case scrut b t alts
-        -> do { (scrut', as1) <- rw env scrut
+        -> do { (scrut', bs1) <- rw env scrut
               ; (env', b') <- bndr env b
               ; rs <- forM alts $ \(Alt c bs rhs) ->
                         do { (env'', bs') <- bndrs env' bs
-                           ; (rhs', as) <- rw env'' rhs
-                           ; return (Alt c bs' rhs', as) }
-              ; return (Case scrut' b' (ty env t) (map fst rs), foldr (plus . snd) as1 rs) }
-      Cast e co -> do { (e', as) <- rw env e
-                      ; return (Cast e' (substCoUnchecked (e_tsub env) co), as) }
-      Tick t e  -> do { (e', as) <- rw env e; return (Tick (rw_tick env t) e', as) }
+                           ; (rhs', bds) <- rw env'' rhs
+                           ; return (Alt c bs' rhs', bds) }
+              ; return (Case scrut' b' (ty env t) (map fst rs), bs1 ++ concatMap snd rs) }
+      Cast e co -> do { (e', bs) <- rw env e
+                      ; return (Cast e' (substCoUnchecked (e_tsub env) co), bs) }
+      Tick t e  -> do { (e', bs) <- rw env e; return (Tick (rw_tick env t) e', bs) }
+
+    -- A call, with the dispatch in place (Note [Lifted bodies]):
+    --   let x = a in case f of { C_i ds c1 c2 zs -> $lam_i @ds zs (x |> c1) |> sym c2 ; .. }
+    dispatch d f a arg_t res_t
+      = do { (bind, arg) <- if exprIsTrivial (stripWebForms a) then return (id, a)
+                            else do { x0 <- fresh_id (fsLit "x") arg_t
+                                    ; let b | isUnliftedType arg_t
+                                            = \e -> Case a x0 res_t [Alt DEFAULT [] e]
+                                            | otherwise
+                                            = \e -> Let (NonRec x0 a) e
+                                    ; return (b, Var x0) }
+           ; scrut_b <- fresh_id (fsLit "wild") (mkTyConApp (d_tycon d) [arg_t, res_t])
+           ; alts <- forM (d_order d) $ \lf ->
+               do { exs <- mapM fresh_tv (lf_tvs lf)
+                  ; let s = zipTvSubst (lf_tvs lf) (mkTyVarTys exs)
+                        inst = substTyUnchecked s
+                        arg_i = inst (idType (lf_x lf))
+                        res_i = inst (lf_res lf)
+                  ; c1 <- fresh_co (mkNomEqPred arg_t arg_i)
+                  ; c2 <- fresh_co (mkNomEqPred res_t res_i)
+                  ; zs <- mapM (\y -> fresh_id (occNameFS (getOccName y)) (inst (idType y))) (lf_ys lf)
+                  ; let args = map Var zs ++ [Cast arg (mkSubCo (mkCoVarCo c1))]
+                        call = foldl (\g (w, v) -> WebApp w g v)
+                                     (mkTyApps (Var (lf_id lf)) (mkTyVarTys exs))
+                                     (zip (lf_webs lf) args)
+                  ; return (Alt (DataAlt (lf_dc lf)) (exs ++ [c1, c2] ++ zs)
+                                (Cast call (mkSubCo (mkSymCo (mkCoVarCo c2))))) }
+           ; return (bind (Case f scrut_b res_t alts)) }
 
     rw_tick env t@(Breakpoint { breakpointFVs = ids }) = t { breakpointFVs = map (lk env) ids }
     rw_tick _ t = t
-
-    plus = plusUFM_C (++)
