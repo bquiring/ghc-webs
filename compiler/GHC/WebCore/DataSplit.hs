@@ -14,7 +14,7 @@ import GHC.Core
 import GHC.Core.DataCon
 import GHC.Core.FVs ( rulesFreeVars, idRuleVars, idUnfoldingVars )
 import GHC.Core.SimpleOpt ( simpleOptExpr, defaultSimpleOpts )
-import GHC.Core.Multiplicity ( Scaled(..) )
+import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
@@ -95,8 +95,9 @@ by those or by the module's rules ('pinned'); coercions; type and data
 family applications; kinds.
 
 Eligible types: algebraic data types with at least one constructor and some
-field, not newtypes, classes, unboxed tuples or sums, family instances, or
-enumerations; every constructor vanilla (no existentials or equalities),
+field, not newtypes, classes, unboxed tuples or sums, family instances,
+enumerations, or boxes of primitives (Int, Char, Double: one constructor,
+all fields unlifted); every constructor vanilla (no existentials or equalities),
 with no wrapper (so no strict or unpacked fields, for now); kinds closed.
 -}
 
@@ -118,6 +119,7 @@ eligible tc
   && not (isUnboxedTupleTyCon tc) && not (isUnboxedSumTyCon tc)
   && not (isClassTyCon tc) && not (isFamInstTyCon tc) && not (isTypeDataTyCon tc)
   && not (isEnumerationTyCon tc)
+  && not prim_box
   && not (null dcs) && any (not . null . dataConOrigArgTys) dcs
   && all ok_dc dcs
   && all ok_binder (tyConBinders tc)
@@ -126,6 +128,14 @@ eligible tc
     ok_dc dc = isVanillaDataCon dc && null (dataConTheta dc)
                && isNothing (dataConWrapId_maybe dc)
     ok_binder b = not (isNamedTyConBinder b) && noFreeVarsOfType (tyVarKind (binderVar b))
+    -- A box of primitives (Int, Char, Double, ...): a copy gains nothing
+    -- (fields of this type are unboxed through the original anyway), and
+    -- loses what GHC and the RTS do for the real one (e.g. the shared
+    -- small-Int closures): nofib spectral/multiplier, which splits only
+    -- Ints, ran 10% more instructions
+    prim_box = case dcs of
+      [dc] -> all (isUnliftedType . scaledThing) (dataConOrigArgTys dc)
+      _    -> False
 
 ------------------------------------------------------------------
 --      Copies
