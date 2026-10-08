@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( datasplit002.hs, datasplit002.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 75, classes: 9, exposed: 7, split: 2, pinned binders: 7
+Main.Shape_s8 = Main.Shape with Main.Square_s8, Main.Tri_s8 (built [2,
+                                                                    3], matched [1, 2,
+                                                                                 3], dropped [1])
+Main.Shape_s9 = Main.Shape with Main.Circle_s9 (built [1], matched [1,
+                                                                    2, 3], dropped [2, 3])
+
+
+[2 of 2] Linking datasplit002

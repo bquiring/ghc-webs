@@ -36,6 +36,8 @@ import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
 import GHC.WebCore.Boundary ( splitBoundary )
+import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes )
+import qualified GHC.WebCore.DataLint as DL
 import GHC.WebCore.Erase
 import GHC.WebCore.Lint
 import GHC.WebCore.Rename
@@ -99,12 +101,20 @@ webPass early guts
        ; us     <- liftIO (mkSplitUniqSupply webUniqueTag)
 
        ; us0    <- liftIO (mkSplitUniqSupply webUniqueTag)
+
+         -- Split data types (early run only)
+         -- See Note [Splitting data types] in GHC.WebCore.DataSplit
+       ; (binds_d, split_tcs) <-
+           if early && gopt Opt_CoreWebsDataSplit dflags
+           then runDataSplit logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
+           else return (mg_binds guts, [])
+
        ; let -- 0. Split exposed webs at the module boundary (early run only)
              -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
              binds0 | early, gopt Opt_CoreWebsBoundary dflags
-                    = splitBoundary (unfoldingOpts dflags) us0 (mg_rules guts) (mg_binds guts)
+                    = splitBoundary (unfoldingOpts dflags) us0 (mg_rules guts) binds_d
                     | otherwise
-                    = mg_binds guts
+                    = binds_d
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
@@ -171,7 +181,37 @@ webPass early guts
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
 
-       ; return (guts { mg_binds = binds4, mg_tcs = mg_tcs guts ++ new_tcs }) }
+       ; return (guts { mg_binds = binds4, mg_tcs = mg_tcs guts ++ split_tcs ++ new_tcs }) }
+
+-- | Split data types (Note [Splitting data types] in GHC.WebCore.DataSplit);
+-- stop if Data Lint finds a type error in the annotated program
+runDataSplit :: Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
+             -> CoreM (CoreProgram, [TyCon])
+runDataSplit logger dflags this_mod rules binds
+  = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let res = splitDataTypes (dataLintConfig dflags) this_mod us rules binds
+             errs = DL.dlr_errs (dsr_lint res)
+       ; unless (isEmptyBag errs) $ liftIO $
+           do { logMsg logger MCInfo noSrcSpan $ withPprStyle defaultDumpStyle $
+                  vcat [ text "*** Data Lint errors: after annotating copies ***"
+                       , pprMessageBag errs ]
+              ; ghcExit logger 1 }
+       ; dump logger Opt_D_dump_webs_data "Webs: splitting data types" (dsr_dump res)
+       ; return (dsr_binds res, dsr_tycons res) }
+
+dataLintConfig :: DynFlags -> DL.LintConfig
+dataLintConfig dflags
+  = DL.LintConfig { DL.l_diagOpts = initDiagOpts dflags
+                  , DL.l_platform = targetPlatform dflags
+                  , DL.l_flags    = flags
+                  , DL.l_vars     = [] }
+  where
+    flags = DL.LF { DL.lf_check_global_ids           = False
+                  , DL.lf_check_inline_loop_breakers = False
+                  , DL.lf_check_static_ptrs          = DL.AllowAnywhere
+                  , DL.lf_report_unsat_syns          = True
+                  , DL.lf_check_linearity            = gopt Opt_DoLinearCoreLinting dflags
+                  , DL.lf_check_fixed_rep            = True }
 
 -- | Defunctionalise, check the result with Web Lint, and dump the verdicts.
 -- Returns the new program, the new type constructors, and whether anything

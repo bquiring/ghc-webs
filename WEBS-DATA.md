@@ -1,6 +1,27 @@
 # Design: Data Webs
 
-Status: plan. Nothing implemented yet.
+Status: phase 2 (splitting) implemented on branch `data-split`, **not** as
+described in sections 1-7 below: data types carry no webs. Instead
+(`GHC/WebCore/DataSplit.hs`, Note [Splitting data types];
+`-fcore-webs-data-split`, dump `-ddump-webs-data`):
+
+* Annotation gives every occurrence of an eligible data type (binder types,
+  type arguments, case types, constructor workers) a fresh *copy* of the
+  type: a real `TyCon` with its own `DataCon`s. Recursive occurrences in a
+  copy's fields are the same copy (a list's tail is the list's copy).
+* Data Lint (`GHC/WebCore/DataLint.hs`), a copy of Core Lint, checks the
+  annotated program up to copies and records the pairs of copies that its
+  type equalities force together. A copy that meets the original type
+  (imported or exported code, coercions, pinned binders) is exposed.
+* Union-find gives classes. A non-exposed class becomes one new local type
+  with only the constructors the class builds (others' alternatives are
+  dropped); a class that builds nothing, and every exposed class, keeps the
+  original. Core Lint checks the result.
+
+Open: whether recursive fields could be separate copies (polymorphic
+recursion in copies; edge cases), copies for fields of other data types
+(section 2, step 3; phase 4), strict and unpacked fields (types with
+wrappers are not eligible yet), and phase 3.
 
 Function webs split the arrows of a program into classes that the typing rules
 force to agree (`Note [Webs]` in `GHC/Types/Web.hs`). Data webs do the same for

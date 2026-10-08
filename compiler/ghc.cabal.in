@@ -1025,6 +1025,9 @@ Library
         GHC.WebCore.Annotate
         GHC.WebCore.Boundary
         GHC.WebCore.Compare
+        GHC.WebCore.DataCopy
+        GHC.WebCore.DataLint
+        GHC.WebCore.DataSplit
         GHC.WebCore.Erase
         GHC.WebCore.FirstClass
         GHC.WebCore.Lint

@@ -197,3 +197,18 @@ for n in range(1, 9):
           use_specs(dict(stdout='defunc%03d.stdout' % n,
                          **({'stderr': 'defunc002.stderr'} if n == 2 else {})))],
          multimod_compile_and_run, ['defunc%03d' % n, df_opts + ' -fcore-webs-defunc-lifted'])
+
+# Note [Splitting data types] (GHC.WebCore.DataSplit, -fcore-webs-data-split).
+# 001 a local list and an exposed one, 002 constructors a class never builds
+# are dropped, 003 a recursive type exposed through a derived instance in one
+# place and split in another.  The *_dump tests show what was split; the
+# runs check the result with Core Lint (and Data Lint checks the copies).
+ds_opts = early_opts + ' -fcore-webs-data-split'
+for n in range(1, 4):
+    test('datasplit%03d' % n, [], compile_and_run, [ds_opts])
+    test('datasplit%03d_dump' % n, [extra_files(['datasplit%03d.hs' % n])],
+         multimod_compile, ['datasplit%03d' % n, ds_opts + ' -ddump-webs-data -dsuppress-uniques'])
+    test('datasplit%03d_all' % n,
+         [extra_files(['datasplit%03d.hs' % n]),
+          use_specs({'stdout': 'datasplit%03d.stdout' % n})],
+         multimod_compile_and_run, ['datasplit%03d' % n, all_opts.replace('-fcore-webs ', '-fcore-webs-early ') + ' -fcore-webs-data-split'])
