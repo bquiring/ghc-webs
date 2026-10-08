@@ -37,6 +37,7 @@ import GHC.Types.SrcLoc ( noSrcSpan )
 import GHC.WebCore.Annotate
 import GHC.WebCore.Boundary ( splitBoundary )
 import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes )
+import GHC.WebCore.DataCopy ( UnboxOpts(..) )
 import qualified GHC.WebCore.DataLint as DL
 import GHC.WebCore.Erase
 import GHC.WebCore.Lint
@@ -189,8 +190,12 @@ runDataSplit :: Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
              -> CoreM (CoreProgram, [TyCon])
 runDataSplit logger dflags this_mod rules binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
-       ; let unbox | gopt Opt_CoreWebsDataUnbox dflags = Just (gopt Opt_CoreWebsDataUnboxEager dflags)
-                   | otherwise                         = Nothing
+       ; let unbox | gopt Opt_CoreWebsDataUnbox dflags
+                   = Just (UnboxOpts { uo_eager      = gopt Opt_CoreWebsDataUnboxEager dflags
+                                     , uo_nested     = gopt Opt_CoreWebsUnboxNested dflags
+                                     , uo_max_size   = websMaxUnboxSize dflags
+                                     , uo_orig_sizes = [] })
+                   | otherwise = Nothing
              res = splitDataTypes unbox
                                   (dataLintConfig dflags) this_mod us rules binds
              errs = DL.dlr_errs (dsr_lint res)

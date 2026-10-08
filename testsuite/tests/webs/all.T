@@ -242,3 +242,31 @@ test('dataunbox005_dump', [extra_files(['dataunbox005.hs'])],
 test('dataunbox006', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox006_dump', [extra_files(['dataunbox006.hs'])],
      multimod_compile, ['dataunbox006', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+
+# Edge cases for data splitting and unboxing.  001-010 are type-level, with
+# coercions: local, parameterised, eta-reducible, recursive and mutually
+# recursive newtypes; coerce; newtype deriving; type and data families;
+# phantom roles; GADTs and existentials; unsafeCoerce.  011-018 are run-time,
+# with boxes: errors and infinite structures inside fields, sharing (a trace
+# that must appear once), seq/foldl'/length, values escaping to base, nested
+# pairs/Maybe/Either, re-boxing, knots, exceptions.  Expected output from the
+# stock compiler at -O0.  Every program runs in five modes, all with Core
+# Lint (and Data Lint): split only; with unboxing; with nested unboxing;
+# with the size bound at 1; and with every early transformation.
+dsedge_all = (early_opts + ' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
+              ' -fcore-webs-dead-params -fcore-webs-result-raise -fcore-webs-strictness'
+              ' -fcore-webs-data-split -fcore-webs-data-unbox -fcore-webs-unbox-nested')
+dsedge_modes = [ ('_split',  ds_opts)
+               , ('_unbox',  ds_opts + ' -fcore-webs-data-unbox')
+               , ('_nested', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-unbox-nested')
+               , ('_size1',  ds_opts + ' -fcore-webs-data-unbox -fcore-webs-unbox-nested'
+                                     ' -fcore-webs-max-unbox-size=1')
+               , ('_all',    dsedge_all) ]
+for n in range(1, 19):
+    name = 'dsedge%03d' % n
+    specs = {'stdout': name + '.stdout'}
+    if n == 12:
+        specs['stderr'] = name + '.stderr'
+    for (suffix, opts) in dsedge_modes:
+        test(name + suffix, [extra_files([name + '.hs']), use_specs(specs)],
+             multimod_compile_and_run, [name, opts])

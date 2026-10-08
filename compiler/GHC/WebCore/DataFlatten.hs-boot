@@ -7,4 +7,5 @@ import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable ( SDoc )
 
-flattenFields :: Bool -> Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc)
+import GHC.WebCore.DataCopy ( UnboxOpts )
+flattenFields :: UnboxOpts -> Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc)

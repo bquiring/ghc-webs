@@ -1868,6 +1868,8 @@ dynamic_flags_deps = [
       (floatSuffix (\_ d -> d))
       "-funfolding-keeness-factor is no longer respected as of GHC 9.0"
 
+  , make_ord_flag defFlag "fcore-webs-max-unbox-size"
+      (intSuffix (\n d -> d {websMaxUnboxSize = n}))
   , make_ord_flag defFlag "fmax-worker-args"
       (intSuffix (\n d -> d {maxWorkerArgs = n}))
   , make_ord_flag defFlag "fmax-forced-spec-args"
@@ -2558,6 +2560,7 @@ fFlagsDeps = [
   flagSpec "core-webs-data-split"             Opt_CoreWebsDataSplit,
   flagSpec "core-webs-data-unbox"             Opt_CoreWebsDataUnbox,
   flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
+  flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,
   flagSpec "liberate-case"                    Opt_LiberateCase,

@@ -59,6 +59,21 @@ benchmark's instructions by more than 0.1% (split + unbox against the same
 without newtypes, 111 benchmarks). What it splits is mostly `ST` (11
 classes) and `IO` (9), plus two local `S` newtypes (CS, dom-lt).
 
+Strictly eliminated fields (Note [Strictly eliminated fields], sound):
+against `early-fix`, geomean −0.53% (18 benchmarks >0.5% better, 2
+worse), the same as the unsound eager flag (−0.53%, 19/2); 398 fields
+unboxed (301 before). linear −12.2%, cryptarithm2 −11.8% (−15.1% before:
+unboxing a thunk field there costs), puzzle −7.2%, solid −4.2%, fibheaps
+−3.1%. Measured with nested dependencies always on; they are now behind
+`-fcore-webs-unbox-nested`, with the size bound `-fcore-webs-max-unbox-size`
+(Note [Bounding unboxing]).
+
+Edge-case tests `dsedge001`-`018` (coercions and boxes, five modes each)
+found two unsound cases, both fixed: a `UnivCo`, and `unsafeCoerce`'s type
+arguments, related two types that Lint does not, so their copies were split
+apart and unboxed differently (a segfault). Both keep original types now
+(Note [Non-parametric functions]).
+
 ### Next: one fixpoint for all unboxing (planned, 2026-10-08)
 
 Field unboxing, argument unboxing (arity raising) and result unboxing

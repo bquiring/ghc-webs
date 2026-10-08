@@ -6,6 +6,7 @@ module GHC.WebCore.DataCopy
   , copyOriginal
   , eraseCopies
   , copyPairs
+  , UnboxOpts(..)
   ) where
 
 import GHC.Prelude
@@ -17,6 +18,13 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Unique.FM
 
 import GHC.Data.Bag
+
+-- | Options for unboxing (Note [Bounding unboxing] in GHC.WebCore.DataFlatten)
+data UnboxOpts = UnboxOpts
+  { uo_eager      :: Bool              -- ^ -fcore-webs-data-unbox-eager
+  , uo_nested     :: Bool              -- ^ -fcore-webs-unbox-nested
+  , uo_max_size   :: Int               -- ^ -fcore-webs-max-unbox-size
+  , uo_orig_sizes :: [(String, Int)] } -- ^ the split constructors' original sizes, by name
 
 -- | Every copy, mapped to the type constructor it is a copy of
 type Copies = UniqFM TyCon TyCon

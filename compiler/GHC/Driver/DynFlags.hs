@@ -404,6 +404,7 @@ data DynFlags = DynFlags {
   unfoldingOpts         :: !UnfoldingOpts,
 
   maxWorkerArgs         :: Int,
+  websMaxUnboxSize      :: Int,   -- ^ -fcore-webs-max-unbox-size: a cell's unboxed size, as a multiple of its original
   maxForcedSpecArgs     :: Int,
 
   ghciHistSize          :: Int,
@@ -695,6 +696,7 @@ defaultDynFlags mySettings =
 
         unfoldingOpts = defaultUnfoldingOpts,
         maxWorkerArgs = 10,
+        websMaxUnboxSize = 4,
         maxForcedSpecArgs = 333,
         -- 333 is fairly arbitrary, see Note [Forcing specialisation]:FS5
 

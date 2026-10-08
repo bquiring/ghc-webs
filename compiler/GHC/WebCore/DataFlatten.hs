@@ -41,6 +41,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic ( panic )
 
 import GHC.WebCore.DataSplit ( mapTyCons, mapTyConsCo )
+import GHC.WebCore.DataCopy ( UnboxOpts(..) )
+import Data.List ( sortOn )
 import GHC.WebCore.Transform.ArityRaise ( productCon, replaceCases )
 
 import Control.Monad ( forM, foldM )
@@ -65,6 +67,26 @@ fields (K, i).  A field stays unboxable while
 
 Start from every candidate field and remove the ones that fail, until
 nothing changes.  A removed field stays a pointer to a boxed value.
+-}
+
+{- Note [Bounding unboxing]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unboxing a field copies its value's contents into the cell.  If one boxed
+value is shared by many cells, each cell now holds its own copy; and when an
+unboxed field's value flows into another structure that keeps it boxed, or
+into a lazy position, it is rebuilt -- a copy, each time.  Two controls:
+
+  * -fcore-webs-max-unbox-size=K (default 4): a constructor's size in words,
+    after unboxing, stays within K times its size as split (pointers and
+    unboxed fields count one word each), over all rounds.  So memory per
+    cell grows at most K-fold.  Applied to the candidates before the
+    fixpoint (dropping the largest expansions first), so that the fixpoint
+    only removes: other fields may rely on a field being unboxed.
+  * -fcore-webs-unbox-nested (off by default): a field may depend on the
+    unboxing of another data structure's field -- a construction passing
+    another unboxed field's pattern variable, or a match storing the field
+    into another unboxed field.  Off, a field is unboxable only from its own
+    constructions and uses; values that move between structures stay boxed.
 -}
 
 {- Note [Strictly eliminated fields]
@@ -169,9 +191,9 @@ data Field = Keep | Flatten DataCon [Type]   -- ^ P's constructor and type argum
 -- | Per split type: its constructors' field plans (by tag), if any is flattened
 type Plans = UniqFM TyCon [(DataCon, [Field])]
 
-flattenFields :: Bool -> Module -> UniqSupply -> [TyCon] -> CoreProgram
+flattenFields :: UnboxOpts -> Module -> UniqSupply -> [TyCon] -> CoreProgram
               -> (CoreProgram, [TyCon], SDoc)
-flattenFields eager this_mod us tcs binds
+flattenFields opts this_mod us tcs binds
   | isNullUFM plans = (binds, tcs, dump)
   | otherwise       = (initUs_ us2 (mapM rw_bind binds), map new_tc tcs, dump)
   where
@@ -180,8 +202,29 @@ flattenFields eager this_mod us tcs binds
     _ = cands
 
     -- Candidate fields: products, not recursive
+    eager  = uo_eager opts
+    nested = uo_nested opts
+
+    -- Note [Bounding unboxing]: a candidate must keep its constructor within
+    -- the size bound, even if every candidate of the constructor is unboxed
     candidate :: DataCon -> Int -> Bool
-    candidate dc i = case drop i (dataConOrigArgTys dc) of
+    candidate dc i = local_candidate dc i && i `elem` within_bound dc
+    within_bound dc
+      = go_b (sortOn (\(_, n) -> n) [ (i, expansion dc i) | i <- all_fields dc, local_candidate dc i ])
+             (dataConRepArity dc)
+      where
+        budget = uo_max_size opts * fromMaybe (dataConRepArity dc)
+                                              (lookup (occNameString (getOccName dc)) (uo_orig_sizes opts))
+        go_b [] _ = []
+        go_b ((i, n) : rest) size
+          | size - 1 + n <= budget = i : go_b rest (size - 1 + n)
+          | otherwise              = go_b rest size
+    expansion dc i = case drop i (dataConOrigArgTys dc) of
+      (Scaled _ t : _) | Just (_, _, pdc) <- productCon (coreFullView t) -> dataConRepArity pdc
+      _ -> 1
+
+    local_candidate :: DataCon -> Int -> Bool
+    local_candidate dc i = case drop i (dataConOrigArgTys dc) of
       (Scaled _ t : _)
         | Just (ptc, _, pdc) <- productCon (coreFullView t)
         , ptc /= dataConTyCon dc
@@ -332,7 +375,7 @@ flattenFields eager this_mod us tcs binds
       | (dc', j, us, _) <- match_facts, dc' == dc, j == i, u <- take 1 (filter (not . use_ok m) us) ]
       where
         arg_ok _ AValue      = True
-        arg_ok m' (APat k j) = in_set m' k j
+        arg_ok m' (APat k j) = nested && in_set m' k j   -- Note [Bounding unboxing]
         -- a thunk, if the field is strictly eliminated (Note [Strictly
         -- eliminated fields]); with -fcore-webs-data-unbox-eager, if every
         -- match is strict in it (Note [Eager unboxing])
@@ -340,7 +383,7 @@ flattenFields eager this_mod us tcs binds
     strict_everywhere dc i = and [ s | (dc', j, _, s) <- match_facts, dc' == dc, j == i ]
     use_ok _ UScrut        = True
     use_ok _ UStrictArg    = True
-    use_ok m (UConArg k j) = in_set m k j
+    use_ok m (UConArg k j) = nested && in_set m k j   -- Note [Bounding unboxing]
     use_ok _ (UBoxed _)    = False
     index i xs = case drop i xs of { (x : _) -> Just x; [] -> Nothing }
 

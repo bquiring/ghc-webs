@@ -41,7 +41,7 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 
-import GHC.Unit.Module ( Module )
+import GHC.Unit.Module ( Module, moduleName, moduleNameString )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( panic, pprPanic )
@@ -319,6 +319,13 @@ mapProgram mp binds
       Lit {}      -> return expr
       Type t      -> Type <$> m_ty mp t
       Coercion co -> Coercion <$> m_co mp co
+      -- A non-parametric function's type arguments keep their types
+      -- (Note [Non-parametric functions])
+      App {}
+        | (Var v, args) <- collectArgs expr, nonParametric v
+        -> mkApps (Var v) <$> mapM (\a -> case a of
+                                      Type _ -> return a
+                                      _      -> go env a) args
       App f a     -> App <$> go env f <*> go env a
       Lam b e     -> do { (env', b') <- bndr env b; Lam b' <$> go env' e }
       Let (NonRec b rhs) body
@@ -385,9 +392,11 @@ mapTyConsCo want f = go
       FunCo { fco_arg = a, fco_res = r }
                            -> (\a' r' -> co { fco_arg = a', fco_res = r' }) <$> go a <*> go r
       AxiomCo ax cos       -> AxiomCo <$> axiom ax <*> mapM go cos
-      UnivCo { uco_lty = l, uco_rty = r, uco_deps = ds }
-                           -> (\l' r' ds' -> co { uco_lty = l', uco_rty = r', uco_deps = ds' })
-                              <$> ty l <*> ty r <*> mapM go ds
+      -- A UnivCo (unsafeCoerce) keeps its types: it asserts that its two
+      -- sides have the same representation, and Lint does not relate them,
+      -- so copies on its two sides could be split, and unboxed, apart.
+      -- With the original types, what passes through it is exposed.
+      UnivCo {}            -> return co
       SymCo c              -> SymCo <$> go c
       TransCo c1 c2        -> TransCo <$> go c1 <*> go c2
       SelCo cs c           -> SelCo cs <$> go c
@@ -408,13 +417,40 @@ mapTyConsCo want f = go
 {- Note [Copies in coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 As web inference does for arrows (FunCo's web), annotation puts copies into
-the types inside coercions: Refl, GRefl, TyConAppCo, UnivCo, and the
-argument coercions of an axiom (whose own types stay original, like an
-exposed signature).  Data Lint compares coercion kinds up to copies where
+the types inside coercions: Refl, GRefl, TyConAppCo, and the argument
+coercions of an axiom (whose own types stay original, like an exposed
+signature).  Not UnivCo (unsafeCoerce): it asserts that its two sides have
+the same representation, but Lint does not relate them, so copies on its two
+sides would be split and unboxed independently (test dsedge010 segfaulted).
+It keeps the original types, exposing what passes through it.  Data Lint compares coercion kinds up to copies where
 Core Lint compares them with ensureEqTys (casts, TransCo), so a value can
 pass through a cast -- e.g. into a local newtype -- without exposing its
 class.  Coercion variables keep their types (what flows through them is
 exposed), and so do kinds.  The rewrite maps copies in coercions too.
+-}
+
+-- | Imported functions that are not parametric: unsafeCoerce relates the
+-- representations of its type arguments (Note [Non-parametric functions])
+nonParametric :: Id -> Bool
+nonParametric v
+  | Just m <- nameModule_maybe (idName v)
+  , moduleNameString (moduleName m) `elem` ["GHC.Internal.Unsafe.Coerce", "Unsafe.Coerce"]
+  = True
+  | otherwise
+  = getOccString v `elem` ["unsafeCoerce#", "unsafeCoerce", "unsafeEqualityProof"]
+
+{- Note [Non-parametric functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Splitting relies on the parametricity of imported polymorphic functions: a
+type variable in an imported signature exposes nothing, since the function
+cannot look inside values of that type (id @[Int] xs leaves xs local).
+unsafeCoerce @A @B is not parametric: it asserts that A and B have the same
+representation.  Copies in its two type arguments would be split (and
+unboxed) independently, and the program would read one layout as the other
+(test dsedge010 segfaulted).  So the type arguments of the functions in
+Unsafe.Coerce keep their original types: what passes through them meets the
+original types and is exposed.  (A UnivCo keeps its types for the same
+reason; Note [Copies in coercions].)
 -}
 
 ------------------------------------------------------------------
@@ -556,7 +592,7 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: Maybe Bool -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
+splitDataTypes :: Maybe UnboxOpts -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
                -> DataSplitResult
 splitDataTypes unbox cfg this_mod us rules binds
   = DataSplitResult
@@ -573,10 +609,12 @@ splitDataTypes unbox cfg this_mod us rules binds
     -- GHC.WebCore.DataFlatten)
     (final_binds, final_tcs, flat_dump)
       | not changed = (binds, [], empty)
-      | Just eager <- unbox
+      | Just opts0 <- unbox
                     = let (us4, us5) = splitUniqSupply us3
                           (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
-                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds eager (3 :: Int) us5 sp_tcs sp_binds
+                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
+                          opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
+                                                         | tc <- sp_tcs, dc <- tyConDataCons tc ] }
                       in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump)
       | otherwise   = (split_binds, new_tcs, empty)
 
@@ -585,13 +623,13 @@ splitDataTypes unbox cfg this_mod us rules binds
     -- Between rounds, the simple optimiser inlines the aliases a round leaves
     -- (let x = y) and takes apart the cases on constructors it builds, so
     -- that the next round sees the fields' real uses
-    flatten_rounds eager n u tcs bs
+    flatten_rounds opts n u tcs bs
       = let (u1, u2) = splitUniqSupply u
-            (bs', tcs', d) = flattenFields eager this_mod u1 tcs bs
+            (bs', tcs', d) = flattenFields opts this_mod u1 tcs bs
             changed_round = map getUnique tcs' /= map getUnique tcs
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
-            (bs'', tcs'', d') | changed_round = flatten_rounds eager (n - 1) u2 tcs' bs_opt
+            (bs'', tcs'', d') | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
                               | otherwise     = (bs', tcs', empty)
         in (bs'', tcs'', d $$ d')
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
