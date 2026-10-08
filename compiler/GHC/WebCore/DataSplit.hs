@@ -5,6 +5,7 @@
 module GHC.WebCore.DataSplit
   ( DataSplitResult(..)
   , splitDataTypes
+  , mapTyCons
   ) where
 
 import GHC.Prelude
@@ -40,6 +41,7 @@ import GHC.Utils.Panic ( panic, pprPanic )
 
 import GHC.WebCore.DataCopy
 import GHC.WebCore.DataLint ( LintConfig, DataLintResult(..), lintDataProgram )
+import {-# SOURCE #-} GHC.WebCore.DataFlatten ( flattenFields )
 
 import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
@@ -369,16 +371,25 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram -> DataSplitResult
-splitDataTypes cfg this_mod us rules binds
+splitDataTypes :: Bool -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
+               -> DataSplitResult
+splitDataTypes unbox cfg this_mod us rules binds
   = DataSplitResult
-      { dsr_binds   = if changed then evalState (mapProgram rwMapper ann_binds) () else binds
-      , dsr_tycons  = new_tcs
-      , dsr_dump    = dump
+      { dsr_binds   = final_binds
+      , dsr_tycons  = final_tcs
+      , dsr_dump    = dump $$ flat_dump
       , dsr_lint    = lint_res
       , dsr_changed = changed }
   where
-    (us1, us2) = splitUniqSupply us
+    (us1, us23) = splitUniqSupply us
+    (us2, us3)  = splitUniqSupply us23
+    split_binds = evalState (mapProgram rwMapper ann_binds) ()
+    -- Unbox fields of the new types (Note [Flattening fields] in
+    -- GHC.WebCore.DataFlatten)
+    (final_binds, final_tcs, flat_dump)
+      | not changed = (binds, [], empty)
+      | unbox       = flattenFields this_mod us3 new_tcs split_binds
+      | otherwise   = (split_binds, new_tcs, empty)
     pinned = pinnedIds rules binds
     (ann_binds, st) = runState (mapProgram (annMapper pinned) binds)
                                (AnnState this_mod us1 emptyUFM [] [] [])

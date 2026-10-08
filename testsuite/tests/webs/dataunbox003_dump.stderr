@@ -1,0 +1,14 @@
+[1 of 2] Compiling Main             ( datasplit003.hs, datasplit003.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 131, classes: 12, exposed: 8, split: 4, pinned binders: 10
+Main.Tree_s9 = Main.Tree with Main.Leaf_s9, Main.Node_s9 (built [1,
+                                                                 2], matched [1, 2])
+Main.Int_s10 = GHC.Internal.Types.Int with Main.I#_s10 (built [1], matched [1])
+Main.Int_s11 = GHC.Internal.Types.Int with Main.I#_s11 (built [1], matched [1])
+Main.Int_s12 = GHC.Internal.Types.Int with Main.I#_s12 (built [1], matched [1])
+Main.Tree_s9: Main.Node_s9 field 1 unboxed
+
+
+[2 of 2] Linking datasplit003

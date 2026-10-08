@@ -189,7 +189,8 @@ runDataSplit :: Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
              -> CoreM (CoreProgram, [TyCon])
 runDataSplit logger dflags this_mod rules binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
-       ; let res = splitDataTypes (dataLintConfig dflags) this_mod us rules binds
+       ; let res = splitDataTypes (gopt Opt_CoreWebsDataUnbox dflags)
+                                  (dataLintConfig dflags) this_mod us rules binds
              errs = DL.dlr_errs (dsr_lint res)
        ; unless (isEmptyBag errs) $ liftIO $
            do { logMsg logger MCInfo noSrcSpan $ withPprStyle defaultDumpStyle $

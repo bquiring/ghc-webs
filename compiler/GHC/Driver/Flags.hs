@@ -659,6 +659,7 @@ data GeneralFlag
    | Opt_CoreWebsDefunc     -- ^ Web pipeline: defunctionalisation
    | Opt_CoreWebsDefuncLifted -- ^ Defunctionalisation: lift the lambdas' bodies, no apply function
    | Opt_CoreWebsDataSplit    -- ^ Split data types by data flow (copies)
+   | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
    | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
@@ -944,6 +945,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDefunc
    , Opt_CoreWebsDefuncLifted
    , Opt_CoreWebsDataSplit
+   , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
    , Opt_Specialise

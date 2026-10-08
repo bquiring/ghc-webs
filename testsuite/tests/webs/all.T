@@ -212,3 +212,15 @@ for n in range(1, 4):
          [extra_files(['datasplit%03d.hs' % n]),
           use_specs({'stdout': 'datasplit%03d.stdout' % n})],
          multimod_compile_and_run, ['datasplit%03d' % n, all_opts.replace('-fcore-webs ', '-fcore-webs-early ') + ' -fcore-webs-data-split'])
+
+# Note [Flattening fields] (GHC.WebCore.DataFlatten, -fcore-webs-data-unbox):
+# the split tests again, with the product fields of the new types unboxed
+# (datasplit002: Circle's and Tri's Double fields; datasplit003: Node's Int).
+for n in range(1, 4):
+    test('dataunbox%03d' % n,
+         [extra_files(['datasplit%03d.hs' % n]),
+          use_specs({'stdout': 'datasplit%03d.stdout' % n})],
+         multimod_compile_and_run, ['datasplit%03d' % n, ds_opts + ' -fcore-webs-data-unbox'])
+for n in [2, 3]:
+    test('dataunbox%03d_dump' % n, [extra_files(['datasplit%03d.hs' % n])],
+         multimod_compile, ['datasplit%03d' % n, ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
