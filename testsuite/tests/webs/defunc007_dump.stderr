@@ -1,0 +1,19 @@
+[1 of 2] Compiling Main             ( defunc007.hs, defunc007.o )
+
+==================== Webs: defunctionalisation ====================
+defunctionalised (1 constructors): x
+not defunctionalised (exposed): s
+not defunctionalised (exposed): v
+not defunctionalised (exposed): v v
+not defunctionalised (no unknown calls): ds
+not defunctionalised (no unknown calls): f
+not defunctionalised (no unknown calls): m
+
+
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 = [GHC.Internal.Types.Int,
+                                           GHC.Internal.Types.Int]
+
+
+[2 of 2] Linking defunc007

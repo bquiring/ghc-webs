@@ -1,0 +1,15 @@
+[1 of 2] Compiling Main             ( defunc008.hs, defunc008.o )
+
+==================== Webs: defunctionalisation ====================
+defunctionalised (2 constructors): ds p
+not defunctionalised (exposed): s
+not defunctionalised (no unknown calls): f
+not defunctionalised (no unknown calls): p
+
+
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 t t t = [(t, t), t]
+
+
+[2 of 2] Linking defunc008

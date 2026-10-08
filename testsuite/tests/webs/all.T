@@ -182,9 +182,18 @@ for n in [1, 2, 4]:
 # sharing (the trace appears once, the error never), 003 curried lambdas
 # (two webs), 004 webs that are rejected (known calls; exposed), 005 a
 # polymorphic and a monomorphic lambda in one web, 006 a polymorphic
-# higher-order function used at two types.  Their dumps show the verdicts.
+# higher-order function used at two types, 007 a lambda whose free
+# variables' types mention a type variable its body does not, 008 a type
+# specialised to more parameters than it had.  Their dumps show the verdicts.
+# The *_lifted tests run the same programs with lifted bodies
+# (Note [Lifted bodies]).
 df_opts = early_opts + ' -fcore-webs-defunc'
-for n in range(1, 7):
+for n in range(1, 9):
     test('defunc%03d' % n, [], compile_and_run, [df_opts])
     test('defunc%03d_dump' % n, [extra_files(['defunc%03d.hs' % n])],
          multimod_compile, ['defunc%03d' % n, df_opts + ' -ddump-webs-defunc -dsuppress-uniques'])
+    test('defunc%03d_lifted' % n,
+         [extra_files(['defunc%03d.hs' % n]),
+          use_specs(dict(stdout='defunc%03d.stdout' % n,
+                         **({'stderr': 'defunc002.stderr'} if n == 2 else {})))],
+         multimod_compile_and_run, ['defunc%03d' % n, df_opts + ' -fcore-webs-defunc-lifted'])

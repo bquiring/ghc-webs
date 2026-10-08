@@ -44,10 +44,15 @@ def tally(config):
             if not m or m.group(1) not in t:
                 continue
             c = t[m.group(1)]
+            # Sections other than the verdicts (defunctionalisation's
+            # specialisation post-pass: "Main.Defun1: specialised ...")
+            skip = False
             for line in open(os.path.join(dirpath, f), errors='replace'):
                 line = line.rstrip('\n')
-                if (not line or line[0].isspace() or line.startswith('====')
-                        or ': ' not in line):
+                if line.startswith('===='):
+                    skip = 'specialising' in line
+                    continue
+                if skip or not line or line[0].isspace() or ': ' not in line:
                     continue
                 verdict = line.rsplit(': ', 1)[0]
                 parts = components(verdict)

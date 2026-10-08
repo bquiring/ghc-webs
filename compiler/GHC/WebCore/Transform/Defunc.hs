@@ -25,7 +25,7 @@ import GHC.Data.Pair ( Pair(..) )
 
 import GHC.Types.Basic ( Arity )
 import GHC.Types.Cpr ( topCprSig )
-import GHC.Types.Demand ( Demand(..), splitDmdSig, mkClosedDmdSig, nopSig, topSubDmd, topDmd, topDiv )
+import GHC.Types.Demand ( Demand(..), isAbs, splitDmdSig, mkClosedDmdSig, nopSig, topSubDmd, topDmd, topDiv )
 import GHC.Types.Id
 import GHC.Types.Id.Make ( mkDataConWorkId )
 import GHC.Types.Name
@@ -261,11 +261,15 @@ verdict tops exposed w i
     fvs l = exprFreeVars (l_expr l)
     fields l = sortOn (getKey . getUnique)
                  [ v | v <- nonDetEltsUniqSet (fvs l), isId v, not (v `elemVarSet` tops) ]
+    -- exprFreeVars does not look into the types of free variables, and a
+    -- field's type can mention a type variable the body does not
+    tycovars l = fvs l `unionVarSet`
+                 tyCoVarsOfTypes (map idType (fields l) ++ [arg_ty l, res_ty l])
     tyvars l = sortOn (getKey . getUnique)
-                 [ v | v <- nonDetEltsUniqSet (fvs l), isTyVar v ]
+                 [ v | v <- nonDetEltsUniqSet (tycovars l), isTyVar v ]
 
     lam_problem l
-      | any isCoVar (nonDetEltsUniqSet (fvs l))  = Just "free coercion variables"
+      | any isCoVar (nonDetEltsUniqSet (tycovars l)) = Just "free coercion variables"
       | isCoVar (l_bndr l)                       = Just "coercion parameter"
       | not (all ok_field (fields l))            = Just "unsuitable free variable"
       | not (all (closed . tyVarKind) (tyvars l)) = Just "kind-polymorphic"
@@ -275,7 +279,9 @@ verdict tops exposed w i
                  in typeHasFixedRuntimeRep t && not (isUnboxedTupleType t)
                     && not (isUnboxedSumType t) && not (isJoinId v)
 
-    plan l = LamPlan (fields l) (tyvars l) (idType (l_bndr l)) (exprType (lam_body (l_expr l)))
+    plan l = LamPlan (fields l) (tyvars l) (arg_ty l) (res_ty l)
+    arg_ty l = idType (l_bndr l)
+    res_ty l = exprType (lam_body (l_expr l))
     lam_body (WebLam _ _ e) = e
     lam_body e              = e
 
@@ -580,8 +586,9 @@ rewrite lifted pol todo changed binds
         fix_arg d _        = d
 
     -- A demand on a function value that is now data: keep how strict and how
-    -- often, drop the call structure
-    data_dmd (n :* _) = n :* topSubDmd
+    -- often, drop the call structure.  (An absent demand has none.)
+    data_dmd d@(n :* _) | isAbs n   = d
+                        | otherwise = n :* topSubDmd
 
     arrows t = case coreFullView t of
       ForAllTy _ r         -> arrows r

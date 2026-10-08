@@ -14,27 +14,12 @@ a heuristic.
 
 ## Now
 
-Plan for the next session (2026-10-08):
+Plan (2026-10-08):
 
-1. **Fix the Core Lint errors in polymorphic defunctionalisation.** The
-   nofib run `early-df` (`webs-bench/run-defunc.sh`, built with
-   `-dcore-lint`) fails to compile four benchmarks, so they are missing from
-   the results: `real/eff/CS`, `spectral/dom-lt`, `spectral/hartel/transform`,
-   `real/veritas` (see `results/early-df/nofib.log`, "Core Lint errors").
-   - Three are "type variable out of scope" in an apply function's
-     alternative: a field's type mentions a type variable that is not among
-     the constructor's existentials (e.g. `k :: Defun1 s o` with `s` free).
-     Suspect: the field types are computed after rewriting nested arrows to
-     other webs' types, or a field's type mentions a type variable that
-     `exprFreeVars` of the lambda does not report.
-   - One is in the specialisation post-pass (`SpecIndex`), with nested
-     specialised types and an unlifted argument kind: "Expected arg type:
-     Defun4 Int (Defun5 r r), Actual: Defun4 r" in `$apply3`. Some use of
-     the old type is not rewritten, probably in the eliminator's body.
-   - `spectral/circsim` and `spectral/hartel/solid` are also missing from
-     the timing: find out why.
-   - `verdicts.py` counts the specialisation dump lines ("Main.Defun1:
-     specialised ...") as verdicts: skip them.
+1. ~~Fix the Core Lint errors in polymorphic defunctionalisation~~ (done,
+   see "Done"). All six benchmarks missing from `early-df` (`CS`, `dom-lt`,
+   `transform`, `veritas`, `circsim`, `solid`) now compile with
+   `-dcore-lint`, with and without lifted bodies.
 2. **Test lifted bodies** (`-fcore-webs-defunc-lifted`, Note [Lifted bodies]
    in `GHC.WebCore.Transform.Defunc`). It compiles but has not run yet: run
    the webs tests with it (add `-fcore-webs-defunc-lifted` variants of the
@@ -144,6 +129,13 @@ Plan for the next session (2026-10-08):
 
 ## Done
 
+- Defunctionalisation fixes (tests `defunc007`, `defunc008`, and `_lifted`
+  variants of every defunc test): a lambda's existentials include the type
+  variables of its free variables' types; the specialisation post-pass names
+  its new coercions freshly (it indexed the old ones by the new parameters:
+  the `!!` panic in `circsim` and `solid`), substitutes eliminated
+  existentials in field binders, and rebuilds every type whose fields
+  mention a specialised type; absent demands are kept as they are.
 - Strictness fixpoints across webs: `05886a3904`.
 - Boundary split, with its heuristics and fixes: `52d79ed9f2`.
 - Early result raising leaves known-call webs to worker/wrapper: `0c771d56b2`.

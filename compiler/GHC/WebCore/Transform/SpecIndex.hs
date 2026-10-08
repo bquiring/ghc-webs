@@ -33,7 +33,7 @@ import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.SrcLoc ( noSrcSpan )
 import GHC.Types.Unique ( Unique )
 import GHC.Types.Unique.FM
-import GHC.Types.Unique.Set ( elementOfUniqSet )
+import GHC.Types.Unique.Set ( elementOfUniqSet, mkUniqSet, nonDetEltsUniqSet )
 import GHC.Types.Unique.Supply
 import GHC.Types.Var ( mkTyVar, mkCoVar )
 import GHC.Types.Var.Env
@@ -42,8 +42,9 @@ import GHC.Types.Var.Set
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
+import Control.Monad ( forM )
 import Data.List ( nub )
-import Data.Maybe ( fromMaybe )
+import Data.Maybe ( fromMaybe, isJust )
 
 {- Note [Specialising indexed types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -274,9 +275,8 @@ mkSpec specs us tc tvs pat
 
     -- The old constructor's indices are P(ts)
     mk_newcon (tag, dc, us_c) = do
-      { idx <- mapM eq_rhs (zip (dataConUnivTyVars dc) (dataConOtherTheta dc))
-      ; s   <- tcMatchTys pat idx
-      ; let ts   = map (substTyVar s) tvs
+      { ts <- conInstance tvs pat dc
+      ; let
             exs  = dataConExTyCoVars dc
             -- Existentials that appear alone, once, become parameters
             elim = [ (ex, j) | (j, TyVarTy ex) <- zip [0 ..] ts, ex `elem` exs
@@ -305,7 +305,18 @@ mkSpec specs us tc tvs pat
 
     lookup_self = fromMaybe (pprPanic "SpecIndex: self" (ppr tc)) (lookupUFM specs tc)
 
-    -- An equality  a ~# t  of the old constructor's context
+-- | For each constructor, the instance ts of the pattern P(as) that its
+-- indices are (Nothing if one is not an instance)
+conIndices :: TyCon -> [TyVar] -> [Type] -> Maybe [[Type]]
+conIndices tc tvs pat = mapM (conInstance tvs pat) (tyConDataCons tc)
+
+conInstance :: [TyVar] -> [Type] -> DataCon -> Maybe [Type]
+conInstance tvs pat dc
+  = do { idx <- mapM eq_rhs (zip (dataConUnivTyVars dc) (dataConOtherTheta dc))
+       ; s   <- tcMatchTys pat idx
+       ; return (map (substTyVar s) tvs) }
+  where
+    -- An equality  a ~# t  of the constructor's context
     eq_rhs (tv, pred_ty) = case getEqPredTys_maybe pred_ty of
       Just (_, l, r) | l `eqType` mkTyVarTy tv -> Just r
       _                                        -> Nothing
@@ -320,22 +331,43 @@ specialiseIndexed :: UniqSupply -> [Indexed] -> CoreProgram
                   -> (CoreProgram, [(TyCon, TyCon)], [SDoc])
 specialiseIndexed us ixs binds
   | isNullUFM specs = (binds, [], dump)
-  | otherwise       = (map rw_bind binds, [ (sp_old sp, sp_new sp) | sp <- nonDetEltsUFM specs ], dump)
+  | otherwise       = ( initUs_ us_rw (mapM rw_bind binds)
+                      , [ (sp_old sp, sp_new sp) | sp <- nonDetEltsUFM specs ], dump )
   where
-    plans = [ (ix, mb)
-            | (ix, u) <- zip ixs (listSplitUniqSupply us)
+    (us_plan, us_rw) = splitUniqSupply us
+    -- Each type: whether its uses can be rewritten, and its pattern (the
+    -- general one if anti-unification gives nothing better)
+    plans = [ (ix, ok && isJust (conIndices tc tvs pat), (tvs, pat), u2)
+            | (ix, u) <- zip ixs (listSplitUniqSupply us_plan)
             , let tc = ix_tycon ix
                   (idxs, ok) = uses tc (ix_elim ix) binds
                   (u1, u2) = splitUniqSupply u
-                  mb | not ok = Nothing
-                     | otherwise = do { (tvs, pat) <- antiUnify u1 idxs
-                                      ; if general tvs pat then Nothing else Just ()
-                                      ; return (tvs, pat, u2) } ]
+                  (tvs, pat) = case antiUnify u1 idxs of
+                    Just (tvs', pat') | isJust (conIndices tc tvs' pat') -> (tvs', pat')
+                    _ -> (tyConTyVars tc, mkTyVarTys (tyConTyVars tc)) ]
     general tvs pat = length tvs == length pat && all isTyVarTy pat
+
+    -- A type whose fields mention a specialised type is rebuilt too (at its
+    -- own pattern, perhaps the general one), or its constructors would
+    -- still mention the old type.  So a type that cannot be rewritten
+    -- blocks the specialisation of every type it reaches through fields.
+    indexed  = mkUniqSet (map ix_tycon ixs)
+    mentions tc = [ tc' | dc <- tyConDataCons tc, t <- dataConOrigArgTys dc
+                        , tc' <- nonDetEltsUniqSet (tyConsOfType (scaledThing t))
+                        , tc' `elementOfUniqSet` indexed, tc' /= tc ]
+    reach tc = go [] (mentions tc)
+      where go seen [] = seen
+            go seen (t : ts) | t `elem` seen = go seen ts
+                             | otherwise     = go (t : seen) (mentions t ++ ts)
+    blocked = concat [ reach (ix_tycon ix) | (ix, False, _, _) <- plans ]
+    seeds   = [ ix_tycon ix | (ix, True, (tvs, pat), _) <- plans
+                            , not (general tvs pat), ix_tycon ix `notElem` blocked ]
+    rebuild tc = tc `elem` seeds || any (`elem` seeds) (reach tc)
 
     specs :: UniqFM TyCon Spec
     specs = listToUFM [ (ix_tycon ix, sp)
-                      | (ix, Just (tvs, pat, u)) <- plans
+                      | (ix, True, (tvs, pat), u) <- plans
+                      , rebuild (ix_tycon ix)
                       , Just sp <- [mkSpec specs u (ix_tycon ix) tvs pat] ]
 
     dump = [ ppr (ix_tycon ix) <> colon <+>
@@ -343,15 +375,16 @@ specialiseIndexed us ixs binds
                 Just sp -> text "specialised to" <+> ppr (sp_new sp) <+> hsep (map ppr (sp_tvs sp))
                            <+> text "=" <+> ppr (sp_pat sp)
                 Nothing -> text "not specialised")
-           | (ix, _) <- plans ]
+           | (ix, _, _, _) <- plans ]
 
     elims = [ (e, sp) | Indexed { ix_tycon = tc, ix_elim = Just e } <- ixs
                       , Just sp <- [lookupUFM specs tc] ]
 
     ty = mapT specs
 
-    rw_bind (NonRec b e) = NonRec (rw_bndr b) (rw_rhs b e)
-    rw_bind (Rec prs)    = Rec [ (rw_bndr b, rw_rhs b e) | (b, e) <- prs ]
+    rw_bind :: CoreBind -> UniqSM CoreBind
+    rw_bind (NonRec b e) = NonRec (rw_bndr b) <$> rw_rhs b e
+    rw_bind (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) (rw_bndr b) <$> rw_rhs b e) prs
 
     -- Binders: new types; vanilla unfoldings may mention the old types.  The
     -- eliminator's type  forall as_old. T as_old -> ..  becomes
@@ -371,26 +404,28 @@ specialiseIndexed us ixs binds
       | Just sp <- lookup b elims
       , (old_tvs, body) <- collectTyBinders e
       , length old_tvs == length (sp_pat sp)
-      = let s = extendTvSubstList (mkEmptySubst (mkInScopeSet (exprFreeVars e)))
+      = let s = extendTvSubstList (mkEmptySubst (mkInScopeSet (exprFreeVars e
+                                                                `unionVarSet` mkVarSet (sp_tvs sp))))
                                   (zip old_tvs (sp_pat sp))
-        in mkLams (sp_tvs sp) (rw (substExpr s body))
+        in mkLams (sp_tvs sp) <$> rw (substExpr s body)
       | otherwise = rw e
 
-    rw :: CoreExpr -> CoreExpr
+    rw :: CoreExpr -> UniqSM CoreExpr
     rw expr = case expr of
-      Var v -> Var (if isLocalId v then rw_bndr v else v)
-      Lit {} -> expr
-      Type t -> Type (ty t)
-      Coercion co -> Coercion (rw_co co)
+      Var v -> return (Var (if isLocalId v then rw_bndr v else v))
+      Lit {} -> return expr
+      Type t -> return (Type (ty t))
+      Coercion co -> return (Coercion (rw_co co))
       App {}
         | (Var v, args) <- collectArgs expr
         -> rw_app v args
-      App f a -> App (rw f) (rw a)
-      Lam b e -> Lam (rw_bndr b) (rw e)
-      Let bind e -> Let (rw_bind bind) (rw e)
-      Case e b t alts -> Case (rw e) (rw_bndr b) (ty t) (map (rw_alt (idType b)) alts)
-      Cast e co -> Cast (rw e) (rw_co co)
-      Tick t e -> Tick t (rw e)
+      App f a -> App <$> rw f <*> rw a
+      Lam b e -> Lam (rw_bndr b) <$> rw e
+      Let bind e -> Let <$> rw_bind bind <*> rw e
+      Case e b t alts -> Case <$> rw e <*> pure (rw_bndr b) <*> pure (ty t)
+                              <*> mapM (rw_alt (idType b)) alts
+      Cast e co -> Cast <$> rw e <*> pure (rw_co co)
+      Tick t e -> Tick t <$> rw e
       WebLam {} -> pprPanic "SpecIndex: web form (runs after erasure)" (ppr expr)
       WebApp {} -> pprPanic "SpecIndex: web form (runs after erasure)" (ppr expr)
 
@@ -415,16 +450,16 @@ specialiseIndexed us ixs binds
                           , ex `notElem` map fst (nc_elim nc) ]
             cos    = [ Coercion (mkNomReflCo (ty (ss !! j))) | j <- nc_eqs nc ]
         in mkApps (Var (dataConWorkId (nc_dc nc)))
-                  (map (Type . ty) ss ++ map (Type . ty) ex_kept ++ cos ++ map rw rest)
+                  . ((map (Type . ty) ss ++ map (Type . ty) ex_kept ++ cos) ++) <$> mapM rw rest
       -- The eliminator: its type arguments are the old indices
       | Just sp <- lookup v elims
       , let n = length (sp_pat sp)
       , length args >= n
       , all isTypeArg (take n args)
       = mkApps (Var (rw_bndr v))
-               (map (Type . ty) (instPat sp [ t | Type t <- take n args ]) ++ map rw (drop n args))
+        . (map (Type . ty) (instPat sp [ t | Type t <- take n args ]) ++) <$> mapM rw (drop n args)
       | otherwise
-      = mkApps (rw (Var v)) (map rw args)
+      = mkApps <$> rw (Var v) <*> mapM rw args
 
     -- A case alternative on a constructor of a specialised type: bind the
     -- new existentials and coercions; rebuild the old coercions by lifting
@@ -433,30 +468,40 @@ specialiseIndexed us ixs binds
       | Just sp <- lookupUFM specs (dataConTyCon dc)
       , Just nc <- lookupUFM (sp_cons sp) dc
       , Just (_, idx) <- splitTyConApp_maybe scrut_ty
-      = let ss     = instPat sp idx
-            n_ex   = length (dataConExTyCoVars dc)
-            n_eq   = length (dataConOtherTheta dc)
-            (ex_bs, rest1)  = splitAt n_ex bs
-            (co_bs, fld_bs) = splitAt n_eq rest1
-            elim_bs = [ (b, j) | (b, ex) <- zip ex_bs (dataConExTyCoVars dc)
-                               , Just j <- [lookup ex (nc_elim nc)] ]
-            kept_bs = [ b | b <- ex_bs, b `notElem` map fst elim_bs ]
-            -- Eliminated existentials are the scrutinee's indices
-            tsub  = [ (b, ss !! j) | (b, j) <- elim_bs ]
-            s0    = extendTvSubstList (mkEmptySubst (mkInScopeSet (exprFreeVars rhs `unionVarSet` mkVarSet bs)))
-                                      tsub
-            new_cos = [ mkCoVar (getName c) (mkNomEqPred (ss !! j) (eq_rhs_of sp nc j ss kept_bs))
-                      | (j, c) <- zip (nc_eqs nc) [ co_bs !! j | j <- nc_eqs nc ] ]
-            lift_cos = [ case lookup j (zip (nc_eqs nc) new_cos) of
-                           Just c  -> mkCoVarCo c
-                           Nothing -> mkNomReflCo (ss !! j)
-                       | j <- [0 .. length (sp_tvs sp) - 1] ]
-            -- The old coercion for index i:  P_i(ss) ~# P_i(ts)
-            old_co i = liftCoSubstWith Nominal (sp_tvs sp) lift_cos (sp_pat sp !! i)
-            s1 = foldl (\s (c, i) -> extendCvSubst s c (old_co i)) s0 (zip co_bs [0 ..])
-        in Alt (DataAlt (nc_dc nc)) (kept_bs ++ new_cos ++ map rw_bndr fld_bs)
-               (rw (substExpr s1 rhs))
-    rw_alt _ (Alt con bs rhs) = Alt con (map rw_bndr bs) (rw rhs)
+      = do { let ss     = instPat sp idx
+                 n_ex   = length (dataConExTyCoVars dc)
+                 n_eq   = length (dataConOtherTheta dc)
+                 (ex_bs, rest1)  = splitAt n_ex bs
+                 (co_bs, fld_bs) = splitAt n_eq rest1
+                 elim_bs = [ (b, j) | (b, ex) <- zip ex_bs (dataConExTyCoVars dc)
+                                    , Just j <- [lookup ex (nc_elim nc)] ]
+                 kept_bs = [ b | b <- ex_bs, b `notElem` map fst elim_bs ]
+                 -- Eliminated existentials are the scrutinee's indices
+                 tsub  = [ (b, ss !! j) | (b, j) <- elim_bs ]
+                 -- In scope: the scrutinee's indices' variables too (the
+                 -- range of tsub and of the coercions below)
+                 s0    = extendTvSubstList (mkEmptySubst (mkInScopeSet
+                           (exprFreeVars rhs `unionVarSet` mkVarSet bs
+                            `unionVarSet` tyCoVarsOfTypes ss)))
+                                           tsub
+             -- One new coercion per equality of the new constructor
+           ; new_cos <- forM (nc_eqs nc) $ \j ->
+               do { u <- getUniqueM
+                  ; return (mkCoVar (mkSystemName u (mkVarOccFS (fsLit "co")))
+                                    (mkNomEqPred (ss !! j) (eq_rhs_of sp nc j ss kept_bs))) }
+           ; let lift_cos = [ case lookup j (zip (nc_eqs nc) new_cos) of
+                                Just c  -> mkCoVarCo c
+                                Nothing -> mkNomReflCo (ss !! j)
+                            | j <- [0 .. length (sp_tvs sp) - 1] ]
+                 -- The old coercion for index i:  P_i(ss) ~# P_i(ts)
+                 old_co i = liftCoSubstWith Nominal (sp_tvs sp) lift_cos (sp_pat sp !! i)
+                 s1 = foldl (\s (c, i) -> extendCvSubst s c (old_co i))
+                            (s0 `extendSubstInScopeList` new_cos) (zip co_bs [0 ..])
+                 -- The fields' types may mention the eliminated existentials
+                 (s2, fld_bs') = substBndrs s1 fld_bs
+           ; Alt (DataAlt (nc_dc nc)) (kept_bs ++ new_cos ++ map rw_bndr fld_bs')
+               <$> rw (substExpr s2 rhs) }
+    rw_alt _ (Alt con bs rhs) = Alt con (map rw_bndr bs) <$> rw rhs
 
     -- The right-hand side of the new constructor's equality for parameter
     -- j, at the scrutinee's indices and the alternative's existentials
