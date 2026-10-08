@@ -96,6 +96,14 @@ Conditions, checked per web:
     -- and in a recursive function, the case cannot be resolved statically
     (the function is a loop breaker, so its constructor is not visible).
   * At most 'maxLambdas' lambdas: $apply_w has one alternative per lambda.
+  * At least two lambdas.  A web with one lambda gains only known calls,
+    which GHC's specialisation gets anyway when the lambda is passed into a
+    recursive function -- and specialises better on the lambda than on its
+    constructor: in nofib real/eff/CS (continuations of a Church-encoded
+    state monad), defunctionalising one-lambda webs left an unknown call
+    in a loop that GHC otherwise reduces to a counter (+156% instructions),
+    and spectral/hartel/event lost 6%.  mate and solid keep their gains.
+  * A curried web only with the web it returns (Note [Curried lambdas]).
   * The argument and result kinds are the same at every occurrence of the
     arrow, closed, and the argument's has a fixed runtime representation;
     the lambdas' free type variables have closed kinds.
@@ -239,6 +247,7 @@ verdict tops exposed w i
   | i_unknown i == 0              = no "no unknown calls"
   | i_known i > 0                 = no "known calls"
   | length lams > maxLambdas      = no "too many lambdas"
+  | [_] <- lams                   = no "one lambda"
   | length (nub (map (getUnique . l_bndr) lams)) /= length lams
                                   = no "shared lambda binders"
   | Nothing <- kinds              = no "representation-polymorphic"
@@ -284,6 +293,8 @@ verdict tops exposed w i
     res_ty l = exprType (lam_body (l_expr l))
     lam_body (WebLam _ _ e) = e
     lam_body e              = e
+
+
 
     firstJust (Just x : _) = Just x
     firstJust (_ : xs)     = firstJust xs
@@ -469,11 +480,26 @@ defuncProgram lifted this_mod pol us exposed binds
     (us1, us2) = splitUniqSupply us
     tops  = mkVarSet (bindersOfBinds binds)
     infos = analyse binds
-    verdicts = [ (w, v, mb, i)
-               | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
-               , let w = mkWebId u
-               , not (null (i_lams i))
-               , let (v, mb) = verdict tops exposed w i ]
+    verdicts0 = [ (w, v, mb, i)
+                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
+                , let w = mkWebId u
+                , not (null (i_lams i))
+                , let (v, mb) = verdict tops exposed w i ]
+
+    -- Curried lambdas (Note [Curried lambdas]): a web whose lambdas return
+    -- lambdas of another web is defunctionalised only with that web
+    accepted = fix (mkUniqSet [ w | (w, _, Just _, _) <- verdicts0 ])
+    fix acc | sizeUniqSet acc' == sizeUniqSet acc = acc
+            | otherwise                           = fix acc'
+      where acc' = filterUniqSet (\w -> all (inner_ok acc) (lams_of w)) acc
+    lams_of w = concat [ i_lams i | (w', _, _, i) <- verdicts0, w' == w ]
+    inner_ok acc l = case innerWeb (l_expr l) of
+      Just w2 -> w2 `elementOfUniqSet` acc
+      Nothing -> True
+    verdicts = [ if isJust mb && not (w `elementOfUniqSet` accepted)
+                 then (w, NoDefunc "curried: the web it returns is not defunctionalised", Nothing, i)
+                 else (w, v, mb, i)
+               | (w, v, mb, i) <- verdicts0 ]
     dump = [ (w, ppr v, isJust mb, map l_bndr (i_lams i)) | (w, v, mb, i) <- verdicts ]
 
     -- The knot: field types may mention any of the new types
@@ -506,6 +532,32 @@ defuncProgram lifted this_mod pol us exposed binds
     bind_x lf arg body
       | isUnliftedType (idType (lf_x lf)) = Case arg (lf_x lf) (lf_res lf) [Alt DEFAULT [] body]
       | otherwise                         = Let (NonRec (lf_x lf) arg) body
+
+-- | The web of the lambda a web lambda returns, if its body is one
+innerWeb :: CoreExpr -> Maybe WebId
+innerWeb (WebLam _ _ body) = go body
+  where
+    go e = case e of
+      WebLam w2 _ _ -> Just w2
+      Lam b e' | not (isId b) -> go e'
+      Tick _ e'     -> go e'
+      Cast e' _     -> go e'
+      _             -> Nothing
+innerWeb _ = Nothing
+
+{- Note [Curried lambdas]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+A lambda  \^w a. \^w2 s. e  (a curried function) called with both
+arguments is one unknown call of a function of arity two: no allocation.
+If w is defunctionalised but w2 is not (say its calls are known), the first
+application goes through $apply_w, which returns the inner lambda -- a
+closure it allocates at every call -- and the second is an unknown call of
+that closure.  In nofib real/eff/CS (a Church-encoded state monad whose
+continuations take the state as a second argument) this more than doubled
+the instructions.  So such a web is defunctionalised only if w2 is too
+(then the first application returns a constructor of D_w2, and the second
+is a call of $apply_w2).  Computed as a fixpoint over the verdicts.
+-}
 
 {- Note [Lifted bodies]
 ~~~~~~~~~~~~~~~~~~~~~~~~
