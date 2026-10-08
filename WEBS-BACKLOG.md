@@ -40,6 +40,29 @@ Plan (2026-10-08):
    types, no webs. nofib with `-dcore-lint` (`early-ds`) to check for type
    errors; then instruction counts (should be unchanged, ±0.1%).
 
+6. **Defunctionalisation heuristics** (commit `008ca506e1` on `data-split`;
+   cherry-pick onto `webs` after the current run, re-accept the defunc test
+   dumps): at least two lambdas; a curried web only with the web it returns
+   (Note [Curried lambdas]). Instructions against early-fix: CS +156% ->
+   +0.0%, event +6.4% -> +0.0%, solid -13.9% -> -13.8%, mate -4.7% kept.
+   constraints +1.4% is left: multi-lambda webs, not yet explained.
+7. **Defunctionalise whole arities** (the user's idea): GHC has no
+   saturated-call arrow, but web uncurrying makes one, (# a, b #) -> c. Run
+   uncurrying, for the curried webs defunctionalisation will take, inside
+   defunctionalisation (one constructor per lambda chain, a multi-argument
+   $apply), instead of the curried gate. A coarse version -- all
+   uncurrying in the early run when defunc is on -- is wrong: event +8.9%,
+   constraints +2.5%, solid -15.8%, and mate fails Core Lint after
+   SpecConstr (an unlifted case binder of nested unboxed-tuple type; an
+   early-uncurrying bug, see Note [No early uncurrying]).
+8. **Data splitting, phase 3** (the user's priorities): unbox inside data
+   structures -- a split list class whose elements are a non-exposed pair
+   class used strictly (every construction passes a value, or every
+   consumer forces it) gets the pair unpacked into the cons cell
+   ([(a,b)] => a list of (# a, b #)); more aggressive unboxing of Int and
+   (,). Needs the copy specialised to its element type (anti-unify the
+   class's type arguments, as GHC.WebCore.Transform.SpecIndex does).
+
 ## Next
 
 - **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
