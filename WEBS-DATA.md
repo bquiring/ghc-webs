@@ -59,6 +59,32 @@ benchmark's instructions by more than 0.1% (split + unbox against the same
 without newtypes, 111 benchmarks). What it splits is mostly `ST` (11
 classes) and `IO` (9), plus two local `S` newtypes (CS, dom-lt).
 
+### Next: one fixpoint for all unboxing (planned, 2026-10-08)
+
+Field unboxing, argument unboxing (arity raising) and result unboxing
+(result raising) depend on each other, so they are solved together, in the
+early web pipeline (flattening moves there from the splitter):
+
+* **Arg(w)**: web w's argument passed as components. Each lambda uses its
+  parameter only by projection, as an argument to an Arg web, in an unboxed
+  field, or as a Res tail; and the lambdas are strict in it, or every call
+  passes a value (values include Res calls and unboxed fields' pattern
+  variables, rebuilt as constructor applications).
+* **Res(w)**: web w's result returned as components. Every tail constructs
+  the product, tail-calls a Res web, or returns an unboxed field's pattern
+  variable; every call's result is used only by projection, an Arg
+  argument, an unboxed field, or a Res tail.
+* **Fld(K, i)**: as now (Note [Unboxable fields]), with "a callee unboxes
+  it" meaning Arg of its web, and Res tails as uses.
+* **Strictly eliminated (K, i)** (Note [Strictly eliminated fields]), with
+  Arg webs as strict arguments.
+
+One greatest fixpoint over all four; then the three rewrites with the
+decisions fixed, each followed by Lint. Flag `-fcore-webs-unbox`, replacing
+the separate decisions (the old passes stay for comparison). Stages: shared
+facts; the solver with today's local conditions only (must reproduce the
+three passes); the cross-dependencies; nofib.
+
 Open: whether recursive fields could be separate copies (polymorphic
 recursion in copies; edge cases), copies for fields of other data types
 (section 2, step 3; phase 4), strict and unpacked fields (types with
