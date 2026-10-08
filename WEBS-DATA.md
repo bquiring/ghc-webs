@@ -52,6 +52,13 @@ fft −2.8%, fulsom −2.2%, pic −2.2%. With eager: linear −12.2%, cryptarit
 rewrite −6.6%, fulsom −5.4%, fft −4.0%. Splitting `Int` (now excluded) cost
 multiplier +10.2%. Compiler allocation roughly doubles (deferred).
 
+Newtype splitting (Note [Splitting newtypes], `f7058ed8df`): all 115
+benchmarks build (after two fixes: congruence's originals counted as class
+members; copied axioms eta-reduced like the original's). It changes no
+benchmark's instructions by more than 0.1% (split + unbox against the same
+without newtypes, 111 benchmarks). What it splits is mostly `ST` (11
+classes) and `IO` (9), plus two local `S` newtypes (CS, dom-lt).
+
 Open: whether recursive fields could be separate copies (polymorphic
 recursion in copies; edge cases), copies for fields of other data types
 (section 2, step 3; phase 4), strict and unpacked fields (types with
