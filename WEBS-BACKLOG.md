@@ -29,6 +29,13 @@ a heuristic.
 
 ## Core-to-Core: to implement
 
+- **Named function types, one per web** (from an earlier implementation):
+  analogous to named data types, each web gets a named function type
+  constructor. Monomorphism or specialisation is then recorded once per web
+  in its type, instead of being recomputed by every pass (e.g.
+  defunctionalisation's types `D_w a b`, and specialising them when a most
+  general unifier exists).
+
 - **Data webs, phases 2–4** (`WEBS-DATA.md`): splitting into local types;
   strict, unpacked and dead fields; congruence for nested fields.
 - **Local newtypes** (Survey §14): a newtype that is not exported gets

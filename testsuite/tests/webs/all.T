@@ -180,10 +180,11 @@ for n in [1, 2, 4]:
 # Note [Defunctionalisation] (GHC.WebCore.Transform.Defunc,
 # -fcore-webs-defunc).  001 is the basic case, 002 checks laziness and
 # sharing (the trace appears once, the error never), 003 curried lambdas
-# (two webs), 004 webs that are rejected (polymorphic; known calls).  Their
-# dumps show the verdicts.
+# (two webs), 004 webs that are rejected (known calls; exposed), 005 a
+# polymorphic and a monomorphic lambda in one web, 006 a polymorphic
+# higher-order function used at two types.  Their dumps show the verdicts.
 df_opts = early_opts + ' -fcore-webs-defunc'
-for n in range(1, 5):
+for n in range(1, 7):
     test('defunc%03d' % n, [], compile_and_run, [df_opts])
     test('defunc%03d_dump' % n, [extra_files(['defunc%03d.hs' % n])],
          multimod_compile, ['defunc%03d' % n, df_opts + ' -ddump-webs-defunc -dsuppress-uniques'])

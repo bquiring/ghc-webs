@@ -1,5 +1,6 @@
 -- Webs that are not defunctionalised (Note [Defunctionalisation]):
---  * twiceP is polymorphic: its parameter's arrow is  a -> a;
+--  * twiceP's web is exposed: 'not', an imported function, reaches it
+--    (polymorphism alone is fine: defunc005, defunc006);
 --  * go is a let-bound function that is called directly (known calls) and
 --    also passed to apply1.
 module Main (main) where
