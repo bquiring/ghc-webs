@@ -1,7 +1,7 @@
 [1 of 2] Compiling Main             ( defunc007.hs, defunc007.o )
 
 ==================== Webs: defunctionalisation ====================
-defunctionalised (1 constructors): x
+defunctionalised (2 constructors): x x
 not defunctionalised (exposed): s
 not defunctionalised (exposed): v
 not defunctionalised (exposed): v v

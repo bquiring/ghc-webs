@@ -30,19 +30,16 @@ Plan (2026-10-08):
    −13.1% time against `base`, `event` +6.5% time (check its
    instructions).
 
-4. **Written, not yet built or tested** (while nofib ran; build after the
-   runs): constructed-argument raising (Note [Arity raising], test
-   `arityraise013`) and one-shot lambdas from webs
-   (`-fcore-webs-one-shot`, Note [One-shot lambdas from webs], test
-   `oneshot001`). Then nofib each against `early-fix`.
+4. ~~Constructed-argument raising and one-shot lambdas~~: done and
+   measured (`WEBS-EXPERIMENTS.md` §8): wave4main −4.6%; one-shot has no
+   effect. Find out why one-shot has no effect, or drop it.
 5. **Data splitting** is on branch `data-split` (worktree
    `~/projects/ghc-data-split`, Note [Splitting data types]): copies of data
    types, no webs. nofib with `-dcore-lint` (`early-ds`) to check for type
    errors; then instruction counts (should be unchanged, ±0.1%).
 
-6. **Defunctionalisation heuristics** (commit `008ca506e1` on `data-split`;
-   cherry-pick onto `webs` after the current run, re-accept the defunc test
-   dumps): at least two lambdas; a curried web only with the web it returns
+6. **Defunctionalisation heuristics** (`78618024bc`, `WEBS-EXPERIMENTS.md`
+   §7): at least two lambdas; a curried web only with the web it returns
    (Note [Curried lambdas]). Instructions against early-fix: CS +156% ->
    +0.0%, event +6.4% -> +0.0%, solid -13.9% -> -13.8%, mate -4.7% kept.
    constraints +1.4% is left: multi-lambda webs, not yet explained.
