@@ -18,7 +18,7 @@ import GHC.Core.Make ( mkCoreUnboxedTuple, mkCoreConApps )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Utils ( exprType )
+import GHC.Core.Utils ( exprType, exprIsHNF )
 
 import GHC.Data.FastString ( fsLit )
 
@@ -39,6 +39,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
 import GHC.WebCore.Transform.Common
+import GHC.WebCore.Traverse ( stripWebForms )
 
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe, isJust )
@@ -90,15 +91,33 @@ A web is also rejected if it is exposed, if some arrow's argument is not a
 product (e.g. a type variable), if the product type differs between arrows,
 if a component has no fixed representation, or if the web appears in a
 coercion we cannot rewrite.
+
+Constructed arguments (Survey §8): if every call of the web passes a value
+of the product type -- an application of its constructor, or a variable
+bound to one (exprIsHNF; GHC let-binds constructor applications, and floats
+constant ones to the top level) --
+
+    f @^w (K es)   ==>   f @^w (# es #)
+    f @^w x        ==>   case x of K ys -> f @^w (# ys #)     (x a value)
+
+evaluates nothing, so the lambdas need not be strict, and may be curried.
+A lambda that still needs the product rebuilds it (let p = K xs), but the
+caller built it at every call before, so nothing is lost; a lambda that
+uses it only on some paths now builds it only there.  This is what
+SpecConstr does for recursive functions by copying them, here for a web
+with unknown calls.  Only for constructors without strict or unpacked
+fields: a constructor's worker takes its strict fields evaluated, which the
+unboxed tuple's components are not known to be.
 -}
 
-data Verdict = Raised | Rejected Reason
+data Verdict = Raised | RaisedConstructed | Rejected Reason
 
 data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
             | KnownCalls | BoxNeeded
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
+  ppr RaisedConstructed = text "raised (constructed arguments)"
   ppr (Rejected r) = text "rejected" <+> parens (ppr r)
 
 instance Outputable Reason where
@@ -153,10 +172,11 @@ data Info = Info
   , i_rep_poly  :: Bool
   , i_coercion  :: Bool
   , i_unknown   :: Bool    -- Some call of the web is not a known call
-  , i_boxed     :: Bool }  -- Some lambda needs its parameter boxed
+  , i_boxed     :: Bool    -- Some lambda needs its parameter boxed
+  , i_noncon    :: Bool }  -- Some call's argument is not a value
 
 noInfo :: Info
-noInfo = Info [] False False False False [] False False False False
+noInfo = Info [] False False False False [] False False False False False
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
@@ -168,7 +188,8 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_rep_poly = i_rep_poly a || i_rep_poly b
                     , i_coercion = i_coercion a || i_coercion b
                     , i_unknown  = i_unknown a  || i_unknown b
-                    , i_boxed    = i_boxed a    || i_boxed b }
+                    , i_boxed    = i_boxed a    || i_boxed b
+                    , i_noncon   = i_noncon a   || i_noncon b }
 
 type Infos = UniqFM WebId Info
 
@@ -217,8 +238,8 @@ analyse binds = foldr go_bind emptyUFM binds
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
     go (WebApp w f a) acc
-      | knownHead f = go f (go a acc)
-      | otherwise   = note w (noInfo { i_unknown = True }) (go f (go a acc))
+      = note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (exprIsHNF (stripWebForms a)) })
+             (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc = go_lam True w p e (go e acc)
     go (Let bind body) acc = go_bind bind (go body acc)
@@ -329,6 +350,8 @@ verdict early exposed complex w i
   | i_not_prod i                 = Rejected NotProduct
   | not (same_tycon (i_tycons i)) = Rejected NotProduct
   | i_rep_poly i                 = Rejected RepPoly
+  | i_lazy i || i_curried i || i_boxed i
+  , constructed                  = RaisedConstructed
   | i_lazy i                     = Rejected Lazy
   | i_curried i                  = Rejected Curried
   | i_boxed i                    = Rejected BoxNeeded
@@ -336,6 +359,13 @@ verdict early exposed complex w i
   where
     same_tycon (tc:tcs) = all (== tc) tcs
     same_tycon []       = False
+    -- Every call passes a value, and the constructor's fields are lazy
+    constructed = not (i_noncon i) && all lazy_fields (take 1 (i_tycons i))
+    lazy_fields tc = case tyConSingleDataCon_maybe tc of
+      Just dc -> all is_lazy (dataConImplBangs dc)
+      Nothing -> False
+    is_lazy HsLazy = True
+    is_lazy _      = False
 
 ------------------------------------------------------------------
 --      One round
@@ -361,7 +391,10 @@ arityRaiseRound us exposed pol done binds
                , let w = mkWebId u
                , not (null (i_lams i))
                , not (w `elementOfUniqSet` done) ]
-    todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
+    todo = mkUniqSet [ w | (w, v, _) <- verdicts, raised v ]
+    raised Raised            = True
+    raised RaisedConstructed = True
+    raised _                 = False
     dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
 
 ------------------------------------------------------------------

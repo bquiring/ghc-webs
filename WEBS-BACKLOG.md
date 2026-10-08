@@ -30,6 +30,16 @@ Plan (2026-10-08):
    −13.1% time against `base`, `event` +6.5% time (check its
    instructions).
 
+4. **Written, not yet built or tested** (while nofib ran; build after the
+   runs): constructed-argument raising (Note [Arity raising], test
+   `arityraise013`) and one-shot lambdas from webs
+   (`-fcore-webs-one-shot`, Note [One-shot lambdas from webs], test
+   `oneshot001`). Then nofib each against `early-fix`.
+5. **Data splitting** is on branch `data-split` (worktree
+   `~/projects/ghc-data-split`, Note [Splitting data types]): copies of data
+   types, no webs. nofib with `-dcore-lint` (`early-ds`) to check for type
+   errors; then instruction counts (should be unchanged, ±0.1%).
+
 ## Next
 
 - **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
@@ -80,6 +90,18 @@ Plan (2026-10-08):
   nofib. Web Lint runs once per round of each transformation.
 
 ## Ideas to test
+
+- **Constructed arguments with known calls.** The early run leaves
+  known-call webs to worker/wrapper (Note [Early arity raising]), but
+  worker/wrapper does not unbox a lazy constructed argument. Try raising
+  constructed webs with only known calls too, against SpecConstr.
+- **Data splitting: keep the original for one class.** A local,
+  unexported type with no exposed class could keep its original type for
+  one class instead of making a copy (fewer info tables).
+- **Data splitting: Int and other boxed primitives.** `Int` is eligible
+  (one constructor, an unboxed field, no wrapper), so local `Int`s get
+  copies. Harmless, but it creates types; decide whether to exclude them
+  until phase 3 can use them (unboxing).
 
 - **Boundary split, size bound.** The bound is 2× `-funfolding-use-threshold`
   (Note [Small functions are not split]). Try 1× and 3× and compare

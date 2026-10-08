@@ -50,6 +50,7 @@ import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
 import GHC.WebCore.Transform.ConstProp ( constPropRound )
 import GHC.WebCore.Transform.Inline ( inlineRound )
 import GHC.WebCore.Transform.Defunc ( defuncProgram )
+import GHC.WebCore.Transform.OneShot ( oneShotRound )
 import GHC.WebCore.Transform.SpecIndex ( Indexed(..), specialiseIndexed )
 import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.WebCore.Traverse ( programWebs, typeWebs )
@@ -270,7 +271,11 @@ runTransforms early logger dflags cfg sigs binds0
     keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
 
     transforms =
-      [ ( Opt_CoreWebsInline, "super-beta inlining", Opt_D_dump_webs_inline
+      -- First: it reads the demands of demand analysis, before anything moves
+      -- See Note [One-shot lambdas from webs] in GHC.WebCore.Transform.OneShot
+      [ ( Opt_CoreWebsOneShot, "one-shot lambdas", Opt_D_dump_webs_one_shot
+        , \us done b -> oneShotRound early us exposed done b )
+      , ( Opt_CoreWebsInline, "super-beta inlining", Opt_D_dump_webs_inline
         , \us done b -> inlineRound (unfoldingOpts dflags) us exposed done b )
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
         , \us done b -> constPropRound us exposed done b )

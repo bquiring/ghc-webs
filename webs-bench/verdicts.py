@@ -11,12 +11,12 @@ count per configuration.
 import os, re, sys, collections
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
-PASSES = ['inline', 'const-prop', 'arity-raise', 'dead-params', 'uncurry', 'defunc',
+PASSES = ['one-shot', 'inline', 'const-prop', 'arity-raise', 'dead-params', 'uncurry', 'defunc',
           'result-raise', 'strictness']
 # A verdict component that changed the program starts with one of these
 FIRED = ['inline', 'strict argument', 'strict result fields',
          'constant argument', 'constant result', 'uncurried', 'raised',
-         'deleted', 'unit']
+         'deleted', 'unit', 'one-shot']
 
 def components(verdict):
     """Split a verdict into its parts (const-prop and strictness give one

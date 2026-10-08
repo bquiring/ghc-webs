@@ -1,0 +1,15 @@
+[1 of 2] Compiling Main             ( oneshot001.hs, oneshot001.o )
+
+==================== Webs: one-shot lambdas ====================
+not one-shot (exposed): s
+not one-shot (used more than once): n
+not one-shot (used more than once): n
+not one-shot (used more than once): y
+one-shot: g
+one-shot: g
+one-shot: k k
+one-shot: k k
+one-shot: x
+
+
+[2 of 2] Linking oneshot001

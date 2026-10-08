@@ -15,7 +15,9 @@ Main.add :: (#,#) GHC.Internal.Types.LiftedRep
                                             GHC.Internal.Prim.Int#) -{2}->
             GHC.Internal.Types.Int
 $wapply2p :: (#,#) GHC.Internal.Types.LiftedRep
-                   GHC.Internal.Types.LiftedRep
+                   ('GHC.Internal.Types.TupleRep (': GHC.Internal.Types.RuntimeRep
+                                                     'GHC.Internal.Types.IntRep
+                                                     ('[] GHC.Internal.Types.RuntimeRep)))
                    ((#,#) GHC.Internal.Types.LiftedRep
                           ('GHC.Internal.Types.TupleRep (': GHC.Internal.Types.RuntimeRep
                                                             'GHC.Internal.Types.IntRep
@@ -24,7 +26,8 @@ $wapply2p :: (#,#) GHC.Internal.Types.LiftedRep
                           (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
                                                     GHC.Internal.Prim.Int#) -{2}->
                     GHC.Internal.Types.Int)
-                   GHC.Internal.Types.Int -{3}->
+                   (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
+                                             GHC.Internal.Prim.Int#) -{3}->
              GHC.Internal.Prim.Int#
 $wk2 :: GHC.Internal.Prim.Int# -{4}-> GHC.Internal.Prim.Int#
 Main.k2 :: GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
@@ -49,13 +52,16 @@ Main.sumP :: (#,#) GHC.Internal.Types.LiftedRep
                    GHC.Internal.Types.Int -{9}->
              GHC.Internal.Types.Int
 $wusePair :: (#,#) GHC.Internal.Types.LiftedRep
-                   GHC.Internal.Types.LiftedRep
+                   ('GHC.Internal.Types.TupleRep (': GHC.Internal.Types.RuntimeRep
+                                                     'GHC.Internal.Types.IntRep
+                                                     ('[] GHC.Internal.Types.RuntimeRep)))
                    ((#,#) GHC.Internal.Types.LiftedRep
                           GHC.Internal.Types.LiftedRep
                           GHC.Internal.Types.Int
                           GHC.Internal.Types.Int -{9}->
                     GHC.Internal.Types.Int)
-                   GHC.Internal.Types.Int -{10}->
+                   (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
+                                             GHC.Internal.Prim.Int#) -{10}->
              GHC.Internal.Prim.Int#
 lvl :: GHC.Internal.Base.String -{E}-> GHC.Internal.Base.String
 lvl :: GHC.Internal.Base.String -{E}-> GHC.Internal.Base.String
