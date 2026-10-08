@@ -204,7 +204,7 @@ for n in range(1, 9):
 # place and split in another.  The *_dump tests show what was split; the
 # runs check the result with Core Lint (and Data Lint checks the copies).
 ds_opts = early_opts + ' -fcore-webs-data-split'
-for n in range(1, 4):
+for n in range(1, 5):
     test('datasplit%03d' % n, [], compile_and_run, [ds_opts])
     test('datasplit%03d_dump' % n, [extra_files(['datasplit%03d.hs' % n])],
          multimod_compile, ['datasplit%03d' % n, ds_opts + ' -ddump-webs-data -dsuppress-uniques'])

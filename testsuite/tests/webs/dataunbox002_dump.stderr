@@ -2,7 +2,7 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 36, classes: 7, exposed: 5, split: 2, pinned binders: 7
+copies: 36, classes: 7, exposed: 5, split: 2, exposed only by casts: 0, pinned binders: 7
 Main.Shape_s6 = Main.Shape with Main.Square_s6, Main.Tri_s6 (built [2,
                                                                     3], matched [1, 2,
                                                                                  3], dropped [1])

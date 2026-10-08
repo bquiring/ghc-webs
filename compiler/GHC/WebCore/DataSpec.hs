@@ -23,7 +23,8 @@ import GHC.Types.Name.Env ( emptyNameEnv )
 import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.SrcLoc ( noSrcSpan )
 import GHC.Types.Unique.FM
-import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
+import GHC.Types.Unique.Set
+import GHC.Core.Coercion ( coercionLKind, coercionRKind, coercionRole, mkSelCo, liftCoSubstWith, downgradeRole, tyConRoleListX )
 import GHC.Types.Unique.Supply
 import GHC.Types.Var ( mkTyVar )
 
@@ -54,8 +55,12 @@ So, for each split type T with parameters as:
   3. Make T' bs, whose constructors have T's fields at as := P(bs).  A
      recursive field T us must come out as T P(bs) (as it does for a regular
      type); otherwise T stays.
-  4. Rewrite: T P(ss) is T' ss in every type, and a constructor occurrence
-     K @P(ss) is K' @ss.
+  4. Rewrite: T P(ss) is T' ss in every type and coercion, and a constructor
+     occurrence K @P(ss) is K' @ss.
+
+Coercions mention split types too (Note [Copies in coercions] in
+GHC.WebCore.DataSplit): their kinds count as uses in step 1, and step 4
+rewrites them (rw_co).
 
 T is local and not exposed, so it has no other uses.
 -}
@@ -100,10 +105,14 @@ specialiseSplit this_mod us tcs binds
       Case e b t alts
         -> go e $ go_bndr b $ go_ty t $
            foldr (\(Alt _ bs rhs) a -> foldr go_bndr (go rhs a) bs) acc alts
-      Cast e _    -> go e acc
+      Cast e co   -> go e (go_co co acc)
       Tick _ e    -> go e acc
       Type t      -> go_ty t acc
+      Coercion co -> go_co co acc
       _           -> acc
+
+    -- A coercion's kinds are uses too (Note [Specialising split types])
+    go_co co acc = go_ty (coercionLKind co) (go_ty (coercionRKind co) acc)
 
     go_bndr b acc | isId b    = go_ty (idType b) acc
                   | otherwise = acc
@@ -249,16 +258,75 @@ specialiseSplit this_mod us tcs binds
       Var v       -> Var (rw_id v)
       Lit {}      -> expr
       Type t      -> Type (ty t)
-      Coercion {} -> expr
+      Coercion co -> Coercion (rw_co co)
       App f a     -> App (rw f) (rw a)
       Lam b e     -> Lam (rw_id b) (rw e)
       Let bind e  -> Let (rw_bind bind) (rw e)
       Case e b t alts
         -> Case (rw e) (rw_id b) (ty t)
                 [ Alt (rw_con con) (map rw_id bs) (rw rhs) | Alt con bs rhs <- alts ]
-      Cast e co   -> Cast (rw e) co
+      Cast e co   -> Cast (rw e) (rw_co co)
       Tick t e    -> Tick t (rw e)
       _           -> expr
+
+    -- Coercions: T P(ss) is T' ss on both sides.  A TyConAppCo of T gives each
+    -- pattern variable the coercion at its first position in the pattern,
+    -- selected out of the argument coercion (mkSelCo simplifies the Refl and
+    -- TyConAppCo cases); a SelCo out of T lifts the pattern over the
+    -- variables' coercions (as in GHC.WebCore.Transform.SpecIndex).
+    rw_co :: Coercion -> Coercion
+    rw_co co = case co of
+      Refl t        -> Refl (ty t)
+      GRefl r t m   -> GRefl r (ty t) m
+      TyConAppCo r tc cos
+        | Just (tc', tvs, pat, _) <- lookupUFM specs tc
+        -> let cos' = map rw_co cos
+           in TyConAppCo r tc' [ var_co r tc pat cos' tv | tv <- tvs ]
+        | otherwise -> TyConAppCo r tc (map rw_co cos)
+      SelCo (SelTyCon i r) c
+        | Just (tc, _) <- splitTyConApp_maybe (coercionLKind c)
+        , Just (tc', tvs, pat, _) <- lookupUFM specs tc
+        , Just p_i <- index i pat
+        -> let c' = rw_co c
+               roles = tyConRoleListX (coercionRole c') tc'
+               tv_cos = [ mkSelCo (SelTyCon j rj) c' | (j, rj) <- zip [0 ..] roles, j < length tvs ]
+           in downgrade r (liftCoSubstWith (coercionRole c') tvs tv_cos p_i)
+      AppCo c1 c2   -> AppCo (rw_co c1) (rw_co c2)
+      ForAllCo { fco_body = b } -> co { fco_body = rw_co b }
+      FunCo { fco_arg = a, fco_res = r } -> co { fco_arg = rw_co a, fco_res = rw_co r }
+      AxiomCo ax cos -> AxiomCo ax (map rw_co cos)
+      UnivCo { uco_lty = l, uco_rty = r, uco_deps = ds }
+                    -> co { uco_lty = ty l, uco_rty = ty r, uco_deps = map rw_co ds }
+      SymCo c       -> SymCo (rw_co c)
+      TransCo c1 c2 -> TransCo (rw_co c1) (rw_co c2)
+      SelCo cs c    -> SelCo cs (rw_co c)
+      LRCo lr c     -> LRCo lr (rw_co c)
+      InstCo c a    -> InstCo (rw_co c) (rw_co a)
+      SubCo c       -> SubCo (rw_co c)
+      _             -> co
+
+    -- The coercion for pattern variable tv: at its first position in the
+    -- pattern, selected out of that argument's coercion
+    var_co r tc pat cos' tv
+      = case [ sel_path (tyConRoleListX r tc !! i) (cos' !! i) path
+             | (i, p) <- zip [0 ..] pat, Just path <- [path_to tv p] ] of
+          (c : _) -> c
+          []      -> pprPanic "specialiseSplit: pattern variable not in pattern" (ppr tv)
+    -- The path to a variable in a pattern type: argument positions
+    path_to tv p = case p of
+      TyVarTy v | v == tv -> Just []
+      TyConApp ptc ts ->
+        case [ (j, rest) | (j, t) <- zip [0 ..] ts, Just rest <- [path_to tv t] ] of
+          ((j, rest) : _) -> Just ((ptc, j) : rest)
+          []              -> Nothing
+      _ -> Nothing
+    sel_path _ c [] = c
+    sel_path r c ((ptc, j) : rest)
+      = let rj = tyConRoleListX r ptc !! j
+        in sel_path rj (mkSelCo (SelTyCon j rj) c) rest
+    downgrade r c | coercionRole c == r = c
+                  | otherwise           = downgradeRole r (coercionRole c) c
+    index i xs = case drop i xs of { (x : _) -> Just x; [] -> Nothing }
 
     rw_con (DataAlt dc)
       | Just (_, _, _, cons) <- lookupUFM specs (dataConTyCon dc)

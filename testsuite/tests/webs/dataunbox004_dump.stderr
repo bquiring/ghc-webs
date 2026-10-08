@@ -2,7 +2,7 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 32, classes: 6, exposed: 4, split: 2, pinned binders: 3
+copies: 32, classes: 6, exposed: 4, split: 2, exposed only by casts: 0, pinned binders: 3
 Main.List_s5 = [] with Main.Con1_s5, Main.Con2_s5 (built [1,
                                                           2], matched [1, 2])
 Main.Tuple2_s6 = (,) with Main.Con1_s6 (built [1], matched [1])

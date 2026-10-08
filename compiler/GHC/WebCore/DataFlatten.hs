@@ -40,7 +40,7 @@ import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( panic )
 
-import GHC.WebCore.DataSplit ( mapTyCons )
+import GHC.WebCore.DataSplit ( mapTyCons, mapTyConsCo )
 import GHC.WebCore.Transform.ArityRaise ( productCon, replaceCases )
 
 import Control.Monad ( forM, foldM )
@@ -385,6 +385,8 @@ flattenFields eager this_mod us tcs binds
 
     ty :: Type -> Type
     ty = runIdentity . mapTyCons (`elemUFM` news) (return . new_tc)
+    -- The rebuilt types have the same parameters: coercions just rename them
+    co_rw = runIdentity . mapTyConsCo (`elemUFM` news) (return . new_tc)
 
     ---------------------------------------------------------------
     rw_bind (NonRec b e) = NonRec (rw_id b) <$> rw e
@@ -400,7 +402,7 @@ flattenFields eager this_mod us tcs binds
         | otherwise -> return (Var (rw_id v))
       Lit {}       -> return expr
       Type t       -> return (Type (ty t))
-      Coercion {}  -> return expr
+      Coercion co  -> return (Coercion (co_rw co))
       App {}
         | (Var v, args) <- collectArgs expr
         , Just dc <- isDataConWorkId_maybe v
@@ -418,7 +420,7 @@ flattenFields eager this_mod us tcs binds
               ; let b' = rw_id b
               ; alts' <- forM alts (rw_alt (idType b'))
               ; return (Case e' b' (ty t) alts') }
-      Cast e co    -> (`Cast` co) <$> rw e
+      Cast e co    -> (`Cast` co_rw co) <$> rw e
       Tick t e     -> Tick t <$> rw e
       _            -> return expr
 

@@ -6,6 +6,7 @@ module GHC.WebCore.DataSplit
   ( DataSplitResult(..)
   , splitDataTypes
   , mapTyCons
+  , mapTyConsCo
   ) where
 
 import GHC.Prelude
@@ -18,6 +19,8 @@ import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
+import GHC.Core.Coercion ( coercionLKind, isCoVar )
+import GHC.Core.Utils ( exprType )
 
 import GHC.Data.Bag
 
@@ -91,8 +94,9 @@ Data types carry no webs.  Instead we use copies:
 
 Not touched (their occurrences keep T, so whatever reaches them is exposed):
 binders that are exported, have stable unfoldings or rules, or are mentioned
-by those or by the module's rules ('pinned'); coercions; type and data
-family applications; kinds.
+by those or by the module's rules ('pinned'); coercion variables; type and
+data family applications; kinds.  Coercions get copies like types (Note
+[Copies in coercions]).
 
 Eligible types: algebraic data types with at least one constructor and some
 field, not newtypes, classes, unboxed tuples or sums, family instances,
@@ -198,7 +202,8 @@ data Mapper m = Mapper
   { m_ty   :: Type -> m Type
   , m_bndr :: Id -> m Id
   , m_con  :: DataCon -> m Id
-  , m_alt  :: Id -> DataCon -> m (Maybe DataCon) }
+  , m_alt  :: Id -> DataCon -> m (Maybe DataCon)
+  , m_co   :: Coercion -> m Coercion }
 
 mapProgram :: forall m. Monad m => Mapper m -> CoreProgram -> m CoreProgram
 mapProgram mp binds
@@ -229,7 +234,7 @@ mapProgram mp binds
         | otherwise                          -> return (Var (lk env v))
       Lit {}      -> return expr
       Type t      -> Type <$> m_ty mp t
-      Coercion {} -> return expr
+      Coercion co -> Coercion <$> m_co mp co
       App f a     -> App <$> go env f <*> go env a
       Lam b e     -> do { (env', b') <- bndr env b; Lam b' <$> go env' e }
       Let (NonRec b rhs) body
@@ -252,7 +257,7 @@ mapProgram mp binds
                          Just con' -> do { (env'', bs') <- bndrs env' bs
                                          ; Just . Alt con' bs' <$> go env'' rhs } }
               ; return (Case scrut' b' ty' (catMaybes alts')) }
-      Cast e co   -> (\e' -> Cast e' co) <$> go env e
+      Cast e co   -> Cast <$> go env e <*> m_co mp co
       Tick t e    -> Tick (tick env t) <$> go env e
       WebLam {}   -> panic "DataSplit: web form"
       WebApp {}   -> panic "DataSplit: web form"
@@ -276,6 +281,48 @@ mapTyCons want f = go
       CastTy t co  -> (\t' -> CastTy t' co) <$> go t
       _            -> return ty
     mentions t = any want (nonDetEltsUniqSet (tyConsOfType t))
+
+-- | Map the type constructors of the types inside a coercion, as 'mapTyCons'
+-- (Note [Copies in coercions]).  Kinds and kind coercions are left alone,
+-- as are coercion variables.
+mapTyConsCo :: Monad m => (TyCon -> Bool) -> (TyCon -> m TyCon) -> Coercion -> m Coercion
+mapTyConsCo want f = go
+  where
+    ty = mapTyCons want f
+    go co = case co of
+      Refl t               -> Refl <$> ty t
+      GRefl r t mco        -> (\t' -> GRefl r t' mco) <$> ty t
+      TyConAppCo r tc cos
+        | isFamilyTyCon tc -> return co
+        | want tc          -> TyConAppCo r <$> f tc <*> mapM go cos
+        | otherwise        -> TyConAppCo r tc <$> mapM go cos
+      AppCo c1 c2          -> AppCo <$> go c1 <*> go c2
+      ForAllCo { fco_body = b } -> (\b' -> co { fco_body = b' }) <$> go b
+      FunCo { fco_arg = a, fco_res = r }
+                           -> (\a' r' -> co { fco_arg = a', fco_res = r' }) <$> go a <*> go r
+      AxiomCo ax cos       -> AxiomCo ax <$> mapM go cos
+      UnivCo { uco_lty = l, uco_rty = r, uco_deps = ds }
+                           -> (\l' r' ds' -> co { uco_lty = l', uco_rty = r', uco_deps = ds' })
+                              <$> ty l <*> ty r <*> mapM go ds
+      SymCo c              -> SymCo <$> go c
+      TransCo c1 c2        -> TransCo <$> go c1 <*> go c2
+      SelCo cs c           -> SelCo cs <$> go c
+      LRCo lr c            -> LRCo lr <$> go c
+      InstCo c a           -> InstCo <$> go c <*> go a
+      SubCo c              -> SubCo <$> go c
+      _                    -> return co   -- CoVarCo, KindCo, HoleCo
+
+{- Note [Copies in coercions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+As web inference does for arrows (FunCo's web), annotation puts copies into
+the types inside coercions: Refl, GRefl, TyConAppCo, UnivCo, and the
+argument coercions of an axiom (whose own types stay original, like an
+exposed signature).  Data Lint compares coercion kinds up to copies where
+Core Lint compares them with ensureEqTys (casts, TransCo), so a value can
+pass through a cast -- e.g. into a local newtype -- without exposing its
+class.  Coercion variables keep their types (what flows through them is
+exposed), and so do kinds.  The rewrite maps copies in coercions too.
+-}
 
 ------------------------------------------------------------------
 --      Annotation
@@ -303,7 +350,7 @@ newCopy tc = do
 annMapper :: VarSet -> Mapper AnnM
 annMapper pinned = Mapper
   { m_ty   = ann_ty
-  , m_bndr = \b -> if b `elemVarSet` pinned then return (zap b)
+  , m_bndr = \b -> if b `elemVarSet` pinned || isCoVar b then return (zap b)
                    else do { t <- ann_ty (idType b); return (zap (setIdType b t)) }
   , m_con  = \dc -> if eligible (dataConTyCon dc)
                     then do { c <- newCopy (dataConTyCon dc)
@@ -314,7 +361,8 @@ annMapper pinned = Mapper
       Just (c, _) | c /= dataConTyCon dc, eligible (dataConTyCon dc)
         -> do { modify (\s -> s { as_matched = (c, dataConTag dc) : as_matched s })
               ; return (Just (con c dc)) }
-      _ -> return (Just dc) }
+      _ -> return (Just dc)
+  , m_co   = mapTyConsCo eligible newCopy }    -- Note [Copies in coercions]
   where
     ann_ty = mapTyCons eligible newCopy
     con c dc = fromMaybe (pprPanic "DataSplit: constructor" (ppr dc)) (conWithTag c (dataConTag dc))
@@ -432,6 +480,16 @@ splitDataTypes unbox cfg this_mod us rules binds
     pairs    = bagToList (dlr_pairs lint_res)
     is_copy c = c `elemUFM` copies
 
+    -- How much casts cost: classes exposed only through a cast (pairs from
+    -- casts removed, the class would not meet the original).  Approximate:
+    -- a pair that also comes from elsewhere is removed too.
+    cast_pairs = [ (getUnique a, getUnique b) | (a, b) <- bagToList (castCopyPairs copies ann_binds) ]
+    pairs_nc = listToBag [ p | p@(a, b) <- pairs, (getUnique a, getUnique b) `notElem` cast_pairs ]
+    rep_nc_of = components (as_all st) pairs_nc
+    rep_nc c = lookupWithDefaultUFM rep_nc_of c c
+    nc_exposed = mkUniqSet [ rep_nc o | (a, b) <- pairs, o <- [a, b], not (is_copy o) ]
+    exposed_by_cast ms = not (any (\m -> rep_nc m `elementOfUniqSet` nc_exposed) ms)
+
     -- Classes: representative -> members
     rep_of = components (as_all st) (dlr_pairs lint_res)
     rep c  = lookupWithDefaultUFM rep_of c c
@@ -497,7 +555,8 @@ splitDataTypes unbox cfg this_mod us rules binds
                         else return (dataConWorkId dc)
       , m_alt  = \_ dc -> let tc = dataConTyCon dc in
                           if is_copy tc then return (final_con tc (dataConTag dc))
-                          else return (Just dc) }
+                          else return (Just dc)
+      , m_co   = mapTyConsCo is_copy (return . final) }
     rw_ty = mapTyCons is_copy (return . final)
 
     dump = vcat
@@ -506,6 +565,8 @@ splitDataTypes unbox cfg this_mod us rules binds
         <+> text "classes:" <+> int (length fates) <> comma
         <+> text "exposed:" <+> int (length [ () | (_, _, Exposed, _, _) <- fates ]) <> comma
         <+> text "split:" <+> int (length new_tcs) <> comma
+        <+> text "exposed only by casts:"
+        <+> int (length [ () | (ms, _, Exposed, _, _) <- fates, exposed_by_cast ms ]) <> comma
         <+> text "pinned binders:" <+> int (sizeVarSet pinned)
       , vcat [ ppr tc <+> text "=" <+> ppr orig
                <+> text "with" <+> hsep (punctuate comma (map ppr (tyConDataCons tc)))
@@ -515,3 +576,18 @@ splitDataTypes unbox cfg this_mod us rules binds
                                                                     , dataConTag dc `notElem` bs ]
                                else empty))
              | (_, orig, Split tc _, bs, ms) <- fates ] ]
+
+-- | The pairs of copies that casts force together: a cast's coercion has the
+-- original types, so its kind against the expression's type
+castCopyPairs :: Copies -> CoreProgram -> Bag (TyCon, TyCon)
+castCopyPairs copies binds = unionManyBags (map bind binds)
+  where
+    bind b = unionManyBags [ expr e | (_, e) <- flattenBinds [b] ]
+    expr e = case e of
+      Cast x co   -> copyPairs copies (coercionLKind co) (exprType x) `unionBags` expr x
+      App f a     -> expr f `unionBags` expr a
+      Lam _ b     -> expr b
+      Let b x     -> bind b `unionBags` expr x
+      Case s _ _ as -> unionManyBags (expr s : [ expr r | Alt _ _ r <- as ])
+      Tick _ x    -> expr x
+      _           -> emptyBag
