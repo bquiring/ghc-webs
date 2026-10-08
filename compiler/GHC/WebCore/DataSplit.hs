@@ -610,12 +610,14 @@ splitDataTypes unbox cfg this_mod us rules binds
 
     -- Classes: representative -> members
     -- with congruence for newtype copies' children (Note [Splitting newtypes])
-    rep_of = congruence (as_all st) (dlr_pairs lint_res)
+    -- (all_pairs: Data Lint's and congruence's; the members of a class come
+    -- from them, so that an original only congruence brings in counts)
+    (rep_of, all_pairs) = congruence (as_all st) (dlr_pairs lint_res)
     children c = lookupUFM (as_children st) c
     congruence nodes prs = go_cong (0 :: Int) prs
       where
         go_cong n ps
-          | null new || n > 20 = r
+          | null new || n > 20 = (r, bagToList ps)
           | otherwise          = go_cong (n + 1) (ps `unionBags` listToBag new)
           where
             r = components nodes ps
@@ -633,7 +635,7 @@ splitDataTypes unbox cfg this_mod us rules binds
     rep c  = lookupWithDefaultUFM rep_of c c
     members :: UniqFM TyCon [TyCon]
     members = foldl (\m c -> addToUFM_C (++) m (rep c) [c]) emptyUFM
-                    (nubTc (as_all st ++ concat [ [a, b] | (a, b) <- pairs ]))
+                    (nubTc (as_all st ++ concat [ [a, b] | (a, b) <- all_pairs ]))
     nubTc = nonDetEltsUniqSet . mkUniqSet
 
     built   = foldl (\m (c, t) -> addToUFM_C (++) m (rep c) [t]) emptyUFM (as_built st)
@@ -722,6 +724,9 @@ splitDataTypes unbox cfg this_mod us rules binds
       , m_co   = mapTyConsCo is_copy (return . final) }
     rw_ty = mapTyCons is_copy (return . final)
 
+    pp_fate_short Exposed     = text "exposed"
+    pp_fate_short Bottom      = text "bottom"
+    pp_fate_short (Split t _) = text "split as" <+> ppr t
     dump = vcat
       [ text "Data Lint:" <+> (if ok then text "ok" else text "errors (not split)")
       , text "copies:" <+> int (sizeUFM copies) <> comma
@@ -739,6 +744,10 @@ splitDataTypes unbox cfg this_mod us rules binds
                                                                     , dataConTag dc `notElem` bs ]
                                else empty))
              | (_, orig, Split tc _, bs, ms) <- fates, not (isNewTyCon orig) ]
+      , whenPprDebug $ vcat
+          [ ppr orig <> colon <+> pp_fate_short f <+> int (length ms) <+> text "members;"
+            <+> text "children:" <+> ppr [ (m, ch) | m <- ms, Just ch <- [children m] ]
+          | (ms, orig, f, _, _) <- fates, isNewTyCon orig ]
       , vcat [ ppr tc <+> text "= newtype" <+> ppr orig <+> text "~R#"
                <+> ppr (snd (newTyConRhs tc))
              | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ] ]
