@@ -383,7 +383,7 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: Bool -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
+splitDataTypes :: Maybe Bool -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
                -> DataSplitResult
 splitDataTypes unbox cfg this_mod us rules binds
   = DataSplitResult
@@ -400,24 +400,25 @@ splitDataTypes unbox cfg this_mod us rules binds
     -- GHC.WebCore.DataFlatten)
     (final_binds, final_tcs, flat_dump)
       | not changed = (binds, [], empty)
-      | unbox       = let (us4, us5) = splitUniqSupply us3
+      | Just eager <- unbox
+                    = let (us4, us5) = splitUniqSupply us3
                           (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 new_tcs split_binds
-                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds (3 :: Int) us5 sp_tcs sp_binds
+                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds eager (3 :: Int) us5 sp_tcs sp_binds
                       in (fl_binds, fl_tcs, sp_dump $$ fl_dump)
       | otherwise   = (split_binds, new_tcs, empty)
 
     -- Each round unpacks one more level (Note [Flattening fields])
-    flatten_rounds 0 _ tcs bs = (bs, tcs, empty)
+    flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty)
     -- Between rounds, the simple optimiser inlines the aliases a round leaves
     -- (let x = y) and takes apart the cases on constructors it builds, so
     -- that the next round sees the fields' real uses
-    flatten_rounds n u tcs bs
+    flatten_rounds eager n u tcs bs
       = let (u1, u2) = splitUniqSupply u
-            (bs', tcs', d) = flattenFields this_mod u1 tcs bs
+            (bs', tcs', d) = flattenFields eager this_mod u1 tcs bs
             changed_round = map getUnique tcs' /= map getUnique tcs
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
-            (bs'', tcs'', d') | changed_round = flatten_rounds (n - 1) u2 tcs' bs_opt
+            (bs'', tcs'', d') | changed_round = flatten_rounds eager (n - 1) u2 tcs' bs_opt
                               | otherwise     = (bs', tcs', empty)
         in (bs'', tcs'', d $$ d')
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)

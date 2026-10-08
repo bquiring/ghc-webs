@@ -7,4 +7,4 @@ import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable ( SDoc )
 
-flattenFields :: Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc)
+flattenFields :: Bool -> Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc)

@@ -231,3 +231,8 @@ for n in [2, 3]:
 test('dataunbox004', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox004_dump', [extra_files(['dataunbox004.hs'])],
      multimod_compile, ['dataunbox004', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+# dataunbox005: a pair passed whole to a function that unboxes it
+# (Note [Unboxable fields])
+test('dataunbox005', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunbox005_dump', [extra_files(['dataunbox005.hs'])],
+     multimod_compile, ['dataunbox005', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])

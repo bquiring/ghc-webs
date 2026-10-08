@@ -23,6 +23,7 @@ import GHC.Types.Name.Env ( emptyNameEnv )
 import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.SrcLoc ( noSrcSpan )
 import GHC.Types.Unique.FM
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.Unique.Supply
 import GHC.Types.Var ( mkTyVar )
 
@@ -119,12 +120,33 @@ specialiseSplit this_mod us tcs binds
 
     -- 2. Patterns
     patterns :: [(TyCon, ([TyVar], [Type]))]
-    patterns = [ (tc, p)
-               | (tc, u) <- zip tcs (listSplitUniqSupply us1)
-               , Just (idxs, True) <- [lookupUFM uses tc]
-               , Just p@(tvs, pat) <- [antiUnify u idxs]
-               , not (length tvs == length pat && all isTyVarTy pat)
-               , recursive_ok tc p ]
+    spec_patterns = [ (tc, p)
+                    | (tc, u) <- zip tcs (listSplitUniqSupply us1)
+                    , rewritable tc
+                    , Just (idxs, _) <- [lookupUFM uses tc]
+                    , Just p@(tvs, pat) <- [antiUnify u idxs]
+                    , not (length tvs == length pat && all isTyVarTy pat)
+                    , recursive_ok tc p ]
+    rewritable tc = case lookupUFM uses tc of
+      Just (_, ok) -> ok
+      Nothing      -> True     -- no uses at all
+
+    -- A type whose fields mention a specialised type is rebuilt too, at its
+    -- own parameters, or its constructors would still mention the old type.
+    -- A type that cannot be rewritten blocks every specialisation it reaches.
+    mentions tc = [ tc' | dc <- tyConDataCons tc, Scaled _ t <- dataConOrigArgTys dc
+                        , tc' <- nonDetEltsUniqSet (tyConsOfType t), is_cand tc', tc' /= tc ]
+    reach tc = go_r [] (mentions tc)
+      where go_r seen [] = seen
+            go_r seen (t : ts) | t `elem` seen = go_r seen ts
+                               | otherwise     = go_r (t : seen) (mentions t ++ ts)
+    blocked = concat [ reach tc | tc <- tcs, not (rewritable tc) ]
+    seeds   = [ tc | (tc, _) <- spec_patterns, tc `notElem` blocked ]
+    patterns = [ (tc, p) | (tc, p) <- spec_patterns, tc `elem` seeds ] ++
+               [ (tc, (tvs, mkTyVarTys tvs))
+               | tc <- tcs, tc `notElem` seeds, rewritable tc
+               , any (`elem` seeds) (reach tc)
+               , let tvs = tyConTyVars tc ]
 
     -- 3. A recursive field must be T P(bs) after the substitution
     recursive_ok tc (_, pat) = and
@@ -161,7 +183,7 @@ specialiseSplit this_mod us tcs binds
                            (VanillaAlgTyCon (mkPrelTyConRepName tc_name)) False
         self ty = case ty of
           TyConApp tc' tys
-            | tc' == tc -> TyConApp tycon (mkTyVarTys tvs)   -- recursive_ok: tys = pat'
+            | tc' == tc -> TyConApp tycon (map self (inst tvs pat' tys))
             | otherwise -> TyConApp tc' (map self tys)
           FunTy { ft_arg = a, ft_res = r } -> ty { ft_arg = self a, ft_res = self r }
           AppTy t1 t2  -> AppTy (self t1) (self t2)

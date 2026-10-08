@@ -2557,6 +2557,7 @@ fFlagsDeps = [
   flagSpec "core-webs-defunc-lifted"          Opt_CoreWebsDefuncLifted,
   flagSpec "core-webs-data-split"             Opt_CoreWebsDataSplit,
   flagSpec "core-webs-data-unbox"             Opt_CoreWebsDataUnbox,
+  flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,
   flagSpec "liberate-case"                    Opt_LiberateCase,

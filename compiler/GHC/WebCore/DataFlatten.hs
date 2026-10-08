@@ -31,17 +31,54 @@ import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
+import GHC.Types.Basic ( Boxity(..) )
+import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd )
+import GHC.Types.Tickish ( GenTickish(..) )
+import GHC.Core.FVs ( exprFreeVarsList )
 
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( panic )
 
 import GHC.WebCore.DataSplit ( mapTyCons )
-import GHC.WebCore.Transform.ArityRaise ( productCon, onlyScrutinised, replaceCases )
+import GHC.WebCore.Transform.ArityRaise ( productCon, replaceCases )
 
 import Control.Monad ( forM, foldM )
 import Data.Functor.Identity ( runIdentity )
 import Data.Maybe ( isNothing, fromMaybe )
+
+{- Note [Unboxable fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Which fields can be unboxed is a greatest fixpoint over the candidate
+fields (K, i).  A field stays unboxable while
+
+  * every construction of K is saturated and passes in field i a value, or
+    the pattern variable of an unboxable field (K', j) (which is rebuilt as
+    a constructor application, a value); and
+  * every use of field i's pattern variable in a match on K is
+      - the scrutinee of a case (a projection),
+      - an argument to a call whose callee's demand signature says it is
+        strict in it and uses it unboxed (worker/wrapper will take the
+        rebuilt box apart again, and the simplifier removes it), or
+      - an argument to an unboxable field (K'', j) of a saturated
+        construction.
+
+Start from every candidate field and remove the ones that fail, until
+nothing changes.  A removed field stays a pointer to a boxed value.
+-}
+
+{- Note [Eager unboxing]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-data-unbox-eager, a construction may also pass an
+unevaluated expression in an unboxable field, if every match on the
+constructor is strict in the field (its pattern variable's demand, from
+demand analysis).  The construction then evaluates it (case e of P ys -> K
+.. ys ..), earlier than the program did.  This is not semantics-preserving
+in general: a value built but never matched has its field evaluated anyway,
+which may fail or diverge where the program did not (e.g. take 0 of a list
+whose element is bottom).  Space is bounded (at worst the box, built
+earlier), so the flag is an experiment, off by default.
+-}
 
 {- Note [Flattening fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -54,8 +91,9 @@ is a product P (one constructor P, no existentials, no wrapper: Int, a pair,
     a constructor application, or a variable bound to one) in the field, or an
     expression that is cheap and cannot fail (exprOkForSpeculation), which can
     be evaluated early without changing the program's meaning; and
-  * every case alternative on K uses the field only as the scrutinee of
-    cases (onlyScrutinised): nothing needs the boxed value.
+  * no match on K needs the boxed value: see Note [Unboxable fields] (a
+    greatest fixpoint: projections, arguments that callees unbox, and
+    arguments to other unboxable fields).
 
 Then
     K .. e ..                      ==>  case e of P ys -> K' .. ys ..
@@ -71,15 +109,26 @@ S is local and not exposed, so no other code builds or matches it.  Fields
 whose type mentions S itself (recursive fields) are not flattened.
 -}
 
+-- | What a construction passes in a candidate field
+data ArgFact = AValue              -- ^ a value (Note [Flattening fields])
+         | APat DataCon Int    -- ^ the pattern variable of another candidate field
+         | AOther
+
+-- | A use of a field's pattern variable in a match
+data Use = UScrut              -- ^ the scrutinee of a case
+         | UStrictArg          -- ^ an argument a callee is strict in and unboxes
+         | UConArg DataCon Int -- ^ an argument to another candidate field
+         | UBoxed
+
 -- | What happens to a field
 data Field = Keep | Flatten DataCon [Type]   -- ^ P's constructor and type arguments
 
 -- | Per split type: its constructors' field plans (by tag), if any is flattened
 type Plans = UniqFM TyCon [(DataCon, [Field])]
 
-flattenFields :: Module -> UniqSupply -> [TyCon] -> CoreProgram
+flattenFields :: Bool -> Module -> UniqSupply -> [TyCon] -> CoreProgram
               -> (CoreProgram, [TyCon], SDoc)
-flattenFields this_mod us tcs binds
+flattenFields eager this_mod us tcs binds
   | isNullUFM plans = (binds, tcs, dump)
   | otherwise       = (initUs_ us2 (mapM rw_bind binds), map new_tc tcs, dump)
   where
@@ -98,59 +147,180 @@ flattenFields this_mod us tcs binds
         -> True
       _ -> False
 
-    -- Bad (constructor, field) pairs, with why
-    bad :: UniqFM DataCon [(Int, String)]
-    bad = foldr (go_bind emptyVarSet) emptyUFM binds
+    -- Facts (Note [Unboxable fields]): what each construction passes in each
+    -- field, and how each match uses each field
+    cons_facts  :: [(DataCon, Maybe [ArgFact])]      -- Nothing: unsaturated
+    match_facts :: [(DataCon, Int, [Use], Bool)]    -- Bool: the match is strict in it
+    (cons_facts, match_facts) = foldr (go_bind emptyVarSet emptyVarEnv) ([], []) binds
 
     is_cand_con dc = dataConTyCon dc `elementOfUniqSet` cands
     all_fields dc = [0 .. dataConRepArity dc - 1]
-    mark why dc is m = addToUFM_C (++) m dc [ (i, why) | i <- is ]
 
-    go_bind ev bind acc = foldr (\(_, e) -> go ev e) acc (flattenBinds [bind])
+    go_bind ev pv bind acc = foldr (\(_, e) -> go ev pv e) acc (flattenBinds [bind])
 
-    -- ev: variables known to be evaluated (case binders)
-    go :: VarSet -> CoreExpr -> UniqFM DataCon [(Int, String)] -> UniqFM DataCon [(Int, String)]
-    go ev expr acc = case expr of
+    -- ev: variables known to be evaluated (case binders);
+    -- pv: pattern variables of candidate constructors' fields
+    go ev pv expr acc@(cf, mf) = case expr of
       App {}
         | (Var v, args) <- collectArgs expr
         , Just dc <- isDataConWorkId_maybe v, is_cand_con dc
         -> let vals = [ a | a <- args, not (isTypeArg a) ]
-               acc' = foldr (go ev) acc args
-           in if length vals == dataConRepArity dc
-              then mark "a construction passes a non-value" dc
-                        [ i | (i, a) <- zip [0 ..] vals, not (value ev a) ] acc'
-              else mark "unsaturated constructor" dc (all_fields dc) acc'
+               acc' = foldr (go ev pv) acc args
+               fact | length vals == dataConRepArity dc = Just (map (arg_fact ev pv) vals)
+                    | otherwise                          = Nothing
+           in (\(c, m) -> ((dc, fact) : c, m)) acc'
       Var v
         | Just dc <- isDataConWorkId_maybe v, is_cand_con dc
         , dataConRepArity dc > 0
-        -> mark "unsaturated constructor" dc (all_fields dc) acc
-      App f a     -> go ev f (go ev a acc)
-      Lam _ e     -> go ev e acc
-      Let bind e  -> go_bind ev bind (go ev e acc)
+        -> ((dc, Nothing) : cf, mf)
+      App f a     -> go ev pv f (go ev pv a acc)
+      Lam _ e     -> go ev pv e acc
+      Let bind e  -> go_bind ev pv bind (go ev pv e acc)
       Case e b _ alts
         -> let ev' = extendVarSet ev b
-           in go ev e $ foldr (\(Alt con bs rhs) a -> go ev' rhs (alt con bs rhs a)) acc alts
-      Cast e _    -> go ev e acc
-      Tick _ e    -> go ev e acc
+           in go ev pv e $
+              foldr (\(Alt con bs rhs) a -> alt ev' pv con bs rhs a) acc alts
+      Cast e _    -> go ev pv e acc
+      Tick _ e    -> go ev pv e acc
       _           -> acc
 
-    alt (DataAlt dc) bs rhs acc
+    alt ev pv (DataAlt dc) bs rhs acc
       | is_cand_con dc
-      = mark "a match uses it boxed" dc
-             [ i | (i, b) <- zip [0 ..] (filter isId bs), not (onlyScrutinised b rhs) ] acc
-    alt _ _ _ acc = acc
+      = let fbs = filter isId bs
+            pv' = extendVarEnvList pv [ (b, (dc, i)) | (i, b) <- zip [0 ..] fbs ]
+            (cf, mf) = go ev pv' rhs acc
+        in (cf, [ (dc, i, usesOf b rhs, isStrUsedDmd (idDemandInfo b))
+                | (i, b) <- zip [0 ..] fbs, candidate dc i ] ++ mf)
+    alt ev pv _ _ rhs acc = go ev pv rhs acc
+
+    arg_fact ev pv a
+      | value ev a                      = AValue
+      | Var v <- a, Just (dc, i) <- lookupVarEnv pv v = APat dc i
+      | otherwise                       = AOther
+
+    -- The greatest fixpoint: start from every candidate field, and remove the
+    -- fields whose constructions or matches need a removed field boxed
+    fixpoint :: UniqFM DataCon [Int] -> UniqFM DataCon [Int]
+    fixpoint cur
+      | sizeOf next == sizeOf cur = cur
+      | otherwise                 = fixpoint next
+      where
+        next = listToUFM [ (dc, [ i | i <- lookupWithDefaultUFM cur [] dc, ok cur dc i ])
+                         | (dc, _) <- cand_list ]
+    sizeOf m = sum (map length (nonDetEltsUFM m))
+    in_set m dc i = i `elem` lookupWithDefaultUFM m [] dc
+    ok m dc i = null (why m dc i)
+    why m dc i =
+      [ "unsaturated constructor" | (dc', Nothing) <- cons_facts, dc' == dc ] ++
+      [ "a construction passes a non-value"
+      | (dc', Just as) <- cons_facts, dc' == dc, Just a <- [index i as], not (arg_ok m a) ] ++
+      [ "a match uses it boxed"
+      | (dc', j, us, _) <- match_facts, dc' == dc, j == i, not (all (use_ok m) us) ]
+      where
+        arg_ok _ AValue      = True
+        arg_ok m' (APat k j) = in_set m' k j
+        -- -fcore-webs-data-unbox-eager: a thunk too, if every match is
+        -- strict in the field (Note [Eager unboxing])
+        arg_ok _ AOther      = eager && strict_everywhere dc i
+    strict_everywhere dc i = and [ s | (dc', j, _, s) <- match_facts, dc' == dc, j == i ]
+    use_ok _ UScrut        = True
+    use_ok _ UStrictArg    = True
+    use_ok m (UConArg k j) = in_set m k j
+    use_ok _ UBoxed        = False
+    index i xs = case drop i xs of { (x : _) -> Just x; [] -> Nothing }
+
+    cand_list = [ (dc, [ i | i <- all_fields dc, candidate dc i ])
+                | tc <- tcs, dc <- tyConDataCons tc ]
+    flat_set = fixpoint (listToUFM cand_list)
+
+    -- Bad (constructor, field) pairs, with why (for the plans and the dump)
+    bad :: UniqFM DataCon [(Int, String)]
+    bad = listToUFM [ (dc, [ (i, case why flat_set dc i of
+                                   (w : _) -> w
+                                   []      -> "depends on a field that stays boxed")
+                           | i <- all_fields dc, not (in_set flat_set dc i) ])
+                    | (dc, _) <- cand_list ]
+
+    -- How a match uses a field's binder b
+    usesOf :: Id -> CoreExpr -> [Use]
+    usesOf b = go_u
+      where
+        go_u expr = case expr of
+          Var v | v == b    -> [UBoxed]
+                | otherwise -> []
+          App {}
+            | (Var f, args) <- collectArgs expr
+            -> let vals = [ a | a <- args, not (isTypeArg a) ]
+               in [ UBoxed | f == b ] ++
+                  concat [ if is_b a then [classify f j (length vals)] else go_u a
+                         | (j, a) <- zip [0 ..] vals ]
+          App f a     -> go_u f ++ go_u a
+          Lam _ e     -> go_u e
+          Let bind e  -> concatMap (go_u . snd) (flattenBinds [bind]) ++ go_u e
+          Case (Var v) cb _ alts
+            | v == b    -> UScrut : concat [ [ UBoxed | cb `elem` exprFreeVarsList r ] ++ go_u r
+                                           | Alt _ _ r <- alts ]
+          Case e _ _ alts -> go_u e ++ concat [ go_u r | Alt _ _ r <- alts ]
+          Cast e _    -> go_u e
+          Tick t e    -> [ UBoxed | Breakpoint { breakpointFVs = ids } <- [t], b `elem` ids ] ++ go_u e
+          _           -> []
+        is_b (Var v) = v == b
+        is_b _       = False
+        -- b as argument j of a call of f with n value arguments
+        classify f j n
+          | Just dc <- isDataConWorkId_maybe f
+          = if n == dataConRepArity dc then UConArg dc j else UBoxed
+          | (ds, _) <- splitDmdSig (idDmdSig f)
+          , n >= length ds, Just d <- index j ds, strict_unboxed d
+          = UStrictArg
+          | otherwise = UBoxed
+        strict_unboxed (card :* sd) = isStrict card && case sd of
+          Prod Unboxed _ -> True
+          Poly Unboxed _ -> True
+          _              -> False
 
     -- Outer structures first: a split type that is unpacked into another
     -- type's field this round keeps its own fields (its constructor must stay
     -- as it is); flattenFields runs again, and the next round can unbox the
     -- fields the container now holds.
-    unpacked = mkUniqSet [ dataConTyCon pdc | (_, cons) <- nonDetUFMToList plans0
-                                            , (_, fs) <- cons, Flatten pdc _ <- fs ]
+    --
+    -- A type whose fields mention a rebuilt type is rebuilt too (all its fields
+    -- kept), or its constructors would still mention the old type.  A type
+    -- that is unpacked into another cannot be rebuilt (the unpacking uses its
+    -- constructor): then that unpacking is dropped, and we try again.
     plans :: Plans
-    plans = filterUFM (any (\(_, fs) -> any is_flat fs)) $
-            mapUFM_Directly (\u cons -> if u `elemUniqSet_Directly` unpacked
-                                        then [ (dc, map (const Keep) fs) | (dc, fs) <- cons ]
-                                        else cons) plans0
+    plans = settle plans0
+
+    settle :: Plans -> Plans
+    settle ps
+      | null conflicts = with_mentioners
+      | otherwise      = settle (drop_unpacking conflicts ps1)
+      where
+        unpacked = mkUniqSet [ dataConTyCon pdc | (_, cons) <- nonDetUFMToList ps
+                                                , (_, fs) <- cons, Flatten pdc _ <- fs ]
+        ps1 = filterUFM (any (\(_, fs) -> any is_flat fs)) $
+              mapUFM_Directly (\u cons -> if u `elemUniqSet_Directly` unpacked
+                                          then [ (dc, map (const Keep) fs) | (dc, fs) <- cons ]
+                                          else cons) ps
+        rebuilt = close_mentions (nonDetKeysTcs ps1)
+        conflicts = [ tc | tc <- rebuilt, tc `elementOfUniqSet` unpacked ]
+        with_mentioners = foldr (\tc m -> if tc `elemUFM` m then m
+                                          else addToUFM m tc [ (dc, map (const Keep) (all_fields dc))
+                                                             | dc <- tyConDataCons tc ])
+                                ps1 rebuilt
+    nonDetKeysTcs ps = [ tc | tc <- tcs, tc `elemUFM` ps ]
+    drop_unpacking bad_tcs ps = filterUFM (any (\(_, fs) -> any is_flat fs)) $
+      mapUFM (map (\(dc, fs) -> (dc, [ case f of
+                                         Flatten pdc _ | dataConTyCon pdc `elem` bad_tcs -> Keep
+                                         _ -> f
+                                     | f <- fs ]))) ps
+    mentions tc = [ tc' | dc <- tyConDataCons tc, Scaled _ t <- dataConOrigArgTys dc
+                        , tc' <- nonDetEltsUniqSet (tyConsOfType t)
+                        , tc' `elementOfUniqSet` cands, tc' /= tc ]
+    close_mentions start = go_c start
+      where go_c acc = let more = [ tc | tc <- tcs, tc `notElem` acc
+                                       , any (`elem` acc) (mentions tc) ]
+                       in if null more then acc else go_c (acc ++ more)
 
     plans0 :: Plans
     plans0 = listToUFM
@@ -197,9 +367,11 @@ flattenFields this_mod us tcs binds
                              _           -> panic "flattenFields"
             dc_name = setNameUnique (dataConName dc) u_dc
             wk_name = mkExternalName u_wk this_mod (mkDataConWorkerOcc (getOccName dc)) noSrcSpan
+            -- Fields may mention the other types rebuilt this round too
+            -- ('ty', lazily: it looks at all of them)
             arg_tys = concat [ case f of
-                                 Keep           -> [Scaled m (self t)]
-                                 Flatten pdc as -> map (\(Scaled m' t') -> Scaled m' (self t'))
+                                 Keep           -> [Scaled m (ty (self t))]
+                                 Flatten pdc as -> map (\(Scaled m' t') -> Scaled m' (ty (self t')))
                                                        (dataConInstArgTys pdc as)
                              | (Scaled m t, f) <- zip (dataConOrigArgTys dc) fs ]
             no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
