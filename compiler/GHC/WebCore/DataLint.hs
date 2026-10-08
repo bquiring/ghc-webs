@@ -1140,14 +1140,16 @@ lintJoinBndrType body_ty bndr
   | JoinPoint arity <- idJoinPointHood bndr
   , let bndr_ty = idType bndr
   , (bndrs, res) <- splitPiTys bndr_ty
-  = checkL (length bndrs >= arity
-            && body_ty `eqType` mkPiTys (drop arity bndrs) res) $
-    hang (text "Join point returns different type than body")
-       2 (vcat [ text "Join bndr:" <+> ppr bndr <+> dcolon <+> ppr (idType bndr)
-               , text "Join arity:" <+> ppr arity
-               , text "Body type:" <+> ppr body_ty ])
+  -- Data Lint: compare with ensureEqTys (up to copies, recording pairs)
+  = do { checkL (length bndrs >= arity) msg
+       ; ensureEqTys body_ty (mkPiTys (drop arity bndrs) res) msg }
   | otherwise
   = return ()
+  where
+    msg = hang (text "Join point returns different type than body")
+             2 (vcat [ text "Join bndr:" <+> ppr bndr <+> dcolon <+> ppr (idType bndr)
+                     , text "Join arity:" <+> ppr (idJoinArity bndr)
+                     , text "Body type:" <+> ppr body_ty ])
 
 checkJoinOcc :: Id -> JoinArity -> LintM ()
 -- Check that if the occurrence is a JoinId, then so is the
