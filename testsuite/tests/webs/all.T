@@ -236,3 +236,9 @@ test('dataunbox004_dump', [extra_files(['dataunbox004.hs'])],
 test('dataunbox005', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox005_dump', [extra_files(['dataunbox005.hs'])],
      multimod_compile, ['dataunbox005', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+# dataunbox006: thunk fields that are strictly eliminated are unboxed; ones
+# that may be built without being eliminated are not (Note [Strictly
+# eliminated fields])
+test('dataunbox006', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunbox006_dump', [extra_files(['dataunbox006.hs'])],
+     multimod_compile, ['dataunbox006', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])

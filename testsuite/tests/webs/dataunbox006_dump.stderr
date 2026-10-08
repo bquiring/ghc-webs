@@ -1,0 +1,37 @@
+[1 of 2] Compiling Main             ( dataunbox006.hs, dataunbox006.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 65, classes: 10, exposed: 6, split: 4, exposed only by casts: 0, pinned binders: 3
+Main.List_s7 = [] with Main.Con1_s7, Main.Con2_s7 (built [1,
+                                                          2], matched [1, 2])
+Main.Tuple2_s8 = (,) with Main.Con1_s8 (built [1], matched [])
+Main.List_s9 = [] with Main.Con1_s9, Main.Con2_s9 (built [1,
+                                                          2], matched [1, 2])
+Main.Tuple2_s10 = (,) with Main.Con1_s10 (built [1], matched [1])
+Main.List_s7: specialised to Main.List_s7 = [Main.Tuple2_s8
+                                               GHC.Internal.Types.Int GHC.Internal.Types.Int]
+Main.Tuple2_s8: specialised to Main.Tuple2_s8 = [GHC.Internal.Types.Int,
+                                                 GHC.Internal.Types.Int]
+Main.List_s9: specialised to Main.List_s9 = [Main.Tuple2_s10
+                                               GHC.Internal.Types.Int GHC.Internal.Types.Int]
+Main.Tuple2_s10: specialised to Main.Tuple2_s10 = [GHC.Internal.Types.Int,
+                                                   GHC.Internal.Types.Int]
+Main.Con2_s7 field 0: unboxed
+Main.Con1_s8 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error) (every match is strict in it, but it may be built without being eliminated))
+Main.Con1_s8 field 1: boxed (its type is unpacked into another this round)
+Main.Con2_s9 field 0: unboxed
+Main.Con1_s10 field 0: boxed (its type is unpacked into another this round)
+Main.Con1_s10 field 1: boxed (its type is unpacked into another this round)
+Main.Con2_s7 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error))
+Main.Con2_s7 field 1: unboxed
+Main.Con1_s8 field 0: unboxed
+Main.Con1_s8 field 1: unboxed
+Main.Con2_s9 field 0: unboxed
+Main.Con2_s9 field 1: unboxed
+Main.Con1_s10 field 0: unboxed
+Main.Con1_s10 field 1: unboxed
+Main.Con2_s7 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error))
+
+
+[2 of 2] Linking dataunbox006

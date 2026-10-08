@@ -32,7 +32,7 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Basic ( Boxity(..) )
-import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd )
+import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd )
 import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.Core.FVs ( exprFreeVarsList )
 
@@ -45,7 +45,7 @@ import GHC.WebCore.Transform.ArityRaise ( productCon, replaceCases )
 
 import Control.Monad ( forM, foldM )
 import Data.Functor.Identity ( runIdentity )
-import Data.Maybe ( isNothing, fromMaybe )
+import Data.Maybe ( isNothing, fromMaybe, isJust )
 
 {- Note [Unboxable fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -65,6 +65,40 @@ fields (K, i).  A field stays unboxable while
 
 Start from every candidate field and remove the ones that fail, until
 nothing changes.  A removed field stays a pointer to a boxed value.
+-}
+
+{- Note [Strictly eliminated fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A field whose every match is strict in it may still never be evaluated:
+strictness at the elimination says nothing about a value that is built but
+never eliminated, and a constructor application is a value, allocated as
+soon as its context runs (let p = (expensive, 1) in if b then fst p else 0).
+So evaluating the field when the value is built is safe only if we also know
+the value will be eliminated, strictly.  Function webs do not have this
+problem: a lambda is entered exactly when it is called.  Data is built at
+one time and eliminated at another.
+
+A field (K, i) of a split type is strictly eliminated if
+
+  (a) every construction of K is built where its value is demanded: in
+      result position (a function's body, a case alternative, the body of a
+      let: built when the value is demanded), as a case scrutinee, as the
+      right-hand side of a strict let, as a strict argument of a call; or in
+      a field (K', j) that is itself strictly eliminated (the fields of a
+      constructor are allocated with it).  Not in a lazy let, a lazy
+      argument, a recursive let, or at the top level (static data).  A
+      non-value expression in a lazy position is a thunk: what is built
+      inside it is built when it is forced, which is demanded.
+  (b) every case on the type -- the split type is local and not exposed, so
+      these are all the places its values are demanded -- has an explicit K
+      alternative whose pattern variable for field i is strict.
+
+Then whenever a K value is built, its field i will be evaluated, and
+evaluating it at construction only moves the evaluation earlier (as
+call-by-value does for a strict argument: GHC's strictness analysis takes
+the same liberty with which exception is raised first).  So a construction
+may pass a thunk in such a field, and flattening evaluates it.  The
+greatest fixpoint over the fields (because of (K', j) in (a)).
 -}
 
 {- Note [Eager unboxing]
@@ -112,13 +146,22 @@ whose type mentions S itself (recursive fields) are not flattened.
 -- | What a construction passes in a candidate field
 data ArgFact = AValue              -- ^ a value (Note [Flattening fields])
          | APat DataCon Int    -- ^ the pattern variable of another candidate field
-         | AOther
+         | AOther String       -- ^ something else: what it is
 
 -- | A use of a field's pattern variable in a match
 data Use = UScrut              -- ^ the scrutinee of a case
          | UStrictArg          -- ^ an argument a callee is strict in and unboxes
          | UConArg DataCon Int -- ^ an argument to another candidate field
-         | UBoxed
+         | UBoxed String       -- ^ any other use: what it is
+
+-- | The context a constructor application is built in
+-- (Note [Strictly eliminated fields])
+data Ctx = CDemanded            -- ^ built when its value is demanded
+         | CAllocated           -- ^ allocated whether or not it is demanded
+         | CField DataCon Int   -- ^ in a field of another candidate constructor
+
+data Facts = Facts [(DataCon, Maybe [ArgFact], Ctx)] [(DataCon, Int, [Use], Bool)]
+                   [(TyCon, [(DataCon, [Bool])])]
 
 -- | What happens to a field
 data Field = Keep | Flatten DataCon [Type]   -- ^ P's constructor and type arguments
@@ -148,55 +191,123 @@ flattenFields eager this_mod us tcs binds
       _ -> False
 
     -- Facts (Note [Unboxable fields]): what each construction passes in each
-    -- field, and how each match uses each field
-    cons_facts  :: [(DataCon, Maybe [ArgFact])]      -- Nothing: unsaturated
-    match_facts :: [(DataCon, Int, [Use], Bool)]    -- Bool: the match is strict in it
-    (cons_facts, match_facts) = foldr (go_bind emptyVarSet emptyVarEnv) ([], []) binds
+    -- field and in what context it is built (Note [Strictly eliminated
+    -- fields]), how each match uses each field, and which constructors each
+    -- case on a candidate type has (with the strictness of their fields)
+    cons_facts  :: [(DataCon, Maybe [ArgFact], Ctx)]  -- Nothing: unsaturated
+    match_facts :: [(DataCon, Int, [Use], Bool)]      -- Bool: the match is strict in it
+    case_facts  :: [(TyCon, [(DataCon, [Bool])])]
+    Facts cons_facts match_facts case_facts
+      = foldr (go_top emptyVarSet emptyVarEnv) (Facts [] [] []) binds
 
     is_cand_con dc = dataConTyCon dc `elementOfUniqSet` cands
     all_fields dc = [0 .. dataConRepArity dc - 1]
 
-    go_bind ev pv bind acc = foldr (\(_, e) -> go ev pv e) acc (flattenBinds [bind])
+    -- A top-level binding: a function's body is demanded when it is called;
+    -- a constructor application is static data, allocated regardless
+    go_top ev pv bind acc = foldr (\(_, e) -> go_pos CAllocated ev pv e) acc (flattenBinds [bind])
+
+    -- An expression in a position of context c: only a constructor
+    -- application there is built in that context; anything else that is not
+    -- a value is a thunk, whose insides run when it is forced (demanded)
+    go_pos c ev pv e
+      | is_con_app e = go c ev pv e
+      | otherwise    = go CDemanded ev pv e
+    is_con_app e = case collectArgs (strip e) of
+      (Var v, _) -> isJust (isDataConWorkId_maybe v)
+      _          -> False
+    strip (Tick _ e) = strip e
+    strip (Cast e _) = strip e
+    strip e          = e
 
     -- ev: variables known to be evaluated (case binders);
-    -- pv: pattern variables of candidate constructors' fields
-    go ev pv expr acc@(cf, mf) = case expr of
+    -- pv: pattern variables of candidate constructors' fields;
+    -- c: the context the expression is evaluated in
+    go c ev pv expr acc@(Facts cf mf kf) = case expr of
       App {}
         | (Var v, args) <- collectArgs expr
-        , Just dc <- isDataConWorkId_maybe v, is_cand_con dc
+        , Just dc <- isDataConWorkId_maybe v
         -> let vals = [ a | a <- args, not (isTypeArg a) ]
-               acc' = foldr (go ev pv) acc args
+               cand = is_cand_con dc
+               -- a constructor's fields are allocated with it
+               field_ctx j | cand      = CField dc j
+                           | otherwise = CAllocated
+               acc' = foldr (\(j, a) -> go_pos (field_ctx j) ev pv a) acc (zip [0 ..] vals)
                fact | length vals == dataConRepArity dc = Just (map (arg_fact ev pv) vals)
                     | otherwise                          = Nothing
-           in (\(c, m) -> ((dc, fact) : c, m)) acc'
+           in if cand then add_con (dc, fact, c) acc' else acc'
+        | (Var f, args) <- collectArgs expr
+        -> let vals = [ a | a <- args, not (isTypeArg a) ]
+               (ds, _) = splitDmdSig (idDmdSig f)
+               saturated = length vals >= length ds
+               arg_ctx j | saturated, Just d <- index j ds, isStrictDmd d = CDemanded
+                         | otherwise                                      = CAllocated
+           in foldr (\(j, a) -> go_pos (arg_ctx j) ev pv a) acc (zip [0 ..] vals)
       Var v
         | Just dc <- isDataConWorkId_maybe v, is_cand_con dc
         , dataConRepArity dc > 0
-        -> ((dc, Nothing) : cf, mf)
-      App f a     -> go ev pv f (go ev pv a acc)
-      Lam _ e     -> go ev pv e acc
-      Let bind e  -> go_bind ev pv bind (go ev pv e acc)
+        -> add_con (dc, Nothing, c) acc
+        | Just dc <- isDataConWorkId_maybe v, is_cand_con dc
+        -> add_con (dc, Just [], c) acc
+      App f a     -> go CDemanded ev pv f (go_pos CAllocated ev pv a acc)
+      Lam _ e     -> go CDemanded ev pv e acc          -- run when applied
+      Let (NonRec b rhs) e
+        -> let rhs_ctx | isStrUsedDmd (idDemandInfo b) = c
+                       | otherwise                     = CAllocated
+           in go_pos rhs_ctx ev pv rhs (go c ev pv e acc)
+      Let (Rec prs) e
+        -> foldr (\(_, r) -> go_pos CAllocated ev pv r) (go c ev pv e acc) prs
       Case e b _ alts
         -> let ev' = extendVarSet ev b
-           in go ev pv e $
-              foldr (\(Alt con bs rhs) a -> alt ev' pv con bs rhs a) acc alts
-      Cast e _    -> go ev pv e acc
-      Tick _ e    -> go ev pv e acc
+               kf' | Just (tc, _) <- splitTyConApp_maybe (idType b)
+                   , tc `elementOfUniqSet` cands
+                   = (tc, [ (dc, map (isStrUsedDmd . idDemandInfo) (filter isId bs))
+                          | Alt (DataAlt dc) bs _ <- alts ]) : kf
+                   | otherwise = kf
+           in go CDemanded ev pv e $
+              foldr (\(Alt con bs rhs) a -> alt c ev' pv con bs rhs a) (Facts cf mf kf') alts
+      Cast e _    -> go c ev pv e acc
+      Tick _ e    -> go c ev pv e acc
       _           -> acc
 
-    alt ev pv (DataAlt dc) bs rhs acc
+    add_con f (Facts cf mf kf) = Facts (f : cf) mf kf
+
+    alt c ev pv (DataAlt dc) bs rhs acc
       | is_cand_con dc
       = let fbs = filter isId bs
             pv' = extendVarEnvList pv [ (b, (dc, i)) | (i, b) <- zip [0 ..] fbs ]
-            (cf, mf) = go ev pv' rhs acc
-        in (cf, [ (dc, i, usesOf b rhs, isStrUsedDmd (idDemandInfo b))
-                | (i, b) <- zip [0 ..] fbs, candidate dc i ] ++ mf)
-    alt ev pv _ _ rhs acc = go ev pv rhs acc
+            Facts cf mf kf = go c ev pv' rhs acc
+        in Facts cf ([ (dc, i, usesOf b rhs, isStrUsedDmd (idDemandInfo b))
+                     | (i, b) <- zip [0 ..] fbs, candidate dc i ] ++ mf) kf
+    alt c ev pv _ _ rhs acc = go c ev pv rhs acc
+
+    -- Note [Strictly eliminated fields]: the greatest fixpoint of the fields
+    -- (K, i) such that every construction of K is built where it is
+    -- demanded (or in a strictly eliminated field), and every case on K's
+    -- type has a K alternative that is strict in field i
+    strictly_eliminated :: UniqFM DataCon [Int]
+    strictly_eliminated = se_fix (listToUFM [ (dc, all_fields dc) | (dc, _) <- cand_list ])
+    se_fix cur
+      | sizeOf next == sizeOf cur = cur
+      | otherwise                 = se_fix next
+      where
+        next = listToUFM [ (dc, [ i | i <- lookupWithDefaultUFM cur [] dc, se_ok cur dc i ])
+                         | (dc, _) <- cand_list ]
+    se_ok m dc i
+      =  and [ ctx_ok m ctx | (dc', _, ctx) <- cons_facts, dc' == dc ]
+      && and [ case lookup dc cons of
+                 Just strs -> fromMaybe False (index i strs)
+                 Nothing   -> False
+             | (tc, cons) <- case_facts, tc == dataConTyCon dc ]
+    ctx_ok _ CDemanded    = True
+    ctx_ok _ CAllocated   = False
+    ctx_ok m (CField k j) = in_set m k j
+    strictly_elim dc i = in_set strictly_eliminated dc i
 
     arg_fact ev pv a
       | value ev a                      = AValue
       | Var v <- a, Just (dc, i) <- lookupVarEnv pv v = APat dc i
-      | otherwise                       = AOther
+      | otherwise                       = AOther (arg_shape a)
 
     -- The greatest fixpoint: start from every candidate field, and remove the
     -- fields whose constructions or matches need a removed field boxed
@@ -211,23 +322,76 @@ flattenFields eager this_mod us tcs binds
     in_set m dc i = i `elem` lookupWithDefaultUFM m [] dc
     ok m dc i = null (why m dc i)
     why m dc i =
-      [ "unsaturated constructor" | (dc', Nothing) <- cons_facts, dc' == dc ] ++
-      [ "a construction passes a non-value"
-      | (dc', Just as) <- cons_facts, dc' == dc, Just a <- [index i as], not (arg_ok m a) ] ++
-      [ "a match uses it boxed"
-      | (dc', j, us, _) <- match_facts, dc' == dc, j == i, not (all (use_ok m) us) ]
+      [ "unsaturated constructor" | (dc', Nothing, _) <- cons_facts, dc' == dc ] ++
+      [ "a construction passes a non-value: " ++ arg_why a
+        ++ (if strict_everywhere dc i
+            then " (every match is strict in it, but it may be built without being eliminated)"
+            else "")
+      | (dc', Just as, _) <- cons_facts, dc' == dc, Just a <- [index i as], not (arg_ok m a) ] ++
+      [ "a match uses it boxed: " ++ use_why u
+      | (dc', j, us, _) <- match_facts, dc' == dc, j == i, u <- take 1 (filter (not . use_ok m) us) ]
       where
         arg_ok _ AValue      = True
         arg_ok m' (APat k j) = in_set m' k j
-        -- -fcore-webs-data-unbox-eager: a thunk too, if every match is
-        -- strict in the field (Note [Eager unboxing])
-        arg_ok _ AOther      = eager && strict_everywhere dc i
+        -- a thunk, if the field is strictly eliminated (Note [Strictly
+        -- eliminated fields]); with -fcore-webs-data-unbox-eager, if every
+        -- match is strict in it (Note [Eager unboxing])
+        arg_ok _ (AOther _)  = strictly_elim dc i || (eager && strict_everywhere dc i)
     strict_everywhere dc i = and [ s | (dc', j, _, s) <- match_facts, dc' == dc, j == i ]
     use_ok _ UScrut        = True
     use_ok _ UStrictArg    = True
     use_ok m (UConArg k j) = in_set m k j
-    use_ok _ UBoxed        = False
+    use_ok _ (UBoxed _)    = False
     index i xs = case drop i xs of { (x : _) -> Just x; [] -> Nothing }
+
+    arg_why (AOther sh)  = sh
+    arg_why (APat k _)   = "the pattern variable of a field of " ++ getOccString k ++ " that stays boxed"
+    arg_why AValue       = "a value"
+    use_why (UBoxed sh)    = sh
+    use_why (UConArg k _)  = "stored in a field of " ++ getOccString k ++ " that stays boxed"
+    use_why _              = "?"
+
+    -- What a construction passes, when it is not a value
+    arg_shape a = case a of
+      Var v | Just site <- lookupVarEnv sites v -> site
+            | isLocalId v  -> "a variable not known to be evaluated"
+            | otherwise    -> "a top-level thunk"
+      App {} | (Var f, _) <- collectArgs a -> "a call of " ++ getOccString f
+             | otherwise                   -> "an application"
+      Case {}   -> "a case"
+      Let {}    -> "a let"
+      Tick _ e  -> arg_shape e
+      Cast e _  -> arg_shape e
+      _         -> "something else"
+
+    -- Where each variable is bound (for the dump), and the let-bound variables
+    -- whose right-hand side is a value: they are values too (annotation
+    -- zaps unfoldings, so exprIsHNF does not see it)
+    (sites, let_values) = foldr site_bind (emptyVarEnv, emptyVarSet) binds
+      where
+        site_bind bind acc = foldr site_pair acc (flattenBinds [bind])
+        site_pair (b, rhs) (env, vs)
+          | exprIsHNF rhs = site_expr rhs (env, extendVarSet vs b)
+          | otherwise     = site_expr rhs (extendVarEnv env b ("a let-bound thunk (" ++ thunk_shape rhs ++ ")"), vs)
+        site_expr e acc@(env, vs) = case e of
+          Lam b x     -> site_expr x (if isId b then extendVarEnv env b "a function argument" else env, vs)
+          App f a     -> site_expr f (site_expr a acc)
+          Let bind x  -> site_bind bind (site_expr x acc)
+          Case x _ _ as -> site_expr x $ foldr (\(Alt con bs r) a ->
+                             site_expr r (case con of
+                               DataAlt dc -> (extendVarEnvList (fst a) [ (b', "a field of " ++ getOccString dc) | b' <- bs, isId b' ], snd a)
+                               _          -> a)) acc as
+          Cast x _    -> site_expr x acc
+          Tick _ x    -> site_expr x acc
+          _           -> acc
+        thunk_shape rhs = case rhs of
+          App {} | (Var f, _) <- collectArgs rhs -> "a call of " ++ getOccString f
+          Case {} -> "a case"
+          Let {}  -> "a let"
+          Var _   -> "a variable"
+          Tick _ x -> thunk_shape x
+          Cast x _ -> thunk_shape x
+          _       -> "something else"
 
     cand_list = [ (dc, [ i | i <- all_fields dc, candidate dc i ])
                 | tc <- tcs, dc <- tyConDataCons tc ]
@@ -246,34 +410,42 @@ flattenFields eager this_mod us tcs binds
     usesOf b = go_u
       where
         go_u expr = case expr of
-          Var v | v == b    -> [UBoxed]
+          Var v | v == b    -> [UBoxed "used as a value (returned, bound, or a lazy argument)"]
                 | otherwise -> []
           App {}
             | (Var f, args) <- collectArgs expr
             -> let vals = [ a | a <- args, not (isTypeArg a) ]
-               in [ UBoxed | f == b ] ++
+               in [ UBoxed "called" | f == b ] ++
                   concat [ if is_b a then [classify f j (length vals)] else go_u a
                          | (j, a) <- zip [0 ..] vals ]
           App f a     -> go_u f ++ go_u a
           Lam _ e     -> go_u e
           Let bind e  -> concatMap (go_u . snd) (flattenBinds [bind]) ++ go_u e
           Case (Var v) cb _ alts
-            | v == b    -> UScrut : concat [ [ UBoxed | cb `elem` exprFreeVarsList r ] ++ go_u r
+            | v == b    -> UScrut : concat [ [ UBoxed "the case binder is used" | cb `elem` exprFreeVarsList r ] ++ go_u r
                                            | Alt _ _ r <- alts ]
           Case e _ _ alts -> go_u e ++ concat [ go_u r | Alt _ _ r <- alts ]
           Cast e _    -> go_u e
-          Tick t e    -> [ UBoxed | Breakpoint { breakpointFVs = ids } <- [t], b `elem` ids ] ++ go_u e
+          Tick t e    -> [ UBoxed "a breakpoint" | Breakpoint { breakpointFVs = ids } <- [t], b `elem` ids ] ++ go_u e
           _           -> []
         is_b (Var v) = v == b
         is_b _       = False
         -- b as argument j of a call of f with n value arguments
         classify f j n
           | Just dc <- isDataConWorkId_maybe f
-          = if n == dataConRepArity dc then UConArg dc j else UBoxed
+          = if n == dataConRepArity dc then UConArg dc j
+            else UBoxed ("an argument to an unsaturated " ++ getOccString dc)
           | (ds, _) <- splitDmdSig (idDmdSig f)
           , n >= length ds, Just d <- index j ds, strict_unboxed d
           = UStrictArg
-          | otherwise = UBoxed
+          | (ds, _) <- splitDmdSig (idDmdSig f), n < length ds
+          = UBoxed ("an argument to a partial application of " ++ getOccString f)
+          | (ds, _) <- splitDmdSig (idDmdSig f), Just (card :* _) <- index j ds, isStrict card
+          = UBoxed ("passed to " ++ getOccString f ++ ", which is strict in it but uses it boxed")
+          | (ds, _) <- splitDmdSig (idDmdSig f), Just _ <- index j ds
+          = UBoxed ("passed to " ++ getOccString f ++ ", which is lazy in it")
+          | otherwise
+          = UBoxed ("passed to " ++ getOccString f ++ " (no demand signature: imported or unknown)")
         strict_unboxed (card :* sd) = isStrict card && case sd of
           Prod Unboxed _ -> True
           Poly Unboxed _ -> True
@@ -336,7 +508,7 @@ flattenFields eager this_mod us tcs binds
       | otherwise = Keep
     value ev a = exprIsHNF a || exprOkForSpeculation a || evald ev a
     evald ev a = case a of
-      Var v     -> v `elemVarSet` ev
+      Var v     -> v `elemVarSet` ev || v `elemVarSet` let_values
       Tick _ e  -> evald ev e
       Cast e _  -> evald ev e
       _         -> False
