@@ -18,6 +18,14 @@ described in sections 1-7 below: data types carry no webs. Instead
   dropped); a class that builds nothing, and every exposed class, keeps the
   original. Core Lint checks the result.
 
+nofib (`early-ds`: every early transformation plus splitting, with
+`-dcore-lint`, 2026-10-08): no Data Lint or Core Lint errors, all 115
+benchmarks build and give the right output. Over 442 modules: 582,500
+copies in 6,788 classes; 4,373 exposed, 1,834 split (30 of them dropping
+constructors), 7,779 binders pinned. Split most often: `Int` 502, `(,)`
+439, `[]` 416, `(,,)` 95, `Double` 85, `Float` 52. Instruction counts not
+measured yet.
+
 Open: whether recursive fields could be separate copies (polymorphic
 recursion in copies; edge cases), copies for fields of other data types
 (section 2, step 3; phase 4), strict and unpacked fields (types with
