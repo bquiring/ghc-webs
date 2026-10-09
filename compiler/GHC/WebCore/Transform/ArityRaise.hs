@@ -39,6 +39,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
 import GHC.WebCore.Transform.Common
+import GHC.WebCore.Sigs ( FieldTys )
+import GHC.WebCore.Traverse ( typeWebs )
 
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe, isJust )
@@ -119,10 +121,30 @@ A product with no components still becomes one (# #) argument, so that a
 function never loses its last lambda (and its work is not shared).
 -}
 
+{- Note [Recursive products]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A web stored in a hidden field of the type it takes (Note [Hidden fields]
+in GHC.WebCore.Sigs),
+
+    data T = T Int (T ->{w} Int)
+
+cannot be raised: its product's components are (Int, T ->{w} Int), the
+second is w itself, and w's new type would be  Int -> w -> Int,  an infinite
+type.  So a web whose product's components mention a web that would be
+raised in the same round is not raised (nor is that one, if it is the same
+web).  Raising both of two webs whose components mention each other would
+loop the same way.  A web raised in an earlier round is no problem: the
+type rewrite then reaches the components too.  Mentioning the type itself
+is no problem either (T = (Int, (T, Int) ->{w} Int)): T is nominal, and its
+field changes with w.  A named type for the web (a newtype) would let it be
+raised: see WEBS-BACKLOG.md.  Result raising does the same (Note [Result
+raising]).
+-}
+
 data Verdict = Raised | Rejected Reason
 
 data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
-            | KnownCalls | BoxNeeded
+            | KnownCalls | BoxNeeded | Recursive
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
@@ -138,6 +160,7 @@ instance Outputable Reason where
   ppr CoVarParam = text "coercion parameter"
   ppr KnownCalls = text "only known calls (early: left to worker/wrapper)"
   ppr BoxNeeded  = text "the product is used boxed"
+  ppr Recursive  = text "a component mentions a raised web"
 
 -- | The product types we raise: boxed, single-constructor data types without
 -- existentials or constraints, that are not classes
@@ -180,10 +203,11 @@ data Info = Info
   , i_rep_poly  :: Bool
   , i_coercion  :: Bool
   , i_unknown   :: Bool    -- Some call of the web is not a known call
-  , i_boxed     :: Bool }  -- Some lambda needs its parameter boxed
+  , i_boxed     :: Bool    -- Some lambda needs its parameter boxed
+  , i_comp_webs :: WebSet } -- The webs in the product's components
 
 noInfo :: Info
-noInfo = Info [] False False False False [] False False False False
+noInfo = Info [] False False False False [] False False False False emptyUniqSet
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
@@ -195,7 +219,8 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_rep_poly = i_rep_poly a || i_rep_poly b
                     , i_coercion = i_coercion a || i_coercion b
                     , i_unknown  = i_unknown a  || i_unknown b
-                    , i_boxed    = i_boxed a    || i_boxed b }
+                    , i_boxed    = i_boxed a    || i_boxed b
+                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
 
 type Infos = UniqFM WebId Info
 
@@ -204,8 +229,8 @@ note w i infos
   | isPlaceholderWeb w = infos
   | otherwise          = addToUFM_C plusInfo infos w i
 
-analyse :: CoreProgram -> Infos
-analyse binds = foldr go_bind emptyUFM binds
+analyse :: FieldTys -> CoreProgram -> Infos
+analyse fields binds = foldr go_bind emptyUFM binds
   where
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
@@ -267,10 +292,11 @@ analyse binds = foldr go_bind emptyUFM binds
         -> let acc' = go_ty a (go_ty r acc)
            in case productCon (coreFullView a) of
                 Just (tc, args, dc)
-                  | all typeHasFixedRuntimeRep (components dc args)
-                  -> note w (noInfo { i_tycons = [tc] }) acc'
-                  | otherwise
-                  -> note w (noInfo { i_tycons = [tc], i_rep_poly = True }) acc'
+                  | let comps = fields dc args
+                        cws   = unionManyUniqSets (map typeWebs comps)
+                  -> if all typeHasFixedRuntimeRep comps
+                     then note w (noInfo { i_tycons = [tc], i_comp_webs = cws }) acc'
+                     else note w (noInfo { i_tycons = [tc], i_rep_poly = True }) acc'
                 Nothing -> note w (noInfo { i_not_prod = True }) acc'
       TyConApp _ tys -> foldr go_ty acc tys
       AppTy t1 t2    -> go_ty t1 (go_ty t2 acc)
@@ -371,23 +397,35 @@ verdict early exposed complex w i
 -- | Analyse the program and raise the webs that qualify.  Each raised web
 -- loses its product arrows, so one round is enough; webs in 'done' have
 -- already been raised and are not considered again.
-arityRaiseRound :: UniqSupply
+arityRaiseRound :: FieldTys    -- ^ Components' types (Note [Signatures follow
+                               --   the transformations] in GHC.WebCore.HiddenFields)
+                -> UniqSupply
                 -> WebSet      -- ^ Exposed webs
                 -> UnfoldingPolicy
                 -> WebSet      -- ^ Webs already raised
                 -> CoreProgram
-                -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
-arityRaiseRound us exposed pol done binds
+                -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
+arityRaiseRound fields us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us1 (rewriteProgram todo inner pol binds), todo), dump)
+  | otherwise           = ( Just ( initUs_ us1 (rewriteProgram fields todo inner pol binds), todo
+                                 , raiseType fields todo inner )
+                          , dump )
   where
-    infos   = analyse binds
+    infos   = analyse fields binds
     complex = complexCoWebs binds
-    verdicts = [ (w, verdict (up_early pol) exposed complex w i, i)
-               | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
-               , let w = mkWebId u
-               , not (null (i_lams i))
-               , not (w `elementOfUniqSet` done) ]
+    verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
+                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
+                , let w = mkWebId u
+                , not (null (i_lams i))
+                , not (w `elementOfUniqSet` done) ]
+    -- Note [Recursive products]
+    candidates = mkUniqSet [ w | (w, Raised, _) <- verdicts0 ]
+    verdicts = [ (w, v', i)
+               | (w, v, i) <- verdicts0
+               , let v' | Raised <- v
+                        , not (isEmptyUniqSet (i_comp_webs i `intersectUniqSets` candidates))
+                        = Rejected Recursive
+                        | otherwise = v ]
     todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
     -- Fresh webs for the new arrows, per raised web
     (us1, us2) = splitUniqSupply us
@@ -402,20 +440,20 @@ arityRaiseRound us exposed pol done binds
 
 type Env = IdEnv Id
 
-raiseType :: WebSet -> InnerWebs -> Type -> Type
-raiseType todo inner = go
+raiseType :: FieldTys -> WebSet -> InnerWebs -> Type -> Type
+raiseType fields todo inner = go
   where
     go ty = case ty of
       FunTy { ft_web = w, ft_mult = m, ft_arg = a, ft_res = r }
         | w `elementOfUniqSet` todo
         , Just (_, args, dc) <- productCon (coreFullView a)
-        -> curriedTy w (inner w) m (components dc (map go args)) (go r)
+        -> curriedTy w (inner w) m (fields dc (map go args)) (go r)
         | otherwise -> ty { ft_arg = go a, ft_res = go r }
       TyConApp tc tys -> TyConApp tc (map go tys)
       AppTy t1 t2     -> AppTy (go t1) (go t2)
       ForAllTy b t    -> ForAllTy b (go t)
-      CastTy t co     -> CastTy (go t) (raiseCo todo inner co)
-      CoercionTy co   -> CoercionTy (raiseCo todo inner co)
+      CastTy t co     -> CastTy (go t) (raiseCo fields todo inner co)
+      CoercionTy co   -> CoercionTy (raiseCo fields todo inner co)
       _               -> ty
 
 -- | The webs of the new arrows of a raised web (all but its last), the same
@@ -445,10 +483,10 @@ curriedCo w ws r m comp_cos res_co = case comp_cos of
                         Pair lb rb = coercionKind b
                     in mk r (chooseFunTyFlag la lb) (chooseFunTyFlag ra rb) m a b
 
-raiseCo :: WebSet -> InnerWebs -> Coercion -> Coercion
-raiseCo todo inner = go
+raiseCo :: FieldTys -> WebSet -> InnerWebs -> Coercion -> Coercion
+raiseCo fields todo inner = go
   where
-    goTy = raiseType todo inner
+    goTy = raiseType fields todo inner
     go co = case co of
       Refl t              -> Refl (goTy t)
       GRefl r t mco       -> GRefl r (goTy t) mco
@@ -483,13 +521,14 @@ componentCos r dc arg_cos
   = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos)
         (map scaledThing (dataConRepArgTys dc))
 
-rewriteProgram :: WebSet -> InnerWebs -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram todo inner pol binds
+rewriteProgram :: FieldTys -> WebSet -> InnerWebs -> UnfoldingPolicy -> CoreProgram
+               -> UniqSM CoreProgram
+rewriteProgram fields todo inner pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
-    upTy = raiseType todo inner
-    upCo = raiseCo todo inner
+    upTy = raiseType fields todo inner
+    upCo = raiseCo fields todo inner
     is_todo w = w `elementOfUniqSet` todo
 
     rw_top env (NonRec b e) = NonRec (lookup_bndr env b) <$> rw env e
@@ -519,7 +558,7 @@ rewriteProgram todo inner pol binds
       FunTy { ft_web = w, ft_arg = a, ft_res = r }
         | is_todo w
         , Just (_, args, dc) <- productCon (coreFullView a)
-        , let k = length (components dc args)
+        , let k = length (fields dc args)
         , k > 0
         -> SplitArg k : raisedFates r
         | otherwise -> KeepArg : raisedFates r
@@ -607,7 +646,7 @@ rewriteProgram todo inner pol binds
       = do { let (env1, p') = rw_bndr1 env p
                  p_ty = idType p'
                  (args, dc) = productOf p_ty
-                 comp_tys = components dc args
+                 comp_tys = fields dc args
            ; xs <- mapM (\ty -> do { u <- getUniqueM
                                    ; return (mkSysLocal (fsLit "x") u ManyTy ty) }) comp_tys
            ; e1 <- rw env1 e
@@ -641,7 +680,7 @@ rewriteProgram todo inner pol binds
                  (args, dc) = productOf x_ty
            ; ys <- mapM (\ty -> do { u <- getUniqueM
                                    ; return (mkSysLocal (fsLit "y") u ManyTy ty) })
-                        (components dc args)
+                        (fields dc args)
            ; b <- mkWild x_ty
            ; let call = curriedCall w f' (map Var ys)
                  wrap body = Case x' b (exprType body) [Alt (DataAlt dc) ys body]

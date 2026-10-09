@@ -2562,6 +2562,7 @@ fFlagsDeps = [
   flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
   flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,
   flagSpec "core-webs-no-strict-elim"         Opt_CoreWebsNoStrictElim,
+  flagSpec "core-webs-no-hidden-fields"       Opt_CoreWebsNoHiddenFields,
   flagSpec "core-webs-uncurry-known"          Opt_CoreWebsUncurryKnown,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,

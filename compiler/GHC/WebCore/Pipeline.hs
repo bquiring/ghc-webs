@@ -25,7 +25,14 @@ import GHC.Types.Web
 
 import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module ( Module )
-import GHC.Core.TyCon ( TyCon )
+import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
+                       , isFamInstTyCon )
+import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dataConWrapId_maybe, dataConTyCon )
+import GHC.Types.Avail ( availsToNameSet )
+import GHC.Types.FieldLabel ( flSelector )
+import GHC.Types.Name.Set ( elemNameSet )
+import GHC.Types.Id.Info ( ruleInfoRules )
+import GHC.Types.Unique ( getUnique )
 
 import GHC.Data.Bag
 import GHC.Utils.Error ( DiagOpts, MessageClass(..), pprMessageBag, ghcExit )
@@ -36,10 +43,13 @@ import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
 import GHC.WebCore.Boundary ( splitBoundary )
-import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes )
+import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes, nonParametric )
+import GHC.Core.TyCo.FVs ( tyConsOfType )
+import GHC.Core.DataCon ( dataConRepArgTys )
 import GHC.WebCore.DataCopy ( UnboxOpts(..) )
 import qualified GHC.WebCore.DataLint as DL
 import GHC.WebCore.Erase
+import GHC.WebCore.HiddenFields
 import GHC.WebCore.Lint
 import GHC.WebCore.Rename
 import GHC.WebCore.Sigs
@@ -121,7 +131,9 @@ webPass early guts
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
-             (binds1, sigs1) = annotateProgram early us (mg_rules guts) binds0
+             hidden | gopt Opt_CoreWebsNoHiddenFields dflags = const False
+                    | otherwise = hiddenFields guts split_tcs binds0
+             (binds1, sigs1) = annotateProgram early hidden us (mg_rules guts) binds0
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -145,29 +157,42 @@ webPass early guts
        ; reportWebLint logger dflags "renaming" binds2 res2
        ; checkSolved "renaming" res2
 
-         -- Transformations
-       ; (binds_t0, transformed0) <- runTransforms early logger dflags cfg sigs2 binds2
+         -- Transformations, with the constructor signatures with hidden
+         -- fields in the program (Note [Signatures in the program] in
+         -- GHC.WebCore.HiddenFields)
+       ; us_sig <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let (binds2s, sig_bndrs) = addSigBinders us_sig sigs2 binds2
+       ; (binds_t1, sigs_t, transformed0) <- runTransforms early logger dflags cfg sigs2 binds2s
+       ; let binds_t0 = removeSigBinders sig_bndrs binds_t1
 
          -- Defunctionalisation runs last: it changes the arrow types of the
          -- webs it handles into new data types
          -- See Note [Defunctionalisation] in GHC.WebCore.Transform.Defunc
        ; (binds_t, new_ixs, defunced) <-
            if gopt Opt_CoreWebsDefunc dflags
-           then runDefunc early logger dflags cfg (mg_module guts) sigs2 binds_t0
+           -- Hidden-field webs are left alone (Note [Signatures follow the
+           -- transformations] in GHC.WebCore.HiddenFields)
+           then runDefunc early logger dflags cfg (mg_module guts)
+                          (addExposedWebs (hiddenFieldWebs sigs_t) sigs_t) binds_t0
            else return (binds_t0, [], False)
        ; let transformed = transformed0 || defunced
 
        ; dump logger Opt_D_dump_webs_summary "Webs: summary" $
-           pprWebSummary (ws_exposed sigs2) binds_t
+           pprWebSummary (ws_exposed sigs_t) binds_t
 
        ; dump logger Opt_D_dump_webs_stats "Webs: statistics" $
            pprWebStats (sizeUniqSet (programWebs binds1)) (sizeUniqSet (programWebs binds2))
                        (ws_exposed sigs1)
                        (lengthBag pairs) sol
+           $$ pprHiddenStats sigs2 binds2
+           $$ pprTypeStats guts split_tcs binds0
 
          -- 4. Erasure
-       ; let binds3 | transformed = reorderTopBinds (eraseProgram sigs2 binds_t)
-                    | otherwise   = eraseProgram sigs2 binds_t
+       ; let binds3a | transformed = reorderTopBinds (eraseProgram sigs_t binds_t)
+                     | otherwise   = eraseProgram sigs_t binds_t
+             -- Types whose hidden fields changed are rebuilt in place
+             (binds3, rebuilt) = rebuildHiddenTypes sigs_t binds3a
+             replace tc = maybe tc id (lookup tc rebuilt)
 
          -- If a transformation changed the program, it is not the original;
          -- Core Lint (endPass, with -dcore-lint) still checks the result
@@ -184,7 +209,169 @@ webPass early guts
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
 
-       ; return (guts { mg_binds = binds4, mg_tcs = mg_tcs guts ++ split_tcs ++ new_tcs }) }
+       ; return (guts { mg_binds = binds4
+                      , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs }) }
+
+-- | Lambda classes (classes with a lambda: what a transformation can act
+-- on), how many are internal, and the hidden fields (Note [Hidden fields]
+-- in GHC.WebCore.Sigs).  For a renamed program.
+pprHiddenStats :: WebSigs -> CoreProgram -> SDoc
+pprHiddenStats sigs binds
+  = vcat [ text "Lambda classes:"           <+> int (sizeUniqSet lams)
+         , text "Internal lambda classes:"  <+> int (sizeUniqSet (lams `minusUniqSet` ws_exposed sigs))
+         , text "Types with hidden fields:" <+> int (sizeUniqSet hidden_tcs)
+         , text "Webs in hidden fields:"    <+> int (sizeUniqSet (hiddenFieldWebs sigs)) ]
+  where
+    lams = mkUniqSet (concatMap (lamWebs . snd) (flattenBinds binds))
+    hidden_tcs = mkUniqSet [ getUnique (dataConTyCon dc) | (dc, _) <- nonDetEltsUFM (ws_dcs sigs)
+                                                       , ws_hidden_fields sigs (dataConTyCon dc) ]
+    lamWebs e = case e of
+      WebLam w _ x  -> w : lamWebs x
+      Lam _ x       -> lamWebs x
+      App f a       -> lamWebs f ++ lamWebs a
+      WebApp _ f a  -> lamWebs f ++ lamWebs a
+      Let b x       -> concatMap lamWebs (rhssOfBind b) ++ lamWebs x
+      Case x _ _ as -> lamWebs x ++ concat [ lamWebs r | Alt _ _ r <- as ]
+      Cast x _      -> lamWebs x
+      Tick _ x      -> lamWebs x
+      _             -> []
+
+-- | The data types defined here, by whether their representation is visible
+-- outside the module (Note [Hidden fields] in GHC.WebCore.Sigs)
+pprTypeStats :: ModGuts -> [TyCon] -> CoreProgram -> SDoc
+pprTypeStats guts split_tcs binds
+  = vcat $ [ text "Data types defined:"            <+> int (length datas)
+           , text "Representation exported:"       <+> int (length [ () | ExportedRep <- cls ])
+           , text "Internal data types:"           <+> int (length internals)
+           , text "Internal, exported abstractly:" <+> int (length [ () | (True, _) <- internals ]) ]
+        ++ [ text ("Internal, " ++ label w ++ ":") <+> int (length [ () | (_, w') <- internals, w' == w ])
+           | w <- [minBound .. maxBound] ]
+        ++ [ text "Data splitting copies:"         <+> int (length split_tcs)
+           , text "Classes and empty types:"       <+> int (length [ () | NotData <- cls ]) ]
+  where
+    classify  = classifyTyCon guts binds
+    cls       = map classify (mg_tcs guts)
+    datas     = [ c | c <- cls, not (isNotData c) ]
+    internals = [ (abs_, w) | Internal abs_ w <- cls ]
+    isNotData NotData = True
+    isNotData _       = False
+    label w = case w of
+      HiddenFields -> "hidden fields"
+      Pinned       -> "in rules or stable unfoldings"
+      UnsafeCo     -> "unsafe coercion"
+      NewtypeTc    -> "newtype"
+      FamInst      -> "data family instance"
+      Existential  -> "existential or GADT"
+      Wrapper      -> "constructor wrapper"
+
+-- | The types defined here whose fields other modules cannot see
+-- See Note [Hidden fields] in GHC.WebCore.Sigs
+hiddenFields :: ModGuts -> [TyCon] -> CoreProgram -> TyCon -> Bool
+hiddenFields guts split_tcs binds = \tc -> getUnique tc `elementOfUniqSet` hidden
+  where
+    classify = classifyTyCon guts binds
+    -- The types defined here, and the copies data splitting made
+    hidden   = mkUniqSet [ getUnique t | t <- mg_tcs guts ++ split_tcs
+                                     , Internal _ HiddenFields <- [classify t] ]
+
+-- | Whose representation is visible outside the module, and for an internal
+-- type, whether its fields are hidden (Note [Hidden fields] in
+-- GHC.WebCore.Sigs) or what keeps them exposed
+data TyConClass
+  = NotData              -- ^ a class, a type without constructors, not algebraic
+  | ExportedRep          -- ^ a constructor or record field is exported
+  | Internal Bool Why    -- ^ internal (exported abstractly?)
+
+data Why = HiddenFields | Pinned | UnsafeCo | NewtypeTc | FamInst | Existential | Wrapper
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- The program-wide sets (pinned constructors, unsafely coerced types) are
+-- computed once per module
+classifyTyCon :: ModGuts -> CoreProgram -> TyCon -> TyConClass
+classifyTyCon guts binds = classify
+  where
+    classify t
+      | not (isAlgTyCon t) || isClassTyCon t || null dcs = NotData
+      | any visible dcs = ExportedRep
+      | otherwise       = Internal (tyConName t `elemNameSet` exported) why
+      where
+        dcs = tyConDataCons t
+        why | any (\dc -> getUnique dc `elementOfUniqSet` pinned) dcs = Pinned
+            | getUnique t `elementOfUniqSet` unsafe                = UnsafeCo
+            | isNewTyCon t                                         = NewtypeTc
+            | isFamInstTyCon t                                     = FamInst
+            | not (all isVanillaDataCon dcs)                       = Existential
+            | not (all (null . dataConWrapId_maybe) dcs)           = Wrapper  -- rebuilt without one
+            | otherwise                                            = HiddenFields
+
+    exported = availsToNameSet (mg_exports guts)
+    visible dc = dataConName dc `elemNameSet` exported
+              || any ((`elemNameSet` exported) . flSelector) (dataConFieldLabels dc)
+
+    -- Types an unsafe coercion relates to another, and the types reachable
+    -- through their fields (Note [Hidden fields] in GHC.WebCore.Sigs)
+    unsafe = close emptyUniqSet (concatMap exprUnsafeTyCons (concatMap rhssOfBind binds))
+    close acc [] = acc
+    close acc (t : ts)
+      | getUnique t `elementOfUniqSet` acc = close acc ts
+      | otherwise = close (addOneToUniqSet acc (getUnique t))
+                          (concat [ nonDetEltsUniqSet (tyConsOfType (scaledThing f))
+                                  | dc <- tyConDataCons t, f <- dataConRepArgTys dc ] ++ ts)
+
+    -- Constructors in Core the transformations do not rewrite: the RULES,
+    -- and the binders' own rules and stable unfoldings (which Tidy may put
+    -- in the interface, in either run)
+    pinned = mkUniqSet (map getUnique (concatMap ruleCons (mg_rules guts)
+                                       ++ concatMap bndrCons (allBinders binds)))
+    ruleCons r = case r of
+      Rule { ru_args = args, ru_rhs = rhs } -> concatMap exprCons (rhs : args)
+      BuiltinRule {}                        -> []
+    bndrCons b = concatMap ruleCons (ruleInfoRules (idSpecialisation b))
+              ++ case realIdUnfolding b of
+                   u | isStableUnfolding u, Just e <- maybeUnfoldingTemplate u -> exprCons e
+                   _ -> []
+
+    allBinders bs = concat [ b : inner e | (b, e) <- flattenBinds bs ]
+      where inner e = case e of
+              Let bind body -> allBinders [bind] ++ inner body
+              Lam _ x       -> inner x
+              App f a       -> inner f ++ inner a
+              Case x _ _ as -> inner x ++ concat [ inner r | Alt _ _ r <- as ]
+              Cast x _      -> inner x
+              Tick _ x      -> inner x
+              _             -> []
+
+-- | The type constructors an expression relates by unsafe coercion: in the
+-- type arguments of a non-parametric function, and in the types of a UnivCo
+exprUnsafeTyCons :: CoreExpr -> [TyCon]
+exprUnsafeTyCons e = case e of
+  App {} | (Var v, args) <- collectArgs e, nonParametric v
+         -> concat [ tcs t | Type t <- args ] ++ concatMap exprUnsafeTyCons args
+  Var _         -> []
+  App f a       -> exprUnsafeTyCons f ++ exprUnsafeTyCons a
+  Lam _ x       -> exprUnsafeTyCons x
+  Let bind body -> concatMap exprUnsafeTyCons (rhssOfBind bind) ++ exprUnsafeTyCons body
+  Case x _ _ as -> exprUnsafeTyCons x ++ concat [ exprUnsafeTyCons r | Alt _ _ r <- as ]
+  Cast x co     -> exprUnsafeTyCons x ++ coUnsafe co
+  Tick _ x      -> exprUnsafeTyCons x
+  Coercion co   -> coUnsafe co
+  _             -> []
+  where
+    tcs t = nonDetEltsUniqSet (tyConsOfType t)
+    coUnsafe co = case co of
+      UnivCo { uco_lty = l, uco_rty = r, uco_deps = ds } -> tcs l ++ tcs r ++ concatMap coUnsafe ds
+      TyConAppCo _ _ cs -> concatMap coUnsafe cs
+      AppCo a b         -> coUnsafe a ++ coUnsafe b
+      ForAllCo { fco_body = b } -> coUnsafe b
+      FunCo { fco_arg = a, fco_res = r } -> coUnsafe a ++ coUnsafe r
+      AxiomCo _ cs      -> concatMap coUnsafe cs
+      SymCo c           -> coUnsafe c
+      TransCo a b       -> coUnsafe a ++ coUnsafe b
+      SelCo _ c         -> coUnsafe c
+      LRCo _ c          -> coUnsafe c
+      InstCo a b        -> coUnsafe a ++ coUnsafe b
+      SubCo c           -> coUnsafe c
+      _                 -> []
 
 -- | Split data types (Note [Splitting data types] in GHC.WebCore.DataSplit);
 -- stop if Data Lint finds a type error in the annotated program
@@ -267,32 +454,39 @@ checkSolved what res
 -- it handled this round (or Nothing if nothing changed), and one verdict per
 -- web for the dump: the verdict, whether it changed the program, and the
 -- web's lambda binders.
-type TransformRound = UniqSupply -> WebSet -> CoreProgram
-                   -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
+--
+-- A round that changes types also returns the type rewrite it applied, for
+-- the signatures of constructors with hidden fields (Note [Signatures follow
+-- the transformations] in GHC.WebCore.HiddenFields); it reads the current
+-- ones from the WebSigs.
+type TransformRound = WebSigs -> UniqSupply -> WebSet -> CoreProgram
+                   -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
 
 -- | Run a web transformation in rounds until nothing changes, running Web
 -- Lint after each round: the transformation must keep the program
 -- well-typed.  Returns whether the program changed.
 runTransform :: String -> DumpFlag -> TransformRound
              -> Logger -> DynFlags -> LintConfig -> WebSigs
-             -> CoreProgram -> CoreM (CoreProgram, Bool)
-runTransform name dump_flag do_round logger dflags cfg sigs binds0
-  = go (1 :: Int) emptyUniqSet binds0 emptyUFM False
+             -> CoreProgram -> CoreM (CoreProgram, WebSigs, Bool)
+runTransform name dump_flag do_round logger dflags cfg sigs0 binds0
+  = go (1 :: Int) emptyUniqSet sigs0 binds0 emptyUFM False
   where
     max_rounds = 10
 
-    go n done binds verdicts changed
-      | n > max_rounds = finish binds verdicts changed
+    go n done sigs binds verdicts changed
+      | n > max_rounds = finish sigs binds verdicts changed
       | otherwise
       = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
-           ; case do_round us done binds of
-               (Nothing, vs) -> finish binds (record vs verdicts) changed
-               (Just (binds', handled), vs) ->
-                 do { let what = name ++ ", round " ++ show n
-                          res  = lintWebProgram cfg sigs binds'
+           ; case do_round sigs us done binds of
+               (Nothing, vs) -> finish sigs binds (record vs verdicts) changed
+               (Just (binds0', handled, rw_ty), vs) ->
+                 do { let what   = name ++ ", round " ++ show n
+                          sigs'  = updateDataConSigs rw_ty sigs
+                          binds' = refreshWorkers sigs' binds0'
+                          res    = lintWebProgram cfg sigs' binds'
                     ; reportWebLint logger dflags what binds' res
                     ; checkSolved what res
-                    ; go (n + 1) (done `unionUniqSets` handled) binds'
+                    ; go (n + 1) (done `unionUniqSets` handled) sigs' binds'
                          (record vs verdicts) True } }
 
     -- The last verdict for each web wins, except that a verdict that changed
@@ -303,10 +497,10 @@ runTransform name dump_flag do_round logger dflags cfg sigs binds0
       | old_ch && not new_ch = old
       | otherwise            = new
 
-    finish binds verdicts changed
+    finish sigs binds verdicts changed
       = do { dump logger dump_flag ("Webs: " ++ name) $
                pprWebVerdicts [ (v, bs) | (v, _, bs) <- nonDetEltsUFM verdicts ]
-           ; return (binds, changed) }
+           ; return (binds, sigs, changed) }
 
 -- | Did a dead-parameter verdict change the program?
 changes :: Verdict -> Bool
@@ -317,40 +511,45 @@ changes _        = False
 -- | The web transformations, in the order they run
 -- See GHC.WebCore.Transform.*
 runTransforms :: Bool -> Logger -> DynFlags -> LintConfig -> WebSigs
-              -> CoreProgram -> CoreM (CoreProgram, Bool)
-runTransforms early logger dflags cfg sigs binds0
-  = foldM step (binds0, False) transforms
+              -> CoreProgram -> CoreM (CoreProgram, WebSigs, Bool)
+runTransforms early logger dflags cfg sigs0 binds0
+  = foldM step (binds0, sigs0, False) transforms
   where
-    exposed = ws_exposed sigs
-    keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
+    exposed = ws_exposed sigs0
+    keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs0, up_early = early }
+
+    -- A round that does not change types
+    same r = case r of
+      (Just (b, ws), vs) -> (Just (b, ws, id), vs)
+      (Nothing, vs)      -> (Nothing, vs)
 
     transforms =
       [ ( Opt_CoreWebsInline, "super-beta inlining", Opt_D_dump_webs_inline
-        , \us done b -> inlineRound (unfoldingOpts dflags) us exposed done b )
+        , \_ us done b -> same (inlineRound (unfoldingOpts dflags) us exposed done b) )
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
-        , \us done b -> constPropRound us exposed done b )
+        , \_ us done b -> same (constPropRound us exposed done b) )
       , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
-        , \us done b -> arityRaiseRound us exposed keep done b )
+        , \sigs us done b -> arityRaiseRound (fieldTys sigs) us exposed keep done b )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
-        , \us done b -> case deadParamsRound us exposed keep done b of
-                          (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
+        , \_ us done b -> case deadParamsRound us exposed keep done b of
+                            (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
       , ( Opt_CoreWebsUncurry, "uncurrying", Opt_D_dump_webs_uncurry
-        , \us _ b -> case uncurryRound (gopt Opt_CoreWebsUncurryKnown dflags) us exposed keep b of
-                       (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) )
+        , \_ us _ b -> case uncurryRound (gopt Opt_CoreWebsUncurryKnown dflags) us exposed keep b of
+                         (r, vs) -> (fmap (\(b', rw) -> (b', emptyUniqSet, rw)) r, vs) )
       , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
-        , \us done b -> resultRaiseRound us exposed keep done b )
+        , \sigs us done b -> resultRaiseRound (fieldTys sigs) us exposed keep done b )
       , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
-        , \us done b -> strictnessRound us exposed done b ) ]
+        , \_ us done b -> same (strictnessRound us exposed done b) ) ]
 
-    step (binds, changed) (flag, name, dump_flag, do_round)
+    step (binds, sigs, changed) (flag, name, dump_flag, do_round)
       | early, flag == Opt_CoreWebsUncurry
-      = return (binds, changed)   -- See Note [No early uncurrying]
+      = return (binds, sigs, changed)   -- See Note [No early uncurrying]
       | gopt flag dflags
-      = do { (binds', changed') <- runTransform name dump_flag do_round
-                                                logger dflags cfg sigs binds
-           ; return (binds', changed || changed') }
+      = do { (binds', sigs', changed') <- runTransform name dump_flag do_round
+                                                       logger dflags cfg sigs binds
+           ; return (binds', sigs', changed || changed') }
       | otherwise
-      = return (binds, changed)
+      = return (binds, sigs, changed)
 
 -- | Lint configuration for Web Lint
 webLintConfig :: DynFlags -> LintConfig

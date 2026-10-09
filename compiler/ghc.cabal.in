@@ -1032,6 +1032,7 @@ Library
         GHC.WebCore.DataSplit
         GHC.WebCore.Erase
         GHC.WebCore.FirstClass
+        GHC.WebCore.HiddenFields
         GHC.WebCore.Lint
         GHC.WebCore.Pipeline
         GHC.WebCore.Rename

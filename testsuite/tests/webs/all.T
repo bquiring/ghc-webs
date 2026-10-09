@@ -314,3 +314,34 @@ for name in ['stream001', 'stream002']:
         test(name + suffix, [extra_files([name + '.hs']), use_specs({'stdout': name + '.stdout'})],
              multimod_compile_and_run, [name, opts])
 
+# Recursive types whose function field's web takes or returns the type:
+# T = (Int, T ->{w} Int), R = (Int, Int ->{w} R), S = (Int, S ->{w} S),
+# T = (Int, (T, Int) ->{w} Int), and a newtype over a pair.  The fields are
+# hidden (Note [Hidden fields] in GHC.WebCore.Sigs), so w is internal;
+# raising w through itself would need an infinite type, so 001-003 are
+# rejected (Note [Recursive products] in GHC.WebCore.Transform.ArityRaise),
+# 004 is raised (T is nominal), and 005's newtype keeps w exposed.  Every
+# dsedge mode.
+for name in ['recweb%03d' % n for n in range(1, 6)]:
+    for (suffix, opts) in dsedge_modes:
+        test(name + suffix, [extra_files([name + '.hs']), use_specs({'stdout': name + '.stdout'})],
+             multimod_compile_and_run, [name, opts])
+
+# Hidden fields (Note [Hidden fields] in GHC.WebCore.Sigs): webs inside the
+# fields of types whose constructors are not exported are internal; a type
+# whose fields change is rebuilt in place (Note [Signatures follow the
+# transformations] in GHC.WebCore.HiddenFields).  hfield001: local types, a
+# record and a Show instance; hfield002: an abstract type, used from another
+# module through unfoldings; hfield003: unsafeCoerce to an exposed type with
+# the same layout keeps the fields exposed; hfield004: a polymorphic field
+# used only at a pair is not raised on the original type, but data
+# splitting specialises its copy (Note [Specialising for webs] in
+# GHC.WebCore.DataSplit) and the copy's field is raised.  Every dsedge mode.
+for name in ['hfield001', 'hfield003', 'hfield004']:
+    for (suffix, opts) in dsedge_modes:
+        test(name + suffix, [extra_files([name + '.hs']), use_specs({'stdout': name + '.stdout'})],
+             multimod_compile_and_run, [name, opts])
+for (suffix, opts) in dsedge_modes:
+    test('hfield002' + suffix, [extra_files(['hfield002.hs', 'HField002A.hs']),
+                               use_specs({'stdout': 'hfield002.stdout'})],
+         multimod_compile_and_run, ['hfield002', opts])

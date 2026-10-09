@@ -7,6 +7,7 @@ module GHC.WebCore.DataSplit
   , splitDataTypes
   , mapTyCons
   , mapTyConsCo
+  , nonParametric
   ) where
 
 import GHC.Prelude
@@ -55,7 +56,8 @@ import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
 import Data.Char ( isUpper, isDigit )
 import Data.List ( sortOn, nub )
-import Data.Maybe ( isNothing, catMaybes, fromMaybe )
+import Data.Maybe ( isNothing, isJust, catMaybes, fromMaybe )
+import GHC.WebCore.Transform.ArityRaise ( productCon )
 
 {- Note [Splitting data types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -189,6 +191,24 @@ other class back on the original type (always well typed: a class is
 closed, as for a class that builds nothing).  A newtype class is kept if one
 of its children's classes is (its axiom names them).  Both passes use the
 same unique supply, so the classes, and their numbers, are the same.
+-}
+
+{- Note [Specialising for webs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A split that specialisation (Note [Specialising split types] in
+GHC.WebCore.DataSpec) gives a function field with a product argument or
+result is useful too, though it unboxes nothing:
+
+    data P a = P Int (a -> Int)      -- used only at P (Int, Int)
+
+P's copy is P_s Int ((Int, Int) -> Int).  Its fields are hidden (Note
+[Hidden fields] in GHC.WebCore.Sigs), and the field's web can now be raised;
+on the original, the definition's field takes one polymorphic parameter
+(Note [Signatures in the program] in GHC.WebCore.HiddenFields).  Data
+splitting runs before the web pipeline, so it cannot tell whether raising
+will fire; more product arguments or results of functions in the fields
+than before specialisation is the cheap test (Int counts: a -> Int already
+has one).
 -}
 
 {- Note [Splitting newtypes]
@@ -642,13 +662,14 @@ splitDataTypes unbox keep cfg this_mod us rules binds
     (final_binds, final_tcs, flat_dump, flat_rebuilt)
       | not changed = (binds, [], empty, [])
       | Just opts0 <- unbox
-                    = let (us4, us5) = splitUniqSupply us3
-                          (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
-                          (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
+                    = let (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
                           opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
                                                          | tc <- sp_tcs, dc <- tyConDataCons tc ] }
                       in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump, fl_rebuilt)
       | otherwise   = (split_binds, new_tcs, empty, [])
+
+    (us4, us5) = splitUniqSupply us3
+    (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
 
     -- Each round unpacks one more level (Note [Flattening fields])
     flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty, [])
@@ -755,9 +776,27 @@ splitDataTypes unbox keep cfg this_mod us rules binds
     -- unboxed in some round, or a constructor dropped.  The new types are
     -- named Orig_s<n> after their class, through every rebuild.
     useful = nub ([ n | tc <- flat_rebuilt, Just n <- [split_number tc] ] ++
+                  -- Note [Specialising for webs]
+                  [ n | (orig, sp) <- zip data_tcs sp_tcs
+                      , getUnique orig /= getUnique sp
+                      , product_funs sp > product_funs orig
+                      , Just n <- [split_number sp] ] ++
                   [ n | (n, (_, orig, Split _ cons, _, _)) <- zip [1 :: Int ..] fates
                       , not (isNewTyCon orig)
                       , length cons < length (tyConDataCons orig) ])
+    -- How many arguments and results of functions in the fields are products?
+    -- (Specialisation adds some where a type variable was.)
+    product_funs tc = sum [ go (scaledThing f) | dc <- tyConDataCons tc, f <- dataConRepArgTys dc ]
+      where go :: Type -> Int
+            go t = case splitFunTy_maybe t of
+              Just (_, _, a, r) -> prod a + prod r + go a + go r
+              Nothing -> case coreFullView t of
+                TyConApp _ ts -> sum (map go ts)
+                AppTy a b     -> go a + go b
+                ForAllTy _ b  -> go b
+                _             -> 0
+            prod t | isJust (productCon (coreFullView t)) = 1
+                   | otherwise                            = 0
     split_number tc = case reverse (occNameString (getOccName tc)) of
       str | (ds@(_ : _), 's' : '_' : _) <- span isDigit str -> Just (read (reverse ds))
       _ -> Nothing

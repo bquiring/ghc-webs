@@ -663,6 +663,7 @@ data GeneralFlag
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
    | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
+   | Opt_CoreWebsNoHiddenFields -- ^ (measuring) every constructor's fields exposed: no Note [Hidden fields]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
@@ -953,6 +954,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested
    , Opt_CoreWebsNoStrictElim
+   , Opt_CoreWebsNoHiddenFields
    , Opt_CoreWebsUncurryKnown
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary

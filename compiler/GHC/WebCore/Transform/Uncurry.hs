@@ -311,10 +311,10 @@ uncurryRound :: Bool        -- ^ uncurry webs with only known calls too
              -> WebSet      -- ^ Exposed webs
              -> UnfoldingPolicy
              -> CoreProgram
-             -> (Maybe CoreProgram, [(WebId, SDoc, Bool, [Id])])
+             -> (Maybe (CoreProgram, Type -> Type), [(WebId, SDoc, Bool, [Id])])
 uncurryRound known_ok us exposed pol binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us (rewriteProgram todo strict pol binds)), dump)
+  | otherwise           = (Just (initUs_ us (rewriteProgram todo strict pol binds), uncurryType todo), dump)
   where
     infos   = analyse binds
     complex = complexCoWebs binds

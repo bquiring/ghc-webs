@@ -8,13 +8,18 @@ module GHC.WebCore.Sigs
   , addGlobalIdSig, addDataConSig, addAxiomSig
   , addExposedWebs
   , pprWebSigs
+    -- * Hidden fields
+  , FieldTys, fieldTys, sigFields
   ) where
 
 import GHC.Prelude
 
 import GHC.Core.Coercion.Axiom
 import GHC.Core.DataCon
-import GHC.Core.TyCo.Rep ( Type )
+import GHC.Core.TyCon ( TyCon )
+import GHC.Core.TyCo.Rep ( Type(..), Scaled(..), scaledThing )
+import GHC.Core.TyCo.Subst ( substTysWith )
+import GHC.Types.Var ( TyVar, VarBndr(..) )
 import GHC.Core.TyCo.Ppr ( pprType )
 
 import GHC.Types.Id
@@ -65,7 +70,40 @@ How the signatures are used:
 
   * Data constructors: Web Lint (GHC.WebCore.Lint.lintCoreAlt) reads the type
     of a data constructor from ws_dcs.  A data constructor's worker Id gets the
-    same signature as the data constructor itself.
+    same signature as the data constructor itself.  For a type whose fields
+    are hidden, only the constructor's own arrows are exposed: Note [Hidden
+    fields].
+-}
+
+{- Note [Hidden fields]
+~~~~~~~~~~~~~~~~~~~~~~~
+What other modules see of this one is its export signature.  A data type's
+fields are part of it only if one of its constructors or record fields is
+exported: a type defined here whose constructors are not exported (local,
+or exported abstractly) has /hidden fields/, even if exported functions
+mention it by name.  The webs inside a hidden field's type are internal, so
+the module's functions stored in such a field, e.g. w in
+
+    data T = T Int (T ->{w} Int)
+
+can change their calling convention.  The webs of the constructor's own
+arrows stay exposed: its arity is fixed.
+
+A constructor that occurs in Core the transformations do not rewrite (the
+RULES, and stable unfoldings in the early run) keeps its fields exposed, as
+do newtypes (their axioms are exposed), classes, families, and types with
+existentials or GADT constructors.
+
+So does a type that an unsafe coercion relates to another (a type argument
+of unsafeCoerce or unsafeEqualityProof, Note [Non-parametric functions] in
+GHC.WebCore.DataSplit, or a type in a UnivCo), and every type reachable
+through its fields: the other side reads the original layout.  Coercing a
+hidden-field type whose field web was raised to a type that still expects
+the old field was a miscompilation.  Only types written in the coercion are
+seen: a polymorphic unsafeCoerce @a @Int, in a function called at a
+hidden-field type, gets past this rule (ignored for now; WEBS-BACKLOG.md).
+
+See hiddenFields in GHC.WebCore.Pipeline.
 -}
 
 data WebSigs = WebSigs
@@ -82,6 +120,8 @@ data WebSigs = WebSigs
       -- interface file: the exported Ids, the Ids free in RULES, and
       -- (transitively) the Ids free in their unfoldings and rules.  Their
       -- types are exposed, and transformations must keep their unfoldings.
+  , ws_hidden_fields :: TyCon -> Bool
+      -- ^ Types whose fields other modules cannot see: Note [Hidden fields]
   }
 
 emptyWebSigs :: WebSigs
@@ -89,7 +129,8 @@ emptyWebSigs = WebSigs { ws_ids     = emptyVarEnv
                        , ws_dcs     = emptyUFM
                        , ws_axioms  = emptyUFM
                        , ws_exposed = emptyUniqSet
-                       , ws_interface_ids = emptyVarSet }
+                       , ws_interface_ids = emptyVarSet
+                       , ws_hidden_fields = const False }
 
 lookupGlobalIdSig :: WebSigs -> Id -> Maybe (Id, Id)
 lookupGlobalIdSig sigs v = lookupVarEnv (ws_ids sigs) v
@@ -128,3 +169,37 @@ pprWebSigs (WebSigs { ws_ids = ids, ws_dcs = dcs, ws_axioms = axs, ws_exposed = 
          , text "Exposed webs:" <+> pprUniqSet ppr exposed ]
   where
     ppr_branch br = sep [ ppr (cab_lhs br), text "~", pprType (cab_rhs br) ]
+
+------------------------------------------------------------------
+--      Hidden fields
+------------------------------------------------------------------
+
+-- | The field types of a data constructor at the given type arguments
+type FieldTys = DataCon -> [Type] -> [Type]
+
+-- | Field types with the webs of the constructor's current signature, for a
+-- type with hidden fields (Note [Hidden fields]): a transformation that
+-- takes a product apart must give its components those webs, which other
+-- transformations may change; otherwise the constructor's own field types
+-- (whose arrows have no webs, and whose webs are exposed)
+fieldTys :: WebSigs -> FieldTys
+fieldTys sigs dc args
+  | ws_hidden_fields sigs (dataConTyCon dc)
+  , Just sig <- lookupDataConSig sigs dc
+  , Just (tvs, fields, _) <- sigFields dc sig
+  , length tvs == length args
+  = substTysWith tvs args (map scaledThing fields)
+  | otherwise
+  = map scaledThing (dataConInstArgTys dc args)
+
+-- | A constructor signature's type variables, fields and result
+sigFields :: DataCon -> Type -> Maybe ([TyVar], [Scaled Type], Type)
+sigFields dc = go []
+  where
+    go tvs (ForAllTy (Bndr tv _) t) = go (tv : tvs) t
+    go tvs t                        = fields (reverse tvs) (dataConRepArity dc) [] t
+
+    fields tvs 0 acc res = Just (tvs, reverse acc, res)
+    fields tvs n acc (FunTy { ft_mult = m, ft_arg = a, ft_res = r })
+      = fields tvs (n - 1 :: Int) (Scaled m a : acc) r
+    fields _ _ _ _ = Nothing

@@ -337,11 +337,11 @@ deadParamsRound :: UniqSupply
                 -> UnfoldingPolicy
                 -> WebSet      -- ^ Done: webs already turned into unit webs
                 -> CoreProgram
-                -> ( Maybe (CoreProgram, WebSet)
+                -> ( Maybe (CoreProgram, WebSet, Type -> Type)
                    , [(WebId, Verdict, [Id])] )
 deadParamsRound us exposed pol done binds
   | isEmptyUniqSet del && isEmptyUniqSet unit = (Nothing, verdicts)
-  | otherwise = ( Just (initUs_ us (rewriteProgram del unit pol binds), unit)
+  | otherwise = ( Just (initUs_ us (rewriteProgram del unit pol binds), unit, dropType del unit)
                 , verdicts )
   where
     infos    = analyse binds

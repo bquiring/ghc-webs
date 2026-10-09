@@ -17,10 +17,10 @@ import GHC.Core.Type
 import GHC.Core.Utils ( exprType, mkLamType )
 
 import GHC.Types.Id
-import GHC.Types.Id.Info ( isEmptyRuleInfo )
+import GHC.Types.Id.Info ( isEmptyRuleInfo, RecSelParent(..) )
 import GHC.Types.Tickish
 import GHC.Types.Unique.Supply
-import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet, mkUniqSet )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
@@ -81,12 +81,14 @@ Details:
 -- See Note [Exposed webs] in GHC.WebCore.Sigs
 annotateProgram :: Bool   -- ^ Keep stable unfoldings (the early run; see
                           --   Note [Early webs] in GHC.WebCore.Pipeline)
+                -> (TyCon -> Bool)   -- ^ Types with hidden fields: Note [Hidden fields]
                 -> UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
-annotateProgram keep_stable us rules binds
+annotateProgram keep_stable hidden us rules binds
   = case unAnnM (ann_top binds) us init_sigs of
       (binds', _, sigs) -> (binds', sigs)
   where
-    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable rules binds }
+    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable hidden rules binds
+                             , ws_hidden_fields = hidden }
 
     ann_top bs
       = do { -- All top-level binders are in scope everywhere
@@ -102,7 +104,10 @@ annotateProgram keep_stable us rules binds
 -- | The local Ids whose types must not change, because unannotated Core that
 -- the web transformations do not rewrite refers to them:
 --
---   * the exported Ids (their types are in the interface)
+--   * the exported Ids (their types are in the interface), except the record
+--     selectors of types with hidden fields: GHC marks every selector
+--     exported, but these are not, and their types follow the fields
+--     (Note [Hidden fields] in GHC.WebCore.Sigs)
 --   * the Ids free in the RULES for imported Ids
 --   * the binders, at any level, that have rules of their own, and the local
 --     Ids free in those rules (Tidy may keep the rules of top-level Ids,
@@ -117,14 +122,18 @@ annotateProgram keep_stable us rules binds
 -- the transformed program (see tidyTopUnfolding in GHC.Iface.Tidy), and the
 -- simplifier rebuilds them too.  In the late run nothing inlines afterwards,
 -- so zapping other unfoldings is harmless.
-keptIds :: Bool -> [CoreRule] -> CoreProgram -> VarSet
-keptIds keep_stable rules binds = go emptyVarSet roots
+keptIds :: Bool -> (TyCon -> Bool) -> [CoreRule] -> CoreProgram -> VarSet
+keptIds keep_stable hidden rules binds = go emptyVarSet roots
   where
     bndrs = allLetBinders binds
-    roots = filter isExportedId (bindersOfBinds binds)
+    roots = filter (\b -> isExportedId b && not (hidden_selector b)) (bindersOfBinds binds)
          ++ filter (not . isEmptyRuleInfo . idSpecialisation) bndrs
          ++ filter isLocalId (nonDetEltsUniqSet (rulesFreeVars rules))
          ++ (if keep_stable then filter (isStableUnfolding . realIdUnfolding) bndrs else [])
+
+    hidden_selector b = case recordSelectorTyCon_maybe b of
+      Just (RecSelData tc) -> hidden tc
+      _                    -> False
 
     -- Look at the binders' own IdInfo: occurrences may carry stale copies.
     -- Several binders can share a Unique (shadowing; e.g. a join point the
@@ -397,15 +406,29 @@ annGlobalId v
                 ; modifySigs (addGlobalIdSig v clone)
                 ; return clone } }
 
--- | The exposed signature of a data constructor's 'dataConRepType'
+-- | The signature of a data constructor's 'dataConRepType': exposed, or for
+-- a type with hidden fields, with only its own arrows exposed
+-- See Note [Hidden fields]
 annDataCon :: DataCon -> AnnM Type
 annDataCon dc
   = do { sigs <- getSigs
        ; case lookupDataConSig sigs dc of
            Just ty -> return ty
-           Nothing -> do { ty <- annExposedType (dataConRepType dc)
-                         ; modifySigs (addDataConSig dc ty)
-                         ; return ty } }
+           Nothing
+             | ws_hidden_fields sigs (dataConTyCon dc)
+             -> do { ty <- annType emptyVarEnv (dataConRepType dc)
+                   ; modifySigs (addExposedWebs (mkUniqSet (spineWebs ty)) . addDataConSig dc ty)
+                   ; return ty }
+             | otherwise
+             -> do { ty <- annExposedType (dataConRepType dc)
+                   ; modifySigs (addDataConSig dc ty)
+                   ; return ty } }
+  where
+    -- The webs of the constructor's own arrows, one per field
+    spineWebs ty = case ty of
+      ForAllTy _ t                   -> spineWebs t
+      FunTy { ft_web = w, ft_res = r } -> w : spineWebs r
+      _                              -> []
 
 annAxiomRule :: CoAxiomRule -> AnnM CoAxiomRule
 annAxiomRule (UnbranchedAxiom ax) = UnbranchedAxiom . toUnbranchedAxiom <$> annAxiom (toBranchedAxiom ax)

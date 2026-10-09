@@ -37,10 +37,11 @@ import GHC.Data.Pair
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
-import GHC.WebCore.Transform.ArityRaise ( productCon, productOf, components
+import GHC.WebCore.Transform.ArityRaise ( productCon, productOf
                                         , splitArgCo, componentsTupleCo, knownHead )
 import GHC.WebCore.Transform.Common
-import GHC.WebCore.Traverse ( stripWebForms )
+import GHC.WebCore.Traverse ( stripWebForms, typeWebs )
+import GHC.WebCore.Sigs ( FieldTys )
 
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe, isJust )
@@ -94,7 +95,7 @@ way left its worker taking a boxed particle and returning a boxed one:
 data Verdict = Raised | Rejected Reason
 
 data Reason = Exposed | NotProduct | RepPoly | Coercion' | JoinLam | KnownCalls
-            | Unconstructed | NoConstruction
+            | Unconstructed | NoConstruction | Recursive
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
@@ -109,6 +110,7 @@ instance Outputable Reason where
   ppr Unconstructed  = text "a tail does not construct the result"
   ppr NoConstruction = text "no tail constructs the result"
   ppr KnownCalls     = text "only known calls (early: left to worker/wrapper)"
+  ppr Recursive      = text "a component mentions a raised web"
 
 ------------------------------------------------------------------
 --      Analysis
@@ -123,10 +125,11 @@ data Info = Info
   , i_coercion  :: Bool
   , i_bad_tail  :: Bool
   , i_con_tails :: Int
-  , i_unknown   :: Bool }   -- Some call of the web is not a known call
+  , i_unknown   :: Bool     -- Some call of the web is not a known call
+  , i_comp_webs :: WebSet } -- The webs in the result's components
 
 noInfo :: Info
-noInfo = Info [] False False [] False False False 0 False
+noInfo = Info [] False False [] False False False 0 False emptyUniqSet
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
@@ -137,7 +140,8 @@ plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
                     , i_coercion  = i_coercion a || i_coercion b
                     , i_bad_tail  = i_bad_tail a || i_bad_tail b
                     , i_con_tails = i_con_tails a + i_con_tails b
-                    , i_unknown   = i_unknown a  || i_unknown b }
+                    , i_unknown   = i_unknown a  || i_unknown b
+                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
 
 type Infos = UniqFM WebId Info
 
@@ -207,8 +211,8 @@ jumpTo e = case e of
   Var v | isJoinId v -> Just v
   _            -> Nothing
 
-analyse :: CoreProgram -> Infos
-analyse binds = foldr go_bind emptyUFM binds
+analyse :: FieldTys -> CoreProgram -> Infos
+analyse fields binds = foldr go_bind emptyUFM binds
   where
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
@@ -254,10 +258,11 @@ analyse binds = foldr go_bind emptyUFM binds
         -> let acc' = go_ty a (go_ty r acc)
            in case productCon (coreFullView r) of
                 Just (tc, args, dc)
-                  | all typeHasFixedRuntimeRep (components dc args)
-                  -> note w (noInfo { i_tycons = [tc] }) acc'
-                  | otherwise
-                  -> note w (noInfo { i_tycons = [tc], i_rep_poly = True }) acc'
+                  | let comps = fields dc args
+                        cws   = unionManyUniqSets (map typeWebs comps)
+                  -> if all typeHasFixedRuntimeRep comps
+                     then note w (noInfo { i_tycons = [tc], i_comp_webs = cws }) acc'
+                     else note w (noInfo { i_tycons = [tc], i_rep_poly = True }) acc'
                 Nothing -> note w (noInfo { i_not_prod = True }) acc'
       TyConApp _ tys -> foldr go_ty acc tys
       AppTy t1 t2    -> go_ty t1 (go_ty t2 acc)
@@ -307,19 +312,29 @@ verdict early exposed complex w i
 
 -- | Analyse the program and raise the results of the webs that qualify.  A
 -- raised web no longer returns a product, so it is not raised again.
-resultRaiseRound :: UniqSupply -> WebSet -> UnfoldingPolicy -> WebSet -> CoreProgram
-                 -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
-resultRaiseRound us exposed pol done binds
+resultRaiseRound :: FieldTys -> UniqSupply -> WebSet -> UnfoldingPolicy -> WebSet -> CoreProgram
+                 -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
+resultRaiseRound fields us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us (rewriteProgram todo pol binds), todo), dump)
+  | otherwise           = ( Just ( initUs_ us (rewriteProgram fields todo pol binds), todo
+                                 , raiseType fields todo )
+                          , dump )
   where
-    infos    = analyse binds
+    infos    = analyse fields binds
     complex  = complexCoWebs binds
-    verdicts = [ (w, verdict (up_early pol) exposed complex w i, i)
-               | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
-               , let w = mkWebId u
-               , not (null (i_lams i))
-               , not (w `elementOfUniqSet` done) ]
+    verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
+                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
+                , let w = mkWebId u
+                , not (null (i_lams i))
+                , not (w `elementOfUniqSet` done) ]
+    -- Note [Recursive products] in GHC.WebCore.Transform.ArityRaise
+    candidates = mkUniqSet [ w | (w, Raised, _) <- verdicts0 ]
+    verdicts = [ (w, v', i)
+               | (w, v, i) <- verdicts0
+               , let v' | Raised <- v
+                        , not (isEmptyUniqSet (i_comp_webs i `intersectUniqSets` candidates))
+                        = Rejected Recursive
+                        | otherwise = v ]
     todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
     dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
 
@@ -328,31 +343,31 @@ resultRaiseRound us exposed pol done binds
 ------------------------------------------------------------------
 
 -- | The unboxed tuple of a product type's components
-tupleOf :: Type -> Type
-tupleOf ty = let (args, dc) = productOf ty in mkTupleTy Unboxed (components dc args)
+tupleOf :: FieldTys -> Type -> Type
+tupleOf fields ty = let (args, dc) = productOf ty in mkTupleTy Unboxed (fields dc args)
 
-raiseType :: WebSet -> Type -> Type
-raiseType todo = go
+raiseType :: FieldTys -> WebSet -> Type -> Type
+raiseType fields todo = go
   where
     go ty = case ty of
       FunTy { ft_web = w, ft_mult = m, ft_arg = a, ft_res = r }
         | w `elementOfUniqSet` todo
         , Just (_, args, dc) <- productCon (coreFullView r)
         -> let a'  = go a
-               tup = mkTupleTy Unboxed (components dc (map go args))
+               tup = mkTupleTy Unboxed (fields dc (map go args))
            in mkWebFunTy w (chooseFunTyFlag a' tup) m a' tup
         | otherwise -> ty { ft_arg = go a, ft_res = go r }
       TyConApp tc tys -> TyConApp tc (map go tys)
       AppTy t1 t2     -> AppTy (go t1) (go t2)
       ForAllTy b t    -> ForAllTy b (go t)
-      CastTy t co     -> CastTy (go t) (raiseCo todo co)
-      CoercionTy co   -> CoercionTy (raiseCo todo co)
+      CastTy t co     -> CastTy (go t) (raiseCo fields todo co)
+      CoercionTy co   -> CoercionTy (raiseCo fields todo co)
       _               -> ty
 
-raiseCo :: WebSet -> Coercion -> Coercion
-raiseCo todo = go
+raiseCo :: FieldTys -> WebSet -> Coercion -> Coercion
+raiseCo fields todo = go
   where
-    goTy = raiseType todo
+    goTy = raiseType fields todo
     go co = case co of
       Refl t              -> Refl (goTy t)
       GRefl r t mco       -> GRefl r (goTy t) mco
@@ -377,13 +392,13 @@ raiseCo todo = go
 
 type Env = IdEnv Id
 
-rewriteProgram :: WebSet -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram todo pol binds
+rewriteProgram :: FieldTys -> WebSet -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
+rewriteProgram fields todo pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
-    upTy = raiseType todo
-    upCo = raiseCo todo
+    upTy = raiseType fields todo
+    upCo = raiseCo fields todo
     is_todo w = w `elementOfUniqSet` todo
 
     rw_top env (NonRec b e) = NonRec (lookup_bndr env b) <$> rw env e
@@ -486,7 +501,7 @@ rewriteProgram todo pol binds
     -- raising, with its arguments raised.
     rebox prod_ty call
       = do { let (args, dc) = productOf prod_ty
-                 comps = components dc args
+                 comps = fields dc args
            ; ys <- mapM (fresh "y") comps
            ; wild <- mkWild (mkTupleTy Unboxed comps)
            ; return (Case call wild prod_ty
@@ -525,7 +540,7 @@ rewriteProgram todo pol binds
               ; alts' <- sequence [ Alt con bs' <$> rw_tail env'' rhs
                                   | Alt con bs rhs <- alts
                                   , let (env'', bs') = rw_bndrs env' bs ]
-              ; return (Case scrut' b' (tupleOf (upTy ty)) alts') }
+              ; return (Case scrut' b' (tupleOf fields (upTy ty)) alts') }
       Tick t e | not (tickishIsCode t) -> Tick (rw_tick env t) <$> rw_tail env e
       _ | Just (_, _, vals) <- conApp expr
         -> mkCoreUnboxedTuple <$> mapM (rw env) vals
@@ -546,7 +561,7 @@ rewriteProgram todo pol binds
     unbox e
       = do { let ty = exprType e
                  (args, dc) = productOf ty
-                 comps = components dc args
+                 comps = fields dc args
            ; ys <- mapM (fresh "y") comps
            ; wild <- mkWild ty
            ; return (Case e wild (mkTupleTy Unboxed comps)
@@ -563,7 +578,7 @@ rewriteProgram todo pol binds
       NotJoinPoint -> j
 
     replaceResult :: Int -> Type -> Type
-    replaceResult 0 ty = tupleOf ty
+    replaceResult 0 ty = tupleOf fields ty
     replaceResult n ty = case ty of
       ForAllTy b t       -> ForAllTy b (replaceResult (n - 1) t)
       ft@FunTy { ft_res = r } -> let r' = replaceResult (n - 1) r
