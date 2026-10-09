@@ -14,27 +14,23 @@ a heuristic.
 
 ## Now
 
-Plan (2026-10-08):
+Plan (2026-10-09):
 
-1. ~~Fix the Core Lint errors in polymorphic defunctionalisation~~ (done,
-   see "Done"). All six benchmarks missing from `early-df` (`CS`, `dom-lt`,
-   `transform`, `veritas`, `circsim`, `solid`) now compile with
-   `-dcore-lint`, with and without lifted bodies.
-2. **Test lifted bodies** (`-fcore-webs-defunc-lifted`, Note [Lifted bodies]
-   in `GHC.WebCore.Transform.Defunc`). It compiles but has not run yet: run
-   the webs tests with it (add `-fcore-webs-defunc-lifted` variants of the
-   `defunc` tests), then nofib against the apply-function version.
-3. **Then measure.** Partial results so far, with the four benchmarks
-   missing (`results/timing-defunc.md`): 71 webs defunctionalised (49 with
-   one constructor), against 22 for the monomorphic version; `mate`
-   −13.1% time against `base`, `event` +6.5% time (check its
-   instructions).
+1. **Time the current state** (`webs-bench/run-hftiming.sh`, running):
+   hidden fields, specialising for webs and the flattening fixes, with
+   early-cur's options, at 3 and 10 flattening rounds, against `base` and
+   `early-cur`; best allocation and instruction counts.
+2. **Then choose the next optimisation** from "Core-to-Core" below. The
+   unboxing fixpoints are not it (see "Unboxing fixpoints").
+3. **Sync the branches.** `webs` has constructed-argument raising and
+   one-shot lambdas (`78d6fd8fc9`, measured in WEBS-EXPERIMENTS.md §8),
+   defunctionalisation heuristics and the latest backlog; `data-split` has
+   data splitting, unboxing, hidden fields, curried arity raising, whole-arity
+   defunctionalisation and the bug log. Neither contains the other.
+4. **k-nucleotide's input** for timing (WEBS-BUGS.md, Open), between runs.
 
-## Next
-
-- **Data webs, phase 1** (`WEBS-DATA.md`): data webs in annotation, Lint,
-  solving, renaming and erasure, with statistics only. Measure how many
-  data webs are local on nofib, per type constructor.
+The polymorphic-defunctionalisation fixes, lifted bodies and their
+measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
 
 ## Core-to-Core: to implement
 
@@ -108,10 +104,8 @@ Plan (2026-10-08):
 - **Local newtypes** (Survey §14): a newtype that is not exported gets
   ordinary webs on its axiom, so functions in a local `State` monad become
   transformable.
-- **Constructed-argument raising** (Survey §8): if every call of a web
-  passes an explicit constructor application, unbox it even if a lambda is
-  lazy in it (each lambda rebuilds it, a value). What SpecConstr does by
-  copying. A second eligibility rule in `ArityRaise.hs`.
+- **Constructed-argument raising** (Survey §8): done on the `webs` branch
+  (`78d6fd8fc9`; wave4main −4.6%), not yet on `data-split`.
 - **Nested unboxing** (Survey §1): arity raising unboxes one level; GHC
   unboxes a pair of pairs recursively.
 - **Uncurrying in the early run** (Survey §11): off there today (Note [No
@@ -128,9 +122,8 @@ Plan (2026-10-08):
 - **Richer demands in web strictness.** Nested demands (strict in a field of
   a product argument), call demands (an argument always called with n
   arguments), cardinality.
-- **One-shot lambdas from webs.** If every partial application of a web's
-  lambdas is called at most once, the lambdas are one-shot. GHC uses this to
-  float work into lambdas and to eta-expand.
+- **One-shot lambdas from webs.** Done on the `webs` branch (`78d6fd8fc9`):
+  no effect on nofib. Find out why, or drop it.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
 - **Streams** (tests `stream001`, `stream002`, 2026-10-09): stream fusion's
@@ -142,6 +135,19 @@ Plan (2026-10-08):
   `Stream` are exposed, so arity raising rejects them; defunctionalisation
   takes only mapS's two functions. First find out what exposes the
   classes (the data dump gives no reason for them: add one).
+- **Unboxing fixpoints** (later, 2026-10-09; measured, little to gain):
+  * More flattening rounds (`-fcore-webs-unbox-rounds`): no field of a split
+    type ends waiting for a later round on nofib, and cryptarithm2 at 5 or
+    10 rounds unboxes the same 6 fields with the same instructions (its lost
+    3% is strict elimination's extra field, which costs). `early-hf10` in
+    run-hftiming.sh checks all of nofib.
+  * One fixpoint for field, argument and result unboxing (WEBS-DATA.md,
+    planned 2026-10-08): of 518 fields of split types, 277 are unboxed and
+    63 dropped; it would reach the 29 used boxed (returned, an argument, an
+    unboxed tuple), and some of the 97 blocked by another structure's boxed
+    field, most of which are exposed tuples. The 37 blocked by laziness need
+    strictness, not a fixpoint. A ceiling of a few percent more fields, and
+    more fields is not always faster.
 - **Call demands and cardinality** are under "Richer demands" above.
 - **Compile time.** The early pipeline costs +10–11% compiler allocation on
   nofib. Web Lint runs once per round of each transformation.
