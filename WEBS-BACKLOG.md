@@ -40,13 +40,71 @@ Plan (2026-10-08):
 
 - **Named function types, one per web** (from an earlier implementation):
   analogous to named data types, each web gets a named function type
-  constructor. Monomorphism or specialisation is then recorded once per web
-  in its type, instead of being recomputed by every pass (e.g.
-  defunctionalisation's types `D_w a b`, and specialising them when a most
-  general unifier exists).
+  constructor, a top-level name for the structural `mu w. A -> B`. Two uses:
+  * **Breaking cycles.** A web stored in a field of the type it takes or
+    returns (`T = (Int, T ->{w} Int)`) cannot be raised structurally (an
+    infinite type); with a name, `newtype W = W (Int -> W -> Int)`, it
+    can, the field holding a `W` and calls unwrapping it (a cast, free).
+    A GHC newtype may be the way to do it in Core (the user's suggestion,
+    2026-10-09).
+  * **Caching analysis.** The named types can be specialised and
+    monomorphised once, recording what downstream web passes now recompute
+    each time (e.g. defunctionalisation's types `D_w a b`, specialised when
+    a most general unifier exists).
 
 - **Data webs, phases 2–4** (`WEBS-DATA.md`): splitting into local types;
   strict, unpacked and dead fields; congruence for nested fields.
+- **Hidden fields** (done, 2026-10-09; Note [Hidden fields] in
+  `GHC.WebCore.Sigs`, Note [Signatures follow the transformations] in
+  `GHC.WebCore.HiddenFields`): the webs inside the fields of types whose
+  constructors are not exported are internal; constructor signatures follow
+  the transformations and the types are rebuilt in place. Webs that would
+  raise through themselves (`T = (Int, T ->{w} Int)`) are rejected (Note
+  [Recursive products]). Tests `hfield001`-`002`, `recweb001`-`005`. Next:
+  * **Recursive webs as newtypes** (low priority: the occurs check fired 0
+    times on nofib, 2026-10-09, and the user expects it to be rare): for
+    exactly the webs Note [Recursive products] rejects, name the web's type
+    with a recursive newtype (`newtype W = W (Int -> W -> Int)`), the field
+    holding a `W`, and raise. **Only there**: every other web stays
+    structural, since a newtype adds a cast at every use (the user,
+    2026-10-09).
+  * **Defunctionalisation** leaves hidden-field webs alone: its new types
+    are replaced by SpecIndex afterwards, and a rebuilt field would have to
+    follow.
+  * **Strict function fields** (next): a constructor whose wrapper only
+    evaluates `!`-marked fields (`data T = T !(Int -> Int)`) keeps its
+    fields exposed today. Regenerate the wrapper with `mkDataConRep` in the
+    rebuild (most wrapper calls are inlined before the early run).
+  * **Low priority** (the user, 2026-10-09), what each would take:
+    * Existentials (non-GADT): the rebuild carries existential type
+      variables and contexts; signatures skip their binders and dictionary
+      arguments. Would unblock stream fusion's `Stream` (`stream001`).
+    * Newtypes (`recweb005`): a hidden newtype's axiom gets an internal
+      signature that follows the transformations, and is rebuilt in place
+      (local newtypes over functions: parsers, `State`; "Local newtypes").
+    * Other wrappers (unpacked fields), GADTs, data family instances.
+    * Not classes: instances are global, and cross-module unfoldings use
+      dictionary fields.
+    Constructors in rules or stable unfoldings stay exposed (that Core is
+    not rewritten), as do types related by unsafe coercions (Note [Hidden
+    fields]).
+  * **Safety, later** (after the runtime gains, the user's call): the
+    unsafe-coercion rule sees only types written in the coercion's type
+    arguments. A polymorphic `unsafeCoerce @a @Int`, in a function called
+    at a hidden-field type, gets past it; ignored explicitly for now.
+  * **Measured on nofib** (early-cur options, `webs-bench/run-hidden.sh`,
+    2026-10-09): 481 types with hidden fields, but only 22 webs inside them;
+    internal lambda classes 7,460 -> 7,483 (+23, +0.3%), most in event,
+    constraints, circsim, k-nucleotide, infer. Arity raising changes 13 ->
+    14 webs, result raising 15 -> 16. All 115 build under Core Lint, same
+    output as base. Local types rarely hold functions; the function-holding
+    ones are newtypes (parsers, State) and existentials (streams), still
+    exposed, so the low-priority items above are where more would come from.
+  * **Specialising for webs** (Note [Specialising for webs] in
+    `GHC.WebCore.DataSplit`): data splitting keeps a copy whose
+    specialisation adds product arguments or results to its function fields
+    (`data P a = P Int (a -> Int)` used only at pairs). Not yet measured on
+    nofib; watch for split costs (Note [Keeping only useful splits]).
 - **Local newtypes** (Survey §14): a newtype that is not exported gets
   ordinary webs on its axiom, so functions in a local `State` monad become
   transformable.
@@ -75,6 +133,15 @@ Plan (2026-10-08):
   float work into lambdas and to eta-expand.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
+- **Streams** (tests `stream001`, `stream002`, 2026-10-09): stream fusion's
+  `Step`/`Stream` with combinators not inlined. No transformation improves
+  either (2,000,000 elements: 806M instructions, 488 MB allocated, base and
+  webs alike, within 0.4%). Data splitting splits nothing (17 classes, 11
+  exposed), so `Step`'s pairs and zipS's state triple stay boxed, even with
+  the state in the type (`stream002`); the step functions stored in each
+  `Stream` are exposed, so arity raising rejects them; defunctionalisation
+  takes only mapS's two functions. First find out what exposes the
+  classes (the data dump gives no reason for them: add one).
 - **Call demands and cardinality** are under "Richer demands" above.
 - **Compile time.** The early pipeline costs +10–11% compiler allocation on
   nofib. Web Lint runs once per round of each transformation.
