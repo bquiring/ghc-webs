@@ -74,6 +74,20 @@ arguments, related two types that Lint does not, so their copies were split
 apart and unboxed differently (a segfault). Both keep original types now
 (Note [Non-parametric functions]).
 
+Strict binders as values (Note [Strict binders are values], demand
+analysis): against `early-fix`, geomean −0.72% (20 >0.5% better, 2 worse),
+from −0.51%; queens −20%, sched −1.0%, typecheck −1.0%, pic −0.9%;
+fibheaps +2.0% against the version before. 421 fields unboxed.
+
+Then: copies keep each field's strictness (Note [Copies keep strictness]:
+a split `Complex` had become lazier than `Complex`, the cause of x2n1's
++1.0%); only splits that change something are kept (Note [Keeping only
+useful splits]: cichelli's split-only +1.7% came from two copy types of
+one list that GHC could no longer share, and a specialisation that no
+longer applied); splitting and unboxing also in the late run, without the
+demand-based rules (Note [Unboxing in the late run]). Edge-case tests now
+21 programs in seven modes (five early, two late).
+
 ### Next: one fixpoint for all unboxing (planned, 2026-10-08)
 
 Field unboxing, argument unboxing (arity raising) and result unboxing

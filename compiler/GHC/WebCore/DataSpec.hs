@@ -211,10 +211,9 @@ specialiseSplit this_mod us tcs binds
             -- Other specialised types in the fields are rewritten too (lazily:
             -- 'ty' looks at all the specialisations)
             arg_tys = [ Scaled m (ty (self (substTy sub t))) | Scaled m t <- dataConOrigArgTys dc ]
-            no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
             dc' = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
-                    (map (const no_bang) arg_tys) (map (const HsLazy) arg_tys)
-                    (map (const NotMarkedStrict) arg_tys)
+                    -- Note [Copies keep strictness] in GHC.WebCore.DataSplit
+                    (dataConSrcBangs dc) (dataConImplBangs dc) (dataConRepStrictness dc)
                     [] tvs [] emptyNameEnv (mkTyVarBinders Specified tvs) [] []
                     arg_tys (mkTyConApp tycon (mkTyVarTys tvs))
                     NoPromInfo tycon (dataConTag dc) [] (mkDataConWorkId wk_name dc') NoDataConRep

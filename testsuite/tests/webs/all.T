@@ -249,10 +249,14 @@ test('dataunbox006_dump', [extra_files(['dataunbox006.hs'])],
 # phantom roles; GADTs and existentials; unsafeCoerce.  011-018 are run-time,
 # with boxes: errors and infinite structures inside fields, sharing (a trace
 # that must appear once), seq/foldl'/length, values escaping to base, nested
-# pairs/Maybe/Either, re-boxing, knots, exceptions.  Expected output from the
-# stock compiler at -O0.  Every program runs in five modes, all with Core
-# Lint (and Data Lint): split only; with unboxing; with nested unboxing;
-# with the size bound at 1; and with every early transformation.
+# pairs/Maybe/Either, re-boxing, knots, exceptions.  019-021 are strict
+# fields: polymorphic ones (no wrapper, so split; a copy must stay strict),
+# Data.Complex, and unpacked ones mixed with lazy ones.  Expected output
+# from the stock compiler at -O0.  Every program runs in seven modes, all
+# with Core Lint (and Data Lint): in the early run, split only; with
+# unboxing; with nested unboxing; with the size bound at 1; with every early
+# transformation; and in the late run, split and unbox; with every late
+# transformation.
 dsedge_all = (early_opts + ' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
               ' -fcore-webs-dead-params -fcore-webs-result-raise -fcore-webs-strictness'
               ' -fcore-webs-data-split -fcore-webs-data-unbox -fcore-webs-unbox-nested')
@@ -261,11 +265,16 @@ dsedge_modes = [ ('_split',  ds_opts)
                , ('_nested', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-unbox-nested')
                , ('_size1',  ds_opts + ' -fcore-webs-data-unbox -fcore-webs-unbox-nested'
                                      ' -fcore-webs-max-unbox-size=1')
-               , ('_all',    dsedge_all) ]
-for n in range(1, 19):
+               , ('_all',    dsedge_all)
+                 # The late run (after all Core optimisations; Note [Unboxing in
+                 # the late run]): split and unbox, and every late transformation
+               , ('_late',   webs_opts + ' -fcore-webs-data-split -fcore-webs-data-unbox')
+               , ('_lateall', all_opts + ' -fcore-webs-data-split -fcore-webs-data-unbox'
+                                       ' -fcore-webs-unbox-nested') ]
+for n in range(1, 22):
     name = 'dsedge%03d' % n
     specs = {'stdout': name + '.stdout'}
-    if n == 12:
+    if n in [12, 19]:
         specs['stderr'] = name + '.stderr'
     for (suffix, opts) in dsedge_modes:
         test(name + suffix, [extra_files([name + '.hs']), use_specs(specs)],

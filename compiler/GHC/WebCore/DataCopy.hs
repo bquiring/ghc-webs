@@ -24,6 +24,8 @@ data UnboxOpts = UnboxOpts
   { uo_eager      :: Bool              -- ^ -fcore-webs-data-unbox-eager
   , uo_nested     :: Bool              -- ^ -fcore-webs-unbox-nested
   , uo_max_size   :: Int               -- ^ -fcore-webs-max-unbox-size
+  , uo_trust_demands :: Bool           -- ^ demands are fresh (the early run):
+                                       --   Note [Unboxing in the late run]
   , uo_orig_sizes :: [(String, Int)] } -- ^ the split constructors' original sizes, by name
 
 -- | Every copy, mapped to the type constructor it is a copy of

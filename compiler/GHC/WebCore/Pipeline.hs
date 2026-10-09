@@ -106,8 +106,10 @@ webPass early guts
          -- Split data types (early run only)
          -- See Note [Splitting data types] in GHC.WebCore.DataSplit
        ; (binds_d, split_tcs) <-
-           if early && gopt Opt_CoreWebsDataSplit dflags
-           then runDataSplit logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
+           -- In the early run, or in the late run if there is no early one
+           -- (Note [Unboxing in the late run] in GHC.WebCore.DataFlatten)
+           if gopt Opt_CoreWebsDataSplit dflags && (early || not (gopt Opt_CoreWebsEarly dflags))
+           then runDataSplit early logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
            else return (mg_binds guts, [])
 
        ; let -- 0. Split exposed webs at the module boundary (early run only)
@@ -186,18 +188,22 @@ webPass early guts
 
 -- | Split data types (Note [Splitting data types] in GHC.WebCore.DataSplit);
 -- stop if Data Lint finds a type error in the annotated program
-runDataSplit :: Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
+runDataSplit :: Bool -> Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
              -> CoreM (CoreProgram, [TyCon])
-runDataSplit logger dflags this_mod rules binds
+runDataSplit early logger dflags this_mod rules binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let unbox | gopt Opt_CoreWebsDataUnbox dflags
                    = Just (UnboxOpts { uo_eager      = gopt Opt_CoreWebsDataUnboxEager dflags
                                      , uo_nested     = gopt Opt_CoreWebsUnboxNested dflags
                                      , uo_max_size   = websMaxUnboxSize dflags
+                                     , uo_trust_demands = early
                                      , uo_orig_sizes = [] })
                    | otherwise = Nothing
-             res = splitDataTypes unbox
-                                  (dataLintConfig dflags) this_mod us rules binds
+             -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
+             split keep = splitDataTypes unbox keep (dataLintConfig dflags) this_mod us rules binds
+             res0 = split Nothing
+             res | Just _ <- unbox, dsr_changed res0 = split (Just (dsr_useful res0))
+                 | otherwise                         = res0
              errs = DL.dlr_errs (dsr_lint res)
        ; unless (isEmptyBag errs) $ liftIO $
            do { logMsg logger MCInfo noSrcSpan $ withPprStyle defaultDumpStyle $

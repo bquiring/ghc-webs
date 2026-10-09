@@ -70,6 +70,20 @@ Start from every candidate field and remove the ones that fail, until
 nothing changes.  A removed field stays a pointer to a boxed value.
 -}
 
+{- Note [Unboxing in the late run]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Data splitting and unboxing run in the early web run (-fcore-webs-early),
+right after demand analysis, or, without an early run, in the late one
+(-fcore-webs), after all of Core's optimisations.  The late run cannot trust
+demands: the simplifier, float-out and SpecConstr have moved code since the
+last demand analysis (a let floated to a larger scope may no longer be
+strict in it).  So there, no rule reads them: strict binders are not values
+(Note [Strict binders are values]), no field is strictly eliminated (Note
+[Strictly eliminated fields]), a callee's signature does not make an
+argument unboxable, and -fcore-webs-data-unbox-eager does nothing.  What is
+left needs no demands: values, projections, strict constructor fields.
+-}
+
 {- Note [Strict binders are values]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A binder that demand analysis says is strictly demanded in its scope -- a
@@ -218,7 +232,10 @@ flattenFields opts this_mod us tcs binds
     _ = cands
 
     -- Candidate fields: products, not recursive
-    eager  = uo_eager opts
+    -- Note [Unboxing in the late run]: without fresh demands, no rule that
+    -- reads them
+    trust  = uo_trust_demands opts
+    eager  = uo_eager opts && trust
     nested = uo_nested opts
 
     -- Note [Bounding unboxing]: a candidate must keep its constructor within
@@ -361,7 +378,7 @@ flattenFields opts this_mod us tcs binds
     ctx_ok _ CDemanded    = True
     ctx_ok _ CAllocated   = False
     ctx_ok m (CField k j) = in_set m k j
-    strictly_elim dc i = in_set strictly_eliminated dc i
+    strictly_elim dc i = trust && in_set strictly_eliminated dc i
 
     arg_fact ev pv a
       | value ev a                      = AValue
@@ -390,12 +407,16 @@ flattenFields opts this_mod us tcs binds
       [ "a match uses it boxed: " ++ use_why u
       | (dc', j, us, _) <- match_facts, dc' == dc, j == i, u <- take 1 (filter (not . use_ok m) us) ]
       where
+        arg_ok _ _ | strict_field dc i = True   -- the worker evaluates it anyway
         arg_ok _ AValue      = True
         arg_ok m' (APat k j) = nested && in_set m' k j   -- Note [Bounding unboxing]
         -- a thunk, if the field is strictly eliminated (Note [Strictly
         -- eliminated fields]); with -fcore-webs-data-unbox-eager, if every
         -- match is strict in it (Note [Eager unboxing])
         arg_ok _ (AOther _)  = strictly_elim dc i || (eager && strict_everywhere dc i)
+    strict_field dc i = case drop i (dataConRepStrictness dc) of
+      (MarkedStrict : _) -> True
+      _                  -> False
     strict_everywhere dc i = and [ s | (dc', j, _, s) <- match_facts, dc' == dc, j == i ]
     use_ok _ UScrut        = True
     use_ok _ UStrictArg    = True
@@ -427,8 +448,9 @@ flattenFields opts this_mod us tcs binds
     -- whose right-hand side is a value: they are values too (annotation
     -- zaps unfoldings, so exprIsHNF does not see it)
     -- Note [Strict binders are values]
-    strict_binders = mkVarSet [ b | b <- concatMap all_bndrs binds, isId b, isLocalId b
-                                  , isStrUsedDmd (idDemandInfo b) ]
+    strict_binders | not trust = emptyVarSet
+                   | otherwise = mkVarSet [ b | b <- concatMap all_bndrs binds, isId b, isLocalId b
+                                              , isStrUsedDmd (idDemandInfo b) ]
     all_bndrs bind = concatMap (\(b, e) -> b : expr_bndrs e) (flattenBinds [bind])
     expr_bndrs e = case e of
       Lam b x       -> b : expr_bndrs x
@@ -506,7 +528,8 @@ flattenFields opts this_mod us tcs binds
           | Just dc <- isDataConWorkId_maybe f
           = if n == dataConRepArity dc then UConArg dc j
             else UBoxed ("an argument to an unsaturated " ++ getOccString dc)
-          | (ds, _) <- splitDmdSig (idDmdSig f)
+          | trust
+          , (ds, _) <- splitDmdSig (idDmdSig f)
           , n >= length ds, Just d <- index j ds, strict_unboxed d
           = UStrictArg
           | (ds, _) <- splitDmdSig (idDmdSig f), n < length ds
@@ -638,11 +661,17 @@ flattenFields opts this_mod us tcs binds
                                  Flatten pdc as -> map (\(Scaled m' t') -> Scaled m' (ty (self t')))
                                                        (dataConInstArgTys pdc as)
                              | (Scaled m t, f) <- zip (dataConOrigArgTys dc) fs ]
-            no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
+            -- Each field keeps its strictness; flattened components take their
+            -- own constructor's (Note [Copies keep strictness] in
+            -- GHC.WebCore.DataSplit)
+            bangs = concat [ case f of
+                               Keep           -> [b]
+                               Flatten pdc _  -> field_bangs pdc
+                           | (b, f) <- zip (field_bangs dc) fs ]
+            field_bangs d = zip3 (dataConSrcBangs d) (dataConImplBangs d) (dataConRepStrictness d)
             univs   = dataConUnivTyVars dc
             dc' = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
-                    (map (const no_bang) arg_tys) (map (const HsLazy) arg_tys)
-                    (map (const NotMarkedStrict) arg_tys)
+                    [ sb | (sb, _, _) <- bangs ] [ ib | (_, ib, _) <- bangs ] [ sm | (_, _, sm) <- bangs ]
                     [] univs [] emptyNameEnv (dataConUserTyVarBinders dc) [] []
                     arg_tys (mkTyConApp tycon (mkTyVarTys univs))
                     NoPromInfo tycon (dataConTag dc) [] (mkDataConWorkId wk_name dc') NoDataConRep

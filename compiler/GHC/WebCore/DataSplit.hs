@@ -53,7 +53,7 @@ import GHC.WebCore.DataSpec ( specialiseSplit )
 
 import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
-import Data.Char ( isUpper )
+import Data.Char ( isUpper, isDigit )
 import Data.List ( sortOn, nub )
 import Data.Maybe ( isNothing, catMaybes, fromMaybe )
 
@@ -114,7 +114,9 @@ data DataSplitResult = DataSplitResult
   , dsr_tycons  :: [TyCon]            -- ^ the new types
   , dsr_dump    :: SDoc               -- ^ for -ddump-webs-data
   , dsr_lint    :: DataLintResult     -- ^ Data Lint on the annotated program
-  , dsr_changed :: Bool }
+  , dsr_changed :: Bool
+  , dsr_useful  :: [Int] }            -- ^ the classes whose split changed something
+                                      --   (Note [Keeping only useful splits])
 
 ------------------------------------------------------------------
 --      Eligibility
@@ -158,6 +160,36 @@ eligibleNewtype tc
 -- | What annotation copies: data types and newtypes
 copyable :: TyCon -> Bool
 copyable tc = eligible tc || eligibleNewtype tc
+
+{- Note [Copies keep strictness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A constructor with strict fields of a type variable needs no wrapper (its
+worker is strict: Note [Data-con worker strictness] in GHC.Core.DataCon), so
+it is eligible -- Data.Complex's  !a :+ !a.  Every rebuild of a constructor
+(a copy, a specialised or a flattened type) keeps each field's source bang,
+implementation bang and strictness mark; flattened components take their
+own constructor's.  (Building them lazy made the split Complex lazier than
+Complex: case undefined :+ 1 of _ :+ _ -> "ok" no longer diverged, and nofib
+imaginary/x2n1 stored thunks where it had stored values.)  A strict field
+evaluates whatever it is given, so for unboxing any argument will do.
+-}
+
+{- Note [Keeping only useful splits]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A split that changes nothing -- no field unboxed, no constructor dropped --
+buys nothing, and costs: GHC cannot share equal expressions at two
+different copy types (nofib spectral/cichelli built [0 .. maxval] twice,
+where it had shared it), specialisations made for the original type no
+longer apply, and every split type has its own info tables.  On nofib,
+splitting alone was +1.7% instructions on cichelli, +1.4% on event.
+
+So with unboxing on, splitting runs twice.  The first pass finds the classes
+whose split changed something; the second splits only those, and puts every
+other class back on the original type (always well typed: a class is
+closed, as for a class that builds nothing).  A newtype class is kept if one
+of its children's classes is (its axiom names them).  Both passes use the
+same unique supply, so the classes, and their numbers, are the same.
+-}
 
 {- Note [Splitting newtypes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -261,11 +293,10 @@ mkCopy us mk_name tc_occ dc_occ tc dcs = tycon
         dc_name = mk_name u_dc occ
         wk_name = mk_name u_wk (mkDataConWorkerOcc occ)
         arg_tys = [ Scaled m (self t) | Scaled m t <- dataConOrigArgTys dc ]
-        no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
         univs   = dataConUnivTyVars dc
+        -- The copy is as strict as the original (Note [Copies keep strictness])
         dc' = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
-                (map (const no_bang) arg_tys) (map (const HsLazy) arg_tys)
-                (map (const NotMarkedStrict) arg_tys)
+                (dataConSrcBangs dc) (dataConImplBangs dc) (dataConRepStrictness dc)
                 [] univs [] emptyNameEnv (dataConUserTyVarBinders dc) [] []
                 arg_tys (mkTyConApp tycon (mkTyVarTys univs))
                 NoPromInfo tycon tag [] (mkDataConWorkId wk_name dc') NoDataConRep
@@ -592,34 +623,35 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: Maybe UnboxOpts -> LintConfig -> Module -> UniqSupply -> [CoreRule] -> CoreProgram
-               -> DataSplitResult
-splitDataTypes unbox cfg this_mod us rules binds
+splitDataTypes :: Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
+               -> CoreProgram -> DataSplitResult
+splitDataTypes unbox keep cfg this_mod us rules binds
   = DataSplitResult
       { dsr_binds   = final_binds
       , dsr_tycons  = final_tcs
       , dsr_dump    = dump $$ flat_dump
       , dsr_lint    = lint_res
-      , dsr_changed = changed }
+      , dsr_changed = changed
+      , dsr_useful  = useful }
   where
     (us1, us23) = splitUniqSupply us
     (us2, us3)  = splitUniqSupply us23
     split_binds = evalState (mapProgram rwMapper ann_binds) ()
     -- Unbox fields of the new types (Note [Flattening fields] in
     -- GHC.WebCore.DataFlatten)
-    (final_binds, final_tcs, flat_dump)
-      | not changed = (binds, [], empty)
+    (final_binds, final_tcs, flat_dump, flat_rebuilt)
+      | not changed = (binds, [], empty, [])
       | Just opts0 <- unbox
                     = let (us4, us5) = splitUniqSupply us3
                           (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
-                          (fl_binds, fl_tcs, fl_dump) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
+                          (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
                           opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
                                                          | tc <- sp_tcs, dc <- tyConDataCons tc ] }
-                      in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump)
-      | otherwise   = (split_binds, new_tcs, empty)
+                      in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump, fl_rebuilt)
+      | otherwise   = (split_binds, new_tcs, empty, [])
 
     -- Each round unpacks one more level (Note [Flattening fields])
-    flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty)
+    flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty, [])
     -- Between rounds, the simple optimiser inlines the aliases a round leaves
     -- (let x = y) and takes apart the cases on constructors it builds, so
     -- that the next round sees the fields' real uses
@@ -629,9 +661,10 @@ splitDataTypes unbox cfg this_mod us rules binds
             changed_round = map getUnique tcs' /= map getUnique tcs
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
-            (bs'', tcs'', d') | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
-                              | otherwise     = (bs', tcs', empty)
-        in (bs'', tcs'', d $$ d')
+            rebuilt = [ tc | tc <- tcs', getUnique tc `notElem` map getUnique tcs ]
+            (bs'', tcs'', d', r') | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
+                                  | otherwise     = (bs', tcs', empty, [])
+        in (bs'', tcs'', d $$ d', rebuilt ++ r')
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
@@ -697,11 +730,37 @@ splitDataTypes unbox cfg this_mod us rules binds
     fates = [ (ms, orig, fate, bs, mts)
             | (n, (orig, ms, bs, mts)) <- zip [1 :: Int ..] classes
             , let fate | any (not . is_copy) ms = Exposed
+                       | not (kept n ms)        = Bottom   -- back to the original
                        | isNewTyCon orig        = mk_split_nt n orig ms
                        | null bs                = Bottom
                        | otherwise              = mk_split n orig bs ]
 
     split_us = listSplitUniqSupply us2
+
+    -- Note [Keeping only useful splits]: in the second pass, a data class is
+    -- split only if the first pass found its split useful; a newtype class
+    -- only if one of its members' children's classes is kept (its axiom
+    -- names them)
+    kept n ms = case keep of
+      Nothing -> True
+      Just ks
+        | any (isNewTyCon . copyOriginal copies) (take 1 ms)
+        -> any (\c -> class_number c `elem` ks)
+               [ ch | m <- ms, Just chs <- [children m], ch <- chs ]
+        | otherwise -> n `elem` ks
+    class_number c = fromMaybe 0 (lookup (getUnique (rep c)) class_numbers)
+    class_numbers = [ (getUnique (rep m0), n) | (n, (_, m0 : _, _, _)) <- zip [1 :: Int ..] classes ]
+
+    -- The classes whose split changed something (first pass): a field
+    -- unboxed in some round, or a constructor dropped.  The new types are
+    -- named Orig_s<n> after their class, through every rebuild.
+    useful = nub ([ n | tc <- flat_rebuilt, Just n <- [split_number tc] ] ++
+                  [ n | (n, (_, orig, Split _ cons, _, _)) <- zip [1 :: Int ..] fates
+                      , not (isNewTyCon orig)
+                      , length cons < length (tyConDataCons orig) ])
+    split_number tc = case reverse (occNameString (getOccName tc)) of
+      str | (ds@(_ : _), 's' : '_' : _) <- span isDigit str -> Just (read (reverse ds))
+      _ -> Nothing
     mk_split n orig tags = Split tc (zip tags (tyConDataCons tc))
       where
         tc = mkCopy (split_us !! n)
