@@ -404,6 +404,29 @@ benchmarks at least 5% faster, backed by instructions. rewrite now builds
 and runs right (−6.6% allocation; early-cur crashed). fasta, awards and
 k-nucleotide fail for base too (harness).
 
+## 12. Strictness feeding raising (2026-10-09)
+
+Web strictness records the strictness it proves on the parameters (Note
+[Recording proven strictness]); raised components get their demands within
+the product (Note [Component demands]), are never partially applied, and are
+substituted rather than aliased, so nested raising works (`alltransforms001`:
+`sumP` passes `Int#`); `-fcore-webs-passes=N` repeats the transformations
+(Note [Repeating the transformations]). `run-strict.sh`: early-mdf's options
+with one pass (`early-ns`) and two (`early-ns2`), all 115 built with
+`-dcore-lint`.
+
+No benchmark changes by more than 0.2% in instructions or allocation
+against `early-mdf` (geomean −2.19% for all three; allocation −3.14%).
+Arity raising raises 27 webs over nofib, 28 with one pass and 30 with two:
+its limits are exposure (7,763 webs) and known calls left to worker/wrapper
+(7,304), not laziness. Kept (correct, and nested raising is needed later),
+with one pass by default.
+
+The measurement itself got faster: builds with 4 jobs (`NOFIB_JOBS`) and
+timing on 4 performance cores (`time-nofib.py --cpus 2,4,6,8`; instruction
+ratios match the serial runner to 0.01 points over 111 benchmarks): 3 rounds
+of 4 configurations in 7 minutes instead of about 40.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

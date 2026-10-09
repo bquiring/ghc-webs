@@ -23,14 +23,14 @@ $wignoreFirst :: (GHC.Internal.Prim.Int# -{7}->
                  GHC.Internal.Prim.Int#
 $wsumP :: GHC.Internal.Prim.Int# -{10}->
           GHC.Internal.Prim.Int# -{11}-> GHC.Internal.Prim.Int#
-Main.sumP :: (#,#) GHC.Internal.Types.LiftedRep
+Main.sumP :: (#,#) 'GHC.Internal.Types.IntRep
                    GHC.Internal.Types.LiftedRep
-                   GHC.Internal.Types.Int
+                   GHC.Internal.Prim.Int#
                    GHC.Internal.Types.Int -{12}->
              GHC.Internal.Types.Int
-$wusePair :: ((#,#) GHC.Internal.Types.LiftedRep
+$wusePair :: ((#,#) 'GHC.Internal.Types.IntRep
                     GHC.Internal.Types.LiftedRep
-                    GHC.Internal.Types.Int
+                    GHC.Internal.Prim.Int#
                     GHC.Internal.Types.Int -{12}->
               GHC.Internal.Types.Int) -{13}->
              GHC.Internal.Prim.Int# -{14}-> GHC.Internal.Prim.Int#

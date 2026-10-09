@@ -16,7 +16,8 @@
 #   runs.tsv       how to run each one in TIMING_MODE (default norm), for
 #                  time-nofib.py: benchmark, directory, runstdtest command
 # Set NOFIB_MODE (default fast) and NOFIB_DIRS (default: nofib's own default
-# set of benchmark directories) to change what runs.
+# set of benchmark directories) to change what runs, and NOFIB_JOBS (default
+# 1) to build and run benchmarks in parallel.
 #
 # Timeouts: each compiler invocation is limited to WEBS_GHC_TIMEOUT seconds
 # (default 300; see ghc-timeout.sh), and the whole build-and-run of one
@@ -52,7 +53,7 @@ make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&
 
 echo "[$NAME] build and run (options: $OPTS)"
 timeout --kill-after=60 "$CONFIG_TIMEOUT" \
-make -k WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
+make -k -j"${NOFIB_JOBS:-1}" WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
      EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats $VERDICTS" \
      > "$OUT/nofib.log" 2>&1
 status=$?

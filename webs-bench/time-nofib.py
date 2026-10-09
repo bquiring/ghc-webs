@@ -38,6 +38,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import queue
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOFIB = os.path.join(ROOT, 'nofib')
@@ -253,6 +255,11 @@ def main():
     ap.add_argument('--rounds', type=int, default=5)
     ap.add_argument('--cpu', type=int, default=4,
                     help='CPU to pin to (default 4: a performance core; leave its sibling 5 idle)')
+    ap.add_argument('--cpus', default=None,
+                    help='comma-separated CPUs to run benchmarks on in parallel, one per '
+                         'physical performance core (e.g. 2,4,6,8); each benchmark runs all '
+                         'its configurations back to back on one CPU, so pairing holds. '
+                         'Instruction counts are unaffected; times share cache and clock')
     ap.add_argument('--bench', action='append', default=[],
                     help='only benchmarks whose directory contains this (repeatable)')
     ap.add_argument('--metric', default='mut+gc', choices=['mut+gc', 'mut', 'wall'])
@@ -284,8 +291,10 @@ def main():
     use_perf = perf_ok()
     mode = next(iter(runs[a.configs[0]].values()))[2]
     st = machine_state()
-    print('%d benchmarks x %d configs x %d rounds (+1 warm-up); CPU %d; perf counters: %s'
-          % (len(dirs), len(a.configs), a.rounds, a.cpu, 'yes' if use_perf else 'no'))
+    cpus = [int(c) for c in a.cpus.split(',')] if a.cpus else [a.cpu]
+    print('%d benchmarks x %d configs x %d rounds (+1 warm-up); CPU %s; perf counters: %s'
+          % (len(dirs), len(a.configs), a.rounds, ','.join(map(str, cpus)),
+             'yes' if use_perf else 'no'))
     print('machine: %s' % st)
     if st['governor'] != 'performance':
         print('note: governor is %s; "sudo cpupower frequency-set -g performance" reduces noise'
@@ -294,27 +303,45 @@ def main():
         print('note: no perf counters; "sudo sysctl kernel.perf_event_paranoid=1" enables '
               'instruction counts')
 
-    data = {'configs': a.configs, 'rounds': a.rounds, 'cpu': a.cpu, 'machine': st,
+    data = {'configs': a.configs, 'rounds': a.rounds, 'cpu': ','.join(map(str, cpus)), 'machine': st,
             'metric': a.metric, 'min_change': a.min_change, 'layout_ins': a.layout_ins,
             'mode': os.environ.get('TIMING_MODE', 'norm'),
             'counters': ['instructions', 'cycles'] if use_perf else [],
             'samples': {d: {c: [] for c in a.configs} for d in dirs}, 'errors': {}}
     broken = set()
     t_start = time.time()
+    # One benchmark: all its configurations, in random order, on one CPU
+    def bench(d, cpu, rnd):
+        order = list(a.configs)
+        random.shuffle(order)
+        got = []
+        for c in order:
+            _, _, cmd = runs[c][d]
+            s = run_once(c, d, cmd, cpu, use_perf, a.timeout)
+            if 'error' in s:
+                return got, (c, s['error'])
+            got.append((c, s))
+        return got, None
+    free = queue.Queue()
+    for c in cpus:
+        free.put(c)
+    def task(d, rnd):
+        cpu = free.get()
+        try:
+            return d, bench(d, cpu, rnd)
+        finally:
+            free.put(cpu)
     for rnd in range(a.rounds + 1):
-        for i, d in enumerate(dirs):
-            if d in broken:
+        todo = [d for d in dirs if d not in broken]
+        with ThreadPoolExecutor(max_workers=len(cpus)) as ex:
+            results = list(ex.map(lambda d: task(d, rnd), todo))
+        for d, (got, err) in results:
+            if err:
+                data['errors']['%s [%s]' % (d, err[0])] = err[1]
+                broken.add(d)
                 continue
-            order = list(a.configs)
-            random.shuffle(order)
-            for c in order:
-                _, _, cmd = runs[c][d]
-                s = run_once(c, d, cmd, a.cpu, use_perf, a.timeout)
-                if 'error' in s:
-                    data['errors']['%s [%s]' % (d, c)] = s['error']
-                    broken.add(d)
-                    break
-                if rnd > 0:
+            if rnd > 0:
+                for c, s in got:
                     data['samples'][d][c].append(s)
         print('round %d/%d done (%.0f s)' % (rnd, a.rounds, time.time() - t_start), flush=True)
         with open(jpath, 'w') as f:

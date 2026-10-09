@@ -122,6 +122,10 @@ data WebSigs = WebSigs
       -- types are exposed, and transformations must keep their unfoldings.
   , ws_hidden_fields :: TyCon -> Bool
       -- ^ Types whose fields other modules cannot see: Note [Hidden fields]
+  , ws_saturated :: WebSet
+      -- ^ Webs never partially applied: the arrows arity raising makes for
+      -- a raised product's components (Note [Component demands] in
+      -- GHC.WebCore.Transform.ArityRaise)
   }
 
 emptyWebSigs :: WebSigs
@@ -130,7 +134,8 @@ emptyWebSigs = WebSigs { ws_ids     = emptyVarEnv
                        , ws_axioms  = emptyUFM
                        , ws_exposed = emptyUniqSet
                        , ws_interface_ids = emptyVarSet
-                       , ws_hidden_fields = const False }
+                       , ws_hidden_fields = const False
+                       , ws_saturated = emptyUniqSet }
 
 lookupGlobalIdSig :: WebSigs -> Id -> Maybe (Id, Id)
 lookupGlobalIdSig sigs v = lookupVarEnv (ws_ids sigs) v

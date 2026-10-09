@@ -117,8 +117,9 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
 - **Boundary split: imported functions.** Eta-expand an imported function
   used as a value in local higher-order code, not only the arguments passed
   to one. (The current split is measured now: `WEBS-EXPERIMENTS.md` §5.)
-- **Strictness feeding raising** (next, after the merged timing; the user's
-  design, 2026-10-09). Web strictness (Note [Web strictness fixpoints])
+- **Strictness feeding raising** (done, 2026-10-09: WEBS-EXPERIMENTS.md §12,
+  no change on nofib; arity raising is limited by exposure and known calls,
+  not laziness). The user's design: Web strictness (Note [Web strictness fixpoints])
   already proves argument strictness as a greatest fixpoint over the webs,
   and strict result fields backward from the case contexts of all calls
   (through tail calls), but it runs last and records nothing on the
@@ -130,6 +131,20 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
   2. the transformation sequence repeats while something changes (2-3
      passes): raising, strictness, raising. Measure against the 39 webs
      arity raising rejects as lazy on nofib.
+- **Strictness feeding data unboxing** (after the function-web version is
+  measured; the user's question, 2026-10-09). Data splitting and unboxing
+  run once, before the web pipeline, so strictness that web strictness
+  proves later never reaches them; but unboxing decides from demands too
+  (Note [Strict binders are values]: 37 of 518 fields are blocked by
+  laziness). Run data splitting and unboxing again after the web passes,
+  on the recorded demands (it has never run twice in one pipeline).
+- **Strictness at the producer** (the user, 2026-10-09; later): lift the
+  evaluation of a data structure's components from where they are consumed
+  to where they are produced. Needs an analysis proving that every path from
+  the construction to the use is strict (the component is certainly forced
+  once the structure is built), across webs and data webs, as a fixpoint.
+  The strict result fields of web strictness are the special case of a
+  direct return to a scrutinising caller.
 - **Richer demands in web strictness** (after the above). GHC's demand type
   instead of one bit per argument: product demands (strict in a field of an
   argument), call demands, cardinality. A web's signature is the lub of its
@@ -144,6 +159,14 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
   Find out why, or drop it.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
+- **What exposes data types?** (the user, 2026-10-09) Measure how many
+  data webs/classes are exposed only because they pass through small
+  imported functions (`map`, `foldr`, `(++)`, `length`, ...) that could be
+  inlined or copied into the module (as the boundary split does for
+  functions). The data dump records no reason for exposure today: add one
+  (which global Id or axiom exposed the class), then count per function on
+  nofib. If a few functions account for most, copying them locally would
+  unlock data splitting (and unboxing) broadly.
 - **Streams** (tests `stream001`, `stream002`, 2026-10-09): stream fusion's
   `Step`/`Stream` with combinators not inlined. No transformation improves
   either (2,000,000 elements: 806M instructions, 488 MB allocated, base and

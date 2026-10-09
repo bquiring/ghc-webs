@@ -71,6 +71,7 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
 
 import Control.Monad
+import Data.Maybe ( fromMaybe )
 
 {- Note [The web pipeline]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -461,29 +462,34 @@ checkSolved what res
 -- the signatures of constructors with hidden fields (Note [Signatures follow
 -- the transformations] in GHC.WebCore.HiddenFields); it reads the current
 -- ones from the WebSigs.
+-- Arity raising also returns the webs it made that are never partially
+-- applied (Note [Component demands] in GHC.WebCore.Transform.ArityRaise).
 type TransformRound = WebSigs -> UniqSupply -> WebSet -> CoreProgram
-                   -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
+                   -> ( Maybe (CoreProgram, WebSet, Type -> Type, WebSet)
+                      , [(WebId, SDoc, Bool, [Id])] )
 
 -- | Run a web transformation in rounds until nothing changes, running Web
 -- Lint after each round: the transformation must keep the program
 -- well-typed.  Returns whether the program changed.
 runTransform :: String -> DumpFlag -> TransformRound
              -> Logger -> DynFlags -> LintConfig -> WebSigs
-             -> CoreProgram -> CoreM (CoreProgram, WebSigs, Bool)
-runTransform name dump_flag do_round logger dflags cfg sigs0 binds0
-  = go (1 :: Int) emptyUniqSet sigs0 binds0 emptyUFM False
+             -> WebSet         -- ^ Webs handled in earlier passes
+             -> CoreProgram -> CoreM (CoreProgram, WebSigs, Bool, WebSet)
+runTransform name dump_flag do_round logger dflags cfg sigs0 done0 binds0
+  = go (1 :: Int) done0 sigs0 binds0 emptyUFM False
   where
     max_rounds = 10
 
     go n done sigs binds verdicts changed
-      | n > max_rounds = finish sigs binds verdicts changed
+      | n > max_rounds = finish done sigs binds verdicts changed
       | otherwise
       = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
            ; case do_round sigs us done binds of
-               (Nothing, vs) -> finish sigs binds (record vs verdicts) changed
-               (Just (binds0', handled, rw_ty), vs) ->
+               (Nothing, vs) -> finish done sigs binds (record vs verdicts) changed
+               (Just (binds0', handled, rw_ty, sat), vs) ->
                  do { let what   = name ++ ", round " ++ show n
-                          sigs'  = updateDataConSigs rw_ty sigs
+                          sigs'  = (updateDataConSigs rw_ty sigs)
+                                     { ws_saturated = ws_saturated sigs `unionUniqSets` sat }
                           binds' = refreshWorkers sigs' binds0'
                           res    = lintWebProgram cfg sigs' binds'
                     ; reportWebLint logger dflags what binds' res
@@ -499,10 +505,23 @@ runTransform name dump_flag do_round logger dflags cfg sigs0 binds0
       | old_ch && not new_ch = old
       | otherwise            = new
 
-    finish sigs binds verdicts changed
+    finish done sigs binds verdicts changed
       = do { dump logger dump_flag ("Webs: " ++ name) $
                pprWebVerdicts [ (v, bs) | (v, _, bs) <- nonDetEltsUFM verdicts ]
-           ; return (binds, sigs, changed) }
+           ; return (binds, sigs, changed, done) }
+
+{- Note [Repeating the transformations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each transformation runs in rounds until it changes nothing, in a fixed
+order (runTransforms).  A later transformation can enable an earlier one:
+web strictness proves parameters strict that demand analysis could not
+(Note [Recording proven strictness] in GHC.WebCore.Transform.Strictness),
+and arity raising, which ran before it, decides from those demands.  With
+-fcore-webs-passes=N the whole sequence runs again while the last pass
+changed something, at most N times.  Each transformation keeps the webs it
+handled in earlier passes, so it does not redo them (strictness would
+evaluate an argument twice).
+-}
 
 -- | Did a dead-parameter verdict change the program?
 changes :: Verdict -> Bool
@@ -515,14 +534,24 @@ changes _        = False
 runTransforms :: Bool -> Logger -> DynFlags -> LintConfig -> WebSigs
               -> CoreProgram -> CoreM (CoreProgram, WebSigs, Bool)
 runTransforms early logger dflags cfg sigs0 binds0
-  = foldM step (binds0, sigs0, False) transforms
+  = passes (1 :: Int) [] (binds0, sigs0, False)
   where
+    -- Note [Repeating the transformations]: another pass while the last one
+    -- changed something, up to -fcore-webs-passes; each transformation's
+    -- handled webs carry over
+    passes n dones (binds, sigs, changed)
+      = do { (binds', sigs', changed', dones') <- foldM step (binds, sigs, False, dones) transforms
+           ; let ch = changed || changed'
+           ; if changed' && n < websPasses dflags
+             then passes (n + 1) dones' (binds', sigs', ch)
+             else return (binds', sigs', ch) }
+
     exposed = ws_exposed sigs0
     keep    = UnfoldingPolicy { up_keep = ws_interface_ids sigs0, up_early = early }
 
     -- A round that does not change types
     same r = case r of
-      (Just (b, ws), vs) -> (Just (b, ws, id), vs)
+      (Just (b, ws), vs) -> (Just (b, ws, id, emptyUniqSet), vs)
       (Nothing, vs)      -> (Nothing, vs)
 
     transforms =
@@ -535,27 +564,31 @@ runTransforms early logger dflags cfg sigs0 binds0
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
         , \_ us done b -> same (constPropRound us exposed done b) )
       , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
-        , \sigs us done b -> arityRaiseRound (fieldTys sigs) us exposed keep done b )
+        , \sigs us done b -> case arityRaiseRound (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
+                               (r, vs) -> (r, vs) )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
         , \_ us done b -> case deadParamsRound us exposed keep done b of
-                            (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
+                            (r, vs) -> ( fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r
+                                       , [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
       , ( Opt_CoreWebsUncurry, "uncurrying", Opt_D_dump_webs_uncurry
         , \_ us _ b -> case uncurryRound (gopt Opt_CoreWebsUncurryKnown dflags) us exposed keep b of
-                         (r, vs) -> (fmap (\(b', rw) -> (b', emptyUniqSet, rw)) r, vs) )
+                         (r, vs) -> (fmap (\(b', rw) -> (b', emptyUniqSet, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
-        , \sigs us done b -> resultRaiseRound (fieldTys sigs) us exposed keep done b )
+        , \sigs us done b -> case resultRaiseRound (fieldTys sigs) us exposed keep done b of
+                               (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
         , \_ us done b -> same (strictnessRound us exposed done b) ) ]
 
-    step (binds, sigs, changed) (flag, name, dump_flag, do_round)
+    step (binds, sigs, changed, dones) (flag, name, dump_flag, do_round)
       | early, flag == Opt_CoreWebsUncurry
-      = return (binds, sigs, changed)   -- See Note [No early uncurrying]
+      = return (binds, sigs, changed, dones)   -- See Note [No early uncurrying]
       | gopt flag dflags
-      = do { (binds', sigs', changed') <- runTransform name dump_flag do_round
-                                                       logger dflags cfg sigs binds
-           ; return (binds', sigs', changed || changed') }
+      = do { let done0 = fromMaybe emptyUniqSet (lookup flag dones)
+           ; (binds', sigs', changed', done') <- runTransform name dump_flag do_round
+                                                    logger dflags cfg sigs done0 binds
+           ; return (binds', sigs', changed || changed', (flag, done') : dones) }
       | otherwise
-      = return (binds, sigs, changed)
+      = return (binds, sigs, changed, dones)
 
 -- | Lint configuration for Web Lint
 webLintConfig :: DynFlags -> LintConfig

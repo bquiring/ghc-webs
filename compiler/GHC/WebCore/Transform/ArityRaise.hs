@@ -23,7 +23,7 @@ import GHC.Core.Utils ( exprType, exprIsHNF )
 import GHC.Data.FastString ( fsLit )
 
 import GHC.Types.Basic ( Boxity(..) )
-import GHC.Types.Demand ( isStrUsedDmd )
+import GHC.Types.Demand ( isStrUsedDmd, Demand(..), viewProd, multDmd, topDmd )
 import GHC.Types.Id
 import GHC.Types.Tickish
 import GHC.Types.Unique ( getKey )
@@ -138,6 +138,24 @@ A product with no components still becomes one (# #) argument, so that a
 function never loses its last lambda (and its work is not shared).
 -}
 
+{- Note [Component demands]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A raised lambda's components are fresh binders, and arity raising decides
+from a parameter's demand (isStrictIn): with no demand, a component that is
+itself a product could never be raised in a later round (nested raising).
+So each component gets the demand its field had in the product's demand,
+scaled by the product's own cardinality (multDmd): field demands describe
+uses once the product is evaluated, so under a lazy product (a web raised
+for constructed arguments) they are lazy too.
+
+The components' lambdas form a chain (\x1 .. \^w xn), so all but the last
+return lambdas, which the curried check rejects (a partial application need
+not force what a full one would).  But every call of a raised web supplies
+all its components at once: the new arrows' webs are never partially
+applied.  Arity raising returns them, the pipeline keeps them
+(ws_saturated), and the curried check skips them.
+-}
+
 {- Note [Recursive products]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A web stored in a hidden field of the type it takes (Note [Hidden fields]
@@ -249,8 +267,8 @@ note w i infos
   | isPlaceholderWeb w = infos
   | otherwise          = addToUFM_C plusInfo infos w i
 
-analyse :: FieldTys -> CoreProgram -> Infos
-analyse fields binds = foldr go_bind emptyUFM binds
+analyse :: FieldTys -> WebSet -> CoreProgram -> Infos
+analyse fields saturated binds = foldr go_bind emptyUFM binds
   where
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
@@ -275,6 +293,7 @@ analyse fields binds = foldr go_bind emptyUFM binds
         note w (noInfo { i_lams    = [p]
                        , i_lazy    = not (isStrictIn p e)
                        , i_curried = can_be_partial && is_lam e
+                                     && not (w `elementOfUniqSet` saturated)
                        , i_covar   = isCoVar p
                        , i_boxed   = not (onlyScrutinised p e) }) acc
 
@@ -428,19 +447,22 @@ verdict early exposed complex w i
 -- already been raised and are not considered again.
 arityRaiseRound :: FieldTys    -- ^ Components' types (Note [Signatures follow
                                --   the transformations] in GHC.WebCore.HiddenFields)
+                -> WebSet      -- ^ Webs never partially applied (components' arrows)
                 -> UniqSupply
                 -> WebSet      -- ^ Exposed webs
                 -> UnfoldingPolicy
                 -> WebSet      -- ^ Webs already raised
                 -> CoreProgram
-                -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
-arityRaiseRound fields us exposed pol done binds
+                -> ( Maybe (CoreProgram, WebSet, Type -> Type, WebSet)
+                   , [(WebId, SDoc, Bool, [Id])] )
+arityRaiseRound fields saturated us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = ( Just ( initUs_ us1 (rewriteProgram fields todo inner pol binds), todo
-                                 , raiseType fields todo inner )
+                                 , raiseType fields todo inner
+                                 , new_saturated )
                           , dump )
   where
-    infos   = analyse fields binds
+    infos   = analyse fields saturated binds
     complex = complexCoWebs binds
     verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
                 | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
@@ -464,6 +486,12 @@ arityRaiseRound fields us exposed pol done binds
     inner_map  = listToUFM [ (w, map mkWebId (uniqsFromSupply s))
                            | ((w, v, _), s) <- zip verdicts (listSplitUniqSupply us2), raised v ]
     inner w    = lookupWithDefaultUFM inner_map [] w
+    -- The new arrows' webs actually used (inner w is infinite): one fewer
+    -- than the product's components (Note [Component demands])
+    new_saturated = mkUniqSet [ wi | (w, v, i) <- verdicts, raised v
+                                   , tc : _ <- [i_tycons i]
+                                   , Just dc <- [tyConSingleDataCon_maybe tc]
+                                   , wi <- take (dataConRepArity dc - 1) (inner w) ]
     dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
 
 ------------------------------------------------------------------
@@ -679,12 +707,19 @@ rewriteProgram fields todo inner pol binds
                  p_ty = idType p'
                  (args, dc) = productOf p_ty
                  comp_tys = fields dc args
-           ; xs <- mapM (\ty -> do { u <- getUniqueM
-                                   ; return (mkSysLocal (fsLit "x") u ManyTy ty) }) comp_tys
+                 -- Note [Component demands]
+                 comp_dmds = case idDemandInfo p of
+                   n :* sd | Just (_, ds) <- viewProd (length comp_tys) sd
+                           -> map (multDmd n) ds
+                   _       -> map (const topDmd) comp_tys
+           ; xs <- mapM (\(ty, d) -> do { u <- getUniqueM
+                                        ; return (mkSysLocal (fsLit "x") u ManyTy ty
+                                                    `setIdDemandInfo` d) })
+                        (zip comp_tys comp_dmds)
            ; e1 <- rw env1 e
              -- Unpack under any further lambdas; see splitLeadingLams
            ; let (lams, body) = splitLeadingLams e1
-                 e2 = replaceCases p' dc xs body
+                 e2 = replaceCasesSubst p' dc xs body
                  e3 | p' `elemVarSet` exprOccurrences e2
                     = Let (NonRec p' (mkCoreConApps dc (map Type args ++ map Var xs))) e2
                     | otherwise = e2
@@ -746,6 +781,64 @@ isStrictIn p body = isStrUsedDmd (idDemandInfo p) || go body
     go (Let _ e)            = go e
     go (Cast e _)           = go e
     go _                    = False
+
+-- | 'replaceCases', substituting the components for the pattern variables
+-- instead of binding them: an alias  let y = x  would make x look used boxed
+-- to the next round, so a component could not be raised in turn (Note
+-- [Component demands])
+replaceCasesSubst :: Id -> DataCon -> [Id] -> CoreExpr -> CoreExpr
+replaceCasesSubst p dc xs = go
+  where
+    go expr = case expr of
+      Case (Var v) b _ [Alt (DataAlt dc') ys rhs]
+        | v == p, dc' == dc
+        -> let rhs' = go (subst (mkVarEnv (zip ys xs)) rhs)
+           in mkLets (alias b rhs') rhs'
+      Case (Var v) b _ [Alt DEFAULT [] rhs]
+        | v == p
+        -> let rhs' = go rhs in mkLets (alias b rhs') rhs'
+      Var {}            -> expr
+      Lit {}            -> expr
+      App f a           -> App (go f) (go a)
+      WebApp w f a      -> WebApp w (go f) (go a)
+      Lam b e           -> Lam b (go e)
+      WebLam w b e      -> WebLam w b (go e)
+      Let bind body     -> Let (go_bind bind) (go body)
+      Case e b ty alts  -> Case (go e) b ty [ Alt con bs (go rhs) | Alt con bs rhs <- alts ]
+      Cast e co         -> Cast (go e) co
+      Tick t e          -> Tick t (go e)
+      Type {}           -> expr
+      Coercion {}       -> expr
+
+    go_bind (NonRec b e) = NonRec b (go e)
+    go_bind (Rec prs)    = Rec [ (b, go e) | (b, e) <- prs ]
+
+    alias b rhs | b `elemVarSet` exprOccurrences rhs = [NonRec b (Var p)]
+                | otherwise                          = []
+
+    -- Occurrences of the pattern variables become the components (their
+    -- binders are unique in the alternative)
+    subst env = sub
+      where
+        sub e = case e of
+          Var v | Just x <- lookupVarEnv env v -> Var x
+          Var {}            -> e
+          Lit {}            -> e
+          App f a           -> App (sub f) (sub a)
+          WebApp w f a      -> WebApp w (sub f) (sub a)
+          Lam b x           -> Lam b (sub x)
+          WebLam w b x      -> WebLam w b (sub x)
+          Let bind body     -> Let (sub_bind bind) (sub body)
+          Case x b ty alts  -> Case (sub x) b ty [ Alt con bs (sub rhs) | Alt con bs rhs <- alts ]
+          Cast x co         -> Cast (sub x) co
+          Tick t x          -> Tick (sub_tick t) (sub x)
+          Type {}           -> e
+          Coercion {}       -> e
+        sub_bind (NonRec b x) = NonRec b (sub x)
+        sub_bind (Rec prs)    = Rec [ (b, sub x) | (b, x) <- prs ]
+        sub_tick t@(Breakpoint { breakpointFVs = ids })
+          = t { breakpointFVs = [ fromMaybe i (lookupVarEnv env i) | i <- ids ] }
+        sub_tick t = t
 
 -- | Replace  case p of b { K ys -> rhs }  by  let b = p; ys = xs in rhs
 -- (and  case p of b { DEFAULT -> rhs }  by  let b = p in rhs)

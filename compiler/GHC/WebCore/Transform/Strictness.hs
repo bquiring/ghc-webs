@@ -14,7 +14,7 @@ import GHC.Core.Type
 import GHC.Types.Var ( isCoVar )
 import GHC.Core.Utils ( exprType, exprIsHNF, exprIsTrivial )
 
-import GHC.Types.Demand ( isStrUsedDmd, splitDmdSig )
+import GHC.Types.Demand ( isStrUsedDmd, splitDmdSig, strictifyDmd )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Id
@@ -106,6 +106,19 @@ Tail contexts make this a fixpoint too, again computed from the top: a web
 starts with "every field strict" and is lowered by its contexts until
 nothing changes.  Join points are lambdas whose calls (jumps) are in tail
 positions, so a join point's result fields come from the lambda it is in.
+-}
+
+{- Note [Recording proven strictness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The fixpoint proves strictness that demand analysis could not see (an
+argument passed on to an unknown call of a strict web).  Besides evaluating
+the argument at the calls, the rewrite records it: the parameter of each
+lambda of a strict web gets a strict demand, so that a later pass of the
+other transformations sees it (arity raising decides from the parameter's
+demand: isStrictIn in GHC.WebCore.Transform.ArityRaise; the pipeline
+repeats the transformations, -fcore-webs-passes).  Only at saturation depth
+1: a curried lambda's demand describes full applications, which a partial
+application need not be (arity raising rejects curried lambdas anyway).
 -}
 
 {- Note [Only evaluate what would be a thunk]
@@ -551,6 +564,14 @@ rewriteProgram :: UniqFM WebId Int                     -- ^ Strict-argument webs
                -> CoreProgram -> UniqSM CoreProgram
 rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
   where
+    -- Note [Recording proven strictness]: a lambda of a strict web, at
+    -- saturation depth 1, is strict in its parameter
+    proven w x
+      | Just 1 <- lookupUFM arg_webs w
+      , isId x, not (isStrUsedDmd (idDemandInfo x))
+      = x `setIdDemandInfo` strictifyDmd (idDemandInfo x)
+      | otherwise = x
+
     -- See Note [Only evaluate what would be a thunk]
     thunks = thunkLets binds
 
@@ -568,9 +589,9 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
     rw lz expr = case expr of
       WebLam w x e
         | Just (dc, fs) <- lookupUFM res_webs w
-        -> WebLam w x <$> (rw False e >>= tails dc fs)
+        -> WebLam w (proven w x) <$> (rw False e >>= tails dc fs)
         | otherwise
-        -> WebLam w x <$> rw False e
+        -> WebLam w (proven w x) <$> rw False e
       Lam b e
         | isTyVar b -> Lam b <$> rw lz e
         | otherwise -> Lam b <$> rw False e
