@@ -368,8 +368,14 @@ getCoreToDo dflags hpt_rule_base extra_vars
         add_late_ccs,
 
         -- The web pipeline runs after all Core optimisations.
-        -- See GHC.WebCore.Pipeline
-        runWhen (gopt Opt_CoreWebs dflags) (CoreDoWebs False),
+        -- See GHC.WebCore.Pipeline.  The simplifier cleans up after it (the
+        -- re-boxing around raised arguments and results, cases of known
+        -- constructors), and the final demand analysis runs again after
+        -- that, as above.  See Note [Simplifying after the late webs].
+        runWhen (gopt Opt_CoreWebs dflags) $ CoreDoPasses
+          [ CoreDoWebs False
+          , simplify "post-webs"
+          , runWhen (strictness || late_dmd_anal) (CoreDoDemand False) ],
 
         -- See Note [First-class function statistics] in GHC.WebCore.FirstClass
         runWhen first_class_stats (CoreDoFirstClassStats "after")
@@ -390,6 +396,19 @@ runWhen False _       = CoreDoNothing
 runMaybe :: Maybe a -> (a -> CoreToDo) -> CoreToDo
 runMaybe (Just x) f = f x
 runMaybe Nothing  _ = CoreDoNothing
+
+{- Note [Simplifying after the late webs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The late web pipeline (-fcore-webs) runs after all of Core's optimisations.
+Its transformations leave work for the simplifier: re-boxing around raised
+arguments and results, cases on constructors they build, trivial lets.
+Without a simplifier run afterwards that work reaches the code generator: on
+nofib, the late transformations cost +2.7% instructions (geomean; up to
++34% in binary-trees), where the early ones, followed by the rest of the
+pipeline, gain.  So the late web pass is followed by a simplifier run, and
+by the final demand analysis again (Note [Final Demand Analyser run] in
+GHC.Core.Opt.DmdAnal).
+-}
 
 {- Note [Inline in InitialPhase]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
