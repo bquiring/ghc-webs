@@ -23,6 +23,7 @@ import GHC.Data.Bag
 data UnboxOpts = UnboxOpts
   { uo_eager      :: Bool              -- ^ -fcore-webs-data-unbox-eager
   , uo_nested     :: Bool              -- ^ -fcore-webs-unbox-nested
+  , uo_strict_elim :: Bool             -- ^ not -fcore-webs-no-strict-elim
   , uo_max_size   :: Int               -- ^ -fcore-webs-max-unbox-size
   , uo_trust_demands :: Bool           -- ^ demands are fresh (the early run):
                                        --   Note [Unboxing in the late run]

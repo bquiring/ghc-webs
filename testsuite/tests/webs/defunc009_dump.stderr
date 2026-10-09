@@ -1,0 +1,20 @@
+[1 of 2] Compiling Main             ( defunc009.hs, defunc009.o )
+
+==================== Webs: defunctionalisation ====================
+defunctionalised (3 constructors) arity 2: a ds ds
+not defunctionalised (absorbed: called only with the web whose lambdas return it): xs ds ns
+not defunctionalised (exposed): ds
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): r r r
+not defunctionalised (no unknown calls): ds
+not defunctionalised (no unknown calls): ds
+not defunctionalised (no unknown calls): f
+not defunctionalised (no unknown calls): ww
+
+
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 t t = [t, [t], t]
+
+
+[2 of 2] Linking defunc009

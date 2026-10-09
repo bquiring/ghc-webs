@@ -2804,10 +2804,35 @@ argToPat in_scope val_env arg arg_occ
     is_value_lam other = False
 -}
 
+  -- A reflexive coercion argument is kept, like a type argument: a
+  -- wild-card would be a coercion variable, and a call pattern that
+  -- quantifies over one is discarded (Note [SpecConstr and casts]).
+  -- See Note [SpecConstr and reflexive coercions]
+argToPat1 _env _in_scope _val_env arg@(Coercion co) _arg_occ _arg_str
+  | isReflCo co
+  = return (False, arg, [])
+
   -- The default case: make a wild-card
   -- We use this for coercions too
 argToPat1 _env _in_scope _val_env arg _arg_occ arg_str
   = wildCardPat (exprType arg) arg_str
+
+{- Note [SpecConstr and reflexive coercions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Defunctionalisation (GHC.WebCore.Transform.Defunc) passes a function as a
+constructor of a GADT-like type, whose equalities are coercion arguments,
+reflexive where the constructor is built:
+
+    foldTree @A @B (Defun1_1 @A @B <A>_N <B>_N) t
+
+Making a wild-card of each coercion argument gave a call pattern over
+coercion variables, which is discarded, so foldTree was never specialised
+on the constructor (where it was specialised on the lambda before), and
+the dispatch stayed in the loop (nofib spectral/constraints).  A reflexive
+coercion is kept as it is: its free variables are type variables, which
+the pattern quantifies over, and the rule matcher matches a reflexive
+template against a reflexive target by its type (match_co).
+-}
 
 -- | wildCardPats are always boring
 wildCardPat :: Type -> StrictnessMark -> UniqSM (Bool, CoreArg, [Id])

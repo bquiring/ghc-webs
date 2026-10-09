@@ -417,7 +417,7 @@ flattenFields opts this_mod us tcs binds
     ctx_ok _ CDemanded    = True
     ctx_ok _ CAllocated   = False
     ctx_ok m (CField k j) = in_set m k j
-    strictly_elim dc i = trust && in_set strictly_eliminated dc i
+    strictly_elim dc i = trust && uo_strict_elim opts && in_set strictly_eliminated dc i
 
     arg_fact ev pv a
       | value ev a                      = AValue

@@ -662,6 +662,7 @@ data GeneralFlag
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
+   | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
@@ -951,6 +952,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested
+   , Opt_CoreWebsNoStrictElim
    , Opt_CoreWebsUncurryKnown
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary

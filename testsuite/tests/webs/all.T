@@ -189,11 +189,12 @@ for n in [1, 2, 4]:
 # polymorphic and a monomorphic lambda in one web, 006 a polymorphic
 # higher-order function used at two types, 007 a lambda whose free
 # variables' types mention a type variable its body does not, 008 a type
-# specialised to more parameters than it had.  Their dumps show the verdicts.
+# specialised to more parameters than it had, 009 lambdas of two arguments
+# defunctionalised at arity two.  Their dumps show the verdicts.
 # The *_lifted tests run the same programs with lifted bodies
 # (Note [Lifted bodies]).
 df_opts = early_opts + ' -fcore-webs-defunc'
-for n in range(1, 9):
+for n in range(1, 10):
     test('defunc%03d' % n, [], compile_and_run, [df_opts])
     test('defunc%03d_dump' % n, [extra_files(['defunc%03d.hs' % n])],
          multimod_compile, ['defunc%03d' % n, df_opts + ' -ddump-webs-defunc -dsuppress-uniques'])
