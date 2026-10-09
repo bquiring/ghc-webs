@@ -254,6 +254,12 @@ test('dataunbox006_dump', [extra_files(['dataunbox006.hs'])],
 test('dataunbox007', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox007_dump', [extra_files(['dataunbox007.hs'])],
      multimod_compile, ['dataunbox007', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+# dataunbox008: demands are rewritten with the fields (Note [Demands after
+# flattening]): a dropped field next to an unpacked pair, read by a function
+# worker/wrapper unboxes (nofib spectral/rewrite entered an absent argument)
+test('dataunbox008', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunbox008_dump', [extra_files(['dataunbox008.hs'])],
+     multimod_compile, ['dataunbox008', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
 
 # Edge cases for data splitting and unboxing.  001-010 are type-level, with
 # coercions: local, parameterised, eta-reducible, recursive and mutually
@@ -263,12 +269,18 @@ test('dataunbox007_dump', [extra_files(['dataunbox007.hs'])],
 # that must appear once), seq/foldl'/length, values escaping to base, nested
 # pairs/Maybe/Either, re-boxing, knots, exceptions.  019-021 are strict
 # fields: polymorphic ones (no wrapper, so split; a copy must stay strict),
-# Data.Complex, and unpacked ones mixed with lazy ones.  Expected output
-# from the stock compiler at -O0.  Every program runs in seven modes, all
-# with Core Lint (and Data Lint): in the early run, split only; with
-# unboxing; with nested unboxing; with the size bound at 1; with every early
-# transformation; and in the late run, split and unbox; with every late
-# transformation.
+# Data.Complex, and unpacked ones mixed with lazy ones.  022-029 are
+# recursive types (Note [Demands after flattening]: a stale or unfolded
+# demand on one): lists only built with (:), so their copies have one
+# constructor; single-constructor streams, self-referencing records and
+# recursion through a pair; mutual recursion with class methods; dead fields
+# (as nofib spectral/rewrite); function fields; polymorphic recursion;
+# infinite trees; strict recursive fields.  Expected output from the stock
+# compiler at -O0.  Every program runs in eight modes, all with Core Lint
+# (and Data Lint): in the early run, split only; with unboxing; with nested
+# unboxing; with the size bound at 1; with every early transformation; with
+# those and defunctionalisation; and in the late run, split and unbox; with
+# every late transformation.
 dsedge_all = (early_opts + ' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
               ' -fcore-webs-dead-params -fcore-webs-result-raise -fcore-webs-strictness'
               ' -fcore-webs-data-split -fcore-webs-data-unbox -fcore-webs-unbox-nested')
@@ -278,12 +290,13 @@ dsedge_modes = [ ('_split',  ds_opts)
                , ('_size1',  ds_opts + ' -fcore-webs-data-unbox -fcore-webs-unbox-nested'
                                      ' -fcore-webs-max-unbox-size=1')
                , ('_all',    dsedge_all)
+               , ('_df',     dsedge_all + ' -fcore-webs-defunc -fcore-webs-defunc-lifted')
                  # The late run (after all Core optimisations; Note [Unboxing in
                  # the late run]): split and unbox, and every late transformation
                , ('_late',   webs_opts + ' -fcore-webs-data-split -fcore-webs-data-unbox')
                , ('_lateall', all_opts + ' -fcore-webs-data-split -fcore-webs-data-unbox'
                                        ' -fcore-webs-unbox-nested') ]
-for n in range(1, 22):
+for n in range(1, 30):
     name = 'dsedge%03d' % n
     specs = {'stdout': name + '.stdout'}
     if n in [12, 19]:
@@ -291,3 +304,13 @@ for n in range(1, 22):
     for (suffix, opts) in dsedge_modes:
         test(name + suffix, [extra_files([name + '.hs']), use_specs(specs)],
              multimod_compile_and_run, [name, opts])
+
+# Streams (stream fusion's Step/Stream, combinators not inlined): stream001
+# with an existential state, stream002 with the state in the type.  Both in
+# every dsedge mode.  So far no transformation improves either
+# (WEBS-BACKLOG.md).
+for name in ['stream001', 'stream002']:
+    for (suffix, opts) in dsedge_modes:
+        test(name + suffix, [extra_files([name + '.hs']), use_specs({'stdout': name + '.stdout'})],
+             multimod_compile_and_run, [name, opts])
+

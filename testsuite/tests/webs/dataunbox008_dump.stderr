@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( dataunbox008.hs, dataunbox008.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 85, classes: 9, exposed: 8, split: 1, exposed only by casts: 0, pinned binders: 8
+Main.Eqn_s9 = Main.Eqn with Main.Eqn_s9 (built [1], matched [1])
+Main.Eqn_s9 field 0: dropped (dead)
+Main.Eqn_s9 field 1: unboxed
+
+
+[2 of 2] Linking dataunbox008

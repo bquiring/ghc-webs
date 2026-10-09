@@ -32,10 +32,14 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Basic ( Boxity(..) )
-import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd )
+import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd
+                         , DmdSig, mkClosedDmdSig, mkProd, viewProd, mkCall, viewCall, topDmd, absDmd
+                         , isAbsDmd )
+import GHC.Types.Cpr ( topCprSig )
 import GHC.Builtin.PrimOps ( primOpOkForSpeculation )
 import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.Core.FVs ( exprFreeVarsList )
+import GHC.Core.TyCo.FVs ( tyConsOfType )
 
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable
@@ -82,6 +86,24 @@ strict in it).  So there, no rule reads them: strict binders are not values
 [Strictly eliminated fields]), a callee's signature does not make an
 argument unboxable, and -fcore-webs-data-unbox-eager does nothing.  What is
 left needs no demands: values, projections, strict constructor fields.
+-}
+
+{- Note [Demands after flattening]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Demand analysis ran before the splitter (in the early run), so a product
+demand on a value of a split type, P(d1, .., dn), describes the old
+constructor's fields.  Flattening and dropping change them, and
+worker/wrapper, which runs next, zips a product demand with the
+constructor's fields when it unboxes an argument.  A stale demand whose
+length happens to match the new fields gives a field another's demand:
+nofib spectral/rewrite dropped Eqn's dead number field in one round and
+flattened its pair of expressions in the next, so Eqn had two fields
+again, and the dropped field's absent demand fell on the first expression
+-- "Entered absent arg".  So every binder whose type mentions a type whose
+fields change gets its demand signature and demand rewritten along with
+the fields (a kept field keeps its demand, a dropped one loses it, a
+flattened one becomes its components' demands, from its own product
+demand or top), and its CPR signature zapped.
 -}
 
 {- Note [Dead fields]
@@ -817,8 +839,61 @@ flattenFields opts this_mod us tcs binds
     rw_bind (NonRec b e) = NonRec (rw_id b) <$> rw e
     rw_bind (Rec prs)    = Rec <$> forM prs (\(b, e) -> (,) (rw_id b) <$> rw e)
 
-    rw_id b | isId b    = setIdType b (ty (idType b))
+    rw_id b | isId b    = fix_dmds (idType b) (setIdType b (ty (idType b)))
             | otherwise = b
+
+    -- Note [Demands after flattening]: demands and CPR describe the old
+    -- fields
+    fix_dmds old_ty b
+      | not (affected old_ty) = b
+      | otherwise = b `setIdDmdSig` fix_sig old_ty (idDmdSig b)
+                      `setIdDemandInfo` fix_dmd old_ty (idDemandInfo b)
+                      `setIdCprSig` topCprSig
+    affected t = any (`elemUFM` plans) (nonDetEltsUniqSet (tyConsOfType t))
+
+    fix_sig :: Type -> DmdSig -> DmdSig
+    fix_sig old_ty sig = case splitDmdSig sig of
+      (ds, div) -> mkClosedDmdSig (go (value_args old_ty) ds) div
+      where go (t : ts) (d : ds) = fix_dmd t d : go ts ds
+            go _        ds       = ds
+    value_args t = case coreFullView t of
+      ForAllTy _ r                                    -> value_args r
+      FunTy { ft_arg = a, ft_res = r }                -> a : value_args r
+      _                                               -> []
+
+    fix_dmd :: Type -> Demand -> Demand
+    fix_dmd t d@(n :* sd)
+      | isAbsDmd d = d
+      | otherwise  = n :* fix_sd t sd
+
+    fix_sd :: Type -> SubDemand -> SubDemand
+    fix_sd t sd
+      | Just (c, sd') <- viewCall sd
+      , FunTy { ft_res = r } <- coreFullView (dropForAlls t)
+      = mkCall c (fix_sd r sd')
+      | Just (tc, args) <- splitTyConApp_maybe t
+      , Just dc <- tyConSingleDataCon_maybe tc
+      , isVanillaDataCon dc
+        -- only an explicit product: a Poly demand fits any fields, and
+        -- expanding it would never stop on a recursive type
+      , Prod {} <- sd
+      , Just (bx, ds) <- viewProd (dataConRepArity dc) sd
+      , let field_tys = map scaledThing (dataConInstArgTys dc args)
+      = case field_plan dc of
+          Nothing -> mkProd bx (zipWith fix_dmd field_tys ds)
+          Just fs -> mkProd bx (concat (zipWith3 step fs field_tys ds))
+      | otherwise = sd
+      where
+        step Keep          ft d = [fix_dmd ft d]
+        step Drop          _  _ = []
+        step (Flatten pdc as) _ d
+          = let comp_tys = map scaledThing (dataConInstArgTys pdc as)
+                k = length comp_tys
+            in case d of
+                 _ :* sd2 | Just (_, cds) <- viewProd (dataConRepArity pdc) sd2, length cds == k
+                          -> zipWith fix_dmd comp_tys cds
+                 _ | isAbsDmd d -> replicate k absDmd
+                   | otherwise  -> replicate k topDmd
 
     rw :: CoreExpr -> UniqSM CoreExpr
     rw expr = case expr of
@@ -864,9 +939,10 @@ flattenFields opts this_mod us tcs binds
           , length vs == dataConRepArity pdc
           = return (wrap, reverse vs ++ acc)
         step (wrap, acc) (Flatten pdc as, v)
-          = do { let comps = map scaledThing (dataConInstArgTys pdc (substTys sub as))
+          = do { let as' = inst_args sub as
+                     comps = map scaledThing (dataConInstArgTys pdc as')
                ; ys <- mapM (fresh "y") comps
-               ; b  <- fresh "p" (mkTyConApp (dataConTyCon pdc) (substTys sub as))
+               ; b  <- fresh "p" (mkTyConApp (dataConTyCon pdc) as')
                ; let wrap' e = wrap (mkSingleAltCase v b (DataAlt pdc) ys e)
                ; return (wrap', reverse (map Var ys) ++ acc) }
 
@@ -891,13 +967,19 @@ flattenFields opts this_mod us tcs binds
       | otherwise
       = return (acc, body)
     field sub (acc, body) (Flatten pdc as, b)
-      = do { let comps = map scaledThing (dataConInstArgTys pdc (substTys sub as))
+      = do { let as' = inst_args sub as
+                 comps = map scaledThing (dataConInstArgTys pdc as')
            ; ys <- mapM (fresh "y") comps
            ; let body1 = replaceCases b pdc ys body
                  body2 | b `elemVarSet'` body1
-                       = Let (NonRec b (mkCoreConApps pdc (map Type (substTys sub as) ++ map Var ys))) body1
+                       = Let (NonRec b (mkCoreConApps pdc (map Type as' ++ map Var ys))) body1
                        | otherwise = body1
            ; return (reverse ys ++ acc, body2) }
+
+    -- A flattened field's type arguments come from the old field type, which
+    -- may mention the types rebuilt this round (R = R (Int, R)): rewrite them
+    -- as the new constructor's fields are ('ty' in 'rebuild')
+    inst_args sub as = map ty (substTys sub as)
 
     elemVarSet' b e = b `elementOfUniqSet` exprFreeIdsSet e
     exprFreeIdsSet e = mkUniqSet (freeIds e)
