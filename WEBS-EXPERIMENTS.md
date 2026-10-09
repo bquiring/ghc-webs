@@ -381,6 +381,29 @@ against `base` (112 benchmarks; `WEBS-DATA.md` has the data-splitting runs):
   against 6,664.9M without strict elimination, 5 fields; base 7,855.9M).
   Strict elimination unboxes one field more, and that one costs.
 
+## 11. After merging webs into data-split (2026-10-09)
+
+The merged compiler (constructed-argument raising, hidden fields,
+specialising for webs, the flattening fixes), all with `-dcore-lint`, all
+115 benchmarks built (`webs-bench/run-merged.sh`; `base` rebuilt with it).
+`early-m` = early-cur's options; `early-mdf` = with defunctionalisation.
+Against `base` (`results/timing-merged.md`, `report-merged.md`):
+
+| | `early-cur` | `early-m` | `early-mdf` |
+|---|---|---|---|
+| instructions (geomean) | −2.00% | −2.02% | **−2.20%** |
+| time (geomean) | −2.32% | −2.34% | **−2.60%** |
+| program allocation (geomean) | −1.84% | −1.89% | **−3.14%** |
+| >0.5% fewer / more instructions | | 31 / 1 | 31 / 1 |
+
+Best instructions (`early-mdf`): integer −59.7%, solid −21.8% (allocation
+−85.9%), queens −20.0%, linear −12.2%, cryptarithm2 −11.8%, mate −7.9%,
+puzzle −7.2%, CS −5.3%, treejoin −5.2%, dom-lt −5.1%, wave4main −4.7%
+(new: constructed arguments), cse −4.0%. Worst: simple +0.5%. 13
+benchmarks at least 5% faster, backed by instructions. rewrite now builds
+and runs right (−6.6% allocation; early-cur crashed). fasta, awards and
+k-nucleotide fail for base too (harness).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

@@ -117,9 +117,29 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
 - **Boundary split: imported functions.** Eta-expand an imported function
   used as a value in local higher-order code, not only the arguments passed
   to one. (The current split is measured now: `WEBS-EXPERIMENTS.md` §5.)
-- **Richer demands in web strictness.** Nested demands (strict in a field of
-  a product argument), call demands (an argument always called with n
-  arguments), cardinality.
+- **Strictness feeding raising** (next, after the merged timing; the user's
+  design, 2026-10-09). Web strictness (Note [Web strictness fixpoints])
+  already proves argument strictness as a greatest fixpoint over the webs,
+  and strict result fields backward from the case contexts of all calls
+  (through tail calls), but it runs last and records nothing on the
+  lambdas' parameters, which arity raising reads. So:
+  1. strictness records what it proves (a strict demand on the parameters
+     of a strict web), and the raised components get the demand they had
+     inside the product (nested raising: their fresh webs are rejected as
+     lazy today, `arityraise013`);
+  2. the transformation sequence repeats while something changes (2-3
+     passes): raising, strictness, raising. Measure against the 39 webs
+     arity raising rejects as lazy on nofib.
+- **Richer demands in web strictness** (after the above). GHC's demand type
+  instead of one bit per argument: product demands (strict in a field of an
+  argument), call demands, cardinality. A web's signature is the lub of its
+  lambdas' demands (strict only if every lambda is), each lambda analysed
+  with the current signatures of the webs it calls, iterated to a fixpoint
+  (a depth bound on nested demands for termination); results backward from
+  the case contexts of all calls. In effect, demand signatures for unknown
+  calls, which GHC's demand analysis lacks. Only internal webs; strict only
+  where evaluation is proven (the user: "we only want to make things strict
+  when we can prove we are going to evaluate it").
 - **One-shot lambdas from webs.** Done (`78d6fd8fc9`): no effect on nofib.
   Find out why, or drop it.
 - **Partial absence.** Drop the unused fields of a product argument at
