@@ -10,6 +10,7 @@ rejected (argument not a product): ww
 rejected (exposed): eta
 rejected (exposed): r r
 rejected (lazy in its argument): n
+rejected (lazy in its argument): x x
 
 
 [2 of 2] Linking arityraise005

@@ -62,17 +62,18 @@ A web w whose arrows all take a product (a single-constructor data type
 without existentials), and whose lambdas are all strict in that argument,
 passes the product's components instead:
 
-    T ts -{w}-> C         becomes   (# c1, .., cn #) -{w}-> C
+    T ts -{w}-> C         becomes   c1 -> .. -> cn -{w}-> C
                                      where c1..cn are the constructor's
                                      representation argument types
-    \^w p. e              becomes   \^w t. case t of (# x1, .., xn #) ->
-                                       e  with  case p of K ys -> rhs
+    \^w p. e              becomes   \x1 .. \^w xn. e
+                                       with  case p of K ys -> rhs
                                        replaced by  let ys = xs in rhs,
                                        and  let p = K xs  if p is still used
-    f @^w (K es)          becomes   f @^w (# es #)
-    f @^w x               becomes   case x of K ys -> f @^w (# ys #)
+    f @^w (K es)          becomes   f e1 .. @^w en
+    f @^w x               becomes   case x of K ys -> f y1 .. @^w yn
 
-The unboxed tuple encodes a multi-argument arrow (Unarise splits it).
+The components are passed curried, one argument each (Note [Raised
+arguments are curried]).
 
 Laziness (WEBS-ARITY-RAISING.md §2): the caller now evaluates the argument,
 so every lambda of the web must be strict in it (its demand, from the demand
@@ -90,6 +91,32 @@ A web is also rejected if it is exposed, if some arrow's argument is not a
 product (e.g. a type variable), if the product type differs between arrows,
 if a component has no fixed representation, or if the web appears in a
 coercion we cannot rewrite.
+-}
+
+{- Note [Raised arguments are curried]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A raised product argument becomes its components as separate, curried
+arguments, as worker/wrapper does, not one unboxed-tuple argument.  The web
+keeps the last arrow (so its result is still C, for result raising); the
+others get fresh webs, the same wherever the web occurs (Web Lint wants a
+web on every lambda).  A later round may raise those too (nested raising).
+The binder's arity grows by k - 1 for each raised argument with k
+components that it covers, and its demand signature gives each component
+the demand it had inside the product's demand (SplitArg, Note [Demand
+signatures after a transformation] in GHC.WebCore.Transform.Common).
+
+Unboxed-tuple arguments cost at the back end: Tidy gives no CBV marks to a
+function whose argument unarises to several, so every match on a strict
+component paid an evaluatedness check; and Unarise types the components'
+binders by their representation only (Any), so the code generator could
+not tell that a Float is not a function, and evaluating one became a slow
+call through stg_ap_0_fast (nofib spectral/hartel/nucleic2, in the late
+run: +11% instructions).  Curried arguments keep their types and get
+ordinary marks.  An unknown call  f x y  of a function of arity 2 is no
+slower: the generic apply checks the arity at run time.
+
+A product with no components still becomes one (# #) argument, so that a
+function never loses its last lambda (and its work is not shared).
 -}
 
 data Verdict = Raised | Rejected Reason
@@ -352,7 +379,7 @@ arityRaiseRound :: UniqSupply
                 -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
 arityRaiseRound us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
-  | otherwise           = (Just (initUs_ us (rewriteProgram todo pol binds), todo), dump)
+  | otherwise           = (Just (initUs_ us1 (rewriteProgram todo inner pol binds), todo), dump)
   where
     infos   = analyse binds
     complex = complexCoWebs binds
@@ -362,6 +389,11 @@ arityRaiseRound us exposed pol done binds
                , not (null (i_lams i))
                , not (w `elementOfUniqSet` done) ]
     todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
+    -- Fresh webs for the new arrows, per raised web
+    (us1, us2) = splitUniqSupply us
+    inner_map  = listToUFM [ (w, map mkWebId (uniqsFromSupply s))
+                           | ((w, Raised, _), s) <- zip verdicts (listSplitUniqSupply us2) ]
+    inner w    = lookupWithDefaultUFM inner_map [] w
     dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
 
 ------------------------------------------------------------------
@@ -370,28 +402,53 @@ arityRaiseRound us exposed pol done binds
 
 type Env = IdEnv Id
 
-raiseType :: WebSet -> Type -> Type
-raiseType todo = go
+raiseType :: WebSet -> InnerWebs -> Type -> Type
+raiseType todo inner = go
   where
     go ty = case ty of
       FunTy { ft_web = w, ft_mult = m, ft_arg = a, ft_res = r }
         | w `elementOfUniqSet` todo
         , Just (_, args, dc) <- productCon (coreFullView a)
-        -> let tup = mkTupleTy Unboxed (components dc (map go args))
-               r'  = go r
-           in mkWebFunTy w (chooseFunTyFlag tup r') m tup r'
+        -> curriedTy w (inner w) m (components dc (map go args)) (go r)
         | otherwise -> ty { ft_arg = go a, ft_res = go r }
       TyConApp tc tys -> TyConApp tc (map go tys)
       AppTy t1 t2     -> AppTy (go t1) (go t2)
       ForAllTy b t    -> ForAllTy b (go t)
-      CastTy t co     -> CastTy (go t) (raiseCo todo co)
-      CoercionTy co   -> CoercionTy (raiseCo todo co)
+      CastTy t co     -> CastTy (go t) (raiseCo todo inner co)
+      CoercionTy co   -> CoercionTy (raiseCo todo inner co)
       _               -> ty
 
-raiseCo :: WebSet -> Coercion -> Coercion
-raiseCo todo = go
+-- | The webs of the new arrows of a raised web (all but its last), the same
+-- wherever the web occurs.  See Note [Raised arguments are curried]
+type InnerWebs = WebId -> [WebId]
+
+-- | The arrows that take a raised product's components, one by one; the
+-- last one is the web's.  A product with no components becomes one (# #)
+-- argument.  See Note [Raised arguments are curried]
+curriedTy :: WebId -> [WebId] -> Mult -> [Type] -> Type -> Type
+curriedTy w ws m comps r = case comps of
+  [] -> let tup = mkTupleTy Unboxed [] in mkWebFunTy w (chooseFunTyFlag tup r) m tup r
+  _  -> foldr arrow (mkWebFunTy w (chooseFunTyFlag cn r) m cn r) (zip ws (init comps))
   where
-    goTy = raiseType todo
+    cn = last comps
+    arrow (wi, c) t = mkWebFunTy wi (chooseFunTyFlag c t) m c t
+
+-- | The coercion version of 'curriedTy', from the components' coercions
+curriedCo :: WebId -> [WebId] -> Role -> Coercion -> [Coercion] -> Coercion -> Coercion
+curriedCo w ws r m comp_cos res_co = case comp_cos of
+  [] -> let tup = mkTyConAppCo r (tupleTyCon Unboxed 0) [] in fun_co (mkWebFunCo2 w) tup res_co
+  _  -> foldr (\(wi, c) t -> fun_co (mkWebFunCo2 wi) c t)
+              (fun_co (mkWebFunCo2 w) (last comp_cos) res_co)
+              (zip ws (init comp_cos))
+  where
+    fun_co mk a b = let Pair la ra = coercionKind a
+                        Pair lb rb = coercionKind b
+                    in mk r (chooseFunTyFlag la lb) (chooseFunTyFlag ra rb) m a b
+
+raiseCo :: WebSet -> InnerWebs -> Coercion -> Coercion
+raiseCo todo inner = go
+  where
+    goTy = raiseType todo inner
     go co = case co of
       Refl t              -> Refl (goTy t)
       GRefl r t mco       -> GRefl r (goTy t) mco
@@ -402,11 +459,7 @@ raiseCo todo = go
         | w `elementOfUniqSet` todo
         , Just (_, arg_cos) <- splitArgCo ca
         , Just (_, _, dc) <- productCon (coercionLKind ca)
-        -> let tup      = componentsTupleCo r dc (map go arg_cos)
-               cr'      = go cr
-               Pair lt rt = coercionKind tup
-               Pair lc rc = coercionKind cr'
-           in mkWebFunCo2 w r (chooseFunTyFlag lt lc) (chooseFunTyFlag rt rc) m tup cr'
+        -> curriedCo w (inner w) r m (componentCos r dc (map go arg_cos)) (go cr)
         | otherwise -> co { fco_arg = go ca, fco_res = go cr }
       AxiomCo ax cos      -> AxiomCo ax (map go cos)
       SymCo c             -> SymCo (go c)
@@ -421,17 +474,22 @@ componentsTupleCo :: Role -> DataCon -> [Coercion] -> Coercion
 componentsTupleCo r dc arg_cos
   = mkTyConAppCo r (tupleTyCon Unboxed (length comp_cos)) (reps ++ comp_cos)
   where
-    comp_cos = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos)
-                   (map scaledThing (dataConRepArgTys dc))
+    comp_cos = componentCos r dc arg_cos
     reps     = map (mkNomReflCo . getRuntimeRep . coercionLKind) comp_cos
 
-rewriteProgram :: WebSet -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram todo pol binds
+-- | The coercions between the components of two instances of a product type
+componentCos :: Role -> DataCon -> [Coercion] -> [Coercion]
+componentCos r dc arg_cos
+  = map (liftCoSubstWith r (dataConUnivTyVars dc) arg_cos)
+        (map scaledThing (dataConRepArgTys dc))
+
+rewriteProgram :: WebSet -> InnerWebs -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
+rewriteProgram todo inner pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
-    upTy = raiseType todo
-    upCo = raiseCo todo
+    upTy = raiseType todo inner
+    upCo = raiseCo todo inner
     is_todo w = w `elementOfUniqSet` todo
 
     rw_top env (NonRec b e) = NonRec (lookup_bndr env b) <$> rw env e
@@ -440,17 +498,32 @@ rewriteProgram todo pol binds
 
     lookup_bndr env v = fromMaybe v (lookupVarEnv env v)
 
-    -- The arity does not change: one product argument becomes one
-    -- unboxed-tuple argument
+    -- A product argument becomes its components, curried: the arity grows
+    -- by the number of components less one, for each raised argument it
+    -- covers (Note [Raised arguments are curried])
     rw_bndr :: Var -> Var
     rw_bndr b
       | not (isId b)         = b
       | not (changed old_ty) = fixUnfolding pol changed_set b
       | otherwise            = fixUnfolding pol changed_set $
-                               fixBinderInfo b new_ty (\_ n -> n) (argFates (\_ _ -> KeepArg) old_ty)
+                               fixBinderInfo b new_ty (\_ n -> reshapeArity fates n) fates
       where
         old_ty = idType b
         new_ty = upTy old_ty
+        fates  = raisedFates old_ty
+
+    -- The fate of each value argument of a type: a raised product with k > 0
+    -- components is split into k arguments
+    raisedFates ty = case coreFullView ty of
+      ForAllTy _ t -> raisedFates t
+      FunTy { ft_web = w, ft_arg = a, ft_res = r }
+        | is_todo w
+        , Just (_, args, dc) <- productCon (coreFullView a)
+        , let k = length (components dc args)
+        , k > 0
+        -> SplitArg k : raisedFates r
+        | otherwise -> KeepArg : raisedFates r
+      _ -> []
 
     -- See Note [Unfoldings and rules after a transformation]
     -- in GHC.WebCore.Transform.Common
@@ -527,8 +600,9 @@ rewriteProgram todo pol binds
       = t { breakpointFVs = map (lookup_bndr env) ids }
     rw_tick _ t = t
 
-    -- \^w p. e  ==>  \^w t. case t of (# xs #) -> [let p = K xs in] e'
+    -- \^w p. e  ==>  \x1 .. \^w xn. [let p = K xs in] e'
     -- where e' replaces  case p of b { K ys -> rhs }  by  let ys = xs in rhs
+    -- (with no components:  \^w t. case t of (# #) -> e')
     rw_raised_lam env w p e
       = do { let (env1, p') = rw_bndr1 env p
                  p_ty = idType p'
@@ -544,11 +618,15 @@ rewriteProgram todo pol binds
                     = Let (NonRec p' (mkCoreConApps dc (map Type args ++ map Var xs))) e2
                     | otherwise = e2
                  tup_ty = mkTupleTy Unboxed comp_tys
-           ; u <- getUniqueM
-           ; let t = mkSysLocal (fsLit "ut") u ManyTy tup_ty
-           ; wild <- mkWild tup_ty
-           ; return (WebLam w t (lams (Case (Var t) wild (exprType e3)
-                                         [Alt (DataAlt (tupleDataCon Unboxed (length xs))) xs e3]))) }
+           ; case xs of
+               [] -> do { u <- getUniqueM
+                        ; let t = mkSysLocal (fsLit "ut") u ManyTy tup_ty
+                        ; wild <- mkWild tup_ty
+                        ; return (WebLam w t (lams (Case (Var t) wild (exprType e3)
+                                                     [Alt (DataAlt (tupleDataCon Unboxed 0)) [] e3]))) }
+               _  -> return (foldr (\(wi, x) b -> WebLam wi x b)
+                                   (WebLam w (last xs) (lams e3))
+                                   (zip (inner w) (init xs))) }
 
     -- f @^w (K es)  ==>  f @^w (# es #)
     -- f @^w x       ==>  case x of b { K ys -> f @^w (# ys #) }
@@ -557,7 +635,7 @@ rewriteProgram todo pol binds
       | Just (dc, _, vals) <- conApp x'
       , Just (_, _, dc') <- productCon (coreFullView (exprType x'))
       , dc == dc'
-      = return (id, WebApp w f' (mkCoreUnboxedTuple vals))
+      = return (id, curriedCall w f' vals)
       | otherwise
       = do { let x_ty = exprType x'
                  (args, dc) = productOf x_ty
@@ -565,9 +643,15 @@ rewriteProgram todo pol binds
                                    ; return (mkSysLocal (fsLit "y") u ManyTy ty) })
                         (components dc args)
            ; b <- mkWild x_ty
-           ; let call = WebApp w f' (mkCoreUnboxedTuple (map Var ys))
+           ; let call = curriedCall w f' (map Var ys)
                  wrap body = Case x' b (exprType body) [Alt (DataAlt dc) ys body]
            ; return (wrap, call) }
+
+    -- f @^w (# es #), with the components passed one by one
+    curriedCall w f' vals = case vals of
+      [] -> WebApp w f' (mkCoreUnboxedTuple [])
+      _  -> WebApp w (foldl (\g (wi, v) -> WebApp wi g v) f' (zip (inner w) (init vals)))
+                     (last vals)
 
     -- A saturated application of a data constructor's worker
     conApp e = case collectArgs e of

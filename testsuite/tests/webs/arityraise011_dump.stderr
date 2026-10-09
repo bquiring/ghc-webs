@@ -10,6 +10,8 @@ rejected (exposed): e1
 rejected (exposed): eta1
 rejected (exposed): s
 rejected (exposed): s s
+rejected (lazy in its argument): x
+rejected (lazy in its argument): x
 
 
 [2 of 2] Linking arityraise011

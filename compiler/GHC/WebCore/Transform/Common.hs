@@ -4,7 +4,7 @@
 module GHC.WebCore.Transform.Common
   ( programOccurrences, exprOccurrences
   , complexCoWebs
-  , fixBinderInfo, ArgFate(..), argFates
+  , fixBinderInfo, ArgFate(..), argFates, reshapeArity
   , UnfoldingPolicy(..), changedBinders, fixUnfolding
   , pprWebVerdicts
   , mkWild
@@ -39,7 +39,7 @@ import GHC.Core.FVs ( exprFreeVars, rulesFreeVars )
 import GHC.Core.Type ( coreFullView )
 import GHC.Types.Demand ( DmdSig, splitDmdSig, mkClosedDmdSig, absDmd, topDmd
                          , Demand(..), Card(..), Boxity(..), mkProd
-                         , mkCall, viewCall, multCard, isAbs, topSubDmd )
+                         , mkCall, viewCall, multCard, isAbs, topSubDmd, viewProd, isAbsDmd )
 
 import Data.List ( sortOn )
 import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
@@ -148,6 +148,8 @@ data ArgFate
   | AbsentArg       -- ^ Replaced by (# #) (dead-parameter elimination)
   | MergeWithNext   -- ^ Merged with the next argument into an unboxed tuple
                     --   (uncurrying); the next argument's fate is ignored
+  | SplitArg Int    -- ^ A product split into its k > 0 components, curried
+                    --   (arity raising)
 
 {- Note [Demand signatures after a transformation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -189,7 +191,14 @@ reshapeDmdSig fates sig
     go (AbsentArg : fs)            (_ : ds)     = absDmd : go fs ds
     go (MergeWithNext : _ : fs)    (d1 : d2 : ds) = merged d1 d2 : go fs ds
     go (MergeWithNext : _)         [_]            = [topDmd]
+    go (SplitArg k : fs)           (d : ds)     = split k d ++ go fs ds
     go _                           ds           = ds
+
+    -- A split product's components get their demands within the product's
+    split k d@(_ :* sd)
+      | Just (_, ds) <- viewProd k sd = ds
+      | isAbsDmd d                    = replicate k absDmd
+    split k _                         = replicate k topDmd
 
     -- The unboxed tuple of two merged arguments is always evaluated (it is
     -- unlifted), and its components have the arguments' demands, so that
@@ -215,6 +224,8 @@ reshapeUsage fates dmd = case dmd of
             -- The call that supplied the deleted argument is gone: its
             -- cardinality multiplies into the next call
             DropArg       -> go fs (scale c sd1)
+            -- One call becomes k, each of the later ones once per the first
+            SplitArg k    -> mkCall c (iterate (mkCall C_11) (go fs sd1) !! (k - 1))
             -- Two calls become one
             MergeWithNext -> case (fs, viewCall sd1) of
               (_ : fs', Just (c2, sd2))
@@ -234,7 +245,13 @@ reshapeCallArity = go
     go (AbsentArg : fs)         n = 1 + go fs (n - 1)
     go (DropArg : fs)           n = go fs (n - 1)
     go (MergeWithNext : _ : fs) n | n >= 2 = 1 + go fs (n - 2)
+    go (SplitArg k : fs)        n = k + go fs (n - 1)
     go _ _ = 0
+
+-- | A binder's new arity, given its old one, when no argument is merged
+-- (the arguments past the fates are unchanged)
+reshapeArity :: [ArgFate] -> Int -> Int
+reshapeArity fates n = reshapeCallArity fates n + max 0 (n - length fates)
 
 -- | Fix up the IdInfo of a binder whose type a transformation changed:
 -- set the new type and arity (and join arity), reshape its demand signature

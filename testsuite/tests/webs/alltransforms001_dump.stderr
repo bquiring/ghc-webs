@@ -4,32 +4,21 @@
 $wadd :: GHC.Internal.Prim.Int# -{1}->
          GHC.Internal.Prim.Int# -{2}-> GHC.Internal.Prim.Int#
 Main.add :: (#,#) GHC.Internal.Types.LiftedRep
-                  ('GHC.Internal.Types.TupleRep (': GHC.Internal.Types.RuntimeRep
-                                                    'GHC.Internal.Types.IntRep
-                                                    ('[] GHC.Internal.Types.RuntimeRep)))
+                  'GHC.Internal.Types.IntRep
                   GHC.Internal.Types.Int
-                  (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
-                                            GHC.Internal.Prim.Int#) -{3}->
+                  GHC.Internal.Prim.Int# -{3}->
             GHC.Internal.Types.Int
 $wapply2p :: ((#,#) GHC.Internal.Types.LiftedRep
-                    ('GHC.Internal.Types.TupleRep (': GHC.Internal.Types.RuntimeRep
-                                                      'GHC.Internal.Types.IntRep
-                                                      ('[] GHC.Internal.Types.RuntimeRep)))
+                    'GHC.Internal.Types.IntRep
                     GHC.Internal.Types.Int
-                    (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
-                                              GHC.Internal.Prim.Int#) -{3}->
+                    GHC.Internal.Prim.Int# -{3}->
               GHC.Internal.Types.Int) -{4}->
              GHC.Internal.Types.Int -{5}-> GHC.Internal.Prim.Int#
 $wk2 :: GHC.Internal.Prim.Int# -{6}-> GHC.Internal.Prim.Int#
-Main.k2 :: GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
-                                    GHC.Internal.Prim.Int# -{7}->
-           GHC.Internal.Types.Int
+Main.k2 :: GHC.Internal.Prim.Int# -{7}-> GHC.Internal.Types.Int
 $wk1 :: GHC.Internal.Prim.Int# -{8}-> GHC.Internal.Prim.Int#
-Main.k1 :: GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
-                                    GHC.Internal.Prim.Int# -{7}->
-           GHC.Internal.Types.Int
-$wignoreFirst :: (GHC.Internal.Types.Solo# 'GHC.Internal.Types.IntRep
-                                           GHC.Internal.Prim.Int# -{7}->
+Main.k1 :: GHC.Internal.Prim.Int# -{7}-> GHC.Internal.Types.Int
+$wignoreFirst :: (GHC.Internal.Prim.Int# -{7}->
                   GHC.Internal.Types.Int) -{9}->
                  GHC.Internal.Prim.Int#
 $wsumP :: GHC.Internal.Prim.Int# -{10}->
