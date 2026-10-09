@@ -662,7 +662,7 @@ splitDataTypes unbox keep cfg this_mod us rules binds
     (final_binds, final_tcs, flat_dump, flat_rebuilt)
       | not changed = (binds, [], empty, [])
       | Just opts0 <- unbox
-                    = let (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (3 :: Int) us5 sp_tcs sp_binds
+                    = let (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (uo_rounds opts0) us5 sp_tcs sp_binds
                           opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
                                                          | tc <- sp_tcs, dc <- tyConDataCons tc ] }
                       in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump, fl_rebuilt)
@@ -683,8 +683,11 @@ splitDataTypes unbox keep cfg this_mod us rules binds
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
             rebuilt = [ tc | tc <- tcs', getUnique tc `notElem` map getUnique tcs ]
-            (bs'', tcs'', d', r') | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
-                                  | otherwise     = (bs', tcs', empty, [])
+            (bs'', tcs'', d', r')
+              | changed_round, n == 1
+              = (bs_opt, tcs', text "round limit reached: the last round still unboxed", [])
+              | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
+              | otherwise     = (bs', tcs', empty, [])
         in (bs'', tcs'', d $$ d', rebuilt ++ r')
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]

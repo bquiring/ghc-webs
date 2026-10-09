@@ -328,12 +328,11 @@ against `base` (112 benchmarks; `WEBS-DATA.md` has the data-splitting runs):
   +1.4% → −0.02%, solid −18.8% (allocation −50.9%), mate −8.0%, CS −5.4%,
   event 0.0%.
 * **cryptarithm2's lost 3%** (−15.1% before strictly eliminated fields,
-  −11.8% after): with `-fcore-webs-no-strict-elim`, −15.2%. Strict
-  elimination unboxes `[Int]`'s head in round 1, which makes the pair
-  type holding that list a rebuilt type, so the outer list cannot unpack it
-  that round (the outer-first rule); the cascade then runs out of rounds
-  (three). To try: rounds to a fixpoint; or hold back inner unboxing while
-  an outer type containing it is pending.
+  −11.8% after): with `-fcore-webs-no-strict-elim`, −15.2%. Not the round
+  limit, as first thought: with `-fcore-webs-unbox-rounds=5` or `10` the
+  same 6 fields are unboxed and the instructions are the same (6,927.8M
+  against 6,664.9M without strict elimination, 5 fields; base 7,855.9M).
+  Strict elimination unboxes one field more, and that one costs.
 
 ## Findings along the way
 

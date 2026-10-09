@@ -25,6 +25,7 @@ data UnboxOpts = UnboxOpts
   , uo_nested     :: Bool              -- ^ -fcore-webs-unbox-nested
   , uo_strict_elim :: Bool             -- ^ not -fcore-webs-no-strict-elim
   , uo_max_size   :: Int               -- ^ -fcore-webs-max-unbox-size
+  , uo_rounds     :: Int               -- ^ -fcore-webs-unbox-rounds
   , uo_trust_demands :: Bool           -- ^ demands are fresh (the early run):
                                        --   Note [Unboxing in the late run]
   , uo_orig_sizes :: [(String, Int)] } -- ^ the split constructors' original sizes, by name

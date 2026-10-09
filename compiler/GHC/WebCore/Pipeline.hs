@@ -384,6 +384,7 @@ runDataSplit early logger dflags this_mod rules binds
                                      , uo_nested     = gopt Opt_CoreWebsUnboxNested dflags
                                      , uo_strict_elim = not (gopt Opt_CoreWebsNoStrictElim dflags)
                                      , uo_max_size   = websMaxUnboxSize dflags
+                                     , uo_rounds     = websUnboxRounds dflags
                                      , uo_trust_demands = early
                                      , uo_orig_sizes = [] })
                    | otherwise = Nothing
