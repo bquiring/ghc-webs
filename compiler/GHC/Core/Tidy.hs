@@ -18,6 +18,7 @@ import GHC.Core
 import GHC.Core.Type
 import GHC.Core.TyCo.Tidy
 import GHC.Core.Seq ( seqUnfolding )
+import GHC.Core.TyCon ( isUnboxedTupleTyCon )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -220,7 +221,8 @@ computeCbvInfo fun_id rhs
 
     isSingleUnarisedArg v
       | isUnboxedSumType ty = False
-      | isUnboxedTupleType ty = all (isSimplePrimRep . typePrimRep) (tupleComponents ty)
+      | Just comps <- tupleComponents ty = all (isSimplePrimRep . typePrimRep) comps
+      | isUnboxedTupleType ty = isSimplePrimRep (typePrimRep ty)
       | otherwise = isSimplePrimRep (typePrimRep ty)
       where
         ty = idType v
@@ -230,9 +232,8 @@ computeCbvInfo fun_id rhs
 
     -- The marks of one argument: one per argument it unarises to
     arg_marks arg mb_sig_dmd
-      | isUnboxedTupleType ty
-      , let comps = tupleComponents ty
-            arg_dmd = case mb_sig_dmd of
+      | Just comps <- tupleComponents ty
+      , let arg_dmd = case mb_sig_dmd of
                         Just d | not (isTopDmd (idDemandInfo arg)) -> idDemandInfo arg
                                | otherwise                         -> d
                         Nothing -> idDemandInfo arg
@@ -248,9 +249,13 @@ computeCbvInfo fun_id rhs
       | isBoxedType t, not (isUnliftedType t)
       , isStrUsedDmd d, not (isDeadEndId fun_id) = MarkedCbv
       | otherwise                                = NotMarkedCbv
+    -- The components of an unboxed tuple type.  Not isUnboxedTupleType, which
+    -- looks at the runtime representation only: a coercion argument
+    -- (a ~# b) is a TupleRep [] too, and its "components" may be of any kind.
     tupleComponents ty = case splitTyConApp_maybe ty of
-      Just (_, args) -> drop (length args `div` 2) args   -- after the RuntimeReps
-      Nothing        -> []
+      Just (tc, args) | isUnboxedTupleTyCon tc
+                      -> Just (drop (length args `div` 2) args)   -- after the RuntimeReps
+      _               -> Nothing
 
     mkMark arg
       | not $ shouldUseCbvForId arg = NotMarkedCbv

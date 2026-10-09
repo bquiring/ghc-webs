@@ -247,6 +247,12 @@ test('dataunbox005_dump', [extra_files(['dataunbox005.hs'])],
 test('dataunbox006', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox006_dump', [extra_files(['dataunbox006.hs'])],
      multimod_compile, ['dataunbox006', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+# dataunbox007: dead fields (Note [Dead fields]): an accumulator field that
+# only feeds itself is dropped, with its arithmetic, even when it holds an
+# error; a field passed to a function is kept
+test('dataunbox007', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunbox007_dump', [extra_files(['dataunbox007.hs'])],
+     multimod_compile, ['dataunbox007', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
 
 # Edge cases for data splitting and unboxing.  001-010 are type-level, with
 # coercions: local, parameterised, eta-reducible, recursive and mutually

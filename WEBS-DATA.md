@@ -88,6 +88,25 @@ longer applied); splitting and unboxing also in the late run, without the
 demand-based rules (Note [Unboxing in the late run]). Edge-case tests now
 21 programs in seven modes (five early, two late).
 
+Dead fields (Note [Dead fields], 2026-10-09): a field is dropped when,
+in every match on its constructor, its pattern variable is in the
+alternative's dead slice: it occurs only inside arguments of dead fields,
+right-hand sides of dead lets, or scrutinees of single-alternative cases
+whose binders are dead (a greatest fixpoint, inside the fixpoint over the
+fields); the slice is deleted with it. x2n1 (`./x2n1 8000000`, pinned,
+user instructions): base 6,677.6M, early-du9 6,741.6M (+0.96%), with dead
+fields 6,677.6M (+0.0002%): the sum's accumulator keeps only the real
+part, one `Double#`; the imaginary parts inside `^` stay (another class).
+Test `dataunbox007`.
+
+Fixed on the way (stage 1 had been frozen, so the libraries had never been
+compiled with it): the CBV marks for unboxed tuple arguments (Note [CBV
+marks for unboxed tuple arguments]) took a coercion argument `a ~# b` for
+an unboxed tuple (`isUnboxedTupleType` looks only at the representation,
+`TupleRep []`) and asked for the representation of `a :: k`: a panic in
+CoreTidy compiling `GHC.Internal.Data.Type.Equality`. Now only an unboxed
+tuple type constructor counts.
+
 ### Next: one fixpoint for all unboxing (planned, 2026-10-08)
 
 Field unboxing, argument unboxing (arity raising) and result unboxing

@@ -1,0 +1,19 @@
+[1 of 2] Compiling Main             ( dataunbox007.hs, dataunbox007.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 81, classes: 10, exposed: 7, split: 3, exposed only by casts: 0, pinned binders: 9
+Main.P_s8 = Main.P with Main.P_s8 (built [1], matched [1])
+Main.Q_s9 = Main.Q with Main.Q_s9 (built [1], matched [1])
+Main.R_s10 = Main.R with Main.R_s10 (built [1], matched [1])
+Main.P_s8 field 0: boxed (a construction passes a non-value: a case)
+Main.P_s8 field 1: dropped (dead)
+Main.Q_s9 field 0: boxed (a construction passes a non-value: a call of $fNumInt_$c+)
+Main.Q_s9 field 1: dropped (dead)
+Main.R_s10 field 0: unboxed
+Main.R_s10 field 1: unboxed
+Main.P_s8 field 0: boxed (a construction passes a non-value: a case)
+Main.Q_s9 field 0: boxed (a construction passes a non-value: a call of $fNumInt_$c+)
+
+
+[2 of 2] Linking dataunbox007

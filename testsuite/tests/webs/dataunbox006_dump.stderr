@@ -17,21 +17,16 @@ Main.List_s9: specialised to Main.List_s9 = [Main.Tuple2_s10
                                                GHC.Internal.Types.Int GHC.Internal.Types.Int]
 Main.Tuple2_s10: specialised to Main.Tuple2_s10 = [GHC.Internal.Types.Int,
                                                    GHC.Internal.Types.Int]
-Main.Con2_s7 field 0: unboxed
-Main.Con1_s8 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error) (every match is strict in it, but it may be built without being eliminated))
-Main.Con1_s8 field 1: boxed (its type is unpacked into another this round)
+Main.Con2_s7 field 0: dropped (dead)
+Main.Con1_s8 field 0: dropped (dead)
+Main.Con1_s8 field 1: dropped (dead)
 Main.Con2_s9 field 0: unboxed
 Main.Con1_s10 field 0: boxed (its type is unpacked into another this round)
 Main.Con1_s10 field 1: boxed (its type is unpacked into another this round)
-Main.Con2_s7 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error))
-Main.Con2_s7 field 1: unboxed
-Main.Con1_s8 field 0: unboxed
-Main.Con1_s8 field 1: unboxed
 Main.Con2_s9 field 0: unboxed
 Main.Con2_s9 field 1: unboxed
 Main.Con1_s10 field 0: unboxed
 Main.Con1_s10 field 1: unboxed
-Main.Con2_s7 field 0: boxed (a construction passes a non-value: a let-bound thunk (a call of error))
 
 
 [2 of 2] Linking dataunbox006

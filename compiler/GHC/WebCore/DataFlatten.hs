@@ -11,7 +11,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.DataCon
-import GHC.Core.Make ( mkCoreConApps )
+import GHC.Core.Make ( mkCoreConApps, mkAbsentErrorApp )
 import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
@@ -82,6 +82,29 @@ strict in it).  So there, no rule reads them: strict binders are not values
 [Strictly eliminated fields]), a callee's signature does not make an
 argument unboxable, and -fcore-webs-data-unbox-eager does nothing.  What is
 left needs no demands: values, projections, strict constructor fields.
+-}
+
+{- Note [Dead fields]
+~~~~~~~~~~~~~~~~~~~~~
+A field of a split type is dead if, in every match on its constructor, its
+pattern variable is in the alternative's dead slice: every occurrence is
+inside an argument of a dead field, inside the right-hand side of a let of a
+dead variable, or the scrutinee of a single-alternative case whose binders
+are all dead (slice_dead: a greatest fixpoint, inside the fixpoint over the
+fields).  So a value that only flows, through arithmetic, into a dead field
+is dead with it.  When a field is dropped, its alternatives' dead slices
+are deleted (prune): the lets and the cases on dead variables, whose results
+fed only dropped arguments.  It is dropped: from the
+constructor, from every construction (with its argument), and from every
+match.  A greatest fixpoint: a field whose value only flows into itself (a
+running sum carried through a loop and never read) is dead.  A strict field
+is dropped only if every construction passes a value (dropping its argument
+then drops no evaluation); a lazy one always may be.  The split type is
+local and closed, so these are all its reads.
+
+(nofib imaginary/x2n1 summed Complex numbers and read only the real part;
+unboxing Complex early carried the imaginary sum through the loop as a
+parameter that nothing removed: +1.0% instructions.)
 -}
 
 {- Note [Strict binders are values]
@@ -216,7 +239,9 @@ data Facts = Facts [(DataCon, Maybe [ArgFact], Ctx)] [(DataCon, Int, [Use], Bool
                    [(TyCon, [(DataCon, [Bool])])]
 
 -- | What happens to a field
-data Field = Keep | Flatten DataCon [Type]   -- ^ P's constructor and type arguments
+data Field = Keep
+           | Flatten DataCon [Type]   -- ^ P's constructor and type arguments
+           | Drop                     -- ^ dead: Note [Dead fields]
 
 -- | Per split type: its constructors' field plans (by tag), if any is flattened
 type Plans = UniqFM TyCon [(DataCon, [Field])]
@@ -272,6 +297,20 @@ flattenFields opts this_mod us tcs binds
     -- case on a candidate type has (with the strictness of their fields)
     cons_facts  :: [(DataCon, Maybe [ArgFact], Ctx)]  -- Nothing: unsaturated
     match_facts :: [(DataCon, Int, [Use], Bool)]      -- Bool: the match is strict in it
+    -- the alternatives on candidate constructors: field binders and right-hand
+    -- side (Note [Dead fields])
+    alt_facts :: [(DataCon, [Id], CoreExpr)]
+    alt_facts = [ (dc, filter isId bs, rhs)
+                | bind <- binds, (_, e) <- flattenBinds [bind], Alt (DataAlt dc) bs rhs <- alts_of e
+                , is_cand_con dc ]
+    alts_of e = case e of
+      Case x _ _ as -> as ++ alts_of x ++ concat [ alts_of r | Alt _ _ r <- as ]
+      App f a       -> alts_of f ++ alts_of a
+      Lam _ b       -> alts_of b
+      Let bind b    -> concatMap (alts_of . snd) (flattenBinds [bind]) ++ alts_of b
+      Cast x _      -> alts_of x
+      Tick _ x      -> alts_of x
+      _             -> []
     case_facts  :: [(TyCon, [(DataCon, [Bool])])]
     Facts cons_facts match_facts case_facts
       = foldr (go_top emptyVarSet emptyVarEnv) (Facts [] [] []) binds
@@ -354,7 +393,7 @@ flattenFields opts this_mod us tcs binds
             pv' = extendVarEnvList pv [ (b, (dc, i)) | (i, b) <- zip [0 ..] fbs ]
             Facts cf mf kf = go c ev pv' rhs acc
         in Facts cf ([ (dc, i, usesOf b rhs, isStrUsedDmd (idDemandInfo b))
-                     | (i, b) <- zip [0 ..] fbs, candidate dc i ] ++ mf) kf
+                     | (i, b) <- zip [0 ..] fbs ] ++ mf) kf
     alt c ev pv _ _ rhs acc = go c ev pv rhs acc
 
     -- Note [Strictly eliminated fields]: the greatest fixpoint of the fields
@@ -595,6 +634,7 @@ flattenFields opts this_mod us tcs binds
       , let cons = [ (dc, [ plan dc i | i <- all_fields dc ]) | dc <- tyConDataCons tc ]
       , any (\(_, fs) -> any is_flat fs) cons ]
     plan dc i
+      | in_set dead_fields dc i = Drop     -- Note [Dead fields]
       | candidate dc i, i `notElem` map fst (lookupWithDefaultUFM bad [] dc)
       , Scaled _ t : _ <- drop i (dataConOrigArgTys dc)
       , Just (_, args, pdc) <- productCon (coreFullView t)
@@ -628,7 +668,97 @@ flattenFields opts this_mod us tcs binds
       Cast x _ -> spec_ok ev x
       _        -> False
     is_flat (Flatten {}) = True
+    is_flat Drop         = True
     is_flat Keep         = False
+
+    -- Note [Dead fields]: the greatest fixpoint of the fields whose every use
+    -- in a match is an argument to a dead field (or none), and that may be
+    -- dropped from every construction (lazy, or given only values)
+    dead_fields :: UniqFM DataCon [Int]
+    dead_fields = dead_fix (listToUFM [ (dc, all_fields dc) | tc <- tcs, dc <- tyConDataCons tc ])
+    dead_fix cur
+      | sizeOf next == sizeOf cur = cur
+      | otherwise                 = dead_fix next
+      where
+        next = listToUFM [ (dc, [ i | i <- is, dead_ok cur dc i ]) | (dc, is) <- ufm_list cur ]
+        ufm_list m = [ (dc, lookupWithDefaultUFM m [] dc) | tc <- tcs, dc <- tyConDataCons tc ]
+    dead_ok m dc i
+      =  con_used dc     -- a type nothing uses any more (unpacked in an earlier
+                         -- round) is left alone
+      && and [ b `elemVarSet` slice_dead m (b : []) rhs
+             | (dc', bs, rhs) <- alt_facts, dc' == dc, Just b <- [index i bs] ]
+      && and [ isJust fact | (dc', fact, _) <- cons_facts, dc' == dc ]     -- saturated
+      && (not (strict_field dc i)
+          || and [ case index i as of { Just AValue -> True; _ -> False }
+                 | (dc', Just as, _) <- cons_facts, dc' == dc ])
+
+    con_used dc = any (\(dc', _, _) -> dc' == dc) cons_facts
+               || any (\(dc', _, _) -> dc' == dc) alt_facts
+
+    -- The variables of an alternative that are dead given the dead fields m:
+    -- every occurrence is inside an argument of a dead field, inside the
+    -- right-hand side of a dead let, or the scrutinee of a single-alternative
+    -- case whose binders are all dead.  A greatest fixpoint over the
+    -- alternative's binders (and the extra ones given).
+    slice_dead :: UniqFM DataCon [Int] -> [Id] -> CoreExpr -> VarSet
+    slice_dead m extra rhs = go_d (mkVarSet (extra ++ local_bndrs rhs))
+      where
+        go_d d | sizeVarSet d' == sizeVarSet d = d
+               | otherwise                   = go_d d'
+          where d' = d `minusVarSet` live m d False rhs
+    local_bndrs e = case e of
+      Lam b x       -> [ b | isId b ] ++ local_bndrs x
+      App f a       -> local_bndrs f ++ local_bndrs a
+      Let bind x    -> concatMap (\(b, r) -> b : local_bndrs r) (flattenBinds [bind]) ++ local_bndrs x
+      Case x b _ as -> b : local_bndrs x ++ concat [ filter isId bs ++ local_bndrs r | Alt _ bs r <- as ]
+      Cast x _      -> local_bndrs x
+      Tick _ x      -> local_bndrs x
+      _             -> []
+
+    -- The variables with an occurrence that is not dead (given dead vars d)
+    live :: UniqFM DataCon [Int] -> VarSet -> Bool -> CoreExpr -> VarSet
+    live m d dead_ctx e = case e of
+      Var v | dead_ctx  -> emptyVarSet
+            | otherwise -> unitVarSet v
+      App {}
+        | (Var f, args) <- collectArgs e
+        , Just dc <- isDataConWorkId_maybe f, is_cand_con dc, not dead_ctx
+        -> unionVarSets [ live m d (dead_ctx || in_set m dc j) a
+                        | (j, a) <- zip [0 ..] [ a | a <- args, not (isTypeArg a) ] ]
+      App f a       -> live m d dead_ctx f `unionVarSet` live m d dead_ctx a
+      Lam _ b       -> live m d dead_ctx b
+      Let (NonRec x r) b
+                    -> live m d (dead_ctx || x `elemVarSet` d) r `unionVarSet` live m d dead_ctx b
+      Let (Rec prs) b
+                    -> unionVarSets [ live m d (dead_ctx || x `elemVarSet` d) r | (x, r) <- prs ]
+                       `unionVarSet` live m d dead_ctx b
+      Case (Var v) cb _ [Alt _ bs r]
+        | all (`elemVarSet` d) (filter isId bs), cb `elemVarSet` d
+                    -> live m d True (Var v) `unionVarSet` live m d dead_ctx r
+      Case x _ _ as -> live m d dead_ctx x `unionVarSet`
+                       unionVarSets [ live m d dead_ctx r | Alt _ _ r <- as ]
+      Cast x _      -> live m d dead_ctx x
+      Tick _ x      -> live m d dead_ctx x
+      _             -> emptyVarSet
+
+    -- Delete a dead slice: lets of dead variables, and single-alternative
+    -- cases on dead variables (their binders are dead too)
+    prune :: VarSet -> CoreExpr -> CoreExpr
+    prune d e = case e of
+      Let (NonRec x _) b | x `elemVarSet` d -> prune d b
+      Let (Rec prs) b    | all ((`elemVarSet` d) . fst) prs -> prune d b
+      Let bind b         -> Let (prune_bind bind) (prune d b)
+      Case (Var v) cb _ [Alt _ bs r]
+        | v `elemVarSet` d, all (`elemVarSet` d) (filter isId bs), cb `elemVarSet` d
+                         -> prune d r
+      Case x b t as      -> Case (prune d x) b t [ Alt c bs (prune d r) | Alt c bs r <- as ]
+      App f a            -> App (prune d f) (prune d a)
+      Lam b x            -> Lam b (prune d x)
+      Cast x co          -> Cast (prune d x) co
+      Tick t x           -> Tick t (prune d x)
+      _                  -> e
+      where prune_bind (NonRec x r) = NonRec x (prune d r)
+            prune_bind (Rec prs)    = Rec [ (x, prune d r) | (x, r) <- prs ]
 
     -- The new types: S' with the flattened constructors (same tags)
     news :: UniqFM TyCon (TyCon, UniqFM DataCon DataCon)
@@ -657,6 +787,7 @@ flattenFields opts this_mod us tcs binds
             -- Fields may mention the other types rebuilt this round too
             -- ('ty', lazily: it looks at all of them)
             arg_tys = concat [ case f of
+                                 Drop           -> []
                                  Keep           -> [Scaled m (ty (self t))]
                                  Flatten pdc as -> map (\(Scaled m' t') -> Scaled m' (ty (self t')))
                                                        (dataConInstArgTys pdc as)
@@ -665,6 +796,7 @@ flattenFields opts this_mod us tcs binds
             -- own constructor's (Note [Copies keep strictness] in
             -- GHC.WebCore.DataSplit)
             bangs = concat [ case f of
+                               Drop           -> []
                                Keep           -> [b]
                                Flatten pdc _  -> field_bangs pdc
                            | (b, f) <- zip (field_bangs dc) fs ]
@@ -724,6 +856,7 @@ flattenFields opts this_mod us tcs binds
       where
         sub = zipTvSubst (dataConUnivTyVars dc') ty_args
         step (wrap, acc) (Keep, v) = return (wrap, v : acc)
+        step (wrap, acc) (Drop, _) = return (wrap, acc)
         step (wrap, acc) (Flatten pdc _, v)
           | (Var w, args) <- collectArgs v
           , Just pdc' <- isDataConWorkId_maybe w, pdc' == pdc
@@ -740,7 +873,9 @@ flattenFields opts this_mod us tcs binds
     -- An alternative: bind the components, and replace the cases on the field
     rw_alt scrut_ty (Alt (DataAlt dc) bs rhs)
       | Just dc' <- new_con dc, Just fs <- field_plan dc
-      = do { rhs' <- rw rhs
+      = do { let dropped = [ b | (Drop, b) <- zip fs (filter isId bs) ]
+                 dead_vars = slice_dead dead_fields dropped rhs
+           ; rhs' <- (if null dropped then id else prune dead_vars) <$> rw rhs
            ; let ty_args = fromMaybe [] (tyConAppArgs_maybe scrut_ty)
                  sub = zipTvSubst (dataConUnivTyVars dc') ty_args
            ; (bs', body) <- foldM (field sub) ([], rhs') (zip fs (map rw_id bs))
@@ -748,6 +883,13 @@ flattenFields opts this_mod us tcs binds
     rw_alt _ (Alt con bs rhs) = Alt con (map rw_id bs) <$> rw rhs
 
     field _ (acc, body) (Keep, b) = return (b : acc, body)
+    -- Its uses were arguments to dead fields, which are gone; should any be
+    -- left, it is absent
+    field _ (acc, body) (Drop, b)
+      | b `elemVarSet'` body
+      = return (acc, Let (NonRec b (mkAbsentErrorApp (idType b) "dropped dead field")) body)
+      | otherwise
+      = return (acc, body)
     field sub (acc, body) (Flatten pdc as, b)
       = do { let comps = map scaledThing (dataConInstArgTys pdc (substTys sub as))
            ; ys <- mapM (fresh "y") comps
@@ -775,6 +917,7 @@ flattenFields opts this_mod us tcs binds
                 | tc <- tcs, dc <- tyConDataCons tc, i <- all_fields dc, candidate dc i
                 , let verdict
                         | Just fs <- field_plan dc, Flatten {} : _ <- drop i fs = text "unboxed"
+                        | Just fs <- field_plan dc, Drop : _ <- drop i fs = text "dropped (dead)"
                         | (why : _) <- [ w | (j, w) <- lookupWithDefaultUFM bad [] dc, j == i ]
                         = text "boxed" <+> parens (text why)
                         | otherwise = text "boxed (its type is unpacked into another this round)" ]
