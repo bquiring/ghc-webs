@@ -1,0 +1,16 @@
+[1 of 2] Compiling Main             ( uncurry011.hs, uncurry011.o )
+
+==================== Webs: uncurrying ====================
+rejected (exposed): s
+rejected (only known calls (left to GHC)): addr
+rejected (only known calls (left to GHC)): f
+rejected (only known calls (left to GHC)): ww
+rejected (only known calls (left to GHC)): z
+rejected (result not an arrow): b b
+rejected (result not an arrow): eta
+rejected (result not an arrow): n
+rejected (result not an arrow): ww
+uncurried: a a
+
+
+[2 of 2] Linking uncurry011

@@ -42,8 +42,10 @@ for n in range(1, 13):
 
 # Uncurrying (GHC.WebCore.Transform.Uncurry).  uncurry003, 004, 005 and 009
 # fail if laziness or sharing is not handled correctly; 003, 004 count
-# evaluations with Debug.Trace (the expected stderr).
-uc_opts = webs_opts + ' -fcore-webs-uncurry'
+# evaluations with Debug.Trace (the expected stderr).  Their webs have only
+# known calls, which are left to GHC (Note [Uncurrying known calls]), so they
+# run with -fcore-webs-uncurry-known; uncurry011 checks the default.
+uc_opts = webs_opts + ' -fcore-webs-uncurry -fcore-webs-uncurry-known'
 
 def uncurry_test(name, extra_opts=''):
     test(name, [], compile_and_run, [uc_opts + extra_opts])
@@ -54,6 +56,9 @@ for n in range(1, 11):
     # uncurry005: stop GHC's own eta-expansion through a case, which would
     # make the program more defined by itself
     uncurry_test('uncurry%03d' % n, ' -fpedantic-bottoms' if n == 5 else '')
+test('uncurry011', [], compile_and_run, [webs_opts + ' -fcore-webs-uncurry'])
+test('uncurry011_dump', [extra_files(['uncurry011.hs'])], multimod_compile,
+     ['uncurry011', webs_opts + ' -fcore-webs-uncurry -ddump-webs-uncurry -dsuppress-uniques'])
 
 # Arity raising (GHC.WebCore.Transform.ArityRaise).  arityraise002-006, 011
 # and 012 check laziness; arityraise008 checks functions passed to polymorphic

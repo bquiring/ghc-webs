@@ -34,6 +34,7 @@ import GHC.Data.Pair
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
+import GHC.WebCore.Transform.ArityRaise ( knownHead )
 import GHC.WebCore.Transform.Common
 import GHC.WebCore.Traverse ( stripWebForms )
 
@@ -83,7 +84,7 @@ data Verdict = Uncurried
              | Rejected Reason
 
 data Reason = Exposed | NotDirect | HiddenResult | RepPoly | Coercion' | CoVarParam
-            | ConstraintArg | JoinResult
+            | ConstraintArg | JoinResult | KnownCalls
 
 instance Outputable Verdict where
   ppr Uncurried    = text "uncurried"
@@ -92,6 +93,7 @@ instance Outputable Verdict where
 instance Outputable Reason where
   ppr Exposed      = text "exposed"
   ppr NotDirect    = text "not directly a lambda"
+  ppr KnownCalls   = text "only known calls (left to GHC)"
   ppr HiddenResult = text "result not an arrow"
   ppr RepPoly      = text "representation-polymorphic argument"
   ppr Coercion'    = text "complex coercion"
@@ -114,10 +116,11 @@ data Info = Info
   , i_constraint :: Bool    -- An argument is a constraint (a dictionary)
   , i_join_res   :: Bool    -- A lambda is the last of a join point's lambdas
   , i_lazy_a     :: Bool    -- Some lambda is lazy in its first parameter
-  , i_lazy_b     :: Bool }  -- Some lambda is lazy in its second parameter
+  , i_lazy_b     :: Bool    -- Some lambda is lazy in its second parameter
+  , i_unknown    :: Bool }  -- Some call of the web is not a known call
 
 noInfo :: Info
-noInfo = Info [] emptyUniqSet False False False False False False False False False
+noInfo = Info [] emptyUniqSet False False False False False False False False False False
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams       = i_lams a ++ i_lams b
@@ -130,7 +133,8 @@ plusInfo a b = Info { i_lams       = i_lams a ++ i_lams b
                     , i_constraint = i_constraint a || i_constraint b
                     , i_join_res   = i_join_res a   || i_join_res b
                     , i_lazy_a     = i_lazy_a a     || i_lazy_a b
-                    , i_lazy_b     = i_lazy_b a     || i_lazy_b b }
+                    , i_lazy_b     = i_lazy_b a     || i_lazy_b b
+                    , i_unknown    = i_unknown a    || i_unknown b }
 
 type Infos = UniqFM WebId Info
 
@@ -197,7 +201,9 @@ analyse binds = foldr go_bind emptyUFM binds
     go (Lit {}) acc = acc
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
-    go (WebApp _ f a) acc = go f (go a acc)
+    go (WebApp w f a) acc
+      | knownHead f = go f (go a acc)
+      | otherwise   = note w (noInfo { i_unknown = True }) (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w a e) acc = go_lam False w a e (go e acc)
     go (Let bind body) acc = go_bind bind (go body acc)
@@ -267,8 +273,21 @@ splitInnerCo co = case co of
          -> Just (mkReflCo r b, mkReflCo r c)
   _ -> Nothing
 
-verdict :: WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict exposed complex w i
+{- Note [Uncurrying known calls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A web whose calls are all known calls is not uncurried.  GHC already makes a
+known saturated call of a curried function a direct call with all its
+arguments; uncurrying such a web (typically worker/wrapper's workers, in the
+late run) gains nothing and, on nofib, cost up to a third more instructions
+(shootout/binary-trees +34%, spectral/fft2 +30%: all of the late run's big
+regressions).  Arity and result raising leave such webs to GHC in the same
+way (Note [Early arity raising] in GHC.WebCore.Transform.ArityRaise).
+-fcore-webs-uncurry-known uncurries them anyway (the uncurrying tests use
+it, to exercise the rewrite).
+-}
+
+verdict :: Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict known_ok exposed complex w i
   | w `elementOfUniqSet` exposed = Rejected Exposed
   | i_covar i                    = Rejected CoVarParam
   | w `elementOfUniqSet` complex = Rejected Coercion'
@@ -278,6 +297,7 @@ verdict exposed complex w i
   | i_constraint i               = Rejected ConstraintArg
   | i_rep_poly i                 = Rejected RepPoly
   | i_not_direct i               = Rejected NotDirect
+  | not known_ok, not (i_unknown i) = Rejected KnownCalls -- Note [Uncurrying known calls]
   | otherwise                    = Uncurried
 
 ------------------------------------------------------------------
@@ -286,18 +306,19 @@ verdict exposed complex w i
 
 -- | Analyse the program and uncurry the webs that qualify.  Returns Nothing
 -- if nothing changed, and the verdicts (for the dump).
-uncurryRound :: UniqSupply
+uncurryRound :: Bool        -- ^ uncurry webs with only known calls too
+             -> UniqSupply
              -> WebSet      -- ^ Exposed webs
              -> UnfoldingPolicy
              -> CoreProgram
              -> (Maybe CoreProgram, [(WebId, SDoc, Bool, [Id])])
-uncurryRound us exposed pol binds
+uncurryRound known_ok us exposed pol binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = (Just (initUs_ us (rewriteProgram todo strict pol binds)), dump)
   where
     infos   = analyse binds
     complex = complexCoWebs binds
-    verdicts = [ (mkWebId u, verdict exposed complex (mkWebId u) i, i)
+    verdicts = [ (mkWebId u, verdict known_ok exposed complex (mkWebId u) i, i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , not (null (i_lams i)) ]
     candidates = mkUniqSet [ w | (w, Uncurried, _) <- verdicts ]

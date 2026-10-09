@@ -334,7 +334,7 @@ runTransforms early logger dflags cfg sigs binds0
         , \us done b -> case deadParamsRound us exposed keep done b of
                           (r, vs) -> (r, [ (w, ppr v, changes v, bs) | (w, v, bs) <- vs ]) )
       , ( Opt_CoreWebsUncurry, "uncurrying", Opt_D_dump_webs_uncurry
-        , \us _ b -> case uncurryRound us exposed keep b of
+        , \us _ b -> case uncurryRound (gopt Opt_CoreWebsUncurryKnown dflags) us exposed keep b of
                        (r, vs) -> (fmap (\b' -> (b', emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
         , \us done b -> resultRaiseRound us exposed keep done b )
