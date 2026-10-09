@@ -13,7 +13,7 @@ $wapply2p :: ((#,#) GHC.Internal.Types.LiftedRep
                     GHC.Internal.Types.Int
                     GHC.Internal.Prim.Int# -{3}->
               GHC.Internal.Types.Int) -{4}->
-             GHC.Internal.Types.Int -{5}-> GHC.Internal.Prim.Int#
+             GHC.Internal.Prim.Int# -{5}-> GHC.Internal.Prim.Int#
 $wk2 :: GHC.Internal.Prim.Int# -{6}-> GHC.Internal.Prim.Int#
 Main.k2 :: GHC.Internal.Prim.Int# -{7}-> GHC.Internal.Types.Int
 $wk1 :: GHC.Internal.Prim.Int# -{8}-> GHC.Internal.Prim.Int#
@@ -33,7 +33,7 @@ $wusePair :: ((#,#) GHC.Internal.Types.LiftedRep
                     GHC.Internal.Types.Int
                     GHC.Internal.Types.Int -{12}->
               GHC.Internal.Types.Int) -{13}->
-             GHC.Internal.Types.Int -{14}-> GHC.Internal.Prim.Int#
+             GHC.Internal.Prim.Int# -{14}-> GHC.Internal.Prim.Int#
 lvl :: GHC.Internal.Base.String -{E}-> GHC.Internal.Base.String
 lvl :: GHC.Internal.Base.String -{E}-> GHC.Internal.Base.String
 lvl :: [] (GHC.Internal.Base.String -{E}->

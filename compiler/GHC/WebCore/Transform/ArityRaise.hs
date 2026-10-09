@@ -18,7 +18,7 @@ import GHC.Core.Make ( mkCoreUnboxedTuple, mkCoreConApps )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Utils ( exprType )
+import GHC.Core.Utils ( exprType, exprIsHNF )
 
 import GHC.Data.FastString ( fsLit )
 
@@ -40,7 +40,7 @@ import GHC.Utils.Panic ( pprPanic )
 
 import GHC.WebCore.Transform.Common
 import GHC.WebCore.Sigs ( FieldTys )
-import GHC.WebCore.Traverse ( typeWebs )
+import GHC.WebCore.Traverse ( typeWebs, stripWebForms )
 
 import Data.List ( sortOn )
 import Data.Maybe ( fromMaybe, isJust )
@@ -93,6 +93,23 @@ A web is also rejected if it is exposed, if some arrow's argument is not a
 product (e.g. a type variable), if the product type differs between arrows,
 if a component has no fixed representation, or if the web appears in a
 coercion we cannot rewrite.
+
+Constructed arguments (Survey §8): if every call of the web passes a value
+of the product type -- an application of its constructor, or a variable
+bound to one (exprIsHNF; GHC let-binds constructor applications, and floats
+constant ones to the top level) --
+
+    f @^w (K es)   ==>   f e1 .. @^w en
+    f @^w x        ==>   case x of K ys -> f y1 .. @^w yn     (x a value)
+
+evaluates nothing, so the lambdas need not be strict, and may be curried.
+A lambda that still needs the product rebuilds it (let p = K xs), but the
+caller built it at every call before, so nothing is lost; a lambda that
+uses it only on some paths now builds it only there.  This is what
+SpecConstr does for recursive functions by copying them, here for a web
+with unknown calls.  Only for constructors without strict or unpacked
+fields: a constructor's worker takes its strict fields evaluated, which the
+unboxed tuple's components are not known to be.
 -}
 
 {- Note [Raised arguments are curried]
@@ -141,13 +158,14 @@ raised: see WEBS-BACKLOG.md.  Result raising does the same (Note [Result
 raising]).
 -}
 
-data Verdict = Raised | Rejected Reason
+data Verdict = Raised | RaisedConstructed | Rejected Reason
 
 data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
             | KnownCalls | BoxNeeded | Recursive
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
+  ppr RaisedConstructed = text "raised (constructed arguments)"
   ppr (Rejected r) = text "rejected" <+> parens (ppr r)
 
 instance Outputable Reason where
@@ -204,10 +222,11 @@ data Info = Info
   , i_coercion  :: Bool
   , i_unknown   :: Bool    -- Some call of the web is not a known call
   , i_boxed     :: Bool    -- Some lambda needs its parameter boxed
+  , i_noncon    :: Bool     -- Some call's argument is not a value
   , i_comp_webs :: WebSet } -- The webs in the product's components
 
 noInfo :: Info
-noInfo = Info [] False False False False [] False False False False emptyUniqSet
+noInfo = Info [] False False False False [] False False False False False emptyUniqSet
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
@@ -220,6 +239,7 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_coercion = i_coercion a || i_coercion b
                     , i_unknown  = i_unknown a  || i_unknown b
                     , i_boxed    = i_boxed a    || i_boxed b
+                    , i_noncon   = i_noncon a   || i_noncon b
                     , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
 
 type Infos = UniqFM WebId Info
@@ -269,8 +289,8 @@ analyse fields binds = foldr go_bind emptyUFM binds
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
     go (WebApp w f a) acc
-      | knownHead f = go f (go a acc)
-      | otherwise   = note w (noInfo { i_unknown = True }) (go f (go a acc))
+      = note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (exprIsHNF (stripWebForms a)) })
+             (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc = go_lam True w p e (go e acc)
     go (Let bind body) acc = go_bind bind (go body acc)
@@ -382,6 +402,8 @@ verdict early exposed complex w i
   | i_not_prod i                 = Rejected NotProduct
   | not (same_tycon (i_tycons i)) = Rejected NotProduct
   | i_rep_poly i                 = Rejected RepPoly
+  | i_lazy i || i_curried i || i_boxed i
+  , constructed                  = RaisedConstructed
   | i_lazy i                     = Rejected Lazy
   | i_curried i                  = Rejected Curried
   | i_boxed i                    = Rejected BoxNeeded
@@ -389,6 +411,13 @@ verdict early exposed complex w i
   where
     same_tycon (tc:tcs) = all (== tc) tcs
     same_tycon []       = False
+    -- Every call passes a value, and the constructor's fields are lazy
+    constructed = not (i_noncon i) && all lazy_fields (take 1 (i_tycons i))
+    lazy_fields tc = case tyConSingleDataCon_maybe tc of
+      Just dc -> all is_lazy (dataConImplBangs dc)
+      Nothing -> False
+    is_lazy HsLazy = True
+    is_lazy _      = False
 
 ------------------------------------------------------------------
 --      One round
@@ -418,19 +447,22 @@ arityRaiseRound fields us exposed pol done binds
                 , let w = mkWebId u
                 , not (null (i_lams i))
                 , not (w `elementOfUniqSet` done) ]
+    raised Raised            = True
+    raised RaisedConstructed = True
+    raised _                 = False
     -- Note [Recursive products]
-    candidates = mkUniqSet [ w | (w, Raised, _) <- verdicts0 ]
+    candidates = mkUniqSet [ w | (w, v, _) <- verdicts0, raised v ]
     verdicts = [ (w, v', i)
                | (w, v, i) <- verdicts0
-               , let v' | Raised <- v
+               , let v' | raised v
                         , not (isEmptyUniqSet (i_comp_webs i `intersectUniqSets` candidates))
                         = Rejected Recursive
                         | otherwise = v ]
-    todo = mkUniqSet [ w | (w, Raised, _) <- verdicts ]
+    todo = mkUniqSet [ w | (w, v, _) <- verdicts, raised v ]
     -- Fresh webs for the new arrows, per raised web
     (us1, us2) = splitUniqSupply us
     inner_map  = listToUFM [ (w, map mkWebId (uniqsFromSupply s))
-                           | ((w, Raised, _), s) <- zip verdicts (listSplitUniqSupply us2) ]
+                           | ((w, v, _), s) <- zip verdicts (listSplitUniqSupply us2), raised v ]
     inner w    = lookupWithDefaultUFM inner_map [] w
     dump = [ (w, ppr v, w `elementOfUniqSet` todo, i_lams i) | (w, v, i) <- verdicts ]
 

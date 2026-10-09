@@ -1546,6 +1546,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_defunc)
   , make_ord_flag defGhcFlag "ddump-webs-data"
         (setDumpFlag Opt_D_dump_webs_data)
+  , make_ord_flag defGhcFlag "ddump-webs-one-shot"
+        (setDumpFlag Opt_D_dump_webs_one_shot)
   , make_ord_flag defGhcFlag "ddump-first-class-stats"
         (setDumpFlag Opt_D_dump_first_class_stats)
   , make_ord_flag defGhcFlag "ddump-stg-from-core"
@@ -2566,6 +2568,7 @@ fFlagsDeps = [
   flagSpec "core-webs-no-strict-elim"         Opt_CoreWebsNoStrictElim,
   flagSpec "core-webs-no-hidden-fields"       Opt_CoreWebsNoHiddenFields,
   flagSpec "core-webs-uncurry-known"          Opt_CoreWebsUncurryKnown,
+  flagSpec "core-webs-one-shot"               Opt_CoreWebsOneShot,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,
   flagSpec "liberate-case"                    Opt_LiberateCase,

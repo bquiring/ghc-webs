@@ -257,6 +257,53 @@ Against `early-fix`, in instructions: `mate` −4.7% (−8.0% against `base`;
 time −11.8% against `base`), `treejoin` +0.3% (cycles −1.2%); every other
 benchmark within ±0.1%.
 
+## 7. Polymorphic defunctionalisation, lifted bodies, heuristics (2026-10-08)
+
+`early-df` (polymorphic, with the specialisation post-pass) and `early-dfl`
+(lifted bodies, `-fcore-webs-defunc-lifted`), both on `early-fix` with
+`-dcore-lint`: no Lint errors, all 115 benchmarks build and give the right
+output (after the fixes in `551b9df701`). 85 webs defunctionalised (54 with
+one constructor). Timing: `results/timing-defunc.md` (3 rounds; the machine
+was loaded, so times are noisy). Instructions against `early-fix`:
+
+| benchmark | early-df | early-dfl |
+|---|---|---|
+| solid | −13.9% | −13.4% |
+| mate | −4.7% | −4.7% |
+| CS | **+156%** | +156% |
+| event | +6.4% | +6.4% |
+| constraints | +1.4% | +1.0% |
+
+Lifted bodies and an apply function come out the same, to within noise.
+
+CS (a Church-encoded state monad) had two causes. Curried continuations
+(`\a s -> ..`) were defunctionalised on their first arrow only, so the first
+application went through `$apply` and returned an allocated closure; and
+one-lambda webs blocked GHC's specialisation of the loop on the lambda,
+which otherwise reduces it to a counter. Heuristics (`78618024bc`, Note
+[Curried lambdas]): at least two lambdas; a curried web only with the web it
+returns. With them: CS +0.0%, event +0.0%, solid −13.8%, mate −4.7%;
+constraints +1.4% left (multi-lambda webs, not yet explained).
+
+Uncurrying every web in the early run when defunctionalisation is on (to
+defunctionalise whole arities) is worse: event +8.9%, constraints +2.5%,
+solid −15.8%, and mate fails Core Lint after SpecConstr (a nested
+unboxed-tuple case binder). The backlog has the restricted version.
+
+## 8. Constructed-argument raising and one-shot lambdas (2026-10-08)
+
+`early-cr` is `early-fix` rebuilt with constructed-argument raising (part of
+arity raising since `78d6fd8fc9`); `early-os` adds `-fcore-webs-one-shot`.
+Both with `-dcore-lint`: no errors, right output everywhere
+(`results/timing-newpasses.md`, `results/verdicts-newpasses.md`).
+
+* Constructed arguments: 4 of 112 benchmarks change by more than 0.1% in
+  instructions against `early-fix`: `wave4main` −4.6%, `dom-lt` −0.3%,
+  `fft` −0.1%, `fluid` +0.2%.
+* One-shot lambdas: 1,588 of 15,300 webs marked one-shot, but no benchmark
+  changes by more than 0.1% against `early-cr`. GHC gets the information
+  elsewhere (demand analysis), or does not use it where we give it.
+
 ## 9. Early against late; uncurrying known calls; CBV marks (2026-10-08/09)
 
 All with `-dcore-lint`, all 115 benchmarks built and right. Instructions

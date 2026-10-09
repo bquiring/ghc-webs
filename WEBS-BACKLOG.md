@@ -22,11 +22,9 @@ Plan (2026-10-09):
    `early-cur`; best allocation and instruction counts.
 2. **Then choose the next optimisation** from "Core-to-Core" below. The
    unboxing fixpoints are not it (see "Unboxing fixpoints").
-3. **Sync the branches.** `webs` has constructed-argument raising and
-   one-shot lambdas (`78d6fd8fc9`, measured in WEBS-EXPERIMENTS.md §8),
-   defunctionalisation heuristics and the latest backlog; `data-split` has
-   data splitting, unboxing, hidden fields, curried arity raising, whole-arity
-   defunctionalisation and the bug log. Neither contains the other.
+3. ~~Sync the branches~~ (2026-10-09): `webs` merged into `data-split`
+   (constructed-argument raising, one-shot lambdas), then `webs` fast-forwarded:
+   both branches are the same.
 4. **k-nucleotide's input** for timing (WEBS-BUGS.md, Open), between runs.
 
 The polymorphic-defunctionalisation fixes, lifted bodies and their
@@ -104,8 +102,8 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
 - **Local newtypes** (Survey §14): a newtype that is not exported gets
   ordinary webs on its axiom, so functions in a local `State` monad become
   transformable.
-- **Constructed-argument raising** (Survey §8): done on the `webs` branch
-  (`78d6fd8fc9`; wave4main −4.6%), not yet on `data-split`.
+- **Constructed-argument raising** (Survey §8): done (`78d6fd8fc9`;
+  wave4main −4.6%), with curried components since the merge.
 - **Nested unboxing** (Survey §1): arity raising unboxes one level; GHC
   unboxes a pair of pairs recursively.
 - **Uncurrying in the early run** (Survey §11): off there today (Note [No
@@ -122,8 +120,8 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
 - **Richer demands in web strictness.** Nested demands (strict in a field of
   a product argument), call demands (an argument always called with n
   arguments), cardinality.
-- **One-shot lambdas from webs.** Done on the `webs` branch (`78d6fd8fc9`):
-  no effect on nofib. Find out why, or drop it.
+- **One-shot lambdas from webs.** Done (`78d6fd8fc9`): no effect on nofib.
+  Find out why, or drop it.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
 - **Streams** (tests `stream001`, `stream002`, 2026-10-09): stream fusion's
@@ -149,10 +147,27 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
     strictness, not a fixpoint. A ceiling of a few percent more fields, and
     more fields is not always faster.
 - **Call demands and cardinality** are under "Richer demands" above.
-- **Compile time.** The early pipeline costs +10–11% compiler allocation on
-  nofib. Web Lint runs once per round of each transformation.
+- **Compile time** (deferred until the transformations give good results,
+  the user's call, 2026-10-08). The early pipeline costs +10–11% compiler
+  allocation on nofib; Web Lint runs once per round of each transformation.
+  Data splitting doubles compiler allocation (+100% against base): every
+  occurrence gets a real TyCon with DataCons (~580,000 copies over nofib).
+  Fix: cheap placeholders per occurrence during annotation and Data Lint,
+  real types only for the final split classes.
 
 ## Ideas to test
+
+- **Constructed arguments with known calls.** The early run leaves
+  known-call webs to worker/wrapper (Note [Early arity raising]), but
+  worker/wrapper does not unbox a lazy constructed argument. Try raising
+  constructed webs with only known calls too, against SpecConstr.
+- **Data splitting: keep the original for one class.** A local,
+  unexported type with no exposed class could keep its original type for
+  one class instead of making a copy (fewer info tables).
+- **Data splitting: Int and other boxed primitives.** `Int` is eligible
+  (one constructor, an unboxed field, no wrapper), so local `Int`s get
+  copies. Harmless, but it creates types; decide whether to exclude them
+  until phase 3 can use them (unboxing).
 
 - **Boundary split, size bound.** The bound is 2× `-funfolding-use-threshold`
   (Note [Small functions are not split]). Try 1× and 3× and compare

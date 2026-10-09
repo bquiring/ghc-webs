@@ -493,6 +493,7 @@ data DumpFlag
    | Opt_D_dump_webs_inline      -- ^ Web pipeline: super-beta inlining verdicts
    | Opt_D_dump_webs_defunc      -- ^ Web pipeline: defunctionalisation verdicts
    | Opt_D_dump_webs_data        -- ^ Web pipeline: data type splitting
+   | Opt_D_dump_webs_one_shot    -- ^ Web pipeline: one-shot lambda verdicts
    | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and
                                   --   after the Core pipeline
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
@@ -665,6 +666,7 @@ data GeneralFlag
    | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
    | Opt_CoreWebsNoHiddenFields -- ^ (measuring) every constructor's fields exposed: no Note [Hidden fields]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
+   | Opt_CoreWebsOneShot      -- ^ One-shot lambdas from webs
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
                             --   before worker/wrapper (needs -fstrictness)
    | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
@@ -956,6 +958,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsNoStrictElim
    , Opt_CoreWebsNoHiddenFields
    , Opt_CoreWebsUncurryKnown
+   , Opt_CoreWebsOneShot
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
    , Opt_Specialise

@@ -62,7 +62,8 @@ test('uncurry011_dump', [extra_files(['uncurry011.hs'])], multimod_compile,
 
 # Arity raising (GHC.WebCore.Transform.ArityRaise).  arityraise002-006, 011
 # and 012 check laziness; arityraise008 checks functions passed to polymorphic
-# functions.
+# functions; arityraise013 constructed arguments (lazy lambdas, lazy
+# components).
 ar_opts = webs_opts + ' -fcore-webs-arity-raise'
 
 def arityraise_test(name):
@@ -70,7 +71,7 @@ def arityraise_test(name):
     test(name + '_dump', [extra_files([name + '.hs'])],
          multimod_compile, [name, ar_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
 
-for n in range(1, 13):
+for n in range(1, 14):
     arityraise_test('arityraise%03d' % n)
 
 # All the transformations together
@@ -345,3 +346,9 @@ for (suffix, opts) in dsedge_modes:
     test('hfield002' + suffix, [extra_files(['hfield002.hs', 'HField002A.hs']),
                                use_specs({'stdout': 'hfield002.stdout'})],
          multimod_compile_and_run, ['hfield002', opts])
+# Note [One-shot lambdas from webs] (GHC.WebCore.Transform.OneShot,
+# -fcore-webs-one-shot).  The dump shows which webs' lambdas are one-shot.
+os_opts = early_opts + ' -fcore-webs-one-shot'
+test('oneshot001', [], compile_and_run, [os_opts])
+test('oneshot001_dump', [extra_files(['oneshot001.hs'])],
+     multimod_compile, ['oneshot001', os_opts + ' -ddump-webs-one-shot -dsuppress-uniques'])

@@ -325,6 +325,8 @@ verdict tops exposed n w i
 
 
 
+
+
     firstJust (Just x : _) = Just x
     firstJust (_ : xs)     = firstJust xs
     firstJust []           = Nothing
