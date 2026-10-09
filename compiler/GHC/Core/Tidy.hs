@@ -18,11 +18,10 @@ import GHC.Core
 import GHC.Core.Type
 import GHC.Core.TyCo.Tidy
 import GHC.Core.Seq ( seqUnfolding )
-import GHC.Core.TyCon ( isUnboxedTupleTyCon )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Demand ( zapDmdEnvSig, isStrUsedDmd, Demand(..), viewProd, topDmd, isTopDmd, splitDmdSig )
+import GHC.Types.Demand ( zapDmdEnvSig, isStrUsedDmd )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Unique (getUnique)
@@ -119,28 +118,6 @@ tidyCbvInfoTop boot_exports id rhs
 tidyCbvInfoLocal :: HasDebugCallStack => Id -> CoreExpr -> Id
 tidyCbvInfoLocal id rhs = computeCbvInfo id rhs
 
-{- Note [CBV marks for unboxed tuple arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-GHC gives no CBV marks to a function with an unboxed tuple argument that
-unarises to several arguments: the marks would have to count unarised
-argument positions.  The web transformations (uncurrying, arity raising,
-result raising) pass arguments as unboxed tuples, often to workers: so a
-worker they rewrite lost its marks, and every call and every match on a
-strict argument paid an evaluatedness check (nofib shootout/binary-trees
-+34% instructions, all from that).
-
-So such a function gets one mark per unarised argument: an unboxed tuple
-argument whose components each unarise to at most one argument gets one
-mark per non-void component, from the component's demand within the
-argument's product demand (a lifted component the function is strict in is
-MarkedCbv); an all-void tuple is one (void) argument; any other argument one
-mark, as before.  That is exactly how GHC.Stg.Unarise lays out a function's
-arguments, and the STG consumers of the marks (tag inference, the
-call-site rewrite, the code generator) all zip them with the unarised
-arguments.  Only CorePrep counts Core arguments (to saturate calls of CBV
-functions): it converts with cbvMarkCoreArity.
--}
-
 -- | For a binding we:
 -- * Look at the args
 -- * Mark any argument as call-by-value if:
@@ -186,16 +163,10 @@ computeCbvInfo fun_id rhs
     cbv_marks = -- assert: CBV marks are only set during tidy so none should be present already.
                 assertPpr (maybe True null $ idCbvMarks_maybe fun_id)
                           (ppr fun_id <+> (ppr $ idCbvMarks_maybe fun_id) $$ ppr rhs) $
-                concat per_arg_marks
-    per_arg_marks = zipWith arg_marks val_args (map Just sig_dmds ++ repeat Nothing)
-    -- The unarised arguments that the arity covers
-    marks_in_arity = length (concat (take (idArity fun_id) per_arg_marks))
-    -- The function's own signature: a binder made by a later pass (the web
-    -- transformations) may carry no demand of its own
-    sig_dmds = fst (splitDmdSig (idDmdSig fun_id))
+                map mkMark val_args
 
     cbv_bndr | any isMarkedCbv cbv_marks
-             = cbv_marks `seqList` setIdCbvMarksN marks_in_arity fun_id cbv_marks
+             = cbv_marks `seqList` setIdCbvMarks fun_id cbv_marks
                -- seqList: avoid retaining the original rhs
 
              | otherwise
@@ -211,51 +182,19 @@ computeCbvInfo fun_id rhs
     -- get a W/W split which will eliminate unboxed tuple arguments, and unboxed
     -- sums are rarely used. But we could change this in the future and support
     -- unboxed sums/tuples as well.
-    --
-    -- Webs: an unboxed tuple argument whose components each unarise to at
-    -- most one argument is allowed; it gets one mark per unarised argument.
-    -- See Note [CBV marks for unboxed tuple arguments].
     valid_unlifted_worker args =
       -- pprTrace "valid_unlifted" (ppr fun_id $$ ppr args) $
       all isSingleUnarisedArg args
 
     isSingleUnarisedArg v
       | isUnboxedSumType ty = False
-      | Just comps <- tupleComponents ty = all (isSimplePrimRep . typePrimRep) comps
       | isUnboxedTupleType ty = isSimplePrimRep (typePrimRep ty)
       | otherwise = isSimplePrimRep (typePrimRep ty)
       where
         ty = idType v
-    isSimplePrimRep []  = True
-    isSimplePrimRep [_] = True
-    isSimplePrimRep _   = False
-
-    -- The marks of one argument: one per argument it unarises to
-    arg_marks arg mb_sig_dmd
-      | Just comps <- tupleComponents ty
-      , let arg_dmd = case mb_sig_dmd of
-                        Just d | not (isTopDmd (idDemandInfo arg)) -> idDemandInfo arg
-                               | otherwise                         -> d
-                        Nothing -> idDemandInfo arg
-            dmds  = case arg_dmd of
-                      _ :* sd | Just (_, ds) <- viewProd (length comps) sd -> ds
-                      _                                                 -> map (const topDmd) comps
-            marks = [ comp_mark t d | (t, d) <- zip comps dmds, length (typePrimRep t) == 1 ]
-      = if null marks then [NotMarkedCbv] else marks   -- all void: one void argument
-      | otherwise = [mkMark arg]
-      where ty = idType arg
-    -- A lifted component that the function is strict in
-    comp_mark t d
-      | isBoxedType t, not (isUnliftedType t)
-      , isStrUsedDmd d, not (isDeadEndId fun_id) = MarkedCbv
-      | otherwise                                = NotMarkedCbv
-    -- The components of an unboxed tuple type.  Not isUnboxedTupleType, which
-    -- looks at the runtime representation only: a coercion argument
-    -- (a ~# b) is a TupleRep [] too, and its "components" may be of any kind.
-    tupleComponents ty = case splitTyConApp_maybe ty of
-      Just (tc, args) | isUnboxedTupleTyCon tc
-                      -> Just (drop (length args `div` 2) args)   -- after the RuntimeReps
-      _               -> Nothing
+        isSimplePrimRep []  = True
+        isSimplePrimRep [_] = True
+        isSimplePrimRep _   = False
 
     mkMark arg
       | not $ shouldUseCbvForId arg = NotMarkedCbv

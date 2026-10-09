@@ -309,8 +309,9 @@ against `base` (112 benchmarks; `WEBS-DATA.md` has the data-splitting runs):
   passes the components curried** (Note [Raised arguments are curried]),
   with the arity, demand signature and usage patched up. nucleic2 (late):
   +11.2% → −0.28%; wheel-sieve1: back to `base`. The CBV-marks change of §9
-  is then mostly dead code; an A/B (`early-cur`/`late-cur` against
-  `-b` without it) decides whether it goes.
+  is then mostly dead code; the A/B (`early-cur`/`late-cur` against
+  `-b` without it) gave identical instructions (−2.00%, −0.87%), so it
+  was removed.
 * **Program allocation** against `base` (geomean): `early-du9` −0.99%,
   `early-du10` (+ dead fields) −1.84%, `early-cur` (+ curried) −1.84%,
   `late-cur` (late, curried, no uncurrying) −0.85%, nothing worse by 1%

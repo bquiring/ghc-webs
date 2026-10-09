@@ -36,9 +36,6 @@ import GHC.Core
 import GHC.Core.Subst
 import GHC.Core.Make hiding( FloatBind(..) )   -- We use our own FloatBind here
 import GHC.Core.Type
-import GHC.Types.RepType ( typePrimRep )
-import GHC.Types.Var ( PiTyBinder(..) )
-import GHC.Core.Multiplicity ( scaledThing )
 import GHC.Core.Coercion
 import GHC.Core.TyCon
 import GHC.Core.DataCon
@@ -1666,31 +1663,15 @@ maybeSaturate fn expr n_args unsat_ticks
   = assert (null unsat_ticks) $
     return expr
   where
-    -- Note [CBV marks for unboxed tuple arguments] in GHC.Core.Tidy: the
-    -- marks count unarised arguments; these count Core arguments
-    mark_arity    = cbvMarkCoreArity fn (idCbvMarkArity fn)
+    mark_arity    = idCbvMarkArity fn
     fn_arity      = idArity fn
     excess_arity  = (max fn_arity mark_arity) - n_args
     sat_expr      = cpeEtaExpand excess_arity expr
-    applied_marks = n_args >= cbvMarkCoreArity fn
-                                 (length . dropWhile (not . isMarkedCbv) .
-                                  reverse . expectJust $ (idCbvMarks_maybe fn))
+    applied_marks = n_args >= (length . dropWhile (not . isMarkedCbv) .
+                               reverse . expectJust $ (idCbvMarks_maybe fn))
     -- For join points we never eta-expand (See Note [Do not eta-expand join points])
     -- so we assert all arguments that need to be passed cbv are visible so that the
     -- backend can evalaute them if required..
-
--- | How many Core value arguments of a function cover its first n unarised
--- arguments (Note [CBV marks for unboxed tuple arguments] in GHC.Core.Tidy):
--- each unarises to as many arguments as its type has PrimReps, at least one
-cbvMarkCoreArity :: Id -> Int -> Int
-cbvMarkCoreArity fn n = go 0 0 arg_widths
-  where
-    arg_widths = [ max 1 (length (typePrimRep (scaledThing t)))
-                 | Anon t _ <- fst (splitPiTys (idType fn)) ]
-    go k covered ws
-      | covered >= n = k
-    go k covered (w : ws) = go (k + 1) (covered + w) ws
-    go k _ []             = k   -- fewer arguments in the type: all of them
 
 {- Note [Eta expansion]
 ~~~~~~~~~~~~~~~~~~~~~~~

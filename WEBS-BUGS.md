@@ -138,7 +138,8 @@ would catch it again), **commit** (empty while uncommitted).
 * **Cause:** `isUnboxedTupleType` looks only at the representation, and
   `a ~# b` has `TupleRep []`.
 * **Fix:** only an unboxed tuple type constructor counts (Note [CBV marks
-  for unboxed tuple arguments]).
+  for unboxed tuple arguments]; the whole change was later removed as dead
+  code, arguments being curried).
 * **Commit:** `56d79f119d`
 
 ### Copies lose field strictness (2026-10-08)
