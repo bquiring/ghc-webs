@@ -297,6 +297,43 @@ against `base` (112 benchmarks; `WEBS-DATA.md` has the data-splitting runs):
   queens +11.1% remain: a second cause. Wins too (puzzle −9.5%, bspt −4.7%,
   gen_regexps −3.2%, solid −2.9%): a finer rule could keep them.
 
+## 10. The second cause; curried arguments; whole-arity defunctionalisation (2026-10-09)
+
+* **The second cause** was Unarise: an unboxed-tuple argument's components
+  get binders typed by representation only (`Any`), so the code generator
+  cannot tell that a `Float` is not a function, and `case us of F# y`
+  becomes a slow call through `stg_ap_0_fast` (nucleic2, late: 15% of its
+  instructions; wheel-sieve1 too). GHC's generic apply checks the arity at
+  run time, so curried calls are already cheap, and uncurrying never showed
+  a win: **uncurrying is parked** (the user's call), and **arity raising
+  passes the components curried** (Note [Raised arguments are curried]),
+  with the arity, demand signature and usage patched up. nucleic2 (late):
+  +11.2% → −0.28%; wheel-sieve1: back to `base`. The CBV-marks change of §9
+  is then mostly dead code; an A/B (`early-cur`/`late-cur` against
+  `-b` without it) decides whether it goes.
+* **Program allocation** against `base` (geomean): `early-du9` −0.99%,
+  `early-du10` (+ dead fields) −1.84%, `early-cur` (+ curried) −1.84%,
+  `late-cur` (late, curried, no uncurrying) −0.85%, nothing worse by 1%
+  (cryptarithm2 −23.1%, compress2 −10.1%, mkhprog −9.5%, treejoin −6.6%).
+* **Whole-arity defunctionalisation** (Note [Defunctionalising whole
+  arities]): constraints' foldTree lambdas take two arguments; the outer web
+  and the one it returns become one `D_w A X B` with a two-argument apply.
+  That alone changed nothing: **SpecConstr made a wild-card of every
+  coercion argument**, and the constructors' reflexive equalities made each
+  call pattern quantify over coercion variables, which SpecConstr discards
+  (Note [SpecConstr and casts]); base GHC specialises foldTree on the
+  lambdas, three copies. Fixed in SpecConstr (Note [SpecConstr and
+  reflexive coercions]). Defunctionalisation against `base`: constraints
+  +1.4% → −0.02%, solid −18.8% (allocation −50.9%), mate −8.0%, CS −5.4%,
+  event 0.0%.
+* **cryptarithm2's lost 3%** (−15.1% before strictly eliminated fields,
+  −11.8% after): with `-fcore-webs-no-strict-elim`, −15.2%. Strict
+  elimination unboxes `[Int]`'s head in round 1, which makes the pair
+  type holding that list a rebuilt type, so the outer list cannot unpack it
+  that round (the outer-first rule); the cascade then runs out of rounds
+  (three). To try: rounds to a fixpoint; or hold back inner unboxing while
+  an outer type containing it is pending.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
