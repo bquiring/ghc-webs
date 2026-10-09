@@ -257,6 +257,46 @@ Against `early-fix`, in instructions: `mate` −4.7% (−8.0% against `base`;
 time −11.8% against `base`), `treejoin` +0.3% (cycles −1.2%); every other
 benchmark within ±0.1%.
 
+## 9. Early against late; uncurrying known calls; CBV marks (2026-10-08/09)
+
+All with `-dcore-lint`, all 115 benchmarks built and right. Instructions
+against `base` (112 benchmarks; `WEBS-DATA.md` has the data-splitting runs):
+
+| configuration | geomean | >0.5% better | >0.5% worse |
+|---|---|---|---|
+| `early-fix` (function webs, early) | −0.20% | 5 | 0 |
+| `late-fix` (function webs, late) | +2.68% | 3 | 57 |
+| `late-fix2` (+ simplifier after the late run) | +2.18% | 7 | 53 |
+| `late-fix3` (+ uncurrying gate) | −0.24% | 8 | 2 |
+| `early-du8` (early + data splitting + unboxing) | **−0.96%** | **23** | 1 |
+| `late-du3` (late + data splitting + unboxing, gated) | −0.58% | 16 | 2 |
+
+* **The simplifier after the late run** (Note [Simplifying after the late
+  webs]) helps a little; the big regressions were elsewhere.
+* **Uncurrying known calls** was all of them: binary-trees +34%, fft2 +30%,
+  both back to `base` without uncurrying. In the late run it uncurried
+  worker/wrapper's workers, whose calls are known. Gate: Note [Uncurrying
+  known calls] (`-fcore-webs-uncurry-known` lifts it).
+* **Why it cost so much**: a worker's strict arguments carry call-by-value
+  marks (`StrictWorker([~, !])`: the caller passes the tree evaluated and
+  tagged, so the callee matches on it without checks). GHC gives no marks to
+  a function with a multi-register unboxed tuple argument, and the web
+  transformations pass arguments as unboxed tuples: the uncurried worker was
+  `StrictWorker([])`, and every match paid an evaluatedness check.
+  Allocation was unchanged; mutator time 0.90 s → 1.32 s.
+* **CBV marks for unboxed tuple arguments** (Note [CBV marks for unboxed
+  tuple arguments] in `GHC.Core.Tidy`): one mark per unarised argument. With
+  known-call workers uncurried, binary-trees 10.07 G → 7.54 G instructions
+  (`base` 7.51 G), fft2 11.33 G → 8.85 G (8.71 G). Passes the webs tests,
+  GHC's stranal, codeGen/should_run and unboxedsums tests, and
+  `-dtag-inference-checks` on five benchmarks. In the default configurations
+  it changes nothing (`early-du9` = `early-du8`, `late-fix4` = `late-fix3`):
+  the gates keep the transformations away from workers.
+* **Without the gate, with marks** (`late-fix4k`): +1.09% (43 worse), from
+  +2.18%. wheel-sieve1 +16.6%, nucleic2 +15.1%, sched +12.1%, boyer +11.6%,
+  queens +11.1% remain: a second cause. Wins too (puzzle −9.5%, bspt −4.7%,
+  gen_regexps −3.2%, solid −2.9%): a finer rule could keep them.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
