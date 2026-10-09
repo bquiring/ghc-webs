@@ -114,7 +114,7 @@ module GHC.Types.Id (
         setIdDemandInfo,
         setIdDmdSig,
         setIdCprSig,
-        setIdCbvMarks,
+        setIdCbvMarks, setIdCbvMarksN,
         idCbvMarks_maybe,
         idCbvMarkArity,
         asWorkerLikeId, asNonWorkerLikeId,
@@ -812,7 +812,13 @@ setIdTagSig id sig = modifyIdInfo (`setTagSig` sig) id
 
 -- | If all marks are NotMarkedStrict we just set nothing.
 setIdCbvMarks :: Id -> [CbvMark] -> Id
-setIdCbvMarks id marks
+setIdCbvMarks id marks = setIdCbvMarksN (idArity id) id marks
+
+-- | Like 'setIdCbvMarks', but the marks count unarised arguments, and the
+-- first n of them are the ones the arity covers (Note [CBV marks for unboxed
+-- tuple arguments] in GHC.Core.Tidy)
+setIdCbvMarksN :: Int -> Id -> [CbvMark] -> Id
+setIdCbvMarksN n id marks
   | not (any isMarkedCbv marks) = id
   | otherwise =
       -- pprTrace "setMarks:" (ppr id <> text ":" <> ppr marks) $
@@ -837,7 +843,7 @@ setIdCbvMarks id marks
       -- This way the length of the list is always exactly number of arguments
       -- that must be visible to CodeGen. See See Note [CBV Function Ids]
       -- for more details.
-      trimmedMarks = dropWhileEndLE (not . isMarkedCbv) $ take (idArity id) marks
+      trimmedMarks = dropWhileEndLE (not . isMarkedCbv) $ take n marks
 
 idCbvMarks_maybe :: Id -> Maybe [CbvMark]
 idCbvMarks_maybe id = case idDetails id of
