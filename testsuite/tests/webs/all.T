@@ -418,7 +418,8 @@ for n in [1, 2]:
 # as it does unoptimised: the expected output is -O0's.  Recursion (001-005),
 # mutual recursion (006-009), higher-order and unknown calls (010-015), data
 # structures (016-025), must-evaluate (026-030), thunks and sharing
-# (031-035), results (036-040).  Every web transformation is on, in the
+# (031-035), results (036-040), fields of local types (041-045: dead through
+# a web, evaluated at the producer only if every construction is consumed).  Every web transformation is on, in the
 # early run (poisonNNN) and in the late run (poisonNNN_late).
 poison_ws = (' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
              ' -fcore-webs-dead-params -fcore-webs-useless -fcore-webs-result-raise'
@@ -426,7 +427,7 @@ poison_ws = (' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise
              ' -fcore-webs-defunc')
 poison_early = early_opts + poison_ws + ' -fcore-webs-boundary'
 poison_late = webs_opts + poison_ws
-for n in range(1, 41):
+for n in range(1, 46):
     name = 'poison%03d' % n
     ec = [exit_code(1)] if 26 <= n <= 30 else []
     test(name, ec, compile_and_run, [poison_early])
@@ -436,7 +437,7 @@ for n in range(1, 41):
 # Note [Strictness as the dual of liveness] (GHC.WebCore.Transform.Forced):
 # the analysis-only dump runs on annotated Core (it once called
 # exprIsDeadEnd on web forms and panicked); here on a few poison programs.
-for n in [1, 6, 13, 36, 40]:
+for n in [1, 6, 13, 16, 19, 36, 40, 41, 43]:
     name = 'poison%03d' % n
     test(name + '_forced', [extra_files([name + '.hs']), grep_errmsg(r'^Forced')],
          multimod_compile, [name, poison_early + ' -ddump-webs-forced'])

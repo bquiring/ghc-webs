@@ -178,7 +178,7 @@ webPass early guts
          -- See Note [Strictness as the dual of liveness] in
          -- GHC.WebCore.Transform.Forced (an analysis only, for now)
        ; dump logger Opt_D_dump_webs_forced "Webs: forced" $
-           pprForced (ws_exposed sigs_t) binds_t0
+           pprForced (ws_hidden_fields sigs_t) (ws_exposed sigs_t) binds_t0
 
          -- Defunctionalisation runs last: it changes the arrow types of the
          -- webs it handles into new data types
@@ -645,7 +645,7 @@ runTransforms early logger dflags cfg sigs0 binds0
         , \sigs us done b -> case resultRaiseRound (fieldTys sigs) us exposed keep done b of
                                (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsUseless, "useless elimination", Opt_D_dump_webs_useless
-        , \_ us done b -> case uselessRound us exposed keep done b of
+        , \sigs us done b -> case uselessRound (ws_hidden_fields sigs) us exposed keep done b of
                             (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
         , \_ us done b -> same (strictnessRound us exposed done b) ) ]

@@ -1,0 +1,4 @@
+Forced (strict) parameters of webs: 3 of 8; not known to demand analysis: 0
+Forced result components: 0 of 18
+Forced lazy lets: 0 of 0; not known to demand analysis: 0
+Forced fields of internal constructors: 1 of 2: Main.T#0

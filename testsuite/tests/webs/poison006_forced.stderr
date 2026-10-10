@@ -1,3 +1,4 @@
 Forced (strict) parameters of webs: 3 of 7; not known to demand analysis: 0
 Forced result components: 0 of 6
 Forced lazy lets: 0 of 0; not known to demand analysis: 0
+Forced fields of internal constructors: 0 of 0

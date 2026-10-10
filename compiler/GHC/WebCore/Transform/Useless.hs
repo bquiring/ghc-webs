@@ -13,19 +13,20 @@ import GHC.Builtin.Types ( unboxedUnitTy, mkTupleTy, tupleDataCon )
 import GHC.Core
 import GHC.Core.Coercion
 import GHC.Core.DataCon ( DataCon, isUnboxedTupleDataCon, dataConRepArity, dataConRepStrictness
-                        , isMarkedStrict )
+                        , isMarkedStrict, dataConTyCon, isVanillaDataCon )
 import GHC.Core.FVs ( exprFreeIds )
 import GHC.Core.Make ( mkCoreUnboxedTuple, mkCoreConApps, mkAbsentErrorApp )
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCon ( isUnboxedTupleTyCon )
+import GHC.Core.TyCon ( TyCon, isUnboxedTupleTyCon, tyConDataCons )
 import GHC.Core.Type
 import GHC.Core.Utils ( exprType )
 import GHC.Core.TyCo.Compare ( eqType )
 
 
 import GHC.Types.Basic ( Boxity(..) )
+import GHC.Types.Name ( getOccString )
 import GHC.Types.Id
-import GHC.Types.Id.Info ( ruleInfoFreeVars )
+import GHC.Types.Id.Info ( ruleInfoFreeVars, RecSelParent(..) )
 import GHC.Data.Pair
 import GHC.Types.Tickish
 import GHC.Types.Unique ( getKey, getUnique )
@@ -110,11 +111,14 @@ argument of a dead parameter.
 ------------------------------------------------------------------
 
 data Elem = EVar !Id | EArg !WebId | ERes !WebId !Int
+          | EField !DataCon !Int   -- ^ field i of an internal constructor:
+                                   --   Note [Dead fields of internal types]
 
 elemKey :: Elem -> (Int, Word64, Int)
 elemKey (EVar v)   = (0, getKey (getUnique v), 0)
 elemKey (EArg w)   = (1, getKey (getUnique w), 0)
 elemKey (ERes w i) = (2, getKey (getUnique w), i)
+elemKey (EField dc i) = (3, getKey (getUnique dc), i)
 
 instance Eq Elem where
   a == b = elemKey a == elemKey b
@@ -231,8 +235,8 @@ coercionWebs binds = foldr go_bind emptyUniqSet binds
                      in acc `unionUniqSets` typeWebs l `unionUniqSets` typeWebs r
 
 -- | The constraints of the program
-constraints :: UniqFM WebId Int -> CoreProgram -> [Con]
-constraints res binds = foldr top [] binds
+constraints :: (DataCon -> Bool) -> UniqFM WebId Int -> CoreProgram -> [Con]
+constraints eligible res binds = foldr top [] binds
   where
     arity w = lookupUFM res w
 
@@ -279,6 +283,10 @@ constraints res binds = foldr top [] binds
     go :: Path -> Tail -> CoreExpr -> Cs
     go p tl expr = case expr of
       Var v | isLocalId v -> (Use (EVar v) p :)
+            | Just (RecSelData tc) <- recordSelectorTyCon_maybe v
+            , any eligible (tyConDataCons tc)
+            -> foldr (.) id [ (Root (EField dc i) :) | dc <- tyConDataCons tc
+                                                     , i <- [0 .. dataConRepArity dc - 1] ]
             | otherwise   -> id
       Lit {}       -> id
       Type {}      -> id
@@ -293,6 +301,8 @@ constraints res binds = foldr top [] binds
 
       Case scrut b _ alts
         -> scrut_cs . foldr (\(Alt _ _ rhs) k -> go p tl rhs . k) id alts
+           . foldr (.) id [ (Use (EField dc i) [EVar x] :)
+                          | Alt (DataAlt dc) xs _ <- alts, eligible dc, (i, x) <- zip [0..] xs ]
         where
           scrut_cs
             | Just w <- callWeb scrut, Just n <- arity w
@@ -320,6 +330,9 @@ constraints res binds = foldr top [] binds
         , Just (_, vals) <- tupleApp expr
         , Just n <- arity tw, length vals == n
         -> foldr (.) id [ component tw i v | (i, v) <- zip [0..] vals ]
+        | Just (dc, _, vals) <- conApp expr, eligible dc
+        -> foldr (.) id [ if fillable dc i v then go (EField dc i : p) NoTail v else go p NoTail v
+                        | (i, v) <- zip [0..] vals ]
         | Just w <- callWeb expr, Just n <- arity w
         -> (case tl of
               Tail tw | arity tw == Just n -> foldr (.) id [ (Use (ERes w i) [ERes tw i] :) | i <- [0 .. n - 1] ]
@@ -387,6 +400,22 @@ tupleApp e = case collect e [] of
     collect (WebApp _ f a) as = collect f (a : as)
     collect (Tick t f) as | not (tickishIsCode t) = collect f as
     collect f as              = (f, as)
+
+{- Note [Dead fields of internal types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A type whose constructors other modules cannot see (hidden fields: the
+copies data splitting makes and internal types, Note [Hidden fields] in
+GHC.WebCore.Sigs) has all its matches in this module.  So field i of such
+a constructor K is an element too, EField K i: it is live if some match on
+K binds field i to a live variable, or a record selector of the type
+occurs (its match is not in the program).  Each construction of K analyses
+its field i under EField K i.  A dead field that is lazy, lifted and needs
+no evaluation is replaced by an absent filler (absentError) at every
+construction: K's type does not change, but the thunk is not built and what
+it would have kept alive is not (a later data unboxing could drop the
+slot).  Strict, unlifted and must-evaluate fields are analysed under the
+current path and keep their value.
+-}
 
 {- Note [Fresh binders for useless elimination]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -490,19 +519,20 @@ conApp e = case collect e [] of
 
 -- | Analyse the program, solve, and rewrite it.  Webs in 'done' (already
 -- turned into unit webs) keep their parameter.
-uselessRound :: UniqSupply
+uselessRound :: (TyCon -> Bool)   -- ^ Types with hidden fields
+             -> UniqSupply
              -> WebSet            -- ^ Exposed webs
              -> UnfoldingPolicy
              -> WebSet            -- ^ Done: webs already turned into unit webs
              -> CoreProgram
              -> ( Maybe (CoreProgram, WebSet, Type -> Type)
                 , [(WebId, SDoc, Bool, [Id])] )
-uselessRound us0 exposed pol done binds0
+uselessRound hidden us0 exposed pol done binds0
   | isEmptyUniqSet del && isEmptyUniqSet unit && sizeUFM masks == 0 && isEmptyVarSet dead_lets
-  , isEmptyVarSet dead_fields
+  , isEmptyVarSet dead_fields, sizeUFM dead_cfields == 0
   = (Nothing, verdicts)
   | otherwise
-  = ( Just (initUs_ us (rewriteProgram del unit masks dead_lets dead_fields pol binds), unit
+  = ( Just (initUs_ us (rewriteProgram del unit masks dead_lets dead_fields dead_cfields pol binds), unit
            , dropType del unit masks)
     , verdicts )
   where
@@ -534,7 +564,8 @@ uselessRound us0 exposed pol done binds0
                     Just i -> not (null (wi_lams i)) && not (wi_non_join i)
                     Nothing -> False
 
-    cons0 = constraints res binds
+    eligible dc = hidden (dataConTyCon dc) && isVanillaDataCon dc && not (isUnboxedTupleDataCon dc)
+    cons0 = constraints eligible res binds
     arg_webs = mkUniqSet [ w | EArg w <- concatMap con_elems cons0 ] :: WebSet
     con_elems c = case c of
       Root e    -> [e]
@@ -570,9 +601,18 @@ uselessRound us0 exposed pol done binds0
     -- Dead pattern variables of scrutinised constructions whose field could
     -- be filled (Note [Scrutinised constructions])
     dead_fields = mkVarSet [ x | x <- scrutVars binds, not (is_live (EVar x)) ]
+    -- Dead fields of internal constructors (Note [Dead fields of internal types])
+    dead_cfields :: UniqFM DataCon [Int]
+    dead_cfields = listToUFM_C (++) [ (dc, [i]) | (dc, i) <- dead_list ]
+    dead_list = sortOn (\(dc, i) -> (getOccString dc, i))
+                  [ (dc, i) | EField dc i <- S.toList all_fields, not (is_live (EField dc i)) ]
+    all_fields = S.fromList [ e | c <- cons0, e@(EField {}) <- con_elems c ]
 
     verdicts = [ (w, ppr v <> res_doc w, changed v || isJust (lookupUFM masks w), bs)
                | (w, v, bs) <- arg_verdicts ]
+               ++ [ (placeholderWeb, text "dead fields:" <+> hsep [ ppr dc <> char '#' <> int i | (dc, i) <- dead_list ]
+                    , True, [])
+                  | not (null dead_list) ]
     res_doc w = case lookupUFM masks w of
       Just m  -> text ", dead results" <+> hsep [ int k | (k, False) <- zip [0 :: Int ..] m ]
                  <+> text "of" <+> int (length m)
@@ -636,9 +676,9 @@ dropCo del unit = go
       SubCo c             -> SubCo (go c)
       _                   -> co
 
-rewriteProgram :: WebSet -> WebSet -> UniqFM WebId [Bool] -> VarSet -> VarSet
+rewriteProgram :: WebSet -> WebSet -> UniqFM WebId [Bool] -> VarSet -> VarSet -> UniqFM DataCon [Int]
                -> UnfoldingPolicy -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram del unit masks dead_lets dead_fields pol binds
+rewriteProgram del unit masks dead_lets dead_fields dead_cfields pol binds
   = do { let env = mkVarEnv [ (b, rw_bndr b) | b <- bindersOfBinds binds ]
        ; mapM (rw_top env) binds }
   where
@@ -695,6 +735,11 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
 
     ---------------
     rw :: Env -> CoreExpr -> UniqSM CoreExpr
+    rw env expr
+      | Just (dc, _, vals) <- conApp expr
+      , Just dead <- lookupUFM dead_cfields dc
+      , or [ i `elem` dead && fillable dc i v | (i, v) <- zip [0..] vals ]
+      = rw_con env dc dead expr
     rw env expr = case expr of
       Var v        -> return (Var (lookup_bndr env v))
       Lit l        -> return (Lit l)
@@ -804,6 +849,24 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
         | otherwise -> rw env expr
 
     flip3 f (dc, xs) env e = f env dc xs e
+
+    -- A construction of K whose dead fields become absent fillers, keeping
+    -- the application spine (and its webs)
+    rw_con :: Env -> DataCon -> [Int] -> CoreExpr -> UniqSM CoreExpr
+    rw_con env dc dead expr = fst <$> go_spine expr
+      where
+        n = dataConRepArity dc
+        -- returns the rewritten spine and the number of value arguments in it
+        go_spine e = case e of
+          App f a | isTypeArg a -> do { (f', k) <- go_spine f; a' <- rw env a; return (App f' a', k) }
+          App f a     -> do { (f', k) <- go_spine f; a' <- field k a; return (App f' a', k + 1) }
+          WebApp w f a -> do { (f', k) <- go_spine f; a' <- field k a; return (WebApp w f' a', k + 1) }
+          Tick t f    -> do { (f', k) <- go_spine f; return (Tick (rw_tick env t) f', k) }
+          _           -> do { e' <- rw env e; return (e', 0) }
+        field k a
+          | k < n, k `elem` dead, fillable dc k a
+          = return (mkAbsentErrorApp (dropTy (exprType a)) "useless field")
+          | otherwise = rw env a
 
     -- A binding whose join points' bodies are rewritten with k
     rw_bind_with env k bind = case bind of
