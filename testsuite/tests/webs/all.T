@@ -432,3 +432,11 @@ for n in range(1, 41):
     test(name, ec, compile_and_run, [poison_early])
     test(name + '_late', ec + [extra_files([name + '.hs'])],
          multimod_compile_and_run, [name, poison_late])
+
+# Note [Strictness as the dual of liveness] (GHC.WebCore.Transform.Forced):
+# the analysis-only dump runs on annotated Core (it once called
+# exprIsDeadEnd on web forms and panicked); here on a few poison programs.
+for n in [1, 6, 13, 36, 40]:
+    name = 'poison%03d' % n
+    test(name + '_forced', [extra_files([name + '.hs']), grep_errmsg(r'^Forced')],
+         multimod_compile, [name, poison_early + ' -ddump-webs-forced'])

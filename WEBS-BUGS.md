@@ -36,6 +36,18 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Forced analysis: exprIsDeadEnd on web forms (2026-10-10)
+* **Found by:** nofib, `run-useless2.sh` (with `-ddump-webs-forced`): all
+  but 3 benchmarks panicked.
+* **Symptom:** `exprBotStrictness: web-annotated form (WebLam/WebApp)
+  outside the web pipeline`.
+* **Cause:** the analysis-only draft (GHC.WebCore.Transform.Forced) called
+  exprIsDeadEnd and exprIsHNF on annotated Core; no test ran the dump.
+* **Fix:** strip the web forms first (stripWebForms), as the other passes
+  do.
+* **Guard:** `poison001_forced`, `006`, `013`, `036`, `040` run the dump.
+* **Commit:**
+
 ### Useless elimination: two binding sites with one unique (2026-10-10)
 * **Found by:** nofib, `run-useless.sh` (`early-uls`, `early-ulsd`): 34
   benchmarks did not build (gen_regexps, wheel-sieve1/2, circsim,

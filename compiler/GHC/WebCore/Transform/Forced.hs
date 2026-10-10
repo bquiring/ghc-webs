@@ -29,6 +29,7 @@ import GHC.Types.Web
 import GHC.Utils.Outputable
 
 import GHC.WebCore.Transform.ArityRaise ( productCon )
+import GHC.WebCore.Traverse ( stripWebForms )
 
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
@@ -203,7 +204,7 @@ constraints exposed binds = foldr top M.empty binds
       Let bind body
         -> let joins' = extendVarEnvList joins [ (j, joinBody j rhs) | (j, rhs) <- flattenBinds [bind], isJoinId j ]
                lets = [ x | (x, rhs) <- flattenBinds [bind], isId x, not (isJoinId x)
-                          , not (exprIsHNF rhs), definitelyLiftedType (idType x) ]
+                          , not (exprIsHNF (stripWebForms rhs)), definitelyLiftedType (idType x) ]
                acc1 = foldr (\x -> addSite (FLet x) (forces joins' x tl body)) acc lets
                acc2 = foldr (\(b, rhs) a -> go joins' (if isJoinId b then tl else NoTail) rhs a) acc1
                             (flattenBinds [bind])
@@ -277,7 +278,7 @@ forces joins0 x = go emptyVarSet joins0
            in go seen joins' tl body
       Case scrut _ _ alts
         -> forr [ go seen joins NoTail scrut
-                , fand [ if exprIsDeadEnd rhs then FTrue else go seen joins tl rhs
+                , fand [ if exprIsDeadEnd (stripWebForms rhs) then FTrue else go seen joins tl rhs
                        | Alt _ _ rhs <- alts ] ]
       _ -> app seen joins tl expr
 
