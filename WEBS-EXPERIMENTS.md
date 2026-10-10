@@ -474,6 +474,40 @@ benchmarks; geomean instructions −3.50%, time −3.61%, allocation −3.82%):
 
 The main-module change is opt-in since: `-fcore-webs-internal-main-exports`.
 
+## 14. The boundary split for every exported function (2026-10-10)
+
+The design from §13: every exported function is split, small ones too; a
+split whose local copy no transformation changed is undone after erasure
+(Note [Contracting the boundary split]); the wrapper eta-expands
+function-typed parameters, sharing partial applications (Note
+[Eta-expanding parameters at the boundary]). `run-exports2.sh`: early-mdf's
+options with the new split (`early-bnd3`), and with Main's exports internal
+too (`early-bm3`), against `base` and `early-bm` (the old split with Main's
+exports internal). Built with `-dcore-lint`; `scc` and `fem` did not build
+(a latent defunctionalisation bug, fixed since: WEBS-BUGS.md, "a captured
+dictionary as a field"), so they are missing from the new configurations.
+
+Against `base` (medians of paired ratios, norm mode, 108 benchmarks timed):
+
+| | instructions | time | allocation |
+|---|---|---|---|
+| `early-bm` | −3.63% | −4.09% | −3.89% |
+| `early-bnd3` | **−3.63%** | −4.00% | −3.82% |
+| `early-bm3` | −3.63% | −3.80% | −3.82% |
+
+* **The new split covers Main's exports.** `early-bm3` and `early-bnd3`
+  have the same instruction count and allocation on every benchmark: with
+  every exported function split, making Main's exports internal changes
+  nothing. `-fcore-webs-internal-main-exports`, which assumes the module is
+  a program's main module, is no longer needed.
+* Against `early-bm`, instructions: integrate −2.8%, simple −0.9%; hpg
+  +3.0%, veritas +0.8%; everything else within 0.1%.
+* hpg is continuation-passing (`Cont = Env -> Answer`): 17 exported
+  functions split, 1 contracted in `Env`. Pinned instruction counts:
+  `early-bm` 5.28 G, new split 5.44 G (+3.0%), new split without
+  defunctionalisation 5.60 G (+6.1%): defunctionalisation recovers half,
+  the rest comes from the split (open, WEBS-BUGS.md).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

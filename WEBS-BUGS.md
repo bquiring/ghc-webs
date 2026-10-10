@@ -12,6 +12,14 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Open
 
+* **hpg +3.0% instructions with the boundary split for every exported
+  function** (2026-10-10, `early-bnd3` against `early-bm`, WEBS-EXPERIMENTS.md
+  §14; also veritas +0.8%). hpg is continuation-passing; its exported
+  combinators (`choose`, `choosew`, `extend_type_env`, ...) are split and
+  kept, and their continuation parameters eta-expanded in the wrappers.
+  Without defunctionalisation +6.1%, so the cost is in the split itself.
+  Next: an ablation flag for the parameter eta-expansion, then ticky.
+
 * **rewrite also fails under `early-cur`** (2026-10-09, nofib binaries
   built before the fix below): fixed; rewrite builds and runs right in the
   hf-on/hf-off/types nofib runs (2026-10-09).
