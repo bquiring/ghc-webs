@@ -450,6 +450,28 @@ treejoin +23% time in early-bnd2 and early-main but not early-bm, with no
 instruction change: probably noise from parallel timing (it is GC-heavy);
 recheck serially.
 
+`early-bm` against `base`, medians of paired ratios, norm mode (112
+benchmarks; geomean instructions −3.50%, time −3.61%, allocation −3.82%):
+
+| benchmark | instructions | time | allocation |
+|---|---|---|---|
+| integrate | −76.4% | −72.0% | −80.8% |
+| integer | −59.7% | −72.7% | −50.5% |
+| solid | −21.8% | −17.8% | −54.6% |
+| queens | −20.0% | −17.7% | 0.0% |
+| constraints | −12.2% | −11.9% | −4.2% |
+| linear | −12.2% | −8.8% | −18.0% |
+| cryptarithm2 | −11.8% | −16.2% | −14.5% |
+| mate | −7.9% | −14.0% | −7.4% |
+| puzzle | −7.2% | −5.6% | +0.7% |
+| cse | −5.7% | −5.1% | −10.5% |
+| CS | −5.3% | −5.9% | 0.0% |
+| dom-lt | −5.1% | −3.9% | −3.7% |
+| wave4main | −4.7% | −5.3% | −13.8% |
+| worst: multiplier | +1.2% | +2.0% | +2.3% |
+
+The main-module change is opt-in since: `-fcore-webs-internal-main-exports`.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

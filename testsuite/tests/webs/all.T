@@ -175,9 +175,7 @@ test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12
 # eta-expands the argument of an imported one; their dumps show the dead
 # parameter going.  003 checks sharing (the trace appears once).  004 does
 # not split a small exported function; its dump shows the web exposed.
-# The tests export from Main to get exposed functions: keep those exports
-# (Note [Main's exports] in GHC.WebCore.Pipeline)
-bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params -fcore-webs-keep-main-exports'
+bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params'
             ' -fcore-webs-strictness')
 for n in range(1, 5):
     test('boundary%03d' % n, [], compile_and_run, [bnd_opts])
@@ -354,3 +352,13 @@ os_opts = early_opts + ' -fcore-webs-one-shot'
 test('oneshot001', [], compile_and_run, [os_opts])
 test('oneshot001_dump', [extra_files(['oneshot001.hs'])],
      multimod_compile, ['oneshot001', os_opts + ' -ddump-webs-one-shot -dsuppress-uniques'])
+
+# Note [Main's exports] (GHC.WebCore.Pipeline, -fcore-webs-internal-main-exports):
+# a Main module without an export list; with the flag its exported function's
+# web is internal and raised, without it exposed (the two dumps)
+me_opts = early_opts + ' -fcore-webs-arity-raise'
+test('mainexp001', [], compile_and_run, [me_opts + ' -fcore-webs-internal-main-exports'])
+test('mainexp001_dump', [extra_files(['mainexp001.hs'])],
+     multimod_compile, ['mainexp001', me_opts + ' -fcore-webs-internal-main-exports -ddump-webs-arity-raise -dsuppress-uniques'])
+test('mainexp001_keep_dump', [extra_files(['mainexp001.hs'])],
+     multimod_compile, ['mainexp001', me_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])

@@ -282,15 +282,18 @@ main module (mainModuleNameIs, Main unless -main-is), only the main function
 exported binders are not kept (their webs may be internal), and the module's
 types have hidden fields (Note [Hidden fields] in GHC.WebCore.Sigs).  Their
 types may change; the interface describes the final ones, and no module
-reads them.  -fcore-webs-keep-main-exports turns this off.  The module name
-is the test, not the link mode: nofib compiles each module with -c.
+reads them.  Opt-in, -fcore-webs-internal-main-exports: it assumes the
+module is compiled as a program's main module, not imported (-main-is moves
+the main module).  The module name is the test, not the link mode: nofib
+compiles each module with -c.  On nofib, with the boundary split, −3.60%
+instructions against −2.33% without it (WEBS-EXPERIMENTS.md §13).
 -}
 
 -- | Are the main module's exports, other than main, internal?
 -- See Note [Main's exports]
 mainExportsInternal :: DynFlags -> ModGuts -> Bool
 mainExportsInternal dflags guts
-  = not (gopt Opt_CoreWebsKeepMainExports dflags)
+  = gopt Opt_CoreWebsInternalMainExports dflags
     && moduleName (mg_module guts) == mainModuleNameIs dflags
 
 -- | The main function, or GHC's :Main.main wrapper

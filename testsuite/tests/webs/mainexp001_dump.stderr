@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( mainexp001.hs, mainexp001.o )
+
+==================== Webs: arity raising ====================
+raised: ds ds
+rejected (exposed): eta
+rejected (only known calls (early: left to worker/wrapper)): f
+rejected (only known calls (early: left to worker/wrapper)): n
+rejected (the product is used boxed): x x
+
+
+[2 of 2] Linking mainexp001

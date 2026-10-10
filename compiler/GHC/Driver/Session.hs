@@ -2569,7 +2569,7 @@ fFlagsDeps = [
   flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,
   flagSpec "core-webs-no-strict-elim"         Opt_CoreWebsNoStrictElim,
   flagSpec "core-webs-no-hidden-fields"       Opt_CoreWebsNoHiddenFields,
-  flagSpec "core-webs-keep-main-exports"      Opt_CoreWebsKeepMainExports,
+  flagSpec "core-webs-internal-main-exports"  Opt_CoreWebsInternalMainExports,
   flagSpec "core-webs-uncurry-known"          Opt_CoreWebsUncurryKnown,
   flagSpec "core-webs-one-shot"               Opt_CoreWebsOneShot,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,

@@ -17,13 +17,19 @@ a heuristic.
 Plan (end of 2026-10-09; branches `webs` = `data-split` at `7582b2195a` and
 later, instrumentation on `exposure-stats`):
 
-1. ~~Read the exports experiment~~ (WEBS-EXPERIMENTS.md §13): both help,
-   together −3.60% instructions and −4.62% allocation against base (from
-   −2.19% / −3.14%); integrate −76%, constraints −12%, sphere −11%. Next:
-   **make the boundary split part of the default configuration** (Main's
-   exports are internal by default already); look at multiplier +1.15%
-   (Main's exports) and recheck treejoin's +23% time serially (no
-   instruction change).
+1. ~~Read the exports experiment~~ (WEBS-EXPERIMENTS.md §13): together
+   −3.50% instructions, −3.61% time, −3.82% allocation (norm mode) against
+   base; integrate −76%, constraints −12%, sphere −11%. Main's exports are
+   now opt-in, `-fcore-webs-internal-main-exports` (assumes the module is a
+   program's main module). **Next (the user's design): boundary split for
+   every exported function, in the web pipeline only, contracted afterwards
+   if the internal copy is unchanged** (a small wrapper and worker both
+   still inline, so "small functions are not split" is unnecessary), **and
+   eta-expand higher-order parameters** (`integrate f = integrate' (\x ->
+   f x)`, so the internal copy's parameter webs hold only our lambdas).
+   Measure against early-bm; that may cover what the Main flag does,
+   without its assumption. Also: multiplier +1.2% (Main's exports), recheck
+   treejoin's time serially.
 2. **Re-measure exposure with the winner** (merge `exposure-stats`' counters
    in temporarily, or run them on that branch rebased): how many lambda
    classes are still exposed, and by what, once exports are handled. That
