@@ -52,7 +52,7 @@ would catch it again), **commit** (empty while uncommitted).
   binders for useless elimination]). The timing of that run compared only
   the 75 benchmarks that built; it is discarded.
 * **Guard:** `useless017` (gen_regexps' expand); the 40 `poison` tests.
-* **Commit:**
+* **Commit:** `e585e36ae3`
 
 ### Defunctionalisation: a captured dictionary as a field (2026-10-10)
 * **Found by:** nofib, `run-exports2.sh` (`early-bnd3`, `early-bm3`: the
