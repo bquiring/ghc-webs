@@ -4,6 +4,7 @@
 -- See Note [Super-beta inlining] and WEBS-INLINING.md.
 module GHC.WebCore.Transform.Inline
   ( inlineRound
+  , cloneExpr
   ) where
 
 import GHC.Prelude

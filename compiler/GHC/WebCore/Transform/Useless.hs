@@ -42,6 +42,7 @@ import GHC.Utils.Panic ( pprPanic )
 import GHC.WebCore.Traverse ( typeWebs )
 import GHC.WebCore.Transform.Common ( UnfoldingPolicy(..), changedBinders, fixUnfolding
                                     , fixBinderInfo, ArgFate(..), argFates, mkWild, exprOccurrences )
+import GHC.WebCore.Transform.Inline ( cloneExpr )
 import GHC.WebCore.Transform.DeadParams ( Verdict(..), WebInfo(..), analyse, verdictUsed
                                         , needsEval, unboxedUnitExpr )
 
@@ -135,6 +136,7 @@ data Tail = NoTail | Tail !WebId
           | Scrut !DataCon [Id]   -- ^ a tail of the scrutinee of a case with one
                                   --   alternative K xs, whose binder is unused:
                                   --   see Note [Scrutinised constructions]
+          | ScrutTup [Id]         -- ^ the same, for an unboxed tuple (# xs #)
 
 -- | The least fixpoint: the live elements
 solve :: [Con] -> S.Set Elem
@@ -300,6 +302,8 @@ constraints res binds = foldr top [] binds
               . foldr (.) id [ (Use (ERes w i) [EVar b] :) | i <- [0 .. n - 1] ]
             | Just (dc, xs) <- scrutCtx scrut b alts
             = go p (Scrut dc xs) scrut
+            | Just xs <- scrutTupCtx b alts
+            = go p (ScrutTup xs) scrut
             | otherwise
             = go p NoTail scrut
 
@@ -308,6 +312,10 @@ constraints res binds = foldr top [] binds
         , dc' == dc, length vals == length xs
         -> foldr (.) id [ if fillable dc i v then go (EVar x : p) NoTail v else go p NoTail v
                         | (i, x, v) <- zip3 [0..] xs vals ]
+        | ScrutTup xs <- tl
+        , Just (_, vals) <- tupleApp expr
+        , length vals == length xs
+        -> foldr (.) id [ tup_component (EVar x) (Root (EVar x) :) v | (x, v) <- zip xs vals ]
         | Tail tw <- tl
         , Just (_, vals) <- tupleApp expr
         , Just n <- arity tw, length vals == n
@@ -315,18 +323,24 @@ constraints res binds = foldr top [] binds
         | Just w <- callWeb expr, Just n <- arity w
         -> (case tl of
               Tail tw | arity tw == Just n -> foldr (.) id [ (Use (ERes w i) [ERes tw i] :) | i <- [0 .. n - 1] ]
+              ScrutTup xs | length xs == n -> foldr (.) id [ (Use (ERes w i) [EVar x] :) | (i, x) <- zip [0..] xs ]
               _ -> foldr (.) id [ (Root (ERes w i) :) | i <- [0 .. n - 1] ])
            . go_spine p expr
         | otherwise
         -> go_spine p expr
       where
-        component tw i v
+        component tw i v = tup_component (ERes tw i) (Root (ERes tw i) :) v
+
+        -- A component of a returned or scrutinised tuple, under e; one
+        -- that must be evaluated is kept (root, if it cannot be evaluated
+        -- with a DEFAULT alternative)
+        tup_component e root v
           | needsEval v
           = (if isUnboxedTupleType (exprType v) || isUnboxedSumType (exprType v)
-             then (Root (ERes tw i) :) else id)
+             then root else id)
             . go p NoTail v
           | otherwise
-          = go (ERes tw i : p) NoTail v
+          = go (e : p) NoTail v
 
     -- An application spine: the head, and each argument under its web
     go_spine :: Path -> CoreExpr -> Cs
@@ -374,6 +388,18 @@ tupleApp e = case collect e [] of
     collect (Tick t f) as | not (tickishIsCode t) = collect f as
     collect f as              = (f, as)
 
+{- Note [Fresh binders for useless elimination]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The elements EVar x are keyed by x's unique.  But Core may bind the same
+unique twice, in scopes that do not overlap (GHC's own Core does: nofib
+imaginary/gen_regexps binds go1 in two case branches).  The two binding
+sites would share an element: a guard from one and uses from the other, and
+a live let could be deleted while its uses stay (Web Lint: out of scope).
+So each round first copies every top-level right-hand side with fresh
+binders (cloneExpr, from super-beta inlining), and analyses and rewrites
+the copy.
+-}
+
 {- Note [Scrutinised constructions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Result raising re-boxes a raised call that is not scrutinised directly, and
@@ -391,6 +417,14 @@ replaces a dead field with an absent filler (absentError); only lazy,
 lifted fields that need no evaluation are treated this way, the others stay
 live.  K's type does not change.  The simplifier, after the web pass,
 removes the box and the filler (case of known constructor).
+
+A case on an unboxed tuple, (# xs #), does the same, and since the tuple is
+not a value anyone else sees, its dead components go instead of being
+filled: the scrutinee's tails return only the live ones (as the tails of a
+lambda whose result components are dead, Note [Useless elimination]: a
+call of a web in such a tail makes ERes w i live if xs_i is, and is adapted
+to the live components).  Arity raising wraps calls this way:
+case (case x of I# n -> f n) of (# a, _ #) -> ..
 -}
 
 -- | The context for the scrutinee of this case, if any
@@ -403,6 +437,15 @@ scrutCtx _ b [Alt (DataAlt dc) xs rhs]
   = Just (dc, xs)
 scrutCtx _ _ _ = Nothing
 
+-- | The context for the scrutinee of a case on an unboxed tuple, if any
+-- See Note [Scrutinised constructions]
+scrutTupCtx :: Id -> [CoreAlt] -> Maybe [Id]
+scrutTupCtx b [Alt (DataAlt dc) xs rhs]
+  | isUnboxedTupleDataCon dc
+  , not (b `elemVarSet` exprOccurrences rhs)
+  = Just xs
+scrutTupCtx _ _ = Nothing
+
 -- | The pattern variables of the cases that give their scrutinee a context
 scrutVars :: CoreProgram -> [Id]
 scrutVars binds = concatMap (go . snd) (flattenBinds binds)
@@ -413,7 +456,8 @@ scrutVars binds = concatMap (go . snd) (flattenBinds binds)
       Lam _ x        -> go x
       WebLam _ _ x   -> go x
       Let b x        -> concatMap (go . snd) (flattenBinds [b]) ++ go x
-      Case s b _ as  -> maybe [] snd (scrutCtx s b as) ++ go s ++ concat [ go r | Alt _ _ r <- as ]
+      Case s b _ as  -> maybe [] snd (scrutCtx s b as) ++ fromMaybe [] (scrutTupCtx b as)
+                        ++ go s ++ concat [ go r | Alt _ _ r <- as ]
       Cast x _       -> go x
       Tick _ x       -> go x
       _              -> []
@@ -453,7 +497,7 @@ uselessRound :: UniqSupply
              -> CoreProgram
              -> ( Maybe (CoreProgram, WebSet, Type -> Type)
                 , [(WebId, SDoc, Bool, [Id])] )
-uselessRound us exposed pol done binds
+uselessRound us0 exposed pol done binds0
   | isEmptyUniqSet del && isEmptyUniqSet unit && sizeUFM masks == 0 && isEmptyVarSet dead_lets
   , isEmptyVarSet dead_fields
   = (Nothing, verdicts)
@@ -462,6 +506,14 @@ uselessRound us exposed pol done binds
            , dropType del unit masks)
     , verdicts )
   where
+    -- Every local binder gets a fresh unique: GHC's Core may bind the same
+    -- unique twice in disjoint scopes (two branches), and the elements are
+    -- keyed by unique (Note [Fresh binders for useless elimination])
+    (us, us1) = splitUniqSupply us0
+    binds = initUs_ us1 (mapM fresh_bind binds0)
+    fresh_bind (NonRec b e) = NonRec b <$> cloneExpr e
+    fresh_bind (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) b <$> cloneExpr e) prs
+
     early  = up_early pol
     infos  = analyse binds
     res    = resultWebs binds
@@ -709,6 +761,18 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
                    _         -> Alt con [] <$> k env rhs
                | Alt con ys rhs <- alts ]
            ; return (Case scrut' wild new_ty alts') }
+      | Just xs <- scrutTupCtx b alts
+      , let m = [ not (x `elemVarSet` dead_fields) | x <- xs ]
+      , not (and m)
+      = do { scrut' <- rw_tail_m env m scrut
+           ; wild <- mkWild (exprType scrut')
+           ; alts' <- sequence
+               [ case con of
+                   DataAlt _ -> do { let (env', ys') = rw_bndrs env [ y | (y, True) <- zip ys m ]
+                                   ; Alt (DataAlt (tupleDataCon Unboxed (length ys'))) ys' <$> k env' rhs }
+                   _         -> Alt con [] <$> k env rhs
+               | Alt con ys rhs <- alts ]
+           ; return (Case scrut' wild new_ty alts') }
       | otherwise
       = do { scrut' <- case scrutCtx scrut b alts of
                          Just (dc, xs) | any (`elemVarSet` dead_fields) xs -> rw_scrut env dc xs scrut
@@ -772,12 +836,16 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
     -- A tail of a lambda of the masked web tw: returns only its live
     -- components
     rw_tail :: Env -> WebId -> CoreExpr -> UniqSM CoreExpr
-    rw_tail env tw expr = case expr of
+    rw_tail env tw = rw_tail_m env (fromMaybe (pprPanic "Useless.rw_tail" (ppr tw)) (mask tw))
+
+    -- A tail that returns only the components live in m
+    rw_tail_m :: Env -> [Bool] -> CoreExpr -> UniqSM CoreExpr
+    rw_tail_m env m expr = case expr of
       Let bind body
-        -> do { (env', mb) <- rw_tail_bind env tw bind; mkLets mb <$> rw_tail env' tw body }
+        -> do { (env', mb) <- rw_tail_bind env m bind; mkLets mb <$> rw_tail_m env' m body }
       Case scrut b ty alts
-        -> rw_case env scrut b ty alts (tail_ty ty) (\env' e -> rw_tail env' tw e)
-      Tick t e | not (tickishIsCode t) -> Tick (rw_tick env t) <$> rw_tail env tw e
+        -> rw_case env scrut b ty alts (tail_ty ty) (\env' e -> rw_tail_m env' m e)
+      Tick t e | not (tickishIsCode t) -> Tick (rw_tick env t) <$> rw_tail_m env m e
       _ | Just (_, vals) <- tupleApp expr
         , length vals == length m
         -> do { let keep = [ v | (v, True) <- zip vals m ]
@@ -792,7 +860,6 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
         | otherwise
         -> do { e' <- rw env expr; adapt e' all_live }
       where
-        m = fromMaybe (pprPanic "Useless.rw_tail" (ppr tw)) (mask tw)
         all_live = map (const True) m
         tail_ty ty = case tupleComps ty of
           Just cs -> mkTupleTy Unboxed [ c | (c, True) <- zip (map dropTy cs) m ]
@@ -814,19 +881,19 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
 
     -- A binding in a masked tail: join points bound here return the masked
     -- tuple too
-    rw_tail_bind env tw bind = case bind of
+    rw_tail_bind env m bind = case bind of
       NonRec j rhs
         | isJoinId j, not (j `elemVarSet` dead_lets)
-        -> do { let j' = retype_join tw j
+        -> do { let j' = retype_join m j
                     env' = extendVarEnv env j j'
-              ; rhs' <- rw_join_rhs (join_arity j) env (\env'' e -> rw_tail env'' tw e) rhs
+              ; rhs' <- rw_join_rhs (join_arity j) env (\env'' e -> rw_tail_m env'' m e) rhs
               ; return (env', [NonRec j' rhs']) }
       Rec prs
         | all (isJoinId . fst) prs
         -> do { let prs1 = [ pr | pr@(j, _) <- prs, not (j `elemVarSet` dead_lets) ]
-                    js' = map (retype_join tw . fst) prs1
+                    js' = map (retype_join m . fst) prs1
                     env' = extendVarEnvList env (zip (map fst prs1) js')
-              ; rhss' <- sequence [ rw_join_rhs (join_arity j) env' (\env'' e -> rw_tail env'' tw e) rhs
+              ; rhss' <- sequence [ rw_join_rhs (join_arity j) env' (\env'' e -> rw_tail_m env'' m e) rhs
                                   | (j, rhs) <- prs1 ]
               ; return (env', [ Rec (zip js' rhss') | not (null prs1) ]) }
       _ -> rw_bind env bind
@@ -839,10 +906,9 @@ rewriteProgram del unit masks dead_lets dead_fields pol binds
       Just j' -> not (idType j' `eqType` idType (rw_bndr j))
       Nothing -> False
 
-    retype_join tw j = let j1 = rw_bndr j
-                       in setIdType j1 (replaceResult (join_arity j) (idType j1))
+    retype_join m j = let j1 = rw_bndr j
+                      in setIdType j1 (replaceResult (join_arity j) (idType j1))
       where
-        m = fromMaybe [] (mask tw)
         replaceResult :: Int -> Type -> Type
         replaceResult 0 ty = case tupleComps ty of
           Just cs -> mkTupleTy Unboxed [ c | (c, True) <- zip cs m ]

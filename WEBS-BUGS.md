@@ -36,6 +36,24 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Useless elimination: two binding sites with one unique (2026-10-10)
+* **Found by:** nofib, `run-useless.sh` (`early-uls`, `early-ulsd`): 34
+  benchmarks did not build (gen_regexps, wheel-sieve1/2, circsim,
+  constraints, integer, mate, typecheck, ...).
+* **Symptom:** Web Lint after useless elimination: "The value variable
+  go1 is out of scope".
+* **Cause:** the liveness elements are keyed by unique, and GHC's Core binds
+  the same unique twice in disjoint scopes (gen_regexps' expand: a go1 from
+  a list comprehension in two case branches). The two sites shared one
+  element, a guard from one and uses from the other, and a live let was
+  deleted.
+* **Fix:** each round copies the program with fresh local binders first
+  (cloneExpr from super-beta inlining) and analyses the copy (Note [Fresh
+  binders for useless elimination]). The timing of that run compared only
+  the 75 benchmarks that built; it is discarded.
+* **Guard:** `useless017` (gen_regexps' expand); the 40 `poison` tests.
+* **Commit:**
+
 ### Defunctionalisation: a captured dictionary as a field (2026-10-10)
 * **Found by:** nofib, `run-exports2.sh` (`early-bnd3`, `early-bm3`: the
   boundary split for every exported function, with eta-expanded

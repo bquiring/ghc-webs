@@ -59,6 +59,7 @@ import GHC.WebCore.Transform.ArityRaise
 import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..), reorderTopBinds )
 import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
 import GHC.WebCore.Transform.Useless ( uselessRound )
+import GHC.WebCore.Transform.Forced ( pprForced )
 import GHC.WebCore.Transform.Uncurry
 import GHC.WebCore.Transform.Strictness ( strictnessRound )
 import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
@@ -173,6 +174,11 @@ webPass early guts
        ; let (binds2s, sig_bndrs) = addSigBinders us_sig sigs2 binds2
        ; (binds_t1, sigs_t, transformed0) <- runTransforms early logger dflags cfg sigs2 binds2s
        ; let binds_t0 = removeSigBinders sig_bndrs binds_t1
+
+         -- See Note [Strictness as the dual of liveness] in
+         -- GHC.WebCore.Transform.Forced (an analysis only, for now)
+       ; dump logger Opt_D_dump_webs_forced "Webs: forced" $
+           pprForced (ws_exposed sigs_t) binds_t0
 
          -- Defunctionalisation runs last: it changes the arrow types of the
          -- webs it handles into new data types

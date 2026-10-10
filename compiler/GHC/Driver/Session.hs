@@ -1532,6 +1532,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_dead_params)
   , make_ord_flag defGhcFlag "ddump-webs-useless"
         (setDumpFlag Opt_D_dump_webs_useless)
+  , make_ord_flag defGhcFlag "ddump-webs-forced"
+        (setDumpFlag Opt_D_dump_webs_forced)
   , make_ord_flag defGhcFlag "ddump-webs-uncurry"
         (setDumpFlag Opt_D_dump_webs_uncurry)
   , make_ord_flag defGhcFlag "ddump-webs-arity-raise"

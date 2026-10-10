@@ -403,6 +403,11 @@ for n in [4, 6, 7]:
     test('useless%03d' % n, [exit_code(1)], compile_and_run, [useless_opts])
 for n in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
     test('useless%03d' % n, [], compile_and_run, [useless_opts])
+# 017: two binding sites with one unique (Note [Fresh binders for useless
+# elimination]); in the configuration nofib found it with
+test('useless017', [], compile_and_run,
+     [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
+      ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])
 for n in [1, 2]:
     test('useless%03d_dump' % n, [extra_files(['useless%03d.hs' % n])],
          multimod_compile, ['useless%03d' % n, useless_opts + ' -ddump-webs-useless -dsuppress-uniques'])

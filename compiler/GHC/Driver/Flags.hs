@@ -486,6 +486,7 @@ data DumpFlag
    | Opt_D_dump_webs_summary  -- ^ Web pipeline: top-level types, arrows labelled by web class
    | Opt_D_dump_webs_dead_params -- ^ Web pipeline: dead-parameter elimination verdicts
    | Opt_D_dump_webs_useless     -- ^ Web pipeline: useless elimination verdicts
+   | Opt_D_dump_webs_forced      -- ^ Web pipeline: what the strictness dual of useless elimination proves
    | Opt_D_dump_webs_uncurry     -- ^ Web pipeline: uncurrying verdicts
    | Opt_D_dump_webs_arity_raise -- ^ Web pipeline: arity raising verdicts
    | Opt_D_dump_webs_strictness  -- ^ Web pipeline: strictness verdicts
