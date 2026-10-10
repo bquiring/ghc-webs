@@ -46,7 +46,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** strip the web forms first (stripWebForms), as the other passes
   do.
 * **Guard:** `poison001_forced`, `006`, `013`, `036`, `040` run the dump.
-* **Commit:**
+* **Commit:** `585ca0a753`
 
 ### Useless elimination: two binding sites with one unique (2026-10-10)
 * **Found by:** nofib, `run-useless.sh` (`early-uls`, `early-ulsd`): 34
