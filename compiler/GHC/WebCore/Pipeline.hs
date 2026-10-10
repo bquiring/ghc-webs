@@ -18,7 +18,9 @@ import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM, lookupWithDefaultUFM )
+import qualified Data.Map as Map
+import qualified Data.List as List
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
@@ -148,7 +150,7 @@ webPass early guts
 
          -- 3. Renaming.  Classes joined with an arrow without a web are now
          -- exposed too; see Note [Arrows without webs] in GHC.WebCore.Lint
-             sigs2  = addExposedWebs (ws_exposed_reps sol) $
+             sigs2  = addExposedWebsFrom "an arrow without a web" (ws_exposed_reps sol) $
                       renameSigs (ws_subst sol) sigs1
              binds2 = renameProgram (ws_subst sol) sigs2 binds1
 
@@ -223,7 +225,17 @@ pprHiddenStats sigs binds
          , text "Internal lambda classes:"  <+> int (sizeUniqSet (lams `minusUniqSet` ws_exposed sigs))
          , text "Types with hidden fields:" <+> int (sizeUniqSet hidden_tcs)
          , text "Webs in hidden fields:"    <+> int (sizeUniqSet (hiddenFieldWebs sigs)) ]
+    $$ vcat [ text "Exposed lambda classes by:" <+> text why <> colon <+> int n | (why, n) <- count by_all ]
+    $$ vcat [ text "Exposed lambda classes only by:" <+> text why <> colon <+> int n | (why, n) <- count by_only ]
   where
+    -- Why each exposed lambda class is exposed (WEBS-BACKLOG.md, "What
+    -- exposes data types?"): every origin of its exposed webs; an origin
+    -- alone, if it is the only one
+    exposed_lams = nonDetEltsUniqSet (lams `intersectUniqSets` ws_exposed sigs)
+    whys w = List.sort (List.nub (lookupWithDefaultUFM (ws_origins sigs) ["(unknown)"] w))
+    by_all  = concatMap whys exposed_lams
+    by_only = [ y | w <- exposed_lams, [y] <- [whys w] ]
+    count xs = Map.toList (Map.fromListWith (+) [ (x, 1 :: Int) | x <- xs ])
     lams = mkUniqSet (concatMap (lamWebs . snd) (flattenBinds binds))
     hidden_tcs = mkUniqSet [ getUnique (dataConTyCon dc) | (dc, _) <- nonDetEltsUFM (ws_dcs sigs)
                                                        , ws_hidden_fields sigs (dataConTyCon dc) ]
@@ -402,6 +414,7 @@ runDataSplit early logger dflags this_mod rules binds
                        , pprMessageBag errs ]
               ; ghcExit logger 1 }
        ; dump logger Opt_D_dump_webs_data "Webs: splitting data types" (dsr_dump res)
+       ; dump logger Opt_D_dump_webs_stats "Webs: exposed data classes" (dsr_exposure res)
        ; return (dsr_binds res, dsr_tycons res) }
 
 dataLintConfig :: DynFlags -> DL.LintConfig

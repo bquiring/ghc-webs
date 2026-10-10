@@ -56,6 +56,7 @@ import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
 import Data.Char ( isUpper, isDigit )
 import Data.List ( sortOn, nub )
+import qualified Data.Map as Map
 import Data.Maybe ( isNothing, isJust, catMaybes, fromMaybe )
 import GHC.WebCore.Transform.ArityRaise ( productCon )
 
@@ -117,8 +118,9 @@ data DataSplitResult = DataSplitResult
   , dsr_dump    :: SDoc               -- ^ for -ddump-webs-data
   , dsr_lint    :: DataLintResult     -- ^ Data Lint on the annotated program
   , dsr_changed :: Bool
-  , dsr_useful  :: [Int] }            -- ^ the classes whose split changed something
+  , dsr_useful  :: [Int]              -- ^ the classes whose split changed something
                                       --   (Note [Keeping only useful splits])
+  , dsr_exposure :: SDoc }            -- ^ why classes are exposed (-ddump-webs-stats)
 
 ------------------------------------------------------------------
 --      Eligibility
@@ -652,7 +654,8 @@ splitDataTypes unbox keep cfg this_mod us rules binds
       , dsr_dump    = dump $$ flat_dump
       , dsr_lint    = lint_res
       , dsr_changed = changed
-      , dsr_useful  = useful }
+      , dsr_useful  = useful
+      , dsr_exposure = exposure }
   where
     (us1, us23) = splitUniqSupply us
     (us2, us3)  = splitUniqSupply us23
@@ -869,6 +872,24 @@ splitDataTypes unbox keep cfg this_mod us rules binds
                           else return (Just dc)
       , m_co   = mapTyConsCo is_copy (return . final) }
     rw_ty = mapTyCons is_copy (return . final)
+
+    -- Why each exposed class is exposed (WEBS-BACKLOG.md, "What exposes data
+    -- types?"): the global functions whose applications tied a copy in it to
+    -- the original type (dlr_origins); "other" for any other place
+    exposure = vcat ([ text "Exposed data classes by:" <+> text why <> colon <+> int n
+                     | (why, n) <- count (concatMap whys exposed_reps) ] ++
+                     [ text "Exposed data classes only by:" <+> text why <> colon <+> int n
+                     | (why, n) <- count [ y | r <- exposed_reps, [y] <- [whys r] ] ])
+    exposed_reps = [ rep m | (m : _, _, Exposed, _, _) <- fates ]
+    origin_map = foldl (\m (c, why) -> addToUFM_C (++) m (rep c) [why]) emptyUFM
+                   [ (if is_copy a then a else b, maybe "other" origin_name h)
+                   | ((a, b), h) <- bagToList (dlr_origins lint_res)
+                   , not (is_copy a && is_copy b) ]
+    whys r = nub (lookupWithDefaultUFM origin_map ["(no pair recorded)"] r)
+    count xs = Map.toList (Map.fromListWith (+) [ (x, 1 :: Int) | x <- xs ])
+    origin_name n = (if isDataOcc (nameOccName n) then "constructor " else "")
+                    ++ maybe "" (\m -> moduleNameString (moduleName m) ++ ".") (nameModule_maybe n)
+                    ++ occNameString (nameOccName n)
 
     pp_fate_short Exposed     = text "exposed"
     pp_fate_short Bottom      = text "bottom"

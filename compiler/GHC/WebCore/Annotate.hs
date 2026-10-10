@@ -32,6 +32,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.WebCore.Sigs
+import GHC.Types.Name ( Name, getName, nameModule_maybe, nameOccName, occNameString )
+import GHC.Unit.Module ( moduleName, moduleNameString )
 import GHC.WebCore.Traverse ( typeWebs )
 
 import Data.Array ( bounds, listArray )
@@ -219,7 +221,7 @@ annBndr env b
          -- The webs of kept binders are exposed; see keptIds
        ; sigs <- getSigs
        ; when (b `elemVarSet` ws_interface_ids sigs) $
-           modifySigs (addExposedWebs (typeWebs ty'))
+           modifySigs (addExposedWebsFrom "kept binder" (typeWebs ty'))
        ; return (extendVarEnv env b b', b') }
   | otherwise   -- Type variable: unchanged
   = return (env, b)
@@ -401,7 +403,7 @@ annGlobalId v
                           -- A data constructor worker shares the signature
                           -- of its data constructor
                           Just dc -> annDataCon dc
-                          Nothing -> annExposedType (idType v)
+                          Nothing -> annExposedType ("imported " ++ originName (idName v)) (idType v)
                 ; let clone = setIdType v ty
                 ; modifySigs (addGlobalIdSig v clone)
                 ; return clone } }
@@ -417,10 +419,11 @@ annDataCon dc
            Nothing
              | ws_hidden_fields sigs (dataConTyCon dc)
              -> do { ty <- annType emptyVarEnv (dataConRepType dc)
-                   ; modifySigs (addExposedWebs (mkUniqSet (spineWebs ty)) . addDataConSig dc ty)
+                   ; modifySigs (addExposedWebsFrom ("constructor arrows " ++ originName (dataConName dc))
+                                                    (mkUniqSet (spineWebs ty)) . addDataConSig dc ty)
                    ; return ty }
              | otherwise
-             -> do { ty <- annExposedType (dataConRepType dc)
+             -> do { ty <- annExposedType ("constructor " ++ originName (dataConName dc)) (dataConRepType dc)
                    ; modifySigs (addDataConSig dc ty)
                    ; return ty } }
   where
@@ -448,17 +451,23 @@ annAxiom ax
                 ; modifySigs (addAxiomSig ax clone)
                 ; return clone } }
   where
+    why = "axiom " ++ originName (getName ax)
     ann_branch br@(CoAxBranch { cab_lhs = lhs, cab_rhs = rhs })
-      = do { lhs' <- mapM annExposedType lhs
-           ; rhs' <- annExposedType rhs
+      = do { lhs' <- mapM (annExposedType why) lhs
+           ; rhs' <- annExposedType why rhs
            ; return (br { cab_lhs = lhs', cab_rhs = rhs' }) }
 
 -- | Annotate a closed type, exposing all its webs
-annExposedType :: HasDebugCallStack => Type -> AnnM Type
-annExposedType ty
+annExposedType :: HasDebugCallStack => String -> Type -> AnnM Type
+annExposedType why ty
   = do { ty' <- annType emptyVarEnv ty
-       ; modifySigs (addExposedWebs (typeWebs ty'))
+       ; modifySigs (addExposedWebsFrom why (typeWebs ty'))
        ; return ty' }
+
+-- | A name with its module, for -ddump-webs-stats
+originName :: Name -> String
+originName n = maybe "" (\m -> moduleNameString (moduleName m) ++ ".") (nameModule_maybe n)
+             ++ occNameString (nameOccName n)
 
 ------------------------------------------------------------------
 --      Utilities

@@ -473,14 +473,19 @@ lint_banner string pass = text "*** Core Lint"      <+> text string
 data DataLintResult = DataLintResult
   { dlr_warns :: Bag SDoc
   , dlr_errs  :: Bag SDoc
-  , dlr_pairs :: Bag (TyCon, TyCon) }
+  , dlr_pairs :: Bag (TyCon, TyCon)
+  , dlr_origins :: Bag ((TyCon, TyCon), Maybe Name)
+      -- ^ Each pair with the global function whose application (argument,
+      -- or result bound or scrutinised) required it, if any: why classes
+      -- are exposed (-ddump-webs-data)
+  }
 
 -- | Type-check a program with copied data types, collecting the pairs of
 -- copies that must be the same
 lintDataProgram :: LintConfig -> Copies -> CoreProgram -> DataLintResult
 lintDataProgram cfg copies binds
   = case initLC cfg copies (lintProgram binds) of
-      (warns, errs, prs) -> DataLintResult warns errs prs
+      (warns, errs, prs) -> DataLintResult warns errs (mapBag fst prs) prs
 
 -- | Type-check a 'CoreProgram'. See Note [Core Lint guarantee].
 lintCoreBindings' :: LintConfig -> CoreProgram -> WarnsAndErrs
@@ -611,7 +616,8 @@ lintLetBind :: TopLevelFlag -> RecFlag -> OutId
 -- This function checks other invariants
 lintLetBind top_lvl rec_flag binder rhs rhs_ty
   = do { let binder_ty = idType binder
-       ; ensureEqTys binder_ty rhs_ty (mkRhsMsg binder (text "RHS") rhs_ty)
+       ; withHead (exprHead rhs) $
+         ensureEqTys binder_ty rhs_ty (mkRhsMsg binder (text "RHS") rhs_ty)
 
        -- If the binding is for a CoVar, the RHS should be (Coercion co)
        -- See Note [Core type and coercion invariant] in GHC.Core
@@ -1009,7 +1015,7 @@ lintCoreExpr e@(App _ _)
 
   | otherwise
   = do { fun_pair <- lintCoreFun fun (length args)
-       ; app_pair@(app_ty, _) <- lintCoreArgs fun_pair args
+       ; app_pair@(app_ty, _) <- withHead (exprHead fun) (lintCoreArgs fun_pair args)
 
        -- See Note [Linting representation-polymorphic builtins]
        ; checkRepPolyBuiltin fun args app_ty
@@ -1505,7 +1511,7 @@ lintTyArg arg
 
 lintValArg  :: InExpr -> Mult -> UsageEnv -> LintM (OutType, UsageEnv)
 lintValArg arg mult fun_ue
-  = do { (arg_ty, arg_ue) <- markAllJoinsBad $ lintCoreExpr arg
+  = do { (arg_ty, arg_ue) <- withHead Nothing $ markAllJoinsBad $ lintCoreExpr arg
            -- See Note [Representation polymorphism invariants] in GHC.Core
 
        ; flags <- getLintFlags
@@ -1632,7 +1638,7 @@ lintCaseExpr scrut case_bndr alt_ty alts
 
        -- Lint the case-binder. Must do this after linting the scrutinee
        -- because the case-binder isn't in scope in the scrutineex
-       ; lintBinder CaseBind case_bndr $ \case_bndr' ->
+       ; withScrut (exprHead scrut) $ lintBinder CaseBind case_bndr $ \case_bndr' ->
       -- Don't use lintIdBndr on case_bndr, because unboxed tuple is legitimate
 
     do { let case_bndr_ty' = idType case_bndr'
@@ -1776,7 +1782,8 @@ lintCoreAlt case_bndr scrut_ty _scrut_mult alt_ty alt@(Alt (DataAlt con) args rh
         -- And now bring the new binders into scope
     ; lintBinders CasePatBind args $ \ args' -> do
       { rhs_ue <- lintAltExpr rhs alt_ty
-      ; rhs_ue' <- addLoc (CasePat alt) $
+      ; scrut_head <- getScrut
+      ; rhs_ue' <- addLoc (CasePat alt) $ withHead scrut_head $
                    lintAltBinders rhs_ue case_bndr scrut_ty con_payload_ty
                                   (zipEqual multiplicities  args')
       ; return $ deleteUE rhs_ue' case_bndr
@@ -2997,6 +3004,8 @@ lint_axiom_pair tc (ax1, ax2)
 data LintEnv
   = LE { le_flags :: LintFlags       -- Linting the result of this pass
        , le_copies :: Copies         -- Data Lint: the copies of data types
+       , le_head  :: Maybe Name      -- Data Lint: the global function pairs are attributed to
+       , le_scrut :: Maybe Name      -- Data Lint: the head of the current case's scrutinee
        , le_loc   :: [LintLocInfo]   -- Locations
 
        , le_subst :: Subst
@@ -3065,7 +3074,7 @@ pattern LintM m <- LintM' m
 instance Functor (LintM) where
   fmap f (LintM m) = LintM $ \e w -> mapLResult f (m e w)
 
-type WarnsAndErrs = (Bag SDoc, Bag SDoc, Bag (TyCon, TyCon))
+type WarnsAndErrs = (Bag SDoc, Bag SDoc, Bag ((TyCon, TyCon), Maybe Name))
 
 -- Using a unboxed tuple here reduced allocations for a lint heavy
 -- file by ~6%. Using MaybeUB reduced them further by another ~12%.
@@ -3386,6 +3395,8 @@ initLC cfg copies m
     vars = l_vars cfg
     env = LE { le_flags   = l_flags cfg
              , le_copies  = copies
+             , le_head    = Nothing
+             , le_scrut   = Nothing
              , le_subst   = mkEmptySubst (mkInScopeSetList vars)
              , le_in_vars = mkVarEnv [ (v,(v, varType v)) | v <- vars ]
              , le_joins   = emptyVarSet
@@ -3438,8 +3449,28 @@ addWarnL msg = LintM $ \ env (warns,errs,prs) ->
 
 -- | Record pairs of copies that must be the same
 recordCopyPairs :: Bag (TyCon, TyCon) -> LintM ()
-recordCopyPairs new = LintM $ \ _ (warns,errs,prs) ->
-  fromBoxedLResult (Just (), (warns, errs, new `unionBags` prs))
+recordCopyPairs new = LintM $ \ env (warns,errs,prs) ->
+  fromBoxedLResult (Just (), (warns, errs, mapBag (\p -> (p, le_head env)) new `unionBags` prs))
+
+-- | The global function a pair is attributed to (dlr_origins)
+withHead :: Maybe Name -> LintM a -> LintM a
+withHead h m = LintM $ \ env errs -> unLintM m (env { le_head = h }) errs
+
+-- | The head of the scrutinee of the case being linted
+withScrut :: Maybe Name -> LintM a -> LintM a
+withScrut h m = LintM $ \ env errs -> unLintM m (env { le_scrut = h }) errs
+
+getScrut :: LintM (Maybe Name)
+getScrut = LintM $ \ env errs -> fromBoxedLResult (Just (le_scrut env), errs)
+
+-- | The global function at the head of an application, if any
+exprHead :: CoreExpr -> Maybe Name
+exprHead e = case e of
+  App f _   -> exprHead f
+  Tick _ x  -> exprHead x
+  Cast x _  -> exprHead x
+  Var v | isGlobalId v -> Just (idName v)
+  _         -> Nothing
 
 getCopies :: LintM Copies
 getCopies = LintM $ \ env errs -> fromBoxedLResult (Just (le_copies env), errs)

@@ -50,7 +50,9 @@ renameSigs subst sigs@(WebSigs { ws_ids = ids, ws_dcs = dcs, ws_axioms = axs, ws
   = sigs { ws_ids     = mapVarEnv (\(orig, clone) -> (orig, mapWebsId wm clone)) ids
          , ws_dcs     = mapUFM (\(dc, ty) -> (dc, mapWebsType wm ty)) dcs
          , ws_axioms  = mapUFM (\(orig, clone) -> (orig, rename_ax clone)) axs
-         , ws_exposed = mapUniqSet (renameWeb subst) exposed }
+         , ws_exposed = mapUniqSet (renameWeb subst) exposed
+         , ws_origins = foldl' (\m (u, whys) -> addToUFM_C (++) m (renameWeb subst (mkWebId u)) whys)
+                               emptyUFM (nonDetUFMToList (ws_origins sigs)) }
   where
     -- Only the webs change, so types need no other mapping
     wm = WebMapper { wm_web       = renameWeb subst

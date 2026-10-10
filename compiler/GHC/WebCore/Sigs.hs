@@ -6,7 +6,7 @@ module GHC.WebCore.Sigs
   , emptyWebSigs
   , lookupGlobalIdSig, lookupDataConSig, lookupAxiomSig
   , addGlobalIdSig, addDataConSig, addAxiomSig
-  , addExposedWebs
+  , addExposedWebs, addExposedWebsFrom
   , pprWebSigs
     -- * Hidden fields
   , FieldTys, fieldTys, sigFields
@@ -122,6 +122,9 @@ data WebSigs = WebSigs
       -- types are exposed, and transformations must keep their unfoldings.
   , ws_hidden_fields :: TyCon -> Bool
       -- ^ Types whose fields other modules cannot see: Note [Hidden fields]
+  , ws_origins :: UniqFM WebId [String]
+      -- ^ Why each exposed web is exposed (for -ddump-webs-stats): the
+      -- imported Id, constructor, axiom or kept binder whose signature it is in
   , ws_saturated :: WebSet
       -- ^ Webs never partially applied: the arrows arity raising makes for
       -- a raised product's components (Note [Component demands] in
@@ -135,6 +138,7 @@ emptyWebSigs = WebSigs { ws_ids     = emptyVarEnv
                        , ws_exposed = emptyUniqSet
                        , ws_interface_ids = emptyVarSet
                        , ws_hidden_fields = const False
+                       , ws_origins = emptyUFM
                        , ws_saturated = emptyUniqSet }
 
 lookupGlobalIdSig :: WebSigs -> Id -> Maybe (Id, Id)
@@ -159,6 +163,13 @@ addAxiomSig orig clone sigs
 
 addExposedWebs :: WebSet -> WebSigs -> WebSigs
 addExposedWebs ws sigs = sigs { ws_exposed = ws_exposed sigs `unionUniqSets` ws }
+
+-- | 'addExposedWebs', recording why
+addExposedWebsFrom :: String -> WebSet -> WebSigs -> WebSigs
+addExposedWebsFrom why ws sigs
+  = (addExposedWebs ws sigs)
+      { ws_origins = foldl' (\m w -> addToUFM_C (++) m w [why]) (ws_origins sigs)
+                            (nonDetEltsUniqSet ws) }
 
 pprWebSigs :: WebSigs -> SDoc
 pprWebSigs (WebSigs { ws_ids = ids, ws_dcs = dcs, ws_axioms = axs, ws_exposed = exposed })
