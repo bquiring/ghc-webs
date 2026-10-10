@@ -513,6 +513,51 @@ Against `base` (medians of paired ratios, norm mode, 108 benchmarks timed):
   defunctionalisation 5.60 G (+6.1%): defunctionalisation recovers half,
   the rest comes from the split (open, WEBS-BUGS.md).
 
+## 15. Function-level polymorphism in the final Core (2026-10-10)
+
+How much polymorphism is left at the end of the Core pipeline (before
+CorePrep), and how each polymorphic binding's type parameters are
+instantiated: Note [Polymorphism statistics] (`-ddump-first-class-stats`),
+`run-poly.sh`, `poly-report.py`, `results/report-poly.md`. nofib, 442
+modules; `poly-base` (GHC alone) and `poly-bnd3` (the webs baseline).
+
+`poly-base`: 2,036 polymorphic bindings (2,020 top-level, 16 local; 910
+exported; 583 overloaded), 3,195 type parameters:
+
+| class | parameters | share |
+|---|---|---|
+| exported | 1,594 | 49.9% |
+| open (one type, with type variables) | 833 | 26.1% |
+| variable | 288 | 9.0% |
+| constant (one closed type) | 220 | 6.9% |
+| escaping | 178 | 5.6% |
+| unused | 46 | 1.4% |
+| other kind | 20 | 0.6% |
+| **shape** (anti-unifier with a constructor on top) | **16** | **0.5%** |
+
+`poly-bnd3` is close: 3,322 parameters, shape 15, constant 210, open 870,
+variable 390.
+
+* **Shape is rare**: 16 parameters, almost all in hartel's generated code
+  (`f :: [a] -> ..` at lists, `(h0, [T])` in transform, solid's
+  `(HS2, h0)`), plus constraints' `mapTree` at pairs. Generalising type
+  abstractions by anti-unification has little to act on in nofib.
+* **Constant**: 220 parameters always at one closed type (lists 41, fluid's
+  `Frac` 24, Char 17, tuples 15, Int 14); 144 have two or more
+  instantiations. Type constant propagation (monomorphisation) would reach
+  these; unboxing gains need the type to be a product or a primitive box.
+* **Open** (26%): one type that mentions type variables, 732 of 833 at a
+  single site: top-level functions (floated out, or worker/wrapper's
+  workers) called from one polymorphic caller at its own type variables.
+  Nothing to specialise.
+* Type applications are mostly to data constructors (65%) and imported
+  functions (28%); 7% are to bindings defined in the module.
+* Half the type parameters belong to exported bindings, which other modules
+  instantiate; the boundary split leaves type abstractions alone.
+* `ZonkAny` already appears in Core here: the typechecker zonks
+  unconstrained type variables to it (parstof's `lexmatch_do`, scs), not
+  the optimiser.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

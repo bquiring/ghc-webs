@@ -161,8 +161,10 @@ webs as newtypes (the occurs check never fires on nofib).
     not constant (constant ones are type constant propagation). In general
     the parameter is replaced by one per hole of the anti-unifier of its
     instantiations. Needs webs on type abstractions, or at least on the type
-    lambdas directly around a web's value lambdas. Measured first: Note
-    [Polymorphism statistics] (`run-poly.sh`, `poly-report.py`).
+    lambdas directly around a web's value lambdas. **Measured
+    (WEBS-EXPERIMENTS.md §15): shape 16 of 3,195 type parameters on nofib
+    (0.5%), constant 220 (6.9%)**: type constant propagation has more to act
+    on than anti-unification.
   Overlaps "Constants of non-closed type" above. First measure: how many
   internal webs have a derived argument, or calls at one type.
 - **Boundary split: imported functions.** Eta-expand an imported function
