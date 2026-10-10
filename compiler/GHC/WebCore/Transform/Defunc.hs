@@ -13,7 +13,7 @@ import GHC.Core
 import GHC.Core.Coercion ( coercionKind, mkNomReflCo, mkSymCo, mkSubCo, mkCoVarCo )
 import GHC.Core.DataCon
 import GHC.Core.FVs ( exprFreeVars )
-import GHC.Core.Predicate ( mkNomEqPred )
+import GHC.Core.Predicate ( mkNomEqPred, isPredTy )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
@@ -310,6 +310,8 @@ verdict tops exposed n w i
     lam_problem l
       | any isCoVar (nonDetEltsUniqSet (tycovars l)) = Just "free coercion variables"
       | any isCoVar (lam_xs l)                   = Just "coercion parameter"
+      -- See Note [Captured dictionaries]
+      | any (isPredTy . idType) (fields l)       = Just "captured dictionary"
       | not (all ok_field (fields l))            = Just "unsuitable free variable"
       | not (all (closed . tyVarKind) (tyvars l)) = Just "kind-polymorphic"
       | otherwise                                = Nothing
@@ -657,6 +659,21 @@ innerWeb (WebLam _ _ body) = go body
       Cast e' _     -> go e'
       _             -> Nothing
 innerWeb _ = Nothing
+
+{- Note [Captured dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A lambda's free variables become ordinary fields of its constructor.  A
+class dictionary ($dEq :: Eq v) cannot be one: its type is a constraint, and
+an arrow from a constraint is =>, not ->, so building the constructor's type
+fails (mkFunTy's assertion).  A web with such a lambda is not
+defunctionalised ("captured dictionary").  It could be: the dictionaries
+would go in the constructor's context, like an existential's.
+
+The boundary split made these webs internal (Note [Eta-expanding parameters
+at the boundary] in GHC.WebCore.Boundary): in nofib's spectral/scc, the
+exported dfs :: Eq v => (v -> [v]) -> .. is passed new_range es, which
+captures the dictionary (test boundary008).
+-}
 
 {- Note [Defunctionalising whole arities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

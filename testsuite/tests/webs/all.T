@@ -178,7 +178,9 @@ test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12
 # (Note [Contracting the boundary split]).  006 eta-expands a higher-order
 # parameter in the wrapper, and its web is defunctionalised; 007 checks that
 # the expansion shares partial applications (the trace appears once; Note
-# [Eta-expanding parameters at the boundary]).
+# [Eta-expanding parameters at the boundary]).  008: a web with such a
+# lambda and one that captures a dictionary is not defunctionalised (Note
+# [Captured dictionaries] in GHC.WebCore.Transform.Defunc).
 bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params'
             ' -fcore-webs-strictness')
 for n in range(1, 7):
@@ -192,6 +194,9 @@ test('boundary006_dump', [extra_files(['boundary006.hs'])],
      multimod_compile, ['boundary006', bnd_opts + ' -fcore-webs-defunc -ddump-webs-defunc -dsuppress-uniques'])
 test('boundary007', [extra_files(['Boundary007A.hs'])],
      multimod_compile_and_run, ['boundary007', bnd_opts])
+test('boundary008', [], compile_and_run, [bnd_opts + ' -fcore-webs-defunc'])
+test('boundary008_dump', [extra_files(['boundary008.hs']), grep_errmsg(r'captured dictionary')],
+     multimod_compile, ['boundary008', bnd_opts + ' -fcore-webs-defunc -ddump-webs-defunc -dsuppress-uniques'])
 
 # Note [Defunctionalisation] (GHC.WebCore.Transform.Defunc,
 # -fcore-webs-defunc).  001 is the basic case, 002 checks laziness and

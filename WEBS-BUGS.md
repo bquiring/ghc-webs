@@ -28,6 +28,25 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Defunctionalisation: a captured dictionary as a field (2026-10-10)
+* **Found by:** nofib, `run-exports2.sh` (`early-bnd3`, `early-bm3`: the
+  boundary split for every exported function, with eta-expanded
+  higher-order parameters): `spectral/scc` (Digraph) and `real/fem`
+  (Matrix) did not build.
+* **Symptom:** `ASSERT failed!` in `mkWebFunTy` (`af [->]`, `chooseAAF
+  [=>]`, `arg Eq t`), building a defunctionalised constructor's type.
+* **Cause:** a lambda's free variables become ordinary fields, and one was a
+  class dictionary; an arrow from a constraint must be `=>`. Latent: the
+  web became internal only when the exported `dfs :: Eq v => (v -> [v]) ->
+  ..`'s wrapper eta-expanded its parameter, joining it with the local
+  `new_range es`, which captures the dictionary.
+* **Fix:** such a web is not defunctionalised, verdict "captured
+  dictionary" (Note [Captured dictionaries] in
+  GHC.WebCore.Transform.Defunc). The dictionaries could go in the
+  constructor's context instead (backlog).
+* **Guard:** `boundary008`, `boundary008_dump`; nofib scc and fem.
+* **Commit:**
+
 ### Hidden fields: the definition is a use too (2026-10-09)
 * **Found by:** the user's question (polymorphism), then a test
   (`hfield004`: `data P a = P Int (a -> Int)`, used only at `(Int, Int)`).
