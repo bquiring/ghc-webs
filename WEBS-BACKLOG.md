@@ -159,6 +159,33 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
   Find out why, or drop it.
 - **Partial absence.** Drop the unused fields of a product argument at
   unknown calls (dead parameters handles whole parameters only).
+- **Exposure through recursive imported functions** (2026-10-09): `map`
+  has no unfolding in base's interface (self-recursive, NOINLINE [0], kept
+  for fusion rules; mapList turns unfused code back into a call), unlike
+  `foldr` (INLINE, a local go), so a lambda passed to `map` is called in
+  base's code. Options: keep the foldr form of functions with fusion rules
+  when the function argument is ours; or expose recursive unfoldings
+  (-fexpose-all-unfoldings for base) and copy such functions into the
+  module, specialised to the argument.
+- **What exposes webs and data types: measured** (branch `exposure-stats`,
+  `-ddump-webs-stats`, nofib with early-mdf's options, 2026-10-09).
+  Lambda classes: 15,245, 7,762 exposed. Exposed *only* by an exported
+  binder: 5,278 (68%; 814 in Main modules, 4,464 in others), only by a
+  binder kept for rules or stable unfoldings: 511, only by `map`: 62, by
+  any other single import: about 250. 243 of nofib's 656 modules have no
+  export list (61 of them Main). So:
+  1. **Boundary split** (exists, `-fcore-webs-boundary`, off in every
+     configuration timed since §5): exposed wrapper, internal worker; aimed
+     at the 4,464. Measure early-mdf with it first.
+  2. **Main's exports**: in the program's main module, everything but `main`
+     is not really exported (nothing imports Main); treat it as internal
+     (814).
+  Data classes: 5,446, 3,995 exposed, 411 split; exposure through imported
+  functions mostly, spread thin (noinline, readNumber, map 291, (++) 235,
+  unpackCString#, runMainIO, ReadP.run, hPutStr: I/O, Read and String
+  plumbing), constructors of other data types holding copies (fields stay
+  original: Note [Splitting data types]; e.g. Step inside Stream), and
+  Typeable metadata.
 - **What exposes data types?** (the user, 2026-10-09) Measure how many
   data webs/classes are exposed only because they pass through small
   imported functions (`map`, `foldr`, `(++)`, `length`, ...) that could be
@@ -167,6 +194,37 @@ measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
   (which global Id or axiom exposed the class), then count per function on
   nofib. If a few functions account for most, copying them locally would
   unlock data splitting (and unboxing) broadly.
+- **Known-call conversion** (agreed with the user, 2026-10-09). A
+  single-lambda web whose lambda is a named function in scope at the call
+  (top-level, or local without captured variables) needs no inlining:
+  `k x  ==>  case k of _ -> f x`, a direct saturated call instead of an
+  unknown one, with no code copied. For the webs super-beta rejects as loop
+  breakers (2,581) or too big (177): inlining a recursive function at its
+  own calls would not terminate, and big bodies are what GHC's threshold
+  keeps from being copied. **Measured (2026-10-09, the user's version: one
+  lambda, a top-level function): 4,772 such webs on nofib, but only 28 calls
+  not already by name (27 in internal webs, 1 in an outflow-only web; 144
+  more in webs that values from outside can reach). Not worth building.**
+- **One-constructor defunctionalisation for captured variables** (agreed,
+  2026-10-09). Wrapping the captured variables in a constructor and
+  projecting them at the call is closure conversion, i.e.
+  defunctionalisation with one constructor, which the heuristics exclude
+  (at least two lambdas: CS was +156% when GHC lost the lambda it
+  specialises loops on). Do it only where the lambda's definition is not
+  in scope at the call (defined in one part of the program, called
+  elsewhere, non-locally); not for recursive functions, or eta-expand them
+  first (the user).
+- **Join points** are not a super-beta blocker: their calls are jumps,
+  known and saturated (2,621 webs; nothing to do).
+- **Super-beta for lambdas that capture locals** (2026-10-09). Of the
+  15,245 webs with lambdas on nofib, 94% have one; super-beta inlines 56.
+  Its blockers among one-lambda webs: exposed 6,999, join point 2,621 (no
+  need), loop breaker 2,581 (no), captures local variables 1,888, too big
+  177. The last needs Shivers' environment analysis: inline at a call that
+  sees the same binding of each captured variable (every call within the
+  binding's scope, no other activation in between), e.g. a local function
+  and its unknown calls in one function body. First count how many of the
+  1,888 have all their calls in scope.
 - **Streams** (tests `stream001`, `stream002`, 2026-10-09): stream fusion's
   `Step`/`Stream` with combinators not inlined. No transformation improves
   either (2,000,000 elements: 806M instructions, 488 MB allocated, base and
