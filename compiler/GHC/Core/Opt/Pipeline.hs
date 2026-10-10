@@ -46,6 +46,7 @@ import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
 import GHC.Core.LateCC.TopLevelBinds (topLevelBindsCCMG)
 import GHC.WebCore.Pipeline ( webPass )
 import GHC.WebCore.FirstClass ( firstClassStats, pprFirstClassStats )
+import GHC.WebCore.PolyStats ( pprPolyStats )
 import GHC.Core.Seq (seqBinds)
 import GHC.Core.FamInstEnv
 
@@ -577,7 +578,9 @@ doCorePass pass guts = do
                                  do { liftIO $ Logger.putDumpFileMaybe logger
                                         Opt_D_dump_first_class_stats
                                         "First-class function statistics" FormatText
-                                        (pprFirstClassStats phase (firstClassStats (mg_binds guts)))
+                                        (pprFirstClassStats phase (firstClassStats (mg_binds guts))
+                                         -- See Note [Polymorphism statistics] in GHC.WebCore.PolyStats
+                                         $$ (if phase == "after" then pprPolyStats (mg_binds guts) else empty))
                                     ; return guts }
 
     CoreDoPrintCore           -> {-# SCC "PrintCore" #-}
