@@ -21,7 +21,9 @@ later, instrumentation on `exposure-stats`):
    split for every exported function, contracted when unchanged, with
    eta-expanded higher-order parameters~~ (§14, 2026-10-10): −3.63%
    instructions against base, the same as `early-bm` without assuming the
-   Main module; Main's exports internal adds nothing on top of it. Open:
+   Main module; Main's exports internal adds nothing on top of it, so
+   `-fcore-webs-internal-main-exports` stays in the compiler but is off in
+   experiments from here on (baseline: `early-bnd3`). Open:
    hpg +3.0% instructions (WEBS-BUGS.md); an ablation flag for the
    parameter eta-expansion would show which part costs it. Also: recheck
    treejoin's time serially.

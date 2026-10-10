@@ -499,7 +499,12 @@ Against `base` (medians of paired ratios, norm mode, 108 benchmarks timed):
   have the same instruction count and allocation on every benchmark: with
   every exported function split, making Main's exports internal changes
   nothing. `-fcore-webs-internal-main-exports`, which assumes the module is
-  a program's main module, is no longer needed.
+  a program's main module, is no longer needed: the split gives Main's
+  exported functions internal local copies, which was the flag's effect on
+  nofib. What only the flag does (hidden fields for Main's types, exported
+  non-function bindings) made no difference. The flag stays in the
+  compiler (Note [Main's exports]), but experiments from here on leave it
+  off; the baseline is `early-bnd3`.
 * Against `early-bm`, instructions: integrate −2.8%, simple −0.9%; hpg
   +3.0%, veritas +0.8%; everything else within 0.1%.
 * hpg is continuation-passing (`Cont = Env -> Answer`): 17 exported

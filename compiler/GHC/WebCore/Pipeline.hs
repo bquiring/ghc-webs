@@ -302,6 +302,15 @@ module is compiled as a program's main module, not imported (-main-is moves
 the main module).  The module name is the test, not the link mode: nofib
 compiles each module with -c.  On nofib, with the boundary split, −3.60%
 instructions against −2.33% without it (WEBS-EXPERIMENTS.md §13).
+
+Since every exported function is split (Note [Contracting the boundary
+split] in GHC.WebCore.Boundary), it changes nothing on nofib: the same
+instruction count and allocation on every benchmark with and without it
+(WEBS-EXPERIMENTS.md §14).  The split gives Main's exported functions
+internal local copies, which is what made their webs internal here.  What
+the flag still adds is hidden fields for Main's types, and exported
+bindings that are not functions; neither showed up on nofib.  It is kept,
+but experiments do not use it.
 -}
 
 -- | Are the main module's exports, other than main, internal?
