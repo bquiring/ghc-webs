@@ -12,6 +12,7 @@ import GHC.Core
 import GHC.Core.DataCon
 import GHC.Core.Type
 import GHC.Types.Var ( isCoVar )
+import GHC.Core.Opt.Arity ( exprIsDeadEnd )
 import GHC.Core.Utils ( exprType, exprIsHNF, exprIsTrivial )
 
 import GHC.Types.Demand ( isStrUsedDmd, splitDmdSig, strictifyDmd )
@@ -119,6 +120,21 @@ demand: isStrictIn in GHC.WebCore.Transform.ArityRaise; the pipeline
 repeats the transformations, -fcore-webs-passes).  Only at saturation depth
 1: a curried lambda's demand describes full applications, which a partial
 application need not be (arity raising rejects curried lambdas anyway).
+-}
+
+{- Note [Do not evaluate dead ends early]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An argument or field that is a dead end (an error call, an absent filler)
+is never evaluated early.  It saves nothing, and strictness here is a
+greatest fixpoint: a field that is only ever passed round a recursion into
+the same field of the result, and never read at the end, is vacuously
+strict.  Useless elimination replaces such a dead field with an absent
+filler (Note [Dead fields of internal types] in
+GHC.WebCore.Transform.Useless), and evaluating the filler at the producer
+crashed nofib spectral/hartel/parstof ("Entered absent arg").  The dead
+non-bottom computations of such a field are still evaluated early; a
+strictness that is also live (the dual of useless elimination) would not
+(WEBS-BACKLOG.md).
 -}
 
 {- Note [Only evaluate what would be a thunk]
@@ -657,6 +673,7 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
     eval lz a
       | definitelyLiftedType ty
       , not (exprIsHNF a0)
+      , not (exprIsDeadEnd a0)   -- Note [Do not evaluate dead ends early]
       , lz || wouldBeThunk thunks a0
       = do { v <- mkWild ty
              -- The evaluated unfolding stops a second evaluation of v

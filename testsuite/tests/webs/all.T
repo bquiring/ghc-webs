@@ -405,6 +405,11 @@ for n in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
     test('useless%03d' % n, [], compile_and_run, [useless_opts])
 # 017: two binding sites with one unique (Note [Fresh binders for useless
 # elimination]); in the configuration nofib found it with
+# 018: parstof, a dead field filled, then evaluated early by web strictness
+# (Note [Do not evaluate dead ends early] in GHC.WebCore.Transform.Strictness)
+test('useless018', [extra_run_opts('1')], compile_and_run,
+     [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
+      ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])
 test('useless017', [], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])
@@ -427,7 +432,7 @@ poison_ws = (' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise
              ' -fcore-webs-defunc')
 poison_early = early_opts + poison_ws + ' -fcore-webs-boundary'
 poison_late = webs_opts + poison_ws
-for n in range(1, 46):
+for n in range(1, 47):
     name = 'poison%03d' % n
     ec = [exit_code(1)] if 26 <= n <= 30 else []
     test(name, ec, compile_and_run, [poison_early])

@@ -36,6 +36,26 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### A dead field filled, then evaluated early: "Entered absent arg" (2026-10-10)
+* **Found by:** nofib, `run-useless3.sh` (`early-uls3`, useless elimination
+  with fields): spectral/hartel/parstof aborted.
+* **Symptom:** `internal error: Oops!  Entered absent arg useless field`.
+* **Cause:** field 0 of `F_Par_succ` is only ever passed round
+  f_parrep_right's recursion into field 0 of the result (through the
+  unknown a_join) and never read at the end: dead, so useless elimination
+  filled it with absentError.  Web strictness's strict result fields are a
+  greatest fixpoint, and the field was vacuously strict (each consumer
+  returns it in the same strict field), so the tails evaluated it at the
+  producer: the filler.
+* **Fix:** web strictness never evaluates a dead end early (Note [Do not
+  evaluate dead ends early] in GHC.WebCore.Transform.Strictness).  Open:
+  dead non-bottom computations of vacuously strict fields are still
+  evaluated early; strictness should require liveness (the dual of useless
+  elimination; WEBS-BACKLOG.md).
+* **Guard:** `useless018` (parstof, preprocessed); `poison046` (a smaller
+  attempt that does not reproduce it).
+* **Commit:**
+
 ### Forced analysis: exprIsDeadEnd on web forms (2026-10-10)
 * **Found by:** nofib, `run-useless2.sh` (with `-ddump-webs-forced`): all
   but 3 benchmarks panicked.
