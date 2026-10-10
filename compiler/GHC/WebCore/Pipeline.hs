@@ -58,6 +58,7 @@ import GHC.WebCore.Solve
 import GHC.WebCore.Transform.ArityRaise
 import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..), reorderTopBinds )
 import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
+import GHC.WebCore.Transform.Useless ( uselessRound )
 import GHC.WebCore.Transform.Uncurry
 import GHC.WebCore.Transform.Strictness ( strictnessRound )
 import GHC.WebCore.Transform.ResultRaise ( resultRaiseRound )
@@ -637,6 +638,9 @@ runTransforms early logger dflags cfg sigs0 binds0
       , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
         , \sigs us done b -> case resultRaiseRound (fieldTys sigs) us exposed keep done b of
                                (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
+      , ( Opt_CoreWebsUseless, "useless elimination", Opt_D_dump_webs_useless
+        , \_ us done b -> case uselessRound us exposed keep done b of
+                            (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
         , \_ us done b -> same (strictnessRound us exposed done b) ) ]
 

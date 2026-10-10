@@ -1530,6 +1530,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_summary)
   , make_ord_flag defGhcFlag "ddump-webs-dead-params"
         (setDumpFlag Opt_D_dump_webs_dead_params)
+  , make_ord_flag defGhcFlag "ddump-webs-useless"
+        (setDumpFlag Opt_D_dump_webs_useless)
   , make_ord_flag defGhcFlag "ddump-webs-uncurry"
         (setDumpFlag Opt_D_dump_webs_uncurry)
   , make_ord_flag defGhcFlag "ddump-webs-arity-raise"
@@ -2555,6 +2557,7 @@ fFlagsDeps = [
   flagSpec "late-specialise"                  Opt_LateSpecialise,
   flagSpec "core-webs"                        Opt_CoreWebs,
   flagSpec "core-webs-dead-params"            Opt_CoreWebsDeadParams,
+  flagSpec "core-webs-useless"                Opt_CoreWebsUseless,
   flagSpec "core-webs-uncurry"                Opt_CoreWebsUncurry,
   flagSpec "core-webs-arity-raise"            Opt_CoreWebsArityRaise,
   flagSpec "core-webs-strictness"             Opt_CoreWebsStrictness,

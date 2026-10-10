@@ -377,3 +377,16 @@ test('mainexp001_dump', [extra_files(['mainexp001.hs'])],
      multimod_compile, ['mainexp001', me_opts + ' -fcore-webs-internal-main-exports -ddump-webs-arity-raise -dsuppress-uniques'])
 test('mainexp001_keep_dump', [extra_files(['mainexp001.hs'])],
      multimod_compile, ['mainexp001', me_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
+
+# Note [Useless elimination] (GHC.WebCore.Transform.Useless,
+# -fcore-webs-useless).  001 drops a dead result component (through a
+# scrutinised re-boxing, Note [Scrutinised constructions]), 002 finds two
+# parameters that only feed each other dead, 003 checks that nothing dead is
+# evaluated.  The dumps show the verdicts.
+useless_opts = (early_opts + ' -fcore-webs-arity-raise -fcore-webs-result-raise'
+                ' -fcore-webs-useless -fcore-webs-strictness')
+for n in range(1, 4):
+    test('useless%03d' % n, [], compile_and_run, [useless_opts])
+for n in [1, 2]:
+    test('useless%03d_dump' % n, [extra_files(['useless%03d.hs' % n])],
+         multimod_compile, ['useless%03d' % n, useless_opts + ' -ddump-webs-useless -dsuppress-uniques'])

@@ -5,6 +5,8 @@ module GHC.WebCore.Transform.DeadParams
   ( deadParamsRound
   , Verdict(..), UnitReason(..), RejectReason(..)
   , pprVerdicts
+    -- For useless elimination (GHC.WebCore.Transform.Useless)
+  , WebInfo(..), analyse, verdictUsed, needsEval, unboxedUnitExpr
   ) where
 
 import GHC.Prelude
@@ -309,10 +311,15 @@ needsEval a = mightBeUnliftedType (exprType a)
            && not (exprOkForSpeculation (stripWebForms a))
 
 verdict :: Bool -> WebSet -> WebId -> WebInfo -> Verdict
-verdict early exposed w i
+verdict early exposed w i = verdictUsed early exposed w i (wi_used i)
+
+-- | The verdict, given whether the parameter is used: here, whether some
+-- lambda mentions it; in useless elimination, whether it is live
+verdictUsed :: Bool -> WebSet -> WebId -> WebInfo -> Bool -> Verdict
+verdictUsed early exposed w i used
   | w `elementOfUniqSet` exposed = Reject RejectExposed
   | wi_covar i                   = Reject RejectCoVar
-  | wi_used i                    = Reject RejectUsed
+  | used                         = Reject RejectUsed
   | wi_coercion i                = Reject RejectCoercion
   | wi_eff_tuple i               = Reject RejectEffectfulTuple
   | not (wi_non_join i)          = Delete   -- Only join points: never values

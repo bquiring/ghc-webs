@@ -1,0 +1,13 @@
+[1 of 2] Compiling Main             ( useless001.hs, useless001.o )
+
+==================== Webs: useless elimination ====================
+rejected (exposed): eta
+rejected (exposed): r r
+rejected (used parameter), dead results 1 of 2: x x
+rejected (used parameter): ds
+rejected (used parameter): eta
+rejected (used parameter): f
+rejected (used parameter): xs
+
+
+[2 of 2] Linking useless001
