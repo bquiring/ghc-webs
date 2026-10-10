@@ -29,6 +29,31 @@ Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
    treejoin's time serially.
 2. **Next (the user, 2026-10-10): absent results, partial absence, sum
    results.**
+   - **Useless elimination as a constraint fixpoint** (the user's design,
+     2026-10-10; dissertation `fixpoint-transformations.tex`, 3cps
+     `useless-elimination.sml`). A least fixpoint over booleans, everything
+     dead until a live use witnesses it, with live dependency paths (a use
+     inside a dead let's right-hand side, an argument for a dead parameter,
+     a component for a dead result component, is dead). Elements, all on
+     webs: local Ids, `Arg w`, `Res w i` (unboxed-tuple result
+     components), `Field K i` (fields of internal data types). Exposed webs,
+     imports and exports: live. Unlifted expressions that are not ok for
+     speculation keep their evaluation (`case e of _ ->`). A new pass
+     (`-fcore-webs-useless`), compared on nofib with dead parameters before
+     replacing it; dead constructors (sum variants never built) later.
+     Subsumes the dead result components below, and catches cycles the
+     round-based dead-parameter pass cannot (two parameters that only feed
+     each other).
+   - **Strictness as its dual** (the user, 2026-10-10): always dead (least
+     fixpoint, uses joined by or) and always used (greatest fixpoint, or
+     along one evaluation path, and across case alternatives) over the same
+     web elements, dependency paths and traversal. The strict solution
+     gives evaluation at the producer (call-by-value, thunk splitting for
+     data webs: Strictness at the producer below); web strictness computes
+     its `Arg w` part today. Cf. Sainati, Cutler, Pierce, Weirich, "Typing
+     Strictness" (arXiv 2510.16133): occurrences on U (unused) <= L (lazy),
+     S (strict), ? (indeterminate), as a type-and-effect system; here the
+     same lattice is computed on webs instead.
    - **Dead result components** (implement): after result raising, a web
      whose result is an unboxed tuple drops the components no call uses
      (every call a case on the tuple, or a tail call within the web): from
