@@ -6,7 +6,7 @@ module GHC.WebCore.Sigs
   , emptyWebSigs
   , lookupGlobalIdSig, lookupDataConSig, lookupAxiomSig
   , addGlobalIdSig, addDataConSig, addAxiomSig
-  , addExposedWebs, addExposedWebsFrom
+  , addExposedWebs, addExposedWebsFrom, addInflowWebs, polarWebs
   , pprWebSigs
     -- * Hidden fields
   , FieldTys, fieldTys, sigFields
@@ -125,6 +125,11 @@ data WebSigs = WebSigs
   , ws_origins :: UniqFM WebId [String]
       -- ^ Why each exposed web is exposed (for -ddump-webs-stats): the
       -- imported Id, constructor, axiom or kept binder whose signature it is in
+  , ws_inflow :: WebSet
+      -- ^ Exposed webs through which values from outside the module reach
+      -- it (positive positions of imported signatures, negative ones of
+      -- exported binders' types, constructors, axioms): only these stop a
+      -- call from being made static (pprKnownCallStats in GHC.WebCore.Pipeline)
   , ws_saturated :: WebSet
       -- ^ Webs never partially applied: the arrows arity raising makes for
       -- a raised product's components (Note [Component demands] in
@@ -139,6 +144,7 @@ emptyWebSigs = WebSigs { ws_ids     = emptyVarEnv
                        , ws_interface_ids = emptyVarSet
                        , ws_hidden_fields = const False
                        , ws_origins = emptyUFM
+                       , ws_inflow = emptyUniqSet
                        , ws_saturated = emptyUniqSet }
 
 lookupGlobalIdSig :: WebSigs -> Id -> Maybe (Id, Id)
@@ -163,6 +169,24 @@ addAxiomSig orig clone sigs
 
 addExposedWebs :: WebSet -> WebSigs -> WebSigs
 addExposedWebs ws sigs = sigs { ws_exposed = ws_exposed sigs `unionUniqSets` ws }
+
+-- | Record webs as inflow (ws_inflow)
+addInflowWebs :: WebSet -> WebSigs -> WebSigs
+addInflowWebs ws sigs = sigs { ws_inflow = ws_inflow sigs `unionUniqSets` ws }
+
+-- | The webs of a type in positive (True) or negative (False) position;
+-- arguments of type constructors count in both
+polarWebs :: Bool -> Type -> [WebId]
+polarWebs want = go True
+  where
+    go pol ty = case ty of
+      FunTy { ft_web = w, ft_arg = a, ft_res = r }
+        -> [ w | pol == want ] ++ go (not pol) a ++ go pol r
+      ForAllTy _ t   -> go pol t
+      TyConApp _ ts  -> concatMap (\t -> go True t ++ go False t) ts
+      AppTy t1 t2    -> concatMap (\t -> go True t ++ go False t) [t1, t2]
+      CastTy t _     -> go pol t
+      _              -> []
 
 -- | 'addExposedWebs', recording why
 addExposedWebsFrom :: String -> WebSet -> WebSigs -> WebSigs

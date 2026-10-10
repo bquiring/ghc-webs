@@ -18,7 +18,7 @@ import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM, lookupWithDefaultUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM, lookupWithDefaultUFM, elemUFM )
 import qualified Data.Map as Map
 import qualified Data.List as List
 import GHC.Types.Unique.Set
@@ -34,7 +34,7 @@ import GHC.Types.Avail ( availsToNameSet )
 import GHC.Types.FieldLabel ( flSelector )
 import GHC.Types.Name.Set ( elemNameSet )
 import GHC.Types.Id.Info ( ruleInfoRules )
-import GHC.Types.Unique ( getUnique )
+import GHC.Types.Unique ( getUnique, getKey )
 
 import GHC.Data.Bag
 import GHC.Utils.Error ( DiagOpts, MessageClass(..), pprMessageBag, ghcExit )
@@ -150,8 +150,12 @@ webPass early guts
 
          -- 3. Renaming.  Classes joined with an arrow without a web are now
          -- exposed too; see Note [Arrows without webs] in GHC.WebCore.Lint
-             sigs2  = addExposedWebsFrom "an arrow without a web" (ws_exposed_reps sol) $
-                      renameSigs (ws_subst sol) sigs1
+             -- A class exposed by nothing recorded met an arrow without a web
+             sigs1r = renameSigs (ws_subst sol) sigs1
+             no_origin = filterUniqSet (\w -> not (w `elemUFM` ws_origins sigs1r)) (ws_exposed_reps sol)
+             sigs2  = addInflowWebs no_origin $
+                      addExposedWebsFrom "an arrow without a web" no_origin $
+                      addExposedWebs (ws_exposed_reps sol) sigs1r
              binds2 = renameProgram (ws_subst sol) sigs2 binds1
 
        ; dump logger Opt_D_dump_webs_solved "Webs: program after renaming" $
@@ -190,6 +194,7 @@ webPass early guts
                        (lengthBag pairs) sol
            $$ pprHiddenStats sigs2 binds2
            $$ pprTypeStats guts split_tcs binds0
+           $$ pprKnownCallStats (ws_exposed sigs2) (ws_inflow sigs2) binds2
 
          -- 4. Erasure
        ; let binds3a | transformed = reorderTopBinds (eraseProgram sigs_t binds_t)
@@ -249,6 +254,74 @@ pprHiddenStats sigs binds
       Cast x _      -> lamWebs x
       Tick _ x      -> lamWebs x
       _             -> []
+
+-- | Known-call conversion candidates (WEBS-BACKLOG.md): webs with one lambda
+-- in the whole program, which is a top-level function's outermost value
+-- lambda (f = /\as. \^w x. ..); their calls not already of f by name could
+-- be static calls of f.  Internal webs, and exposed ones (whose calls may
+-- reach lambdas outside the module) separately.  For a renamed program.
+pprKnownCallStats :: WebSet -> WebSet -> CoreProgram -> SDoc
+pprKnownCallStats exposed inflow binds
+  = vcat [ line "internal" (filter (not . is_exposed) cands)
+         , line "exposed, outflow only" (filter (\w -> is_exposed w && not (is_inflow w)) cands)
+         , line "inflow" (filter is_inflow cands) ]
+  where
+    is_inflow w = w `elementOfUniqSet` inflow
+    line what ws
+      = text ("Known-call candidates (" ++ what ++ "):") <+> int (length ws) <+> text "webs,"
+        <+> int (sum (map hits ws)) <+> text "calls,"
+        <+> int (length (filter ((> 0) . hits) ws)) <+> text "webs with calls"
+    is_exposed w = w `elementOfUniqSet` exposed
+
+    -- Lambdas per web, over the whole program
+    lam_count = Map.fromListWith (+) [ (getKey (getUnique w), 1 :: Int) | w <- concatMap (lamWebsE . snd) (flattenBinds binds) ]
+    -- Top-level functions' outermost value lambdas
+    tops = [ (w, b) | (b, e) <- flattenBinds binds, Just w <- [outer e] ]
+    outer e = case e of
+      Lam v x | isTyVar v -> outer x
+      Tick _ x            -> outer x
+      WebLam w _ _        -> Just w
+      _                   -> Nothing
+    cands = [ w | (w, _) <- tops, Map.lookup (getKey (getUnique w)) lam_count == Just 1 ]
+    owner = Map.fromList [ (getKey (getUnique w), b) | (w, b) <- tops ]
+
+    -- Calls of w whose function is not its top-level function by name
+    calls_by = Map.fromListWith (++) [ (getKey (getUnique w), [h])
+                                     | (w, h) <- concatMap (callsE . snd) (flattenBinds binds) ]
+    hits w = case Map.lookup (getKey (getUnique w)) owner of
+      Just f  -> length [ () | h <- Map.findWithDefault [] (getKey (getUnique w)) calls_by
+                             , h /= Just f ]
+      Nothing -> 0
+
+    lamWebsE e = case e of
+      WebLam w _ x  -> w : lamWebsE x
+      Lam _ x       -> lamWebsE x
+      App f a       -> lamWebsE f ++ lamWebsE a
+      WebApp _ f a  -> lamWebsE f ++ lamWebsE a
+      Let bnd x     -> concatMap lamWebsE (rhssOfBind bnd) ++ lamWebsE x
+      Case x _ _ as -> lamWebsE x ++ concat [ lamWebsE r | Alt _ _ r <- as ]
+      Cast x _      -> lamWebsE x
+      Tick _ x      -> lamWebsE x
+      _             -> []
+
+    -- Each WebApp w f a, with the variable its function is (after type
+    -- applications, ticks and casts), if it is one
+    callsE e = case e of
+      WebApp w f a  -> (w, fun_var f) : callsE f ++ callsE a
+      App f a       -> callsE f ++ callsE a
+      Lam _ x       -> callsE x
+      WebLam _ _ x  -> callsE x
+      Let bnd x     -> concatMap callsE (rhssOfBind bnd) ++ callsE x
+      Case x _ _ as -> callsE x ++ concat [ callsE r | Alt _ _ r <- as ]
+      Cast x _      -> callsE x
+      Tick _ x      -> callsE x
+      _             -> []
+    fun_var f = case f of
+      Var v            -> Just v
+      App g (Type _)   -> fun_var g
+      Tick _ g         -> fun_var g
+      Cast g _         -> fun_var g
+      _                -> Nothing
 
 -- | The data types defined here, by whether their representation is visible
 -- outside the module (Note [Hidden fields] in GHC.WebCore.Sigs)

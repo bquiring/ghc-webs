@@ -20,7 +20,7 @@ import GHC.Types.Id
 import GHC.Types.Id.Info ( isEmptyRuleInfo, RecSelParent(..) )
 import GHC.Types.Tickish
 import GHC.Types.Unique.Supply
-import GHC.Types.Unique.Set ( nonDetEltsUniqSet, mkUniqSet )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet, mkUniqSet, unionManyUniqSets )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
@@ -221,7 +221,10 @@ annBndr env b
          -- The webs of kept binders are exposed; see keptIds
        ; sigs <- getSigs
        ; when (b `elemVarSet` ws_interface_ids sigs) $
-           modifySigs (addExposedWebsFrom "kept binder" (typeWebs ty'))
+           modifySigs (addInflowWebs (mkUniqSet (polarWebs False ty')) .
+                       addExposedWebsFrom (if isExportedId b then "exported binder"
+                                           else "kept binder (rules, stable unfoldings)")
+                                          (typeWebs ty'))
        ; return (extendVarEnv env b b', b') }
   | otherwise   -- Type variable: unchanged
   = return (env, b)
@@ -403,7 +406,9 @@ annGlobalId v
                           -- A data constructor worker shares the signature
                           -- of its data constructor
                           Just dc -> annDataCon dc
-                          Nothing -> annExposedType ("imported " ++ originName (idName v)) (idType v)
+                          Nothing -> do { t <- annExposedType ("imported " ++ originName (idName v)) (idType v)
+                                        ; modifySigs (addInflowWebs (mkUniqSet (polarWebs True t)))
+                                        ; return t }
                 ; let clone = setIdType v ty
                 ; modifySigs (addGlobalIdSig v clone)
                 ; return clone } }
@@ -424,6 +429,7 @@ annDataCon dc
                    ; return ty }
              | otherwise
              -> do { ty <- annExposedType ("constructor " ++ originName (dataConName dc)) (dataConRepType dc)
+                   ; modifySigs (addInflowWebs (typeWebs ty))
                    ; modifySigs (addDataConSig dc ty)
                    ; return ty } }
   where
@@ -455,6 +461,7 @@ annAxiom ax
     ann_branch br@(CoAxBranch { cab_lhs = lhs, cab_rhs = rhs })
       = do { lhs' <- mapM (annExposedType why) lhs
            ; rhs' <- annExposedType why rhs
+           ; modifySigs (addInflowWebs (unionManyUniqSets (map typeWebs (rhs' : lhs'))))
            ; return (br { cab_lhs = lhs', cab_rhs = rhs' }) }
 
 -- | Annotate a closed type, exposing all its webs
