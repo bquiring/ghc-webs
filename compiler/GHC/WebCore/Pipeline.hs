@@ -43,7 +43,7 @@ import GHC.Utils.Panic
 import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
-import GHC.WebCore.Boundary ( splitBoundary )
+import GHC.WebCore.Boundary ( splitBoundary, contractBoundary )
 import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes, nonParametric )
 import GHC.Core.TyCo.FVs ( tyConsOfType )
 import GHC.Core.DataCon ( dataConRepArgTys )
@@ -72,7 +72,9 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
 
 import Control.Monad
+import Data.List ( sortBy )
 import Data.Maybe ( fromMaybe )
+import Data.Ord ( comparing )
 
 {- Note [The web pipeline]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -127,10 +129,10 @@ webPass early guts
 
        ; let -- 0. Split exposed webs at the module boundary (early run only)
              -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
-             binds0 | early, gopt Opt_CoreWebsBoundary dflags
-                    = splitBoundary (unfoldingOpts dflags) us0 (mg_rules guts) binds_d
-                    | otherwise
-                    = binds_d
+             boundary = early && gopt Opt_CoreWebsBoundary dflags
+             (binds0, split_fns)
+                    | boundary  = splitBoundary us0 (mg_rules guts) binds_d
+                    | otherwise = (binds_d, [])
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
@@ -205,12 +207,25 @@ webPass early guts
        ; when (gopt Opt_DoCoreLinting dflags && not transformed) $
            checkRoundTrip binds0 binds3
 
+         -- Undo the boundary split where the local copy is unchanged
+         -- See Note [Contracting the boundary split] in GHC.WebCore.Boundary
+       ; let (binds3c, contracted)
+               | boundary  = contractBoundary split_fns binds0 binds3
+               | otherwise = (binds3, [])
+       ; when boundary $
+           dump logger Opt_D_dump_webs_stats "Webs: boundary split" $
+             vcat [ text "Split:"      <+> int (length split_fns)
+                  , text "Contracted:" <+> int (length contracted)
+                  , text "Kept:"       <+> pprWithCommas ppr
+                      (sortBy (comparing getOccString)
+                         [ f | (f, _) <- split_fns, not (f `elem` contracted) ]) ]
+
          -- Specialise the new types to their uses
          -- See Note [Specialising indexed types] in GHC.WebCore.Transform.SpecIndex
        ; us_s <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let (binds4, replaced, spec_dump)
-               | null new_ixs = (binds3, [], [])
-               | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3
+               | null new_ixs = (binds3c, [], [])
+               | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3c
              new_tcs = [ maybe tc id (lookup tc replaced) | (tc, _) <- new_ixs ]
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)

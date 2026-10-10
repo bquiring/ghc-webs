@@ -1,8 +1,7 @@
 -- Note [Splitting webs at the boundary], part 1: step is exported, and also
 -- passed to the local apply2.  Its second argument is dead.  Without the
 -- split, step's web is exposed and keeps the argument; with it, the local
--- copy $estep drops it, and apply2 no longer passes it.  (step is too big
--- to nearly inline; small functions are not split: boundary004.)
+-- copy $estep drops it, and apply2 no longer passes it.
 module Main (main, step) where
 
 step :: Int -> Int -> Int

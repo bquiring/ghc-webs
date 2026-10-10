@@ -1,0 +1,19 @@
+[1 of 2] Compiling Main             ( boundary006.hs, boundary006.o )
+
+==================== Webs: defunctionalisation ====================
+defunctionalised (3 constructors): v x p
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): eta
+not defunctionalised (exposed): r r
+not defunctionalised (no unknown calls): ds
+not defunctionalised (no unknown calls): ds
+
+
+
+==================== Webs: specialising defunctionalised types ====================
+Main.Defun1: specialised to Main.Defun1 = [GHC.Internal.Types.Int,
+                                           GHC.Internal.Types.Int]
+
+
+[2 of 2] Linking boundary006

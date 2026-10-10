@@ -173,15 +173,25 @@ test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12
 # Note [Splitting webs at the boundary] (GHC.WebCore.Boundary,
 # -fcore-webs-boundary).  boundary001 splits an exported function, 002
 # eta-expands the argument of an imported one; their dumps show the dead
-# parameter going.  003 checks sharing (the trace appears once).  004 does
-# not split a small exported function; its dump shows the web exposed.
+# parameter going.  003 checks sharing (the trace appears once).  004 splits
+# a small exported function too.  005 keeps one split and contracts another
+# (Note [Contracting the boundary split]).  006 eta-expands a higher-order
+# parameter in the wrapper, and its web is defunctionalised; 007 checks that
+# the expansion shares partial applications (the trace appears once; Note
+# [Eta-expanding parameters at the boundary]).
 bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params'
             ' -fcore-webs-strictness')
-for n in range(1, 5):
+for n in range(1, 7):
     test('boundary%03d' % n, [], compile_and_run, [bnd_opts])
 for n in [1, 2, 4]:
     test('boundary%03d_dump' % n, [extra_files(['boundary%03d.hs' % n])],
          multimod_compile, ['boundary%03d' % n, bnd_opts + ' -ddump-webs-dead-params -dsuppress-uniques'])
+test('boundary005_dump', [extra_files(['boundary005.hs']), grep_errmsg(r'^(Split|Contracted|Kept):')],
+     multimod_compile, ['boundary005', bnd_opts + ' -ddump-webs-stats'])
+test('boundary006_dump', [extra_files(['boundary006.hs'])],
+     multimod_compile, ['boundary006', bnd_opts + ' -fcore-webs-defunc -ddump-webs-defunc -dsuppress-uniques'])
+test('boundary007', [extra_files(['Boundary007A.hs'])],
+     multimod_compile_and_run, ['boundary007', bnd_opts])
 
 # Note [Defunctionalisation] (GHC.WebCore.Transform.Defunc,
 # -fcore-webs-defunc).  001 is the basic case, 002 checks laziness and

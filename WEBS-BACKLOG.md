@@ -296,9 +296,6 @@ webs as newtypes (the occurs check never fires on nofib).
   copies. Harmless, but it creates types; decide whether to exclude them
   until phase 3 can use them (unboxing).
 
-- **Boundary split, size bound.** The bound is 2× `-funfolding-use-threshold`
-  (Note [Small functions are not split]). Try 1× and 3× and compare
-  instruction counts.
 - **Boundary split, profitability.** Which passes fire on split webs
   (verdict dumps), and does each kind of firing pay off in instructions?
 - **Inlining vs fetch bandwidth.** Less inlining means smaller code (fetch

@@ -1,7 +1,7 @@
--- Note [Splitting webs at the boundary], part 1: step is exported, and small
--- enough to certainly inline, so it is not split (unlike boundary001): its
--- web stays exposed and keeps the dead argument, and other modules inline
--- its whole body instead.
+-- Note [Contracting the boundary split]: step is exported and small enough to
+-- certainly inline.  It is split like any other exported function
+-- (boundary001): its local copy drops the dead argument, so the split is
+-- kept, and the wrapper and the copy are both small enough to inline.
 module Main (main, step) where
 
 step :: Int -> Int -> Int

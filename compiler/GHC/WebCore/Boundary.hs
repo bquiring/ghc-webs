@@ -6,6 +6,7 @@
 -- See Note [Splitting webs at the boundary].
 module GHC.WebCore.Boundary
   ( splitBoundary
+  , contractBoundary
   ) where
 
 import GHC.Prelude
@@ -14,19 +15,23 @@ import GHC.Core
 import GHC.Core.FVs ( rulesFreeVars )
 import GHC.Core.Opt.Arity ( etaExpand )
 import GHC.Core.Utils ( exprIsTrivial )
-import GHC.Core.Unfold ( UnfoldingOpts, unfoldingUseThreshold )
+import GHC.Core.Map.Expr ( eqCoreExpr )
 import GHC.Core.Coercion ( isReflexiveCo )
+import GHC.Core.Type ( Type, Mult, pattern ManyTy, splitFunTy_maybe )
+import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Data.FastString
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Demand ( splitDmdSig )
+import GHC.Types.Demand ( SubDemand, pattern (:*), splitDmdSig, viewCall
+                         , isAbsDmd, isAtMostOnce, topSubDmd )
 import GHC.Types.Basic ( Arity, isDefaultInlinePragma, noOccInfo )
-import GHC.Core.Type ( pattern ManyTy )
+import GHC.Types.Var ( FunTyFlag(..) )
 import GHC.Types.Name
 import GHC.Types.Unique ( Unique )
 import GHC.Types.Unique.Supply
+import GHC.Types.Unique.FM ( nonDetEltsUFM )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 
@@ -58,10 +63,10 @@ run only):
         f   = \xs -> $ef xs            -- exported
 
     and every occurrence of f in the module becomes $ef.  This is
-    worker/wrapper with the identity as the wrapper.  f is left alone if it
-    has a stable unfolding, rules, or an inline pragma, or if a rule
-    mentions it.  It is also left alone if it is small: see
-    Note [Small functions are not split].
+    worker/wrapper with the identity as the wrapper.  The wrapper also
+    eta-expands f's higher-order parameters: see Note [Eta-expanding
+    parameters at the boundary].  f is left alone if it has a stable
+    unfolding, rules, or an inline pragma, or if a rule mentions it.
 
  2. Arguments of global Ids.  A local function variable v (arity n > 0)
     passed to an imported function or a data constructor is eta-expanded
@@ -76,79 +81,91 @@ Both are semantically the identity: v has arity n, so it, and its partial
 application to fewer than n arguments, are values, and eta-expansion
 neither duplicates work nor turns bottom into a lambda.
 
-If no transformation changes f's or v's web, the simplifier, which runs
-after the early web pass, undoes the split: it eta-reduces  \ys -> v ys,
-and shortOutIndirections turns  f = $ef  back into one binding.  If a
-transformation did change the web, the wrapper is where the old calling
-convention meets the new one (e.g.  \x y -> $ef x  after dead-parameter
-deletion): GHC's worker/wrapper, with the wrapper built by the web pass.
-In the late run nothing simplifies afterwards, so the split is not done.
+After the web pass, a split whose local copy no transformation changed is
+contracted: see Note [Contracting the boundary split].  If a transformation
+did change $ef, the wrapper is where the old calling convention meets the
+new one (e.g.  \x y -> $ef x  after dead-parameter deletion): GHC's
+worker/wrapper, with the wrapper built by the web pass.  The simplifier,
+which runs after the early web pass, eta-reduces the expanded arguments
+(\ys -> v ys) whose webs were not changed.  In the late run nothing
+simplifies afterwards, so the split is not done.
 -}
 
-{- Note [Small functions are not split]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-GHC's worker/wrapper does not split a function that is small enough to
-certainly inline after the split; it gives it a stable unfolding instead,
-which inlines everywhere, even partially applied (Note [Don't w/w inline
-small non-loop-breaker things] in GHC.Core.Opt.WorkWrap).  Its whole body
-then reaches every caller, in other modules too, and its web is optimised
-there, by inlining.  Splitting such a function at the boundary only stops
-that:
+{- Note [Contracting the boundary split]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If no transformation changed the local copy $ef of an exported function f
+(its type and right-hand side after erasure are those the split built), the
+split is undone after erasure: the wrapper is dropped, $ef's binding becomes
+f's again, with f's original Id (its unfolding and analysis results), and
+every occurrence of $ef becomes f.  So an exported function the web pass
+did not change is exactly as without the split.
 
-  * real/infer: StateX.thenSX and friends are tiny.  Split, the exported
-    wrapper got no stable unfolding, and InferMonad's partial applications
-    (thenSX thenX) no longer inlined: +4.5% allocation.
-
-  * real/gamteb: RoulSplit.split returns a pair of records.  Split, its
-    result raised, it became a worker returning an unboxed pair and a
-    wrapper; the callers in other modules, which used to inline its body
-    and take the records apart, called the worker instead: +1.0%
-    allocation.
-
-We cannot ask worker/wrapper's own question (certainlyWillInline) here:
-it is about the body after worker/wrapper, which unboxes arguments and
-drops absent ones, and is often much smaller.  split's unfolding has size
-152 before worker/wrapper and inlines unconditionally after it.  So the test
-is a heuristic: a function is not split if its unfolding is within twice
-the inlining threshold (-funfolding-use-threshold), with the argument
-discount certainlyWillInline uses.  A function with an INLINE-like
-unfolding (UnfWhen) is never split.
+This used to be left to the simplifier (shortOutIndirections), with small
+functions not split at all: the exported wrapper had lost f's unfolding, so
+a small function (StateX.thenSX in real/infer) no longer inlined in other
+modules when partially applied (+4.5% allocation).  With the contraction
+every exported function is split: if its copy is changed, the wrapper and
+the copy are both small when f was, and both inline.
 -}
 
--- | Is f small enough that GHC's worker/wrapper would probably make it
--- inline everywhere?  See Note [Small functions are not split]
-nearlyInlines :: UnfoldingOpts -> Id -> Bool
-nearlyInlines opts f = case realIdUnfolding f of
-  CoreUnfolding { uf_guidance = UnfWhen {} } -> True
-  CoreUnfolding { uf_guidance = UnfIfGoodArgs { ug_size = size, ug_args = args } }
-    -> size - 10 * (length args + 1) <= 2 * unfoldingUseThreshold opts
-  _ -> False
+{- Note [Eta-expanding parameters at the boundary]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The wrapper of an exported function passes its parameters to the local
+copy.  A parameter g of function type is exposed (any caller in another
+module passes its own lambdas), and passing it on as it is would join the
+web of $ef's parameter with g's, exposing it too.  So the wrapper
+eta-expands it:
+
+    integrate f a b = $eintegrate (\x -> f x) a b
+
+and $ef's parameter web holds only the wrapper's lambda and the lambdas
+passed by local callers.  For a parameter with more arrows, the partial
+application is shared, as in g itself:
+
+    g :: a -> b -> c    ==>    \x -> let r = g x in \y -> r y
+
+and a lambda is marked one-shot when f's demand on g says it is called at
+most once (g's partial applications, from the call demand), so the
+simplifier inlines r where it may (\x y -> g x y).  Only plain arrows are
+expanded (not constraint arrows, foralls or newtypes), and not parameters
+that f does not use (absent demand).
+
+As for any eta-expansion of a variable, \x -> g x differs from g only when
+g is bottom and f's body forces it with seq; GHC's own eta-expansion makes
+the same assumption (-fno-pedantic-bottoms).
+-}
 
 -- | Split exposed webs at the boundary of the module.
 -- See Note [Splitting webs at the boundary]
-splitBoundary :: UnfoldingOpts -> UniqSupply -> [CoreRule] -> CoreProgram -> CoreProgram
-splitBoundary uf_opts us rules binds
-  = map etaArgsBind (concat binds')
+--
+-- Returns the split program and, for each split function, its original Id
+-- and its local copy (for 'contractBoundary').
+splitBoundary :: UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, [(Id, Id)])
+splitBoundary us rules binds
+  = (map etaArgsBind (concat binds'), nonDetEltsUFM env)
   where
     rule_fvs = rulesFreeVars rules
     (env, binds') = initUs_ us (mapAccumLM split_bind emptyVarEnv binds)
 
     -- First pass: choose the exported functions to split, and build their
-    -- local copies.  The substitution maps each to its local copy.
-    split_bind :: IdEnv Id -> CoreBind -> UniqSM (IdEnv Id, [CoreBind])
+    -- local copies.  The environment maps each to itself and its local copy.
+    split_bind :: IdEnv (Id, Id) -> CoreBind -> UniqSM (IdEnv (Id, Id), [CoreBind])
     split_bind acc (NonRec f rhs)
       | Just n <- splittable f rhs
       = do { u <- getUniqueM
            ; let f_w = mkLocalCopy u f
-           ; return ( extendVarEnv acc f f_w
-                    , [ NonRec f_w rhs, NonRec (zapSplit f) (mkWrapper f n f_w) ] ) }
+           ; wrapper <- mkWrapper f n f_w
+           ; return ( extendVarEnv acc f (f, f_w)
+                    , [ NonRec f_w rhs, NonRec (zapSplit f) wrapper ] ) }
     split_bind acc (Rec prs)
       = do { split <- sequence [ do { u <- getUniqueM; return (f, mkLocalCopy u f, n) }
                                | (f, rhs) <- prs, Just n <- [splittable f rhs] ]
+           ; wrappers <- sequence [ NonRec (zapSplit f) <$> mkWrapper f n f_w
+                                  | (f, f_w, n) <- split ]
            ; let sub = mkVarEnv [ (f, f_w) | (f, f_w, _) <- split ]
-           ; return ( acc `plusVarEnv` sub
+           ; return ( acc `plusVarEnv` mkVarEnv [ (f, (f, f_w)) | (f, f_w, _) <- split ]
                     , Rec [ (lookupVarEnv sub f `orElse` f, rhs) | (f, rhs) <- prs ]
-                      : [ NonRec (zapSplit f) (mkWrapper f n f_w) | (f, f_w, n) <- split ] ) }
+                      : wrappers ) }
     split_bind acc bind = return (acc, [bind])
 
     splittable f rhs
@@ -158,7 +175,6 @@ splitBoundary uf_opts us rules binds
       , isEmptyRuleInfo (idSpecialisation f)
       , isDefaultInlinePragma (idInlinePragma f)
       , not (f `elemVarSet` rule_fvs)
-      , not (nearlyInlines uf_opts f)
       , let n = length (filter isId (fst (collectBinders rhs)))
       , n > 0
       = Just n
@@ -173,7 +189,7 @@ splitBoundary uf_opts us rules binds
 
     go :: CoreExpr -> CoreExpr
     go expr = case expr of
-      Var v -> Var (lookupVarEnv env v `orElse` v)
+      Var v -> Var (maybe v snd (lookupVarEnv env v))
       App {}
         | (Var g, args) <- collectArgs expr
         , isGlobalId g
@@ -225,13 +241,111 @@ zapSplit f = f `setIdUnfolding` noUnfolding
 -- its binder's demand says it is strict.  Without them, f's worker took its
 -- arguments boxed, and so did every caller in other modules (nofib
 -- real/gamteb, PhotoElec.photoElec: +0.4% allocation).
-mkWrapper :: Id -> Arity -> Id -> CoreExpr
-mkWrapper f n f_w = go dmds (etaExpandNoCast n (Var f_w))
+--
+-- Its higher-order parameters are eta-expanded: see Note [Eta-expanding
+-- parameters at the boundary].
+mkWrapper :: Id -> Arity -> Id -> UniqSM CoreExpr
+mkWrapper f n f_w
+  | (fun, args) <- collectArgs body
+  , Var v <- fun, v == f_w
+  = mkLams bs . mkApps fun <$> mapM eta_arg args
+  | otherwise
+  = return wrapper
   where
+    wrapper  = go dmds (etaExpandNoCast n (Var f_w))
+    (bs, body) = collectBinders wrapper
     dmds = fst (splitDmdSig (idDmdSig f))
     go (d:ds) (Lam b e) | isId b = Lam (b `setIdDemandInfo` d) (go ds e)
     go ds     (Lam b e)          = Lam b (go ds e)
     go _      e                  = e
+
+    -- The binders carry the demands, their occurrences do not
+    eta_arg (Var x) | Just b <- lookupVarEnv bndrs x
+                    , isId b
+                    , not (isAbsDmd (idDemandInfo b))
+                    = etaParam b
+    eta_arg a = return a
+    bndrs = mkVarEnv [ (b, b) | b <- bs ]
+
+-- | A parameter of function type, eta-expanded along its plain arrows,
+-- sharing its partial applications
+-- See Note [Eta-expanding parameters at the boundary]
+etaParam :: Id -> UniqSM CoreExpr
+etaParam g = expand (Var g) (idType g) sd
+  where
+    sd = case idDemandInfo g of _ :* s -> s
+
+    expand :: CoreExpr -> Type -> SubDemand -> UniqSM CoreExpr
+    expand e ty call
+      | Just (FTF_T_T, mult, arg, res) <- splitFunTy_maybe ty
+      = do { x <- mk_bndr (fsLit "p") mult arg
+           ; let (once, call') = case viewCall call of
+                   Just (c, sd') -> (isAtMostOnce c, sd')
+                   Nothing       -> (False, topSubDmd)
+                 x' | once      = setOneShotLambda x
+                    | otherwise = x
+                 app = App e (Var x)
+           ; if hasArrow res
+             then do { r <- mk_bndr (fsLit "r") ManyTy res
+                     ; inner <- expand (Var r) res call'
+                     ; return (Lam x' (Let (NonRec r app) inner)) }
+             else return (Lam x' app) }
+      | otherwise
+      = return e
+
+    hasArrow ty | Just (FTF_T_T, _, _, _) <- splitFunTy_maybe ty = True
+                | otherwise                                     = False
+
+    mk_bndr :: FastString -> Mult -> Type -> UniqSM Id
+    mk_bndr fs mult ty = do { u <- getUniqueM; return (mkSysLocal fs u mult ty) }
+
+-- | Undo the split of each exported function whose local copy no
+-- transformation changed.  Takes the split functions, the program after the
+-- split, and the program after erasure; returns the program and the
+-- functions whose split was undone.
+-- See Note [Contracting the boundary split]
+contractBoundary :: [(Id, Id)] -> CoreProgram -> CoreProgram -> (CoreProgram, [Id])
+contractBoundary split before after
+  | isEmptyVarEnv sub = (after, [])
+  | otherwise         = (concatMap contract_bind after, nonDetEltsUFM sub)
+  where
+    before_rhss = mkVarEnv [ (b, (b, rhs)) | (b, rhs) <- flattenBinds before ]
+    after_rhss  = mkVarEnv [ (b, (b, rhs)) | (b, rhs) <- flattenBinds after ]
+
+    -- Each unchanged local copy, mapped to its original
+    sub :: IdEnv Id
+    sub = mkVarEnv [ (f_w, f) | (f, f_w) <- split, unchanged f_w ]
+    -- The wrappers to drop
+    dropped = mkVarSet [ f | (f, f_w) <- split, f_w `elemVarEnv` sub ]
+
+    unchanged f_w
+      | Just (b1, e1) <- lookupVarEnv before_rhss f_w
+      , Just (b2, e2) <- lookupVarEnv after_rhss f_w
+      = idType b1 `eqType` idType b2 && eqCoreExpr e1 e2
+      | otherwise
+      = False
+
+    contract_bind (NonRec b rhs)
+      | b `elemVarSet` dropped = []
+      | otherwise              = [NonRec (bndr b) (subst rhs)]
+    contract_bind (Rec prs)    = [Rec [ (bndr b, subst rhs) | (b, rhs) <- prs
+                                      , not (b `elemVarSet` dropped) ]]
+
+    bndr b = lookupVarEnv sub b `orElse` b
+
+    subst :: CoreExpr -> CoreExpr
+    subst expr = case expr of
+      Var v            -> Var (bndr v)
+      App f a          -> App (subst f) (subst a)
+      Lam b e          -> Lam b (subst e)
+      Let bind body    -> Let (sub_bind bind) (subst body)
+      Case e b ty alts -> Case (subst e) b ty [ Alt c bs (subst rhs) | Alt c bs rhs <- alts ]
+      Cast e co        -> Cast (subst e) co
+      Tick t e         -> Tick t (subst e)
+      _                -> expr
+
+    sub_bind (NonRec b rhs) = NonRec b (subst rhs)
+    sub_bind (Rec prs)      = Rec [ (b, subst rhs) | (b, rhs) <- prs ]
 
 -- | etaExpand, without the reflexive cast it can leave around the lambdas
 -- (forall types).  A cast there hides the lambdas from GHC's worker/wrapper
