@@ -427,6 +427,29 @@ timing on 4 performance cores (`time-nofib.py --cpus 2,4,6,8`; instruction
 ratios match the serial runner to 0.01 points over 111 benchmarks): 3 rounds
 of 4 configurations in 7 minutes instead of about 40.
 
+## 13. Exports: the boundary split and the main module (2026-10-09)
+
+Exported binders alone exposed 68% of exposed lambda classes (branch
+`exposure-stats`). `run-exports.sh`: early-mdf's options with the boundary
+split (`early-bnd2`), with the main module's exports other than main
+internal (`early-main`, Note [Main's exports]), and both (`early-bm`); all
+115 built with `-dcore-lint`. Against `base`:
+
+| | instructions | time | allocation |
+|---|---|---|---|
+| `early-mdf` | −2.19% | −2.47% | −3.14% |
+| `early-bnd2` | −2.33% | −2.38% | −3.19% |
+| `early-main` | −3.56% | −3.34% | −4.66% |
+| `early-bm` | **−3.60%** | **−3.61%** | **−4.62%** |
+
+Against `early-mdf`: integrate −76.2% and sphere −11.2% (Main's exports),
+constraints −12.2%, cse −1.8%, prolog −1.0% (boundary split); multiplier
++1.15% (Main's exports), the only regression above 0.5% in instructions.
+15 benchmarks at least 5% faster, backed by instructions (12 before).
+treejoin +23% time in early-bnd2 and early-main but not early-bm, with no
+instruction change: probably noise from parallel timing (it is GC-heavy);
+recheck serially.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

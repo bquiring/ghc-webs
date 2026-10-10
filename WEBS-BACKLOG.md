@@ -17,15 +17,13 @@ a heuristic.
 Plan (end of 2026-10-09; branches `webs` = `data-split` at `7582b2195a` and
 later, instrumentation on `exposure-stats`):
 
-1. **Read the exports experiment** (`webs-bench/run-exports.sh`, results in
-   `results/timing-exports.md`, `report-exports.md`): early-mdf's options
-   with the boundary split (`early-bnd2`), with the main module's exports
-   internal (`early-main`, Note [Main's exports]), and both (`early-bm`),
-   against `base` and `early-mdf` (−2.20% instructions, −3.14% allocation).
-   Exported binders alone exposed 68% of exposed lambda classes (4,464 in
-   ordinary modules, 814 in Main). If the boundary split helps, make it part
-   of the default configuration; check its regressions first (WEBS-EXPERIMENTS
-   §5 fixed infer, gamteb, VS).
+1. ~~Read the exports experiment~~ (WEBS-EXPERIMENTS.md §13): both help,
+   together −3.60% instructions and −4.62% allocation against base (from
+   −2.19% / −3.14%); integrate −76%, constraints −12%, sphere −11%. Next:
+   **make the boundary split part of the default configuration** (Main's
+   exports are internal by default already); look at multiplier +1.15%
+   (Main's exports) and recheck treejoin's +23% time serially (no
+   instruction change).
 2. **Re-measure exposure with the winner** (merge `exposure-stats`' counters
    in temporarily, or run them on that branch rebased): how many lambda
    classes are still exposed, and by what, once exports are handled. That
