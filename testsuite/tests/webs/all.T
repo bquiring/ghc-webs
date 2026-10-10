@@ -387,6 +387,22 @@ useless_opts = (early_opts + ' -fcore-webs-arity-raise -fcore-webs-result-raise'
                 ' -fcore-webs-useless -fcore-webs-strictness')
 for n in range(1, 4):
     test('useless%03d' % n, [], compile_and_run, [useless_opts])
+
+# Bad strictness: each program must behave as it does unoptimised (the
+# expected output is -O0's).  004, 006: a dead unlifted argument or result
+# component that raises an error is still evaluated (exit 1).  005, 012,
+# 013: dead lazy arguments and lets that are errors, loops or traces are
+# not.  007: a strict field the pattern ignores keeps its value (exit 1);
+# 016: a lazy one becomes an absent filler and is never evaluated
+# (Note [Scrutinised constructions]).  008: a field read through the case
+# binder stays.  009: a dead last parameter keeps the lambda, so work is not
+# shared.  010: a forced function value stays a function.  011: dead join
+# point arguments.  014: a dead component returned through a join point.
+# 015: a tail call adapted to fewer components.
+for n in [4, 6, 7]:
+    test('useless%03d' % n, [exit_code(1)], compile_and_run, [useless_opts])
+for n in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
+    test('useless%03d' % n, [], compile_and_run, [useless_opts])
 for n in [1, 2]:
     test('useless%03d_dump' % n, [extra_files(['useless%03d.hs' % n])],
          multimod_compile, ['useless%03d' % n, useless_opts + ' -ddump-webs-useless -dsuppress-uniques'])
