@@ -14,21 +14,43 @@ a heuristic.
 
 ## Now
 
-Plan (2026-10-09):
+Plan (end of 2026-10-09; branches `webs` = `data-split` at `7582b2195a` and
+later, instrumentation on `exposure-stats`):
 
-1. **Time the current state** (`webs-bench/run-hftiming.sh`, running):
-   hidden fields, specialising for webs and the flattening fixes, with
-   early-cur's options, at 3 and 10 flattening rounds, against `base` and
-   `early-cur`; best allocation and instruction counts.
-2. **Then choose the next optimisation** from "Core-to-Core" below. The
-   unboxing fixpoints are not it (see "Unboxing fixpoints").
-3. ~~Sync the branches~~ (2026-10-09): `webs` merged into `data-split`
-   (constructed-argument raising, one-shot lambdas), then `webs` fast-forwarded:
-   both branches are the same.
-4. **k-nucleotide's input** for timing (WEBS-BUGS.md, Open), between runs.
+1. **Read the exports experiment** (`webs-bench/run-exports.sh`, results in
+   `results/timing-exports.md`, `report-exports.md`): early-mdf's options
+   with the boundary split (`early-bnd2`), with the main module's exports
+   internal (`early-main`, Note [Main's exports]), and both (`early-bm`),
+   against `base` and `early-mdf` (−2.20% instructions, −3.14% allocation).
+   Exported binders alone exposed 68% of exposed lambda classes (4,464 in
+   ordinary modules, 814 in Main). If the boundary split helps, make it part
+   of the default configuration; check its regressions first (WEBS-EXPERIMENTS
+   §5 fixed infer, gamteb, VS).
+2. **Re-measure exposure with the winner** (merge `exposure-stats`' counters
+   in temporarily, or run them on that branch rebased): how many lambda
+   classes are still exposed, and by what, once exports are handled. That
+   decides between:
+   - imported recursive functions (`map` 62, `filter` 21, ...): keep the
+     foldr form of functions with fusion rules, or copy them with exposed
+     unfoldings;
+   - one-constructor defunctionalisation for captured variables, where the
+     lambda's definition is not in scope at the call (not recursive
+     functions, or eta-expand them first);
+   - nested fields for data splitting (the `Step` inside `Stream` case:
+     copies keep other data types in fields original).
+3. **Super-beta for captured locals** (1,888 webs): count the ones whose
+   calls are all in the binding's scope, before building anything.
+4. **Data unboxing on the recorded demands**: run data splitting again after
+   the web passes (37 of 518 fields blocked by laziness).
+5. **Housekeeping**: the timing runner's k-nucleotide input (norm mode has
+   no stdin file); fix the "by kind" grouping in the exposure script (the
+   binder labels were filed under imported functions).
 
-The polymorphic-defunctionalisation fixes, lifted bodies and their
-measurement (the plan of 2026-10-08) are done: WEBS-EXPERIMENTS.md §6-7, 10.
+Measured and set aside (2026-10-09): unboxing fixpoints (more rounds change
+nothing; one fixpoint for fields, arguments and results: a few percent more
+fields at most), strictness feeding raising (no change on nofib), known-call
+conversion for top-level single-lambda webs (28 calls over nofib), recursive
+webs as newtypes (the occurs check never fires on nofib).
 
 ## Core-to-Core: to implement
 
