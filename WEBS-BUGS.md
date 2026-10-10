@@ -54,7 +54,7 @@ would catch it again), **commit** (empty while uncommitted).
   elimination; WEBS-BACKLOG.md).
 * **Guard:** `useless018` (parstof, preprocessed); `poison046` (a smaller
   attempt that does not reproduce it).
-* **Commit:**
+* **Commit:** `5a33b37065`
 
 ### Forced analysis: exprIsDeadEnd on web forms (2026-10-10)
 * **Found by:** nofib, `run-useless2.sh` (with `-ddump-webs-forced`): all
