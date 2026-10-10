@@ -27,7 +27,34 @@ Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
    hpg +3.0% instructions (WEBS-BUGS.md); an ablation flag for the
    parameter eta-expansion would show which part costs it. Also: recheck
    treejoin's time serially.
-2. **Re-measure exposure with the winner** (merge `exposure-stats`' counters
+2. **Next (the user, 2026-10-10): absent results, partial absence, sum
+   results.**
+   - **Dead result components** (implement): after result raising, a web
+     whose result is an unboxed tuple drops the components no call uses
+     (every call a case on the tuple, or a tail call within the web): from
+     the result type, every lambda's tails (through join points) and every
+     call's pattern; all gone leaves `(# #)`, so the call still runs.
+     Forces nothing new. Test case: `apply :: (Int -> (Int, Int)) -> ..`
+     whose callers use only the first component still builds `I# (x * 7)`.
+     The user expects it to be rare and to save little (laziness), but
+     wants it evaluated.
+   - **Partial absence**: for strict and constructed product arguments it
+     happens already, by iteration: arity raising splits the product, dead
+     parameters replaces the unused components with `(##)` (checked
+     2026-10-10: `f (x, x * 7)` with the second field unused becomes
+     `f y1 (##)`). Left: lazy product arguments, which only selector thunks
+     could split (a thunk per field per call). Count them on nofib first.
+   - **Sum-type result raising** (experiment): a web whose lambdas all
+     return some constructor of the same sum type returns an unboxed sum
+     `(# fields1 | fields2 #)`, re-boxed at the calls; GHC's CPR for sums
+     needs known calls. Also not done by iteration: nested CPR (result
+     raising's tuple components are not web results) and sums for arity
+     raising. Nested unboxing of arguments is done by iteration (Note
+     [Component demands]).
+   - Not measured yet: webs on local newtypes' axioms (functions inside
+     local newtypes: parsers, `State`); only the data side was (newtype
+     splitting, WEBS-DATA.md: no change above 0.1%).
+3. **Re-measure exposure with the winner** (merge `exposure-stats`' counters
    in temporarily, or run them on that branch rebased): how many lambda
    classes are still exposed, and by what, once exports are handled. That
    decides between:
@@ -39,11 +66,11 @@ Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
      functions, or eta-expand them first);
    - nested fields for data splitting (the `Step` inside `Stream` case:
      copies keep other data types in fields original).
-3. **Super-beta for captured locals** (1,888 webs): count the ones whose
+4. **Super-beta for captured locals** (1,888 webs): count the ones whose
    calls are all in the binding's scope, before building anything.
-4. **Data unboxing on the recorded demands**: run data splitting again after
+5. **Data unboxing on the recorded demands**: run data splitting again after
    the web passes (37 of 518 fields blocked by laziness).
-5. **Housekeeping**: the timing runner's k-nucleotide input (norm mode has
+6. **Housekeeping**: the timing runner's k-nucleotide input (norm mode has
    no stdin file); fix the "by kind" grouping in the exposure script (the
    binder labels were filed under imported functions).
 
