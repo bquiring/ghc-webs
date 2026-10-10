@@ -236,8 +236,11 @@ holds one box fewer.  This is the field version of constructed-argument
 raising (Note [Arity raising] in GHC.WebCore.Transform.ArityRaise).  An Int
 field becomes an Int# field; a pair field becomes two fields.
 
-S is local and not exposed, so no other code builds or matches it.  Fields
-whose type mentions S itself (recursive fields) are not flattened.
+S is local and not exposed, so no other code builds or matches it.  A field
+whose product type is S itself is not flattened (a one-constructor type
+holding itself would unbox forever).  A product that only mentions S is:
+in  data L a = Nil | Cons (a, L a)  the pair field becomes two fields,
+Cons' a (L a), and the tail stays a pointer.
 -}
 
 -- | What a construction passes in a candidate field
@@ -278,7 +281,7 @@ flattenFields opts this_mod us tcs binds
     cands = mkUniqSet tcs
     _ = cands
 
-    -- Candidate fields: products, not recursive
+    -- Candidate fields: products other than the type itself
     -- Note [Unboxing in the late run]: without fresh demands, no rule that
     -- reads them
     trust  = uo_trust_demands opts
