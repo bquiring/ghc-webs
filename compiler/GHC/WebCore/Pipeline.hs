@@ -24,13 +24,14 @@ import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 import GHC.Types.Web
 
 import GHC.Unit.Module.ModGuts
-import GHC.Unit.Module ( Module )
+import GHC.Unit.Module ( Module, moduleName )
+import GHC.Types.Name ( getOccString )
 import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
                        , isFamInstTyCon )
 import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dataConWrapId_maybe, dataConTyCon )
 import GHC.Types.Avail ( availsToNameSet )
 import GHC.Types.FieldLabel ( flSelector )
-import GHC.Types.Name.Set ( elemNameSet )
+import GHC.Types.Name.Set ( elemNameSet, emptyNameSet )
 import GHC.Types.Id.Info ( ruleInfoRules )
 import GHC.Types.Unique ( getUnique )
 
@@ -133,9 +134,12 @@ webPass early guts
              cfg    = webLintConfig dflags
 
              -- 1. Annotation
+             main_only = mainExportsInternal dflags guts
+             exported b | main_only = isExportedId b && isMainEntry dflags b
+                        | otherwise = isExportedId b
              hidden | gopt Opt_CoreWebsNoHiddenFields dflags = const False
-                    | otherwise = hiddenFields guts split_tcs binds0
-             (binds1, sigs1) = annotateProgram early hidden us (mg_rules guts) binds0
+                    | otherwise = hiddenFields main_only guts split_tcs binds0
+             (binds1, sigs1) = annotateProgram early exported hidden us (mg_rules guts) binds0
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -251,7 +255,7 @@ pprTypeStats guts split_tcs binds
         ++ [ text "Data splitting copies:"         <+> int (length split_tcs)
            , text "Classes and empty types:"       <+> int (length [ () | NotData <- cls ]) ]
   where
-    classify  = classifyTyCon guts binds
+    classify  = classifyTyCon False guts binds
     cls       = map classify (mg_tcs guts)
     datas     = [ c | c <- cls, not (isNotData c) ]
     internals = [ (abs_, w) | Internal abs_ w <- cls ]
@@ -266,12 +270,40 @@ pprTypeStats guts split_tcs binds
       Existential  -> "existential or GADT"
       Wrapper      -> "constructor wrapper"
 
+{- Note [Main's exports]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+A Main module with no export list exports every top-level binding, and so
+does any program's main module that lists more than main; but nothing
+imports the main module of a program, so those exports are never used.
+(61 of nofib's Main modules have no export list; their exported binders
+alone exposed 814 lambda classes, WEBS-BACKLOG.md.)  So in the program's
+main module (mainModuleNameIs, Main unless -main-is), only the main function
+(mainFunIs, main) and GHC's :Main.main wrapper count as exported: the other
+exported binders are not kept (their webs may be internal), and the module's
+types have hidden fields (Note [Hidden fields] in GHC.WebCore.Sigs).  Their
+types may change; the interface describes the final ones, and no module
+reads them.  -fcore-webs-keep-main-exports turns this off.  The module name
+is the test, not the link mode: nofib compiles each module with -c.
+-}
+
+-- | Are the main module's exports, other than main, internal?
+-- See Note [Main's exports]
+mainExportsInternal :: DynFlags -> ModGuts -> Bool
+mainExportsInternal dflags guts
+  = not (gopt Opt_CoreWebsKeepMainExports dflags)
+    && moduleName (mg_module guts) == mainModuleNameIs dflags
+
+-- | The main function, or GHC's :Main.main wrapper
+isMainEntry :: DynFlags -> Id -> Bool
+isMainEntry dflags b = occ == fromMaybe "main" (mainFunIs dflags) || take 1 occ == ":"
+  where occ = getOccString b
+
 -- | The types defined here whose fields other modules cannot see
 -- See Note [Hidden fields] in GHC.WebCore.Sigs
-hiddenFields :: ModGuts -> [TyCon] -> CoreProgram -> TyCon -> Bool
-hiddenFields guts split_tcs binds = \tc -> getUnique tc `elementOfUniqSet` hidden
+hiddenFields :: Bool -> ModGuts -> [TyCon] -> CoreProgram -> TyCon -> Bool
+hiddenFields main_only guts split_tcs binds = \tc -> getUnique tc `elementOfUniqSet` hidden
   where
-    classify = classifyTyCon guts binds
+    classify = classifyTyCon main_only guts binds
     -- The types defined here, and the copies data splitting made
     hidden   = mkUniqSet [ getUnique t | t <- mg_tcs guts ++ split_tcs
                                      , Internal _ HiddenFields <- [classify t] ]
@@ -289,8 +321,8 @@ data Why = HiddenFields | Pinned | UnsafeCo | NewtypeTc | FamInst | Existential 
 
 -- The program-wide sets (pinned constructors, unsafely coerced types) are
 -- computed once per module
-classifyTyCon :: ModGuts -> CoreProgram -> TyCon -> TyConClass
-classifyTyCon guts binds = classify
+classifyTyCon :: Bool -> ModGuts -> CoreProgram -> TyCon -> TyConClass
+classifyTyCon main_only guts binds = classify
   where
     classify t
       | not (isAlgTyCon t) || isClassTyCon t || null dcs = NotData
@@ -306,7 +338,9 @@ classifyTyCon guts binds = classify
             | not (all (null . dataConWrapId_maybe) dcs)           = Wrapper  -- rebuilt without one
             | otherwise                                            = HiddenFields
 
-    exported = availsToNameSet (mg_exports guts)
+    -- Note [Main's exports]: the main module exports no types
+    exported | main_only = emptyNameSet
+             | otherwise = availsToNameSet (mg_exports guts)
     visible dc = dataConName dc `elemNameSet` exported
               || any ((`elemNameSet` exported) . flSelector) (dataConFieldLabels dc)
 

@@ -665,6 +665,7 @@ data GeneralFlag
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
    | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
    | Opt_CoreWebsNoHiddenFields -- ^ (measuring) every constructor's fields exposed: no Note [Hidden fields]
+   | Opt_CoreWebsKeepMainExports -- ^ (measuring) the main module's exports stay exported: no Note [Main's exports]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
    | Opt_CoreWebsOneShot      -- ^ One-shot lambdas from webs
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
@@ -957,6 +958,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsUnboxNested
    , Opt_CoreWebsNoStrictElim
    , Opt_CoreWebsNoHiddenFields
+   , Opt_CoreWebsKeepMainExports
    , Opt_CoreWebsUncurryKnown
    , Opt_CoreWebsOneShot
    , Opt_CoreWebsEarly

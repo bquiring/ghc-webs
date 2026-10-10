@@ -175,7 +175,9 @@ test('wwreturn003', [grep_errmsg(r'^ *\$wf$|^ *\$wf =|\\ x _ ->|\$wf ww1 of|h[12
 # eta-expands the argument of an imported one; their dumps show the dead
 # parameter going.  003 checks sharing (the trace appears once).  004 does
 # not split a small exported function; its dump shows the web exposed.
-bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params'
+# The tests export from Main to get exposed functions: keep those exports
+# (Note [Main's exports] in GHC.WebCore.Pipeline)
+bnd_opts = (early_opts + ' -fcore-webs-boundary -fcore-webs-dead-params -fcore-webs-keep-main-exports'
             ' -fcore-webs-strictness')
 for n in range(1, 5):
     test('boundary%03d' % n, [], compile_and_run, [bnd_opts])

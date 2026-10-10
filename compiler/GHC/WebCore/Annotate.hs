@@ -81,13 +81,14 @@ Details:
 -- See Note [Exposed webs] in GHC.WebCore.Sigs
 annotateProgram :: Bool   -- ^ Keep stable unfoldings (the early run; see
                           --   Note [Early webs] in GHC.WebCore.Pipeline)
+                -> (Id -> Bool)      -- ^ Really exported: Note [Main's exports] in GHC.WebCore.Pipeline
                 -> (TyCon -> Bool)   -- ^ Types with hidden fields: Note [Hidden fields]
                 -> UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
-annotateProgram keep_stable hidden us rules binds
+annotateProgram keep_stable exported hidden us rules binds
   = case unAnnM (ann_top binds) us init_sigs of
       (binds', _, sigs) -> (binds', sigs)
   where
-    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable hidden rules binds
+    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable exported hidden rules binds
                              , ws_hidden_fields = hidden }
 
     ann_top bs
@@ -122,11 +123,11 @@ annotateProgram keep_stable hidden us rules binds
 -- the transformed program (see tidyTopUnfolding in GHC.Iface.Tidy), and the
 -- simplifier rebuilds them too.  In the late run nothing inlines afterwards,
 -- so zapping other unfoldings is harmless.
-keptIds :: Bool -> (TyCon -> Bool) -> [CoreRule] -> CoreProgram -> VarSet
-keptIds keep_stable hidden rules binds = go emptyVarSet roots
+keptIds :: Bool -> (Id -> Bool) -> (TyCon -> Bool) -> [CoreRule] -> CoreProgram -> VarSet
+keptIds keep_stable exported hidden rules binds = go emptyVarSet roots
   where
     bndrs = allLetBinders binds
-    roots = filter (\b -> isExportedId b && not (hidden_selector b)) (bindersOfBinds binds)
+    roots = filter (\b -> exported b && not (hidden_selector b)) (bindersOfBinds binds)
          ++ filter (not . isEmptyRuleInfo . idSpecialisation) bndrs
          ++ filter isLocalId (nonDetEltsUniqSet (rulesFreeVars rules))
          ++ (if keep_stable then filter (isStableUnfolding . realIdUnfolding) bndrs else [])
