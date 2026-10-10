@@ -471,7 +471,6 @@ benchmarks; geomean instructions −3.50%, time −3.61%, allocation −3.82%):
 | spectral/dom-lt | −5.1% | −3.9% | −3.7% |
 | spectral/hartel/wave4main | −4.7% | −5.3% | −13.8% |
 | spectral/ansi | −3.9% | −9.0% | −3.9% |
-| worst: spectral/multiplier | +1.2% | +2.0% | +2.3% |
 
 The main-module change is opt-in since: `-fcore-webs-internal-main-exports`.
 
