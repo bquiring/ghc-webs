@@ -406,3 +406,24 @@ for n in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
 for n in [1, 2]:
     test('useless%03d_dump' % n, [extra_files(['useless%03d.hs' % n])],
          multimod_compile, ['useless%03d' % n, useless_opts + ' -ddump-webs-useless -dsuppress-uniques'])
+
+# Deadness and strictness (poison001-040): programs with thunks that no
+# evaluation should reach (UNREACHABLE errors, a loop in 035) and, in
+# 026-030, values that must still be evaluated (exit 1).  Each must behave
+# as it does unoptimised: the expected output is -O0's.  Recursion (001-005),
+# mutual recursion (006-009), higher-order and unknown calls (010-015), data
+# structures (016-025), must-evaluate (026-030), thunks and sharing
+# (031-035), results (036-040).  Every web transformation is on, in the
+# early run (poisonNNN) and in the late run (poisonNNN_late).
+poison_ws = (' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
+             ' -fcore-webs-dead-params -fcore-webs-useless -fcore-webs-result-raise'
+             ' -fcore-webs-strictness -fcore-webs-data-split -fcore-webs-data-unbox'
+             ' -fcore-webs-defunc')
+poison_early = early_opts + poison_ws + ' -fcore-webs-boundary'
+poison_late = webs_opts + poison_ws
+for n in range(1, 41):
+    name = 'poison%03d' % n
+    ec = [exit_code(1)] if 26 <= n <= 30 else []
+    test(name, ec, compile_and_run, [poison_early])
+    test(name + '_late', ec + [extra_files([name + '.hs'])],
+         multimod_compile_and_run, [name, poison_late])
