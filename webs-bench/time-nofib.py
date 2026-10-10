@@ -268,7 +268,8 @@ def main():
     ap.add_argument('--layout-ins', type=float, default=0.005,
                     help='a time change with an instruction change under this is '
                          'layout only (default 0.005)')
-    ap.add_argument('--timeout', type=int, default=300, help='per run, in seconds')
+    ap.add_argument('--timeout', type=int, default=10,
+                    help='per run, in seconds (the slowest baseline run, fannkuch-redux, takes 3.9s)')
     ap.add_argument('--report-only', action='store_true',
                     help='rewrite the report from the saved samples')
     a = ap.parse_args()

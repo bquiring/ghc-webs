@@ -20,14 +20,18 @@
 # 1) to build and run benchmarks in parallel.
 #
 # Timeouts: each compiler invocation is limited to WEBS_GHC_TIMEOUT seconds
-# (default 300; see ghc-timeout.sh), and the whole build-and-run of one
-# configuration to WEBS_CONFIG_TIMEOUT seconds (default 3600), which also
-# catches benchmarks that do not terminate.  A timeout is recorded in
+# (default 120, twice the slowest baseline compile; see ghc-timeout.sh), each
+# benchmark run to WEBS_RUN_TIMEOUT seconds (default 5: the slowest baseline
+# run in this mode takes 0.6s; laziness bugs tend not to terminate, and a
+# timeout shows up as "Error 124", to debug separately), and the whole
+# build-and-run of one configuration to WEBS_CONFIG_TIMEOUT seconds
+# (default 3600).  A timeout is recorded in
 # exit-code (124) and the dumps collected so far are kept.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GHC=$ROOT/webs-bench/ghc-timeout.sh
 CONFIG_TIMEOUT=${WEBS_CONFIG_TIMEOUT:-3600}
+RUN_TIMEOUT=${WEBS_RUN_TIMEOUT:-5}
 NAME=$1
 OPTS=${2:-}
 MODE=${NOFIB_MODE:-fast}
@@ -54,6 +58,7 @@ make boot WithNofibHc="$GHC" mode="$MODE" "${DIRS_ARG[@]}" > "$OUT/boot.log" 2>&
 echo "[$NAME] build and run (options: $OPTS)"
 timeout --kill-after=60 "$CONFIG_TIMEOUT" \
 make -k -j"${NOFIB_JOBS:-1}" WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
+     RUNTEST="timeout --kill-after=2 $RUN_TIMEOUT $ROOT/nofib/runstdtest/runstdtest" \
      EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats $VERDICTS" \
      > "$OUT/nofib.log" 2>&1
 status=$?
