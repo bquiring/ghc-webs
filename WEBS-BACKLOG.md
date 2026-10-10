@@ -14,8 +14,8 @@ a heuristic.
 
 ## Now
 
-Plan (end of 2026-10-09; branches `webs` = `data-split` at `7582b2195a` and
-later, instrumentation on `exposure-stats`):
+Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
+`exposure-stats`):
 
 1. ~~Read the exports experiment~~ (WEBS-EXPERIMENTS.md §13), ~~boundary
    split for every exported function, contracted when unchanged, with
@@ -137,6 +137,28 @@ webs as newtypes (the occurs check never fires on nofib).
   handles closed constants, including global dictionaries; a constant whose
   type mentions the web's type variables needs specialisation. The static
   argument transformation is the recursive-call case. Low priority.
+- **Generalised constant propagation** (the user, 2026-10-10). Constant
+  propagation substitutes closed constants that every call passes. More
+  generally:
+  * **Derived arguments:** every call in the web passes, in one position,
+    the same expression of its other arguments (`f x (g x)`): drop the
+    parameter and compute it in the body (a `let`, so laziness is kept).
+    Sharing: a caller that computes `g x` once for several calls would now
+    repeat it; safe when the expression is cheap or used once.
+  * **The reverse:** every lambda of the web computes the same expression
+    of its parameters: pass it instead, so callers that already have it, or
+    can compute it outside a loop, do not recompute it (hoisting across
+    unknown calls).
+  * **Type arguments:** type abstractions get no webs today (`Lam` on a
+    type variable and type applications stay plain; Annotate.hs), so
+    instantiations are not tracked. Constant type arguments (every call at
+    the same type): instantiate in the body, so that parameters of type `a`
+    become e.g. `Int` and can be unboxed (GHC specialises only overloaded
+    functions, at known calls). Or generalise the type abstraction (to be
+    worked out with the user). Needs webs on type abstractions, or at least
+    on the type lambdas directly around a web's value lambdas.
+  Overlaps "Constants of non-closed type" above. First measure: how many
+  internal webs have a derived argument, or calls at one type.
 - **Boundary split: imported functions.** Eta-expand an imported function
   used as a value in local higher-order code, not only the arguments passed
   to one. (The current split is measured now: `WEBS-EXPERIMENTS.md` §5.)
