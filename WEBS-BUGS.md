@@ -45,7 +45,7 @@ would catch it again), **commit** (empty while uncommitted).
   GHC.WebCore.Transform.Defunc). The dictionaries could go in the
   constructor's context instead (backlog).
 * **Guard:** `boundary008`, `boundary008_dump`; nofib scc and fem.
-* **Commit:**
+* **Commit:** `aee37c2fe7`
 
 ### Hidden fields: the definition is a use too (2026-10-09)
 * **Found by:** the user's question (polymorphism), then a test
