@@ -39,7 +39,7 @@ module GHC.WebCore.DataLint (
 
 import GHC.Prelude
 
-import GHC.WebCore.DataCopy ( Copies, eraseCopies, copyPairs )
+import GHC.WebCore.DataCopy ( Copies, copyOriginal, eraseCopies, copyPairs )
 
 import GHC.Driver.DynFlags
 
@@ -2600,6 +2600,7 @@ lintCoercion co@(TransCo co1 co2)
 lintCoercion the_co@(SelCo cs co)
   = do { lintCoercion co
        ; Pair s t <- substCoKindM co
+       ; copies <- getCopies
 
        ; if -- forall (both TyVar and CoVar)
             | Just _ <- splitForAllTyCoVar_maybe s
@@ -2616,9 +2617,12 @@ lintCoercion the_co@(SelCo cs co)
             -> return ()
 
             -- TyCon
+            -- Data Lint: the same up to copies, recording the pair (one side
+            -- can reach the original through a type synonym, which is not
+            -- copied: GHC.Hs.Type's XRecGhc and GenLocated, building GHC)
             | Just (tc_s, tys_s) <- splitTyConApp_maybe s
             , Just (tc_t, tys_t) <- splitTyConApp_maybe t
-            , tc_s == tc_t
+            , copyOriginal copies tc_s == copyOriginal copies tc_t
             , SelTyCon n r0 <- cs
             , let co_role = coercionRole co
             , isInjectiveTyCon tc_s co_role
@@ -2626,6 +2630,7 @@ lintCoercion the_co@(SelCo cs co)
             , tys_s `equalLength` tys_t
             , tys_s `lengthExceeds` n
             -> do { lintRole the_co (tyConRole co_role tc_s n) r0
+                  ; unless (tc_s == tc_t) $ recordCopyPairs (unitBag (tc_s, tc_t))
                   ; return () }
 
             | otherwise

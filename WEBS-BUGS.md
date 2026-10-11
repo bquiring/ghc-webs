@@ -36,6 +36,26 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Data Lint: a SelCo between a copy and an original behind a synonym (2026-10-11)
+* **Found by:** building GHC with the webs compiler (early-ulsl,
+  ~/projects/ghc-selfhost), in GHC.Hs.Type.
+* **Symptom:** Data Lint after annotating copies: "Bad SelCo:
+  SelCo:Tc(1,R) (Sym (D:R:XRecGhcPassa ...) ; ... ; GenLocated ...)" in
+  hsWcScopedTvs; fatal, so the module did not compile.
+* **Cause:** annotation copies every eligible type (GenLocated) in types it
+  can see, but not behind a type synonym in an imported family instance's
+  axiom (XRec (GhcPass p) a = XRecGhc a = GenLocated (Anno a) a).  The
+  SelCo's kind then had the original on one side and the copy on the other,
+  and Data Lint's SelCo check compared type constructors exactly, where the
+  rest of Data Lint compares up to copies and records the pair (which then
+  makes the copy exposed).
+* **Fix:** the SelCo check compares up to copies and records the pair
+  (lintCoercion SelCo in GHC.WebCore.DataLint).
+* **Guard:** the GHC build (GHC.Hs.Type).  No small reproduction found: the
+  simplifier removes the cast pairs that would carry such a SelCo in small
+  programs (attempts with XRec/NoGhcTc-like families).
+* **Commit:**
+
 ### Data splitting: a type used as a kind is copied (2026-10-11)
 * **Found by:** building pretty-show 1.10 (skylighting's dependencies,
   Hackage benchmarks) with early-ulsl and `-dcore-lint`.
