@@ -2,10 +2,10 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 52, classes: 8, exposed: 6, split: 2, exposed only by casts: 0, pinned binders: 5
-Main.List_s7 = [] with Main.Con1_s7, Main.Con2_s7 (built [1,
+copies: 47, classes: 7, exposed: 5, split: 2, exposed only by casts: 0, pinned binders: 5
+Main.List_s6 = [] with Main.Con1_s6, Main.Con2_s6 (built [1,
                                                           2], matched [1, 2])
-Main.Stack_s8 = newtype Main.Stack ~R# Main.List_s7
+Main.Stack_s7 = newtype Main.Stack ~R# Main.List_s6
                                          GHC.Internal.Types.Int
 
 

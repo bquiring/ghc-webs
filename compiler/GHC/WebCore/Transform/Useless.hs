@@ -216,22 +216,26 @@ tupleComps ty = case splitTyConApp_maybe (coreFullView ty) of
   Just (tc, args) | isUnboxedTupleTyCon tc -> Just (drop (length args `div` 2) args)
   _ -> Nothing
 
--- | Webs that appear in a coercion: their results are not changed
+-- | Webs that appear in a coercion, or in the type of a coercion variable:
+-- their results are not changed (a coercion variable's occurrences in
+-- coercions keep its old type; hashable's unsafeIOToST, useless020)
 coercionWebs :: CoreProgram -> WebSet
 coercionWebs binds = foldr go_bind emptyUniqSet binds
   where
-    go_bind b acc = foldr (go . snd) acc (flattenBinds [b])
+    go_bind b acc = foldr (\(x, e) -> go_b x . go e) acc (flattenBinds [b])
     go e acc = case e of
       App f a        -> go f (go a acc)
       WebApp _ f a   -> go f (go a acc)
-      Lam _ x        -> go x acc
-      WebLam _ _ x   -> go x acc
+      Lam b x        -> go_b b (go x acc)
+      WebLam _ b x   -> go_b b (go x acc)
       Let b x        -> go_bind b (go x acc)
-      Case s _ _ as  -> go s (foldr (\(Alt _ _ r) -> go r) acc as)
+      Case s b _ as  -> go_b b (go s (foldr (\(Alt _ bs r) a -> foldr go_b (go r a) bs) acc as))
       Cast x co      -> go x (co_webs co acc)
       Tick _ x       -> go x acc
       Coercion co    -> co_webs co acc
       _              -> acc
+    go_b b acc | isCoVar b = acc `unionUniqSets` typeWebs (varType b)
+               | otherwise = acc
     co_webs co acc = let Pair l r = coercionKind co
                      in acc `unionUniqSets` typeWebs l `unionUniqSets` typeWebs r
 
@@ -1006,8 +1010,11 @@ rewriteProgram del unit masks dead_lets dead_fields dead_cfields pol binds
       Just j' -> not (idType j' `eqType` idType (rw_bndr j))
       Nothing -> False
 
+    -- j1's type has lost the arrows of deleted parameters, and its join
+    -- arity with them (fixBinderInfo): peel j1's arity, not j's
+    -- (network: a join point in a masked tail that also lost a parameter)
     retype_join m j = let j1 = rw_bndr j
-                      in setIdType j1 (replaceResult (join_arity j) (idType j1))
+                      in setIdType j1 (replaceResult (join_arity j1) (idType j1))
       where
         replaceResult :: Int -> Type -> Type
         replaceResult 0 ty = case tupleComps ty of

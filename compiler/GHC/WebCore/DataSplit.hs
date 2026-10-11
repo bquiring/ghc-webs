@@ -21,7 +21,8 @@ import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Coercion ( coercionLKind, isCoVar )
+import GHC.Core.Coercion ( coercionLKind, coercionKind, isCoVar )
+import GHC.Data.Pair ( Pair(..) )
 import GHC.Core.Coercion.Axiom ( CoAxiomRule(..), coAxiomTyCon )
 import GHC.Core.FamInstEnv ( mkNewTypeCoAxiom )
 import Data.Functor.Identity ( runIdentity )
@@ -505,6 +506,51 @@ original types and is exposed.  (A UnivCo keeps its types for the same
 reason; Note [Copies in coercions].)
 -}
 
+{- Note [Types used as kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A type can be used as a kind: GHC.Generics' FixityI instantiates SingI's
+kind variable in the Constructor instances' SingI axioms, at 'PrefixI
+(Hackage pretty-show: N:SingI <FixityI>_N <'PrefixI>_N).  Copying it there
+would leave the promoted constructor with the original's kind, and the axiom
+application would no longer check (Data Lint: "Bad axiom application").
+Such types are not copied anywhere: usedAsKinds collects the types in the
+kinds of the program's type variables, and the types that occur in some type
+(or coercion kind) next to one of their own promoted constructors.
+
+Only those: excluding every type whose constructors are used promoted
+somewhere would exclude lists and Bool, whose promoted constructors are in
+most programs' types (the 'False of the Generics metadata, type-level lists),
+and nothing would be split (datasplit001).
+-}
+
+-- | The types used at the kind level (Note [Types used as kinds])
+usedAsKinds :: CoreProgram -> TyCon -> Bool
+usedAsKinds binds = \tc -> tc `elementOfUniqSet` kinded
+  where
+    kinded = mkUniqSet (concatMap kindLevel (concatMap bindTypes binds))
+    -- the kinds of type variables, and the types instantiated at their own
+    -- promoted constructors' kind
+    kindLevel (Left k)   = tyconsOf k
+    kindLevel (Right ty) = [ p | Just dc <- map isPromotedDataCon_maybe tcs
+                               , let p = dataConTyCon dc, p `elem` tcs ]
+      where tcs = tyconsOf ty
+    tyconsOf t = nonDetEltsUniqSet (tyConsOfType t)
+    bindTypes b = concat [ bndrTypes x ++ exprTypes e | (x, e) <- flattenBinds [b] ]
+    bndrTypes x | isTyVar x = [Left (tyVarKind x)]
+                | otherwise = [Right (varType x)]
+    exprTypes e = case e of
+      Type t        -> [Right t]
+      Coercion co   -> coTypes co
+      App f a       -> exprTypes f ++ exprTypes a
+      Lam x b       -> bndrTypes x ++ exprTypes b
+      Let b x       -> bindTypes b ++ exprTypes x
+      Case s x t as -> exprTypes s ++ bndrTypes x ++ [Right t]
+                       ++ concat [ concatMap bndrTypes bs ++ exprTypes r | Alt _ bs r <- as ]
+      Cast x co     -> exprTypes x ++ coTypes co
+      Tick _ x      -> exprTypes x
+      _             -> []
+    coTypes co = let Pair l r = coercionKind co in [Right l, Right r]
+
 ------------------------------------------------------------------
 --      Annotation
 ------------------------------------------------------------------
@@ -516,7 +562,9 @@ data AnnState = AnnState
   , as_all     :: [TyCon]           -- ^ every copy
   , as_children :: UniqFM TyCon [TyCon]  -- ^ a newtype copy's children (Note [Splitting newtypes])
   , as_built   :: [(TyCon, Int)]    -- ^ copy, tag of a constructor built there
-  , as_matched :: [(TyCon, Int)] }  -- ^ copy, tag of a constructor matched there
+  , as_matched :: [(TyCon, Int)]    -- ^ copy, tag of a constructor matched there
+  , as_kinded  :: TyCon -> Bool }   -- ^ used at the kind level: not copied
+                                    --   (Note [Types used as kinds])
 
 type AnnM = State AnnState
 
@@ -530,7 +578,8 @@ newCopy tc
 newNewtypeCopy :: TyCon -> AnnM TyCon
 newNewtypeCopy tc = do
   { let (_, rhs) = newTyConRhs tc
-  ; rhs0 <- mapTyCons (\t -> copyable t && t /= tc) newCopy rhs
+  ; kinded <- gets as_kinded
+  ; rhs0 <- mapTyCons (\t -> copyable t && not (kinded t) && t /= tc) newCopy rhs
   ; s <- get
   ; let (us1, us2) = splitUniqSupply (as_us s)
         selfTo c' = runIdentity . mapTyCons (== tc) (\_ -> return c')
@@ -560,24 +609,27 @@ newDataCopy tc = do
   ; put s { as_us = us2, as_copies = addToUFM (as_copies s) c tc, as_all = c : as_all s }
   ; return c }
 
-annMapper :: VarSet -> Mapper AnnM
-annMapper pinned = Mapper
+annMapper :: VarSet -> (TyCon -> Bool) -> Mapper AnnM
+annMapper pinned kinded = Mapper
   { m_ty   = ann_ty
   , m_bndr = \b -> if b `elemVarSet` pinned || isCoVar b then return (zap b)
                    else do { t <- ann_ty (idType b); return (zap (setIdType b t)) }
-  , m_con  = \dc -> if eligible (dataConTyCon dc)
+  , m_con  = \dc -> if eligible' (dataConTyCon dc)
                     then do { c <- newCopy (dataConTyCon dc)
                             ; modify (\s -> s { as_built = (c, dataConTag dc) : as_built s })
                             ; return (dataConWorkId (con c dc)) }
                     else return (dataConWorkId dc)
   , m_alt  = \b dc -> case splitTyConApp_maybe (idType b) of
-      Just (c, _) | c /= dataConTyCon dc, eligible (dataConTyCon dc)
+      Just (c, _) | c /= dataConTyCon dc, eligible' (dataConTyCon dc)
         -> do { modify (\s -> s { as_matched = (c, dataConTag dc) : as_matched s })
               ; return (Just (con c dc)) }
       _ -> return (Just dc)
-  , m_co   = mapTyConsCo copyable newCopy }    -- Note [Copies in coercions]
+  , m_co   = mapTyConsCo copyable' newCopy }    -- Note [Copies in coercions]
   where
-    ann_ty = mapTyCons copyable newCopy
+    -- Note [Types used as kinds]
+    copyable' t = copyable t && not (kinded t)
+    eligible' t = eligible t && not (kinded t)
+    ann_ty = mapTyCons copyable' newCopy
     con c dc = fromMaybe (pprPanic "DataSplit: constructor" (ppr dc)) (conWithTag c (dataConTag dc))
     -- Vanilla unfoldings may mention binders whose types change; the
     -- simplifier rebuilds them
@@ -694,8 +746,9 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
-    (ann_binds, st) = runState (mapProgram (annMapper pinned) binds)
-                               (AnnState this_mod us1 emptyUFM [] emptyUFM [] [])
+    (ann_binds, st) = runState (mapProgram (annMapper pinned kinded) binds)
+                               (AnnState this_mod us1 emptyUFM [] emptyUFM [] [] kinded)
+    kinded = usedAsKinds binds
     copies   = as_copies st
     lint_res = lintDataProgram cfg copies ann_binds
     ok       = isEmptyBag (dlr_errs lint_res)

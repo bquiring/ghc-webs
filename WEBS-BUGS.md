@@ -36,6 +36,55 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Data splitting: a type used as a kind is copied (2026-10-11)
+* **Found by:** building pretty-show 1.10 (skylighting's dependencies,
+  Hackage benchmarks) with early-ulsl and `-dcore-lint`.
+* **Symptom:** Data Lint after annotating copies: "Bad axiom application
+  (check_ki1 N:SingI <FixityI>_N <'PrefixI>_N ...)" in a Constructor
+  dictionary of Text.Show.PrettyVal's exported Either instance.
+* **Cause:** GHC.Generics' FixityI is eligible (InfixI has fields), and was
+  copied where it instantiates SingI's kind variable, while the promoted
+  'PrefixI kept the original's kind.
+* **Fix:** types used as kinds are not copied: those in the kinds of type
+  variables, and those occurring in a type next to one of their own
+  promoted constructors (usedAsKinds, Note [Types used as kinds] in
+  GHC.WebCore.DataSplit).  A first version excluded every type with a
+  promoted constructor anywhere, which stopped lists from being split (the
+  'False of the Generics metadata and type-level lists are everywhere);
+  the datasplit dumps caught it.  The final version only drops RuntimeRep
+  (an exposed class, never split) from the testsuite's copies.
+* **Guard:** `datasplit005`; the pretty-show build.
+* **Commit:**
+
+### Useless elimination: a join point's result after a deleted parameter (2026-10-11)
+* **Found by:** building network 3.1.2.7 (skylighting's dependencies,
+  Hackage benchmarks) with early-ulsl.
+* **Symptom:** panic `Useless.replaceResult (# State# RealWorld, () #)`.
+* **Cause:** a join point bound in a tail whose result loses components is
+  retyped after its binder is rewritten; the rewrite deletes dead
+  parameters' arrows (and lowers the join arity), but the retyping peeled
+  the old binder's arity off the new type.
+* **Fix:** peel the rewritten binder's join arity (retype_join in
+  GHC.WebCore.Transform.Useless).
+* **Guard:** `useless021`; the network build.
+* **Commit:**
+
+### Useless elimination: a web in a coercion variable's type (2026-10-11)
+* **Found by:** building hashable 1.5.0.0 (skylighting's dependencies, the
+  Hackage benchmarks in ~/projects/webs-hackage-bench) with early-ulsl and
+  `-dcore-lint`.
+* **Symptom:** Web Lint after useless elimination: "Mismatch in type
+  between binder and occurrence" for a coercion variable bound by matching
+  `UnsafeRefl` (unsafeIOToST's unsafeCoerce) in Data.Hashable.XXH3.
+* **Cause:** the IO action's result `(# State# s, () #)` had a dead
+  component; the variable's binder type was rewritten, its occurrences in
+  coercions were not.  Webs in coercions were roots for result components,
+  but only those in casts and coercion arguments.
+* **Fix:** webs in the types of coercion-variable binders are roots too
+  (coercionWebs in GHC.WebCore.Transform.Useless).
+* **Guard:** `useless020`; the hashable build.
+* **Commit:**
+
 ### Result raising: a rebuilt case binder mentions dead field binders (2026-10-10)
 * **Found by:** building happy 2.1.3 (the new Hackage benchmarks,
   webs-bench/hackage/) with early-ulsl and `-dcore-lint`.

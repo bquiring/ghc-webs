@@ -1,4 +1,10 @@
+[1 of 2] Compiling Main             ( poison016.hs, poison016.o )
+
+==================== Webs: forced ====================
 Forced (strict) parameters of webs: 1 of 5; not known to demand analysis: 0
 Forced result components: 0 of 7
 Forced lazy lets: 1 of 1; not known to demand analysis: 0
-Forced fields of internal constructors: 1 of 2: Main.Con2_s6#1
+Forced fields of internal constructors: 1 of 2: Main.Con2_s5#1
+
+
+[2 of 2] Linking poison016

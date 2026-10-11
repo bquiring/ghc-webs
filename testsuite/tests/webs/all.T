@@ -234,6 +234,9 @@ for n in range(1, 5):
          [extra_files(['datasplit%03d.hs' % n]),
           use_specs({'stdout': 'datasplit%03d.stdout' % n})],
          multimod_compile_and_run, ['datasplit%03d' % n, all_opts.replace('-fcore-webs ', '-fcore-webs-early ') + ' -fcore-webs-data-split'])
+# datasplit005: GHC.Generics' FixityI is used as a kind and is not copied
+# (Note [Types used as kinds])
+test('datasplit005', [], compile_and_run, [ds_opts])
 
 # Note [Flattening fields] (GHC.WebCore.DataFlatten, -fcore-webs-data-unbox):
 # the split tests again, with the product fields of the new types unboxed
@@ -412,6 +415,14 @@ test('useless018', [extra_run_opts('1')], compile_and_run,
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])
 # 019: rewrite, split again (Note [Data splitting again])
 test('useless019', [extra_run_opts('20000')], compile_and_run,
+     [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
+      ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary -fcore-webs-data-again'])
+# 020: a web in the type of a coercion variable (unsafeIOToST; hashable)
+test('useless020', [], compile_and_run,
+     [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
+      ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary -fcore-webs-data-again'])
+# 021: a join point in a masked tail with a dead parameter (network)
+test('useless021', [], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary -fcore-webs-data-again'])
 test('useless017', [], compile_and_run,
