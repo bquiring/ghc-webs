@@ -411,6 +411,15 @@ webs as newtypes (the occurs check never fires on nofib).
   the rounds; an adapter case should be recognised and not wrapped again.
   Seen 2026-10-11 while fixing the http2 runRW# bug.
 
+- The `base` configuration is not exactly GHC HEAD: SpecConstr keeps
+  reflexive coercion arguments in call patterns (Note [SpecConstr and
+  reflexive coercions], for defunctionalisation), with or without webs
+  flags.  Judged negligible (coercion arguments in recursive calls are rare
+  outside defunctionalised code); gate it behind a flag if a comparison
+  ever needs stock behaviour.  Everything else outside GHC.WebCore is
+  mechanical (WebLam/WebApp cases, the ft_web/fco_web field) or runs only
+  with a webs flag (2026-10-11 audit against master).
+
 ## Ideas to test
 
 - **Constructed arguments with known calls.** The early run leaves
