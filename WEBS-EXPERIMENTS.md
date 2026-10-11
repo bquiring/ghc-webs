@@ -631,6 +631,38 @@ time, −4.18% allocation; all 115 benchmarks build (data splitting again
 broke rewrite until its binders and occurrences were re-synchronised,
 WEBS-BUGS.md).
 
+## 17. Hackage programs: base vs early-ulsl (2026-10-11)
+
+Real programs outside nofib, in the local repo ~/projects/webs-hackage-bench
+(not part of this tree): happy 2.1.3 on GHC's Parser.y, alex 3.5.2.0 on
+Lexer.x, cpphs 1.20.10 on all of compiler/GHC/*/*.hs concatenated, and
+skylighting 0.13 highlighting Simplify/Iteration.hs as HTML.  Every package
+and its non-boot dependencies (70 packages) built with -O2 plus the
+configuration's flags; boot packages (base, containers, text, bytestring,
+mtl, parsec, ...) are the tree's own and get no webs, as in nofib.
+early-ulsl is the nofib baseline's flags (-fcore-webs-early, inline,
+const-prop, arity/result raising, strictness, data split/unbox, defunc,
+boundary, useless, data-again) with -dcore-lint.  5 interleaved rounds on
+one pinned CPU, medians; all outputs identical to base.
+
+| benchmark | base time (s) | base instr. (G) | instructions | time | allocation |
+|---|---|---|---|---|---|
+| happy | 2.30 | 35.78 | -0.05% | +0.16% | -0.02% |
+| alex | 0.15 | 1.52 | -0.49% | +0.13% | -0.56% |
+| cpphs | 0.61 | 6.59 | +0.53% | +0.30% | +0.03% |
+| skylighting | 0.97 | 8.38 | +0.11% | +1.42% | -1.28% |
+| geomean | | | +0.02% | +0.50% | -0.46% |
+
+Neutral: nothing like nofib's -4%.  Time differences are within noise of
+one-second runs; instructions and allocation are the reliable columns.
+Likely reasons, not yet examined: much of these programs' time is in boot
+libraries (text, containers, bytestring, parsec), which are not rebuilt
+with webs; and the webs are per module, so the boundary split exposes the
+large cross-module interfaces of library code while gaining little inside
+it.  Building them found four compiler bugs (WEBS-BUGS.md, 2026-10-10/11:
+result raising's case binder, useless elimination's coercion variables and
+join arities, data splitting's kind-level types), all fixed.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
