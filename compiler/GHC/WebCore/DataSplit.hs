@@ -323,11 +323,20 @@ mkCopy us mk_name tc_occ dc_occ tc dcs = tycon
                 arg_tys (mkTyConApp tycon (mkTyVarTys univs))
                 NoPromInfo tycon tag [] (mkDataConWorkId wk_name dc') NoDataConRep
 
--- | A constructor of a type with a given original tag
+-- | A constructor of a type with a given original tag.  The constructor at
+-- position tag-1 first: in originals and annotation copies it is the one,
+-- and finding it walks only the list's spine.  A copy's constructors are
+-- built lazily, and searching by tag would build every constructor before
+-- the one wanted: quadratic in the constructors over a case's alternatives,
+-- which ran GHC.Builtin.PrimOps (PrimOp: ~1500 constructors, info tables
+-- matching all of them) out of memory when building GHC with webs.
 conWithTag :: TyCon -> Int -> Maybe DataCon
-conWithTag tc tag = case [ dc | dc <- tyConDataCons tc, dataConTag dc == tag ] of
-  (dc : _) -> Just dc
-  []       -> Nothing
+conWithTag tc tag
+  | (dc : _) <- drop (tag - 1) dcs, tag >= 1, dataConTag dc == tag = Just dc
+  | otherwise = case [ dc | dc <- dcs, dataConTag dc == tag ] of
+      (dc : _) -> Just dc
+      []       -> Nothing
+  where dcs = tyConDataCons tc
 
 ------------------------------------------------------------------
 --      Traversal

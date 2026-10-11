@@ -237,6 +237,9 @@ for n in range(1, 5):
 # datasplit005: GHC.Generics' FixityI is used as a kind and is not copied
 # (Note [Types used as kinds])
 test('datasplit005', [], compile_and_run, [ds_opts])
+# datasplit006 (generated): 2000 constructors matched by case tables; finding
+# copied constructors by tag was quadratic (GHC.Builtin.PrimOps, out of memory)
+test('datasplit006', [], compile_and_run, [ds_opts])
 
 # Note [Flattening fields] (GHC.WebCore.DataFlatten, -fcore-webs-data-unbox):
 # the split tests again, with the product fields of the new types unboxed
