@@ -30,11 +30,11 @@ Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
 2. **Next (the user, 2026-10-10): absent results, partial absence, sum
    results.** Useless elimination done (WEBS-EXPERIMENTS.md §16: −0.57%
    instructions against dead parameters, mostly dead fields; the forced
-   dual finds little beyond demand analysis). Open: strictness that also
-   requires liveness (vacuously strict dead fields are still evaluated
-   early by web strictness, Note [Do not evaluate dead ends early]); why
-   paraffins gains 45%; dead constructors; dropping filled field slots
-   (data unboxing again after the web passes).
+   dual finds little beyond demand analysis). Done since: strict ∧ live
+   (Note [Strict and live]), paraffins explained (every field of C dead:
+   one static C), data splitting again (drops filled slots and unbuilt
+   constructors; −0.02%). Baseline for later experiments: `early-ulsl`
+   (useless elimination and data splitting again, no dead parameters).
    - **Useless elimination as a constraint fixpoint** (the user's design,
      2026-10-10; dissertation `fixpoint-transformations.tex`, 3cps
      `useless-elimination.sml`). A least fixpoint over booleans, everything

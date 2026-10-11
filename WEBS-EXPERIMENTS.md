@@ -613,6 +613,24 @@ poison001-046 (each also in the late run), poison*_forced.
 A timing run during heavy background load (a game, 5x slower wall times)
 hit the 10 s timing timeout in 12 benchmarks; it was rerun with 60 s.
 
+**Data splitting again and strict ∧ live** (`run-uselessda.sh`,
+`run-strictlive.sh`). Splitting and unboxing again after the web passes
+(`-fcore-webs-data-again`, Note [Data splitting again]) on top of
+`early-uls3`: −0.02% instructions (constraints −2.1%; parstof −3%
+allocation); once useless elimination has filled a dead field, dropping its
+slot saves little, and few more fields unbox. Dead constructors are mostly
+gone already: data splitting keeps only the constructors built in each
+class, and a constructor built only for dead code is usually its own class
+(poison047). Strict ∧ live (Note [Strict and live]: web strictness
+evaluates early only what liveness finds live) changes no benchmark's
+instructions (`early-ulsl` against `early-ulsda`): with useless elimination
+before it, one strictness verdict on nofib changes; it closes the
+soundness gap (vacuously strict dead values, parstof) rather than speeding
+anything up. Against `base`, `early-ulsl`: −4.10% instructions, −4.44%
+time, −4.18% allocation; all 115 benchmarks build (data splitting again
+broke rewrite until its binders and occurrences were re-synchronised,
+WEBS-BUGS.md).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
