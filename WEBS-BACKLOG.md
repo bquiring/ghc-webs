@@ -384,6 +384,14 @@ webs as newtypes (the occurs check never fires on nofib).
   helping, +6.1% without it); the suspected cost is the eta-expanded
   continuations allocated at every call from another module: confirm with
   a flag that turns the parameter eta-expansion off alone.
+  veritas (+1.0%): 15 of its 18 defunctionalised webs hold a wrapper eta
+  lambda, and Edlib's 6 hold nothing else (`p p`: exported parser
+  combinators passing their parameters to each other); its wrappers are
+  called from other modules, so each call wraps a function in a
+  constructor only to dispatch on it. Without defunctionalisation +0.4%
+  (the split itself, as in hpg), without the boundary split +0.2% (not
+  yet looked at: defunctionalisation of other webs, e.g. Goals'). So also:
+  never defunctionalise a web whose lambdas are all wrapper eta lambdas.
 
 - **Improvements without defunctionalisation** (the user, 2026-10-10;
   eventually, for the paper: a common reviewer criticism is that the gains
