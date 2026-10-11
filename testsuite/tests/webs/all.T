@@ -424,15 +424,17 @@ for n in [1, 2]:
 # mutual recursion (006-009), higher-order and unknown calls (010-015), data
 # structures (016-025), must-evaluate (026-030), thunks and sharing
 # (031-035), results (036-040), fields of local types (041-045: dead through
-# a web, evaluated at the producer only if every construction is consumed).  Every web transformation is on, in the
+# a web, evaluated at the producer only if every construction is consumed),
+# 046 (parstof's shape), 047 (a constructor built only for dead code).  The
+# early run also splits data types again (Note [Data splitting again]).  Every web transformation is on, in the
 # early run (poisonNNN) and in the late run (poisonNNN_late).
 poison_ws = (' -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise'
              ' -fcore-webs-dead-params -fcore-webs-useless -fcore-webs-result-raise'
              ' -fcore-webs-strictness -fcore-webs-data-split -fcore-webs-data-unbox'
              ' -fcore-webs-defunc')
-poison_early = early_opts + poison_ws + ' -fcore-webs-boundary'
+poison_early = early_opts + poison_ws + ' -fcore-webs-boundary -fcore-webs-data-again'
 poison_late = webs_opts + poison_ws
-for n in range(1, 47):
+for n in range(1, 48):
     name = 'poison%03d' % n
     ec = [exit_code(1)] if 26 <= n <= 30 else []
     test(name, ec, compile_and_run, [poison_early])

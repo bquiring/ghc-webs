@@ -11,6 +11,7 @@ module GHC.WebCore.DataSplit
   ) where
 
 import GHC.Prelude
+import Data.List ( isPrefixOf )
 
 import GHC.Core
 import GHC.Core.DataCon
@@ -643,9 +644,10 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
+splitDataTypes :: String          -- ^ The copies' suffix, before their class number
+               -> Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
                -> CoreProgram -> DataSplitResult
-splitDataTypes unbox keep cfg this_mod us rules binds
+splitDataTypes sfx unbox keep cfg this_mod us rules binds
   = DataSplitResult
       { dsr_binds   = final_binds
       , dsr_tycons  = final_tcs
@@ -801,14 +803,15 @@ splitDataTypes unbox keep cfg this_mod us rules binds
             prod t | isJust (productCon (coreFullView t)) = 1
                    | otherwise                            = 0
     split_number tc = case reverse (occNameString (getOccName tc)) of
-      str | (ds@(_ : _), 's' : '_' : _) <- span isDigit str -> Just (read (reverse ds))
+      str | (ds@(_ : _), rest) <- span isDigit str
+          , reverse sfx `isPrefixOf` rest -> Just (read (reverse ds))
       _ -> Nothing
     mk_split n orig tags = Split tc (zip tags (tyConDataCons tc))
       where
         tc = mkCopy (split_us !! n)
                     (\u occ -> mkExternalName u this_mod occ noSrcSpan)
-                    (mkTcOcc (occNameString (getOccName orig) ++ "_s" ++ show n))
-                    (\dc _ -> mkDataOcc (con_base dc ++ "_s" ++ show n))
+                    (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
+                    (\dc _ -> mkDataOcc (con_base dc ++ sfx ++ show n))
                     orig [ dc | dc <- tyConDataCons orig, dataConTag dc `elem` tags ]
     -- A newtype class: its representation, from one member, with the
     -- children mapped to their classes' types (lazily)
@@ -816,7 +819,7 @@ splitDataTypes unbox keep cfg this_mod us rules binds
       where
         member = head [ m | m <- ms, is_copy m ]
         tc = mkNewtypeCopy (split_us !! n) (\u occ -> mkExternalName u this_mod occ noSrcSpan)
-                           (mkTcOcc (occNameString (getOccName orig) ++ "_s" ++ show n))
+                           (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
                            orig (evalState (rw_ty (snd (newTyConRhs member))) ())
     -- Constructors with alphanumeric names keep them; [], (:) and tuples
     -- become Con<tag>

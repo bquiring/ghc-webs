@@ -126,7 +126,7 @@ webPass early guts
            -- In the early run, or in the late run if there is no early one
            -- (Note [Unboxing in the late run] in GHC.WebCore.DataFlatten)
            if gopt Opt_CoreWebsDataSplit dflags && (early || not (gopt Opt_CoreWebsEarly dflags))
-           then runDataSplit early logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
+           then runDataSplit "_s" early logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
            else return (mg_binds guts, [])
 
        ; let -- 0. Split exposed webs at the module boundary (early run only)
@@ -237,8 +237,35 @@ webPass early guts
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
 
-       ; return (guts { mg_binds = binds4
-                      , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs }) }
+         -- Split and unbox data types again, on what the web passes left
+         -- See Note [Data splitting again]
+       ; (binds5, again_tcs) <-
+           if early && gopt Opt_CoreWebsDataAgain dflags && gopt Opt_CoreWebsDataSplit dflags
+           then runDataSplit "_r" early logger dflags (mg_module guts) (mg_rules guts) binds4
+           else return (binds4, [])
+
+       ; return (guts { mg_binds = binds5
+                      , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
+
+{- Note [Data splitting again]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-data-again, the early run splits and unboxes data types a
+second time, after the web passes (Note [Splitting data types] in
+GHC.WebCore.DataSplit).  The web passes leave work for it:
+
+  * Useless elimination fills dead fields with absent fillers (Note [Dead
+    fields of internal types] in GHC.WebCore.Transform.Useless); data
+    unboxing's dead fields then drop the slots.
+  * Constructors whose constructions were deleted are no longer built;
+    splitting keeps only the constructors built in each class, and the
+    matches lose their alternatives.
+  * Web strictness records the strictness it proved on lambda parameters
+    (Note [Recording proven strictness] in GHC.WebCore.Transform.Strictness),
+    which unboxing reads (37 of 518 fields were blocked by laziness).
+
+The second run's copies are named Orig_r<n>, so as not to clash with the
+first run's Orig_s<n>.
+-}
 
 -- | Lambda classes (classes with a lambda: what a transformation can act
 -- on), how many are internal, and the hidden fields (Note [Hidden fields]
@@ -445,9 +472,9 @@ exprUnsafeTyCons e = case e of
 
 -- | Split data types (Note [Splitting data types] in GHC.WebCore.DataSplit);
 -- stop if Data Lint finds a type error in the annotated program
-runDataSplit :: Bool -> Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
+runDataSplit :: String -> Bool -> Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
              -> CoreM (CoreProgram, [TyCon])
-runDataSplit early logger dflags this_mod rules binds
+runDataSplit sfx early logger dflags this_mod rules binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let unbox | gopt Opt_CoreWebsDataUnbox dflags
                    = Just (UnboxOpts { uo_eager      = gopt Opt_CoreWebsDataUnboxEager dflags
@@ -459,7 +486,7 @@ runDataSplit early logger dflags this_mod rules binds
                                      , uo_orig_sizes = [] })
                    | otherwise = Nothing
              -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
-             split keep = splitDataTypes unbox keep (dataLintConfig dflags) this_mod us rules binds
+             split keep = splitDataTypes sfx unbox keep (dataLintConfig dflags) this_mod us rules binds
              res0 = split Nothing
              res | Just _ <- unbox, dsr_changed res0 = split (Just (dsr_useful res0))
                  | otherwise                         = res0

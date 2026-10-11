@@ -654,6 +654,7 @@ data GeneralFlag
    | Opt_CoreWebs        -- ^ Run the web pipeline; see GHC.WebCore.Pipeline
    | Opt_CoreWebsDeadParams -- ^ Web pipeline: dead-parameter elimination
    | Opt_CoreWebsUseless    -- ^ Web pipeline: useless elimination (a liveness fixpoint)
+   | Opt_CoreWebsDataAgain  -- ^ Web pipeline: split and unbox data types again after the web passes
    | Opt_CoreWebsUncurry    -- ^ Web pipeline: uncurrying
    | Opt_CoreWebsArityRaise -- ^ Web pipeline: arity raising
    | Opt_CoreWebsStrictness -- ^ Web pipeline: strict arguments and result fields
@@ -948,6 +949,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebs
    , Opt_CoreWebsDeadParams
    , Opt_CoreWebsUseless
+   , Opt_CoreWebsDataAgain
    , Opt_CoreWebsUncurry
    , Opt_CoreWebsArityRaise
    , Opt_CoreWebsStrictness

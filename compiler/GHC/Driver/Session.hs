@@ -2560,6 +2560,7 @@ fFlagsDeps = [
   flagSpec "core-webs"                        Opt_CoreWebs,
   flagSpec "core-webs-dead-params"            Opt_CoreWebsDeadParams,
   flagSpec "core-webs-useless"                Opt_CoreWebsUseless,
+  flagSpec "core-webs-data-again"             Opt_CoreWebsDataAgain,
   flagSpec "core-webs-uncurry"                Opt_CoreWebsUncurry,
   flagSpec "core-webs-arity-raise"            Opt_CoreWebsArityRaise,
   flagSpec "core-webs-strictness"             Opt_CoreWebsStrictness,
