@@ -565,6 +565,7 @@ runDefunc early logger dflags cfg this_mod sigs binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let pol = UnfoldingPolicy { up_keep = ws_interface_ids sigs, up_early = early }
              (res, vs) = defuncProgram (gopt Opt_CoreWebsDefuncLifted dflags)
+                                       (dopt Opt_D_dump_webs_defunc dflags)
                                        this_mod pol us (ws_exposed sigs) binds
        ; dump logger Opt_D_dump_webs_defunc "Webs: defunctionalisation" $
            pprWebVerdicts [ (v, bs) | (_, v, _, bs) <- vs ]

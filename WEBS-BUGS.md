@@ -59,6 +59,26 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Defunctionalisation: the analysis ran ShellCheck.Parser out of memory (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), ShellCheck-0.11.0,
+  ShellCheck.Parser (300k terms after simplification, parsec throughout).
+* **Symptom:** `ghc: out of memory` (8 GB) in the early webs pass, after
+  strictness; with data splitting off too (data splitting also runs out on
+  this module: the open entry above).  With defunctionalisation and data
+  splitting off the module compiles at a 1.3 GB peak.
+* **Cause:** the analysis recorded every occurrence of every web's arrow in
+  every type, lazily appended per web, including the exposed webs of
+  library signatures, which occur millions of times in a module like this
+  and are rejected anyway.
+* **Fix:** nothing is recorded for an exposed web, except its lambdas when
+  -ddump-webs-defunc is on (its verdict is dumped).  The module's
+  defunctionalisation now takes 2 s (13 webs), peak 1.33 GB with data
+  splitting off.
+* **Guard:** the ShellCheck build; the testsuite's defunc dumps are
+  unchanged.  No small reproduction (a memory blowup on a 300k-term
+  module).
+* **Commit:**
+
 ### Useless elimination: runRW# in a masked tail took its jumps out of tail position (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), http2-5.4.8,
   Network.HTTP2.H2.Receiver (needed by pandoc).

@@ -171,17 +171,31 @@ plusInfo a b = Info (i_lams a ++ i_lams b) (i_occs a ++ i_occs b)
 
 type Infos = UniqFM WebId Info
 
-note :: WebId -> Info -> Infos -> Infos
-note w i infos
+note0 :: WebId -> Info -> Infos -> Infos
+note0 w i infos
   | isPlaceholderWeb w = infos
   | otherwise          = addToUFM_C plusInfo infos w i
 
 block :: String -> Info
 block why = noInfo { i_block = Just why }
 
-analyse :: CoreProgram -> Infos
-analyse binds = foldr go_bind emptyUFM binds
+-- | The Bool says whether the verdicts will be dumped
+analyse :: Bool -> WebSet -> CoreProgram -> Infos
+analyse want_dump exposed binds = foldr go_bind emptyUFM binds
   where
+    -- An exposed web is rejected whatever else is known, so nothing is
+    -- recorded for it, except its lambdas when the verdicts are dumped.
+    -- Its occurrences (every arrow of every signature it is in) were most
+    -- of what was recorded: in ShellCheck's parsec-heavy ShellCheck.Parser
+    -- they ran the compiler out of memory.
+    note w i infos
+      | w `elementOfUniqSet` exposed
+      = if want_dump && not (null (i_lams i))
+        then note0 w (noInfo { i_lams = i_lams i }) infos
+        else infos
+      | otherwise
+      = note0 w i infos
+
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
 
@@ -519,13 +533,15 @@ mkDWeb this_mod todo us n chain kas kb lams plans
 --      The program
 ------------------------------------------------------------------
 
--- | Defunctionalise the webs that qualify.  The Bool says whether to lift
--- the lambdas' bodies (Note [Lifted bodies]) rather than put them in an
--- apply function.  Returns the new program (if anything changed), the new
--- type constructors with their apply functions (if any), and the verdicts.
-defuncProgram :: Bool -> Module -> UnfoldingPolicy -> UniqSupply -> WebSet -> CoreProgram
+-- | Defunctionalise the webs that qualify.  The first Bool says whether to
+-- lift the lambdas' bodies (Note [Lifted bodies]) rather than put them in an
+-- apply function, the second whether the verdicts will be dumped (exposed
+-- webs get one only then).  Returns the new program (if anything changed),
+-- the new type constructors with their apply functions (if any), and the
+-- verdicts.
+defuncProgram :: Bool -> Bool -> Module -> UnfoldingPolicy -> UniqSupply -> WebSet -> CoreProgram
               -> (Maybe (CoreProgram, [(TyCon, Maybe Id)]), [(WebId, SDoc, Bool, [Id])])
-defuncProgram lifted this_mod pol us exposed binds
+defuncProgram lifted want_dump this_mod pol us exposed binds
   | isNullUFM todo = (Nothing, dump)
   | lifted
   = ( Just (binds' ++ [Rec [ (lf_id lf, mk_lifted lf body) | (_, lf, body) <- bodies ]]
@@ -538,7 +554,7 @@ defuncProgram lifted this_mod pol us exposed binds
   where
     (us1, us2) = splitUniqSupply us
     tops  = mkVarSet (bindersOfBinds binds)
-    infos = analyse binds
+    infos = analyse want_dump exposed binds
     info w = lookupWithDefaultUFM infos noInfo w
 
     -- Chains (Note [Defunctionalising whole arities]): w's lambdas all
