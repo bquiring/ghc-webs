@@ -47,7 +47,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** zap the field binders' occurrence info when the case binder is
   rebuilt (GHC.WebCore.Transform.ResultRaise).
 * **Guard:** `resraise_alias`, `resraise_alias_late`; the happy build.
-* **Commit:**
+* **Commit:** `aee1086c04`
 
 ### Data splitting again: binding order and stale occurrences (2026-10-10)
 * **Found by:** nofib, `run-uselessda.sh` (`early-ulsda`,
