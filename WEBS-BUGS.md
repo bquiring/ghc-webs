@@ -59,6 +59,21 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Defunctionalisation: lambdas that take class dictionaries (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), hpke-0.2.1,
+  Crypto.HPKE.AEAD (needed by pandoc and hledger).
+* **Symptom:** `ASSERT failed` in mkWebFunTy (arg `a4 :: Constraint`),
+  called from mkVisFunTyMany in GHC.WebCore.Transform.Defunc.
+* **Cause:** mkSealA takes a function polymorphic in its ByteArray types,
+  and is called with three such functions; their web was defunctionalised
+  (arity 8: four dictionaries, four arguments).  The apply function's type
+  (and a lifted function's) was built with visible arrows, but a dictionary
+  parameter needs a constraint arrow.
+* **Fix:** build those arrows with mkFunctionType, which picks the arrow
+  from the argument's kind.
+* **Guard:** `defunc010`, `defunc010_lifted` (fail without the fix).
+* **Commit:**
+
 ### Unboxing: a field mentioned only by a stable unfolding lost its binding (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
   Codec.Picture.Gif.

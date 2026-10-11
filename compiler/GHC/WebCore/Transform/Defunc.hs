@@ -494,7 +494,7 @@ mkDWeb this_mod todo us n chain kas kb lams plans
                        (mkNomEqPred (mkTyVarTy ab) res)
         webs = map mkWebId (take (length ys + arity) uf5)
         fun_ty = mkSpecForAllTys tvs' $
-                 foldr (\(w, t) r -> setFunTyWeb w (mkVisFunTyMany t r)) res
+                 foldr (\(w, t) r -> setFunTyWeb w (mkFunctionType ManyTy t r)) res
                        (zip webs (map idType (ys ++ xs')))
         fun  = mkSysLocal (mkFastString ("$lam" ++ k ++ "_" ++ show tag)) (uf2 !! 2) ManyTy fun_ty
                  `setIdArity` (length ys + arity)
@@ -511,7 +511,7 @@ mkDWeb this_mod todo us n chain kas kb lams plans
     wild = mkSysLocal (fsLit "wild") u_wild ManyTy d_ty
     xs   = [ mkSysLocal (fsLit "x") (u !! 2) ManyTy (mkTyVarTy a) | (a, u) <- zip aas per_arg ]
     apply_ty = mkSpecForAllTys (aas ++ [ab]) $
-               foldr (\(w, t) r -> setFunTyWeb w (mkVisFunTyMany t r)) (mkTyVarTy ab)
+               foldr (\(w, t) r -> setFunTyWeb w (mkFunctionType ManyTy t r)) (mkTyVarTy ab)
                      (zip ws (d_ty : mkTyVarTys aas))
     apply = mkSysLocal (mkFastString ("$apply" ++ k)) u_ap ManyTy apply_ty
 

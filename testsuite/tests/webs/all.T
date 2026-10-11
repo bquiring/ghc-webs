@@ -219,6 +219,12 @@ for n in range(1, 10):
           use_specs(dict(stdout='defunc%03d.stdout' % n,
                          **({'stderr': 'defunc002.stderr'} if n == 2 else {})))],
          multimod_compile_and_run, ['defunc%03d' % n, df_opts + ' -fcore-webs-defunc-lifted'])
+# defunc010: lambdas that take class dictionaries (hpke's Crypto.HPKE.AEAD):
+# the apply function's and lifted functions' dictionary arrows are
+# constraint arrows.
+test('defunc010', [], compile_and_run, [df_opts])
+test('defunc010_lifted', [extra_files(['defunc010.hs']), use_specs({'stdout': 'defunc010.stdout'})],
+     multimod_compile_and_run, ['defunc010', df_opts + ' -fcore-webs-defunc-lifted'])
 
 # Note [Splitting data types] (GHC.WebCore.DataSplit, -fcore-webs-data-split).
 # 001 a local list and an exposed one, 002 constructors a class never builds
