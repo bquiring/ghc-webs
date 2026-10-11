@@ -36,6 +36,22 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Data splitting again: binding order and stale occurrences (2026-10-10)
+* **Found by:** nofib, `run-uselessda.sh` (`early-ulsda`,
+  `-fcore-webs-data-again`): spectral/rewrite did not build.
+* **Symptom:** `ASSERT failed! lvl_wdt6` in CPR analysis (CprAnal.hs:357).
+* **Cause:** the second data split runs after the pipeline sorted the
+  top-level bindings, and it rewrites binders (zapping unfoldings) but not
+  every occurrence. The simplifier fixes both after the first split; after
+  the second, CPR analysis runs first, and it decides at the binding (from
+  the binder's unfolding: a data structure gets no signature) and again at
+  an occurrence (from the occurrence's), which disagreed.
+* **Fix:** after the second split, sort the top-level bindings again and
+  make every occurrence the binder's own Id (syncOccurrences in
+  GHC.WebCore.Pipeline, Note [Data splitting again]).
+* **Guard:** `useless019` (rewrite).
+* **Commit:**
+
 ### A dead field filled, then evaluated early: "Entered absent arg" (2026-10-10)
 * **Found by:** nofib, `run-useless3.sh` (`early-uls3`, useless elimination
   with fields): spectral/hartel/parstof aborted.

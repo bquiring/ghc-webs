@@ -14,13 +14,16 @@ import GHC.Core
 import GHC.Core.Map.Expr ( eqCoreExpr )
 import GHC.Core.Opt.Monad
 import GHC.Core.Ppr ( pprCoreBindings )
+import GHC.Core.Subst ( mkEmptySubst, substExpr )
+import GHC.Types.Var.Env ( mkInScopeSet )
+import GHC.Types.Var.Set ( mkVarSet )
 import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
 import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM )
 import GHC.Types.Unique.Set
-import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
+import GHC.Types.Unique.Supply ( mkSplitUniqSupply, splitUniqSupply )
 import GHC.Types.Web
 
 import GHC.Unit.Module.ModGuts
@@ -58,7 +61,7 @@ import GHC.WebCore.Solve
 import GHC.WebCore.Transform.ArityRaise
 import GHC.WebCore.Transform.Common ( pprWebVerdicts, UnfoldingPolicy(..), reorderTopBinds )
 import GHC.WebCore.Transform.DeadParams ( deadParamsRound, Verdict(..) )
-import GHC.WebCore.Transform.Useless ( uselessRound )
+import GHC.WebCore.Transform.Useless ( uselessRound, liveness )
 import GHC.WebCore.Transform.Forced ( pprForced )
 import GHC.WebCore.Transform.Uncurry
 import GHC.WebCore.Transform.Strictness ( strictnessRound )
@@ -241,11 +244,30 @@ webPass early guts
          -- See Note [Data splitting again]
        ; (binds5, again_tcs) <-
            if early && gopt Opt_CoreWebsDataAgain dflags && gopt Opt_CoreWebsDataSplit dflags
-           then runDataSplit "_r" early logger dflags (mg_module guts) (mg_rules guts) binds4
+           then do { (bs, tcs) <- runDataSplit "_r" early logger dflags (mg_module guts) (mg_rules guts) binds4
+                     -- splitting can change the dependencies between top-level
+                     -- bindings (Note [Top-level binding order] in
+                     -- GHC.WebCore.Transform.Common; CPR analysis asserts it)
+                   ; return (syncOccurrences (reorderTopBinds bs), tcs) }
            else return (binds4, [])
 
        ; return (guts { mg_binds = binds5
                       , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
+
+-- | Make every occurrence the binder's own Id (with its current IdInfo).
+-- Data splitting rewrites binders (types, zapped unfoldings) but not every
+-- occurrence; after the first run the simplifier fixes that, but after the
+-- second, CPR analysis runs first, and it decides at the binding (from the
+-- binder's unfolding) whether to record a signature, and at an occurrence
+-- (from the occurrence's) whether to expect one: nofib spectral/rewrite
+-- failed its assertion.  An occurrence not in the substitution is looked up
+-- in the in-scope set, which holds the binders.
+syncOccurrences :: CoreProgram -> CoreProgram
+syncOccurrences binds = map sync binds
+  where
+    subst = mkEmptySubst (mkInScopeSet (mkVarSet (bindersOfBinds binds)))
+    sync (NonRec b e) = NonRec b (substExpr subst e)
+    sync (Rec prs)    = Rec [ (b, substExpr subst e) | (b, e) <- prs ]
 
 {- Note [Data splitting again]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -675,7 +697,9 @@ runTransforms early logger dflags cfg sigs0 binds0
         , \sigs us done b -> case uselessRound (ws_hidden_fields sigs) us exposed keep done b of
                             (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsStrictness, "strictness", Opt_D_dump_webs_strictness
-        , \_ us done b -> same (strictnessRound us exposed done b) ) ]
+        , \sigs us done b -> let (us1, us2) = splitUniqSupply us
+                             in same (strictnessRound (liveness (ws_hidden_fields sigs) exposed us1 b)
+                                                      us2 exposed done b) ) ]
 
     step (binds, sigs, changed, dones) (flag, name, dump_flag, do_round)
       | early, flag == Opt_CoreWebsUncurry

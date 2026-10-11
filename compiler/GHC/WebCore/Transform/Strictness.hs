@@ -122,6 +122,23 @@ repeats the transformations, -fcore-webs-passes).  Only at saturation depth
 application need not be (arity raising rejects curried lambdas anyway).
 -}
 
+{- Note [Strict and live]
+~~~~~~~~~~~~~~~~~~~~~~~~
+Strictness here is a greatest fixpoint, which makes recursive webs strict
+(f x n = if n == 0 then x else f x (n - 1) is strict in x).  But it proves
+an implication, "if demanded then forced", and a value that only goes round
+a cycle and is never read at the end satisfies it vacuously: in nofib
+spectral/hartel/parstof every consumer of the parsers' results puts field
+0 back into field 0, and main inspects another copy of the type.
+Evaluating such a value early evaluates what the program never touches.
+Useless elimination (GHC.WebCore.Transform.Useless) asks the dual question
+as a least fixpoint, with a witness: is it ever used?  So an argument or a
+field is evaluated early only if it is strict and live (liveness): the
+strict elements in the sense of Sainati et al.'s S, which implies used.
+Elements liveness has no constraint for (fields of types that are not
+internal) count as live, as before.
+-}
+
 {- Note [Do not evaluate dead ends early]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 An argument or field that is a dead end (an error call, an absent filler)
@@ -546,9 +563,10 @@ changes _                    = False
 ------------------------------------------------------------------
 
 -- | Analyse and rewrite.  Webs in 'done' were handled in an earlier round.
-strictnessRound :: UniqSupply -> WebSet -> WebSet -> CoreProgram
+strictnessRound :: (WebId -> Bool, DataCon -> Int -> Bool)   -- ^ Liveness: Note [Strict and live]
+                -> UniqSupply -> WebSet -> WebSet -> CoreProgram
                 -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
-strictnessRound us exposed done binds
+strictnessRound (live_arg, live_field) us exposed done binds
   | isNullUFM arg_webs && isNullUFM res_webs = (Nothing, dump)
   | otherwise = ( Just (initUs_ us (rewriteProgram arg_webs res_webs binds), handled)
                 , dump )
@@ -561,10 +579,20 @@ strictnessRound us exposed done binds
               | otherwise                  = joint sw1
       where rfs0 = strictResultFields exposed sw0 infos
             sw1  = strictArgWebs exposed rfs0 infos
-    verdicts = [ (w, verdict exposed sw rfs w i, i)
+    verdicts = [ (w, live_only w (verdict exposed sw rfs w i), i)
                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                , let w = mkWebId u
                , not (w `elementOfUniqSet` done) ]
+    -- Note [Strict and live]: evaluate early only what is also live
+    live_only w (a, f) = (a', f')
+      where a' = case a of
+                   StrictArg _ | not (live_arg w) -> NotStrictArg "dead"
+                   _ -> a
+            f' = case f of
+                   StrictFields dc fs
+                     | let fs' = [ i | i <- fs, live_field dc i ]
+                     -> if null fs' then NoStrictFields "dead" else StrictFields dc fs'
+                   _ -> f
     arg_webs = listToUFM [ (w, k) | (w, (StrictArg k, _), _) <- verdicts ]
     res_webs = listToUFM [ (w, (dc, fs)) | (w, (_, StrictFields dc fs), _) <- verdicts ]
     handled  = mkUniqSet [ w | (w, v, _) <- verdicts, changes v ]

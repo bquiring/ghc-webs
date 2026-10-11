@@ -410,6 +410,10 @@ for n in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
 test('useless018', [extra_run_opts('1')], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])
+# 019: rewrite, split again (Note [Data splitting again])
+test('useless019', [extra_run_opts('20000')], compile_and_run,
+     [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
+      ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary -fcore-webs-data-again'])
 test('useless017', [], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])

@@ -5,6 +5,7 @@
 -- See Note [Useless elimination].
 module GHC.WebCore.Transform.Useless
   ( uselessRound
+  , liveness
   ) where
 
 import GHC.Prelude
@@ -620,6 +621,42 @@ uselessRound hidden us0 exposed pol done binds0
     changed Delete   = True
     changed (Unit _) = True
     changed _        = False
+
+-- | Liveness alone, for other passes: is the parameter of this web live,
+-- and is field i of this constructor live?  Elements without a constraint
+-- (a constructor of a type that is not internal) count as live.
+-- See Note [Strict and live] in GHC.WebCore.Transform.Strictness
+liveness :: (TyCon -> Bool)   -- ^ Types with hidden fields
+         -> WebSet            -- ^ Exposed webs
+         -> UniqSupply -> CoreProgram
+         -> (WebId -> Bool, DataCon -> Int -> Bool)
+liveness hidden exposed us0 binds0 = (live_arg, live_field)
+  where
+    binds = initUs_ us0 (mapM fresh_bind binds0)   -- Note [Fresh binders for useless elimination]
+    fresh_bind (NonRec b e) = NonRec b <$> cloneExpr e
+    fresh_bind (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) b <$> cloneExpr e) prs
+    infos = analyse binds
+    res   = resultWebs binds
+    co_ws = coercionWebs binds
+    eligible dc = hidden (dataConTyCon dc) && isVanillaDataCon dc && not (isUnboxedTupleDataCon dc)
+    cons0 = constraints eligible res binds
+    con_elems c = case c of
+      Root e    -> [e]
+      Guard e p -> e : p
+      Use e p   -> e : p
+    arg_webs = mkUniqSet [ w | EArg w <- concatMap con_elems cons0 ] :: WebSet
+    arg_root w = case lookupUFM infos w of
+      Just i | not (null (wi_lams i))
+        -> w `elementOfUniqSet` exposed || wi_covar i || wi_coercion i || wi_eff_tuple i
+      _ -> True
+    res_root w = w `elementOfUniqSet` exposed || w `elementOfUniqSet` co_ws
+    roots =  [ Root (EArg w) | w <- nonDetEltsUniqSet arg_webs, arg_root w ]
+          ++ [ Root (ERes (mkWebId u) k) | (u, n) <- nonDetUFMToList res
+                                         , res_root (mkWebId u), k <- [0 .. n - 1] ]
+    live = solve (roots ++ cons0)
+    known = S.fromList (concatMap con_elems cons0)
+    live_arg w = not (EArg w `S.member` known) || EArg w `S.member` live
+    live_field dc i = not (EField dc i `S.member` known) || EField dc i `S.member` live
 
 ------------------------------------------------------------------
 --      The rewrite
