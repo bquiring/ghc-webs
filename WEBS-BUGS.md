@@ -77,7 +77,7 @@ would catch it again), **commit** (empty while uncommitted).
   (Note [runRW# in a masked tail] in GHC.WebCore.Transform.Useless).
 * **Guard:** `useless022` (a byte array built under runRW# in a strict
   field before throwIO; fails without the fix).
-* **Commit:**
+* **Commit:** `34aab1b77c`
 
 ### Defunctionalisation: lambdas that take class dictionaries (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), hpke-0.2.1,
