@@ -367,6 +367,17 @@ webs as newtypes (the occurs check never fires on nofib).
   Fix: cheap placeholders per occurrence during annotation and Data Lint,
   real types only for the final split classes.
 
+- **Improvements without defunctionalisation** (the user, 2026-10-10;
+  eventually, for the paper: a common reviewer criticism is that the gains
+  are just defunctionalisation). Measure `early-ulsl` without
+  `-fcore-webs-defunc` against `base` and against `early-ulsl`, on nofib
+  (instructions, time, allocation, top winners), and show which
+  transformations carry the gains without it (per-transformation
+  ablations as in the worst-case bisection, `scratchpad/worst/bisect.sh`
+  style). Note that defunctionalisation interacts with the boundary split
+  (multiplier: it fires on webs whose second lambda is a dead wrapper eta
+  lambda) and helps hpg (+6.1% without it).
+
 ## Ideas to test
 
 - **Constructed arguments with known calls.** The early run leaves
