@@ -282,6 +282,10 @@ test('dataunbox007_dump', [extra_files(['dataunbox007.hs'])],
 test('dataunbox008', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox008_dump', [extra_files(['dataunbox008.hs'])],
      multimod_compile, ['dataunbox008', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
+# dataunbox009: a local list of pairs, both specialised, cast through a type
+# family: a coercion selects into the pair by the list pattern's paths
+# (GHC.Cmm.CommonBlockElim, building GHC with webs)
+test('dataunbox009', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 
 # Edge cases for data splitting and unboxing.  001-010 are type-level, with
 # coercions: local, parameterised, eta-reducible, recursive and mutually

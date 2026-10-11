@@ -36,6 +36,28 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Data specialisation: nested specialised types in coercions (2026-10-11)
+* **Found by:** building GHC with the webs compiler (early-ulsl,
+  ~/projects/ghc-selfhost), in GHC.Cmm.CommonBlockElim.
+* **Symptom:** `ASSERT failed` in mkSelCo called from
+  GHC.WebCore.DataSpec (coercion `Tuple2_s19 (Sub (D:R:KeyListMap ...) ; ...)`);
+  after fixing that, Web Lint: "Role incompatibility: expected nominal, got
+  representational" in a coercion `List_s6 (...)_R`.
+* **Cause:** a local list of pairs, both specialised (List_s6 t1 =
+  [Tuple2_s7 t1 Int]), cast through a type family (Key (ListMap ..) =
+  [Label]).  (1) A TyConAppCo of the list selected each pattern variable's
+  coercion out of already rewritten argument coercions, by paths through the
+  pattern's original type constructors, while the rewritten pair is the
+  specialised one with other arguments.  (2) Specialised types had
+  all-nominal parameters, which a representational coercion between them
+  cannot match.
+* **Fix:** select out of the original argument coercions, then rewrite;
+  a specialised type's parameter has the strictest role along its positions
+  in the pattern, and its coercion is selected at that position
+  (patVarRole, patPathRole in GHC.WebCore.DataSpec).
+* **Guard:** `dataunbox009`; the GHC build.
+* **Commit:**
+
 ### Data splitting: finding copied constructors by tag is quadratic (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
   ~/projects/ghc-selfhost): GHC.Builtin.PrimOps ran out of memory (4 GB);

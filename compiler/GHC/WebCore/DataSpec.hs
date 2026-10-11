@@ -15,6 +15,7 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Unify ( tcMatchTys )
+import Data.List ( sortOn )
 
 import GHC.Types.Id
 import GHC.Types.Id.Make ( mkDataConWorkId )
@@ -188,7 +189,7 @@ specialiseSplit this_mod us tcs binds
         pat' = substTys (zipTvSubst tvs0 (mkTyVarTys tvs)) pat
         tc_name = setNameUnique (tyConName tc) (uniqFromSupply u1)
         tycon = mkAlgTyCon tc_name (mkAnonTyConBinders tvs) (tyConResKind tc)
-                           (map (const Nominal) tvs) Nothing [] (mkDataTyConRhs dcs)
+                           (map (patVarRole tc pat') tvs) Nothing [] (mkDataTyConRhs dcs)
                            (VanillaAlgTyCon (mkPrelTyConRepName tc_name)) False
         self ty = case ty of
           TyConApp tc' tys
@@ -278,9 +279,12 @@ specialiseSplit this_mod us tcs binds
       Refl t        -> Refl (ty t)
       GRefl r t m   -> GRefl r (ty t) m
       TyConAppCo r tc cos
+        -- selected out of the original argument coercions, then rewritten:
+        -- the pattern's paths run through the original type constructors,
+        -- and a specialised one inside the pattern takes other arguments
+        -- (a list of pairs, both specialised: dataunbox009)
         | Just (tc', tvs, pat, _) <- lookupUFM specs tc
-        -> let cos' = map rw_co cos
-           in TyConAppCo r tc' [ var_co r tc pat cos' tv | tv <- tvs ]
+        -> TyConAppCo r tc' [ rw_co (var_co r tc pat cos tv) | tv <- tvs ]
         | otherwise -> TyConAppCo r tc (map rw_co cos)
       SelCo (SelTyCon i r) c
         | Just (tc, _) <- splitTyConApp_maybe (coercionLKind c)
@@ -304,21 +308,14 @@ specialiseSplit this_mod us tcs binds
       SubCo c       -> SubCo (rw_co c)
       _             -> co
 
-    -- The coercion for pattern variable tv: at its first position in the
-    -- pattern, selected out of that argument's coercion
+    -- The coercion for pattern variable tv: selected out of an argument's
+    -- coercion at the position of tv in the pattern with the strictest role
+    -- (the role of the specialised type's parameter: patVarRole)
     var_co r tc pat cos' tv
-      = case [ sel_path (tyConRoleListX r tc !! i) (cos' !! i) path
-             | (i, p) <- zip [0 ..] pat, Just path <- [path_to tv p] ] of
-          (c : _) -> c
-          []      -> pprPanic "specialiseSplit: pattern variable not in pattern" (ppr tv)
-    -- The path to a variable in a pattern type: argument positions
-    path_to tv p = case p of
-      TyVarTy v | v == tv -> Just []
-      TyConApp ptc ts ->
-        case [ (j, rest) | (j, t) <- zip [0 ..] ts, Just rest <- [path_to tv t] ] of
-          ((j, rest) : _) -> Just ((ptc, j) : rest)
-          []              -> Nothing
-      _ -> Nothing
+      = case sortOn fst [ (patPathRole tc i path, sel_path (tyConRoleListX r tc !! i) (cos' !! i) path)
+                        | (i, path) <- patVarPaths pat tv ] of
+          ((_, c) : _) -> c
+          []           -> pprPanic "specialiseSplit: pattern variable not in pattern" (ppr tv)
     sel_path _ c [] = c
     sel_path r c ((ptc, j) : rest)
       = let rj = tyConRoleListX r ptc !! j
@@ -335,3 +332,30 @@ specialiseSplit this_mod us tcs binds
     dump = vcat [ ppr tc <> colon <+> text "specialised to" <+> ppr tc' <+> hsep (map ppr tvs)
                   <+> text "=" <+> ppr pat
                 | tc <- tcs, Just (tc', tvs, pat, _) <- [lookupUFM specs tc] ]
+
+-- | The positions of a variable in a pattern: argument index and the path of
+-- (type constructor, argument position) steps below it
+patVarPaths :: [Type] -> TyVar -> [(Int, [(TyCon, Int)])]
+patVarPaths pat tv = [ (i, path) | (i, p) <- zip [0 ..] pat, path <- go p ]
+  where
+    go p = case p of
+      TyVarTy v | v == tv -> [[]]
+      TyConApp ptc ts -> [ (ptc, j) : rest | (j, t) <- zip [0 ..] ts, rest <- go t ]
+      _ -> []
+
+-- | The role at a position in a pattern for T: T's parameter's role, then
+-- each step's
+patPathRole :: TyCon -> Int -> [(TyCon, Int)] -> Role
+patPathRole tc i path = foldl step (tyConRoleListX Representational tc !! i) path
+  where step r (ptc, j) = tyConRoleListX r ptc !! j
+
+-- | The role of a specialised type's parameter: the strictest at the
+-- variable's positions in the pattern (the coercions for it are selected at
+-- that position: var_co).  Specialised types had all-nominal parameters,
+-- which no representational coercion between them could match (a list of
+-- pairs cast through a type family: dataunbox009, building GHC with webs).
+patVarRole :: TyCon -> [Type] -> TyVar -> Role
+patVarRole tc pat tv = case [ patPathRole tc i path | (i, path) <- patVarPaths pat tv ] of
+  [] -> Nominal
+  (r : rs) -> foldl min r rs
+
