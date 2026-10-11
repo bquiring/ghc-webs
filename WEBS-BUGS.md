@@ -51,7 +51,7 @@ would catch it again), **commit** (empty while uncommitted).
   489 MB peak on PrimOps.
 * **Guard:** `datasplit006` (generated: 2000 constructors, 6 tables); the
   GHC build.
-* **Commit:**
+* **Commit:** `095ea69492`
 
 ### Data Lint: a SelCo between a copy and an original behind a synonym (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
