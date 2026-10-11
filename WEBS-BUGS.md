@@ -72,7 +72,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** coercion variables free in a cast's coercion, a coercion or type
   argument, or a case's result type are live.
 * **Guard:** `dataunbox010` (a copy of the module; fails without the fix).
-* **Commit:**
+* **Commit:** `0fd07f955a`
 
 ### Rebuilt hidden-field types: types that mention them keep the old ones (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), uniplate-1.6.13,
@@ -97,7 +97,7 @@ would catch it again), **commit** (empty while uncommitted).
   fails without the fix).
 * **Performance:** `Referenced` can only expose fields that were hidden
   before; not yet measured on nofib.
-* **Commit:**
+* **Commit:** `0fd07f955a`
 
 ### Annotation rebuilds arrow-free types: out of memory (2026-10-11)
 * **Found by:** building GHC with the webs compiler, GHC.Tc.Errors.Types.
