@@ -36,6 +36,42 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### OPEN: data splitting runs GHC.Tc.Errors.Types out of memory (2026-10-11)
+* **Found by:** building GHC with the webs compiler (early-ulsl,
+  ~/projects/ghc-selfhost).
+* **Symptom:** `ghc: out of memory` (4 GB) in the early webs run with
+  -fcore-webs-data-split; -fcore-webs-early alone and every other pass fit
+  (after the annotation fix below).  The module has 32k terms but 6.5 million
+  type nodes counted as trees: the Generic representations of its large sums
+  (:+: trees, built and matched by the derived from/to) repeated in every
+  alternative's coercions.
+* **Cause (partly known):** annotation copies :+: at every occurrence, and
+  copies are expensive (a type constructor with constructors, and the types
+  around it unshared): traces showed annotation itself reaching ~90,000
+  copies before running out.  A cap of 40,000 copies (originals kept after
+  it, which is sound) still ran out later in data splitting, so something
+  after annotation (Data Lint over the unshared types?) is also too big.
+* **Tried and dropped:** forcing Data Lint's recorded pairs (kept: harmless);
+  making mapTyCons keep unchanged subtrees shared: did not help, and broke
+  recweb/hfield/poison013 tests with an Int/Int# mismatch in a worker
+  ($wwalkR), unexplained since the change should not alter any result.
+* **Workaround:** none yet; the self-host ulsl build stops at this module.
+  Deferred (the user: other benchmarks first).
+* **Commit:**
+
+### Annotation rebuilds arrow-free types: out of memory (2026-10-11)
+* **Found by:** building GHC with the webs compiler, GHC.Tc.Errors.Types.
+* **Symptom:** out of memory (4 GB) in the early webs run with only
+  -fcore-webs-early; a heap profile showed THUNK_2_0 growing steadily.
+* **Cause:** annType rebuilt every type node in the lazy AnnM monad, a thunk
+  per node and no sharing, even in types with nothing to annotate.
+* **Fix:** types with no arrow (written or behind a synonym) and no coercion
+  are returned as they are (Note [Types without arrows] in
+  GHC.WebCore.Annotate): the module's early run peaks at ~500 MB.  Output is
+  unchanged (no webs are created for such types).
+* **Guard:** the GHC build; the webs testsuite (unchanged results).
+* **Commit:**
+
 ### Data specialisation: nested specialised types in coercions (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
   ~/projects/ghc-selfhost), in GHC.Cmm.CommonBlockElim.

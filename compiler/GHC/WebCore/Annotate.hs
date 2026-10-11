@@ -323,6 +323,7 @@ annTick _ t = t
 annType :: AnnEnv -> Type -> AnnM Type
 annType env = go
   where
+    go ty | not (needsAnn ty) = return ty   -- Note [Types without arrows]
     go ty@(TyVarTy {}) = return ty
     go ty@(LitTy {})   = return ty
     go (AppTy t1 t2)   = AppTy <$> go t1 <*> go t2
@@ -342,6 +343,29 @@ annType env = go
            ; return (ty { ft_web = w, ft_arg = arg', ft_res = res' }) }
     go (CastTy ty co)  = (\ty' -> CastTy ty' co) <$> go ty   -- Kind coercion: unchanged
     go (CoercionTy co) = CoercionTy <$> annCo env co
+
+{- Note [Types without arrows]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A type with no arrow (written, or behind a synonym) and no coercion has
+nothing to annotate, and annType returns it as it is.  Rebuilding it in
+AnnM gave nothing new but a thunk for every node and lost sharing: in
+GHC.Tc.Errors.Types (6.5 million type nodes, mostly the Generic
+representations of its large sums) the early run went out of memory
+(4 GB) when building GHC with webs.
+-}
+
+-- | Does annType have anything to do in this type: an arrow (written, or
+-- behind a synonym) or a coercion?
+needsAnn :: Type -> Bool
+needsAnn ty = case ty of
+  FunTy {}        -> True
+  CoercionTy {}   -> True
+  TyConApp tc tys -> any needsAnn tys
+                     || (isTypeSynonymTyCon tc && maybe False hasArrow (coreView ty))
+  AppTy t1 t2     -> needsAnn t1 || needsAnn t2
+  ForAllTy _ t    -> needsAnn t
+  CastTy t _      -> needsAnn t
+  _               -> False
 
 -- | Does this type contain an arrow, looking through synonyms?
 hasArrow :: Type -> Bool

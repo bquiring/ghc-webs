@@ -3441,10 +3441,16 @@ addWarnL :: SDoc -> LintM ()
 addWarnL msg = LintM $ \ env (warns,errs,prs) ->
               fromBoxedLResult (Just (), (addMsg True env warns msg, errs, prs))
 
--- | Record pairs of copies that must be the same
+-- | Record pairs of copies that must be the same.  Forced as they are
+-- recorded: a lazy copyPairs keeps the two types it compares alive until
+-- the end of Data Lint, and Lint's types are substituted, unshared copies
+-- (GHC.Tc.Errors.Types ran out of memory when building GHC with webs:
+-- Note [Keeping types shared] in GHC.WebCore.DataSplit)
 recordCopyPairs :: Bag (TyCon, TyCon) -> LintM ()
 recordCopyPairs new = LintM $ \ _ (warns,errs,prs) ->
-  fromBoxedLResult (Just (), (warns, errs, new `unionBags` prs))
+  let !prs' = foldr (\(a, b) acc -> a `seq` b `seq` acc) () (bagToList new)
+                `seq` (new `unionBags` prs)
+  in fromBoxedLResult (Just (), (warns, errs, prs'))
 
 getCopies :: LintM Copies
 getCopies = LintM $ \ env errs -> fromBoxedLResult (Just (le_copies env), errs)
