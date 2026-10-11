@@ -77,7 +77,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** the ShellCheck build; the testsuite's defunc dumps are
   unchanged.  No small reproduction (a memory blowup on a 300k-term
   module).
-* **Commit:**
+* **Commit:** `b4bb78939d`
 
 ### Useless elimination: runRW# in a masked tail took its jumps out of tail position (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), http2-5.4.8,
