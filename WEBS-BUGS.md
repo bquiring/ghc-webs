@@ -74,7 +74,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** both count the variables of a let binder's unfolding and rules.
 * **Guard:** `dataunbox011` (a RULE active from phase 1 removes the use from
   the right-hand side but not from the unfolding; fails without the fix).
-* **Commit:**
+* **Commit:** `0dd375d78d`
 
 ### Constant propagation: a local binder with a top-level binder's unique (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
@@ -97,7 +97,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** the JuicyPixels build; no small reproduction (the collision
   comes from GHC's earlier passes on vector code).  Testsuite dumps
   unchanged.
-* **Commit:**
+* **Commit:** `0dd375d78d`
 
 ### Dead fields: a coercion bound by a match on Refl counted as unused (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
