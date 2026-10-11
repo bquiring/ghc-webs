@@ -8,7 +8,7 @@ module GHC.WebCore.HiddenFields
   ( updateDataConSigs, refreshWorkers
   , addSigBinders, removeSigBinders
   , hiddenFieldWebs
-  , rebuildHiddenTypes
+  , rebuildHiddenTypes, rebuildableTyCon, fieldTyCons
   , exprCons
   ) where
 
@@ -20,6 +20,7 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare ( eqType )
 import GHC.Core.TyCon
 import GHC.Core.Type ( mkTyConApp, mkTyVarTys )
+import GHC.Core.TyCo.FVs ( tyConsOfType )
 import GHC.Builtin.Types ( manyDataConTy )
 
 import GHC.Types.Id
@@ -63,6 +64,26 @@ type.  Every occurrence in the program is pointed at the rebuilt type
 constructor, data constructors and workers, and unfoldings that mention the
 old constructors are dropped (stable ones never do: such constructors keep
 their fields exposed).
+
+A rebuilt type is a new TyCon object, and a type that mentions the old one
+leads back to the old fields: in uniplate's Data.Generics.Uniplate.Zipper,
+
+    data Zipper from to = Zipper (Str to -> from) (ZipN to)    -- abstract
+    data ZipN x = ZipN [Str x -> Zip1 x] (Zip1 x)              -- local
+
+result raising raised the arrow in ZipN's field, and ZipN was rebuilt, but
+Zipper's field still mentioned the old ZipN.  Worker/wrapper unboxed a
+Zipper argument through it, and gave the worker the old field type
+(Core Lint: the case binder's type did not match the scrutinee's).  So the
+types that mention a rebuilt type are rebuilt too, transitively: the data
+types defined here that can be rebuilt (rebuildableTyCon), with their
+fields unchanged except for the type constructors they mention.  A type
+that cannot be (a newtype, a class, a family instance, a type with a
+constructor wrapper or an existential) and a type synonym or family
+instance also lead back to the old type; what they reach keeps its fields
+exposed (Referenced, hiddenFields in GHC.WebCore.Pipeline).  Stable
+unfoldings, which transformations leave alone, are pointed at the rebuilt
+types as well.
 
 Defunctionalisation leaves hidden-field webs alone for now: it makes new
 types, which SpecIndex then replaces, and a rebuilt field would have to
@@ -159,8 +180,8 @@ hiddenFieldWebs sigs
 -- signatures changed, and point the (erased) program at them.  Returns the
 -- program and the replaced type constructors, old and new.
 -- See Note [Signatures follow the transformations]
-rebuildHiddenTypes :: WebSigs -> CoreProgram -> (CoreProgram, [(TyCon, TyCon)])
-rebuildHiddenTypes sigs binds
+rebuildHiddenTypes :: WebSigs -> [TyCon] -> CoreProgram -> (CoreProgram, [(TyCon, TyCon)])
+rebuildHiddenTypes sigs local_tcs binds
   | null changed = (binds, [])
   | otherwise    = (map rw_bind binds, [ (tc, new_tc tc) | tc <- changed ])
   where
@@ -177,7 +198,15 @@ rebuildHiddenTypes sigs binds
       | otherwise
       = Nothing
 
-    changed = [ tc | tc <- nonDetEltsUniqSet tcs, any (isJust' . new_fields) (tyConDataCons tc) ]
+    changed0 = [ tc | tc <- nonDetEltsUniqSet tcs, any (isJust' . new_fields) (tyConDataCons tc) ]
+    -- With the types that mention them (Note [Signatures follow the transformations])
+    changed = nonDetEltsUniqSet (close (mkUniqSet changed0))
+    close acc
+      | null more = acc
+      | otherwise = close (acc `unionUniqSets` mkUniqSet more)
+      where more = [ tc | tc <- local_tcs, rebuildableTyCon tc
+                        , not (tc `elementOfUniqSet` acc)
+                        , any (`elementOfUniqSet` acc) (fieldTyCons tc) ]
     tcs = mkUniqSet [ dataConTyCon dc | (dc, _) <- nonDetEltsUFM (ws_dcs sigs)
                                       , ws_hidden_fields sigs (dataConTyCon dc) ]
     isJust' = maybe False (const True)
@@ -219,7 +248,9 @@ rebuildHiddenTypes sigs binds
     rw_bind (NonRec b e) = NonRec (rw_id b) (rw e)
     rw_bind (Rec prs)    = Rec [ (rw_id b, rw e) | (b, e) <- prs ]
 
-    -- A vanilla unfolding that mentions an old constructor is stale
+    -- A vanilla unfolding that mentions an old constructor is stale; a
+    -- stable one mentions none (its constructors keep their fields
+    -- exposed), but may mention the old types
     rw_id v
       | not (isId v) = v
       | otherwise    = drop_stale (setIdType v (ty (idType v)))
@@ -228,6 +259,11 @@ rebuildHiddenTypes sigs binds
         , Just e <- maybeUnfoldingTemplate u
         , any (`elementOfUniqSet` old_dcs) (exprCons e)
         -> setIdUnfolding v noUnfolding
+      u@(CoreUnfolding { uf_tmpl = e })
+        | isStableUnfolding u
+        -> v `setIdUnfolding` u { uf_tmpl = rw e }
+      u@(DFunUnfolding { df_args = as })
+        -> v `setIdUnfolding` u { df_args = map rw as }
       _ -> v
 
     rw expr = case expr of
@@ -253,6 +289,19 @@ rebuildHiddenTypes sigs binds
     rw_con c            = c
 
     orElse = flip fromMaybe
+
+-- | Can a type be rebuilt in place by 'rebuildHiddenTypes'?  It is rebuilt
+-- without constructor wrappers or existentials.
+rebuildableTyCon :: TyCon -> Bool
+rebuildableTyCon tc
+  = isAlgTyCon tc && not (isClassTyCon tc) && not (isNewTyCon tc) && not (isFamInstTyCon tc)
+    && not (null dcs) && all isVanillaDataCon dcs && all (null . dataConWrapId_maybe) dcs
+  where dcs = tyConDataCons tc
+
+-- | The type constructors in the fields of a type's constructors
+fieldTyCons :: TyCon -> [TyCon]
+fieldTyCons tc = nonDetEltsUniqSet (unionManyUniqSets
+                   [ tyConsOfType (scaledThing f) | dc <- tyConDataCons tc, f <- dataConRepArgTys dc ])
 
 -- | The data constructors an expression builds or matches
 exprCons :: CoreExpr -> [DataCon]

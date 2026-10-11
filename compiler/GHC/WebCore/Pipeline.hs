@@ -30,7 +30,8 @@ import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module ( Module, moduleName )
 import GHC.Types.Name ( getOccString )
 import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
-                       , isFamInstTyCon )
+                       , isFamInstTyCon, synTyConRhs_maybe )
+import GHC.Core.FamInstEnv ( famInstRHS )
 import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dataConWrapId_maybe, dataConTyCon )
 import GHC.Types.Avail ( availsToNameSet )
 import GHC.Types.FieldLabel ( flSelector )
@@ -209,7 +210,7 @@ webPass early guts
        ; let binds3a | transformed = reorderTopBinds (eraseProgram sigs_t binds_t)
                      | otherwise   = eraseProgram sigs_t binds_t
              -- Types whose hidden fields changed are rebuilt in place
-             (binds3, rebuilt) = rebuildHiddenTypes sigs_t binds3a
+             (binds3, rebuilt) = rebuildHiddenTypes sigs_t (mg_tcs guts ++ split_tcs) binds3a
              replace tc = maybe tc id (lookup tc rebuilt)
 
          -- If a transformation changed the program, it is not the original;
@@ -326,7 +327,7 @@ pprTypeStats guts split_tcs binds
         ++ [ text "Data splitting copies:"         <+> int (length split_tcs)
            , text "Classes and empty types:"       <+> int (length [ () | NotData <- cls ]) ]
   where
-    classify  = classifyTyCon False guts binds
+    classify  = classifyTyCon False guts split_tcs binds
     cls       = map classify (mg_tcs guts)
     datas     = [ c | c <- cls, not (isNotData c) ]
     internals = [ (abs_, w) | Internal abs_ w <- cls ]
@@ -340,6 +341,7 @@ pprTypeStats guts split_tcs binds
       FamInst      -> "data family instance"
       Existential  -> "existential or GADT"
       Wrapper      -> "constructor wrapper"
+      Referenced   -> "reached from a type that cannot be rebuilt"
 
 {- Note [Main's exports]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -386,7 +388,7 @@ isMainEntry dflags b = occ == fromMaybe "main" (mainFunIs dflags) || take 1 occ 
 hiddenFields :: Bool -> ModGuts -> [TyCon] -> CoreProgram -> TyCon -> Bool
 hiddenFields main_only guts split_tcs binds = \tc -> getUnique tc `elementOfUniqSet` hidden
   where
-    classify = classifyTyCon main_only guts binds
+    classify = classifyTyCon main_only guts split_tcs binds
     -- The types defined here, and the copies data splitting made
     hidden   = mkUniqSet [ getUnique t | t <- mg_tcs guts ++ split_tcs
                                      , Internal _ HiddenFields <- [classify t] ]
@@ -400,12 +402,13 @@ data TyConClass
   | Internal Bool Why    -- ^ internal (exported abstractly?)
 
 data Why = HiddenFields | Pinned | UnsafeCo | NewtypeTc | FamInst | Existential | Wrapper
+         | Referenced
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- The program-wide sets (pinned constructors, unsafely coerced types) are
 -- computed once per module
-classifyTyCon :: Bool -> ModGuts -> CoreProgram -> TyCon -> TyConClass
-classifyTyCon main_only guts binds = classify
+classifyTyCon :: Bool -> ModGuts -> [TyCon] -> CoreProgram -> TyCon -> TyConClass
+classifyTyCon main_only guts split_tcs binds = classify
   where
     classify t
       | not (isAlgTyCon t) || isClassTyCon t || null dcs = NotData
@@ -419,6 +422,7 @@ classifyTyCon main_only guts binds = classify
             | isFamInstTyCon t                                     = FamInst
             | not (all isVanillaDataCon dcs)                       = Existential
             | not (all (null . dataConWrapId_maybe) dcs)           = Wrapper  -- rebuilt without one
+            | getUnique t `elementOfUniqSet` referenced            = Referenced
             | otherwise                                            = HiddenFields
 
     -- Note [Main's exports]: the main module exports no types
@@ -436,6 +440,23 @@ classifyTyCon main_only guts binds = classify
       | otherwise = close (addOneToUniqSet acc (getUnique t))
                           (concat [ nonDetEltsUniqSet (tyConsOfType (scaledThing f))
                                   | dc <- tyConDataCons t, f <- dataConRepArgTys dc ] ++ ts)
+
+    -- Types reachable from a type defined here that cannot be rebuilt in
+    -- place, a type synonym or a family instance: they would lead back to
+    -- the old fields (Note [Signatures follow the transformations] in
+    -- GHC.WebCore.HiddenFields)
+    local_tcs  = mg_tcs guts ++ split_tcs
+    local      = mkUniqSet (map getUnique local_tcs)
+    referenced = reach emptyUniqSet (concat (
+                   [ fieldTyCons t | t <- local_tcs, not (rebuildableTyCon t) ] ++
+                   [ nonDetEltsUniqSet (tyConsOfType rhs) | t <- local_tcs
+                                                          , Just rhs <- [synTyConRhs_maybe t] ] ++
+                   [ nonDetEltsUniqSet (tyConsOfType (famInstRHS fi)) | fi <- mg_fam_insts guts ]))
+    reach acc [] = acc
+    reach acc (t : ts)
+      | getUnique t `elementOfUniqSet` acc     = reach acc ts
+      | not (getUnique t `elementOfUniqSet` local) = reach acc ts
+      | otherwise = reach (addOneToUniqSet acc (getUnique t)) (fieldTyCons t ++ ts)
 
     -- Constructors in Core the transformations do not rewrite: the RULES,
     -- and the binders' own rules and stable unfoldings (which Tidy may put

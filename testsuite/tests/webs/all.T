@@ -286,6 +286,12 @@ test('dataunbox008_dump', [extra_files(['dataunbox008.hs'])],
 # family: a coercion selects into the pair by the list pattern's paths
 # (GHC.Cmm.CommonBlockElim, building GHC with webs)
 test('dataunbox009', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+# dataunbox010: JuicyPixels' Codec.Picture.Metadata.  A match on Refl binds a
+# coercion variable that a cast uses: the field it came from is live (Note
+# [Dead fields] in GHC.WebCore.DataFlatten).
+test('dataunbox010', [extra_files(['dataunbox010.hs', 'Dataunbox010A.hs'])],
+     multimod_compile_and_run,
+     ['dataunbox010', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-data-again'])
 
 # Edge cases for data splitting and unboxing.  001-010 are type-level, with
 # coercions: local, parameterised, eta-reducible, recursive and mutually
@@ -371,6 +377,15 @@ for (suffix, opts) in dsedge_modes:
     test('hfield002' + suffix, [extra_files(['hfield002.hs', 'HField002A.hs']),
                                use_specs({'stdout': 'hfield002.stdout'})],
          multimod_compile_and_run, ['hfield002', opts])
+# hfield005: an abstract type that mentions a local type whose field web is
+# raised is rebuilt too (uniplate's Data.Generics.Uniplate.Zipper).
+for (suffix, opts) in dsedge_modes:
+    test('hfield005' + suffix, [extra_files(['hfield005.hs', 'HField005A.hs']),
+                               use_specs({'stdout': 'hfield005.stdout'})],
+         multimod_compile_and_run, ['hfield005', opts])
+test('hfield005_rr', [extra_files(['hfield005.hs', 'HField005A.hs']),
+                      use_specs({'stdout': 'hfield005.stdout'})],
+     multimod_compile_and_run, ['hfield005', early_opts + ' -fcore-webs-result-raise'])
 # Note [One-shot lambdas from webs] (GHC.WebCore.Transform.OneShot,
 # -fcore-webs-one-shot).  The dump shows which webs' lambdas are one-shot.
 os_opts = early_opts + ' -fcore-webs-one-shot'

@@ -1,0 +1,4 @@
+(Just 640,Just 96,Just "juicy",Nothing)
+(Nothing,Just (ExifLong 7),Nothing)
+[(TagA,ExifLong 7)]
+Metadatas {getMetadatas = [Exif TagA :=> ExifLong 7,Title :=> "juicy",Format :=> SourcePng,Width :=> 640,Height :=> 480,DpiX :=> 72]}

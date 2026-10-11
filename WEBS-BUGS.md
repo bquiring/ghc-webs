@@ -59,6 +59,46 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Dead fields: a coercion bound by a match on Refl counted as unused (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
+  Codec.Picture.Metadata.
+* **Symptom:** Web Lint after annotation: "The coercion variable co is out
+  of scope", in `lookup`'s `Just Refl -> Just v`.
+* **Cause:** keyEq's `Maybe (a :~: b)` was specialised to `Maybe_s a b`, and
+  dead-field elimination dropped Just's field: the only use of its pattern
+  variable was a case on Refl whose binder, a coercion variable, occurred
+  only in a cast (`v |> co`).  The liveness walk (DataFlatten `live`) saw
+  occurrences in expressions only, not in coercions or types.
+* **Fix:** coercion variables free in a cast's coercion, a coercion or type
+  argument, or a case's result type are live.
+* **Guard:** `dataunbox010` (a copy of the module; fails without the fix).
+* **Commit:**
+
+### Rebuilt hidden-field types: types that mention them keep the old ones (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), uniplate-1.6.13,
+  Data.Generics.Uniplate.Zipper (needed by pandoc).
+* **Symptom:** Core Lint after the Simplifier, in worker/wrapper's `$wup`:
+  "Result binder in case doesn't match scrutinee" (`[Str to -> (# [Diff1 to],
+  to #)]` vs `[Str to -> Zip1 to]`).  Needs only -fcore-webs-early and
+  -fcore-webs-result-raise.
+* **Cause:** result raising raised the function web in local ZipN's field,
+  and ZipN was rebuilt in place (new TyCon, same unique).  Zipper (exported
+  abstractly) mentions ZipN in a field and was not rebuilt, so it pointed at
+  the old ZipN object; worker/wrapper unboxed a Zipper argument through it
+  and read the old field types.  The third case of "old and rebuilt types".
+* **Fix:** rebuildHiddenTypes also rebuilds, transitively, every local data
+  type that can be rebuilt in place (rebuildableTyCon) and mentions a
+  rebuilt type, and points stable and DFun unfoldings at the rebuilt types.
+  Types reached from a local type that cannot be rebuilt (newtype, class,
+  wrapper, existential, family instance), a type synonym or a family
+  instance keep their fields exposed (new class `Referenced`).  Note
+  [Signatures follow the transformations] in GHC.WebCore.HiddenFields.
+* **Guard:** `hfield005` (every dsedge mode, plus result raising alone;
+  fails without the fix).
+* **Performance:** `Referenced` can only expose fields that were hidden
+  before; not yet measured on nofib.
+* **Commit:**
+
 ### Annotation rebuilds arrow-free types: out of memory (2026-10-11)
 * **Found by:** building GHC with the webs compiler, GHC.Tc.Errors.Types.
 * **Symptom:** out of memory (4 GB) in the early webs run with only
@@ -564,7 +604,8 @@ What keeps coming back, to check first when something breaks:
   rewrite). Reshape it with the change.
 * **Old and rebuilt types.** Every place that builds a type from a
   constructor or a field (new fields, match binders, construction binders,
-  coercions) must map it through the rebuild (`ty`). Twice so far.
+  coercions) must map it through the rebuild (`ty`), and so must every type
+  that mentions a rebuilt one (uniplate's Zipper). Three times so far.
 * **Recursive types.** Never unfold a type, or a demand along a type,
   without a stopping rule. Splitting can give a recursive type one
   constructor (dropping a constructor never built). A web stored in a field

@@ -31,6 +31,7 @@ import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
+import GHC.Types.Var ( isCoVar )
 import GHC.Types.Basic ( Boxity(..) )
 import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd
                          , DmdSig, mkClosedDmdSig, mkProd, viewProd, mkCall, viewCall, topDmd, absDmd
@@ -39,7 +40,7 @@ import GHC.Types.Cpr ( topCprSig )
 import GHC.Builtin.PrimOps ( primOpOkForSpeculation )
 import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.Core.FVs ( exprFreeVarsList )
-import GHC.Core.TyCo.FVs ( tyConsOfType )
+import GHC.Core.TyCo.FVs ( tyConsOfType, tyCoVarsOfType, tyCoVarsOfCo )
 
 import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable
@@ -760,11 +761,20 @@ flattenFields opts this_mod us tcs binds
       Case (Var v) cb _ [Alt _ bs r]
         | all (`elemVarSet` d) (filter isId bs), cb `elemVarSet` d
                     -> live m d True (Var v) `unionVarSet` live m d dead_ctx r
-      Case x _ _ as -> live m d dead_ctx x `unionVarSet`
+      Case x _ t as -> live m d dead_ctx x `unionVarSet` co_vars (tyCoVarsOfType t) `unionVarSet`
                        unionVarSets [ live m d dead_ctx r | Alt _ _ r <- as ]
-      Cast x _      -> live m d dead_ctx x
+      Cast x co     -> live m d dead_ctx x `unionVarSet` co_vars (tyCoVarsOfCo co)
       Tick _ x      -> live m d dead_ctx x
+      Type t        -> co_vars (tyCoVarsOfType t)
+      Coercion co   -> co_vars (tyCoVarsOfCo co)
       _             -> emptyVarSet
+      where
+        -- A coercion variable is used by the coercions and types it occurs
+        -- in: a match on a GADT constructor (Refl) binds one that a cast
+        -- uses, so the field it came from is live (JuicyPixels'
+        -- Codec.Picture.Metadata: Just Refl -> Just (v |> co))
+        co_vars vs | dead_ctx  = emptyVarSet
+                   | otherwise = filterVarSet isCoVar vs
 
     -- Delete a dead slice: lets of dead variables, and single-alternative
     -- cases on dead variables (their binders are dead too)
