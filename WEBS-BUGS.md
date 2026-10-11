@@ -54,7 +54,7 @@ would catch it again), **commit** (empty while uncommitted).
   the datasplit dumps caught it.  The final version only drops RuntimeRep
   (an exposed class, never split) from the testsuite's copies.
 * **Guard:** `datasplit005`; the pretty-show build.
-* **Commit:**
+* **Commit:** 6ce8c6716c
 
 ### Useless elimination: a join point's result after a deleted parameter (2026-10-11)
 * **Found by:** building network 3.1.2.7 (skylighting's dependencies,
@@ -67,7 +67,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** peel the rewritten binder's join arity (retype_join in
   GHC.WebCore.Transform.Useless).
 * **Guard:** `useless021`; the network build.
-* **Commit:**
+* **Commit:** 6ce8c6716c
 
 ### Useless elimination: a web in a coercion variable's type (2026-10-11)
 * **Found by:** building hashable 1.5.0.0 (skylighting's dependencies, the
@@ -83,7 +83,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** webs in the types of coercion-variable binders are roots too
   (coercionWebs in GHC.WebCore.Transform.Useless).
 * **Guard:** `useless020`; the hashable build.
-* **Commit:**
+* **Commit:** 6ce8c6716c
 
 ### Result raising: a rebuilt case binder mentions dead field binders (2026-10-10)
 * **Found by:** building happy 2.1.3 (the new Hackage benchmarks,
