@@ -56,7 +56,7 @@ would catch it again), **commit** (empty while uncommitted).
   in the pattern, and its coercion is selected at that position
   (patVarRole, patPathRole in GHC.WebCore.DataSpec).
 * **Guard:** `dataunbox009`; the GHC build.
-* **Commit:**
+* **Commit:** `89f414d94a`
 
 ### Data splitting: finding copied constructors by tag is quadratic (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
