@@ -367,6 +367,24 @@ webs as newtypes (the occurs check never fires on nofib).
   Fix: cheap placeholders per occurrence during annotation and Data Lint,
   real types only for the final split classes.
 
+- **Wrapper eta lambdas and defunctionalisation** (to look at; found
+  debugging multiplier's +1.8% against base, 2026-10-10). The boundary
+  split's wrappers eta-expand higher-order parameters (`\p -> f p`, Note
+  [Eta-expanding parameters at the boundary]), and that lambda joins the
+  local copy's parameter web. In multiplier (a Main module without an
+  export list: all 52 functions split, 15 kept) nothing calls the wrappers,
+  so the lambda never exists at run time, but a web with one real lambda
+  now has two: defunctionalisation fires on 8 such webs (`ds p`, `p p`,
+  one constructor never built), +1.2%; useless elimination's 3 extra
+  changes on the newly internal webs, +0.6%. Without the boundary split
+  multiplier equals base. Fix to try: mark wrapper eta lambdas where the
+  split builds them, and do not count them towards defunctionalisation's
+  "at least two lambdas" (and later tell super-beta inlining they are
+  boundary lambdas). hpg's +3.0% is the split too (with defunctionalisation
+  helping, +6.1% without it); the suspected cost is the eta-expanded
+  continuations allocated at every call from another module: confirm with
+  a flag that turns the parameter eta-expansion off alone.
+
 - **Improvements without defunctionalisation** (the user, 2026-10-10;
   eventually, for the paper: a common reviewer criticism is that the gains
   are just defunctionalisation). Measure `early-ulsl` without
