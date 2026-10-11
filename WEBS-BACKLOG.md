@@ -28,7 +28,13 @@ Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
    parameter eta-expansion would show which part costs it. Also: recheck
    treejoin's time serially.
 2. **Next (the user, 2026-10-10): absent results, partial absence, sum
-   results.**
+   results.** Useless elimination done (WEBS-EXPERIMENTS.md §16: −0.57%
+   instructions against dead parameters, mostly dead fields; the forced
+   dual finds little beyond demand analysis). Open: strictness that also
+   requires liveness (vacuously strict dead fields are still evaluated
+   early by web strictness, Note [Do not evaluate dead ends early]); why
+   paraffins gains 45%; dead constructors; dropping filled field slots
+   (data unboxing again after the web passes).
    - **Useless elimination as a constraint fixpoint** (the user's design,
      2026-10-10; dissertation `fixpoint-transformations.tex`, 3cps
      `useless-elimination.sml`). A least fixpoint over booleans, everything

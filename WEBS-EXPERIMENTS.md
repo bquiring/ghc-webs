@@ -558,6 +558,48 @@ variable 390.
   unconstrained type variables to it (parstof's `lexmatch_do`, scs), not
   the optimiser.
 
+## 16. Useless elimination and its strictness dual (2026-10-10)
+
+Useless elimination (`-fcore-webs-useless`, Note [Useless elimination]):
+the user's constraint-fixpoint design on webs, a least fixpoint over local
+variables, web parameters, unboxed-tuple result components and the fields
+of internal types, with live dependency paths; dead lets go, dead
+parameters are deleted or turned into `(# #)`, dead components are dropped,
+dead fields become absent fillers. Against `early-bnd4` (the baseline with
+dead parameters), useless elimination in its place (`early-uls3`), 112
+benchmarks, `timing-useless3b.md`:
+
+| against `base` | instructions | time | allocation |
+|---|---|---|---|
+| `early-bnd4` | −3.51% | −3.99% | −3.76% |
+| `early-uls3` | **−4.05%** | **−4.70%** | **−4.17%** |
+
+`early-uls3` against `early-bnd4`: −0.57% instructions, −0.74% time;
+paraffins −45.3% instructions (−29.9% allocation), ida −2.5%, parstof −1.7%
+(−11.4% allocation); pic +1.0%, multiplier +0.6%. Time changes without
+instruction changes (bspt, integer, fem +7–8%) are layout. Without fields
+(`early-uls2`), useless elimination was −0.01% against `early-bnd4`: it
+finds about 33 more dead parameters than dead parameters (cycles like the
+dissertation's f/g) and 16 webs with dead result components, which change
+little; the gain is the 14 dead fields, almost all of it paraffins'.
+
+The dual (`-ddump-webs-forced`, analysis only, Note [Strictness as the dual
+of liveness], Note [Forced fields]) on nofib: web parameters 6,965 strict of
+23,280, 46 not known to demand analysis; lets 1,975 of 5,830 (with
+let-bound thunks followed), 19 new; fields of internal types 56 of 1,107;
+result components 0 (the 43 before let-following and fields were vacuous).
+Little for a transformation to gain beyond what GHC already does.
+
+Bugs found on the way (WEBS-BUGS.md): one unique bound twice in disjoint
+scopes (fresh binders per round); the dump calling exprIsDeadEnd on web
+forms; and a dead field filled by useless elimination, then evaluated early
+by web strictness (vacuously strict: a greatest fixpoint), in parstof
+(Note [Do not evaluate dead ends early]). Tests: useless001-018,
+poison001-046 (each also in the late run), poison*_forced.
+
+A timing run during heavy background load (a game, 5x slower wall times)
+hit the 10 s timing timeout in 12 benchmarks; it was rerun with 60 s.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
