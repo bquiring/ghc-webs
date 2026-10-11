@@ -57,7 +57,7 @@ would catch it again), **commit** (empty while uncommitted).
   ($wwalkR), unexplained since the change should not alter any result.
 * **Workaround:** none yet; the self-host ulsl build stops at this module.
   Deferred (the user: other benchmarks first).
-* **Commit:**
+* **Commit:** `56cae268d6` (partial)
 
 ### Annotation rebuilds arrow-free types: out of memory (2026-10-11)
 * **Found by:** building GHC with the webs compiler, GHC.Tc.Errors.Types.
@@ -70,7 +70,7 @@ would catch it again), **commit** (empty while uncommitted).
   GHC.WebCore.Annotate): the module's early run peaks at ~500 MB.  Output is
   unchanged (no webs are created for such types).
 * **Guard:** the GHC build; the webs testsuite (unchanged results).
-* **Commit:**
+* **Commit:** `56cae268d6`
 
 ### Data specialisation: nested specialised types in coercions (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
