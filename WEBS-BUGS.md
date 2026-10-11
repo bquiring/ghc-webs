@@ -72,7 +72,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** build those arrows with mkFunctionType, which picks the arrow
   from the argument's kind.
 * **Guard:** `defunc010`, `defunc010_lifted` (fail without the fix).
-* **Commit:**
+* **Commit:** `b0e5aafc16`
 
 ### Unboxing: a field mentioned only by a stable unfolding lost its binding (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
