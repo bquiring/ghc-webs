@@ -50,7 +50,7 @@ would catch it again), **commit** (empty while uncommitted).
   make every occurrence the binder's own Id (syncOccurrences in
   GHC.WebCore.Pipeline, Note [Data splitting again]).
 * **Guard:** `useless019` (rewrite).
-* **Commit:**
+* **Commit:** `7579b380fd`
 
 ### A dead field filled, then evaluated early: "Entered absent arg" (2026-10-10)
 * **Found by:** nofib, `run-useless3.sh` (`early-uls3`, useless elimination
