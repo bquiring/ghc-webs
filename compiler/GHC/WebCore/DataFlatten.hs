@@ -39,7 +39,7 @@ import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isSt
 import GHC.Types.Cpr ( topCprSig )
 import GHC.Builtin.PrimOps ( primOpOkForSpeculation )
 import GHC.Types.Tickish ( GenTickish(..) )
-import GHC.Core.FVs ( exprFreeVarsList )
+import GHC.Core.FVs ( exprFreeVarsList, idUnfoldingVars, idRuleVars )
 import GHC.Core.TyCo.FVs ( tyConsOfType, tyCoVarsOfType, tyCoVarsOfCo )
 
 import GHC.Unit.Module ( Module )
@@ -754,9 +754,11 @@ flattenFields opts this_mod us tcs binds
       App f a       -> live m d dead_ctx f `unionVarSet` live m d dead_ctx a
       Lam _ b       -> live m d dead_ctx b
       Let (NonRec x r) b
-                    -> live m d (dead_ctx || x `elemVarSet` d) r `unionVarSet` live m d dead_ctx b
+                    -> live m d (dead_ctx || x `elemVarSet` d) r `unionVarSet` bndr_vars x
+                       `unionVarSet` live m d dead_ctx b
       Let (Rec prs) b
-                    -> unionVarSets [ live m d (dead_ctx || x `elemVarSet` d) r | (x, r) <- prs ]
+                    -> unionVarSets [ live m d (dead_ctx || x `elemVarSet` d) r `unionVarSet` bndr_vars x
+                                    | (x, r) <- prs ]
                        `unionVarSet` live m d dead_ctx b
       Case (Var v) cb _ [Alt _ bs r]
         | all (`elemVarSet` d) (filter isId bs), cb `elemVarSet` d
@@ -775,6 +777,10 @@ flattenFields opts this_mod us tcs binds
         -- Codec.Picture.Metadata: Just Refl -> Just (v |> co))
         co_vars vs | dead_ctx  = emptyVarSet
                    | otherwise = filterVarSet isCoVar vs
+        -- A live let binder's stable unfolding and rules use what they
+        -- mention: the simplifier may inline the unfolding
+        bndr_vars x | dead_ctx || x `elemVarSet` d = emptyVarSet
+                    | otherwise = idUnfoldingVars x `unionVarSet` idRuleVars x
 
     -- Delete a dead slice: lets of dead variables, and single-alternative
     -- cases on dead variables (their binders are dead too)
@@ -1000,7 +1006,12 @@ flattenFields opts this_mod us tcs binds
       Var v -> [v]
       App f a -> freeIds f ++ freeIds a
       Lam _ x -> freeIds x
-      Let bind x -> concatMap (freeIds . snd) (flattenBinds [bind]) ++ freeIds x
+      -- A let binder's stable unfolding or rules may mention the variable
+      -- when nothing else does (JuicyPixels' Codec.Picture.Gif: vector's
+      -- step1, INLINE, mentions a flattened Int field n1, and n1 must stay
+      -- bound)
+      Let bind x -> concat [ freeIds r ++ nonDetEltsUniqSet (idUnfoldingVars b `unionVarSet` idRuleVars b)
+                           | (b, r) <- flattenBinds [bind] ] ++ freeIds x
       Case s _ _ as -> freeIds s ++ concat [ freeIds r | Alt _ _ r <- as ]
       Cast x _ -> freeIds x
       Tick _ x -> freeIds x

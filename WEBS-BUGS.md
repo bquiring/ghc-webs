@@ -59,6 +59,46 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Unboxing: a field mentioned only by a stable unfolding lost its binding (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
+  Codec.Picture.Gif.
+* **Symptom:** Data Lint in the second data split (-fcore-webs-data-again):
+  "The value variable n1 is out of scope ... In the unfolding of step1".
+* **Cause:** vector's step1 (INLINE) has a stable unfolding that still
+  mentions a stream size field n1, which its simplified right-hand side no
+  longer does.  When the first run unboxed the field, DataFlatten's free
+  variable walk (freeIds) did not look at let binders' unfoldings and rules,
+  saw no use of n1, and did not rebind it.  Dead-field liveness had the
+  same gap: such a field could be dropped, and inlining the unfolding later
+  would reach the absent-error filler.
+* **Fix:** both count the variables of a let binder's unfolding and rules.
+* **Guard:** `dataunbox011` (a RULE active from phase 1 removes the use from
+  the right-hand side but not from the unfolding; fails without the fix).
+* **Commit:**
+
+### Constant propagation: a local binder with a top-level binder's unique (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
+  Codec.Picture.Bitmap.
+* **Symptom:** Web Lint after constant propagation: "Mismatch in type
+  between binder and occurrence: eta_B0 :: Word16 / eta_B0 ::
+  IndexedBmpFormat", in a derived Show function.
+* **Cause:** GHC's eta expansion names binders eta_B0, eta_B1, ...; one
+  became a top-level `eta_B0 :: Word16`, and local lambdas elsewhere were
+  also eta_B0.  isConstant accepted any variable whose unique was in the
+  top-level set, so a local eta_B0 passed to showsPrec counted as the
+  top-level constant, and the parameter was replaced by it.  The rewrite
+  also substituted under binders that shadow the parameter or the
+  constant's variable.
+* **Fix:** the analysis tracks local binders in scope (a variable is a
+  top-level constant only if none shadows it); the rewrite does not
+  substitute under a binder that shadows the parameter or the constant's
+  variable (Note [Constants and shadowing] in
+  GHC.WebCore.Transform.ConstProp).
+* **Guard:** the JuicyPixels build; no small reproduction (the collision
+  comes from GHC's earlier passes on vector code).  Testsuite dumps
+  unchanged.
+* **Commit:**
+
 ### Dead fields: a coercion bound by a match on Refl counted as unused (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), JuicyPixels-3.3.9,
   Codec.Picture.Metadata.

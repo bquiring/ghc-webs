@@ -292,6 +292,10 @@ test('dataunbox009', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunbox010', [extra_files(['dataunbox010.hs', 'Dataunbox010A.hs'])],
      multimod_compile_and_run,
      ['dataunbox010', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-data-again'])
+# dataunbox011: a field mentioned only by a let binder's stable unfolding
+# stays bound and live (JuicyPixels' Codec.Picture.Gif).
+test('dataunbox011', [], compile_and_run,
+     [ds_opts + ' -fcore-webs-data-unbox -fcore-webs-data-again'])
 
 # Edge cases for data splitting and unboxing.  001-010 are type-level, with
 # coercions: local, parameterised, eta-reducible, recursive and mutually
