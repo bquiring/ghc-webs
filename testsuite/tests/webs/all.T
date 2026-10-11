@@ -452,3 +452,9 @@ for n in [1, 6, 13, 16, 19, 36, 40, 41, 43]:
     name = 'poison%03d' % n
     test(name + '_forced', [extra_files([name + '.hs']), grep_errmsg(r'^Forced')],
          multimod_compile, [name, poison_early + ' -ddump-webs-forced'])
+
+# Note [Result raising]: a case binder rebuilt from field binders one of
+# which is a wildcard (found building happy's generated parser)
+test('resraise_alias', [], compile_and_run, [early_opts + ' -fcore-webs-result-raise'])
+test('resraise_alias_late', [extra_files(['resraise_alias.hs'])],
+     multimod_compile_and_run, ['resraise_alias', rr_opts])

@@ -36,6 +36,19 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Result raising: a rebuilt case binder mentions dead field binders (2026-10-10)
+* **Found by:** building happy 2.1.3 (the new Hackage benchmarks,
+  webs-bench/hackage/) with early-ulsl and `-dcore-lint`.
+* **Symptom:** Web Lint after result raising: "Occurrence of a dead Id"
+  in happyReduce (happy's generated parser).
+* **Cause:** `case f x of b { K y1 _ -> .. b .. }` becomes
+  `case f x of (# y1, y2 #) -> let b = K y1 y2 in ..`; the wildcard's binder
+  keeps its dead occurrence info, and the rebuilt K now mentions it.
+* **Fix:** zap the field binders' occurrence info when the case binder is
+  rebuilt (GHC.WebCore.Transform.ResultRaise).
+* **Guard:** `resraise_alias`, `resraise_alias_late`; the happy build.
+* **Commit:**
+
 ### Data splitting again: binding order and stale occurrences (2026-10-10)
 * **Found by:** nofib, `run-uselessda.sh` (`early-ulsda`,
   `-fcore-webs-data-again`): spectral/rewrite did not build.

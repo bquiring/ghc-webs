@@ -459,12 +459,17 @@ rewriteProgram fields todo pol binds
                     (env2, ys') = rw_bndrs env1 ys
               ; rhs' <- rw env2 rhs
               ; let ty_args = map Type (tyConAppArgs (idType b'))
-                    alias | b `elemVarSet` exprOccurrences rhs
-                          = [NonRec b' (mkCoreConApps dc (ty_args ++ map Var ys'))]
+                    used_b = b `elemVarSet` exprOccurrences rhs
+                    -- The alias mentions every field binder, even those
+                    -- marked dead (wildcards): zap their occurrence info
+                    -- (Web Lint: "Occurrence of a dead Id"; happy's parser)
+                    ys'' | used_b    = map zapIdOccInfo ys'
+                         | otherwise = ys'
+                    alias | used_b    = [NonRec b' (mkCoreConApps dc (ty_args ++ map Var ys''))]
                           | otherwise = []
               ; wild <- mkWild (exprType scrut')
               ; return (Case scrut' wild (upTy ty)
-                          [Alt (DataAlt (tupleDataCon Unboxed (length ys'))) ys'
+                          [Alt (DataAlt (tupleDataCon Unboxed (length ys''))) ys''
                                (mkLets alias rhs')]) }
 
       Case scrut b ty alts
