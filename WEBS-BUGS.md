@@ -54,7 +54,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** the GHC build (GHC.Hs.Type).  No small reproduction found: the
   simplifier removes the cast pairs that would carry such a SelCo in small
   programs (attempts with XRec/NoGhcTc-like families).
-* **Commit:**
+* **Commit:** `b228cf6240`
 
 ### Data splitting: a type used as a kind is copied (2026-10-11)
 * **Found by:** building pretty-show 1.10 (skylighting's dependencies,
