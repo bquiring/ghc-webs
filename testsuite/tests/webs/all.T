@@ -457,6 +457,8 @@ test('useless020', [], compile_and_run,
 test('useless021', [], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary -fcore-webs-data-again'])
+# 022: runRW# in a masked tail, jumping to a join point (http2)
+test('useless022', [], compile_and_run, [useless_opts])
 test('useless017', [], compile_and_run,
      [useless_opts + ' -O2 -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-data-split'
       ' -fcore-webs-data-unbox -fcore-webs-defunc -fcore-webs-boundary'])

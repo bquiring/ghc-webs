@@ -30,7 +30,8 @@ import GHC.Types.Id
 import GHC.Types.Id.Info ( ruleInfoFreeVars, RecSelParent(..) )
 import GHC.Data.Pair
 import GHC.Types.Tickish
-import GHC.Types.Unique ( getKey, getUnique )
+import GHC.Types.Unique ( getKey, getUnique, hasKey )
+import GHC.Builtin.Names ( runRWKey )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
@@ -460,6 +461,28 @@ call of a web in such a tail makes ERes w i live if xs_i is, and is adapted
 to the live components).  Arity raising wraps calls this way:
 case (case x of I# n -> f n) of (# a, _ #) -> ..
 -}
+
+{- Note [runRW# in a masked tail]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+runRW# f is in tail position whenever its call is, and f's body may jump to
+join points bound outside (Core Lint allows it, Note [Linting of runRW#]):
+
+    join j s = .. in .. runRW# @r @(# State# RealWorld, () #) (\s -> .. jump j s' ..)
+
+When such a tail's result components are masked (the () above is dead), j
+returns the masked tuple, and so must the body of f.  Adapting the runRW#
+call as any other call (case runRW# .. of (# a, _ #) -> (# a #)) took it
+out of tail position, where the jumps inside are invalid, and left f's
+body returning the old type (http2's Network.HTTP2.H2.Receiver).  So the
+rewrite goes into f's body as a tail, and instantiates runRW# at the masked
+type.
+-}
+
+-- | runRW# @r @o @^w (\^w2 s -> body)
+runRWApp :: CoreExpr -> Maybe (Id, WebId, Type, WebId, Id, CoreExpr)
+runRWApp (WebApp w (App (App (Var v) (Type _)) (Type o)) (WebLam w2 s body))
+  | v `hasKey` runRWKey = Just (v, w, o, w2, s, body)
+runRWApp _ = Nothing
 
 -- | The context for the scrutinee of this case, if any
 -- See Note [Scrutinised constructions]
@@ -950,7 +973,13 @@ rewriteProgram del unit masks dead_lets dead_fields dead_cfields pol binds
       Case scrut b ty alts
         -> rw_case env scrut b ty alts (tail_ty ty) (\env' e -> rw_tail_m env' m e)
       Tick t e | not (tickishIsCode t) -> Tick (rw_tick env t) <$> rw_tail_m env m e
-      _ | Just (_, vals) <- tupleApp expr
+      -- Note [runRW# in a masked tail]
+      _ | Just (rr, w, o_ty, w2, s, body) <- runRWApp expr
+        , Just cs <- tupleComps o_ty, length cs == length m
+        -> do { lam' <- rw_lam env w2 s body (\env' e' -> rw_tail_m env' m e')
+              ; let o_ty' = tail_ty o_ty
+              ; return (WebApp w (mkTyApps (Var rr) [getRuntimeRep o_ty', o_ty']) lam') }
+        | Just (_, vals) <- tupleApp expr
         , length vals == length m
         -> do { let keep = [ v | (v, True) <- zip vals m ]
                     drop_eval = [ v | (v, False) <- zip vals m, needsEval v ]

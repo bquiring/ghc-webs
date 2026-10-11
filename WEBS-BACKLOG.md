@@ -404,6 +404,13 @@ webs as newtypes (the occurs check never fires on nofib).
   (multiplier: it fires on webs whose second lambda is a dead wrapper eta
   lambda) and helps hpg (+6.1% without it).
 
+- Useless elimination re-adapts the same scrutinised unboxed tuple every
+  round: in `useless022`, `unsafeFreezeByteArray#`'s `(# s, ba #)` ends up
+  under eleven nested `case .. of (# w #) -> (# w #)`.  Harmless at run time
+  (the simplifier removes them), but compile time and dump size grow with
+  the rounds; an adapter case should be recognised and not wrapped again.
+  Seen 2026-10-11 while fixing the http2 runRW# bug.
+
 ## Ideas to test
 
 - **Constructed arguments with known calls.** The early run leaves

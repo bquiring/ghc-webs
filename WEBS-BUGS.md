@@ -59,6 +59,26 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Useless elimination: runRW# in a masked tail took its jumps out of tail position (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl), http2-5.4.8,
+  Network.HTTP2.H2.Receiver (needed by pandoc).
+* **Symptom:** Web Lint after useless elimination: "Invalid occurrence of a
+  join variable", and "Type of case alternatives not the same as the
+  annotation on case" ((# State# RealWorld #) vs (# State# RealWorld, () #)).
+* **Cause:** with -XStrict, Short.toShort's runRW# is evaluated before
+  throwIO, and the simplifier moved the rest of the IO action, which jumps
+  to a join point, into runRW#'s argument (Note [Simplification of runRW#]).
+  The action's () result was dead, so the join point returned the masked
+  tuple; the masked-tail rewrite treated the runRW# call as any other call
+  and adapted it (case runRW# .. of (# a, _ #) -> (# a #)), which took it
+  out of tail position and left its argument returning the old type.
+* **Fix:** a runRW# call in a masked tail stays a tail: its argument's body
+  is rewritten as the tail, and runRW# is instantiated at the masked type
+  (Note [runRW# in a masked tail] in GHC.WebCore.Transform.Useless).
+* **Guard:** `useless022` (a byte array built under runRW# in a strict
+  field before throwIO; fails without the fix).
+* **Commit:**
+
 ### Defunctionalisation: lambdas that take class dictionaries (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), hpke-0.2.1,
   Crypto.HPKE.AEAD (needed by pandoc and hledger).
