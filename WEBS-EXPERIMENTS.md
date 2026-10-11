@@ -574,6 +574,19 @@ benchmarks, `timing-useless3b.md`:
 | `early-bnd4` | −3.51% | −3.99% | −3.76% |
 | `early-uls3` | **−4.05%** | **−4.70%** | **−4.17%** |
 
+**Why paraffins gains 45%.** It only counts: `length` of lists of
+radicals and paraffins, never a look inside `data Radical = H | C Radical
+Radical Radical`. So all three fields of `C` are dead (each `C ri rj rk`'s
+fields only go into other `C`s and paraffins, which are never matched).
+Useless elimination replaces them with absent fillers, every construction
+becomes `C absent absent absent`, a constant, and GHC floats it to one
+static closure (`lvl8 = C lvl7 lvl7 lvl7`): the program no longer allocates
+a `C` cell per radical. 17: 52.1 GB to 35.1 GB allocated, 6.4 s to 3.7 s
+MUT. In general: when every field of a constructor is dead, all its
+constructions collapse into one shared value. With
+`-fcore-webs-data-again` the fields are then dropped from the type (`C_r14`
+becomes nullary), which saves nothing more here.
+
 `early-uls3` against `early-bnd4`: −0.57% instructions, −0.74% time;
 paraffins −45.3% instructions (−29.9% allocation), ida −2.5%, parstof −1.7%
 (−11.4% allocation); pic +1.0%, multiplier +0.6%. Time changes without
