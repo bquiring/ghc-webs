@@ -694,10 +694,11 @@ Caveats: a first look, not final numbers.
   Agda (does not build with this GHC snapshot at all) are set aside.
 
 hledger is the one regression (+1.0% instructions, +1.7% allocation; its
-time column is noisier).  Not yet examined.  Building the group found ten
-webs bugs (WEBS-BUGS.md, 2026-10-11: uniplate, JuicyPixels x3, hpke,
-http2, ShellCheck, aeson's letrecE, and the defunctionalisation and data
-splitting memory blowups), all but the data-splitting one fixed.
+time column is noisier).  Not yet examined.  Building the group found nine
+webs bugs (WEBS-BUGS.md, 2026-10-11): eight fixed (uniplate, JuicyPixels
+x3, hpke, http2, defunctionalisation's memory use on ShellCheck.Parser,
+aeson's letrecE miscompilation) and one open (data splitting's memory use
+on very large modules).
 
 ## Findings along the way
 
