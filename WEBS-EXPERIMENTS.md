@@ -702,23 +702,26 @@ on very large modules).
 
 ## 19. SML benchmarks translated to Haskell: base vs early-ulsl (2026-10-12)
 
-The 3CPS test suite's SML programs (~/projects/3cps/3cps-main/test/programs/
-llvm-sml, John Reppy's and others' benchmarks), translated to Haskell in
-~/projects/webs-hackage-bench/sml (README there): ordinary lazy Haskell (no
-strictness annotations, so the strictness analyses have to find what SML
-evaluates eagerly), the same algorithms and data structures, each repeated
-to ~1 s, each printing what its SML original prints (checked against the
-MLton executables).  boyer, life and nucleic are left out (nofib has them).
-early-ulsl with -dcore-lint, -O2; 3 interleaved rounds on one pinned CPU,
-medians.  Instructions and allocation are the reliable columns (tak: +7.5%
-time with identical instructions).
+The 3CPS test suite's SML programs (~/projects/3cps/3cps-main/test/programs/:
+llvm-sml, mostly John Reppy's and others' classic benchmarks, and
+higher-order, programs written to exercise higher-order behaviour),
+translated to Haskell in ~/projects/webs-hackage-bench/sml (README there):
+ordinary lazy Haskell (no strictness annotations, so the strictness
+analyses have to find what SML evaluates eagerly), the same algorithms and
+data structures, each repeated to ~1 s with an opaque zero added to its
+inputs so nothing is floated out of the loop, each printing what its SML
+original prints (checked against MLton executables).  boyer, life and
+nucleic are left out (nofib has them).  early-ulsl with -dcore-lint, -O2;
+3 interleaved rounds on one pinned CPU, medians.  Instructions and
+allocation are the reliable columns (tak: +10% time with identical
+instructions).  All 39 built without a webs bug.
 
 | benchmark | base instr. (G) | instructions | allocation |
 |---|---|---|---|
 | ack | 16.45 | -0.04% | 0 |
 | tak | 15.01 | 0 | 0 |
 | cpstak | 12.94 | **+82.00%** | +6.87% |
-| y-fact | 20.24 | **-17.75%** | -100% |
+| y-fact | 20.24 | **-17.75%** | -100.00% |
 | nqueens | 9.46 | **-22.48%** | -14.73% |
 | mandelbrot | 14.52 | +1.47% | 0 |
 | quicksort | 11.26 | 0 | 0 |
@@ -736,13 +739,39 @@ time with identical instructions).
 | ratio-regions | 11.55 | **-17.82%** | -31.97% |
 | k-cfa | 14.29 | +1.88% | +0.10% |
 | mc-ray | 14.52 | -8.30% | -0.48% |
-| geomean | | -1.67% | (y-fact's -100% makes it meaningless) |
+| *higher-order/* | | | |
+| defunctionalization | 14.05 | **-19.95%** | -44.26% |
+| returned-closures | 11.51 | +1.97% | 0 |
+| function-composition | 19.58 | **-31.30%** | -28.57% |
+| mutual-recursion-ho | 12.71 | **-31.10%** | -27.16% |
+| tree-fold-ho | 8.30 | **+32.14%** | +43.85% |
+| curry-uncurry | 14.20 | -0.16% | -3.12% |
+| closure-capture | 8.69 | **-32.29%** | -50.00% |
+| higher-order-list | 11.73 | +1.53% | -0.80% |
+| church-encoding | 22.00 | 0 | 0 |
+| cps-explicit | 7.48 | -7.97% | -8.77% |
+| callback-state | 21.15 | 0 | 0 |
+| environment-sharing | 11.15 | **-29.45%** | -46.98% |
+| polymorphic-ho | 7.01 | **-40.56%** | -50.00% |
+| continuation-combinators | 17.39 | **-21.26%** | -33.33% |
+| applicative-functor | 16.80 | **-11.70%** | -9.20% |
+| tree-traversal-ho | 13.24 | -1.73% | -5.08% |
+| register-allocator | 11.26 | **-15.63%** | -20.37% |
+| dpll-sat | 8.06 | -1.26% | 0 |
+| geomean, llvm-sml (21) | | -1.67% | |
+| geomean, higher-order (18) | | -13.28% | |
+| geomean, all 39 | | -7.21% | |
 
-Much larger effects than nofib or the Hackage programs, both ways: six
-benchmarks gain 8-25%, and cpstak (+82%, the CPS Takeuchi function),
-twenty-four (+12.6%, CPS backtracking) and json-decode (+6.6%, allocation
-x2.4) regress.  Not examined yet (the user: regressions later).  All
-built without a webs bug.
+The higher-order programs are what webs was designed for, and it shows:
+13 of 18 improve, 9 by 15-40% (polymorphic-ho -41%, closure-capture -32%,
+function-composition -31%, mutual-recursion-ho -31%, environment-sharing
+-29%), with allocation often halved.  The llvm-sml set is mixed: raytracer
+-25%, nqueens -22%, ratio-regions and y-fact -18%.  Regressions, not
+examined yet (the user: regressions later): cpstak +82% (CPS Takeuchi),
+tree-fold-ho +32% (a generic fold with several function pairs),
+twenty-four +12.6% (CPS backtracking), json-decode +6.6% (allocation x2.4),
+parser-comb +5.5%.  The allocation geomean is not meaningful (y-fact drops
+to almost nothing).
 
 ## Findings along the way
 
