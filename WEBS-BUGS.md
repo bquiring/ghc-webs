@@ -84,7 +84,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Also:** the ulsl store builds made before the fix (aeson and whatever
   else uses atomicModifyIORef this way) are miscompiled; cabal does not
   rebuild them by itself (same flags, same hash).
-* **Commit:**
+* **Commit:** `4623d859d3`
 
 ### Defunctionalisation: the analysis ran ShellCheck.Parser out of memory (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), ShellCheck-0.11.0,
