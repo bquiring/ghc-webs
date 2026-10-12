@@ -663,6 +663,42 @@ it.  Building them found four compiler bugs (WEBS-BUGS.md, 2026-10-10/11:
 result raising's case binder, useless elimination's coercion variables and
 join arities, data splitting's kind-level types), all fixed.
 
+## 18. Large Hackage programs: base vs early-ulsl (2026-10-11)
+
+The second group in ~/projects/webs-hackage-bench (`large/`): ShellCheck
+0.11.0 checking GHC's libraries/unix/configure (7.9k lines; GHC's own
+19k-line configure needs more than 12 GB even without webs), hledger 1.52.4
+on a generated 100,000-transaction journal (balance --tree --monthly
+--value=then,$), and dhall 1.42.3 type-checking its Prelude without the
+import cache.  Same setup as §17 (-O2, every non-boot package with the
+configuration's flags, early-ulsl with -dcore-lint), 3 interleaved rounds on
+one pinned CPU, medians; all outputs identical to base.
+
+| benchmark | base time (s) | base instr. (G) | instructions | time | allocation |
+|---|---|---|---|---|---|
+| shellcheck | 8.05 | 69.90 | -0.35% | -0.67% | +0.15% |
+| hledger | 4.82 | 41.45 | +0.95% | +3.67% | +1.73% |
+| dhall | 0.51 | 2.35 | -0.01% | -1.55% | -0.07% |
+| geomean | | | +0.20% | +0.46% | +0.60% |
+
+Caveats: a first look, not final numbers.
+
+* ShellCheck's early-ulsl build has data splitting, unboxing and data-again
+  off (data splitting runs ShellCheck.Parser out of memory: WEBS-BUGS.md,
+  open entry), so it measures the other transformations only.
+* The store mixes packages built by successive versions of the webs
+  compiler during the bug fixes of 2026-10-11 (only aeson and its dependents
+  were rebuilt after the atomicModifyMutVar2# miscompilation).  A clean
+  rebuild of every package is planned before final numbers.
+* pandoc (out of memory in Text.Pandoc.Readers.LaTeX under early-ulsl) and
+  Agda (does not build with this GHC snapshot at all) are set aside.
+
+hledger is the one regression (+1.0% instructions, +1.7% allocation; its
+time column is noisier).  Not yet examined.  Building the group found ten
+webs bugs (WEBS-BUGS.md, 2026-10-11: uniplate, JuicyPixels x3, hpke,
+http2, ShellCheck, aeson's letrecE, and the defunctionalisation and data
+splitting memory blowups), all but the data-splitting one fixed.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
