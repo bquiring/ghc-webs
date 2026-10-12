@@ -55,8 +55,16 @@ would catch it again), **commit** (empty while uncommitted).
   making mapTyCons keep unchanged subtrees shared: did not help, and broke
   recweb/hfield/poison013 tests with an Int/Int# mismatch in a worker
   ($wwalkR), unexplained since the change should not alter any result.
-* **Workaround:** none yet; the self-host ulsl build stops at this module.
-  Deferred (the user: other benchmarks first).
+* **Also:** ShellCheck.Parser (300k terms, parsec) runs out of 8 GB in data
+  splitting (confirmed: it compiles with data splitting off, 1.3 GB, once the
+  defunctionalisation fix below is in); pandoc's Text.Pandoc.Readers.LaTeX
+  (parsec) runs out of 8 GB under early-ulsl, probably the same (not
+  confirmed).
+* **Workaround:** none in the compiler yet.  The self-host ulsl build stops
+  at GHC.Tc.Errors.Types; the Hackage large group builds ShellCheck with
+  data splitting off (large/ulsl.extra, not for benchmarking) and sets pandoc
+  aside.  Deferred (the user: other benchmarks first; capping copies is a
+  heuristic decision for the user).
 * **Commit:** `56cae268d6` (partial)
 
 ### Data splitting: atomicModifyIORef's pair is read by the RTS (2026-10-11)
