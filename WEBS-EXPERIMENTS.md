@@ -700,6 +700,50 @@ x3, hpke, http2, defunctionalisation's memory use on ShellCheck.Parser,
 aeson's letrecE miscompilation) and one open (data splitting's memory use
 on very large modules).
 
+## 19. SML benchmarks translated to Haskell: base vs early-ulsl (2026-10-12)
+
+The 3CPS test suite's SML programs (~/projects/3cps/3cps-main/test/programs/
+llvm-sml, John Reppy's and others' benchmarks), translated to Haskell in
+~/projects/webs-hackage-bench/sml (README there): ordinary lazy Haskell (no
+strictness annotations, so the strictness analyses have to find what SML
+evaluates eagerly), the same algorithms and data structures, each repeated
+to ~1 s, each printing what its SML original prints (checked against the
+MLton executables).  boyer, life and nucleic are left out (nofib has them).
+early-ulsl with -dcore-lint, -O2; 3 interleaved rounds on one pinned CPU,
+medians.  Instructions and allocation are the reliable columns (tak: +7.5%
+time with identical instructions).
+
+| benchmark | base instr. (G) | instructions | allocation |
+|---|---|---|---|
+| ack | 16.45 | -0.04% | 0 |
+| tak | 15.01 | 0 | 0 |
+| cpstak | 12.94 | **+82.00%** | +6.87% |
+| y-fact | 20.24 | **-17.75%** | -100% |
+| nqueens | 9.46 | **-22.48%** | -14.73% |
+| mandelbrot | 14.52 | +1.47% | 0 |
+| quicksort | 11.26 | 0 | 0 |
+| filter | 18.19 | 0 | 0 |
+| derivative | 14.21 | -0.32% | -3.30% |
+| streams | 18.53 | -5.81% | 0 |
+| tardis | 13.64 | -4.50% | -2.69% |
+| interpreter | 17.19 | -8.95% | -14.25% |
+| parser-comb | 13.00 | +5.48% | -10.39% |
+| twenty-four | 18.07 | **+12.58%** | +15.31% |
+| json-decode | 16.01 | +6.60% | +143.65% |
+| cps-convert | 14.63 | +0.48% | -0.65% |
+| knuth-bendix | 9.86 | 0 | +0.82% |
+| raytracer | 15.56 | **-25.21%** | -30.52% |
+| ratio-regions | 11.55 | **-17.82%** | -31.97% |
+| k-cfa | 14.29 | +1.88% | +0.10% |
+| mc-ray | 14.52 | -8.30% | -0.48% |
+| geomean | | -1.67% | (y-fact's -100% makes it meaningless) |
+
+Much larger effects than nofib or the Hackage programs, both ways: six
+benchmarks gain 8-25%, and cpstak (+82%, the CPS Takeuchi function),
+twenty-four (+12.6%, CPS backtracking) and json-decode (+6.6%, allocation
+x2.4) regress.  Not examined yet (the user: regressions later).  All
+built without a webs bug.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
