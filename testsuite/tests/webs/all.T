@@ -246,6 +246,18 @@ test('datasplit005', [], compile_and_run, [ds_opts])
 # datasplit006 (generated): 2000 constructors matched by case tables; finding
 # copied constructors by tag was quadratic (GHC.Builtin.PrimOps, out of memory)
 test('datasplit006', [], compile_and_run, [ds_opts])
+# datasplit007, datasplit008: atomicModifyIORef's pair is read by the RTS
+# (atomicModifyMutVar2#, a selector thunk on its first field), so it is not
+# split (Note [Non-parametric functions] in GHC.WebCore.DataSplit); 008 is
+# aeson's letrecE, run in IO.  With unboxing (dead fields) and with useless
+# elimination (absent fillers).
+for (suffix, extra) in [('_unbox', ' -fcore-webs-data-unbox'), ('_useless', ' -fcore-webs-useless')]:
+    test('datasplit007' + suffix, [extra_files(['datasplit007.hs']),
+                                   use_specs({'stdout': 'datasplit007.stdout'})],
+         multimod_compile_and_run, ['datasplit007', ds_opts + extra])
+    test('datasplit008' + suffix, [extra_files(['datasplit008.hs', 'Datasplit008A.hs']),
+                                   use_specs({'stdout': 'datasplit008.stdout'})],
+         multimod_compile_and_run, ['datasplit008', ds_opts + extra + ' -package template-haskell'])
 
 # Note [Flattening fields] (GHC.WebCore.DataFlatten, -fcore-webs-data-unbox):
 # the split tests again, with the product fields of the new types unboxed

@@ -31,6 +31,7 @@ import GHC.Core.Utils ( exprType )
 import GHC.Data.Bag
 
 import GHC.Types.Id
+import GHC.Builtin.PrimOps ( PrimOp(AtomicModifyMutVar2Op) )
 import GHC.Types.Id.Make ( mkDataConWorkId )
 import GHC.Types.Name
 import GHC.Types.Name.Env ( emptyNameEnv )
@@ -495,6 +496,8 @@ exposed), and so do kinds.  The rewrite maps copies in coercions too.
 -- representations of its type arguments (Note [Non-parametric functions])
 nonParametric :: Id -> Bool
 nonParametric v
+  | Just AtomicModifyMutVar2Op <- isPrimOpId_maybe v
+  = True
   | Just m <- nameModule_maybe (idName v)
   , moduleNameString (moduleName m) `elem` ["GHC.Internal.Unsafe.Coerce", "Unsafe.Coerce"]
   = True
@@ -513,6 +516,16 @@ unboxed) independently, and the program would read one layout as the other
 Unsafe.Coerce keep their original types: what passes through them meets the
 original types and is exposed.  (A UnivCo keeps its types for the same
 reason; Note [Copies in coercions].)
+
+atomicModifyMutVar2# :: MutVar# s a -> (a -> c) -> State# s -> (# State# s, a, c #)
+is not parametric in c either: the RTS takes the new contents out of f's
+result with a selector thunk on its first field, so c must be a pair-like
+constructor whose first field is the new value.  No case in the program
+reads that field, so with c a split copy, dead-field elimination dropped it
+(and useless elimination filled it with an absent error), and the IORef got
+the second field instead (aeson's Data.Aeson.Internal.TH, whose letrecE
+uses atomicModifyIORef: GHC segfaulted running deriveToJSON's splices;
+test datasplit007).
 -}
 
 {- Note [Types used as kinds]

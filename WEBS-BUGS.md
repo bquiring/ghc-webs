@@ -59,6 +59,33 @@ would catch it again), **commit** (empty while uncommitted).
   Deferred (the user: other benchmarks first).
 * **Commit:** `56cae268d6` (partial)
 
+### Data splitting: atomicModifyIORef's pair is read by the RTS (2026-10-11)
+* **Found by:** the large Hackage group (early-ulsl): GHC segfaulted
+  compiling pandoc-types' Text.Pandoc.Definition, running aeson's
+  deriveToJSON splices (aeson compiled with webs).  Bisected to aeson's
+  Data.Aeson.Internal.TH, then reproduced without Template Haskell (letrecE
+  run in IO).
+* **Symptom:** segfault with -fcore-webs-data-split -fcore-webs-data-unbox;
+  `absent error` abort with -fcore-webs-data-split -fcore-webs-useless.
+  Data Lint and Core Lint pass: a miscompilation.
+* **Cause:** letrecE records bindings with atomicModifyIORef ref (\m ->
+  (Map.insert .., ())).  The pair is atomicModifyMutVar2#'s result type c,
+  polymorphic in its signature, so splitting took it as parametric and split
+  it.  But the RTS takes the IORef's new contents out of it with a selector
+  thunk on its first field, a read no case shows: dead-field elimination
+  dropped that field (useless elimination filled it with an absent error),
+  and the IORef got () as its Map.
+* **Fix:** atomicModifyMutVar2# is a non-parametric function: its type
+  arguments keep their types (Note [Non-parametric functions] in
+  GHC.WebCore.DataSplit).
+* **Guard:** `datasplit007` (a memo table updated with atomicModifyIORef),
+  `datasplit008` (aeson's letrecE), each with unboxing and with useless
+  elimination; all four fail without the fix.
+* **Also:** the ulsl store builds made before the fix (aeson and whatever
+  else uses atomicModifyIORef this way) are miscompiled; cabal does not
+  rebuild them by itself (same flags, same hash).
+* **Commit:**
+
 ### Defunctionalisation: the analysis ran ShellCheck.Parser out of memory (2026-10-11)
 * **Found by:** the large Hackage group (early-ulsl), ShellCheck-0.11.0,
   ShellCheck.Parser (300k terms after simplification, parsec throughout).

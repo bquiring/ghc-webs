@@ -1,0 +1,13 @@
+let {_let5_0 = 0;
+     _let0_1 = 1;
+     _let1_2 = 2;
+     _let2_3 = 3;
+     _let3_4 = 4;
+     _let4_5 = 5}
+ in _let0_1 + (_let1_2 + (_let2_3 + (_let3_4 + (_let4_5 + _let5_0))))
+let {_let4_0 = 0;
+     _let3_1 = 1 + _let4_0;
+     _let2_2 = 1 + _let3_1;
+     _let1_3 = 1 + _let2_2;
+     _let0_4 = 1 + _let1_3}
+ in _let0_4
