@@ -36,6 +36,52 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Data splitting never split lists in a program with IO (2026-10-13)
+* **Found by:** nofib after the reporting audit: `early-ulsl2` (early-ulsl's
+  options, current compiler) −2.93% instructions against base where
+  `early-ulsl` (built 2026-10-11 01:47) had −4.49%; integer (−74%) and
+  queens (−20%) lost everything, cryptarithm2, typecheck and constraints
+  most.
+* **Symptom:** in queens, every class exposed and nothing split (before:
+  the list split, specialised to Int and unboxed).
+* **Cause:** Note [Types used as kinds] (6ce8c6716c, ten minutes after
+  early-ulsl was built, for pretty-show) excluded a type that occurs in some
+  type next to one of its own promoted constructors.  An unboxed tuple's
+  hidden representation arguments count: getArgs's (# State# RealWorld,
+  [String] #) has the representation TupleRep '[], so [] was "used as a
+  kind" in every program with IO, and lists were never copied.
+* **Fix:** a type is used as a kind if it is in a type variable's kind or in
+  a dependent (named) argument of a type constructor (SingI's kind argument
+  in pretty-show's case, a promoted constructor's kind argument); the
+  -ddump-webs-data dump lists the copyable types left out, with a witness
+  type under -dppr-debug.
+* **Guard:** `datasplit009` (a list split in a program with IO);
+  `datasplit005` still checks pretty-show's case.  Every nofib and Hackage
+  result with data splitting since 2026-10-11 has lists unsplit:
+  WEBS-EXPERIMENTS.md figures from early-ulsl builds after that date, and
+  the Hackage groups' configurations with data splitting, need a rerun
+  (`nods` has none).
+* **Commit:** (this entry's commit)
+
+### Data splitting: quadratic list code; GHC.Tc.Errors.Types takes an hour (2026-10-13)
+* **Found by:** the self-host build (OPEN entry below), profiled alone: 63
+  minutes, 2.0 GB maximum residency, 77% of the time in GC; ~3,100 s in the
+  untimed data-splitting passes.
+* **Cause:** list operations that grow with the number of copies and
+  classes: each class's members appended to (`old ++ [x]` under a lazy
+  foldl), the pairs from casts looked up in a list per Data Lint pair,
+  `split_us !! n` per class, class numbers and reachable types in lists;
+  in DataFlatten a list lookup of every constructor's size per candidate
+  field and a closure that rescanned every type each round; in DataSpec a
+  search with a list per type; origin lists appended per web in renaming.
+* **Fix:** sets, maps and prepends; strict folds; one closure each over who
+  mentions whom; -dshow-passes times both data-splitting passes.  The
+  algorithms that are still superlinear are in WEBS-BACKLOG.md
+  ("Superlinear algorithms left in the web passes").
+* **Guard:** none automatic (compile time); `datasplit006` covers the
+  2000-constructor case.
+* **Commit:** (this entry's commit)
+
 ### Reporting audit: verdicts that fired without a change; script labels (2026-10-13)
 * **Found by:** an audit of the dumps and the benchmark scripts, after the
   exposure-statistics bug below.

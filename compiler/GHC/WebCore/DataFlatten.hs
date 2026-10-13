@@ -54,6 +54,7 @@ import GHC.WebCore.Transform.ArityRaise ( productCon, replaceCases )
 import Control.Monad ( forM, foldM )
 import Data.Functor.Identity ( runIdentity )
 import Data.Maybe ( isNothing, fromMaybe, isJust )
+import qualified Data.Map.Strict as Map
 
 {- Note [Unboxable fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -292,13 +293,16 @@ flattenFields opts this_mod us tcs binds
     -- Note [Bounding unboxing]: a candidate must keep its constructor within
     -- the size bound, even if every candidate of the constructor is unboxed
     candidate :: DataCon -> Int -> Bool
+    -- (a map, not the list: a lookup per candidate; the first entry wins, as
+    -- with lookup)
+    orig_sizes = Map.fromListWith (\_new old -> old) (uo_orig_sizes opts)
     candidate dc i = local_candidate dc i && i `elem` within_bound dc
     within_bound dc
       = go_b (sortOn (\(_, n) -> n) [ (i, expansion dc i) | i <- all_fields dc, local_candidate dc i ])
              (dataConRepArity dc)
       where
         budget = uo_max_size opts * fromMaybe (dataConRepArity dc)
-                                              (lookup (occNameString (getOccName dc)) (uo_orig_sizes opts))
+                                              (Map.lookup (occNameString (getOccName dc)) orig_sizes)
         go_b [] _ = []
         go_b ((i, n) : rest) size
           | size - 1 + n <= budget = i : go_b rest (size - 1 + n)
@@ -625,7 +629,7 @@ flattenFields opts this_mod us tcs binds
     settle :: Plans -> Plans
     settle ps
       | null conflicts = with_mentioners
-      | otherwise      = settle (drop_unpacking conflicts ps1)
+      | otherwise      = settle (drop_unpacking (mkUniqSet conflicts) ps1)
       where
         unpacked = mkUniqSet [ dataConTyCon pdc | (_, cons) <- nonDetUFMToList ps
                                                 , (_, fs) <- cons, Flatten pdc _ <- fs ]
@@ -642,16 +646,24 @@ flattenFields opts this_mod us tcs binds
     nonDetKeysTcs ps = [ tc | tc <- tcs, tc `elemUFM` ps ]
     drop_unpacking bad_tcs ps = filterUFM (any (\(_, fs) -> any is_flat fs)) $
       mapUFM (map (\(dc, fs) -> (dc, [ case f of
-                                         Flatten pdc _ | dataConTyCon pdc `elem` bad_tcs -> Keep
+                                         Flatten pdc _ | dataConTyCon pdc `elementOfUniqSet` bad_tcs -> Keep
                                          _ -> f
                                      | f <- fs ]))) ps
     mentions tc = [ tc' | dc <- tyConDataCons tc, Scaled _ t <- dataConOrigArgTys dc
                         , tc' <- nonDetEltsUniqSet (tyConsOfType t)
                         , tc' `elementOfUniqSet` cands, tc' /= tc ]
-    close_mentions start = go_c start
-      where go_c acc = let more = [ tc | tc <- tcs, tc `notElem` acc
-                                       , any (`elem` acc) (mentions tc) ]
-                       in if null more then acc else go_c (acc ++ more)
+    -- The types that mention start, transitively (in the order of tcs): a
+    -- worklist over who mentions whom
+    close_mentions start = [ tc | tc <- tcs, tc `elementOfUniqSet` closed ]
+      where closed = go_c (mkUniqSet start) start
+            go_c acc []       = acc
+            go_c acc (t : ts) = let new = [ m | m <- lookupWithDefaultUFM mentioners [] t
+                                              , not (m `elementOfUniqSet` acc) ]
+                                in go_c (addListToUniqSet acc new) (new ++ ts)
+    mentioners :: UniqFM TyCon [TyCon]
+    mentioners = foldl' (\m tc -> foldl' (\m' t' -> addToUFM_C (\old new -> new ++ old) m' t' [tc])
+                                         m (mentions tc))
+                        emptyUFM tcs
 
     plans0 :: Plans
     plans0 = listToUFM

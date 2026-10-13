@@ -60,6 +60,8 @@ import Control.Monad.Trans.State.Strict
 import Data.Char ( isUpper, isDigit )
 import Data.List ( sortOn, nub )
 import Data.Maybe ( isNothing, isJust, catMaybes, fromMaybe )
+import qualified Data.Set as Set
+import qualified Data.IntSet as IntSet
 import GHC.WebCore.Transform.ArityRaise ( productCon )
 
 {- Note [Splitting data types]
@@ -536,26 +538,45 @@ kind variable in the Constructor instances' SingI axioms, at 'PrefixI
 would leave the promoted constructor with the original's kind, and the axiom
 application would no longer check (Data Lint: "Bad axiom application").
 Such types are not copied anywhere: usedAsKinds collects the types in the
-kinds of the program's type variables, and the types that occur in some type
-(or coercion kind) next to one of their own promoted constructors.
+kinds of the program's type variables, and in the dependent (named)
+arguments of type constructors in the program's types and coercion kinds:
+SingI's kind argument FixityI above, a promoted constructor's kind argument
+('[] @RuntimeRep).
 
-Only those: excluding every type whose constructors are used promoted
+Only those.  Excluding every type whose constructors are used promoted
 somewhere would exclude lists and Bool, whose promoted constructors are in
 most programs' types (the 'False of the Generics metadata, type-level lists),
-and nothing would be split (datasplit001).
+and nothing would be split (datasplit001).  An earlier version excluded a
+type that occurs in some type next to one of its own promoted constructors:
+an unboxed tuple's hidden representation arguments count, so
+(# State# RealWorld, [String] #), whose first representation is
+TupleRep '[], excluded lists from every program with IO (nofib queens,
+integer, cryptarithm2: datasplit009).
 -}
 
 -- | The types used at the kind level (Note [Types used as kinds])
-usedAsKinds :: CoreProgram -> TyCon -> Bool
-usedAsKinds binds = \tc -> tc `elementOfUniqSet` kinded
+-- (each with a type that shows it, for -ddump-webs-data)
+usedAsKinds :: CoreProgram -> UniqFM TyCon (TyCon, String, Type)
+usedAsKinds binds = kinded
   where
-    kinded = mkUniqSet (concatMap kindLevel (concatMap bindTypes binds))
-    -- the kinds of type variables, and the types instantiated at their own
-    -- promoted constructors' kind
-    kindLevel (Left k)   = tyconsOf k
-    kindLevel (Right ty) = [ p | Just dc <- map isPromotedDataCon_maybe tcs
-                               , let p = dataConTyCon dc, p `elem` tcs ]
-      where tcs = tyconsOf ty
+    kinded = listToUFM_C (\a _ -> a) (concatMap kindLevel (concatMap bindTypes binds))
+    -- the kinds of type variables, and the dependent arguments of type
+    -- constructors (a poly-kinded class's kind, a promoted constructor's)
+    kindLevel (Left k)   = [ (tc, (tc, "in the kind", k)) | tc <- tyconsOf k ]
+    kindLevel (Right ty) = [ (tc, (tc, "in a dependent argument of", ty))
+                           | tc <- dependent ty ]
+    dependent ty
+      | Just ty' <- coreView ty = dependent ty'
+    dependent ty = case ty of
+      TyConApp tc args
+        -> concat [ if isNamedTyConBinder b then tyconsOf a else dependent a
+                  | (b, a) <- zip (tyConBinders tc) args ]
+           ++ concatMap dependent (drop (length (tyConBinders tc)) args)
+      FunTy { ft_arg = a, ft_res = r } -> dependent a ++ dependent r
+      AppTy a b                        -> dependent a ++ dependent b
+      ForAllTy b t                     -> tyconsOf (tyVarKind (binderVar b)) ++ dependent t
+      CastTy t _                       -> dependent t
+      _                                -> []
     tyconsOf t = nonDetEltsUniqSet (tyConsOfType t)
     bindTypes b = concat [ bndrTypes x ++ exprTypes e | (x, e) <- flattenBinds [b] ]
     bndrTypes x | isTyVar x = [Left (tyVarKind x)]
@@ -699,9 +720,12 @@ components :: [TyCon] -> Bag (TyCon, TyCon) -> UniqFM TyCon TyCon
 components nodes pairs = foldl visit emptyUFM all_nodes
   where
     adj :: UniqFM TyCon [TyCon]
-    adj = foldl (\m (a, b) -> addToUFM_C (++) (addToUFM_C (++) m a [b]) b [a]) emptyUFM
-                (bagToList pairs)
+    -- prepending (addToUFM_C's combining function gets the old value first):
+    -- appending is quadratic in a type constructor's number of pairs
+    adj = foldl' (\m (a, b) -> addToUFM_C prepend (addToUFM_C prepend m a [b]) b [a]) emptyUFM
+                 (bagToList pairs)
     all_nodes = nodes ++ concat [ [a, b] | (a, b) <- bagToList pairs ]
+    prepend old new = new ++ old
     visit acc n
       | n `elemUFM` acc = acc
       | otherwise       = dfs n acc [n]
@@ -758,7 +782,8 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
             changed_round = map getUnique tcs' /= map getUnique tcs
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
-            rebuilt = [ tc | tc <- tcs', getUnique tc `notElem` map getUnique tcs ]
+            old = mkUniqSet tcs
+            rebuilt = [ tc | tc <- tcs', not (tc `elementOfUniqSet` old) ]
             (bs'', tcs'', d', r')
               | changed_round, n == 1
               = (bs_opt, tcs', text "round limit reached: the last round still unboxed", [])
@@ -770,7 +795,12 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     pinned = pinnedIds rules binds
     (ann_binds, st) = runState (mapProgram (annMapper pinned kinded) binds)
                                (AnnState this_mod us1 emptyUFM [] emptyUFM [] [] kinded)
-    kinded = usedAsKinds binds
+    kinded_set = usedAsKinds binds
+    kinded tc = tc `elemUFM` kinded_set
+    -- (for the dump: those that would otherwise be copied)
+    kinded_list = sortOn (\(tc, _, _) -> getOccString tc)
+                         [ k | k@(tc, _, _) <- nonDetEltsUFM kinded_set, copyable tc ]
+    fst3 (a, _, _) = a
     copies   = as_copies st
     lint_res = lintDataProgram cfg copies ann_binds
     ok       = isEmptyBag (dlr_errs lint_res)
@@ -780,8 +810,9 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     -- How much casts cost: classes exposed only through a cast (pairs from
     -- casts removed, the class would not meet the original).  Approximate:
     -- a pair that also comes from elsewhere is removed too.
-    cast_pairs = [ (getUnique a, getUnique b) | (a, b) <- bagToList (castCopyPairs copies ann_binds) ]
-    pairs_nc = listToBag [ p | p@(a, b) <- pairs, (getUnique a, getUnique b) `notElem` cast_pairs ]
+    cast_pairs = Set.fromList [ key_pair a b | (a, b) <- bagToList (castCopyPairs copies ann_binds) ]
+    key_pair a b = (getKey (getUnique a), getKey (getUnique b))
+    pairs_nc = listToBag [ p | p@(a, b) <- pairs, not (key_pair a b `Set.member` cast_pairs) ]
     rep_nc_of = components (as_all st) pairs_nc
     rep_nc c = lookupWithDefaultUFM rep_nc_of c c
     nc_exposed = mkUniqSet [ rep_nc o | (a, b) <- pairs, o <- [a, b], not (is_copy o) ]
@@ -801,7 +832,7 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
           where
             r = components nodes ps
             repr c = lookupWithDefaultUFM r c c
-            cls = foldl (\m c -> addToUFM_C (++) m (repr c) [c]) emptyUFM
+            cls = foldl' (\m c -> addToUFM_C (\old new -> new ++ old) m (repr c) [c]) emptyUFM
                         (nubTc (nodes ++ concat [ [a, b] | (a, b) <- bagToList ps ]))
             -- a pair already in the same class adds nothing
             new = [ p | p@(a, b) <- concatMap child_pairs (nonDetEltsUFM cls)
@@ -813,12 +844,15 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
           []           -> []
     rep c  = lookupWithDefaultUFM rep_of c c
     members :: UniqFM TyCon [TyCon]
-    members = foldl (\m c -> addToUFM_C (++) m (rep c) [c]) emptyUFM
-                    (nubTc (as_all st ++ concat [ [a, b] | (a, b) <- all_pairs ]))
+    -- (built in reverse, by prepending: appending is quadratic in a class's size)
+    members = mapUFM reverse $
+              foldl' (\m c -> addToUFM_C (\old new -> new ++ old) m (rep c) [c]) emptyUFM
+                     (nubTc (as_all st ++ concat [ [a, b] | (a, b) <- all_pairs ]))
     nubTc = nonDetEltsUniqSet . mkUniqSet
 
-    built   = foldl (\m (c, t) -> addToUFM_C (++) m (rep c) [t]) emptyUFM (as_built st)
-    matched = foldl (\m (c, t) -> addToUFM_C (++) m (rep c) [t]) emptyUFM (as_matched st)
+    -- (in any order: sorted below)
+    built   = foldl' (\m (c, t) -> addToUFM_C (\old new -> new ++ old) m (rep c) [t]) emptyUFM (as_built st)
+    matched = foldl' (\m (c, t) -> addToUFM_C (\old new -> new ++ old) m (rep c) [t]) emptyUFM (as_matched st)
 
     -- The classes, in a deterministic order (by their first copy)
     classes = map snd $ sortOn fst
@@ -829,28 +863,31 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
                 | ms@(m0 : _) <- nonDetEltsUFM members, let r = rep m0 ]
     fates :: [([TyCon], TyCon, Fate, [Int], [Int])]    -- members, original, fate, built, matched
     fates = [ (ms, orig, fate, bs, mts)
-            | (n, (orig, ms, bs, mts)) <- zip [1 :: Int ..] classes
+            | (n, us_n, (orig, ms, bs, mts)) <- zip3 [1 :: Int ..] (drop 1 split_us) classes
             , let fate | any (not . is_copy) ms = Exposed
                        | not (kept n ms)        = Bottom   -- back to the original
-                       | isNewTyCon orig        = mk_split_nt n orig ms
+                       | isNewTyCon orig        = mk_split_nt n us_n orig ms
                        | null bs                = Bottom
-                       | otherwise              = mk_split n orig bs ]
+                       | otherwise              = mk_split n us_n orig bs ]
 
+    -- class n's supply is element n (zipped, not indexed: (!!) is linear)
     split_us = listSplitUniqSupply us2
 
     -- Note [Keeping only useful splits]: in the second pass, a data class is
     -- split only if the first pass found its split useful; a newtype class
     -- only if one of its members' children's classes is kept (its axiom
     -- names them)
-    kept n ms = case keep of
+    kept n ms = case keep_set of
       Nothing -> True
       Just ks
         | any (isNewTyCon . copyOriginal copies) (take 1 ms)
-        -> any (\c -> class_number c `elem` ks)
+        -> any (\c -> class_number c `IntSet.member` ks)
                [ ch | m <- ms, Just chs <- [children m], ch <- chs ]
-        | otherwise -> n `elem` ks
-    class_number c = fromMaybe 0 (lookup (getUnique (rep c)) class_numbers)
-    class_numbers = [ (getUnique (rep m0), n) | (n, (_, m0 : _, _, _)) <- zip [1 :: Int ..] classes ]
+        | otherwise -> n `IntSet.member` ks
+    keep_set = IntSet.fromList <$> keep
+    class_number c = lookupWithDefaultUFM class_numbers 0 (rep c)
+    class_numbers :: UniqFM TyCon Int
+    class_numbers = listToUFM [ (rep m0, n) | (n, (_, m0 : _, _, _)) <- zip [1 :: Int ..] classes ]
 
     -- The classes whose split changed something (first pass): a field
     -- unboxed in some round, or a constructor dropped.  The new types are
@@ -881,19 +918,19 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
       str | (ds@(_ : _), rest) <- span isDigit str
           , reverse sfx `isPrefixOf` rest -> Just (read (reverse ds))
       _ -> Nothing
-    mk_split n orig tags = Split tc (zip tags (tyConDataCons tc))
+    mk_split n us_n orig tags = Split tc (zip tags (tyConDataCons tc))
       where
-        tc = mkCopy (split_us !! n)
+        tc = mkCopy us_n
                     (\u occ -> mkExternalName u this_mod occ noSrcSpan)
                     (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
                     (\dc _ -> mkDataOcc (con_base dc ++ sfx ++ show n))
                     orig [ dc | dc <- tyConDataCons orig, dataConTag dc `elem` tags ]
     -- A newtype class: its representation, from one member, with the
     -- children mapped to their classes' types (lazily)
-    mk_split_nt n orig ms = Split tc []
+    mk_split_nt n us_n orig ms = Split tc []
       where
         member = head [ m | m <- ms, is_copy m ]
-        tc = mkNewtypeCopy (split_us !! n) (\u occ -> mkExternalName u this_mod occ noSrcSpan)
+        tc = mkNewtypeCopy us_n (\u occ -> mkExternalName u this_mod occ noSrcSpan)
                            (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
                            orig (evalState (rw_ty (snd (newTyConRhs member))) ())
     -- Constructors with alphanumeric names keep them; [], (:) and tuples
@@ -910,18 +947,19 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     -- Specialisation and flattening rebuild data types, not newtypes: they
     -- leave out the split newtypes and every split type their
     -- representations reach (Note [Splitting newtypes])
-    nt_reach = go_reach [] [ t | nt <- new_tcs, isNewTyCon nt
+    nt_reach = go_reach emptyUniqSet [ t | nt <- new_tcs, isNewTyCon nt
                                , t <- nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs nt))) ]
     go_reach seen [] = seen
     go_reach seen (t : ts)
-      | t `elem` seen || t `notElem` new_tcs = go_reach seen ts
-      | otherwise = go_reach (t : seen) (field_tcs t ++ ts)
+      | t `elementOfUniqSet` seen || not (t `elementOfUniqSet` new_set) = go_reach seen ts
+      | otherwise = go_reach (addOneToUniqSet seen t) (field_tcs t ++ ts)
+    new_set = mkUniqSet new_tcs
     field_tcs t
       | isNewTyCon t = nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs t)))
       | otherwise    = [ t' | dc <- tyConDataCons t, Scaled _ ft <- dataConOrigArgTys dc
                             , t' <- nonDetEltsUniqSet (tyConsOfType ft) ]
-    data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), tc `notElem` nt_reach ]
-    kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elem` nt_reach ]
+    data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), not (tc `elementOfUniqSet` nt_reach) ]
+    kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elementOfUniqSet` nt_reach ]
     changed = ok && not (null new_tcs)
 
     -- The type constructor a copy becomes, and a constructor (by original tag)
@@ -960,6 +998,9 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
         <+> text "exposed only by casts:"
         <+> int (length [ () | (ms, _, Exposed, _, _) <- fates, exposed_by_cast ms ]) <> comma
         <+> text "pinned binders:" <+> int (sizeVarSet pinned)
+      , ppUnless (null kinded_list) $
+        text "not copied (used as kinds):" <+> pprWithCommas ppr (map fst3 kinded_list)
+      , whenPprDebug $ nest 2 $ vcat [ ppr tc <+> text why <+> ppr t | (tc, why, t) <- kinded_list ]
       , vcat [ ppr tc <+> text "=" <+> ppr orig
                <+> text "with" <+> hsep (punctuate comma (map ppr (tyConDataCons tc)))
                <+> parens (text "built" <+> ppr bs <> comma <+> text "matched" <+> ppr ms

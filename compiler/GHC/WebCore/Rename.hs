@@ -52,7 +52,9 @@ renameSigs subst sigs@(WebSigs { ws_ids = ids, ws_dcs = dcs, ws_axioms = axs, ws
          , ws_axioms  = mapUFM (\(orig, clone) -> (orig, rename_ax clone)) axs
          , ws_exposed = mapUniqSet (renameWeb subst) exposed
          , ws_origins = nonDetStrictFoldUFM_Directly
-                          (\u whys m -> addToUFM_C (++) m (renameWeb subst (mkWebId u)) whys)
+                          -- (new before old: a class's webs all go to its
+                          -- representative, and appending is quadratic)
+                          (\u whys m -> addToUFM_C (\old new -> new ++ old) m (renameWeb subst (mkWebId u)) whys)
                           emptyUFM (ws_origins sigs) }
   where
     -- Only the webs change, so types need no other mapping

@@ -79,8 +79,9 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
 
 import Control.Monad
-import Data.List ( sortBy, sort, nub )
+import Data.List ( sortBy )
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Maybe ( fromMaybe )
 import Data.Ord ( comparing )
 
@@ -245,7 +246,8 @@ webPass early guts
                   , text "Contracted:" <+> int (length contracted)
                   , text "Not contracted:" <+> pprWithCommas ppr
                       (sortBy (comparing getOccString)
-                         [ f | (f, _) <- split_fns, not (f `elem` contracted) ]) ]
+                         (let done = mkVarSet contracted
+                          in [ f | (f, _) <- split_fns, not (f `elemVarSet` done) ])) ]
 
          -- Specialise the new types to their uses
          -- See Note [Specialising indexed types] in GHC.WebCore.Transform.SpecIndex
@@ -322,7 +324,7 @@ pprHiddenStats sigs binds
     -- Why each exposed lambda class is exposed: every origin of its webs
     -- (ws_origins), and the origin alone when it is the only one
     exposed_lams = nonDetEltsUniqSet (lams `intersectUniqSets` ws_exposed sigs)
-    whys w = sort (nub (lookupWithDefaultUFM (ws_origins sigs) ["(unknown)"] w))
+    whys w = Set.toAscList (Set.fromList (lookupWithDefaultUFM (ws_origins sigs) ["(unknown)"] w))
     by_all  = concatMap whys exposed_lams
     by_only = [ y | w <- exposed_lams, [y] <- [whys w] ]
     count xs = Map.toList (Map.fromListWith (+) [ (x, 1 :: Int) | x <- xs ])
@@ -556,10 +558,19 @@ runDataSplit sfx early logger dflags this_mod rules binds
                    | otherwise = Nothing
              -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
              split keep = splitDataTypes sfx unbox keep (dataLintConfig dflags) this_mod us rules binds
-             res0 = split Nothing
-             res | Just _ <- unbox, dsr_changed res0 = split (Just (dsr_useful res0))
-                 | otherwise                         = res0
-             errs = DL.dlr_errs (dsr_lint res)
+             -- for -dshow-passes: the first pass's program is not used when
+             -- the second runs, so only what decides the second is forced
+             force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()
+             force r = seqBinds (dsr_binds r)
+       ; res0 <- withTiming logger (text "Webs: splitting data types" <+> text sfx) force_useful
+                   (return (split Nothing))
+       ; res <- case unbox of
+                  Just _ | dsr_changed res0
+                    -> withTiming logger (text "Webs: splitting data types" <+> text sfx
+                                          <> text ", useful splits") force
+                         (return (split (Just (dsr_useful res0))))
+                  _ -> return res0
+       ; let errs = DL.dlr_errs (dsr_lint res)
        ; unless (isEmptyBag errs) $ liftIO $
            do { logMsg logger MCInfo noSrcSpan $ withPprStyle defaultDumpStyle $
                   vcat [ text "*** Data Lint errors: after annotating copies ***"

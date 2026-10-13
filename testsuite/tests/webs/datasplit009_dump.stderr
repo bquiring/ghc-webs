@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( datasplit009.hs, datasplit009.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 33, classes: 5, exposed: 4, split: 1, exposed only by casts: 0, pinned binders: 3
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
+Main.List_s5 = [] with Main.Con1_s5, Main.Con2_s5 (built [1,
+                                                          2], matched [1, 2])
+
+
+[2 of 2] Linking datasplit009

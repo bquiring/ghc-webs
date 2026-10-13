@@ -244,8 +244,16 @@ for n in range(1, 5):
 # (Note [Types used as kinds])
 test('datasplit005', [], compile_and_run, [ds_opts])
 # datasplit006 (generated): 2000 constructors matched by case tables; finding
-# copied constructors by tag was quadratic (GHC.Builtin.PrimOps, out of memory)
-test('datasplit006', [], compile_and_run, [ds_opts])
+# copied constructors by tag was quadratic (GHC.Builtin.PrimOps, out of memory).
+# GHC's own passes take ~4 minutes on it with -dcore-lint, near the default
+# timeout under load: hence the multiplier
+test('datasplit006', [compile_timeout_multiplier(3)], compile_and_run, [ds_opts])
+# datasplit009: a program with IO still splits its local lists; an unboxed
+# tuple's hidden representation arguments ('[] in TupleRep '[]) made lists
+# "used as kinds" (Note [Types used as kinds])
+test('datasplit009', [], compile_and_run, [ds_opts])
+test('datasplit009_dump', [extra_files(['datasplit009.hs'])],
+     multimod_compile, ['datasplit009', ds_opts + ' -ddump-webs-data -dsuppress-uniques'])
 # datasplit007, datasplit008: atomicModifyIORef's pair is read by the RTS
 # (atomicModifyMutVar2#, a selector thunk on its first field), so it is not
 # split (Note [Non-parametric functions] in GHC.WebCore.DataSplit); 008 is

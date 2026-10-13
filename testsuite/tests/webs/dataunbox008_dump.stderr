@@ -3,6 +3,7 @@
 ==================== Webs: splitting data types ====================
 Data Lint: ok
 copies: 80, classes: 8, exposed: 7, split: 1, exposed only by casts: 0, pinned binders: 8
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
 Main.Eqn_s8 = Main.Eqn with Main.Eqn_s8 (built [1], matched [1])
 Main.Eqn_s8 field 0: dropped (dead)
 Main.Eqn_s8 field 1: unboxed

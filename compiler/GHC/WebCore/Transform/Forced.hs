@@ -486,7 +486,7 @@ lambdaParams :: CoreProgram -> UniqFM WebId [Id]
 lambdaParams binds = foldr (\(_, e) -> go e) emptyUFM (flattenBinds binds)
   where
     go e acc = case e of
-      WebLam w x b   -> addToUFM_C (++) (go b acc) w [x]
+      WebLam w x b   -> addToUFM_C (\old new -> new ++ old) (go b acc) w [x]   -- (in any order)
       Lam _ b        -> go b acc
       App f a        -> go f (go a acc)
       WebApp _ f a   -> go f (go a acc)

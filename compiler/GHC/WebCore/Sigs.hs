@@ -173,7 +173,7 @@ addExposedWebs ws sigs = sigs { ws_exposed = ws_exposed sigs `unionUniqSets` ws 
 addExposedWebsFrom :: String -> WebSet -> WebSigs -> WebSigs
 addExposedWebsFrom why ws sigs
   = (addExposedWebs ws sigs)
-      { ws_origins = foldl' (\m w -> addToUFM_C (++) m w [why]) (ws_origins sigs)
+      { ws_origins = foldl' (\m w -> addToUFM_C (\old new -> new ++ old) m w [why]) (ws_origins sigs)
                             (nonDetEltsUniqSet ws) }
 
 pprWebSigs :: WebSigs -> SDoc

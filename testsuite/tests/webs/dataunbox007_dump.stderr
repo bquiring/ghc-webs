@@ -3,6 +3,7 @@
 ==================== Webs: splitting data types ====================
 Data Lint: ok
 copies: 72, classes: 9, exposed: 6, split: 3, exposed only by casts: 0, pinned binders: 9
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
 Main.P_s7 = Main.P with Main.P_s7 (built [1], matched [1])
 Main.Q_s8 = Main.Q with Main.Q_s8 (built [1], matched [1])
 Main.R_s9 = Main.R with Main.R_s9 (built [1], matched [1])

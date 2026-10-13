@@ -146,16 +146,30 @@ specialiseSplit this_mod us tcs binds
     -- A type that cannot be rewritten blocks every specialisation it reaches.
     mentions tc = [ tc' | dc <- tyConDataCons tc, Scaled _ t <- dataConOrigArgTys dc
                         , tc' <- nonDetEltsUniqSet (tyConsOfType t), is_cand tc', tc' /= tc ]
-    reach tc = go_r [] (mentions tc)
+    -- (sets and one search each, not a search per type: these grow with
+    -- the number of split types)
+    -- The types reachable from these through fields, in one or more steps
+    reach_from starts = go_r emptyUniqSet (concatMap mentions starts)
       where go_r seen [] = seen
-            go_r seen (t : ts) | t `elem` seen = go_r seen ts
-                               | otherwise     = go_r (t : seen) (mentions t ++ ts)
-    blocked = concat [ reach tc | tc <- tcs, not (rewritable tc) ]
-    seeds   = [ tc | (tc, _) <- spec_patterns, tc `notElem` blocked ]
-    patterns = [ (tc, p) | (tc, p) <- spec_patterns, tc `elem` seeds ] ++
+            go_r seen (t : ts) | t `elementOfUniqSet` seen = go_r seen ts
+                               | otherwise = go_r (addOneToUniqSet seen t) (mentions t ++ ts)
+    -- The types from which one of these is reachable, in one or more steps
+    reaching starts = go_m emptyUniqSet (concatMap mentioned_by starts)
+      where go_m seen [] = seen
+            go_m seen (t : ts) | t `elementOfUniqSet` seen = go_m seen ts
+                               | otherwise = go_m (addOneToUniqSet seen t) (mentioned_by t ++ ts)
+    mentioned_by t = lookupWithDefaultUFM mentioners [] t
+    mentioners :: UniqFM TyCon [TyCon]
+    mentioners = foldl' (\m tc -> foldl' (\m' t' -> addToUFM_C (\old new -> new ++ old) m' t' [tc])
+                                         m (mentions tc))
+                        emptyUFM tcs
+    blocked = reach_from [ tc | tc <- tcs, not (rewritable tc) ]
+    seeds   = mkUniqSet [ tc | (tc, _) <- spec_patterns, not (tc `elementOfUniqSet` blocked) ]
+    reaches_seed = reaching (nonDetEltsUniqSet seeds)
+    patterns = [ (tc, p) | (tc, p) <- spec_patterns, tc `elementOfUniqSet` seeds ] ++
                [ (tc, (tvs, mkTyVarTys tvs))
-               | tc <- tcs, tc `notElem` seeds, rewritable tc
-               , any (`elem` seeds) (reach tc)
+               | tc <- tcs, not (tc `elementOfUniqSet` seeds), rewritable tc
+               , tc `elementOfUniqSet` reaches_seed
                , let tvs = tyConTyVars tc ]
 
     -- 3. A recursive field must be T P(bs) after the substitution

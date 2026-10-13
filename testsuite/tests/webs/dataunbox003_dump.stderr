@@ -3,6 +3,7 @@
 ==================== Webs: splitting data types ====================
 Data Lint: ok
 copies: 68, classes: 7, exposed: 6, split: 1, exposed only by casts: 0, pinned binders: 10
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
 Main.Tree_s7 = Main.Tree with Main.Leaf_s7, Main.Node_s7 (built [1,
                                                                  2], matched [1, 2])
 Main.Node_s7 field 1: unboxed
