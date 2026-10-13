@@ -59,7 +59,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** the haskell-src-exts build (compilers group); the testsuite's
   defunc and arity-raising dumps are unchanged.  No small reproduction (a
   memory blowup on a 77k-term module).
-* **Commit:**
+* **Commit:** `4f6c501909`
 
 ### Useless elimination: changes that change nothing, until the round limit (2026-10-13)
 * **Found by:** the compilers group, nods configuration (early-ulsl without
