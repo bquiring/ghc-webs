@@ -64,7 +64,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `useless_rounds001` (accumArray, as the module; two rounds) and
   `useless_rounds002` (a strict dead field and one that needs evaluation;
   one round); both ran ten rounds without the fix.
-* **Commit:**
+* **Commit:** `d241b19232`
 
 ### OPEN: data splitting runs GHC.Tc.Errors.Types out of memory (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
