@@ -36,6 +36,26 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Statistics: every exposed class "joined with an arrow without a web"; defunctionalisation never counted as firing (2026-10-13)
+* **Found by:** porting the exposure statistics (branch `exposure-stats`)
+  and tallying the compilers group's dumps.
+* **Symptom:** in `-ddump-webs-stats`, every exposed lambda class with more
+  than one web had the origin "an arrow without a web" (100% of exposed
+  classes on a small program that has no placeholder web), so few classes
+  showed a single origin.  Separately, `webs-bench/verdicts.py` reported 0
+  webs defunctionalised on nofib early-ulsl (there are 102).
+* **Cause:** the origin was recorded for `ws_exposed_reps`, the
+  representatives of every class with an exposed web, not just those with
+  the placeholder web.  verdicts.py's list of verdicts that fire lacked
+  "defunctionalised" (and "dead fields").
+* **Fix:** record the origin only for the classes that contain
+  placeholderWeb (GHC.WebCore.Pipeline, sigs2); add the verdicts.  The
+  §13 figure "exported binders alone exposed 68%" (WEBS-EXPERIMENTS.md) came
+  from the branch's counts, so it was a lower bound.
+* **Guard:** none automatic (dump statistics); `boundary_kept001` checks
+  the single-origin line.
+* **Commit:** `a6f48e7819`
+
 ### Defunctionalisation and arity raising: an analysis list per arrow occurrence (2026-10-13)
 * **Found by:** the compilers group, nods configuration:
   haskell-src-exts-1.24.0, Language.Haskell.Exts.InternalParser (happy's
