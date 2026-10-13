@@ -366,6 +366,34 @@ webs as newtypes (the occurs check never fires on nofib).
   occurrence gets a real TyCon with DataCons (~580,000 copies over nofib).
   Fix: cheap placeholders per occurrence during annotation and Data Lint,
   real types only for the final split classes.
+- **Superlinear algorithms left in the web passes** (audit 2026-10-13, after
+  GHC.Tc.Errors.Types took 63 minutes, ~52 of them in data splitting; the
+  list operations that were quadratic in DataSplit, DataFlatten, DataSpec,
+  Rename, Forced and the statistics are fixed). Each of these keeps its
+  results; they need a different algorithm, not a data structure:
+  1. *Strictness fixpoints* (strictArgWebs, strictResultFields in
+     GHC.WebCore.Transform.Strictness): naive rounds that re-check every
+     web's lambdas each round, O(rounds × program) where a chain of webs
+     drops one per round; and the two fixpoints iterate against each other.
+     Fix: a worklist with reverse dependencies (record the webs each check
+     consults through strict_at and the tail contexts).
+  2. *Useless and Forced solvers* (solve in Transform/Useless.hs and
+     Transform/Forced.hs): worklists, but each dependency that changes
+     re-evaluates all of an element's guards and uses (`holds`), or its
+     whole formula: O(k²) for an element with k uses. Fix: a counter per
+     clause of the elements not yet live (Forced: per conjunct/disjunct).
+  3. *DataFlatten's "the case binder is used"* (go_u): the free variables of
+     each alternative of each case on the binder, quadratic in the nesting
+     of such cases. Fix: one occurrence pass, or fresh occurrence info.
+  4. *Defunctionalisation's curried-lambda fixpoint* (accepted in
+     Transform/Defunc.hs): naive rounds over the accepted webs, bounded by
+     chain length; low priority.
+  5. *Data splitting's congruence* (DataSplit, congruence): recomputes the
+     components of all pairs each round, up to 20 rounds; an online
+     union-find (as in the 3cps SML inference) would merge as it goes.
+  Measure first: on GHC.Tc.Errors.Types useless elimination and strictness
+  take ~5 s each (data splitting ~3,100 s), so these matter only if the
+  per-pass timings (-dshow-passes) show them on a large module.
 
 - **Wrapper eta lambdas and defunctionalisation** (to look at; found
   debugging multiplier's +1.8% against base, 2026-10-10). The boundary
