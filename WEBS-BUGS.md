@@ -72,7 +72,7 @@ would catch it again), **commit** (empty while uncommitted).
   Timings are unaffected.
 * **Guard:** the dump tests' expected output (strictness, const-prop and
   inline dumps).
-* **Commit:** (this entry's commit)
+* **Commit:** `e241d489e8`
 
 ### Statistics: every exposed class "joined with an arrow without a web"; defunctionalisation never counted as firing (2026-10-13)
 * **Found by:** porting the exposure statistics (branch `exposure-stats`)
