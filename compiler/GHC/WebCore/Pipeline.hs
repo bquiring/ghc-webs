@@ -168,9 +168,10 @@ webPass early guts
        ; dump logger Opt_D_dump_webs_solved "Webs: program after renaming" $
            pprCoreBindings binds2 $$ blankLine $$ pprWebClasses sol
 
-       ; let res2 = lintWebProgram cfg sigs2 binds2
-       ; reportWebLint logger dflags "renaming" binds2 res2
-       ; checkSolved "renaming" res2
+       ; when (gopt Opt_DoCoreLinting dflags) $   -- Note [Checking the web pipeline]
+           do { let res2 = lintWebProgram cfg sigs2 binds2
+              ; reportWebLint logger dflags "renaming" binds2 res2
+              ; checkSolved "renaming" res2 }
 
          -- Transformations, with the constructor signatures with hidden
          -- fields in the program (Note [Signatures in the program] in
@@ -560,7 +561,8 @@ dataLintConfig dflags
                   , DL.lf_check_linearity            = gopt Opt_DoLinearCoreLinting dflags
                   , DL.lf_check_fixed_rep            = True }
 
--- | Defunctionalise, check the result with Web Lint, and dump the verdicts.
+-- | Defunctionalise, check the result with Web Lint (with -dcore-lint), and
+-- dump the verdicts.
 -- Returns the new program, the new type constructors, and whether anything
 -- changed.
 runDefunc :: Bool -> Logger -> DynFlags -> LintConfig -> Module -> WebSigs -> CoreProgram
@@ -580,7 +582,9 @@ runDefunc early logger dflags cfg this_mod sigs binds
            Just (binds', tcs) ->
              do { let what = "defunctionalisation"
                       lres = lintWebProgram cfg sigs binds'
-                ; withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
+                  -- Note [Checking the web pipeline]
+                ; when (gopt Opt_DoCoreLinting dflags) $
+                    withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
                     do { reportWebLint logger dflags what binds' lres
                        ; checkSolved what lres }
                 ; return (binds', tcs, True) } }
@@ -615,8 +619,9 @@ type TransformRound = WebSigs -> UniqSupply -> WebSet -> CoreProgram
                       , [(WebId, SDoc, Bool, [Id])] )
 
 -- | Run a web transformation in rounds until nothing changes, running Web
--- Lint after each round: the transformation must keep the program
--- well-typed.  Returns whether the program changed.
+-- Lint after each round with -dcore-lint: the transformation must keep the
+-- program well-typed (Note [Checking the web pipeline]).  Returns whether
+-- the program changed.
 runTransform :: String -> DumpFlag -> TransformRound
              -> Logger -> DynFlags -> LintConfig -> WebSigs
              -> WebSet         -- ^ Webs handled in earlier passes
@@ -643,7 +648,9 @@ runTransform name dump_flag do_round logger dflags cfg sigs0 done0 binds0
                                      { ws_saturated = ws_saturated sigs `unionUniqSets` sat }
                           binds' = refreshWorkers sigs' binds0'
                           res    = lintWebProgram cfg sigs' binds'
-                    ; withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
+                      -- Note [Checking the web pipeline]
+                    ; when (gopt Opt_DoCoreLinting dflags) $
+                        withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
                         do { reportWebLint logger dflags what binds' res
                            ; checkSolved what res }
                     ; go (n + 1) (done `unionUniqSets` handled) sigs' binds'
@@ -906,6 +913,25 @@ pprWebSummary exposed binds
 dump :: Logger -> DumpFlag -> String -> SDoc -> CoreM ()
 dump logger flag hdr doc
   = liftIO $ putDumpFileMaybe logger flag hdr FormatCore doc
+
+{- Note [Checking the web pipeline]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Web Lint runs once in every compilation, after annotation: it generates the
+web constraints (wlr_pairs) that the solver needs, and it stops on a type
+error in the annotated program.  Once the solved webs are written into the
+program (renaming), Web Lint runs again only with -dcore-lint: after
+renaming, after each round of each transformation, and after
+defunctionalisation, and erasure is checked against the original program
+(Note [Web round trip]) when nothing changed.  These re-checks cost a lot on
+large modules (a full Web Lint per round: seconds and gigabytes on happy's
+generated parsers), so an ordinary compilation does not pay for them.
+
+-dcore-webs-lint is the cheap check for large builds: Core Lint on the
+web pipeline's output only (after erasure), with none of GHC's other passes
+linted (initEndPassConfig in GHC.Driver.Config.Core.Lint).  Together with
+the Web Lint run after annotation, that catches almost every webs bug (the
+user, 2026-10-12); -dcore-lint, which the testsuite uses, checks everything.
+-}
 
 {- Note [Early webs]
 ~~~~~~~~~~~~~~~~~~~~

@@ -600,6 +600,7 @@ data GeneralFlag
    | Opt_DumpWithWays                   -- ^ Use foo.ways.<dumpFlag> instead of foo.<dumpFlag>
    | Opt_D_dump_minimal_imports
    | Opt_DoCoreLinting
+   | Opt_DoCoreWebsLinting  -- ^ Core Lint after the web pipeline only; see Note [Checking the web pipeline] in GHC.WebCore.Pipeline
    | Opt_DoLinearCoreLinting
    | Opt_DoStgLinting
    | Opt_DoCmmLinting

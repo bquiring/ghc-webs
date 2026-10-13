@@ -523,3 +523,8 @@ test('resraise_alias_late', [extra_files(['resraise_alias.hs'])],
 for name in ['useless_rounds001', 'useless_rounds002']:
     test(name, [grep_errmsg(r'^!!! Webs: (useless elimination, round [0-9]+):', [1])],
          compile_and_run, [early_opts + ' -fcore-webs-useless -dshow-passes'])
+
+# -dcore-webs-lint lints the web pipeline's output only; Web Lint's
+# re-checks after the transformations need -dcore-lint
+test('lint_flag001', [grep_errmsg(r'^(\*\*\* Core Linted result of [^:]*|!!! Webs: Web Lint after [^:]*):', [1])],
+     compile_and_run, ['-O -fcore-webs-early -fcore-webs-useless -dcore-webs-lint -dshow-passes'])

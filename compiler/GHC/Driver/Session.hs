@@ -1667,6 +1667,8 @@ dynamic_flags_deps = [
         (NoArg enableDLint)
   , make_ord_flag defGhcFlag "dcore-lint"
         (NoArg (setGeneralFlag Opt_DoCoreLinting))
+  , make_ord_flag defGhcFlag "dcore-webs-lint"
+        (NoArg (setGeneralFlag Opt_DoCoreWebsLinting))
   , make_ord_flag defGhcFlag "dlinear-core-lint"
         (NoArg (setGeneralFlag Opt_DoLinearCoreLinting))
   , make_ord_flag defGhcFlag "dstg-lint"

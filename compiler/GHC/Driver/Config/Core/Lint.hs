@@ -65,7 +65,7 @@ lintCoreBindings dflags coreToDo vars -- binds
 initEndPassConfig :: DynFlags -> [Var] -> NamePprCtx -> CoreToDo -> EndPassConfig
 initEndPassConfig dflags extra_vars name_ppr_ctx pass = EndPassConfig
   { ep_dumpCoreSizes = not (gopt Opt_SuppressCoreSizes dflags)
-  , ep_lintPassResult = if gopt Opt_DoCoreLinting dflags
+  , ep_lintPassResult = if gopt Opt_DoCoreLinting dflags || webs_lint
       then Just $ initLintPassResultConfig dflags extra_vars pass
       else Nothing
   , ep_namePprCtx = name_ppr_ctx
@@ -73,6 +73,10 @@ initEndPassConfig dflags extra_vars name_ppr_ctx pass = EndPassConfig
   , ep_prettyPass = ppr pass
   , ep_passDetails = pprPassDetails pass
   }
+  where
+    -- See Note [Checking the web pipeline] in GHC.WebCore.Pipeline
+    webs_lint | CoreDoWebs {} <- pass = gopt Opt_DoCoreWebsLinting dflags
+              | otherwise             = False
 
 coreDumpFlag :: CoreToDo -> Maybe DumpFlag
 coreDumpFlag (CoreDoSimplify {})      = Just Opt_D_verbose_core2core
