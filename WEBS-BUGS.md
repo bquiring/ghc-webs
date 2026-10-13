@@ -61,7 +61,7 @@ would catch it again), **commit** (empty while uncommitted).
   WEBS-EXPERIMENTS.md figures from early-ulsl builds after that date, and
   the Hackage groups' configurations with data splitting, need a rerun
   (`nods` has none).
-* **Commit:** (this entry's commit)
+* **Commit:** `29cd822b48`
 
 ### Data splitting: quadratic list code; GHC.Tc.Errors.Types takes an hour (2026-10-13)
 * **Found by:** the self-host build (OPEN entry below), profiled alone: 63
@@ -80,7 +80,7 @@ would catch it again), **commit** (empty while uncommitted).
   ("Superlinear algorithms left in the web passes").
 * **Guard:** none automatic (compile time); `datasplit006` covers the
   2000-constructor case.
-* **Commit:** (this entry's commit)
+* **Commit:** `29cd822b48`
 
 ### Reporting audit: verdicts that fired without a change; script labels (2026-10-13)
 * **Found by:** an audit of the dumps and the benchmark scripts, after the
