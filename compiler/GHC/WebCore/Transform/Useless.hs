@@ -31,7 +31,7 @@ import GHC.Types.Id.Info ( ruleInfoFreeVars, RecSelParent(..) )
 import GHC.Data.Pair
 import GHC.Types.Tickish
 import GHC.Types.Unique ( getKey, getUnique, hasKey )
-import GHC.Builtin.Names ( runRWKey )
+import GHC.Builtin.Names ( runRWKey, absentErrorIdKey )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
@@ -51,7 +51,7 @@ import GHC.WebCore.Transform.DeadParams ( Verdict(..), WebInfo(..), analyse, ver
 
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
-import Data.List ( sortOn )
+import Data.List ( isSubsequenceOf, sortOn )
 import Data.Maybe ( fromMaybe, isJust )
 import Data.Word ( Word64 )
 
@@ -503,7 +503,10 @@ scrutTupCtx b [Alt (DataAlt dc) xs rhs]
   = Just xs
 scrutTupCtx _ _ = Nothing
 
--- | The pattern variables of the cases that give their scrutinee a context
+-- | The pattern variables of the cases that give their scrutinee a context,
+-- and whose field the rewrite could change: a pattern variable of K xs only
+-- if some tail of the scrutinee builds K with that field fillable and not
+-- already an absent filler.  See Note [Scrutinised constructions]
 scrutVars :: CoreProgram -> [Id]
 scrutVars binds = concatMap (go . snd) (flattenBinds binds)
   where
@@ -513,11 +516,68 @@ scrutVars binds = concatMap (go . snd) (flattenBinds binds)
       Lam _ x        -> go x
       WebLam _ _ x   -> go x
       Let b x        -> concatMap (go . snd) (flattenBinds [b]) ++ go x
-      Case s b _ as  -> maybe [] snd (scrutCtx s b as) ++ fromMaybe [] (scrutTupCtx b as)
+      Case s b _ as  -> fillable_vars s (scrutCtx s b as) ++ tup_vars b as
                         ++ go s ++ concat [ go r | Alt _ _ r <- as ]
       Cast x _       -> go x
       Tick _ x       -> go x
       _              -> []
+
+    fillable_vars _ Nothing         = []
+    fillable_vars s (Just (dc, xs)) = [ x | (i, x) <- zip [0 ..] xs, i `elem` is ]
+      where is = fillableTails dc (length xs) s
+
+    -- A projection, case e of (# ys #) -> (# ys' #) with ys' fewer of the
+    -- ys, is what the rewrite builds around a call whose result it cannot
+    -- mask (adapt in rewriteProgram); its dead components are dead by
+    -- construction, and taking them as a change built the projection again
+    -- in every round
+    tup_vars b as = case scrutTupCtx b as of
+      Just xs | not (isProjection xs as) -> xs
+      _ -> []
+
+-- | The alternative of a case on an unboxed tuple returns fewer of its
+-- pattern variables, in order, as an unboxed tuple
+isProjection :: [Id] -> [CoreAlt] -> Bool
+isProjection xs [Alt _ _ rhs]
+  | Just (_, vals) <- tupleApp rhs
+  , Just ys <- mapM getVar vals
+  = length ys < length xs && ys `isSubsequenceOf` xs
+  where
+    getVar (Var v) = Just v
+    getVar _       = Nothing
+isProjection _ _ = False
+
+-- | The fields of K that the rewrite of a scrutinee in the context of K xs
+-- would replace by absent fillers (rw_scrut in rewriteProgram), if dead.
+-- Without this, a dead field that cannot be filled, or that already was in
+-- an earlier round, counted as a change in every round, and the pass ran
+-- until its round limit (Cabal-syntax's Language.Haskell.Extension: ten
+-- rounds of useless elimination, each with Web Lint).
+fillableTails :: DataCon -> Int -> CoreExpr -> [Int]
+fillableTails dc n = go
+  where
+    go e = case e of
+      Let b body -> concat [ go (join_body a rhs)
+                           | (j, rhs) <- flattenBinds [b], JoinPoint a <- [idJoinPointHood j] ]
+                    ++ go body
+      Case _ _ _ as -> concat [ go r | Alt _ _ r <- as ]
+      Tick t x | not (tickishIsCode t) -> go x
+      _ | Just (dc', _, vals) <- conApp e, dc' == dc, length vals == n
+        -> [ i | (i, v) <- zip [0 ..] vals, fillable dc i v, not (isAbsentFiller v) ]
+        | otherwise -> []
+    join_body :: Int -> CoreExpr -> CoreExpr
+    join_body 0 e              = e
+    join_body k (Lam _ e)      = join_body (k - 1) e
+    join_body k (WebLam _ _ e) = join_body (k - 1) e
+    join_body _ e              = e
+
+-- | An absent filler, as mkAbsentErrorApp builds it
+isAbsentFiller :: CoreExpr -> Bool
+isAbsentFiller e = case e of
+  App f _      -> isAbsentFiller f
+  WebApp _ f _ -> isAbsentFiller f
+  Var v        -> v `hasKey` absentErrorIdKey
+  _            -> False
 
 -- | Can field i of this construction be replaced by an absent filler?
 fillable :: DataCon -> Int -> CoreExpr -> Bool

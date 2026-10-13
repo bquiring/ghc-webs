@@ -36,6 +36,36 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Useless elimination: changes that change nothing, until the round limit (2026-10-13)
+* **Found by:** the compilers group, nods configuration (early-ulsl without
+  data splitting, with -dcore-lint): Cabal-syntax-3.18.1.0,
+  Language.Haskell.Extension (35k terms, 1.2 million type nodes from the
+  Generic instance of its 140-constructor KnownExtension; base has the same
+  size).  haskell-src-exts' Language.Haskell.Exts.Syntax failed the same
+  way (not confirmed to be this bug).
+* **Symptom:** `ghc: out of memory` (4 GB) with -dcore-lint; without it
+  2:40 and a 2.3 GB peak (base: 0:45, 0.5 GB).  -dshow-passes (which now
+  times each round) showed useless elimination running all ten rounds, each
+  followed by a Web Lint check of the program (5 s, 18.7 GB allocated each).
+* **Cause:** uselessRound reported a change whenever a pattern variable of a
+  scrutinised construction was dead (dead_fields), whether or not the
+  rewrite could do anything with it: (1) a field of a lifted constructor
+  that cannot be filled (strict, or needs evaluation) or already was, in
+  an earlier round; (2) a component of the projection the rewrite builds
+  around a call whose result it cannot mask (adapt; here the primop
+  unsafeFreezeArray#, its state token dead): the next round took the
+  projection's dead component as a change and built the projection again.
+  So the pass ran to its limit of ten rounds, rebuilding the same program.
+* **Fix:** dead_fields keeps only pattern variables whose field some tail
+  of the scrutinee builds fillable and not yet an absent filler
+  (fillableTails), and skips projections (isProjection), in
+  GHC.WebCore.Transform.Useless (scrutVars).  The module settles in two
+  rounds: 1:29, 1.2 GB peak, and compiles with -dcore-lint.
+* **Guard:** `useless_rounds001` (accumArray, as the module; two rounds) and
+  `useless_rounds002` (a strict dead field and one that needs evaluation;
+  one round); both ran ten rounds without the fix.
+* **Commit:**
+
 ### OPEN: data splitting runs GHC.Tc.Errors.Types out of memory (2026-10-11)
 * **Found by:** building GHC with the webs compiler (early-ulsl,
   ~/projects/ghc-selfhost).

@@ -515,3 +515,11 @@ for n in [1, 6, 13, 16, 19, 36, 40, 41, 43]:
 test('resraise_alias', [], compile_and_run, [early_opts + ' -fcore-webs-result-raise'])
 test('resraise_alias_late', [extra_files(['resraise_alias.hs'])],
      multimod_compile_and_run, ['resraise_alias', rr_opts])
+
+# Useless elimination settles before its round limit: a dead component it
+# cannot drop (a projection around a primop call) or a dead field it cannot
+# fill does not count as a change (Cabal-syntax's Language.Haskell.Extension
+# ran ten rounds, each with Web Lint, and ran out of memory)
+for name in ['useless_rounds001', 'useless_rounds002']:
+    test(name, [grep_errmsg(r'^!!! Webs: (useless elimination, round [0-9]+):', [1])],
+         compile_and_run, [early_opts + ' -fcore-webs-useless -dshow-passes'])

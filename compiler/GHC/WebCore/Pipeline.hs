@@ -40,7 +40,8 @@ import GHC.Types.Id.Info ( ruleInfoRules )
 import GHC.Types.Unique ( getUnique )
 
 import GHC.Data.Bag
-import GHC.Utils.Error ( DiagOpts, MessageClass(..), pprMessageBag, ghcExit )
+import GHC.Core.Seq ( seqBinds )
+import GHC.Utils.Error ( DiagOpts, MessageClass(..), pprMessageBag, ghcExit, withTiming )
 import GHC.Utils.Logger
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -619,11 +620,16 @@ runTransform name dump_flag do_round logger dflags cfg sigs0 done0 binds0
   where
     max_rounds = 10
 
+    force_round (Just (b, _, _, _), _) = seqBinds b
+    force_round (Nothing, _)           = ()
+
     go n done sigs binds verdicts changed
       | n > max_rounds = finish done sigs binds verdicts changed
       | otherwise
       = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
-           ; case do_round sigs us done binds of
+           ; r <- withTiming logger (text "Webs:" <+> text name <> text ", round" <+> int n)
+                    force_round (return (do_round sigs us done binds))
+           ; case r of
                (Nothing, vs) -> finish done sigs binds (record vs verdicts) changed
                (Just (binds0', handled, rw_ty, sat), vs) ->
                  do { let what   = name ++ ", round " ++ show n
@@ -631,8 +637,9 @@ runTransform name dump_flag do_round logger dflags cfg sigs0 done0 binds0
                                      { ws_saturated = ws_saturated sigs `unionUniqSets` sat }
                           binds' = refreshWorkers sigs' binds0'
                           res    = lintWebProgram cfg sigs' binds'
-                    ; reportWebLint logger dflags what binds' res
-                    ; checkSolved what res
+                    ; withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
+                        do { reportWebLint logger dflags what binds' res
+                           ; checkSolved what res }
                     ; go (n + 1) (done `unionUniqSets` handled) sigs' binds'
                          (record vs verdicts) True } }
 
