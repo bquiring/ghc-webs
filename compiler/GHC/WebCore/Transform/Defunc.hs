@@ -19,6 +19,7 @@ import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Utils ( exprType, exprIsTrivial )
 import GHC.Core.TyCo.Compare ( eqType )
+import GHC.Core.Map.Type ( TypeMap, emptyTypeMap, extendTypeMap, foldTypeMap )
 
 import GHC.Data.FastString ( fsLit, mkFastString )
 import GHC.Data.Pair ( Pair(..) )
@@ -146,35 +147,83 @@ instance Outputable Verdict where
 
 data Lam = Lam' { l_bndr :: Id, l_expr :: CoreExpr }
 
+{- Note [The size of the analysis]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The analysis visits every arrow in every type of the program: binder types,
+type arguments, case types.  A web's arrow can occur there a great many
+times; in happy's generated parsers (haskell-src-exts'
+Language.Haskell.Exts.InternalParser) the internal webs of the action
+functions occur hundreds of millions of times, and a list per occurrence
+(the occurrence's type, its parent web, and per call the head's web), held
+until the verdicts, ran the compiler out of memory (5.5 GB of list cells
+live; a 13 GB peak with the boundary split).  The verdicts need only the
+counts, the sets of parent and head webs, and the distinct occurrence types
+(whose kinds must agree), so that is what Info keeps; and note0 combines
+strictly, so a web does not carry a chain of thunks either.
+-}
+
+-- | What the analysis records for a web.  Occurrences and calls are counted,
+-- and only the distinct occurrence types and the sets of parent and head
+-- webs kept: a list per occurrence ran haskell-src-exts' generated parser
+-- out of memory (Note [The size of the analysis])
 data Info = Info
-  { i_lams    :: [Lam]
-  , i_occs    :: [Type]          -- ^ Occurrences of the web's arrow type
-  , i_known   :: Int
-  , i_unknown :: Int
-  , i_block   :: Maybe String    -- ^ Why the web cannot be defunctionalised
-  , i_parents :: [WebId]         -- ^ Per occurrence of the arrow type that is the
-                                 --   result of another arrow: that arrow's web
-  , i_heads   :: [Maybe WebId] } -- ^ Per call: the web of the call it applies, if
-                                 --   its function is a call
-                                 --   (Note [Defunctionalising whole arities])
+  { i_lams      :: [Lam]
+  , i_occs      :: !(TypeMap Type) -- ^ The distinct occurrences of the web's
+                                   --   arrow type (up to webs)
+  , i_n_occs    :: !Int            -- ^ How many occurrences
+  , i_known     :: !Int
+  , i_unknown   :: !Int
+  , i_block     :: !(Maybe String) -- ^ Why the web cannot be defunctionalised
+  , i_n_parents :: !Int            -- ^ Occurrences that are the result of another
+                                   --   arrow
+  , i_parents   :: !WebSet         -- ^ Those arrows' webs
+  , i_heads     :: !WebSet         -- ^ The webs of the calls the calls apply, if
+                                   --   their function is a call
+                                   --   (Note [Defunctionalising whole arities])
+  , i_head_none :: !Bool }         -- ^ Some call's function is not a call
 
 noInfo :: Info
-noInfo = Info [] [] 0 0 Nothing [] []
+noInfo = Info [] emptyTypeMap 0 0 0 Nothing 0 emptyUniqSet emptyUniqSet False
 
+-- | Add the second (usually one note) to the first
 plusInfo :: Info -> Info -> Info
-plusInfo a b = Info (i_lams a ++ i_lams b) (i_occs a ++ i_occs b)
+plusInfo a b = Info (i_lams a ++ i_lams b)
+                    (foldTypeMap (\t m -> extendTypeMap m t t) (i_occs a) (i_occs b))
+                    (i_n_occs a + i_n_occs b)
                     (i_known a + i_known b) (i_unknown a + i_unknown b)
                     (i_block a `orElse'` i_block b)
-                    (i_parents a ++ i_parents b) (i_heads a ++ i_heads b)
+                    (i_n_parents a + i_n_parents b)
+                    (i_parents a `unionUniqSets` i_parents b)
+                    (i_heads a `unionUniqSets` i_heads b)
+                    (i_head_none a || i_head_none b)
   where orElse' (Just r) _ = Just r
         orElse' Nothing r  = r
 
+-- | One occurrence of the web's arrow type
+occInfo :: Type -> Info
+occInfo ty = noInfo { i_occs = extendTypeMap emptyTypeMap ty ty, i_n_occs = 1 }
+
+-- | One call, known or not, applying the call of this web (if any)
+callInfo :: Bool -> Maybe WebId -> Info
+callInfo known mb_head
+  = noInfo { i_known   = if known then 1 else 0
+           , i_unknown = if known then 0 else 1
+           , i_heads   = maybe emptyUniqSet unitUniqSet mb_head
+           , i_head_none = not (isJust mb_head) }
+
+-- | The calls of the web
+calls :: Info -> Int
+calls i = i_known i + i_unknown i
+
 type Infos = UniqFM WebId Info
 
+-- | Strict in the combined Info: a lazy one was a chain of thunks per web
 note0 :: WebId -> Info -> Infos -> Infos
 note0 w i infos
   | isPlaceholderWeb w = infos
-  | otherwise          = addToUFM_C plusInfo infos w i
+  | otherwise          = case lookupUFM infos w of
+      Nothing  -> addToUFM infos w i
+      Just old -> let !new = plusInfo old i in addToUFM infos w new
 
 block :: String -> Info
 block why = noInfo { i_block = Just why }
@@ -212,8 +261,8 @@ analyse want_dump exposed binds = foldr go_bind emptyUFM binds
       WebLam w p e  -> note w (noInfo { i_lams = [Lam' p expr] }) (go_bndr p (go e acc))
       Lam b e       -> go_bndr b (go e acc)
       WebApp w f a
-        | knownHead f -> note w (noInfo { i_known = 1, i_heads = [head_web f] })   (go f (go a acc))
-        | otherwise   -> note w (noInfo { i_unknown = 1, i_heads = [head_web f] }) (go f (go a acc))
+        | knownHead f -> note w (callInfo True  (head_web f)) (go f (go a acc))
+        | otherwise   -> note w (callInfo False (head_web f)) (go f (go a acc))
       App f a       -> go f (go a acc)
       Let bind body -> go_bind bind (go body acc)
       Case e b ty alts
@@ -237,10 +286,11 @@ analyse want_dump exposed binds = foldr go_bind emptyUFM binds
     go_ty :: Type -> Infos -> Infos
     go_ty ty acc = case ty of
       FunTy { ft_web = w, ft_arg = a, ft_res = r }
-                     -> note w (noInfo { i_occs = [ty] }) $
+                     -> note w (occInfo ty) $
                         go_ty a $
                         (case r of
-                           FunTy { ft_web = w2 } -> note w2 (noInfo { i_parents = [w] })
+                           FunTy { ft_web = w2 } -> note w2 (noInfo { i_n_parents = 1
+                                                                    , i_parents = unitUniqSet w })
                            _                     -> id) $
                         go_ty r acc
       TyConApp _ tys -> foldr go_ty acc tys
@@ -301,9 +351,10 @@ verdict tops exposed n w i
 
     -- The argument and result kinds (n arguments, along the chain): the
     -- same everywhere, and closed
-    kinds = case [ (map typeKind as, typeKind r, as) | Just (as, r) <- map (peelArrows n) (i_occs i) ] of
+    occs  = foldTypeMap (:) [] (i_occs i)
+    kinds = case [ (map typeKind as, typeKind r, as) | Just (as, r) <- map (peelArrows n) occs ] of
       ((kas, kb, as) : rest)
-        | length rest + 1 == length (i_occs i)
+        | length rest + 1 == length occs
         , all (\(kas', kb', _) -> and (zipWith eqType kas' kas) && kb' `eqType` kb) rest
         , all closed (kb : kas)
         , all typeHasFixedRuntimeRep as
@@ -570,9 +621,9 @@ defuncProgram lifted want_dump this_mod pol us exposed binds
       , not (w2 `elementOfUniqSet` exposed)
       , Nothing <- i_block i2
       , length (i_lams i2) == length lams
-      , not (null (i_heads i2)), all (== Just w) (i_heads i2)
-      , length (i_heads i2) == length (i_heads (info w))
-      , length (i_parents i2) == length (i_occs i2), all (== w) (i_parents i2)
+      , calls i2 > 0, not (i_head_none i2), nonDetEltsUniqSet (i_heads i2) == [w]
+      , calls i2 == calls (info w)
+      , i_n_parents i2 == i_n_occs i2, all (== w) (nonDetEltsUniqSet (i_parents i2))
       = Just w2
       | otherwise = Nothing
     chain w = w : maybe [] chain (next w)   -- finite: each web is next of one web at most

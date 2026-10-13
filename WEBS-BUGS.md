@@ -36,6 +36,31 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Defunctionalisation and arity raising: an analysis list per arrow occurrence (2026-10-13)
+* **Found by:** the compilers group, nods configuration:
+  haskell-src-exts-1.24.0, Language.Haskell.Exts.InternalParser (happy's
+  generated parser, 77k terms; Futhark needs it).
+* **Symptom:** `ghc: out of memory` (4 GB, and still at 16 GB); a 13 GB peak
+  with 40 GB allowed (base: 0.6 GB).  Defunctionalisation alone: 4.6 GB, and
+  it defunctionalised nothing (20 s, 18 GB allocated); with the boundary
+  split 8.9 GB.  The heap profile: 5.5 GB of list cells live.
+* **Cause:** both analyses note every arrow of every type in the program,
+  and kept a list element per occurrence until the verdicts: defunc the
+  occurrence's type, its parent web and per call the head's web; arity
+  raising the product type of the parameter.  Combined lazily, too (a chain
+  of thunks per web).  Happy's action functions share internal webs whose
+  arrows occur hundreds of millions of times.
+* **Fix:** the verdicts read only counts, sets of webs, the distinct
+  occurrence types (a TypeMap) and whether the product types agree (at most
+  two kept), so Info keeps those, with strict fields and a strict note
+  (Note [The size of the analysis] in GHC.WebCore.Transform.Defunc;
+  GHC.WebCore.Transform.ArityRaise).  The module now peaks at 0.92 GB with
+  every nods flag (281 MB live); defunctionalisation takes 0.6 s.
+* **Guard:** the haskell-src-exts build (compilers group); the testsuite's
+  defunc and arity-raising dumps are unchanged.  No small reproduction (a
+  memory blowup on a 77k-term module).
+* **Commit:**
+
 ### Useless elimination: changes that change nothing, until the round limit (2026-10-13)
 * **Found by:** the compilers group, nods configuration (early-ulsl without
   data splitting, with -dcore-lint): Cabal-syntax-3.18.1.0,

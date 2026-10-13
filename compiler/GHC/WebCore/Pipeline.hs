@@ -216,6 +216,7 @@ webPass early guts
 
          -- If a transformation changed the program, it is not the original;
          -- Core Lint (endPass, with -dcore-lint) still checks the result
+       ; _ <- withTiming logger (text "Webs: erasure") seqBinds (return binds3)
        ; when (gopt Opt_DoCoreLinting dflags && not transformed) $
            checkRoundTrip binds0 binds3
 
@@ -224,6 +225,7 @@ webPass early guts
        ; let (binds3c, contracted)
                | boundary  = contractBoundary split_fns binds0 binds3
                | otherwise = (binds3, [])
+       ; _ <- withTiming logger (text "Webs: boundary contraction") seqBinds (return binds3c)
        ; when boundary $
            dump logger Opt_D_dump_webs_stats "Webs: boundary split" $
              vcat [ text "Split:"      <+> int (length split_fns)
@@ -239,6 +241,7 @@ webPass early guts
                | null new_ixs = (binds3c, [], [])
                | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3c
              new_tcs = [ maybe tc id (lookup tc replaced) | (tc, _) <- new_ixs ]
+       ; _ <- withTiming logger (text "Webs: specialising indexed types") seqBinds (return binds4)
        ; unless (null spec_dump) $
            dump logger Opt_D_dump_webs_defunc "Webs: specialising defunctionalised types" (vcat spec_dump)
 
@@ -568,6 +571,8 @@ runDefunc early logger dflags cfg this_mod sigs binds
              (res, vs) = defuncProgram (gopt Opt_CoreWebsDefuncLifted dflags)
                                        (dopt Opt_D_dump_webs_defunc dflags)
                                        this_mod pol us (ws_exposed sigs) binds
+       ; _ <- withTiming logger (text "Webs: defunctionalisation")
+                (\r -> case r of { Just (b, _) -> seqBinds b; Nothing -> () }) (return res)
        ; dump logger Opt_D_dump_webs_defunc "Webs: defunctionalisation" $
            pprWebVerdicts [ (v, bs) | (_, v, _, bs) <- vs ]
        ; case res of
@@ -575,8 +580,9 @@ runDefunc early logger dflags cfg this_mod sigs binds
            Just (binds', tcs) ->
              do { let what = "defunctionalisation"
                       lres = lintWebProgram cfg sigs binds'
-                ; reportWebLint logger dflags what binds' lres
-                ; checkSolved what lres
+                ; withTiming logger (text "Webs: Web Lint after" <+> text what) (const ()) $
+                    do { reportWebLint logger dflags what binds' lres
+                       ; checkSolved what lres }
                 ; return (binds', tcs, True) } }
 
 

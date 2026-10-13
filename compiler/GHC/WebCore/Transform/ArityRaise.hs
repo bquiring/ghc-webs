@@ -229,19 +229,24 @@ components dc args = map scaledThing (dataConInstArgTys dc args)
 --      Analysis
 ------------------------------------------------------------------
 
+-- Strict, and with at most two product types: the analysis notes every
+-- arrow of every type, and a list per occurrence (and thunks) ran
+-- haskell-src-exts' generated parser out of memory (Note [The size of the
+-- analysis] in GHC.WebCore.Transform.Defunc)
 data Info = Info
   { i_lams      :: [Id]
-  , i_lazy      :: Bool
-  , i_curried   :: Bool   -- A (non-join) lambda whose body is another lambda
-  , i_covar     :: Bool
-  , i_not_prod  :: Bool
-  , i_tycons    :: [TyCon]
-  , i_rep_poly  :: Bool
-  , i_coercion  :: Bool
-  , i_unknown   :: Bool    -- Some call of the web is not a known call
-  , i_boxed     :: Bool    -- Some lambda needs its parameter boxed
-  , i_noncon    :: Bool     -- Some call's argument is not a value
-  , i_comp_webs :: WebSet } -- The webs in the product's components
+  , i_lazy      :: !Bool
+  , i_curried   :: !Bool   -- A (non-join) lambda whose body is another lambda
+  , i_covar     :: !Bool
+  , i_not_prod  :: !Bool
+  , i_tycons    :: ![TyCon] -- The product types of the parameter: the first
+                            -- one seen, and another if there is one
+  , i_rep_poly  :: !Bool
+  , i_coercion  :: !Bool
+  , i_unknown   :: !Bool    -- Some call of the web is not a known call
+  , i_boxed     :: !Bool    -- Some lambda needs its parameter boxed
+  , i_noncon    :: !Bool    -- Some call's argument is not a value
+  , i_comp_webs :: !WebSet } -- The webs in the product's components
 
 noInfo :: Info
 noInfo = Info [] False False False False [] False False False False False emptyUniqSet
@@ -252,7 +257,7 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_curried  = i_curried a  || i_curried b
                     , i_covar    = i_covar a    || i_covar b
                     , i_not_prod = i_not_prod a || i_not_prod b
-                    , i_tycons   = i_tycons a ++ i_tycons b
+                    , i_tycons   = two (i_tycons a ++ i_tycons b)
                     , i_rep_poly = i_rep_poly a || i_rep_poly b
                     , i_coercion = i_coercion a || i_coercion b
                     , i_unknown  = i_unknown a  || i_unknown b
@@ -260,12 +265,19 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_noncon   = i_noncon a   || i_noncon b
                     , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
 
+  where
+    -- the first, and a different one if any (all that the verdict reads)
+    two (tc : tcs) = tc : take 1 (filter (/= tc) tcs)
+    two []         = []
+
 type Infos = UniqFM WebId Info
 
 note :: WebId -> Info -> Infos -> Infos
 note w i infos
   | isPlaceholderWeb w = infos
-  | otherwise          = addToUFM_C plusInfo infos w i
+  | otherwise          = case lookupUFM infos w of
+      Nothing  -> addToUFM infos w i
+      Just old -> let !new = plusInfo old i in addToUFM infos w new
 
 analyse :: FieldTys -> WebSet -> CoreProgram -> Infos
 analyse fields saturated binds = foldr go_bind emptyUFM binds
