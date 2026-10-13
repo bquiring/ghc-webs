@@ -677,6 +677,8 @@ data GeneralFlag
                             --   before worker/wrapper (needs -fstrictness)
    | Opt_CoreWebsBoundary   -- ^ Web pipeline (early run): split webs at the
                             --   module boundary by eta-expansion
+   | Opt_CoreWebsBoundaryKept -- ^ ... and split the binders kept for unfoldings
+                              --   and rules too: Note [Splitting kept binders]
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -970,6 +972,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsOneShot
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
+   , Opt_CoreWebsBoundaryKept
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

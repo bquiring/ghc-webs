@@ -16,12 +16,12 @@ import GHC.Core.Opt.Monad
 import GHC.Core.Ppr ( pprCoreBindings )
 import GHC.Core.Subst ( mkEmptySubst, substExpr )
 import GHC.Types.Var.Env ( mkInScopeSet )
-import GHC.Types.Var.Set ( mkVarSet )
+import GHC.Types.Var.Set ( mkVarSet, elemVarSet, emptyVarSet )
 import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
 import GHC.Types.Id
-import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM )
+import GHC.Types.Unique.FM ( sizeUFM, emptyUFM, lookupUFM, addToUFM, addToUFM_C, nonDetEltsUFM, lookupWithDefaultUFM )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply ( mkSplitUniqSupply, splitUniqSupply )
 import GHC.Types.Web
@@ -79,7 +79,8 @@ import GHC.Core.TyCo.Rep
 import GHC.Types.Var ( VarBndr(..), isTyVar )
 
 import Control.Monad
-import Data.List ( sortBy )
+import Data.List ( sortBy, sort, nub )
+import qualified Data.Map as Map
 import Data.Maybe ( fromMaybe )
 import Data.Ord ( comparing )
 
@@ -137,8 +138,13 @@ webPass early guts
        ; let -- 0. Split exposed webs at the module boundary (early run only)
              -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
              boundary = early && gopt Opt_CoreWebsBoundary dflags
+             -- See Note [Splitting kept binders] in GHC.WebCore.Boundary
+             kept0  | gopt Opt_CoreWebsBoundaryKept dflags
+                    = mkVarSet (map fst (nonDetEltsUFM
+                        (keptIds early isExportedId (const False) (const False) (mg_rules guts) binds_d)))
+                    | otherwise = emptyVarSet
              (binds0, split_fns)
-                    | boundary  = splitBoundary us0 (mg_rules guts) binds_d
+                    | boundary  = splitBoundary us0 (mg_rules guts) kept0 binds_d
                     | otherwise = (binds_d, [])
              cfg    = webLintConfig dflags
 
@@ -148,7 +154,9 @@ webPass early guts
                         | otherwise = isExportedId b
              hidden | gopt Opt_CoreWebsNoHiddenFields dflags = const False
                     | otherwise = hiddenFields main_only guts split_tcs binds0
-             (binds1, sigs1) = annotateProgram early exported hidden us (mg_rules guts) binds0
+             wrappers = mkVarSet (map fst split_fns)
+             (binds1, sigs1) = annotateProgram early exported (`elemVarSet` wrappers) hidden us
+                                               (mg_rules guts) binds0
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -161,7 +169,11 @@ webPass early guts
 
          -- 3. Renaming.  Classes joined with an arrow without a web are now
          -- exposed too; see Note [Arrows without webs] in GHC.WebCore.Lint
+             -- (ws_exposed_reps: every exposed class; the origin is
+             -- recorded only for the classes with the placeholder web)
              sigs2  = addExposedWebs (ws_exposed_reps sol) $
+                      addExposedWebsFrom "an arrow without a web"
+                        (mkUniqSet [ rep | cls@(rep : _) <- ws_classes sol, any isPlaceholderWeb cls ]) $
                       renameSigs (ws_subst sol) sigs1
              binds2 = renameProgram (ws_subst sol) sigs2 binds1
 
@@ -304,7 +316,16 @@ pprHiddenStats sigs binds
          , text "Internal lambda classes:"  <+> int (sizeUniqSet (lams `minusUniqSet` ws_exposed sigs))
          , text "Types with hidden fields:" <+> int (sizeUniqSet hidden_tcs)
          , text "Webs in hidden fields:"    <+> int (sizeUniqSet (hiddenFieldWebs sigs)) ]
+    $$ vcat [ text "Exposed lambda classes by:" <+> text why <> colon <+> int n | (why, n) <- count by_all ]
+    $$ vcat [ text "Exposed lambda classes only by:" <+> text why <> colon <+> int n | (why, n) <- count by_only ]
   where
+    -- Why each exposed lambda class is exposed: every origin of its webs
+    -- (ws_origins), and the origin alone when it is the only one
+    exposed_lams = nonDetEltsUniqSet (lams `intersectUniqSets` ws_exposed sigs)
+    whys w = sort (nub (lookupWithDefaultUFM (ws_origins sigs) ["(unknown)"] w))
+    by_all  = concatMap whys exposed_lams
+    by_only = [ y | w <- exposed_lams, [y] <- [whys w] ]
+    count xs = Map.toList (Map.fromListWith (+) [ (x, 1 :: Int) | x <- xs ])
     lams = mkUniqSet (concatMap (lamWebs . snd) (flattenBinds binds))
     hidden_tcs = mkUniqSet [ getUnique (dataConTyCon dc) | (dc, _) <- nonDetEltsUFM (ws_dcs sigs)
                                                        , ws_hidden_fields sigs (dataConTyCon dc) ]

@@ -2582,6 +2582,7 @@ fFlagsDeps = [
   flagSpec "core-webs-one-shot"               Opt_CoreWebsOneShot,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
   flagSpec "core-webs-boundary"               Opt_CoreWebsBoundary,
+  flagSpec "core-webs-boundary-kept"          Opt_CoreWebsBoundaryKept,
   flagSpec "liberate-case"                    Opt_LiberateCase,
   flagHiddenSpec "llvm-fill-undef-with-garbage" Opt_LlvmFillUndefWithGarbage,
   flagSpec "loopification"                    Opt_Loopification,

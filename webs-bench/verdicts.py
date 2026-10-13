@@ -4,7 +4,8 @@
     webs-bench/verdicts.py CONFIG [CONFIG ...]
 
 reads the -ddump-webs-<pass> dumps in webs-bench/results/CONFIG/dumps/ (see
-run-nofib.sh).  Each dump line is "verdict: binders", one per web.  Prints,
+run-nofib.sh), or, for a CONFIG that is a directory, the dumps anywhere
+under it (a cabal build directory built with -ddump-to-file).  Each dump line is "verdict: binders", one per web.  Prints,
 per pass, how many webs the pass changed ("fired"), then every verdict's
 count per configuration.
 """
@@ -12,11 +13,11 @@ import os, re, sys, collections
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 PASSES = ['one-shot', 'inline', 'const-prop', 'arity-raise', 'dead-params', 'uncurry', 'defunc',
-          'result-raise', 'strictness']
+          'result-raise', 'strictness', 'useless']
 # A verdict component that changed the program starts with one of these
 FIRED = ['inline', 'strict argument', 'strict result fields',
          'constant argument', 'constant result', 'uncurried', 'raised',
-         'deleted', 'unit', 'one-shot']
+         'deleted', 'unit', 'one-shot', 'dead fields', 'defunctionalised']
 
 def components(verdict):
     """Split a verdict into its parts (const-prop and strictness give one
@@ -37,7 +38,7 @@ def fired(part):
 def tally(config):
     """pass -> Counter of verdict parts, plus 'webs' and 'fired' counts"""
     t = {p: collections.Counter() for p in PASSES}
-    d = os.path.join(ROOT, config, 'dumps')
+    d = config if os.path.isdir(config) else os.path.join(ROOT, config, 'dumps')
     for dirpath, _, files in os.walk(d):
         for f in files:
             m = re.search(r'\.dump-webs-(.*)$', f)

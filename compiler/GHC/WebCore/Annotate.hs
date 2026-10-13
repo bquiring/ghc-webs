@@ -4,6 +4,7 @@
 -- See Note [Initial annotation].
 module GHC.WebCore.Annotate
   ( annotateProgram
+  , keptIds
   ) where
 
 import GHC.Prelude
@@ -24,6 +25,7 @@ import GHC.Types.Unique.Set ( nonDetEltsUniqSet, mkUniqSet )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
+import GHC.Types.Unique.FM ( nonDetEltsUFM )
 import GHC.Core.FVs ( rulesFreeVars, stableUnfoldingVars )
 import GHC.Types.Web
 
@@ -33,6 +35,8 @@ import GHC.Utils.Panic
 
 import GHC.WebCore.Sigs
 import GHC.WebCore.Traverse ( typeWebs )
+import GHC.Types.Name ( Name, getName, nameModule_maybe, nameOccName, occNameString )
+import GHC.Unit.Module ( moduleName, moduleNameString )
 
 import Data.Array ( bounds, listArray )
 import Data.Maybe ( fromMaybe )
@@ -82,13 +86,16 @@ Details:
 annotateProgram :: Bool   -- ^ Keep stable unfoldings (the early run; see
                           --   Note [Early webs] in GHC.WebCore.Pipeline)
                 -> (Id -> Bool)      -- ^ Really exported: Note [Main's exports] in GHC.WebCore.Pipeline
+                -> (Id -> Bool)      -- ^ The boundary split's wrappers (for -ddump-webs-stats)
                 -> (TyCon -> Bool)   -- ^ Types with hidden fields: Note [Hidden fields]
                 -> UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, WebSigs)
-annotateProgram keep_stable exported hidden us rules binds
+annotateProgram keep_stable exported wrapper hidden us rules binds
   = case unAnnM (ann_top binds) us init_sigs of
       (binds', _, sigs) -> (binds', sigs)
   where
-    init_sigs = emptyWebSigs { ws_interface_ids = keptIds keep_stable exported hidden rules binds
+    kept      = keptIds keep_stable exported wrapper hidden rules binds
+    init_sigs = emptyWebSigs { ws_interface_ids = mkVarSet (map fst (nonDetEltsUFM kept))
+                             , ws_kept_why = kept
                              , ws_hidden_fields = hidden }
 
     ann_top bs
@@ -123,14 +130,19 @@ annotateProgram keep_stable exported hidden us rules binds
 -- the transformed program (see tidyTopUnfolding in GHC.Iface.Tidy), and the
 -- simplifier rebuilds them too.  In the late run nothing inlines afterwards,
 -- so zapping other unfoldings is harmless.
-keptIds :: Bool -> (Id -> Bool) -> (TyCon -> Bool) -> [CoreRule] -> CoreProgram -> VarSet
-keptIds keep_stable exported hidden rules binds = go emptyVarSet roots
+--
+-- Each with why it is kept (the first reason found, for -ddump-webs-stats).
+keptIds :: Bool -> (Id -> Bool) -> (Id -> Bool) -> (TyCon -> Bool) -> [CoreRule] -> CoreProgram
+        -> VarEnv (Id, String)
+keptIds keep_stable exported wrapper hidden rules binds = go emptyVarEnv roots
   where
     bndrs = allLetBinders binds
-    roots = filter (\b -> exported b && not (hidden_selector b)) (bindersOfBinds binds)
-         ++ filter (not . isEmptyRuleInfo . idSpecialisation) bndrs
-         ++ filter isLocalId (nonDetEltsUniqSet (rulesFreeVars rules))
-         ++ (if keep_stable then filter (isStableUnfolding . realIdUnfolding) bndrs else [])
+    roots = [ (b, "exported") | b <- bindersOfBinds binds, exported b, not (hidden_selector b) ]
+         ++ [ (b, "has rules") | b <- bndrs, not (isEmptyRuleInfo (idSpecialisation b)) ]
+         ++ [ (b, "free in rules") | b <- nonDetEltsUniqSet (rulesFreeVars rules), isLocalId b ]
+         ++ (if keep_stable then [ (b, "stable unfolding") | b <- bndrs
+                                                          , isStableUnfolding (realIdUnfolding b) ]
+                            else [])
 
     hidden_selector b = case recordSelectorTyCon_maybe b of
       Just (RecSelData tc) -> hidden tc
@@ -143,10 +155,11 @@ keptIds keep_stable exported hidden rules binds = go emptyVarSet roots
     bndr_env = foldr (\b env -> extendVarEnv_C (++) env b [b]) emptyVarEnv bndrs
 
     go acc []     = acc
-    go acc (v:vs)
-      | v `elemVarSet` acc = go acc vs
+    go acc ((v, why) : vs)
+      | v `elemVarEnv` acc = go acc vs
       | otherwise
-      = go (acc `extendVarSet` v) (filter isLocalId (deps v) ++ vs)
+      = go (extendVarEnv acc v (v, if wrapper v then why ++ " (boundary wrapper)" else why))
+           ([ (d, "in an unfolding or rule") | d <- deps v, isLocalId d ] ++ vs)
 
     -- The free variables of the binder's rules and stable unfolding,
     -- recomputed from the rules (the cached ruleInfoFreeVars can be stale)
@@ -220,7 +233,8 @@ annBndr env b
          -- The webs of kept binders are exposed; see keptIds
        ; sigs <- getSigs
        ; when (b `elemVarSet` ws_interface_ids sigs) $
-           modifySigs (addExposedWebs (typeWebs ty'))
+           modifySigs (addExposedWebsFrom ("kept binder: " ++ maybe "?" snd (lookupVarEnv (ws_kept_why sigs) b))
+                                          (typeWebs ty'))
        ; return (extendVarEnv env b b', b') }
   | otherwise   -- Type variable: unchanged
   = return (env, b)
@@ -426,7 +440,7 @@ annGlobalId v
                           -- A data constructor worker shares the signature
                           -- of its data constructor
                           Just dc -> annDataCon dc
-                          Nothing -> annExposedType (idType v)
+                          Nothing -> annExposedType ("imported " ++ originName (idName v)) (idType v)
                 ; let clone = setIdType v ty
                 ; modifySigs (addGlobalIdSig v clone)
                 ; return clone } }
@@ -442,10 +456,11 @@ annDataCon dc
            Nothing
              | ws_hidden_fields sigs (dataConTyCon dc)
              -> do { ty <- annType emptyVarEnv (dataConRepType dc)
-                   ; modifySigs (addExposedWebs (mkUniqSet (spineWebs ty)) . addDataConSig dc ty)
+                   ; modifySigs (addExposedWebsFrom ("constructor arrows " ++ originName (dataConName dc))
+                                                    (mkUniqSet (spineWebs ty)) . addDataConSig dc ty)
                    ; return ty }
              | otherwise
-             -> do { ty <- annExposedType (dataConRepType dc)
+             -> do { ty <- annExposedType ("constructor " ++ originName (dataConName dc)) (dataConRepType dc)
                    ; modifySigs (addDataConSig dc ty)
                    ; return ty } }
   where
@@ -473,17 +488,24 @@ annAxiom ax
                 ; modifySigs (addAxiomSig ax clone)
                 ; return clone } }
   where
+    why = "axiom " ++ originName (getName ax)
     ann_branch br@(CoAxBranch { cab_lhs = lhs, cab_rhs = rhs })
-      = do { lhs' <- mapM annExposedType lhs
-           ; rhs' <- annExposedType rhs
+      = do { lhs' <- mapM (annExposedType why) lhs
+           ; rhs' <- annExposedType why rhs
            ; return (br { cab_lhs = lhs', cab_rhs = rhs' }) }
 
--- | Annotate a closed type, exposing all its webs
-annExposedType :: HasDebugCallStack => Type -> AnnM Type
-annExposedType ty
+-- | Annotate a closed type, exposing all its webs (the string says why,
+-- for -ddump-webs-stats)
+annExposedType :: HasDebugCallStack => String -> Type -> AnnM Type
+annExposedType why ty
   = do { ty' <- annType emptyVarEnv ty
-       ; modifySigs (addExposedWebs (typeWebs ty'))
+       ; modifySigs (addExposedWebsFrom why (typeWebs ty'))
        ; return ty' }
+
+-- | A name with its module, for -ddump-webs-stats
+originName :: Name -> String
+originName n = maybe "" (\m -> moduleNameString (moduleName m) ++ ".") (nameModule_maybe n)
+             ++ occNameString (nameOccName n)
 
 ------------------------------------------------------------------
 --      Utilities

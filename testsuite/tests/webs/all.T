@@ -528,3 +528,8 @@ for name in ['useless_rounds001', 'useless_rounds002']:
 # re-checks after the transformations need -dcore-lint
 test('lint_flag001', [grep_errmsg(r'^(\*\*\* Core Linted result of [^:]*|!!! Webs: Web Lint after [^:]*):', [1])],
      compile_and_run, ['-O -fcore-webs-early -fcore-webs-useless -dcore-webs-lint -dshow-passes'])
+
+# -fcore-webs-boundary-kept splits binders kept only for rules and
+# unfoldings; the specialisation $sinsert keeps only its wrapper exposed
+test('boundary_kept001', [grep_errmsg(r'^Exposed lambda classes only by: (kept binder[^:]*: [^:]*):', [1])],
+     compile_and_run, [early_opts + ' -fcore-webs-boundary -fcore-webs-boundary-kept -ddump-webs-stats'])

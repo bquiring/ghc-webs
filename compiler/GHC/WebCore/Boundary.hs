@@ -12,7 +12,7 @@ module GHC.WebCore.Boundary
 import GHC.Prelude
 
 import GHC.Core
-import GHC.Core.FVs ( rulesFreeVars )
+import GHC.Core.FVs ( rulesFreeVars, ruleLhsFreeIds )
 import GHC.Core.Opt.Arity ( etaExpand )
 import GHC.Core.Utils ( exprIsTrivial )
 import GHC.Core.Map.Expr ( eqCoreExpr )
@@ -26,7 +26,8 @@ import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Demand ( SubDemand, pattern (:*), splitDmdSig, viewCall
                          , isAbsDmd, isAtMostOnce, topSubDmd )
-import GHC.Types.Basic ( Arity, isDefaultInlinePragma, noOccInfo )
+import GHC.Types.Basic ( Arity, isDefaultInlinePragma, isInlinablePragma, defaultInlinePragma
+                        , InlinePragma, noOccInfo )
 import GHC.Types.Var ( FunTyFlag(..) )
 import GHC.Types.Name
 import GHC.Types.Unique ( Unique )
@@ -91,6 +92,36 @@ which runs after the early web pass, eta-reduces the expanded arguments
 simplifies afterwards, so the split is not done.
 -}
 
+{- Note [Splitting kept binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Besides the exported functions, the binders that unannotated Core refers
+to keep their types: the Ids free in the RULES and in the stable unfoldings
+of kept binders (keptIds in GHC.WebCore.Annotate), and their webs are
+exposed.  On the compilers group (cabal-install, Koka, PureScript) these
+kept binders exposed 70% of the exposed lambda classes, and nothing else
+exposed them.  An example: the specialiser's copy $smapM_ of an imported
+mapM_, which the RULE for mapM_ mentions.
+
+With -fcore-webs-boundary-kept, such a binder f is split like an exported
+function (Note [Splitting webs at the boundary]): f keeps its type, its
+unfolding and the rules that mention it, and becomes the wrapper
+f = \xs -> $ef xs, while the program's own occurrences go to $ef, which the
+transformations may change.  The unfoldings and rules are only rewritten
+later (by the simplifier that runs after the early web pass, and in other
+modules), and what they rewrite to is a call of the wrapper, which then
+inlines.  A binder with rules, an INLINE pragma or an INLINE unfolding of its
+own is not split: redirecting its occurrences to $ef would lose those
+rules, or the inlining, in this module.  An INLINABLE one is: its stable
+unfolding is there for specialisation (GHC's specialisations of INLINABLE
+imported functions, such as $sinsert for Data.Map.insert at Int keys, carry
+one), and specialisation has run before the early web pass.  Both halves
+lose the pragma and the stable unfolding (an exported INLINABLE function is
+not split, so other modules can still specialise it).  Nor is one on the left-hand side of a rule, which must see it
+to fire; on a right-hand side it is fine (unlike an exported function,
+which the plain split leaves alone if any rule mentions it).  As before, the split is undone if $ef does not change (Note
+[Contracting the boundary split]).
+-}
+
 {- Note [Contracting the boundary split]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If no transformation changed the local copy $ef of an exported function f
@@ -140,11 +171,16 @@ the same assumption (-fno-pedantic-bottoms).
 --
 -- Returns the split program and, for each split function, its original Id
 -- and its local copy (for 'contractBoundary').
-splitBoundary :: UniqSupply -> [CoreRule] -> CoreProgram -> (CoreProgram, [(Id, Id)])
-splitBoundary us rules binds
+splitBoundary :: UniqSupply -> [CoreRule]
+              -> VarSet   -- ^ Kept binders to split too: Note [Splitting kept binders]
+              -> CoreProgram -> (CoreProgram, [(Id, Id)])
+splitBoundary us rules kept binds
   = (map etaArgsBind (concat binds'), nonDetEltsUFM env)
   where
     rule_fvs = rulesFreeVars rules
+    -- A kept binder only needs to stay out of the rules' left-hand sides,
+    -- where a rule must see it to fire (Note [Splitting kept binders])
+    rule_lhs_fvs = unionVarSets (map ruleLhsFreeIds rules)
     (env, binds') = initUs_ us (mapAccumLM split_bind emptyVarEnv binds)
 
     -- First pass: choose the exported functions to split, and build their
@@ -168,13 +204,20 @@ splitBoundary us rules binds
                       : wrappers ) }
     split_bind acc bind = return (acc, [bind])
 
+    prag_of f = idInlinePragma f
+
     splittable f rhs
-      | isExportedId f
+      | isExportedId f || f `elemVarSet` kept
       , not (isJoinId f)
-      , not (isStableUnfolding (realIdUnfolding f))
       , isEmptyRuleInfo (idSpecialisation f)
-      , isDefaultInlinePragma (idInlinePragma f)
-      , not (f `elemVarSet` rule_fvs)
+      , if isExportedId f
+        then not (isStableUnfolding (realIdUnfolding f))
+             && isDefaultInlinePragma (idInlinePragma f)
+             && not (f `elemVarSet` rule_fvs)
+        else -- Note [Splitting kept binders]
+             not (isInlineUnfolding (realIdUnfolding f))
+             && (isDefaultInlinePragma (prag_of f) || isInlinablePragma (prag_of f))
+             && not (f `elemVarSet` rule_lhs_fvs)
       , let n = length (filter isId (fst (collectBinders rhs)))
       , n > 0
       = Just n
@@ -229,11 +272,20 @@ mkLocalCopy u f = mkLocalIdWithInfo name ManyTy (idType f) info
     info = idInfo f `setUnfoldingInfo` noUnfolding
                     `setRuleInfo` emptyRuleInfo
                     `setOccInfo` noOccInfo
+                    `setInlinePragInfo` noInlinable (idInlinePragma f)
 
 -- | The exported wrapper keeps its Id, but not its unfolding, which
--- describes the old right-hand side
+-- describes the old right-hand side, nor an INLINABLE pragma (a kept
+-- binder's: Note [Splitting kept binders])
 zapSplit :: Id -> Id
 zapSplit f = f `setIdUnfolding` noUnfolding
+               `setInlinePragma` noInlinable (idInlinePragma f)
+
+-- | An INLINABLE pragma becomes the default one: the stable unfolding it
+-- asked for is gone (Note [Splitting kept binders])
+noInlinable :: InlinePragma -> InlinePragma
+noInlinable prag | isInlinablePragma prag = defaultInlinePragma
+                 | otherwise              = prag
 
 -- | The exported wrapper  f = \xs -> $ef xs.  Its binders get the demands
 -- of f's parameters (from f's demand signature): the binders etaExpand
