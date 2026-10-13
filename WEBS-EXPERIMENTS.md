@@ -773,6 +773,39 @@ twenty-four +12.6% (CPS backtracking), json-decode +6.6% (allocation x2.4),
 parser-comb +5.5%.  The allocation geomean is not meaningful (y-fact drops
 to almost nothing).
 
+## 20. Compilers on Hackage: base vs nods (2026-10-13)
+
+The third group in ~/projects/webs-hackage-bench (`compilers/`):
+cabal-install 3.18.1.0 solving a 319-package plan (pandoc, dhall, ...)
+against its own copy of the Hackage index (`--dry-run`); Futhark 0.27.1
+compiling Rodinia's myocyte to OpenCL C; PureScript 0.15.15 compiling 53
+libraries of the package set (331 modules) to JavaScript; Koka 3.2.9
+compiling its standard library and samples to JavaScript.  Configuration
+nods: early-ulsl without data splitting, unboxing and data-again (the
+user, 2026-10-11), with -dcore-lint, every non-boot package built with the
+flags.  5 interleaved rounds on one pinned CPU, medians; all outputs
+identical to base (Futhark's output stamps the git commit it was built at;
+time.py now ignores that line).
+
+| benchmark | base time (s) | base instr. (G) | instructions | time | allocation |
+|---|---|---|---|---|---|
+| cabal | 3.12 | 27.27 | +0.20% | +0.71% | +0.11% |
+| futhark | 4.90 | 41.58 | -0.42% | +0.71% | +0.00% |
+| purs | 15.92 | 123.46 | +0.27% | +0.37% | +0.74% |
+| koka | 3.66 | 26.08 | -0.05% | -0.48% | -0.11% |
+| geomean | | | -0.00% | +0.33% | +0.19% |
+
+Neutral: every instruction count within 0.5% of base.  An earlier
+5-round run (without Futhark) agreed within 0.3% on instructions.  Why the
+transformations find nothing to gain here is not yet examined (how many
+webs they change in these packages, -ddump-webs-stats).
+
+Building the group found two webs bugs, both fixed (WEBS-BUGS.md,
+2026-10-13): useless elimination reporting changes it could not make until
+the round limit (Cabal-syntax ran out of memory), and defunctionalisation's
+and arity raising's analyses keeping a list entry per arrow occurrence
+(haskell-src-exts's happy-generated parser: 13 GB, now 0.92 GB).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
