@@ -78,6 +78,7 @@ done
 TIMING_MODE=${TIMING_MODE:-norm}
 echo "[$NAME] keeping executables (run commands for mode $TIMING_MODE)"
 : > "$OUT/runs.tsv"
+echo "$TIMING_MODE" > "$OUT/mode"   # read by time-nofib.py's report
 find . -type d -name "$DUMPDIR" | sort | while read -r d; do
   dir=$(dirname "$d" | sed 's|^\./||')
   cmd=$(cd "$dir" && make -n -s runtests mode="$TIMING_MODE" NoFibRuns=1 WithNofibHc="$GHC" 2>/dev/null \

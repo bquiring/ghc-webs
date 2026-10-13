@@ -7,8 +7,8 @@ lazy argument (lazy); no strict result fields (unknown call context): n
 lazy argument (lazy); no strict result fields (unknown call context): void
 lazy argument (lazy); no strict result fields (unknown call context): ww
 lazy argument (lazy); no strict result fields (unknown call context): x ds
-strict argument (depth 1); no strict result fields (unknown call context): ww
-strict argument (depth 2); no strict result fields (no calls): f
+strict argument (depth 1, no change); no strict result fields (unknown call context): ww
+strict argument (depth 2, no change); no strict result fields (no calls): f
 
 
 [2 of 2] Linking strict002

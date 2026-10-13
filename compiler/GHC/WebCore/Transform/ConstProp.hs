@@ -277,12 +277,17 @@ verdict exposed w i
           Just (c : rest) | all (eqCoreExpr c) rest -> ResConst c
           _ -> NoResConst "not constant"
 
-pprVerdict :: (ArgVerdict, ResVerdict) -> SDoc
-pprVerdict (a, r) = ppr_a a <> semi <+> ppr_r r
+-- | A verdict, given whether the constant argument and the constant result
+-- change the program (a parameter that never occurs, a result no case
+-- scrutinises: "no change")
+pprVerdict :: (Bool, Bool) -> (ArgVerdict, ResVerdict) -> SDoc
+pprVerdict (use_a, use_r) (a, r) = ppr_a a <> semi <+> ppr_r r
   where
     ppr_a (ArgConst c)     = text "constant argument" <+> ppr c
+                             <+> (if use_a then empty else text "(no change: parameter unused)")
     ppr_a (NoArgConst why) = text "no constant argument" <+> parens (text why)
     ppr_r (ResConst c)     = text "constant result" <+> ppr c
+                             <+> (if use_r then empty else text "(no change: no scrutinised call)")
     ppr_r (NoResConst why) = text "no constant result" <+> parens (text why)
 
 ------------------------------------------------------------------
@@ -304,19 +309,43 @@ constPropRound _us exposed done binds
                , not (null (i_lams i))
                , not (w `elementOfUniqSet` done)
                , let v = verdict exposed w i ]
-    arg_webs = listToUFM [ (w, c) | (w, (ArgConst c, _), _) <- verdicts ]
+    arg_webs = listToUFM [ (w, c) | (w, (ArgConst c, _), i) <- verdicts, used i ]
     res_webs = listToUFM [ (w, c) | (w, (_, ResConst c), _) <- verdicts, useful w ]
-    handled  = mkUniqSet ([ w | (w, (ArgConst _, _), _) <- verdicts ] ++ nonDetKeysW res_webs)
+    handled  = mkUniqSet (nonDetKeysW arg_webs ++ nonDetKeysW res_webs)
     nonDetKeysW m = [ mkWebId u | (u, _) <- nonDetUFMToList m ]
-    dump     = [ (w, pprVerdict v, changes w v, map fst (i_lams i)) | (w, v, i) <- verdicts ]
+    dump     = [ (w, pprVerdict (used i, useful w) v, changes w i v, map fst (i_lams i))
+               | (w, v, i) <- verdicts ]
 
-    changes _ (ArgConst {}, _) = True
-    changes w (_, ResConst {}) = useful w
-    changes _ _                = False
+    changes _ i (ArgConst {}, _) | used i = True
+    changes w _ (_, ResConst {})          = useful w
+    changes _ _ _                         = False
+
+    -- Substituting a constant argument changes something only if a
+    -- lambda's parameter occurs (GHC's void arguments, (##), to join
+    -- points and thunks are usually unused)
+    used i = any ((`elemVarSet` occurring) . fst) (i_lams i)
+    occurring = occurringVars binds
 
     -- A constant result is useful if some call of the web is scrutinised
     useful w = w `elementOfUniqSet` scrutinised
     scrutinised = scrutinisedWebs binds
+
+-- | The variables that occur in a program (not as binders)
+occurringVars :: CoreProgram -> VarSet
+occurringVars binds = foldr go_bind emptyVarSet binds
+  where
+    go_bind b acc = foldr go acc (rhssOfBind b)
+    go expr acc = case expr of
+      Var v         -> extendVarSet acc v
+      WebLam _ _ e  -> go e acc
+      Lam _ e       -> go e acc
+      WebApp _ f a  -> go f (go a acc)
+      App f a       -> go f (go a acc)
+      Let bind body -> go_bind bind (go body acc)
+      Case e _ _ as -> go e (foldr (\(Alt _ _ rhs) -> go rhs) acc as)
+      Cast e _      -> go e acc
+      Tick _ e      -> go e acc
+      _             -> acc
 
 -- | The webs of calls that are scrutinised by a case
 scrutinisedWebs :: CoreProgram -> WebSet

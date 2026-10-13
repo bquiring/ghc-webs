@@ -48,9 +48,9 @@ and, for context:
   lams         value-lambda groups
   calls        applications to at least one value argument, other than data
                constructor applications
-  unknown_calls  calls whose head is not a let-bound, top-level or imported
-               variable (e.g. a lambda- or case-bound variable): calls of
-               first-class functions
+  unknown_calls  calls whose head (through casts and ticks) is not a
+               let-bound, top-level or imported variable (e.g. a lambda- or
+               case-bound variable): calls of first-class functions
   partial_apps calls of a let-bound, top-level or imported function with
                fewer value arguments than its arity (manifest arity for local
                functions, idArity for imported ones)
@@ -179,12 +179,21 @@ firstClassStats binds = sumFCS (go_bind top_env) binds
                    , fc_unknown_calls = if known then 0 else 1
                    , fc_partial_apps  = if partial then 1 else 0 }
 
-        known = case fun of
-          Var v -> isGlobalId v || v `elemKnown` env
-          _     -> False
+        -- The head through casts and ticks: (f |> co) x, a call of a
+        -- function wrapped in a newtype, is a call of f
+        head_var = case stripHead fun of
+          Var v -> Just v
+          _     -> Nothing
+        stripHead (Cast e _) = stripHead e
+        stripHead (Tick _ e) = stripHead e
+        stripHead e          = e
 
-        partial = case fun of
-          Var v | Just ar <- arityOf env v -> n_val < ar
+        known = case head_var of
+          Just v -> isGlobalId v || v `elemKnown` env
+          _      -> False
+
+        partial = case head_var of
+          Just v | Just ar <- arityOf env v -> n_val < ar
           _ -> False
 
 -- | Variables whose calls are known (let-bound and top-level ones), with

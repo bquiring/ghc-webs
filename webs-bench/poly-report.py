@@ -51,14 +51,32 @@ def clean(s):
     return s
 
 
+def top_level(ty, sym):
+    """Does sym occur in ty outside brackets?"""
+    depth = 0
+    for i, ch in enumerate(ty):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and ty.startswith(sym, i):
+            return True
+    return False
+
+
 def head_of(ty):
     ty = ty.strip()
-    if ty.startswith("("):
-        return "tuple" if "," in ty else "parenthesised"
+    # an arrow outside brackets first: (a -> b) -> c and (a, b) -> c are
+    # functions, not a parenthesised type or a tuple
+    if top_level(ty, "->"):
+        return "function"
+    if ty.startswith("(") and ty.endswith(")"):
+        inner = ty[1:-1]
+        if top_level(inner, ","):
+            return "tuple"
+        return head_of(inner) if inner.strip() else "unit"
     if ty.startswith("["):
         return "list"
-    if "->" in ty:
-        return "function"
     return ty.split()[0]
 
 

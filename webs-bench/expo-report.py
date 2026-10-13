@@ -43,7 +43,12 @@ def read(d):
             if not f.endswith('.dump-webs-stats'):
                 continue
             t['modules'] += 1
+            blocks = 0
             for line in open(os.path.join(dirpath, f), errors='replace'):
+                if line.startswith('==================== Webs: statistics'):
+                    blocks += 1
+                    if blocks == 2:
+                        t['repeated'] += 1
                 m = re.match(r'(Lambda classes|Internal lambda classes|Webs|Exposed webs): (\d+)$', line)
                 if m:
                     t[m.group(1)] += int(m.group(2))
@@ -72,6 +77,9 @@ def main():
     print('# Exposure: %s\n' % a.dir)
     print('%d modules; %d lambda classes, %d exposed (%.1f%%), %d internal.'
           % (t['modules'], lams, exposed, 100.0 * exposed / max(lams, 1), internal))
+    if t['repeated']:
+        print('\nNote: %d modules have more than one statistics block (an early and a late '
+              'web run): their classes are counted once per run.' % t['repeated'])
     for title, c in [('Exposed lambda classes by kind of origin (a class counts under each of its origins)', by),
                      ('... with only one origin', only)]:
         k = collections.Counter()

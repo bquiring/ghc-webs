@@ -25,6 +25,13 @@ def components(verdict):
     the constant or the depth from the parts that fired."""
     out = []
     for c in verdict.split('; '):
+        if 'no change' in c:
+            # e.g. "constant argument X (no change: parameter unused)",
+            # "strict argument (depth 1, no change)": the kind and the reason
+            kind = next((k for k in FIRED if c.startswith(k)), c)
+            m = re.search(r'no change(: [^)]*)?', c)
+            out.append('%s (%s)' % (kind, m.group(0)))
+            continue
         for k in FIRED:
             if c.startswith(k) and not c.startswith('unit ('):
                 c = k
@@ -33,6 +40,10 @@ def components(verdict):
     return out
 
 def fired(part):
+    # "no change": the verdict held but the rewrite had nothing to do
+    # (strictness, constant propagation, inlining say so)
+    if 'no change' in part:
+        return False
     return part in FIRED or part.startswith('unit (')
 
 def tally(config):
@@ -48,10 +59,17 @@ def tally(config):
             # Sections other than the verdicts (defunctionalisation's
             # specialisation post-pass: "Main.Defun1: specialised ...")
             skip = False
+            blocks = 0
             for line in open(os.path.join(dirpath, f), errors='replace'):
                 line = line.rstrip('\n')
                 if line.startswith('===='):
                     skip = 'specialising' in line
+                    if not skip:
+                        blocks += 1
+                        if blocks == 2:
+                            # an early and a late run, or several passes
+                            # (-fcore-webs-passes): webs are counted per block
+                            c['repeated blocks'] += 1
                     continue
                 if skip or not line or line[0].isspace() or ': ' not in line:
                     continue
@@ -72,10 +90,14 @@ def main(configs):
     for p in PASSES:
         print('| %s | ' % p + ' | '.join(
             '%d / %d' % (ts[c][p]['fired'], ts[c][p]['webs']) for c in configs) + ' |')
+    rep = [(c, p, ts[c][p]['repeated blocks']) for c in configs for p in PASSES if ts[c][p]['repeated blocks']]
+    if rep:
+        print('\nNote: dumps with more than one block (each web counted once per block): '
+              + ', '.join('%s %s: %d files' % r for r in rep))
     for p in PASSES:
         keys = set()
         for c in configs:
-            keys |= set(ts[c][p]) - {'webs', 'fired'}
+            keys |= set(ts[c][p]) - {'webs', 'fired', 'repeated blocks'}
         if not keys:
             continue
         print('\n## %s\n' % p)

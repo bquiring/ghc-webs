@@ -60,6 +60,25 @@ def read_runs(config):
     return runs
 
 
+def built_mode(config):
+    """The nofib mode the configuration's run commands were made for
+    (run-nofib.sh's TIMING_MODE): results/CONFIG/mode, or its log line"""
+    d = os.path.join(RESULTS, config)
+    try:
+        with open(os.path.join(d, 'mode')) as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if name.endswith('.log'):
+            with open(os.path.join(d, name), errors='replace') as f:
+                for line in f:
+                    m = re.search(r'run commands for mode (\S+)\)', line)
+                    if m:
+                        return m.group(1)
+    return 'unknown'
+
+
 def perf_ok():
     try:
         with open('/proc/sys/kernel/perf_event_paranoid') as f:
@@ -181,6 +200,7 @@ def report(data, out):
     wins = {c: [] for c in configs[1:]}
     losses = {c: [] for c in configs[1:]}
     layouts = {c: [] for c in configs[1:]}
+    win_ins = {c: {} for c in configs[1:]}   # a win's instruction ratio
     rows = []
     for d, per in sorted(data['samples'].items()):
         if any(not per.get(c) for c in configs):
@@ -207,6 +227,8 @@ def report(data, out):
                         layouts[c].append((d.split('/')[-1], r))
                     elif real:
                         (wins if r < 1 else losses)[c].append((d.split('/')[-1], r))
+                        if r < 1 and ins:
+                            win_ins[c][d.split('/')[-1]] = median(ins)
                     cells.append('%s%+.1f%%' % ('L' if layout else '' if real else '~', 100 * (r - 1)))
                 else:
                     cells.append('%+.2f%%' % (100 * (r - 1)))
@@ -228,7 +250,8 @@ def report(data, out):
     w('')
     w('Faster at least 5%%, backed by instructions (at least %.1f%% fewer): %s' % (
         100 * data['layout_ins'],
-        '; '.join('%s: %s' % (c, ', '.join(n for n, r in sorted(wins[c], key=lambda x: x[1]) if r <= 0.95) or '-')
+        '; '.join('%s: %s' % (c, ', '.join(n for n, r in sorted(wins[c], key=lambda x: x[1])
+                                            if r <= 0.95 and win_ins[c].get(n, 1) <= 1 - data['layout_ins']) or '-')
                   for c in configs[1:]) if lay else '(no instruction counts)'))
     w('')
     w('## Per benchmark\n')
@@ -290,7 +313,8 @@ def main():
     if a.bench:
         dirs = [d for d in dirs if any(b in d for b in a.bench)]
     use_perf = perf_ok()
-    mode = next(iter(runs[a.configs[0]].values()))[2]
+    # nofib's mode is fixed when run-nofib.sh writes the run commands
+    mode = built_mode(a.configs[0])
     st = machine_state()
     cpus = [int(c) for c in a.cpus.split(',')] if a.cpus else [a.cpu]
     print('%d benchmarks x %d configs x %d rounds (+1 warm-up); CPU %s; perf counters: %s'
@@ -306,7 +330,7 @@ def main():
 
     data = {'configs': a.configs, 'rounds': a.rounds, 'cpu': ','.join(map(str, cpus)), 'machine': st,
             'metric': a.metric, 'min_change': a.min_change, 'layout_ins': a.layout_ins,
-            'mode': os.environ.get('TIMING_MODE', 'norm'),
+            'mode': mode,
             'counters': ['instructions', 'cycles'] if use_perf else [],
             'samples': {d: {c: [] for c in a.configs} for d in dirs}, 'errors': {}}
     broken = set()

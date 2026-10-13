@@ -229,14 +229,15 @@ def main(configs):
     for k, name in [('obj_text', 'object code (text), total'),
                     ('obj_total', 'object files (text+data+bss), total'),
                     ('exe_text', 'executable (text), total')]:
-        base = sum(sz[c0][b][k] for b in sz[c0])
-        cells = [str(base)]
+        base = [b for b in sz[c0] if sz[c0][b][k] > 0]
+        cells = ['%d (%d benchmarks)' % (sum(sz[c0][b][k] for b in base), len(base))]
         for c in configs[1:]:
             common = [b for b in sz[c0] if sz[c0][b][k] > 0 and sz[c][b][k] > 0]
             tot = sum(sz[c][b][k] for b in common)
             tot0 = sum(sz[c0][b][k] for b in common)
             g = geomean_ratio([sz[c][b][k] / sz[c0][b][k] for b in common])
-            cells.append('%d (%s; geomean %+.2f%%)' % (tot, pct(tot, tot0), 100 * (g - 1)))
+            cells.append('%d (%d benchmarks: %s against the same in %s; geomean %+.2f%%)'
+                         % (tot, len(common), pct(tot, tot0), c0, 100 * (g - 1)))
         print('| %s | ' % name + ' | '.join(cells) + ' |')
     print()
     if len(configs) > 1:

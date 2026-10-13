@@ -243,7 +243,7 @@ webPass early guts
            dump logger Opt_D_dump_webs_stats "Webs: boundary split" $
              vcat [ text "Split:"      <+> int (length split_fns)
                   , text "Contracted:" <+> int (length contracted)
-                  , text "Kept:"       <+> pprWithCommas ppr
+                  , text "Not contracted:" <+> pprWithCommas ppr
                       (sortBy (comparing getOccString)
                          [ f | (f, _) <- split_fns, not (f `elem` contracted) ]) ]
 

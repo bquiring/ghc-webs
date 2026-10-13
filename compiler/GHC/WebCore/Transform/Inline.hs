@@ -186,11 +186,12 @@ lamBody e              = e
 inlineRound :: UnfoldingOpts -> UniqSupply -> WebSet -> WebSet -> CoreProgram
             -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
 inlineRound opts us exposed done binds
-  | isNullUFM todo = (Nothing, dump)
+  | isNullUFM todo = (Nothing, dump emptyUniqSet)
   | otherwise
   = case initUs_ us (rewriteProgram todo binds) of
-      (binds', n) | n > 0     -> (Just (binds', mkUniqSet (map fst todo_list)), dump)
-                  | otherwise -> (Nothing, dump)
+      (binds', inlined)
+        | isEmptyUniqSet inlined -> (Nothing, dump inlined)
+        | otherwise              -> (Just (binds', mkUniqSet (map fst todo_list)), dump inlined)
   where
     tops  = mkVarSet (bindersOfBinds binds)
     infos = analyse binds
@@ -201,7 +202,13 @@ inlineRound opts us exposed done binds
                , not (w `elementOfUniqSet` done) ]
     todo_list = [ (w, lam) | (w, Inline, i) <- verdicts, [(_, lam)] <- [i_lams i] ]
     todo = listToUFM todo_list
-    dump = [ (w, ppr v, is_inline v, map fst (i_lams i)) | (w, v, i) <- verdicts ]
+    -- A web is reported inlined only if some call of it was (a call inside
+    -- its own lambda, or of a known function, is not inlined)
+    dump inlined = [ (w, ppr_v (w `elementOfUniqSet` inlined) v, is_inline v && w `elementOfUniqSet` inlined
+                     , map fst (i_lams i))
+                   | (w, v, i) <- verdicts ]
+    ppr_v did Inline | not did = text "inline (no change: no call inlinable)"
+    ppr_v _ v                  = ppr v
     is_inline Inline = True
     is_inline _      = False
 
@@ -209,11 +216,11 @@ inlineRound opts us exposed done binds
 --      The rewrite
 ------------------------------------------------------------------
 
--- | Inline at the calls; also returns the number of calls inlined
-rewriteProgram :: UniqFM WebId CoreExpr -> CoreProgram -> UniqSM (CoreProgram, Int)
+-- | Inline at the calls; also returns the webs with a call inlined
+rewriteProgram :: UniqFM WebId CoreExpr -> CoreProgram -> UniqSM (CoreProgram, WebSet)
 rewriteProgram todo binds
   = do { rs <- mapM (\(gi, bind) -> rw_top (gi, is_rec bind) bind) (zip [0..] binds)
-       ; return (map fst rs, sum (map snd rs)) }
+       ; return (map fst rs, unionManyUniqSets (map snd rs)) }
   where
     is_rec (Rec {}) = True
     is_rec _        = False
@@ -223,10 +230,10 @@ rewriteProgram todo binds
     rw_bind g inside (NonRec b e) = do { (e', n) <- rw g inside e; return (NonRec b e', n) }
     rw_bind g inside (Rec prs)
       = do { rs <- mapM (\(b, e) -> do { (e', n) <- rw g inside e; return ((b, e'), n) }) prs
-           ; return (Rec (map fst rs), sum (map snd rs)) }
+           ; return (Rec (map fst rs), unionManyUniqSets (map snd rs)) }
 
     -- 'inside': the webs whose lambda we are inside
-    rw :: (Int, Bool) -> WebSet -> CoreExpr -> UniqSM (CoreExpr, Int)
+    rw :: (Int, Bool) -> WebSet -> CoreExpr -> UniqSM (CoreExpr, WebSet)
     rw g inside expr = case expr of
       WebLam w x e
         | w `elemUFM` todo -> do { (e', n) <- rw g (addOneToUniqSet inside w) e
@@ -237,28 +244,28 @@ rewriteProgram todo binds
       WebApp {}     -> rw_spine g inside expr
       Let bind body -> do { (bind', n1) <- rw_bind g inside bind
                           ; (body', n2) <- rw g inside body
-                          ; return (Let bind' body', n1 + n2) }
+                          ; return (Let bind' body', n1 `unionUniqSets` n2) }
       Case e b ty alts
         -> do { (e', n) <- rw g inside e
               ; rs <- mapM (\(Alt c bs rhs) -> do { (rhs', m) <- rw g inside rhs
                                                   ; return (Alt c bs rhs', m) }) alts
-              ; return (Case e' b ty (map fst rs), n + sum (map snd rs)) }
+              ; return (Case e' b ty (map fst rs), n `unionUniqSets` unionManyUniqSets (map snd rs)) }
       Cast e co     -> do { (e', n) <- rw g inside e; return (Cast e' co, n) }
       Tick t e      -> do { (e', n) <- rw g inside e; return (Tick t e', n) }
-      _             -> return (expr, 0)
+      _             -> return (expr, emptyUniqSet)
 
     -- An application spine: find the first argument whose web is inlined
     rw_spine g inside expr
       = do { (hd', n0) <- rw g inside hd
            ; rs <- mapM (\(mw, a) -> do { (a', m) <- rw g inside a; return ((mw, a'), m) }) args
            ; let args' = map fst rs
-                 n1 = n0 + sum (map snd rs)
+                 n1 = n0 `unionUniqSets` unionManyUniqSets (map snd rs)
            ; (e', n2) <- go hd' args'
-           ; return (e', n1 + n2) }
+           ; return (e', n1 `unionUniqSets` n2) }
       where
         (hd, args) = collect expr []
 
-        go f [] = return (f, 0)
+        go f [] = return (f, emptyUniqSet)
         go f ((Just w, a) : rest)
           | Just lam <- lookupUFM todo w
           , not (w `elementOfUniqSet` inside)
@@ -267,10 +274,10 @@ rewriteProgram todo binds
           = do { lam' <- cloneExpr lam
                ; e <- beta f lam' ((Just w, a) : rest)
                ; (e', n) <- go_rest e
-               ; return (e', n + 1) }
+               ; return (e', addOneToUniqSet n w) }
         go f ((mw, a) : rest) = go (app f mw a) rest
 
-        go_rest (e, rest) = return (foldl (\f (mw, a) -> app f mw a) e rest, 0)
+        go_rest (e, rest) = return (foldl (\f (mw, a) -> app f mw a) e rest, emptyUniqSet)
 
     -- A call of a known function (or a jump) is the inliner's business; see
     -- Note [Super-beta inlining]

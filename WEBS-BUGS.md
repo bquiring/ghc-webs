@@ -36,6 +36,44 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Reporting audit: verdicts that fired without a change; script labels (2026-10-13)
+* **Found by:** an audit of the dumps and the benchmark scripts, after the
+  exposure-statistics bug below.
+* **Symptoms and causes:**
+  - Strictness printed "strict argument" or "strict result fields" for every
+    web the analysis proved strict, and marked it changed, even when the
+    rewrite edited nothing (the arguments already values, or passed by
+    value by demand analysis).  On the compilers group this was 25% of webs
+    "fired".
+  - Constant propagation counted a constant argument for a parameter that
+    is never used (on the compilers group, 458 of its 592: the `(##)`
+    arguments of join points and thunks), and a constant result with no
+    case on a call.
+  - Inlining marked every candidate web changed when any call in the round
+    was inlined.
+  - FirstClass counted `(f |> co) x` and `(tick f) x` as unknown calls.
+  - verdicts.py inferred firing from the verdict's first words; it now
+    honours "no change", and verdicts.py and expo-report.py warn when a
+    module's dump has more than one block (two builds into one directory).
+  - time-nofib.py: "faster, backed by ≥0.5% fewer instructions" accepted
+    any instruction change; the header's mode came from the environment,
+    not from how the configuration was built (now recorded by run-nofib.sh;
+    old configurations report "unknown").
+  - poly-report.py classified `(a -> b) -> c` as parenthesised, not a
+    function; report.py's baseline code-size total covered a different set
+    of benchmarks; time.py's docstring named the wrong statistic.
+  - The boundary-split statistic "Kept:" (splits not contracted) read as
+    kept binders; now "Not contracted:".
+* **Fix:** each pass records the webs it edited (Strictness: a StateT over
+  the rewrite; Inline: the set of webs with an inlined call; ConstProp: only
+  parameters that occur), and its dump marks only those changed, printing
+  "(no change: reason)" otherwise.  Fire rates reported before this
+  (WEBS-EXPERIMENTS.md tallies) overstate strictness, const-prop and inline.
+  Timings are unaffected.
+* **Guard:** the dump tests' expected output (strictness, const-prop and
+  inline dumps).
+* **Commit:** (this entry's commit)
+
 ### Statistics: every exposed class "joined with an arrow without a web"; defunctionalisation never counted as firing (2026-10-13)
 * **Found by:** porting the exposure statistics (branch `exposure-stats`)
   and tallying the compilers group's dumps.

@@ -31,6 +31,9 @@ import GHC.WebCore.Transform.Common ( mkWild )
 import GHC.WebCore.Traverse ( stripWebForms )
 
 import Data.List ( sortOn )
+import Control.Monad ( when )
+import Control.Monad.Trans.Class ( lift )
+import Control.Monad.Trans.State.Strict ( StateT, runStateT, modify' )
 
 {- Note [Web strictness]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -545,13 +548,17 @@ verdict exposed sw rfs w i
       Just FTop        -> NoStrictFields "only tail calls"
       Nothing          -> NoStrictFields "no calls"
 
-pprVerdict :: (ArgVerdict, ResVerdict) -> SDoc
-pprVerdict (a, r) = ppr_a a <> semi <+> ppr_r r
+-- | A verdict, given whether the rewrite changed the program for the
+-- argument and for the result (a strict web may need no change: "no change")
+pprVerdict :: (Bool, Bool) -> (ArgVerdict, ResVerdict) -> SDoc
+pprVerdict (did_a, did_r) (a, r) = ppr_a a <> semi <+> ppr_r r
   where
-    ppr_a (StrictArg k)      = text "strict argument (depth" <+> int k <> text ")"
+    ppr_a (StrictArg k)      = text "strict argument (depth" <+> int k <> no_change did_a <> text ")"
     ppr_a (NotStrictArg why) = text "lazy argument" <+> parens (text why)
-    ppr_r (StrictFields dc fs) = text "strict result fields" <+> ppr dc <+> ppr fs
+    ppr_r (StrictFields dc fs) = text "strict result fields" <+> ppr dc <+> ppr fs <> no_change' did_r
     ppr_r (NoStrictFields why) = text "no strict result fields" <+> parens (text why)
+    no_change did  = if did then empty else text ", no change"
+    no_change' did = if did then empty else text " (no change)"
 
 changes :: (ArgVerdict, ResVerdict) -> Bool
 changes (StrictArg {}, _)    = True
@@ -567,10 +574,13 @@ strictnessRound :: (WebId -> Bool, DataCon -> Int -> Bool)   -- ^ Liveness: Note
                 -> UniqSupply -> WebSet -> WebSet -> CoreProgram
                 -> (Maybe (CoreProgram, WebSet), [(WebId, SDoc, Bool, [Id])])
 strictnessRound (live_arg, live_field) us exposed done binds
-  | isNullUFM arg_webs && isNullUFM res_webs = (Nothing, dump)
-  | otherwise = ( Just (initUs_ us (rewriteProgram arg_webs res_webs binds), handled)
-                , dump )
+  | isNullUFM arg_webs && isNullUFM res_webs = (Nothing, dump (emptyUniqSet, emptyUniqSet))
+  -- A strict web whose rewrite changes nothing (every argument already a
+  -- value, or passed by value by its demand signature): no new round
+  | isEmptyUniqSet edited_a && isEmptyUniqSet edited_r = (Nothing, dump edited)
+  | otherwise = (Just (binds', handled), dump edited)
   where
+    (binds', edited@(edited_a, edited_r)) = initUs_ us (rewriteProgram arg_webs res_webs binds)
     infos = analyse binds
     -- The two fixpoints feed each other (Note [Web strictness fixpoints]):
     -- iterate until the strict-argument webs stop growing
@@ -596,25 +606,45 @@ strictnessRound (live_arg, live_field) us exposed done binds
     arg_webs = listToUFM [ (w, k) | (w, (StrictArg k, _), _) <- verdicts ]
     res_webs = listToUFM [ (w, (dc, fs)) | (w, (_, StrictFields dc fs), _) <- verdicts ]
     handled  = mkUniqSet [ w | (w, v, _) <- verdicts, changes v ]
-    dump     = [ (w, pprVerdict v, changes v, map fst (i_lams i))
-               | (w, v, i) <- verdicts, not (null (i_lams i)) || changes v ]
+    -- The dump says which verdicts changed the program: a strict web is
+    -- only reported as changed if the rewrite edited something for it
+    dump ed  = [ (w, pprVerdict (did_a, did_r) v, (did_a && is_a v) || (did_r && is_r v), map fst (i_lams i))
+               | (w, v, i) <- verdicts, not (null (i_lams i)) || changes v
+               , let did_a = w `elementOfUniqSet` fst ed
+                     did_r = w `elementOfUniqSet` snd ed ]
+    is_a (StrictArg {}, _)    = True
+    is_a _                    = False
+    is_r (_, StrictFields {}) = True
+    is_r _                    = False
 
 ------------------------------------------------------------------
 --      The rewrite
 ------------------------------------------------------------------
 
+-- | The rewrite, recording the webs for which it changed something (the
+-- strict-argument webs, the strict-result-field webs)
+type RwM = StateT (WebSet, WebSet) UniqSM
+
 rewriteProgram :: UniqFM WebId Int                     -- ^ Strict-argument webs, with depth
                -> UniqFM WebId (DataCon, [Int])        -- ^ Strict-result-field webs
-               -> CoreProgram -> UniqSM CoreProgram
-rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
+               -> CoreProgram -> UniqSM (CoreProgram, (WebSet, WebSet))
+rewriteProgram arg_webs res_webs binds
+  = runStateT (mapM (rw_bind False) binds) (emptyUniqSet, emptyUniqSet)
   where
+    edited_arg w = modify' (\(a, r) -> (addOneToUniqSet a w, r))
+    edited_res w = modify' (\(a, r) -> (a, addOneToUniqSet r w))
+
     -- Note [Recording proven strictness]: a lambda of a strict web, at
     -- saturation depth 1, is strict in its parameter
     proven w x
+      | proves w x = x `setIdDemandInfo` strictifyDmd (idDemandInfo x)
+      | otherwise  = x
+    proves w x
       | Just 1 <- lookupUFM arg_webs w
       , isId x, not (isStrUsedDmd (idDemandInfo x))
-      = x `setIdDemandInfo` strictifyDmd (idDemandInfo x)
-      | otherwise = x
+      = True
+      | otherwise = False
+    lam w x = do { when (proves w x) (edited_arg w); return (proven w x) }
 
     -- See Note [Only evaluate what would be a thunk]
     thunks = thunkLets binds
@@ -629,13 +659,13 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
     rhs_lz lz b e | isJoinId b = lz
                   | otherwise  = not (exprIsHNF (stripWebForms e))
 
-    rw :: Bool -> CoreExpr -> UniqSM CoreExpr
+    rw :: Bool -> CoreExpr -> RwM CoreExpr
     rw lz expr = case expr of
       WebLam w x e
         | Just (dc, fs) <- lookupUFM res_webs w
-        -> WebLam w (proven w x) <$> (rw False e >>= tails dc fs)
+        -> do { x' <- lam w x; WebLam w x' <$> (rw False e >>= tails w dc fs) }
         | otherwise
-        -> WebLam w (proven w x) <$> rw False e
+        -> do { x' <- lam w x; WebLam w x' <$> rw False e }
       Lam b e
         | isTyVar b -> Lam b <$> rw lz e
         | otherwise -> Lam b <$> rw False e
@@ -669,8 +699,11 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
           = do { a' <- rw_arg a
                ; (wrap_a, a'') <- case lookupUFM arg_webs w of
                    Just k | n + 1 >= k
-                          , not (by_sig (n_args - 1 - n)) -> eval lz a'
-                   _                                      -> return (id, a')
+                          , not (by_sig (n_args - 1 - n))
+                          -> do { (wrap, a'', did) <- eval lz a'
+                                ; when did (edited_arg w)
+                                ; return (wrap, a'') }
+                   _      -> return (id, a')
                ; (wrap_f, f') <- go f (n + 1)
                ; return (wrap_f . wrap_a, WebApp w f' a'') }
         go (App f a) n
@@ -697,26 +730,26 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
     -- Evaluate an argument (if lifted, not already a value, and, unless the
     -- Bool says always, it would otherwise be a thunk: Note [Only evaluate
     -- what would be a thunk])
-    eval :: Bool -> CoreExpr -> UniqSM (CoreExpr -> CoreExpr, CoreExpr)
+    eval :: Bool -> CoreExpr -> RwM (CoreExpr -> CoreExpr, CoreExpr, Bool)
     eval lz a
       | definitelyLiftedType ty
       , not (exprIsHNF a0)
       , not (exprIsDeadEnd a0)   -- Note [Do not evaluate dead ends early]
       , lz || wouldBeThunk thunks a0
-      = do { v <- mkWild ty
+      = do { v <- lift (mkWild ty)
              -- The evaluated unfolding stops a second evaluation of v
              -- (exprIsHNF), e.g. by the tails of an enclosing lambda
            ; let v' = v `setIdUnfolding` evaldUnfolding
-           ; return (\body -> Case a v' (exprType body) [Alt DEFAULT [] body], Var v') }
+           ; return (\body -> Case a v' (exprType body) [Alt DEFAULT [] body], Var v', True) }
       | otherwise
-      = return (id, a)
+      = return (id, a, False)
       where ty = exprType a
             a0 = stripWebForms a
 
     -- The tail positions of a lambda's body: evaluate the strict fields of
     -- the constructor applications returned there
-    tails :: DataCon -> [Int] -> CoreExpr -> UniqSM CoreExpr
-    tails dc fs = go
+    tails :: WebId -> DataCon -> [Int] -> CoreExpr -> RwM CoreExpr
+    tails w dc fs = go
       where
         go expr = case expr of
           Let bind@(NonRec j rhs) body
@@ -730,10 +763,10 @@ rewriteProgram arg_webs res_webs binds = mapM (rw_bind False) binds
           Case e b ty alts -> Case e b ty <$> mapM (\(Alt c bs rhs) -> Alt c bs <$> go rhs) alts
           Tick t e  -> Tick t <$> go e
           _ | Just (vals, mk) <- conApp expr
-            -> do { (wraps, vals') <- unzip <$> sequence
-                                        [ if n `elem` fs then eval False v else return (id, v)
-                                        | (n, v) <- zip [0..] vals ]
-                  ; return (foldr (.) id wraps (mk vals')) }
+            -> do { rs <- sequence [ if n `elem` fs then eval False v else return (id, v, False)
+                                   | (n, v) <- zip [0..] vals ]
+                  ; when (or [ did | (_, _, did) <- rs ]) (edited_res w)
+                  ; return (foldr (.) id [ wrap | (wrap, _, _) <- rs ] (mk [ v | (_, v, _) <- rs ])) }
             | otherwise -> return expr
 
         -- A join point's body (after its lambdas) is a tail too
