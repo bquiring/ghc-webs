@@ -51,7 +51,8 @@ would catch it again), **commit** (empty while uncommitted).
 * **Fix:** record the origin only for the classes that contain
   placeholderWeb (GHC.WebCore.Pipeline, sigs2); add the verdicts.  The
   §13 figure "exported binders alone exposed 68%" (WEBS-EXPERIMENTS.md) came
-  from the branch's counts, so it was a lower bound.
+  from the branch's counts; if it was a single-origin count, it was
+  understated.
 * **Guard:** none automatic (dump statistics); `boundary_kept001` checks
   the single-origin line.
 * **Commit:** `a6f48e7819`
