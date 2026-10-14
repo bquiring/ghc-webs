@@ -104,7 +104,7 @@ would catch it again), **commit** (empty while uncommitted).
   so nofib is unchanged.
 * **Guard:** `dataspec001` (a split pair at (Int -> Age, Int), coerced to
   (Int -> Int, Int)), which panicked before the fix.
-* **Commit:**
+* **Commit:** `3297d377ac`
 
 ### Worker/wrapper split small functions whose unfoldings webs had zapped; importers grew 37x (2026-10-14)
 * **Found by:** step 0 of the data-splitting redesign (WEBS-DATA.md
