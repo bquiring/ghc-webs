@@ -121,6 +121,16 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `datasplit010` (a state monad whose small methods got
   wrappers, plus a split list); `datasplit010_wrappers` greps -ddump-simpl
   for wrappers of the methods and expects none (six before the fix).
+* **nofib** (`early-ulsl4` against `early-ulsl`, instructions): 108 of 109
+  benchmarks within 0.5% (104 within 0.1%), geomean -4.17% against -4.19%.
+  integrate is +2.9% (-76.40% against base instead of -77.07%):
+  `integrate1D` keeps its unfolding now and becomes no wrapper, and -O2's
+  specialisation then makes a large specialised copy of its worker (1,218
+  terms to 2,151). That is what GHC does with it without webs.
+  Reproduced with -fcore-webs-no-restore-unfoldings (1,247.6M against
+  1,284.6M instructions). Kept: the fix is right, and the cost is GHC's
+  heuristic on one function. Compiler allocation: +112% against base,
+  from +145%.
 * **Also:** every data-splitting measurement so far carries this effect:
   nofib's early-ulsl and early-ulsl3, the Hackage, large and SML groups
   (WEBS-EXPERIMENTS.md §16-§19), and the step 0 timings of CodeGen

@@ -274,7 +274,8 @@ webPass early guts
            else return (binds4, [])
 
          -- Note [Restoring vanilla unfoldings]
-       ; let binds6 | early     = restoreUnfoldings (unfoldingOpts dflags)
+       ; let binds6 | early, not (gopt Opt_CoreWebsNoRestoreUnfoldings dflags)
+                                = restoreUnfoldings (unfoldingOpts dflags)
                                                     (vanillaUnfolded (mg_binds guts)) binds5
                     | otherwise = binds5
 
@@ -637,7 +638,8 @@ runDataSplit sfx early logger dflags this_mod rules binds
                                      , uo_orig_sizes = [] })
                    | otherwise = Nothing
              -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
-             split keep = splitDataTypes sfx unbox keep (dataLintConfig dflags) this_mod us rules binds
+             split keep = splitDataTypes sfx (gopt Opt_CoreWebsDataSkipPlain dflags) unbox keep
+                                         (dataLintConfig dflags) this_mod us rules binds
              -- for -dshow-passes: the first pass's program is not used when
              -- the second runs, so only what decides the second is forced
              force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()
