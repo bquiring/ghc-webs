@@ -105,7 +105,7 @@ would catch it again), **commit** (empty while uncommitted).
   (Note [Observed tags] in GHC.WebCore.DataSplit).
 * **Guard:** `datasplit012` (the type in its own module, the comparison in
   a local recursive function, as in the solver; fails without the fix).
-* **Commit:**
+* **Commit:** `0d8eebdce9`
 
 ### Flattening: an absent call demand on a function component (2026-10-14)
 * **Found by:** the compilers group with data splitting (`ulsl2`, after the
