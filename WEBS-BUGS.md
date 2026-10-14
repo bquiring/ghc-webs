@@ -85,6 +85,24 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Data splitting: the "useful splits" pass kept the first pass alive (2026-10-14)
+* **Found by:** the self-host build (early-ulsl, after the list fix
+  `29cd822b48`): `ghc: out of memory` in GHC.CmmToLlvm.CodeGen (992k terms),
+  which had compiled when lists were not split. Compiled alone with -M16g:
+  the first splitting pass finished (614 s, 1.5 TB allocated), then the
+  second ("useful splits") ran out of the 16 GB heap.
+* **Cause:** `runDataSplit` passed `dsr_useful res0` to the second pass as
+  a thunk. Until the second pass forced it, the thunk kept the whole first
+  result alive: its annotated program, Data Lint's result and the dump.
+* **Fix:** `dsr_changed` and the list of useful classes are forced before
+  the second pass starts, so only they survive it. The same module then
+  finishes both passes (523 s and 547 s; Note [Keeping only useful
+  splits]). -dshow-passes now also times each step of splitting
+  (annotation, Data Lint, solving, rewriting, specialising), and the
+  -ddump-webs-data stats line counts the constructors behind the copies.
+* **Guard:** none automatic (memory on a 1M-term module).
+* **Commit:**
+
 ### Data splitting: quadratic list code; GHC.Tc.Errors.Types takes an hour (2026-10-13)
 * **Found by:** the self-host build (OPEN entry below), profiled alone: 63
   minutes, 2.0 GB maximum residency, 77% of the time in GC; ~3,100 s in the
@@ -218,7 +236,17 @@ would catch it again), **commit** (empty while uncommitted).
   one round); both ran ten rounds without the fix.
 * **Commit:** `d241b19232`
 
-### OPEN: data splitting runs GHC.Tc.Errors.Types out of memory (2026-10-11)
+### OPEN: data splitting is too slow and big for GHC's largest modules (2026-10-11)
+* **Update 2026-10-14:** GHC.Tc.Errors.Types now compiles: after the list
+  fixes (`29cd822b48`) it needs 2.4 GB of live heap and 6.1 GB in all, in
+  1,003 s. The self-host runs with ulimit -v 10 GB at -j2. With lists split
+  again (`29cd822b48`), GHC.CmmToLlvm.CodeGen ran out of memory. After the
+  space-leak fix above it gets through both splitting passes, but those
+  take 523 s and 547 s. The self-host without data splitting (nods)
+  builds GHC: phase 1 4,767 s against base's 2,796 s. Next: the redesign
+  in WEBS-DATA.md section 11 (name-only copies, inference by unification,
+  one pass with the webs), measured step by step first.
+
 * **Found by:** building GHC with the webs compiler (early-ulsl,
   ~/projects/ghc-selfhost).
 * **Symptom:** `ghc: out of memory` (4 GB) in the early webs run with

@@ -562,13 +562,25 @@ runDataSplit sfx early logger dflags this_mod rules binds
              -- the second runs, so only what decides the second is forced
              force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()
              force r = seqBinds (dsr_binds r)
-       ; res0 <- withTiming logger (text "Webs: splitting data types" <+> text sfx) force_useful
-                   (return (split Nothing))
+             -- the steps first, each timed (dsr_stages), then the rest
+             timed what r = do { mapM_ (\(stage, v) -> withTiming logger
+                                           (what <> comma <+> text stage) id (return v))
+                                       (dsr_stages r)
+                               ; return r }
+             first_what = text "Webs: splitting data types" <+> text sfx
+       ; res0 <- withTiming logger first_what force_useful
+                   (timed first_what (split Nothing))
+         -- Only the useful classes go on to the second pass: a thunk
+         -- (dsr_useful res0) would keep the whole first result alive (its
+         -- annotated program, Data Lint's result, the dump) during it
+       ; let !changed0 = dsr_changed res0
+             !useful   = forceList (dsr_useful res0)
+             forceList xs = foldr seq () xs `seq` xs
        ; res <- case unbox of
-                  Just _ | dsr_changed res0
-                    -> withTiming logger (text "Webs: splitting data types" <+> text sfx
-                                          <> text ", useful splits") force
-                         (return (split (Just (dsr_useful res0))))
+                  Just _ | changed0
+                    -> let what = first_what <> text ", useful splits"
+                       in withTiming logger what force
+                            (timed what (split (Just useful)))
                   _ -> return res0
        ; let errs = DL.dlr_errs (dsr_lint res)
        ; unless (isEmptyBag errs) $ liftIO $

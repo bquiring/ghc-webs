@@ -2,7 +2,7 @@
 
 ==================== Webs: splitting data types ====================
 Data Lint: ok
-copies: 47, classes: 7, exposed: 5, split: 2, exposed only by casts: 0, pinned binders: 5
+copies: 47 (78 constructors behind them), classes: 7, exposed: 5, split: 2, exposed only by casts: 0, pinned binders: 5
 not copied (used as kinds): GHC.Internal.Types.RuntimeRep
 Main.List_s6 = [] with Main.Con1_s6, Main.Con2_s6 (built [1,
                                                           2], matched [1, 2])

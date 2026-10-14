@@ -27,6 +27,7 @@ import GHC.Core.Coercion.Axiom ( CoAxiomRule(..), coAxiomTyCon )
 import GHC.Core.FamInstEnv ( mkNewTypeCoAxiom )
 import Data.Functor.Identity ( runIdentity )
 import GHC.Core.Utils ( exprType )
+import GHC.Core.Seq ( seqBinds )
 
 import GHC.Data.Bag
 
@@ -122,8 +123,10 @@ data DataSplitResult = DataSplitResult
   , dsr_dump    :: SDoc               -- ^ for -ddump-webs-data
   , dsr_lint    :: DataLintResult     -- ^ Data Lint on the annotated program
   , dsr_changed :: Bool
-  , dsr_useful  :: [Int] }            -- ^ the classes whose split changed something
+  , dsr_useful  :: [Int]              -- ^ the classes whose split changed something
                                       --   (Note [Keeping only useful splits])
+  , dsr_stages  :: [(String, ())] }   -- ^ for -dshow-passes: forcing each in turn
+                                      --   times the steps of splitting
 
 ------------------------------------------------------------------
 --      Eligibility
@@ -752,7 +755,8 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
       , dsr_dump    = dump $$ flat_dump
       , dsr_lint    = lint_res
       , dsr_changed = changed
-      , dsr_useful  = useful }
+      , dsr_useful  = useful
+      , dsr_stages  = stages }
   where
     (us1, us23) = splitUniqSupply us
     (us2, us3)  = splitUniqSupply us23
@@ -986,12 +990,24 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
       , m_co   = mapTyConsCo is_copy (return . final) }
     rw_ty = mapTyCons is_copy (return . final)
 
+    -- Each stage forces what the next one needs, and no more (forcing an
+    -- annotated program does not build its copies' constructors: Data Lint
+    -- does).  Specialising and flattening are what is left.
+    stages = [ ("annotation", seqBinds ann_binds `seq` sizeUFM copies `seq` ())
+             , ("Data Lint", ok `seq` length pairs `seq` ())
+             , ("solving", foldr (\(ms, _, f, _, _) acc -> length ms `seq` f `seq` acc) () fates)
+             , ("rewriting", if changed then seqBinds split_binds else ())
+             , ("specialising", if changed && isJust unbox
+                                then seqBinds sp_binds `seq` length sp_tcs `seq` () else ()) ]
+
     pp_fate_short Exposed     = text "exposed"
     pp_fate_short Bottom      = text "bottom"
     pp_fate_short (Split t _) = text "split as" <+> ppr t
     dump = vcat
       [ text "Data Lint:" <+> (if ok then text "ok" else text "errors (not split)")
-      , text "copies:" <+> int (sizeUFM copies) <> comma
+      , text "copies:" <+> int (sizeUFM copies)
+        <+> parens (int (nonDetFoldUFM (\o n -> n + length (tyConDataCons o)) 0 copies)
+                    <+> text "constructors behind them") <> comma
         <+> text "classes:" <+> int (length fates) <> comma
         <+> text "exposed:" <+> int (length [ () | (_, _, Exposed, _, _) <- fates ]) <> comma
         <+> text "split:" <+> int (length new_tcs) <> comma
