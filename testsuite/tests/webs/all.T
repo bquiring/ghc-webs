@@ -254,6 +254,11 @@ test('datasplit006', [compile_timeout_multiplier(3)], compile_and_run, [ds_opts]
 test('datasplit009', [], compile_and_run, [ds_opts])
 test('datasplit009_dump', [extra_files(['datasplit009.hs'])],
      multimod_compile, ['datasplit009', ds_opts + ' -ddump-webs-data -dsuppress-uniques'])
+# datasplit011: a newtype class kept only through a newtype child, which
+# stays split (Note [Keeping only useful splits]; futhark's Unify)
+test('datasplit011', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('datasplit011_again', [extra_files(['datasplit011.hs']), use_specs({'stdout': 'datasplit011.stdout'})],
+     multimod_compile_and_run, ['datasplit011', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-data-again -fcore-webs-useless'])
 # datasplit010: splitting keeps the vanilla unfoldings that worker/wrapper
 # reads, so small functions get no wrapper (Note [Restoring vanilla
 # unfoldings] in GHC.WebCore.Pipeline)

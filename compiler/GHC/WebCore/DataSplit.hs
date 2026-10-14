@@ -203,7 +203,8 @@ So with unboxing on, splitting runs twice.  The first pass finds the classes
 whose split changed something; the second splits only those, and puts every
 other class back on the original type (always well typed: a class is
 closed, as for a class that builds nothing).  A newtype class is kept if one
-of its children's classes is (its axiom names them).  The two passes share
+of its children's classes is (its axiom names them), transitively: a child
+may be a newtype class kept for its own children.  The two passes share
 annotation, the pairs and the classes (splitDataTypes, applied to all but
 the kept classes); only the classes' fates and what follows from them --
 rewriting, specialising, flattening -- are computed twice.
@@ -808,14 +809,23 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
         -- split only if the first pass found its split useful; a newtype class
         -- only if one of its members' children's classes is kept (its axiom
         -- names them)
-        kept n ms = case keep_set of
+        kept n _ = case keep_set of
           Nothing -> True
-          Just ks
-            | any (isNewTyCon . copyOriginal copies) (take 1 ms)
-            -> any (\c -> class_number c `IntSet.member` ks)
-                   [ ch | m <- ms, Just chs <- [children m], ch <- chs ]
-            | otherwise -> n `IntSet.member` ks
-        keep_set = IntSet.fromList <$> keep
+          Just ks -> n `IntSet.member` ks
+        -- The useful classes, and every newtype class with a kept child's
+        -- class, transitively: a newtype class that goes back to the
+        -- original takes the original axiom, whose representation names the
+        -- original types, so none of its children may stay split -- and a
+        -- child is often a newtype too (ExceptT inside a local UnifyM, kept
+        -- for the Either inside it: futhark's Language.Futhark.TypeChecker.
+        -- Unify was left ill-typed, testsuite datasplit011)
+        keep_set = close . IntSet.fromList <$> keep
+        close ks | IntSet.size ks' == IntSet.size ks = ks
+                 | otherwise                         = close ks'
+          where ks' = IntSet.union ks (IntSet.fromList
+                        [ n | (n, chs) <- nt_children, any (`IntSet.member` ks) chs ])
+        nt_children = [ (n, [ class_number ch | m <- ms, Just chs <- [children m], ch <- chs ])
+                      | (n, (orig, ms, _, _)) <- zip [1 :: Int ..] classes, isNewTyCon orig ]
         -- The classes whose split changed something (first pass): a field
         -- unboxed in some round, or a constructor dropped.  The new types are
         -- named Orig_s<n> after their class, through every rebuild.

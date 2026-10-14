@@ -85,6 +85,26 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Useful splits: a newtype class reverted while its newtype child stayed split (2026-10-14)
+* **Found by:** the compilers group with data splitting (`ulsl2`): Web Lint
+  after annotation failed in futhark's Language.Futhark.TypeChecker.Unify,
+  with a TransCo mismatch between `ExceptT_s136` and ExceptT, under
+  `Sym N:UnifyM`. (Data Lint's pairs give the same classes and the same
+  error, so the inference is not involved.)
+* **Cause:** in the useful-splits pass, a newtype class is kept if one of
+  its children's classes is useful. The useful set has data classes only,
+  but a child is often a newtype itself: ExceptT inside the local UnifyM,
+  kept for the Either inside it. UnifyM's class went back to the original,
+  whose axiom names the original ExceptT, while its ExceptT copy stayed
+  split.
+* **Fix:** the kept classes are closed transitively: every newtype class
+  with a kept child's class is kept (Note [Keeping only useful splits] in
+  GHC.WebCore.DataSplit).
+* **Guard:** `datasplit011` and `datasplit011_again`: a local newtype U
+  over a newtype E over an Either that is only built with Right. Lint
+  error before the fix.
+* **Commit:**
+
 ### Specialising a split type: a coercion through a variable under an arrow (2026-10-14)
 * **Found by:** the Hackage root group rebuilt after the list and unfolding
   fixes (`ulsl2`, -O1 compiler): GHC panicked in vector-algorithms 0.9.1.0,
