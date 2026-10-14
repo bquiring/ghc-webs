@@ -85,6 +85,51 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Worker/wrapper split small functions whose unfoldings webs had zapped; importers grew 37x (2026-10-14)
+* **Found by:** step 0 of the data-splitting redesign (WEBS-DATA.md
+  section 11). GHC.CmmToLlvm.CodeGen took 66 s against the nods build's
+  interfaces, but over 18 minutes against the ulsl build's. The source
+  desugars to 11.4k terms either way, but against ulsl's interfaces the
+  simplifier grows it from 29k to 810k terms in one iteration (34,349
+  inlinings of appOL against 165). Webs off in the importing module gives
+  the same. Taking GHC.CmmToLlvm.Base's interface alone from ulsl gives the
+  same; its LlvmM actions (getConfig1, $fMonadLlvmM1, ...) have wrappers
+  (Inline: [2], boring_ok=False) instead of always-inline stable unfoldings:
+  50 wrappers with data splitting, 21 without (and in base).
+* **Cause:** the early run zaps vanilla unfoldings and leaves the
+  simplifier to rebuild them. Data splitting zaps every binder it does not
+  pin; the transformations zap those whose types they change (Note
+  [Unfoldings and rules after a transformation]). But CPR analysis and
+  worker/wrapper run before the simplifier, and worker/wrapper's
+  certainlyWillInline needs an unfolding. A small function that would
+  have kept a stable "always inline" unfolding was split instead. Its
+  wrapper is active only from phase 2 and is not inlined in boring
+  contexts, which changed how the LlvmM code inlined into CodeGen.
+* **Fix:** at the end of the early run, every let-bound function (arity >
+  0, or a join point) that had a vanilla unfolding before it and has none
+  now gets one, built from its final right-hand side (mkUnfolding, as the
+  simplifier would): Note [Restoring vanilla unfoldings] in
+  GHC.WebCore.Pipeline. Base then has 20 wrappers, and CodeGen against it
+  has 26,928 terms, as against the nods build's.
+* **On the way:** restoring arity-0 binders too broke CPR analysis's
+  assertion that a binder and its occurrences agree on whether it is a
+  data structure (13 tests: dsedge022/026/029, poison037, useless018).
+  CPR analysis reads a data structure's unfolding at its occurrences, and
+  those still carry the old Id. Synchronising the occurrences does not help,
+  because substitution drops vanilla unfoldings. Worker/wrapper's
+  certainlyWillInline needs arity > 0 anyway.
+* **Guard:** `datasplit010` (a state monad whose small methods got
+  wrappers, plus a split list); `datasplit010_wrappers` greps -ddump-simpl
+  for wrappers of the methods and expects none (six before the fix).
+* **Also:** every data-splitting measurement so far carries this effect:
+  nofib's early-ulsl and early-ulsl3, the Hackage, large and SML groups
+  (WEBS-EXPERIMENTS.md §16-§19), and the step 0 timings of CodeGen
+  (measured against nods' interfaces, so not affected) and the earlier
+  CodeGen out-of-memory runs (affected: that was this bug). The
+  transformations' zaps, without data splitting, can do the same on a
+  smaller scale.
+* **Commit:**
+
 ### Data splitting: the "useful splits" pass kept the first pass alive (2026-10-14)
 * **Found by:** the self-host build (early-ulsl, after the list fix
   `29cd822b48`): `ghc: out of memory` in GHC.CmmToLlvm.CodeGen (992k terms),
@@ -101,6 +146,10 @@ would catch it again), **commit** (empty while uncommitted).
   (annotation, Data Lint, solving, rewriting, specialising), and the
   -ddump-webs-data stats line counts the constructors behind the copies.
 * **Guard:** none automatic (memory on a 1M-term module).
+* **Also:** CodeGen had 992k terms only because of the unfolding bug above
+  (the importers' 37x growth); without it CodeGen has 27k terms, and its
+  two splitting passes take 12 s and 10 s. The leak is real, but it took
+  that program to show it.
 * **Commit:** `3f0c024f91`
 
 ### Data splitting: quadratic list code; GHC.Tc.Errors.Types takes an hour (2026-10-13)
@@ -240,9 +289,11 @@ would catch it again), **commit** (empty while uncommitted).
 * **Update 2026-10-14:** GHC.Tc.Errors.Types now compiles: after the list
   fixes (`29cd822b48`) it needs 2.4 GB of live heap and 6.1 GB in all, in
   1,003 s. The self-host runs with ulimit -v 10 GB at -j2. With lists split
-  again (`29cd822b48`), GHC.CmmToLlvm.CodeGen ran out of memory. After the
-  space-leak fix above it gets through both splitting passes, but those
-  take 523 s and 547 s. The self-host without data splitting (nods)
+  again (`29cd822b48`), GHC.CmmToLlvm.CodeGen ran out of memory: it had
+  grown to 992k terms through the unfolding bug above. With that fixed it
+  has 27k terms, and its two splitting passes take 12 s and 10 s.
+  GHC.Tc.Errors.Types (6M type nodes) still spends 100 s per splitting
+  pass and splits nothing. The self-host without data splitting (nods)
   builds GHC: phase 1 4,767 s against base's 2,796 s. Next: the redesign
   in WEBS-DATA.md section 11 (name-only copies, inference by unification,
   one pass with the webs), measured step by step first.

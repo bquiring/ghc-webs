@@ -254,6 +254,13 @@ test('datasplit006', [compile_timeout_multiplier(3)], compile_and_run, [ds_opts]
 test('datasplit009', [], compile_and_run, [ds_opts])
 test('datasplit009_dump', [extra_files(['datasplit009.hs'])],
      multimod_compile, ['datasplit009', ds_opts + ' -ddump-webs-data -dsuppress-uniques'])
+# datasplit010: splitting keeps the vanilla unfoldings that worker/wrapper
+# reads, so small functions get no wrapper (Note [Restoring vanilla
+# unfoldings] in GHC.WebCore.Pipeline)
+test('datasplit010', [], compile_and_run, [ds_opts])
+test('datasplit010_wrappers', [extra_files(['datasplit010.hs']),
+                               grep_errmsg(r'^Main\.\$f\S* \[InlPrag=\[2\]')],
+     multimod_compile, ['datasplit010', ds_opts + ' -ddump-simpl -dsuppress-uniques'])
 # datasplit007, datasplit008: atomicModifyIORef's pair is read by the RTS
 # (atomicModifyMutVar2#, a selector thunk on its first field), so it is not
 # split (Note [Non-parametric functions] in GHC.WebCore.DataSplit); 008 is

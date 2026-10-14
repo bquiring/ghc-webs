@@ -405,19 +405,32 @@ the useful classes, then again keeping only those (Note [Keeping only
 useful splits]). With `-fcore-webs-data-again` that happens in both the
 `_s` and the `_r` run.
 
-| module | size before webs | one splitting step (`_s`) | its "useful splits" rerun |
-|---|---|---|---|
-| `GHC.Core.Opt.Arity` | 7.7k terms, 7.8k types | 1.1 s, 1.8 GB | 0.9 s, 1.7 GB |
-| `GHC.Tc.Errors.Types` | 31k terms, 6.0M types | 253 s, 328 GB | 142 s, 303 GB |
-| `GHC.CmmToLlvm.CodeGen` | 992k terms, 497k types | 523 s, 1.5 TB | 547 s, 1.2 TB |
+Step 0 (2026-10-14, `3f0c024f91`: -dshow-passes times each step) on three
+GHC modules, first `_s` pass. Allocation in GB; "rest" is flattening and the
+dump.
 
-That is 240 KB per term on `Arity` and 1.5 MB per term on `CodeGen`. In
-`Arity`, 4,153 copies make 81 classes and 3 splits. A whole-program Core
-Lint allocates about 250 MB there, so Data Lint explains only part of the
-1.8 GB. Sampling (`perf`) attributes most of the time to GC and generic
-application, not to our functions. So **step 0 below measures each part of
-splitting before anything changes**; this section's cost claims are
-hypotheses until then.
+| module | size | copies (constructors behind them) | annotation | Data Lint | solving | rewriting | specialising | rest | total |
+|---|---|---|---|---|---|---|---|---|---|
+| `GHC.Core.Opt.Arity` | 7.7k terms | 4,194 (14k) | 0.16 | 0.37 | **0.85** | 0.10 | 0.03 | 0.36 | 1.87 GB, 0.8 s |
+| `GHC.CmmToLlvm.CodeGen` | 27k terms | 66,328 (284k) | 1.6 | 3.3 | **23.3** | 1.3 | 0.5 | 8.2 | 38 GB, 12 s |
+| `GHC.Tc.Errors.Types` | 31k terms, 6.0M types | 362,154 (1.39M) | 37 | **211** | 83 | 0 | 0 | 0 | 331 GB, 100 s |
+
+* The parts the redesign replaces are annotation, Data Lint and solving.
+  They take 74% of the allocation on `Arity`, 74% on `CodeGen` and 100% on
+  `GHC.Tc.Errors.Types`.
+* Solving dominates the first two. It is probably the offline congruence
+  loop (`components` over every pair, up to 20 rounds), the only part of
+  solving that is not linear; the timer covers all of solving.
+* Data Lint dominates on large types: `GHC.Tc.Errors.Types` has 362k
+  copies, and all 221 classes end up exposed. It splits nothing, so its
+  100 s per pass (and the `_r` pass's 96 s) buy nothing.
+* The "useful splits" rerun costs about as much again where something
+  splits (`CodeGen`: 10 s, 33 GB).
+
+(`CodeGen` once had 992k terms and ran out of memory. That came from a
+separate bug: imported wrappers made by worker/wrapper after webs zapped
+unfoldings; WEBS-BUGS.md, 2026-10-14. The earlier figures of 523 s and
+1.5 TB are from that program.)
 
 What the current design pays, per pass:
 

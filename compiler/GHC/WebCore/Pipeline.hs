@@ -16,7 +16,9 @@ import GHC.Core.Opt.Monad
 import GHC.Core.Ppr ( pprCoreBindings )
 import GHC.Core.Subst ( mkEmptySubst, substExpr )
 import GHC.Types.Var.Env ( mkInScopeSet )
-import GHC.Types.Var.Set ( mkVarSet, elemVarSet, emptyVarSet )
+import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet )
+import GHC.Core.Unfold ( UnfoldingOpts )
+import GHC.Core.Unfold.Make ( mkUnfolding )
 import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
@@ -271,8 +273,86 @@ webPass early guts
                    ; return (syncOccurrences (reorderTopBinds bs), tcs) }
            else return (binds4, [])
 
-       ; return (guts { mg_binds = binds5
+         -- Note [Restoring vanilla unfoldings]
+       ; let binds6 | early     = restoreUnfoldings (unfoldingOpts dflags)
+                                                    (vanillaUnfolded (mg_binds guts)) binds5
+                    | otherwise = binds5
+
+       ; return (guts { mg_binds = binds6
                       , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
+
+{- Note [Restoring vanilla unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The early run zaps the vanilla unfoldings of the binders whose types it
+changes, or whose unfoldings mention them (Note [Unfoldings and rules after
+a transformation] in GHC.WebCore.Transform.Common); data splitting zaps every
+binder it does not pin (Note [Splitting data types] in
+GHC.WebCore.DataSplit).  They expect the simplifier to rebuild them, but CPR
+analysis and worker/wrapper run first, and worker/wrapper reads them: a small
+function that will certainly inline gets a stable unfolding and no split
+(certainlyWillInline in GHC.Core.Unfold.Make), but only if it has an
+unfolding.  Without one, every small function was split into a worker and a
+wrapper, active only from phase 2 and not inlined in boring contexts.
+Building GHC with data splitting, GHC.CmmToLlvm.Base's LlvmM actions became
+such wrappers (50 instead of 21), and the module importing them,
+GHC.CmmToLlvm.CodeGen, grew from 27k terms to 992k in the simplifier (34,000
+inlinings of appOL), then ran the compiler out of memory.
+
+So at the end of the early run, every let-bound function (arity > 0, or a
+join point) that had a vanilla unfolding before it and has none now gets one
+again, built from its final right-hand side as the simplifier would
+(mkUnfolding).  Only functions: certainlyWillInline's size test needs
+arity > 0, and CPR analysis reads the unfolding of an arity-0 binder that is
+evaluated (a data structure, isDataStructure in GHC.Core.Opt.CprAnal) at
+its occurrences too, which still carry the binder's old Id without one; it
+asserts that binder and occurrences agree (dsedge022, useless018).  A
+function's occurrences use its CPR signature, never its unfolding.  (Synchronising the
+occurrences does not help: substitution drops vanilla unfoldings.)
+-}
+
+-- | The let binders with a vanilla (not stable) unfolding
+vanillaUnfolded :: CoreProgram -> VarSet
+vanillaUnfolded binds = foldr bind emptyVarSet binds
+  where
+    bind b acc = foldr (\(v, e) a -> add v (expr e a)) acc (flattenBinds [b])
+    add v acc | isId v, hasCoreUnfolding (realIdUnfolding v)
+              , not (isStableUnfolding (realIdUnfolding v)) = extendVarSet acc v
+              | otherwise                                    = acc
+    expr e acc = case e of
+      Lam _ x          -> expr x acc
+      WebLam _ _ x     -> expr x acc
+      App f a          -> expr f (expr a acc)
+      WebApp _ f a     -> expr f (expr a acc)
+      Let b x          -> bind b (expr x acc)
+      Case x _ _ alts  -> expr x (foldr (\(Alt _ _ r) a -> expr r a) acc alts)
+      Cast x _         -> expr x acc
+      Tick _ x         -> expr x acc
+      _                -> acc
+
+-- | Give the functions in the set that have lost their unfolding a vanilla
+-- one again.  Note [Restoring vanilla unfoldings]
+restoreUnfoldings :: UnfoldingOpts -> VarSet -> CoreProgram -> CoreProgram
+restoreUnfoldings opts had binds
+  | isEmptyVarSet had = binds
+  | otherwise         = map (bind True) binds
+  where
+    bind top (NonRec b e) = let e' = expr e in NonRec (fix top b e') e'
+    bind top (Rec prs)    = Rec [ (fix top b e', e') | (b, e) <- prs, let e' = expr e ]
+    fix top b rhs
+      | b `elemVarSet` had, idArity b > 0 || isJoinId b
+      , not (hasSomeUnfolding (realIdUnfolding b))
+      = b `setIdUnfolding` mkUnfolding opts VanillaSrc top (isDeadEndId b) (isJoinId b) rhs Nothing
+      | otherwise = b
+    expr e = case e of
+      Lam b x          -> Lam b (expr x)
+      WebLam w b x     -> WebLam w b (expr x)
+      App f a          -> App (expr f) (expr a)
+      WebApp w f a     -> WebApp w (expr f) (expr a)
+      Let b x          -> Let (bind False b) (expr x)
+      Case x b t alts  -> Case (expr x) b t [ Alt c bs (expr r) | Alt c bs r <- alts ]
+      Cast x co        -> Cast (expr x) co
+      Tick t x         -> Tick t (expr x)
+      _                -> e
 
 -- | Make every occurrence the binder's own Id (with its current IdInfo).
 -- Data splitting rewrites binders (types, zapped unfoldings) but not every
