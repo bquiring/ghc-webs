@@ -36,6 +36,28 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Type synonyms kept their types' fields exposed: constraints +15% (2026-10-13)
+* **Found by:** comparing the fixed baseline (`early-ulsl2`, after the list
+  fix below) per benchmark against `early-ulsl`: the only loss of ≥0.5%
+  instructions, spectral/constraints +14.9%.
+* **Symptom:** five more webs exposed (`eta` lambdas of CSP's fields), so
+  inlining, useless elimination and arity raising skipped them, and data
+  splitting's second pass no longer split CSP.
+* **Cause:** 0fd07f955a (uniplate's Zipper) marks as Referenced, with
+  their fields exposed, the types reachable from a local type that cannot
+  be rebuilt, a family instance, or a type synonym's right-hand side.
+  constraints' synonyms (`type Labeler = CSP -> ...`) mention CSP.  The
+  synonym clause is not needed: the rewrite expands every use of a synonym
+  that mentions a rebuilt type (mapTyCons), and tyConsOfType (fieldTyCons)
+  sees through synonyms, so data and class fields that use one are already
+  covered.  Found by bisecting with compiler/GHC/WebCore checked out per
+  commit.
+* **Fix:** drop the synonym clause (classifyTyCon in GHC.WebCore.Pipeline).
+* **Guard:** `hfield006` (a hidden-field type behind two synonyms, every
+  data-split mode; `_stats` checks it stays internal); hfield005 still
+  covers Zipper.
+* **Commit:** (this entry's commit)
+
 ### Data splitting never split lists in a program with IO (2026-10-13)
 * **Found by:** nofib after the reporting audit: `early-ulsl2` (early-ulsl's
   options, current compiler) −2.93% instructions against base where

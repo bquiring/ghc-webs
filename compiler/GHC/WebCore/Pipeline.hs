@@ -30,7 +30,7 @@ import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module ( Module, moduleName )
 import GHC.Types.Name ( getOccString )
 import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
-                       , isFamInstTyCon, synTyConRhs_maybe )
+                       , isFamInstTyCon )
 import GHC.Core.FamInstEnv ( famInstRHS )
 import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dataConWrapId_maybe, dataConTyCon )
 import GHC.Types.Avail ( availsToNameSet )
@@ -470,15 +470,15 @@ classifyTyCon main_only guts split_tcs binds = classify
                                   | dc <- tyConDataCons t, f <- dataConRepArgTys dc ] ++ ts)
 
     -- Types reachable from a type defined here that cannot be rebuilt in
-    -- place, a type synonym or a family instance: they would lead back to
-    -- the old fields (Note [Signatures follow the transformations] in
-    -- GHC.WebCore.HiddenFields)
+    -- place, or from a family instance: they would lead back to the old
+    -- fields (Note [Signatures follow the transformations] in
+    -- GHC.WebCore.HiddenFields).  Not from a type synonym: its uses are
+    -- expanded wherever they mention a rebuilt type (mapTyCons), and
+    -- fieldTyCons sees through it.
     local_tcs  = mg_tcs guts ++ split_tcs
     local      = mkUniqSet (map getUnique local_tcs)
     referenced = reach emptyUniqSet (concat (
                    [ fieldTyCons t | t <- local_tcs, not (rebuildableTyCon t) ] ++
-                   [ nonDetEltsUniqSet (tyConsOfType rhs) | t <- local_tcs
-                                                          , Just rhs <- [synTyConRhs_maybe t] ] ++
                    [ nonDetEltsUniqSet (tyConsOfType (famInstRHS fi)) | fi <- mg_fam_insts guts ]))
     reach acc [] = acc
     reach acc (t : ts)

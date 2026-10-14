@@ -416,6 +416,14 @@ for (suffix, opts) in dsedge_modes:
 test('hfield005_rr', [extra_files(['hfield005.hs', 'HField005A.hs']),
                       use_specs({'stdout': 'hfield005.stdout'})],
      multimod_compile_and_run, ['hfield005', early_opts + ' -fcore-webs-result-raise'])
+# hfield006: a type synonym that mentions a hidden-field type does not keep
+# its fields exposed (nofib constraints); the stats show the type internal.
+for (suffix, opts) in dsedge_modes:
+    test('hfield006' + suffix, [extra_files(['hfield006.hs']), use_specs({'stdout': 'hfield006.stdout'})],
+         multimod_compile_and_run, ['hfield006', opts])
+test('hfield006_stats', [extra_files(['hfield006.hs']),
+                         grep_errmsg(r'^Internal, hidden fields: [0-9]+')],
+     multimod_compile, ['hfield006', early_opts + ' -fcore-webs-result-raise -ddump-webs-stats'])
 # Note [One-shot lambdas from webs] (GHC.WebCore.Transform.OneShot,
 # -fcore-webs-one-shot).  The dump shows which webs' lambdas are one-shot.
 os_opts = early_opts + ' -fcore-webs-one-shot'
