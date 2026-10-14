@@ -432,19 +432,16 @@ separate bug: imported wrappers made by worker/wrapper after webs zapped
 unfoldings; WEBS-BUGS.md, 2026-10-14. The earlier figures of 523 s and
 1.5 TB are from that program.)
 
-Plain types (Note [Plain types], `-fcore-webs-data-skip-plain`, the user's
-suggestion, 2026-10-14). The flag stops copying of types that are
-monomorphic, not recursive, reach no arrow through their fields (transitively),
-and have no field that could be unboxed. It saves little:
-`CodeGen` skips 25 such types, and copies drop from 66,328 to 65,907. Its
-unboxing is unchanged: 86 fields unboxed, 6 dead fields dropped, 1
-constructor dropped. `GHC.Tc.Errors.Types` skips 45, and copies drop from
-362,154 to 358,039. Its copies are GHC's syntax-tree types used in the error
-messages (`GenLocated` 31k, `EpAnn` 30k, `[]` 27k, `AnnListItem` 23k,
-`NonEmpty` 18k, `RdrName` 18k, `HsType`, `HsExpr`, ...). These are
-polymorphic, recursive or reach arrows, and every class is exposed
-(-dppr-debug -ddump-webs-data prints the copies per type). The cost is in
-how each copy is handled, not in which types are copied. The flag stays off.
+Plain types (the user's suggestion, 2026-10-14; tried in `ed3d581b0f`, then
+removed). Not copying types that are monomorphic, not recursive, reach no
+arrow through their fields and have no field that could be unboxed saves
+about 1% of copies: `CodeGen` 66,328 to 65,907, with the same unboxing, and
+`GHC.Tc.Errors.Types` 362,154 to 358,039. The copies there are GHC's
+syntax-tree types used in the error messages (`GenLocated` 31k, `EpAnn` 30k,
+`[]` 27k, `AnnListItem` 23k, `NonEmpty` 18k, `RdrName` 18k, `HsType`,
+`HsExpr`, ...). These are polymorphic, recursive or reach arrows, and every
+class is exposed (-dppr-debug -ddump-webs-data prints the copies per type).
+So the cost is in how each copy is handled, not in which types are copied.
 
 What the current design pays, per pass:
 

@@ -27,9 +27,6 @@ import GHC.Core.Coercion.Axiom ( CoAxiomRule(..), coAxiomTyCon )
 import GHC.Core.FamInstEnv ( mkNewTypeCoAxiom )
 import Data.Functor.Identity ( runIdentity )
 import GHC.Core.Utils ( exprType )
-import GHC.Builtin.Types.Prim ( isArrowTyCon )
-import GHC.Data.Graph.Directed ( Node(..), SCC(..), stronglyConnCompFromEdgedVerticesUniq )
-import Data.Foldable ( toList )
 import GHC.Core.Seq ( seqBinds )
 
 import GHC.Data.Bag
@@ -600,111 +597,6 @@ usedAsKinds binds = kinded
       _             -> []
     coTypes co = let Pair l r = coercionKind co in [Right l, Right r]
 
-{- Note [Plain types]
-~~~~~~~~~~~~~~~~~~~~~
-With -fcore-webs-data-skip-plain, data splitting leaves /plain/ types alone:
-it makes no copies of them, so every occurrence keeps the original.  A type
-is plain when nothing in it can gain from a split:
-
-  * it has no type parameters (a polymorphic type is split: its classes can
-    be specialised to their instances, Note [Specialising split types]);
-  * it is not recursive, alone or with others, through its fields;
-  * no field reaches an arrow, through the fields of the types it mentions,
-    transitively (an arrow in a split type can get an internal web; a type
-    family application counts as one, since it might be);
-  * no field can be unboxed: none has a type with one constructor and some
-    field (Int, Double, a tuple, a record) -- Note [Flattening fields] in
-    GHC.WebCore.DataFlatten unpacks those, which is most of what splitting
-    buys.
-
-Enumerations are never copied anyway (eligible).  What is left is, for
-instance, a sum of messages whose fields are enumerations, strings or other
-plain types.
-
-Plain types are found once per module, over the strongly connected
-components of the type graph reachable from the program's types.
--}
-
--- | The plain types reachable from the program (Note [Plain types])
-plainTyCons :: CoreProgram -> UniqSet TyCon
-plainTyCons binds = mkUniqSet [ tc | tc <- nodes, plain tc ]
-  where
-    roots = nonDetEltsUniqSet (programTyCons binds)
-    nodes = reach emptyUniqSet roots []
-    reach _ [] acc = acc
-    reach seen (t : ts) acc
-      | t `elementOfUniqSet` seen = reach seen ts acc
-      | otherwise = reach (addOneToUniqSet seen t) (succs t ++ ts) (t : acc)
-
-    info :: UniqFM TyCon ([TyCon], Bool)    -- successors, a field with an arrow
-    info = listToUFM [ (t, scanTys (fieldTys t)) | t <- nodes ]
-    succs t = fst (scanTys (fieldTys t))
-    direct t = maybe False snd (lookupUFM info t)
-
-    fieldTys t
-      | isNewTyCon t = [snd (newTyConRhs t)]
-      | isAlgTyCon t = [ scaledThing f | dc <- tyConDataCons t, f <- dataConOrigArgTys dc ]
-      | otherwise    = []
-
-    sccs = stronglyConnCompFromEdgedVerticesUniq
-             [ DigraphNode t t (maybe [] fst (lookupUFM info t)) | t <- nodes ]
-    -- (dependencies first)
-    (arrowy, recursive) = foldl' scc (emptyUniqSet, emptyUniqSet) sccs
-    scc (ar, re) (AcyclicSCC t)
-      = ( if direct t || any (`elementOfUniqSet` ar) (succs t) then addOneToUniqSet ar t else ar
-        , if t `elem` succs t then addOneToUniqSet re t else re )
-    scc (ar, re) (NECyclicSCC ts)
-      = let ms = toList ts
-            a  = any direct ms || any (`elementOfUniqSet` ar) (concatMap succs ms)
-        in (if a then addListToUniqSet ar ms else ar, addListToUniqSet re ms)
-
-    plain t =  copyable t && null (tyConBinders t)
-            && not (t `elementOfUniqSet` recursive) && not (t `elementOfUniqSet` arrowy)
-            && not (any unboxable (fieldTys t))
-    unboxable ty = case splitTyConApp_maybe (coreFullView ty) of
-      Just (t, _)
-        | isNewTyCon t       -> unboxable (snd (newTyConRhs t))
-        | Just dc <- tyConSingleDataCon_maybe t
-        , isAlgTyCon t, not (null (dataConOrigArgTys dc)) -> True
-      _ -> False
-
--- | The type constructors of a list of types, and whether one of the types
--- has an arrow (or a type family application: it might)
-scanTys :: [Type] -> ([TyCon], Bool)
-scanTys tys = foldr go ([], False) tys
-  where
-    go ty acc | Just ty' <- coreView ty = go ty' acc
-    go ty acc@(tcs, ar) = case ty of
-      TyConApp tc args -> foldr go (tc : tcs, ar || isArrowTyCon tc || isFamilyTyCon tc) args
-      FunTy { ft_arg = a, ft_res = r } -> go a (go r (tcs, True))
-      AppTy a b    -> go a (go b acc)
-      ForAllTy _ t -> go t acc
-      CastTy t _   -> go t acc
-      _            -> acc
-
--- | The type constructors in the program's types: binders, type arguments,
--- case types, coercions, constructors
-programTyCons :: CoreProgram -> UniqSet TyCon
-programTyCons binds = unionManyUniqSets (map bind binds)
-  where
-    bind b = unionManyUniqSets [ ty (varType x) `unionUniqSets` expr e | (x, e) <- flattenBinds [b] ]
-    ty = tyConsOfType
-    bndr x | isId x    = ty (varType x)
-           | otherwise = emptyUniqSet
-    expr e = case e of
-      Var v | Just dc <- isDataConWorkId_maybe v -> unitUniqSet (dataConTyCon dc)
-      Type t        -> ty t
-      Coercion co   -> co_tys co
-      App f a       -> expr f `unionUniqSets` expr a
-      Lam x b       -> bndr x `unionUniqSets` expr b
-      Let b x       -> bind b `unionUniqSets` expr x
-      Case s x t as -> unionManyUniqSets (expr s : bndr x : ty t
-                                          : [ unionManyUniqSets (expr r : map bndr bs) | Alt _ bs r <- as ])
-      Cast x co     -> expr x `unionUniqSets` co_tys co
-      Tick _ x      -> expr x
-      _             -> emptyUniqSet
-    co_tys co = let Pair l r = coercionKind co in ty l `unionUniqSets` ty r
-
 ------------------------------------------------------------------
 --      Annotation
 ------------------------------------------------------------------
@@ -854,10 +746,9 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
 splitDataTypes :: String          -- ^ The copies' suffix, before their class number
-               -> Bool            -- ^ leave plain types alone (Note [Plain types])
                -> Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
                -> CoreProgram -> DataSplitResult
-splitDataTypes sfx skip_plain unbox keep cfg this_mod us rules binds
+splitDataTypes sfx unbox keep cfg this_mod us rules binds
   = DataSplitResult
       { dsr_binds   = final_binds
       , dsr_tycons  = final_tcs
@@ -909,10 +800,7 @@ splitDataTypes sfx skip_plain unbox keep cfg this_mod us rules binds
     (ann_binds, st) = runState (mapProgram (annMapper pinned kinded) binds)
                                (AnnState this_mod us1 emptyUFM [] emptyUFM [] [] kinded)
     kinded_set = usedAsKinds binds
-    -- not copied: used as kinds, or plain (Note [Plain types])
-    kinded tc = tc `elemUFM` kinded_set || tc `elementOfUniqSet` plain_set
-    plain_set | skip_plain = plainTyCons binds
-              | otherwise  = emptyUniqSet
+    kinded tc = tc `elemUFM` kinded_set
     -- (for the dump: those that would otherwise be copied)
     kinded_list = sortOn (\(tc, _, _) -> getOccString tc)
                          [ k | k@(tc, _, _) <- nonDetEltsUFM kinded_set, copyable tc ]
@@ -1126,9 +1014,6 @@ splitDataTypes sfx skip_plain unbox keep cfg this_mod us rules binds
         <+> text "exposed only by casts:"
         <+> int (length [ () | (ms, _, Exposed, _, _) <- fates, exposed_by_cast ms ]) <> comma
         <+> text "pinned binders:" <+> int (sizeVarSet pinned)
-      , ppUnless (isEmptyUniqSet plain_set) $
-        text "plain types, not copied:" <+> int (sizeUniqSet plain_set)
-      , whenPprDebug $ nest 2 $ pprWithCommas ppr (sortOn getOccString (nonDetEltsUniqSet plain_set))
       , whenPprDebug $ text "copies per type:" <+> pprWithCommas (\(n, t) -> ppr t <> colon <> int n)
           (take 25 (sortOn (negate . fst)
              [ (n, t) | (t, n) <- nonDetEltsUFM (foldl' (\m o -> addToUFM_C (\(t, a) (_, b) -> (t, a + b)) m o (o, 1 :: Int))

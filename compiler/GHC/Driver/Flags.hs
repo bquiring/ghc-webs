@@ -671,7 +671,6 @@ data GeneralFlag
    | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
    | Opt_CoreWebsNoHiddenFields -- ^ (measuring) every constructor's fields exposed: no Note [Hidden fields]
    | Opt_CoreWebsNoRestoreUnfoldings -- ^ (measuring) no Note [Restoring vanilla unfoldings]
-   | Opt_CoreWebsDataSkipPlain -- ^ data splitting leaves plain types alone: Note [Plain types]
    | Opt_CoreWebsInternalMainExports -- ^ The main module's exports other than main are internal: Note [Main's exports]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
    | Opt_CoreWebsOneShot      -- ^ One-shot lambdas from webs
@@ -970,7 +969,6 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsNoStrictElim
    , Opt_CoreWebsNoHiddenFields
    , Opt_CoreWebsNoRestoreUnfoldings
-   , Opt_CoreWebsDataSkipPlain
    , Opt_CoreWebsInternalMainExports
    , Opt_CoreWebsUncurryKnown
    , Opt_CoreWebsOneShot
