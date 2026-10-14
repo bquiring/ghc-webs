@@ -1027,6 +1027,7 @@ Library
         GHC.WebCore.Compare
         GHC.WebCore.DataCopy
         GHC.WebCore.DataFlatten
+        GHC.WebCore.DataInfer
         GHC.WebCore.DataLint
         GHC.WebCore.DataSpec
         GHC.WebCore.DataSplit

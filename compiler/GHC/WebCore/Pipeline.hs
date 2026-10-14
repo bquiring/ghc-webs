@@ -51,7 +51,7 @@ import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
 import GHC.WebCore.Boundary ( splitBoundary, contractBoundary )
-import GHC.WebCore.DataSplit ( DataSplitResult(..), splitDataTypes, nonParametric )
+import GHC.WebCore.DataSplit ( DataSplitResult(..), PairSource(..), splitDataTypes, nonParametric )
 import GHC.Core.TyCo.FVs ( tyConsOfType )
 import GHC.Core.DataCon ( dataConRepArgTys )
 import GHC.WebCore.DataCopy ( UnboxOpts(..) )
@@ -638,7 +638,10 @@ runDataSplit sfx early logger dflags this_mod rules binds
                                      , uo_orig_sizes = [] })
                    | otherwise = Nothing
              -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
-             split keep = splitDataTypes sfx unbox keep (dataLintConfig dflags) this_mod us rules binds
+             source | gopt Opt_CoreWebsDataInferCheck dflags = CheckInference
+                    | gopt Opt_CoreWebsDataInfer dflags      = FromInference
+                    | otherwise                              = FromDataLint
+             split keep = splitDataTypes sfx source unbox keep (dataLintConfig dflags) this_mod us rules binds
              -- for -dshow-passes: the first pass's program is not used when
              -- the second runs, so only what decides the second is forced
              force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()

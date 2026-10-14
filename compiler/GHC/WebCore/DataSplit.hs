@@ -4,6 +4,7 @@
 -- See Note [Splitting data types].
 module GHC.WebCore.DataSplit
   ( DataSplitResult(..)
+  , PairSource(..)
   , splitDataTypes
   , mapTyCons
   , mapTyConsCo
@@ -53,6 +54,7 @@ import GHC.Utils.Panic ( panic, pprPanic )
 
 import GHC.WebCore.DataCopy
 import GHC.WebCore.DataLint ( LintConfig, DataLintResult(..), lintDataProgram )
+import GHC.WebCore.DataInfer ( inferCopyPairs, solveCopies )
 import {-# SOURCE #-} GHC.WebCore.DataFlatten ( flattenFields )
 import GHC.WebCore.DataSpec ( specialiseSplit )
 
@@ -741,14 +743,22 @@ components nodes pairs = foldl visit emptyUFM all_nodes
 --      The pass
 ------------------------------------------------------------------
 
+-- | Where the pairs of copies come from (Note [Inferring copy pairs] in
+-- GHC.WebCore.DataInfer)
+data PairSource
+  = FromDataLint      -- ^ Data Lint type-checks the annotated program
+  | FromInference     -- ^ unification, without type-checking
+  | CheckInference    -- ^ both; the classes must be the same (panics if not)
+
 -- | What a class of copies becomes: the original, or a new type with the
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
 splitDataTypes :: String          -- ^ The copies' suffix, before their class number
+               -> PairSource
                -> Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
                -> CoreProgram -> DataSplitResult
-splitDataTypes sfx unbox keep cfg this_mod us rules binds
+splitDataTypes sfx source unbox keep cfg this_mod us rules binds
   = DataSplitResult
       { dsr_binds   = final_binds
       , dsr_tycons  = final_tcs
@@ -806,9 +816,28 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
                          [ k | k@(tc, _, _) <- nonDetEltsUFM kinded_set, copyable tc ]
     fst3 (a, _, _) = a
     copies   = as_copies st
-    lint_res = lintDataProgram cfg copies ann_binds
-    ok       = isEmptyBag (dlr_errs lint_res)
+    lint_res = case source of
+      FromInference -> DataLintResult { dlr_warns = emptyBag, dlr_errs = emptyBag
+                                      , dlr_pairs = inferred }
+      _             -> lintDataProgram cfg copies ann_binds
+    inferred = inferCopyPairs copies ann_binds
+    ok       = isEmptyBag (dlr_errs lint_res) && checked && solve_checked
     pairs    = bagToList (dlr_pairs lint_res)
+    -- -fcore-webs-data-infer-check: the same classes from both
+    checked = case source of
+      CheckInference
+        | not (null mismatches)
+        -> pprPanic "DataSplit: inferred classes differ from Data Lint's"
+             (vcat [ ppr a <+> text "~" <+> ppr b <+> parens (text why) | (a, b, why) <- take 20 mismatches ])
+      _ -> True
+    mismatches
+      = [ (a, b, "only inferred")  | (a, b) <- bagToList inferred
+                                   , repOf lint_comps a /= repOf lint_comps b ] ++
+        [ (a, b, "only Data Lint") | (a, b) <- bagToList (dlr_pairs lint_res)
+                                   , repOf infer_comps a /= repOf infer_comps b ]
+    lint_comps  = components (as_all st) (dlr_pairs lint_res)
+    infer_comps = components (as_all st) inferred
+    repOf m c = lookupWithDefaultUFM m c c
     is_copy c = c `elemUFM` copies
 
     -- How much casts cost: classes exposed only through a cast (pairs from
@@ -822,12 +851,31 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     nc_exposed = mkUniqSet [ rep_nc o | (a, b) <- pairs, o <- [a, b], not (is_copy o) ]
     exposed_by_cast ms = not (any (\m -> rep_nc m `elementOfUniqSet` nc_exposed) ms)
 
-    -- Classes: representative -> members
-    -- with congruence for newtype copies' children (Note [Splitting newtypes])
-    -- (all_pairs: Data Lint's and congruence's; the members of a class come
-    -- from them, so that an original only congruence brings in counts)
-    (rep_of, all_pairs) = congruence (as_all st) (dlr_pairs lint_res)
+    -- Classes: representative -> members, with congruence for newtype
+    -- copies' children (Note [Splitting newtypes]), by an online union-find
+    -- (Note [Solving copy classes online] in GHC.WebCore.DataInfer); the
+    -- members include the originals that only congruence brings in
+    (rep_of, all_nodes) = solveCopies copies children (as_all st) pairs
     children c = lookupUFM (as_children st) c
+    -- -fcore-webs-data-infer-check: the old solver (components, then
+    -- congruence in rounds) gives the same classes
+    solve_checked = case source of
+      CheckInference
+        | let (old_rep, old_pairs) = congruence (as_all st) (dlr_pairs lint_res)
+              old_nodes = nubTc (as_all st ++ concat [ [a, b] | (a, b) <- old_pairs ])
+              -- the same nodes, and old and new representatives in a bijection
+              r m n = lookupWithDefaultUFM m n n
+              fwd = foldl' (\m n -> addToUFM_C (++) m (r old_rep n) [r rep_of n]) emptyUFM old_nodes
+              bwd = foldl' (\m n -> addToUFM_C (++) m (r rep_of n) [r old_rep n]) emptyUFM all_nodes
+              many xs = length (nubTc xs) > 1
+              old_set = mkUniqSet old_nodes
+              new_set = mkUniqSet all_nodes
+              bad = [ (n, n) | n <- old_nodes, not (n `elementOfUniqSet` new_set) ]
+                    ++ [ (n, n) | n <- all_nodes, not (n `elementOfUniqSet` old_set) ]
+                    ++ [ (a, b) | xs@(a : b : _) <- nonDetEltsUFM fwd ++ nonDetEltsUFM bwd, many xs ]
+        , not (null bad)
+        -> pprPanic "DataSplit: online classes differ from the rounds'" (ppr (take 20 bad))
+      _ -> True
     congruence nodes prs = go_cong (0 :: Int) prs
       where
         go_cong n ps
@@ -851,7 +899,7 @@ splitDataTypes sfx unbox keep cfg this_mod us rules binds
     -- (built in reverse, by prepending: appending is quadratic in a class's size)
     members = mapUFM reverse $
               foldl' (\m c -> addToUFM_C (\old new -> new ++ old) m (rep c) [c]) emptyUFM
-                     (nubTc (as_all st ++ concat [ [a, b] | (a, b) <- all_pairs ]))
+                     all_nodes
     nubTc = nonDetEltsUniqSet . mkUniqSet
 
     -- (in any order: sorted below)
