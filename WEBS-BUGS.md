@@ -103,7 +103,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `datasplit011` and `datasplit011_again`: a local newtype U
   over a newtype E over an Either that is only built with Right. Lint
   error before the fix.
-* **Commit:**
+* **Commit:** `ccc9e17218`
 
 ### Specialising a split type: a coercion through a variable under an arrow (2026-10-14)
 * **Found by:** the Hackage root group rebuilt after the list and unfolding
