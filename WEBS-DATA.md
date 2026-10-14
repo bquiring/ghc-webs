@@ -390,3 +390,205 @@ All of it sits behind a flag, `-fcore-webs-data`. With the flag off, every
   simplifier's last phases, so they can optimise the new types. That is the
   early run. The late run would only get the representation change, with
   no cleanup.
+
+## 11. Redesign: splitting by unification (proposed, 2026-10-14)
+
+Status: proposed, not implemented. Modelled on the SML web inference in
+`~/projects/3cps` (`infer-webs.sml`: `newTyc`, `renameDCon`, `unifyTyc`,
+`mergeTycons`).
+
+### Why
+
+Splitting costs far more than the rest of the web pipeline, and its cost
+grows faster than the module. Each splitting step runs twice: once to find
+the useful classes, then again keeping only those (Note [Keeping only
+useful splits]). With `-fcore-webs-data-again` that happens in both the
+`_s` and the `_r` run.
+
+| module | size before webs | one splitting step (`_s`) | its "useful splits" rerun |
+|---|---|---|---|
+| `GHC.Core.Opt.Arity` | 7.7k terms, 7.8k types | 1.1 s, 1.8 GB | 0.9 s, 1.7 GB |
+| `GHC.Tc.Errors.Types` | 31k terms, 6.0M types | 253 s, 328 GB | 142 s, 303 GB |
+| `GHC.CmmToLlvm.CodeGen` | 992k terms, 497k types | 523 s, 1.5 TB | 547 s, 1.2 TB |
+
+That is 240 KB per term on `Arity` and 1.5 MB per term on `CodeGen`. In
+`Arity`, 4,153 copies make 81 classes and 3 splits. A whole-program Core
+Lint allocates about 250 MB there, so Data Lint explains only part of the
+1.8 GB. Sampling (`perf`) attributes most of the time to GC and generic
+application, not to our functions. So **step 0 below measures each part of
+splitting before anything changes**; this section's cost claims are
+hypotheses until then.
+
+What the current design pays, per pass:
+
+* **Full copies.** Every occurrence of an eligible type is a real `TyCon`
+  with its own `DataCon`s, workers and field types (`mkCopy`). They are built
+  lazily, but anything that looks at a copy's constructors builds them. A
+  type with many constructors (`CmmToLlvm`'s and `Cmm`'s instruction and
+  operation types) costs that many `DataCon`s per occurrence.
+* **Data Lint.** A 4,079-line fork of Core Lint type-checks the annotated
+  program. For every comparison it erases copies from both types
+  (`eraseCopies`) and walks them again for pairs (`copyPairs`). It also
+  checks kinds and substitutes types as Core Lint does, which unshares them
+  (Note [Keeping types shared]).
+* **Offline solving.** The pairs go into a list, then into connected
+  components. Newtype congruence recomputes the components for up to 20
+  rounds (WEBS-BACKLOG, "Superlinear algorithms", 5).
+* **Two complete passes.** The "useful splits" pass repeats annotation, Data
+  Lint and solving on the same input, and gets the same classes.
+
+### The design
+
+The classes, fates and names stay exactly as they are now. Only how they are
+computed changes. So the first version must give the same output as today:
+same `-ddump-webs-data`, the same instruction counts in nofib.
+
+1. **Name-only copies.** A copy is a `TyCon` with a fresh `Name` and
+   `Unique`, the original's binders, kind and roles, and no constructors
+   (an abstract right-hand side), like `newTyc`'s `DataTyc []` in the SML.
+   It costs one `TyCon` and one `Name`, whatever the type's size.
+   * **Constructor occurrences.** A constructor occurrence becomes a fresh
+     occurrence `Id` whose type is the worker's type with the copy in place
+     of `T` (in the result and the recursive fields, as now). A side table
+     maps it to its `DataCon` and copy.
+   * **Case alternatives.** They keep the original `DataCon`; their copy is
+     the case binder's.
+   * **Newtype copies.** They get no axiom. Coercions that use an original
+     newtype axiom instantiate it with fresh copies. Only a split newtype
+     class gets a real axiom, at the end (`mkNewtypeCopy`, as now).
+2. **Inference instead of Data Lint.** One traversal of the annotated program
+   computes each expression's type and unifies two types wherever Core Lint
+   requires them to be equal. Those are Data Lint's `ensureEqTys` sites:
+   * a binder's type against its right-hand side's, including join points
+     and unfoldings;
+   * a function's argument type against the argument's;
+   * a case binder's type against the scrutinee's;
+   * a constructor pattern's instantiated fields against its binders;
+   * each alternative's type against the case's;
+   * a cast's coercion kind against its expression;
+   * inside coercions, where they compose (`TransCo`, instantiated axioms,
+     `ForAllCo` kinds).
+
+   Unifying walks the two types once: same original, different copies →
+   union. There is no erasure, no kind checking, no Lint environment and no
+   substitution beyond instantiating `forall`s at type applications. A
+   missed site would make two classes that meet differ. Core Lint on the
+   output (tests and nofib run with `-dcore-lint`) reports that as a type
+   error. While the new inference is developed, the old Data Lint stays
+   behind a debug flag that checks both give the same partition. Once
+   nofib and the self-host agree, it is deleted.
+3. **Online union-find** (in `ST`, as `unifyTyc` and `merge` in the SML).
+   Each class has a descriptor: the original if it meets one (exposed); the
+   constructor tags built and matched; for newtype copies, their children.
+   Merging two classes merges their descriptors. Merging two newtype classes
+   unifies their children pairwise; merging one with its original unifies
+   its children with the original's types. That is the congruence the
+   20-round loop computes now, done once when the merge happens.
+4. **One annotation and inference for both splitting passes.** The "useful
+   splits" pass reuses the first pass's annotated program and classes. It
+   only recomputes the fates, keeping the useful classes. Then it rewrites,
+   specialises and flattens again. Annotation and solving are deterministic,
+   so this is the second pass the current code computes.
+5. **Rewriting** maps each copy to its class's type, and each occurrence
+   `Id` to that type's constructor, as `rwMapper` does now. Classes are
+   numbered by first copy in traversal order, as now, so `T_s<n>` keeps its
+   number.
+
+### One pass for data and function webs (user, 2026-10-14)
+
+Data splitting and the web inference become one pass, as in the SML, where
+one type checker unifies the fresh names of both datatypes and function
+types. Function webs sit on arrows (`ft_web`). Web Lint records a pair of
+webs at the same type comparisons where Data Lint records a pair of copies.
+So one walk does both: `unify` unions the two arrows' webs at a `FunTy`, the
+two copies at a `TyConApp`, and recurses. The early run becomes:
+
+1. **Annotation:** arrows get webs (`annotateProgram`, as now) and eligible
+   type occurrences get name-only copies, in the same traversal.
+2. **Inference:** the unification above, at Core Lint's comparison sites,
+   gives web pairs and data classes. Exposure works as now: webs reach
+   `placeholderWeb`; data classes meet an original.
+3. **Solving:** `solveWebs` for the webs (as now); fates for the data
+   classes.
+4. **Data:** rewrite to the split types, then specialise and flatten.
+   Usefulness: recompute the fates and rewrite once more, without
+   inferring again.
+5. **Web transformations**, using the solution from step 3. The data rewrite
+   rebuilds types with record updates and substitution, which keep
+   `ft_web`. Wherever it builds a new arrow, the arrow gets the web of
+   the one it replaces (section 7's helper). The rounds' Web Lint check
+   (`checkSolved`, under `-dcore-lint`) catches a web that was lost.
+
+**Webs in the fields of split types.** Today the webs see the program
+after splitting, and `hiddenFields` hides the fields of the split types: an
+arrow in a split type's field gets an internal web. In one pass, whether a
+data class is exposed is known only while solving. So each constructor
+occurrence gets fresh webs on the arrows in its fields. A class's descriptor
+holds them, by constructor and field. Merging two classes unifies them, and
+a class that meets its original unifies them with `placeholderWeb`. This
+gives the same webs as today for split classes, and exposed ones for the
+rest. It is the arrow half of `renameDCon`.
+
+Web Lint and Data Lint both stay as checkers while this is built. The new
+inference must give the same web solution as Web Lint and the same data
+partition as Data Lint. After that, the inference is the only source of
+constraints. Web Lint remains as the `-dcore-lint` check of each round.
+
+What happens to the `_r` run (splitting again after the web
+transformations) is decided by measurement. If it still adds splits, it
+reruns the joint pass on the transformed program. If not, it goes.
+
+### Later: nested fields (changes results; behind a flag)
+
+The SML gives each constructor occurrence fresh copies of every datatype in
+its fields too (`renameDCon`). Unifying two classes unifies their
+constructors' fields by name (`unifyDCons`). Today a field of type `[Int]`
+in `data T = T [Int]` keeps the original `[]`. So whatever flows through it
+is exposed (section 4, phase 4 in section 9). With nested fields, the
+descriptor holds each constructor's field copies, and a merge unifies them.
+
+A final type's fields can then name other classes (a list's cells whose tail
+is another class), so the new `TyCon`s are built knot-tied. This splits
+more, so it goes behind its own flag and must pass the no-regression check
+against `early-ulsl` before it is on by default.
+
+### Steps
+
+0. **Measure.** Add timings (`withTiming`, under `-dshow-passes`) for
+   annotation, Data Lint, solving, rewriting, specialisation and each
+   flattening round, and print the copy count with the constructors behind
+   it. Measure `Arity`, `GHC.Tc.Errors.Types` and `CodeGen`. If
+   specialisation or flattening dominates (each flattening round runs the
+   simple optimiser over the whole program), fix that first; it is separate
+   from this design.
+1. Name-only copies, inference, online union-find. Check them against the
+   old Data Lint (same partition) on the webs testsuite and nofib.
+2. One annotation and inference for both passes.
+   Then merge it with the web inference: one annotation, one inference,
+   one solve for data and function webs (above). The web solution must
+   be the same as Web Lint's.
+3. **Verify; no lost splitting.** Each module must split at least what it
+   splits now. A script compares old and new compilers per module: classes
+   split, constructors dropped, fields unboxed, and internal webs. It runs
+   on the webs testsuite, nofib and the Hackage and SML programs, and every
+   module that splits less is explained or fixed. The webs testsuite's
+   dumps are unchanged (apart from timing lines). nofib per benchmark is
+   identical to `early-ulsl3`.
+   Compiler allocation is measured on the three modules above. Then the GHC
+   self-host builds with data splitting, which ran out of memory in
+   `CodeGen` before. Delete Data Lint.
+4. Nested fields, behind a flag; measured on nofib against `early-ulsl`,
+   then on the Hackage and SML programs.
+
+### Risks
+
+* **Missed equation sites.** These are unsound when built without Lint.
+  The partition check against Data Lint guards them during development.
+  Afterwards, every test and benchmark build runs Core Lint on the result.
+* **Coercions.** These are the hardest part to get right: axioms, `UnivCo`
+  and the non-parametric functions (Note [Non-parametric functions]). They
+  keep their current rule: whatever they touch meets the original.
+* **Order.** Rewriting from the solved classes must give the same class
+  numbers as now, or every dump and test output changes. Numbering by first
+  copy in traversal order keeps them, if annotation visits occurrences in
+  the same order.
