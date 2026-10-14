@@ -100,7 +100,7 @@ would catch it again), **commit** (empty while uncommitted).
   GHC.WebCore.Transform.Common already does.
 * **Guard:** `dataunbox012` (a nested pair whose function component is only
   seq'd; the assertion fires without the fix).
-* **Commit:**
+* **Commit:** `589650cb37`
 
 ### Useful splits: a newtype class reverted while its newtype child stayed split (2026-10-14)
 * **Found by:** the compilers group with data splitting (`ulsl2`): Web Lint
