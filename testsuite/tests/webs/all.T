@@ -259,6 +259,9 @@ test('datasplit009_dump', [extra_files(['datasplit009.hs'])],
 test('datasplit011', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('datasplit011_again', [extra_files(['datasplit011.hs']), use_specs({'stdout': 'datasplit011.stdout'})],
      multimod_compile_and_run, ['datasplit011', ds_opts + ' -fcore-webs-data-unbox -fcore-webs-data-again -fcore-webs-useless'])
+# datasplit012: a copy whose tags dataToTag# observes keeps every
+# constructor (Note [Observed tags]; cabal-install's solver)
+test('datasplit012', [extra_files(['Datasplit012V.hs'])], multimod_compile_and_run, ['datasplit012', ds_opts])
 # datasplit010: splitting keeps the vanilla unfoldings that worker/wrapper
 # reads, so small functions get no wrapper (Note [Restoring vanilla
 # unfoldings] in GHC.WebCore.Pipeline)

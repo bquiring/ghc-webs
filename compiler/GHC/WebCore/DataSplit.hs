@@ -33,7 +33,7 @@ import GHC.Core.Seq ( seqBinds )
 import GHC.Data.Bag
 
 import GHC.Types.Id
-import GHC.Builtin.PrimOps ( PrimOp(AtomicModifyMutVar2Op) )
+import GHC.Builtin.PrimOps ( PrimOp(AtomicModifyMutVar2Op, DataToTagSmallOp, DataToTagLargeOp, TagToEnumOp) )
 import GHC.Types.Id.Make ( mkDataConWorkId )
 import GHC.Types.Name
 import GHC.Types.Name.Env ( emptyNameEnv )
@@ -505,6 +505,43 @@ pass through a cast -- e.g. into a local newtype -- without exposing its
 class.  Coercion variables keep their types (what flows through them is
 exposed), and so do kinds.  The rewrite maps copies in coercions too.
 -}
+
+{- Note [Observed tags]
+~~~~~~~~~~~~~~~~~~~~~~
+A split copy keeps only the constructors built in its class, numbered from
+1 (mkCopy).  The numbering is visible to dataToTag# and tagToEnum#, and the
+simplifier has already folded tags of known constructors into literals with
+the original numbering.  The derived (==) of
+    data Var qpn = P qpn | F (FN qpn) | S (SN qpn)
+compares the two arguments' tags, and for F qfn == var it became
+    case dataToTag# var of { 1# -> case var of { F y -> ... }; _ -> ... }
+where 1# is F's original tag.  In cabal-install's solver var's copy had only
+F and S (tags 0 and 1 for dataToTag#), so an S took the F branch and failed
+its pattern match.  So a copy that one of these primops is applied at keeps
+every constructor of its original, and with them the original tags.
+-}
+
+-- | Copies whose constructor tags the program observes: the type arguments
+-- of dataToTag# and tagToEnum#.  Note [Observed tags]
+tagObserved :: Copies -> CoreProgram -> [TyCon]
+tagObserved copies binds = concatMap bind binds
+  where
+    bind (NonRec _ e) = expr e
+    bind (Rec prs)    = concatMap (expr . snd) prs
+    expr e = case e of
+      App {} | (Var v, args) <- collectArgs e
+             , Just op <- isPrimOpId_maybe v
+             , op `elem` [DataToTagSmallOp, DataToTagLargeOp, TagToEnumOp]
+             -> [ c | Type t <- args, Just (c, _) <- [splitTyConApp_maybe t]
+                    , c `elemUFM` copies ]
+                ++ concatMap expr args
+      App f a       -> expr f ++ expr a
+      Lam _ b       -> expr b
+      Let b x       -> bind b ++ expr x
+      Case s _ _ as -> expr s ++ concat [ expr r | Alt _ _ r <- as ]
+      Cast x _      -> expr x
+      Tick _ x      -> expr x
+      _             -> []
 
 -- | Imported functions that are not parametric: unsafeCoerce relates the
 -- representations of its type arguments (Note [Non-parametric functions])
@@ -1067,7 +1104,11 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
     nubTc = nonDetEltsUniqSet . mkUniqSet
 
     -- (in any order: sorted below)
-    built   = foldl' (\m (c, t) -> addToUFM_C (\old new -> new ++ old) m (rep c) [t]) emptyUFM (as_built st)
+    built   = foldl' (\m (c, t) -> addToUFM_C (\old new -> new ++ old) m (rep c) [t]) emptyUFM
+                     (as_built st ++ tag_built)
+    -- a copy whose tags are observed keeps every constructor (Note [Observed tags])
+    tag_built = [ (c, dataConTag dc) | c <- tagObserved copies ann_binds
+                                     , dc <- tyConDataCons (copyOriginal copies c) ]
     matched = foldl' (\m (c, t) -> addToUFM_C (\old new -> new ++ old) m (rep c) [t]) emptyUFM (as_matched st)
 
     -- The classes, in a deterministic order (by their first copy)

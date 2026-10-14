@@ -85,6 +85,28 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Split copies renumbered constructors that folded tags still named (2026-10-14)
+* **Found by:** timing the compilers group: cabal-install built with data
+  splitting (`ulsl2`) failed at run time, "Var.hs:23:13-14: Non-exhaustive
+  patterns in case" (the derived Eq of the solver's `Var`), while `nods2`
+  ran. Web Lint, Core Lint and the inference parity check all passed.
+  Bisected by package (only the solver) and by module (Linking or Validate,
+  either alone).
+* **Cause:** a split copy keeps only the constructors built in its class and
+  numbers them from 1 (mkCopy). Tags are observable: before splitting, the
+  simplifier had turned `F qfn == var` (the derived (==) compares tags) into
+  `case dataToTag# var of 1# -> case var of F y -> ...`, with
+  `dataToTag# var` floated out of a loop and 1# the original tag of F. The
+  copy of `Var` built only F and S, so it dropped P and renumbered: an S
+  (copy tag 1) took the F branch and failed the pattern match, and an F was
+  never equal. Lint checks types, not tag numbers.
+* **Fix:** a copy that dataToTag# or tagToEnum# is applied at keeps every
+  constructor of its original, so the tags stay the original's
+  (Note [Observed tags] in GHC.WebCore.DataSplit).
+* **Guard:** `datasplit012` (the type in its own module, the comparison in
+  a local recursive function, as in the solver; fails without the fix).
+* **Commit:**
+
 ### Flattening: an absent call demand on a function component (2026-10-14)
 * **Found by:** the compilers group with data splitting (`ulsl2`, after the
   newtype fix below): "ASSERT failed!" in GHC.Types.Demand (mkCall,
