@@ -56,7 +56,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `hfield006` (a hidden-field type behind two synonyms, every
   data-split mode; `_stats` checks it stays internal); hfield005 still
   covers Zipper.
-* **Commit:** (this entry's commit)
+* **Commit:** `ec8e62c538`
 
 ### Data splitting never split lists in a program with IO (2026-10-13)
 * **Found by:** nofib after the reporting audit: `early-ulsl2` (early-ulsl's
