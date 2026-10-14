@@ -8,4 +8,4 @@ import GHC.Unit.Module ( Module )
 import GHC.Utils.Outputable ( SDoc )
 
 import GHC.WebCore.DataCopy ( UnboxOpts )
-flattenFields :: UnboxOpts -> Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc)
+flattenFields :: UnboxOpts -> Module -> UniqSupply -> [TyCon] -> CoreProgram -> (CoreProgram, [TyCon], SDoc, [(String, ())])

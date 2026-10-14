@@ -27,6 +27,7 @@ import GHC.Types.Name.Env ( emptyNameEnv )
 import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Types.SrcLoc ( noSrcSpan )
 import GHC.Types.Unique.FM
+import GHC.Types.Unique ( Uniquable )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
 import GHC.Types.Var.Env
@@ -274,11 +275,20 @@ data Field = Keep
 type Plans = UniqFM TyCon [(DataCon, [Field])]
 
 flattenFields :: UnboxOpts -> Module -> UniqSupply -> [TyCon] -> CoreProgram
-              -> (CoreProgram, [TyCon], SDoc)
-flattenFields opts this_mod us tcs binds
-  | isNullUFM plans = (binds, tcs, dump)
-  | otherwise       = (initUs_ us2 (mapM rw_bind binds), map new_tc tcs, dump)
+              -> (CoreProgram, [TyCon], SDoc, [(String, ())])
+flattenFields opts this_mod us tcs binds = (binds', tcs', dump, steps)
   where
+    (binds', tcs')
+      | isNullUFM plans = (binds, tcs)
+      | otherwise       = (initUs_ us2 (mapM rw_bind binds), map new_tc tcs)
+    -- for -dshow-passes: forcing each in turn times the steps before the
+    -- rewrite (which the caller times)
+    steps = [ ("facts", length cons_facts `seq` length match_facts `seq` length case_facts
+                        `seq` length alt_facts `seq` ())
+            , ("fixpoints", sizeOf flat_set `seq` sizeOf strictly_eliminated `seq` ())
+            , ("dead fields", sizeOf dead_fields `seq` ())
+            , ("why boxed", sum [ length w | ws <- nonDetEltsUFM bad, (_, w) <- ws ] `seq` ())
+            , ("plans", sizeUFM plans `seq` ()) ]
     (us1, us2) = splitUniqSupply us
     cands = mkUniqSet tcs
     _ = cands
@@ -344,6 +354,18 @@ flattenFields opts this_mod us tcs binds
     case_facts  :: [(TyCon, [(DataCon, [Bool])])]
     Facts cons_facts match_facts case_facts
       = foldr (go_top emptyVarSet emptyVarEnv) (Facts [] [] []) binds
+
+    -- The facts by constructor (and by type for cases), in their order: each
+    -- query looks only at its own constructor's (scanning them all per field
+    -- and per fixpoint round was quadratic: GHC.CmmToLlvm.CodeGen)
+    by_key :: Uniquable k => (a -> k) -> [a] -> UniqFM k [a]
+    by_key key = foldr (\x m -> addToUFM_C (\old new -> new ++ old) m (key x) [x]) emptyUFM
+    cons_by  = by_key (\(dc, _, _) -> dc) cons_facts
+    match_by = by_key (\(dc, _, _, _) -> dc) match_facts
+    alt_by   = by_key (\(dc, _, _) -> dc) alt_facts
+    case_by  = by_key fst case_facts
+    cons_of dc  = lookupWithDefaultUFM cons_by [] dc
+    match_of dc = lookupWithDefaultUFM match_by [] dc
 
     is_cand_con dc = dataConTyCon dc `elementOfUniqSet` cands
     all_fields dc = [0 .. dataConRepArity dc - 1]
@@ -439,11 +461,11 @@ flattenFields opts this_mod us tcs binds
         next = listToUFM [ (dc, [ i | i <- lookupWithDefaultUFM cur [] dc, se_ok cur dc i ])
                          | (dc, _) <- cand_list ]
     se_ok m dc i
-      =  and [ ctx_ok m ctx | (dc', _, ctx) <- cons_facts, dc' == dc ]
+      =  and [ ctx_ok m ctx | (_, _, ctx) <- cons_of dc ]
       && and [ case lookup dc cons of
                  Just strs -> fromMaybe False (index i strs)
                  Nothing   -> False
-             | (tc, cons) <- case_facts, tc == dataConTyCon dc ]
+             | (_, cons) <- lookupWithDefaultUFM case_by [] (dataConTyCon dc) ]
     ctx_ok _ CDemanded    = True
     ctx_ok _ CAllocated   = False
     ctx_ok m (CField k j) = in_set m k j
@@ -467,14 +489,14 @@ flattenFields opts this_mod us tcs binds
     in_set m dc i = i `elem` lookupWithDefaultUFM m [] dc
     ok m dc i = null (why m dc i)
     why m dc i =
-      [ "unsaturated constructor" | (dc', Nothing, _) <- cons_facts, dc' == dc ] ++
+      [ "unsaturated constructor" | (_, Nothing, _) <- cons_of dc ] ++
       [ "a construction passes a non-value: " ++ arg_why a
         ++ (if strict_everywhere dc i
             then " (every match is strict in it, but it may be built without being eliminated)"
             else "")
-      | (dc', Just as, _) <- cons_facts, dc' == dc, Just a <- [index i as], not (arg_ok m a) ] ++
+      | (_, Just as, _) <- cons_of dc, Just a <- [index i as], not (arg_ok m a) ] ++
       [ "a match uses it boxed: " ++ use_why u
-      | (dc', j, us, _) <- match_facts, dc' == dc, j == i, u <- take 1 (filter (not . use_ok m) us) ]
+      | (_, j, us, _) <- match_of dc, j == i, u <- take 1 (filter (not . use_ok m) us) ]
       where
         arg_ok _ _ | strict_field dc i = True   -- the worker evaluates it anyway
         arg_ok _ AValue      = True
@@ -486,7 +508,7 @@ flattenFields opts this_mod us tcs binds
     strict_field dc i = case drop i (dataConRepStrictness dc) of
       (MarkedStrict : _) -> True
       _                  -> False
-    strict_everywhere dc i = and [ s | (dc', j, _, s) <- match_facts, dc' == dc, j == i ]
+    strict_everywhere dc i = and [ s | (_, j, _, s) <- match_of dc, j == i ]
     use_ok _ UScrut        = True
     use_ok _ UStrictArg    = True
     use_ok m (UConArg k j) = nested && in_set m k j   -- Note [Bounding unboxing]
@@ -718,20 +740,25 @@ flattenFields opts this_mod us tcs binds
       | sizeOf next == sizeOf cur = cur
       | otherwise                 = dead_fix next
       where
-        next = listToUFM [ (dc, [ i | i <- is, dead_ok cur dc i ]) | (dc, is) <- ufm_list cur ]
+        next = listToUFM [ (dc, [ i | i <- is, dead_ok cur slices dc i ]) | (dc, is) <- ufm_list cur ]
         ufm_list m = [ (dc, lookupWithDefaultUFM m [] dc) | tc <- tcs, dc <- tyConDataCons tc ]
-    dead_ok m dc i
+        -- each alternative's dead variables, once per round, with all its
+        -- field binders as candidates: a pattern binder is no let or case
+        -- binder of the right-hand side, so whether one is dead does not
+        -- depend on whether the others are candidates -- the same answer
+        -- as slicing for each field alone, once instead of once per field
+        slices = mapUFM (map (\(_, bs, rhs) -> (bs, slice_dead cur bs rhs))) alt_by
+    dead_ok _ slices dc i
       =  con_used dc     -- a type nothing uses any more (unpacked in an earlier
                          -- round) is left alone
-      && and [ b `elemVarSet` slice_dead m (b : []) rhs
-             | (dc', bs, rhs) <- alt_facts, dc' == dc, Just b <- [index i bs] ]
-      && and [ isJust fact | (dc', fact, _) <- cons_facts, dc' == dc ]     -- saturated
+      && and [ b `elemVarSet` dead | (bs, dead) <- lookupWithDefaultUFM slices [] dc
+                                   , Just b <- [index i bs] ]
+      && and [ isJust fact | (_, fact, _) <- cons_of dc ]     -- saturated
       && (not (strict_field dc i)
           || and [ case index i as of { Just AValue -> True; _ -> False }
-                 | (dc', Just as, _) <- cons_facts, dc' == dc ])
+                 | (_, Just as, _) <- cons_of dc ])
 
-    con_used dc = any (\(dc', _, _) -> dc' == dc) cons_facts
-               || any (\(dc', _, _) -> dc' == dc) alt_facts
+    con_used dc = dc `elemUFM` cons_by || dc `elemUFM` alt_by
 
     -- The variables of an alternative that are dead given the dead fields m:
     -- every occurrence is inside an argument of a dead field, inside the

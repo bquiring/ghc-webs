@@ -407,7 +407,13 @@ useful splits]). With `-fcore-webs-data-again` that happens in both the
 
 Step 0 (2026-10-14, `3f0c024f91`: -dshow-passes times each step) on three
 GHC modules, first `_s` pass. Allocation in GB; "rest" is flattening and the
-dump.
+dump. **Caveat:** these figures, and every compile-time figure in this
+document before 2026-10-14, come from the devel2 stage 2 compiler, built
+with -O0 and debug assertions. Its unique maps run through unspecialised
+`Bits Word64` and `Integer` code, so map-heavy code is penalised out of
+proportion. From 2026-10-14 the stage 2 compiler is built with -O1
+(`_build/hadrian.settings`). Only the large structural differences carry
+over.
 
 | module | size | copies (constructors behind them) | annotation | Data Lint | solving | rewriting | specialising | rest | total |
 |---|---|---|---|---|---|---|---|---|---|

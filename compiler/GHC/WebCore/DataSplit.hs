@@ -199,8 +199,10 @@ So with unboxing on, splitting runs twice.  The first pass finds the classes
 whose split changed something; the second splits only those, and puts every
 other class back on the original type (always well typed: a class is
 closed, as for a class that builds nothing).  A newtype class is kept if one
-of its children's classes is (its axiom names them).  Both passes use the
-same unique supply, so the classes, and their numbers, are the same.
+of its children's classes is (its axiom names them).  The two passes share
+annotation, the pairs and the classes (splitDataTypes, applied to all but
+the kept classes); only the classes' fates and what follows from them --
+rewriting, specialising, flattening -- are computed twice.
 -}
 
 {- Note [Specialising for webs]
@@ -756,54 +758,202 @@ data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
 splitDataTypes :: String          -- ^ The copies' suffix, before their class number
                -> PairSource
-               -> Maybe UnboxOpts -> Maybe [Int] -> LintConfig -> Module -> UniqSupply -> [CoreRule]
-               -> CoreProgram -> DataSplitResult
-splitDataTypes sfx source unbox keep cfg this_mod us rules binds
-  = DataSplitResult
-      { dsr_binds   = final_binds
-      , dsr_tycons  = final_tcs
-      , dsr_dump    = dump $$ flat_dump
-      , dsr_lint    = lint_res
-      , dsr_changed = changed
-      , dsr_useful  = useful
-      , dsr_stages  = stages }
+               -> Maybe UnboxOpts -> LintConfig -> Module -> UniqSupply -> [CoreRule]
+               -> CoreProgram
+               -> Maybe [Int]      -- ^ the classes to keep (Note [Keeping only useful splits])
+               -> DataSplitResult
+-- Annotation, the pairs and the classes do not depend on which classes are
+-- kept: applied to all but the last argument, it computes them once for
+-- both passes (Note [Keeping only useful splits])
+splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
   where
+    split_with keep = DataSplitResult
+        { dsr_binds   = final_binds
+        , dsr_tycons  = final_tcs
+        , dsr_dump    = dump $$ flat_dump
+        , dsr_lint    = lint_res
+        , dsr_changed = changed
+        , dsr_useful  = useful
+        , dsr_stages  = stages }
+      where
+        split_binds = evalState (mapProgram rwMapper ann_binds) ()
+        -- Unbox fields of the new types (Note [Flattening fields] in
+        -- GHC.WebCore.DataFlatten)
+        (final_binds, final_tcs, flat_dump, flat_rebuilt, flat_stages)
+          | not changed = (binds, [], empty, [], [])
+          | Just opts0 <- unbox
+                        = let (fl_binds, fl_tcs, fl_dump, fl_rebuilt, fl_stages)
+                                = flatten_rounds opts (uo_rounds opts0) us5 sp_tcs sp_binds
+                              opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
+                                                             | tc <- sp_tcs, dc <- tyConDataCons tc ] }
+                          in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump, fl_rebuilt, fl_stages)
+          | otherwise   = (split_binds, new_tcs, empty, [], [])
+
+        (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
+
+        fates :: [([TyCon], TyCon, Fate, [Int], [Int])]    -- members, original, fate, built, matched
+        fates = [ (ms, orig, fate, bs, mts)
+                | (n, us_n, (orig, ms, bs, mts)) <- zip3 [1 :: Int ..] (drop 1 split_us) classes
+                , let fate | any (not . is_copy) ms = Exposed
+                           | not (kept n ms)        = Bottom   -- back to the original
+                           | isNewTyCon orig        = mk_split_nt n us_n orig ms
+                           | null bs                = Bottom
+                           | otherwise              = mk_split n us_n orig bs ]
+
+        -- Note [Keeping only useful splits]: in the second pass, a data class is
+        -- split only if the first pass found its split useful; a newtype class
+        -- only if one of its members' children's classes is kept (its axiom
+        -- names them)
+        kept n ms = case keep_set of
+          Nothing -> True
+          Just ks
+            | any (isNewTyCon . copyOriginal copies) (take 1 ms)
+            -> any (\c -> class_number c `IntSet.member` ks)
+                   [ ch | m <- ms, Just chs <- [children m], ch <- chs ]
+            | otherwise -> n `IntSet.member` ks
+        keep_set = IntSet.fromList <$> keep
+        -- The classes whose split changed something (first pass): a field
+        -- unboxed in some round, or a constructor dropped.  The new types are
+        -- named Orig_s<n> after their class, through every rebuild.
+        useful = nub ([ n | tc <- flat_rebuilt, Just n <- [split_number tc] ] ++
+                      -- Note [Specialising for webs]
+                      [ n | (orig, sp) <- zip data_tcs sp_tcs
+                          , getUnique orig /= getUnique sp
+                          , product_funs sp > product_funs orig
+                          , Just n <- [split_number sp] ] ++
+                      [ n | (n, (_, orig, Split _ cons, _, _)) <- zip [1 :: Int ..] fates
+                          , not (isNewTyCon orig)
+                          , length cons < length (tyConDataCons orig) ])
+        -- A newtype class: its representation, from one member, with the
+        -- children mapped to their classes' types (lazily)
+        mk_split_nt n us_n orig ms = Split tc []
+          where
+            member = head [ m | m <- ms, is_copy m ]
+            tc = mkNewtypeCopy us_n (\u occ -> mkExternalName u this_mod occ noSrcSpan)
+                               (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
+                               orig (evalState (rw_ty (snd (newTyConRhs member))) ())
+        fate_of :: UniqFM TyCon Fate      -- every member of a class
+        fate_of = listToUFM [ (m, f) | (ms, _, f, _, _) <- fates, m <- ms ]
+
+        new_tcs = [ tc | (_, _, Split tc _, _, _) <- fates ]
+
+        -- Specialisation and flattening rebuild data types, not newtypes: they
+        -- leave out the split newtypes and every split type their
+        -- representations reach (Note [Splitting newtypes])
+        nt_reach = go_reach emptyUniqSet [ t | nt <- new_tcs, isNewTyCon nt
+                                   , t <- nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs nt))) ]
+        go_reach seen [] = seen
+        go_reach seen (t : ts)
+          | t `elementOfUniqSet` seen || not (t `elementOfUniqSet` new_set) = go_reach seen ts
+          | otherwise = go_reach (addOneToUniqSet seen t) (field_tcs t ++ ts)
+        new_set = mkUniqSet new_tcs
+        field_tcs t
+          | isNewTyCon t = nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs t)))
+          | otherwise    = [ t' | dc <- tyConDataCons t, Scaled _ ft <- dataConOrigArgTys dc
+                                , t' <- nonDetEltsUniqSet (tyConsOfType ft) ]
+        data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), not (tc `elementOfUniqSet` nt_reach) ]
+        kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elementOfUniqSet` nt_reach ]
+        changed = ok && not (null new_tcs)
+
+        -- The type constructor a copy becomes, and a constructor (by original tag)
+        final c = case lookupUFM fate_of c of
+          Just (Split tc _) -> tc
+          _                 -> copyOriginal copies c
+        final_con c tag = case lookupUFM fate_of c of
+          Just (Split _ cons) -> lookup tag cons
+          _                   -> conWithTag (copyOriginal copies c) tag
+
+        rwMapper :: Mapper (State ())
+        rwMapper = Mapper
+          { m_ty   = rw_ty
+          , m_bndr = \b -> do { t <- rw_ty (idType b); return (setIdType b t) }
+          , m_con  = \dc -> let tc = dataConTyCon dc in
+                            if is_copy tc
+                            then case final_con tc (dataConTag dc) of
+                                   Just dc' -> return (dataConWorkId dc')
+                                   Nothing  -> pprPanic "DataSplit: built constructor" (ppr dc)
+                            else return (dataConWorkId dc)
+          , m_alt  = \_ dc -> let tc = dataConTyCon dc in
+                              if is_copy tc then return (final_con tc (dataConTag dc))
+                              else return (Just dc)
+          , m_co   = mapTyConsCo is_copy (return . final) }
+        rw_ty = mapTyCons is_copy (return . final)
+
+        -- Each stage forces what the next one needs, and no more (forcing an
+        -- annotated program does not build its copies' constructors: Data Lint
+        -- does).  Specialising and flattening are what is left.
+        stages = [ ("annotation", seqBinds ann_binds `seq` sizeUFM copies `seq` ())
+                 , ("Data Lint", ok `seq` length pairs `seq` ())
+                 , ("solving", sizeUFM rep_of `seq` length all_nodes `seq` ())
+                 , ("classes", foldr (\(ms, _, f, _, _) acc -> length ms `seq` f `seq` acc) () fates)
+                 , ("rewriting", if changed then seqBinds split_binds else ())
+                 , ("specialising", if changed && isJust unbox
+                                    then seqBinds sp_binds `seq` length sp_tcs `seq` () else ()) ]
+                 ++ flat_stages
+                 ++ [ ("usefulness", changed `seq` length useful `seq` ()) ]
+
+        dump = vcat
+          [ text "Data Lint:" <+> (if ok then text "ok" else text "errors (not split)")
+          , whenPprDebug $ text "pairs:" <+> int (length pairs)
+          , text "copies:" <+> int (sizeUFM copies)
+            <+> parens (int (nonDetFoldUFM (\o n -> n + length (tyConDataCons o)) 0 copies)
+                        <+> text "constructors behind them") <> comma
+            <+> text "classes:" <+> int (length fates) <> comma
+            <+> text "exposed:" <+> int (length [ () | (_, _, Exposed, _, _) <- fates ]) <> comma
+            <+> text "split:" <+> int (length new_tcs) <> comma
+            <+> text "exposed only by casts:"
+            <+> int (length [ () | (ms, _, Exposed, _, _) <- fates, exposed_by_cast ms ]) <> comma
+            <+> text "pinned binders:" <+> int (sizeVarSet pinned)
+          , whenPprDebug $ text "copies per type:" <+> pprWithCommas (\(n, t) -> ppr t <> colon <> int n)
+              (take 25 (sortOn (negate . fst)
+                 [ (n, t) | (t, n) <- nonDetEltsUFM (foldl' (\m o -> addToUFM_C (\(t, a) (_, b) -> (t, a + b)) m o (o, 1 :: Int))
+                                                           emptyUFM (nonDetEltsUFM copies)) ]))
+          , ppUnless (null kinded_list) $
+            text "not copied (used as kinds):" <+> pprWithCommas ppr (map fst3 kinded_list)
+          , whenPprDebug $ nest 2 $ vcat [ ppr tc <+> text why <+> ppr t | (tc, why, t) <- kinded_list ]
+          , vcat [ ppr tc <+> text "=" <+> ppr orig
+                   <+> text "with" <+> hsep (punctuate comma (map ppr (tyConDataCons tc)))
+                   <+> parens (text "built" <+> ppr bs <> comma <+> text "matched" <+> ppr ms
+                               <> (if length bs < length (tyConDataCons orig)
+                                   then comma <+> text "dropped" <+> ppr [ dataConTag dc | dc <- tyConDataCons orig
+                                                                        , dataConTag dc `notElem` bs ]
+                                   else empty))
+                 | (_, orig, Split tc _, bs, ms) <- fates, not (isNewTyCon orig) ]
+          , whenPprDebug $ vcat
+              [ ppr orig <> colon <+> pp_fate_short f <+> int (length ms) <+> text "members;"
+                <+> text "children:" <+> ppr [ (m, ch) | m <- ms, Just ch <- [children m] ]
+              | (ms, orig, f, _, _) <- fates, isNewTyCon orig ]
+          , vcat [ ppr tc <+> text "= newtype" <+> ppr orig <+> text "~R#"
+                   <+> ppr (snd (newTyConRhs tc))
+                 | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ] ]
+
     (us1, us23) = splitUniqSupply us
     (us2, us3)  = splitUniqSupply us23
-    split_binds = evalState (mapProgram rwMapper ann_binds) ()
-    -- Unbox fields of the new types (Note [Flattening fields] in
-    -- GHC.WebCore.DataFlatten)
-    (final_binds, final_tcs, flat_dump, flat_rebuilt)
-      | not changed = (binds, [], empty, [])
-      | Just opts0 <- unbox
-                    = let (fl_binds, fl_tcs, fl_dump, fl_rebuilt) = flatten_rounds opts (uo_rounds opts0) us5 sp_tcs sp_binds
-                          opts = opts0 { uo_orig_sizes = [ (occNameString (getOccName dc), dataConRepArity dc)
-                                                         | tc <- sp_tcs, dc <- tyConDataCons tc ] }
-                      in (fl_binds, fl_tcs ++ kept_tcs, sp_dump $$ fl_dump, fl_rebuilt)
-      | otherwise   = (split_binds, new_tcs, empty, [])
-
     (us4, us5) = splitUniqSupply us3
-    (sp_binds, sp_tcs, sp_dump) = specialiseSplit this_mod us4 data_tcs split_binds
-
     -- Each round unpacks one more level (Note [Flattening fields])
-    flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty, [])
+    -- (the last component: each round's two steps, for -dshow-passes)
+    flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty, [], [])
     -- Between rounds, the simple optimiser inlines the aliases a round leaves
     -- (let x = y) and takes apart the cases on constructors it builds, so
     -- that the next round sees the fields' real uses
     flatten_rounds opts n u tcs bs
       = let (u1, u2) = splitUniqSupply u
-            (bs', tcs', d) = flattenFields opts this_mod u1 tcs bs
+            (bs', tcs', d, steps) = flattenFields opts this_mod u1 tcs bs
             changed_round = map getUnique tcs' /= map getUnique tcs
             bs_opt | changed_round = map simple_bind bs'
                    | otherwise     = bs'
             old = mkUniqSet tcs
             rebuilt = [ tc | tc <- tcs', not (tc `elementOfUniqSet` old) ]
-            (bs'', tcs'', d', r')
+            (bs'', tcs'', d', r', st')
               | changed_round, n == 1
-              = (bs_opt, tcs', text "round limit reached: the last round still unboxed", [])
+              = (bs_opt, tcs', text "round limit reached: the last round still unboxed", [], [])
               | changed_round = flatten_rounds opts (n - 1) u2 tcs' bs_opt
-              | otherwise     = (bs', tcs', empty, [])
-        in (bs'', tcs'', d $$ d', rebuilt ++ r')
+              | otherwise     = (bs', tcs', empty, [], [])
+            round_stages = [ ("flattening (" ++ show n ++ " rounds left), " ++ w, v) | (w, v) <- steps ] ++
+                           [ ("flattening (" ++ show n ++ " rounds left), rewrite", seqBinds bs' `seq` length tcs' `seq` ())
+                           , ("flattening (" ++ show n ++ " rounds left), simple optimiser"
+                             , if changed_round then seqBinds bs_opt else ()) ]
+        in (bs'', tcs'', d $$ d', rebuilt ++ r', round_stages ++ st')
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
@@ -913,46 +1063,13 @@ splitDataTypes sfx source unbox keep cfg this_mod us rules binds
                     , sortOn id (nub (lookupWithDefaultUFM built [] r))
                     , sortOn id (nub (lookupWithDefaultUFM matched [] r)) ))
                 | ms@(m0 : _) <- nonDetEltsUFM members, let r = rep m0 ]
-    fates :: [([TyCon], TyCon, Fate, [Int], [Int])]    -- members, original, fate, built, matched
-    fates = [ (ms, orig, fate, bs, mts)
-            | (n, us_n, (orig, ms, bs, mts)) <- zip3 [1 :: Int ..] (drop 1 split_us) classes
-            , let fate | any (not . is_copy) ms = Exposed
-                       | not (kept n ms)        = Bottom   -- back to the original
-                       | isNewTyCon orig        = mk_split_nt n us_n orig ms
-                       | null bs                = Bottom
-                       | otherwise              = mk_split n us_n orig bs ]
-
     -- class n's supply is element n (zipped, not indexed: (!!) is linear)
     split_us = listSplitUniqSupply us2
 
-    -- Note [Keeping only useful splits]: in the second pass, a data class is
-    -- split only if the first pass found its split useful; a newtype class
-    -- only if one of its members' children's classes is kept (its axiom
-    -- names them)
-    kept n ms = case keep_set of
-      Nothing -> True
-      Just ks
-        | any (isNewTyCon . copyOriginal copies) (take 1 ms)
-        -> any (\c -> class_number c `IntSet.member` ks)
-               [ ch | m <- ms, Just chs <- [children m], ch <- chs ]
-        | otherwise -> n `IntSet.member` ks
-    keep_set = IntSet.fromList <$> keep
     class_number c = lookupWithDefaultUFM class_numbers 0 (rep c)
     class_numbers :: UniqFM TyCon Int
     class_numbers = listToUFM [ (rep m0, n) | (n, (_, m0 : _, _, _)) <- zip [1 :: Int ..] classes ]
 
-    -- The classes whose split changed something (first pass): a field
-    -- unboxed in some round, or a constructor dropped.  The new types are
-    -- named Orig_s<n> after their class, through every rebuild.
-    useful = nub ([ n | tc <- flat_rebuilt, Just n <- [split_number tc] ] ++
-                  -- Note [Specialising for webs]
-                  [ n | (orig, sp) <- zip data_tcs sp_tcs
-                      , getUnique orig /= getUnique sp
-                      , product_funs sp > product_funs orig
-                      , Just n <- [split_number sp] ] ++
-                  [ n | (n, (_, orig, Split _ cons, _, _)) <- zip [1 :: Int ..] fates
-                      , not (isNewTyCon orig)
-                      , length cons < length (tyConDataCons orig) ])
     -- How many arguments and results of functions in the fields are products?
     -- (Specialisation adds some where a type variable was.)
     product_funs tc = sum [ go (scaledThing f) | dc <- tyConDataCons tc, f <- dataConRepArgTys dc ]
@@ -977,114 +1094,15 @@ splitDataTypes sfx source unbox keep cfg this_mod us rules binds
                     (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
                     (\dc _ -> mkDataOcc (con_base dc ++ sfx ++ show n))
                     orig [ dc | dc <- tyConDataCons orig, dataConTag dc `elem` tags ]
-    -- A newtype class: its representation, from one member, with the
-    -- children mapped to their classes' types (lazily)
-    mk_split_nt n us_n orig ms = Split tc []
-      where
-        member = head [ m | m <- ms, is_copy m ]
-        tc = mkNewtypeCopy us_n (\u occ -> mkExternalName u this_mod occ noSrcSpan)
-                           (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
-                           orig (evalState (rw_ty (snd (newTyConRhs member))) ())
     -- Constructors with alphanumeric names keep them; [], (:) and tuples
     -- become Con<tag>
     con_base dc = case occNameString (getOccName dc) of
       str@(c : _) | isUpper c -> str
       _                       -> "Con" ++ show (dataConTag dc)
 
-    fate_of :: UniqFM TyCon Fate      -- every member of a class
-    fate_of = listToUFM [ (m, f) | (ms, _, f, _, _) <- fates, m <- ms ]
-
-    new_tcs = [ tc | (_, _, Split tc _, _, _) <- fates ]
-
-    -- Specialisation and flattening rebuild data types, not newtypes: they
-    -- leave out the split newtypes and every split type their
-    -- representations reach (Note [Splitting newtypes])
-    nt_reach = go_reach emptyUniqSet [ t | nt <- new_tcs, isNewTyCon nt
-                               , t <- nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs nt))) ]
-    go_reach seen [] = seen
-    go_reach seen (t : ts)
-      | t `elementOfUniqSet` seen || not (t `elementOfUniqSet` new_set) = go_reach seen ts
-      | otherwise = go_reach (addOneToUniqSet seen t) (field_tcs t ++ ts)
-    new_set = mkUniqSet new_tcs
-    field_tcs t
-      | isNewTyCon t = nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs t)))
-      | otherwise    = [ t' | dc <- tyConDataCons t, Scaled _ ft <- dataConOrigArgTys dc
-                            , t' <- nonDetEltsUniqSet (tyConsOfType ft) ]
-    data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), not (tc `elementOfUniqSet` nt_reach) ]
-    kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elementOfUniqSet` nt_reach ]
-    changed = ok && not (null new_tcs)
-
-    -- The type constructor a copy becomes, and a constructor (by original tag)
-    final c = case lookupUFM fate_of c of
-      Just (Split tc _) -> tc
-      _                 -> copyOriginal copies c
-    final_con c tag = case lookupUFM fate_of c of
-      Just (Split _ cons) -> lookup tag cons
-      _                   -> conWithTag (copyOriginal copies c) tag
-
-    rwMapper :: Mapper (State ())
-    rwMapper = Mapper
-      { m_ty   = rw_ty
-      , m_bndr = \b -> do { t <- rw_ty (idType b); return (setIdType b t) }
-      , m_con  = \dc -> let tc = dataConTyCon dc in
-                        if is_copy tc
-                        then case final_con tc (dataConTag dc) of
-                               Just dc' -> return (dataConWorkId dc')
-                               Nothing  -> pprPanic "DataSplit: built constructor" (ppr dc)
-                        else return (dataConWorkId dc)
-      , m_alt  = \_ dc -> let tc = dataConTyCon dc in
-                          if is_copy tc then return (final_con tc (dataConTag dc))
-                          else return (Just dc)
-      , m_co   = mapTyConsCo is_copy (return . final) }
-    rw_ty = mapTyCons is_copy (return . final)
-
-    -- Each stage forces what the next one needs, and no more (forcing an
-    -- annotated program does not build its copies' constructors: Data Lint
-    -- does).  Specialising and flattening are what is left.
-    stages = [ ("annotation", seqBinds ann_binds `seq` sizeUFM copies `seq` ())
-             , ("Data Lint", ok `seq` length pairs `seq` ())
-             , ("solving", foldr (\(ms, _, f, _, _) acc -> length ms `seq` f `seq` acc) () fates)
-             , ("rewriting", if changed then seqBinds split_binds else ())
-             , ("specialising", if changed && isJust unbox
-                                then seqBinds sp_binds `seq` length sp_tcs `seq` () else ()) ]
-
     pp_fate_short Exposed     = text "exposed"
     pp_fate_short Bottom      = text "bottom"
     pp_fate_short (Split t _) = text "split as" <+> ppr t
-    dump = vcat
-      [ text "Data Lint:" <+> (if ok then text "ok" else text "errors (not split)")
-      , text "copies:" <+> int (sizeUFM copies)
-        <+> parens (int (nonDetFoldUFM (\o n -> n + length (tyConDataCons o)) 0 copies)
-                    <+> text "constructors behind them") <> comma
-        <+> text "classes:" <+> int (length fates) <> comma
-        <+> text "exposed:" <+> int (length [ () | (_, _, Exposed, _, _) <- fates ]) <> comma
-        <+> text "split:" <+> int (length new_tcs) <> comma
-        <+> text "exposed only by casts:"
-        <+> int (length [ () | (ms, _, Exposed, _, _) <- fates, exposed_by_cast ms ]) <> comma
-        <+> text "pinned binders:" <+> int (sizeVarSet pinned)
-      , whenPprDebug $ text "copies per type:" <+> pprWithCommas (\(n, t) -> ppr t <> colon <> int n)
-          (take 25 (sortOn (negate . fst)
-             [ (n, t) | (t, n) <- nonDetEltsUFM (foldl' (\m o -> addToUFM_C (\(t, a) (_, b) -> (t, a + b)) m o (o, 1 :: Int))
-                                                       emptyUFM (nonDetEltsUFM copies)) ]))
-      , ppUnless (null kinded_list) $
-        text "not copied (used as kinds):" <+> pprWithCommas ppr (map fst3 kinded_list)
-      , whenPprDebug $ nest 2 $ vcat [ ppr tc <+> text why <+> ppr t | (tc, why, t) <- kinded_list ]
-      , vcat [ ppr tc <+> text "=" <+> ppr orig
-               <+> text "with" <+> hsep (punctuate comma (map ppr (tyConDataCons tc)))
-               <+> parens (text "built" <+> ppr bs <> comma <+> text "matched" <+> ppr ms
-                           <> (if length bs < length (tyConDataCons orig)
-                               then comma <+> text "dropped" <+> ppr [ dataConTag dc | dc <- tyConDataCons orig
-                                                                    , dataConTag dc `notElem` bs ]
-                               else empty))
-             | (_, orig, Split tc _, bs, ms) <- fates, not (isNewTyCon orig) ]
-      , whenPprDebug $ vcat
-          [ ppr orig <> colon <+> pp_fate_short f <+> int (length ms) <+> text "members;"
-            <+> text "children:" <+> ppr [ (m, ch) | m <- ms, Just ch <- [children m] ]
-          | (ms, orig, f, _, _) <- fates, isNewTyCon orig ]
-      , vcat [ ppr tc <+> text "= newtype" <+> ppr orig <+> text "~R#"
-               <+> ppr (snd (newTyConRhs tc))
-             | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ] ]
-
 -- | The pairs of copies that casts force together: a cast's coercion has the
 -- original types, so its kind against the expression's type
 castCopyPairs :: Copies -> CoreProgram -> Bag (TyCon, TyCon)

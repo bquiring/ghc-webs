@@ -641,7 +641,8 @@ runDataSplit sfx early logger dflags this_mod rules binds
              source | gopt Opt_CoreWebsDataInferCheck dflags = CheckInference
                     | gopt Opt_CoreWebsDataInfer dflags      = FromInference
                     | otherwise                              = FromDataLint
-             split keep = splitDataTypes sfx source unbox keep (dataLintConfig dflags) this_mod us rules binds
+             -- annotation, the pairs and the classes, once for both passes
+             split = splitDataTypes sfx source unbox (dataLintConfig dflags) this_mod us rules binds
              -- for -dshow-passes: the first pass's program is not used when
              -- the second runs, so only what decides the second is forced
              force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()
@@ -656,7 +657,8 @@ runDataSplit sfx early logger dflags this_mod rules binds
                    (timed first_what (split Nothing))
          -- Only the useful classes go on to the second pass: a thunk
          -- (dsr_useful res0) would keep the whole first result alive (its
-         -- annotated program, Data Lint's result, the dump) during it
+         -- rewritten and flattened program, the dump) during it.  (The
+         -- annotated program and the classes are shared by both passes.)
        ; let !changed0 = dsr_changed res0
              !useful   = forceList (dsr_useful res0)
              forceList xs = foldr seq () xs `seq` xs
