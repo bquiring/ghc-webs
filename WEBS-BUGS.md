@@ -295,7 +295,15 @@ would catch it again), **commit** (empty while uncommitted).
   one round); both ran ten rounds without the fix.
 * **Commit:** `d241b19232`
 
-### OPEN: data splitting is too slow and big for GHC's largest modules (2026-10-11)
+### Data splitting was too slow and big for GHC's largest modules (2026-10-11, resolved 2026-10-14)
+* **Update 2026-10-14 (later): resolved.** GHC builds with data splitting
+  (self-host `ulsl`, early-ulsl's options with -dcore-webs-lint, the -O1
+  stage 2 compiler, inference by default): phase 1 1,761 s, phase 2 710 s,
+  no errors. The resulting GHC compiles anna, fluid and cacheprof to the
+  same object files as base's GHC, and allocates 0.03-0.18% less. What
+  fixed it: the unfolding bug (CodeGen's 37x growth), the space leak, the
+  redesign steps 1a and 2 (WEBS-DATA.md section 11), and no longer
+  measuring with an -O0 compiler.
 * **Update 2026-10-14:** GHC.Tc.Errors.Types now compiles: after the list
   fixes (`29cd822b48`) it needs 2.4 GB of live heap and 6.1 GB in all, in
   1,003 s. The self-host runs with ulimit -v 10 GB at -j2. With lists split
