@@ -101,7 +101,7 @@ would catch it again), **commit** (empty while uncommitted).
   (annotation, Data Lint, solving, rewriting, specialising), and the
   -ddump-webs-data stats line counts the constructors behind the copies.
 * **Guard:** none automatic (memory on a 1M-term module).
-* **Commit:**
+* **Commit:** `3f0c024f91`
 
 ### Data splitting: quadratic list code; GHC.Tc.Errors.Types takes an hour (2026-10-13)
 * **Found by:** the self-host build (OPEN entry below), profiled alone: 63
