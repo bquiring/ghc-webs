@@ -324,6 +324,10 @@ test('dataunbox008_dump', [extra_files(['dataunbox008.hs'])],
 # family: a coercion selects into the pair by the list pattern's paths
 # (GHC.Cmm.CommonBlockElim, building GHC with webs)
 test('dataunbox009', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+# dataunbox012: a flattened pair's function component that is only seq'd
+# (demand 1A): its demand is left alone (fix_sd in GHC.WebCore.DataFlatten;
+# futhark's Language.Futhark.TypeChecker.Terms tripped mkCall's assertion)
+test('dataunbox012', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 # dataspec001: a split pair specialised at (b -> c, Int), cast with coerce:
 # its variables occur only under an arrow, so it is not specialised
 # (Note [Specialising split types]; vector-algorithms panicked)

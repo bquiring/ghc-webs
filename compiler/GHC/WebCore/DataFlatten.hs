@@ -36,7 +36,7 @@ import GHC.Types.Var ( isCoVar )
 import GHC.Types.Basic ( Boxity(..) )
 import GHC.Types.Demand ( Demand(..), SubDemand(..), splitDmdSig, isStrict, isStrUsedDmd, isStrictDmd
                          , DmdSig, mkClosedDmdSig, mkProd, viewProd, mkCall, viewCall, topDmd, absDmd
-                         , isAbsDmd )
+                         , isAbsDmd, isAbs )
 import GHC.Types.Cpr ( topCprSig )
 import GHC.Builtin.PrimOps ( primOpOkForSpeculation )
 import GHC.Types.Tickish ( GenTickish(..) )
@@ -927,6 +927,9 @@ flattenFields opts this_mod us tcs binds = (binds', tcs', dump, steps)
     fix_sd :: Type -> SubDemand -> SubDemand
     fix_sd t sd
       | Just (c, sd') <- viewCall sd
+      , not (isAbs c)   -- never called this deep: leave it (mkCall takes no
+                        -- absent cardinality; as reshapeUsage in
+                        -- GHC.WebCore.Transform.Common)
       , FunTy { ft_res = r } <- coreFullView (dropForAlls t)
       = mkCall c (fix_sd r sd')
       | Just (tc, args) <- splitTyConApp_maybe t

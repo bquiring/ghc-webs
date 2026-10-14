@@ -85,6 +85,23 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Flattening: an absent call demand on a function component (2026-10-14)
+* **Found by:** the compilers group with data splitting (`ulsl2`, after the
+  newtype fix below): "ASSERT failed!" in GHC.Types.Demand (mkCall,
+  cardinality A), building futhark's Language.Futhark.TypeChecker.Terms.
+  The debug stage 2 compiler checks assertions; a release compiler would
+  have built a call demand with an absent cardinality.
+* **Cause:** when a field is flattened, its components' demands are
+  rewritten (fix_sd). A function component that is only evaluated has the
+  demand 1A (seq: absent below). viewCall reads that sub-demand as a call
+  with cardinality A, and fix_sd rebuilt it with mkCall, which takes no
+  absent cardinality.
+* **Fix:** an absent call is left as it is, as reshapeUsage in
+  GHC.WebCore.Transform.Common already does.
+* **Guard:** `dataunbox012` (a nested pair whose function component is only
+  seq'd; the assertion fires without the fix).
+* **Commit:**
+
 ### Useful splits: a newtype class reverted while its newtype child stayed split (2026-10-14)
 * **Found by:** the compilers group with data splitting (`ulsl2`): Web Lint
   after annotation failed in futhark's Language.Futhark.TypeChecker.Unify,
