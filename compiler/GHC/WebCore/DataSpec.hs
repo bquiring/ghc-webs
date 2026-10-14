@@ -61,7 +61,16 @@ So, for each split type T with parameters as:
 
 Coercions mention split types too (Note [Copies in coercions] in
 GHC.WebCore.DataSplit): their kinds count as uses in step 1, and step 4
-rewrites them (rw_co).
+rewrites them (rw_co).  A coercion T P(cos) becomes T' cos', each of cos'
+selected out of cos along the path to its variable in P (var_co), a path
+through type constructors only.  So if a coercion T cos occurs in the
+program, every variable of P must occur on such a path: one that occurs only
+under an arrow, a type application or a forall (P = (b -> c, Int)) has none,
+and T then stays as it is.  (Without such a coercion T is specialised: that
+is what makes its Int field concrete, to unbox.)  (The path could
+go through FunCo with SelFun selectors, but nothing needed it: building
+vector-algorithms' Data.Vector.Algorithms.Tim panicked here; test
+dataspec001.)
 
 T is local and not exposed, so it has no other uses.
 -}
@@ -136,7 +145,36 @@ specialiseSplit this_mod us tcs binds
                     , Just (idxs, _) <- [lookupUFM uses tc]
                     , Just p@(tvs, pat) <- [antiUnify u idxs]
                     , not (length tvs == length pat && all isTyVarTy pat)
+                      -- a coercion T cos needs each variable on a path
+                    , not (tc `elementOfUniqSet` co_heads) || all (not . null . patVarPaths pat) tvs
                     , recursive_ok tc p ]
+    -- the split types at the head of a TyConAppCo somewhere in the program
+    co_heads = foldr (\(_, e) acc -> heads_e e acc) emptyUniqSet (flattenBinds binds)
+    heads_e e acc = case e of
+      App f a       -> heads_e f (heads_e a acc)
+      Lam _ b       -> heads_e b acc
+      Let bind b    -> foldr (\(_, r) -> heads_e r) (heads_e b acc) (flattenBinds [bind])
+      Case s _ _ as -> heads_e s (foldr (\(Alt _ _ r) -> heads_e r) acc as)
+      Cast x co     -> heads_e x (heads_co co acc)
+      Tick _ x      -> heads_e x acc
+      Coercion co   -> heads_co co acc
+      _             -> acc
+    heads_co co acc = case co of
+      TyConAppCo _ tc cos -> foldr heads_co (if is_cand tc then addOneToUniqSet acc tc else acc) cos
+      AppCo c1 c2   -> heads_co c1 (heads_co c2 acc)
+      ForAllCo { fco_kind = k, fco_body = b } -> heads_co k (heads_co b acc)
+      FunCo { fco_mult = m, fco_arg = a, fco_res = r } -> heads_co m (heads_co a (heads_co r acc))
+      AxiomCo _ cos -> foldr heads_co acc cos
+      UnivCo { uco_deps = ds } -> foldr heads_co acc ds
+      SymCo c       -> heads_co c acc
+      TransCo c1 c2 -> heads_co c1 (heads_co c2 acc)
+      SelCo _ c     -> heads_co c acc
+      LRCo _ c      -> heads_co c acc
+      InstCo c a    -> heads_co c (heads_co a acc)
+      KindCo c      -> heads_co c acc
+      SubCo c       -> heads_co c acc
+      GRefl _ _ (MCo c) -> heads_co c acc
+      _             -> acc
     rewritable tc = case lookupUFM uses tc of
       Just (_, ok) -> ok
       Nothing      -> True     -- no uses at all

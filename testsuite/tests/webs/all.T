@@ -319,6 +319,10 @@ test('dataunbox008_dump', [extra_files(['dataunbox008.hs'])],
 # family: a coercion selects into the pair by the list pattern's paths
 # (GHC.Cmm.CommonBlockElim, building GHC with webs)
 test('dataunbox009', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+# dataspec001: a split pair specialised at (b -> c, Int), cast with coerce:
+# its variables occur only under an arrow, so it is not specialised
+# (Note [Specialising split types]; vector-algorithms panicked)
+test('dataspec001', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 # dataunbox010: JuicyPixels' Codec.Picture.Metadata.  A match on Refl binds a
 # coercion variable that a cast uses: the field it came from is live (Note
 # [Dead fields] in GHC.WebCore.DataFlatten).

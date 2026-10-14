@@ -85,6 +85,27 @@ would catch it again), **commit** (empty while uncommitted).
   (`nods` has none).
 * **Commit:** `29cd822b48`
 
+### Specialising a split type: a coercion through a variable under an arrow (2026-10-14)
+* **Found by:** the Hackage root group rebuilt after the list and unfolding
+  fixes (`ulsl2`, -O1 compiler): GHC panicked in vector-algorithms 0.9.1.0,
+  Data.Vector.Algorithms.Tim, with "specialiseSplit: pattern variable not in
+  pattern". (The earlier ulsl builds had never split lists in programs with
+  IO, so they never got this far.)
+* **Cause:** specialisation rebuilds a coercion T cos through a specialised
+  T' by selecting each pattern variable's coercion out of cos along its
+  path in the pattern (var_co). The path is followed through type
+  constructor applications only. A pattern such as (b -> c, Int) has its
+  variables only under an arrow, so it has no path, and the panic followed.
+* **Fix:** a split type that heads a TyConAppCo in the program is
+  specialised only if every pattern variable lies on such a path (Note
+  [Specialising split types] in GHC.WebCore.DataSpec). Without such a
+  coercion it is still specialised, which is what makes its Int field
+  concrete for unboxing. No nofib module had the case (all of them built),
+  so nofib is unchanged.
+* **Guard:** `dataspec001` (a split pair at (Int -> Age, Int), coerced to
+  (Int -> Int, Int)), which panicked before the fix.
+* **Commit:**
+
 ### Worker/wrapper split small functions whose unfoldings webs had zapped; importers grew 37x (2026-10-14)
 * **Found by:** step 0 of the data-splitting redesign (WEBS-DATA.md
   section 11). GHC.CmmToLlvm.CodeGen took 66 s against the nods build's
