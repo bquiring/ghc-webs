@@ -89,14 +89,18 @@ Data types carry no webs.  Instead we use copies:
      is exposed).  A case alternative uses the constructor of the case
      binder's copy.
 
-  2. Data Lint (GHC.WebCore.DataLint), a copy of Core Lint, type-checks the
-     annotated program up to copies, and records a pair of type constructors
-     wherever it requires two types to be equal and they have different
-     copies (or a copy and the original) at the same place.
+  2. Pairs: wherever the program requires two types to be equal and they
+     have different copies (or a copy and the original) at the same place,
+     the two type constructors are paired.  A walk of the program finds them
+     by unification (Note [Inferring copy pairs] in GHC.WebCore.DataInfer).
+     With -fcore-webs-data-lint-pairs, Data Lint (GHC.WebCore.DataLint, a
+     copy of Core Lint) records them instead, while type-checking the
+     annotated program up to copies.
 
-  3. Union-find over the pairs gives classes of copies.  A class that
-     contains an original type constructor is exposed: it meets code that
-     expects T.
+  3. The classes of copies are the components of the pairs, closed under
+     congruence for newtype copies (Note [Solving copy classes online] in
+     GHC.WebCore.DataInfer).  A class that contains an original type
+     constructor is exposed: it meets code that expects T.
 
   4. Each non-exposed class gets a new type T_s<n>, with only the
      constructors that the class builds: a constructor that no occurrence in

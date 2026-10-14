@@ -61,8 +61,10 @@ Occurrences need nothing: annotation gives an occurrence its binder's Id
 Imported functions, exported and pinned binders have the original types, so
 a copy that meets one of them is paired with the original, as in Data Lint.
 
-The check -fcore-webs-data-infer-check compares the classes from these pairs
-with Data Lint's on every module.
+This is the default; -fcore-webs-data-lint-pairs takes the pairs from Data
+Lint instead, and -fcore-webs-data-infer-check compares the classes from
+both on every module (they were the same on all of nofib, 469 modules, and
+the data-splitting tests, 2026-10-14).
 -}
 
 -- | The pairs of type constructors (copies, or a copy and its original)

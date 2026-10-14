@@ -366,6 +366,27 @@ webs as newtypes (the occurs check never fires on nofib).
   occurrence gets a real TyCon with DataCons (~580,000 copies over nofib).
   Fix: cheap placeholders per occurrence during annotation and Data Lint,
   real types only for the final split classes.
+- **Data splitting: the redesign's remaining steps** (WEBS-DATA.md section
+  11; deferred 2026-10-14 by the user: "probably fast enough, we can make it
+  faster later"). Done: inference by unification instead of Data Lint, the
+  online congruence, one analysis for both passes, the dead-field slices.
+  Measured with the -O1 stage 2 compiler, first `_s` pass: `CodeGen` 1.6 GB,
+  `GHC.Tc.Errors.Types` 6.8 GB / 42 s (from 15.7 GB / 67 s). Left, in order:
+  1. **Skip the `_r` analysis when `_s` split nothing in the module.**
+     `GHC.Tc.Errors.Types` annotates its 362k copies twice and splits nothing
+     either time. This needs a check first: the transformations between the
+     passes can create new splits.
+  2. **Name-only copies (step 1b).** Annotation is now the largest step on
+     large types: `GHC.Tc.Errors.Types` takes 30 s for 5.1 GB, mostly GC over
+     a 2 GB live heap of copied types.
+  3. **One pass with the web inference** (WEBS-DATA.md section 11).
+  4. **Nested fields**, behind a flag.
+  5. **Specialising and flattening on ordinary modules.** On `CodeGen` they
+     are about 0.8 GB of the 1.6 GB.
+  Also measured and dropped: a union-find over every copy, merging online
+  during the walk, in ST or with persistent maps. It cost more than the walk
+  plus a separate solve, at -O0. Measure again at -O1 before trying again.
+
 - **Superlinear algorithms left in the web passes** (audit 2026-10-13, after
   GHC.Tc.Errors.Types took 63 minutes, ~52 of them in data splitting; the
   list operations that were quadratic in DataSplit, DataFlatten, DataSpec,

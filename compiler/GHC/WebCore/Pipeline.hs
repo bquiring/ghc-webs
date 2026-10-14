@@ -639,8 +639,8 @@ runDataSplit sfx early logger dflags this_mod rules binds
                    | otherwise = Nothing
              -- Note [Keeping only useful splits] in GHC.WebCore.DataSplit
              source | gopt Opt_CoreWebsDataInferCheck dflags = CheckInference
-                    | gopt Opt_CoreWebsDataInfer dflags      = FromInference
-                    | otherwise                              = FromDataLint
+                    | gopt Opt_CoreWebsDataLintPairs dflags  = FromDataLint
+                    | otherwise                              = FromInference
              -- annotation, the pairs and the classes, once for both passes
              split = splitDataTypes sfx source unbox (dataLintConfig dflags) this_mod us rules binds
              -- for -dshow-passes: the first pass's program is not used when

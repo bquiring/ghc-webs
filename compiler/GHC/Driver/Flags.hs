@@ -671,7 +671,7 @@ data GeneralFlag
    | Opt_CoreWebsNoStrictElim -- ^ (debugging) ... without Note [Strictly eliminated fields]
    | Opt_CoreWebsNoHiddenFields -- ^ (measuring) every constructor's fields exposed: no Note [Hidden fields]
    | Opt_CoreWebsNoRestoreUnfoldings -- ^ (measuring) no Note [Restoring vanilla unfoldings]
-   | Opt_CoreWebsDataInfer      -- ^ data splitting's pairs by unification: Note [Inferring copy pairs]
+   | Opt_CoreWebsDataLintPairs  -- ^ (checking) data splitting's pairs from Data Lint, not by unification
    | Opt_CoreWebsDataInferCheck -- ^ (checking) unification and Data Lint must give the same classes
    | Opt_CoreWebsInternalMainExports -- ^ The main module's exports other than main are internal: Note [Main's exports]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
@@ -971,7 +971,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsNoStrictElim
    , Opt_CoreWebsNoHiddenFields
    , Opt_CoreWebsNoRestoreUnfoldings
-   , Opt_CoreWebsDataInfer
+   , Opt_CoreWebsDataLintPairs
    , Opt_CoreWebsDataInferCheck
    , Opt_CoreWebsInternalMainExports
    , Opt_CoreWebsUncurryKnown

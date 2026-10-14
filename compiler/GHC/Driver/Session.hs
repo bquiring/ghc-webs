@@ -2578,7 +2578,7 @@ fFlagsDeps = [
   flagSpec "core-webs-no-strict-elim"         Opt_CoreWebsNoStrictElim,
   flagSpec "core-webs-no-hidden-fields"       Opt_CoreWebsNoHiddenFields,
   flagSpec "core-webs-no-restore-unfoldings"  Opt_CoreWebsNoRestoreUnfoldings,
-  flagSpec "core-webs-data-infer"             Opt_CoreWebsDataInfer,
+  flagSpec "core-webs-data-lint-pairs"        Opt_CoreWebsDataLintPairs,
   flagSpec "core-webs-data-infer-check"       Opt_CoreWebsDataInferCheck,
   flagSpec "core-webs-internal-main-exports"  Opt_CoreWebsInternalMainExports,
   flagSpec "core-webs-uncurry-known"          Opt_CoreWebsUncurryKnown,
