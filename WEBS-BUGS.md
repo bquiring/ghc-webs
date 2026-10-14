@@ -128,7 +128,7 @@ would catch it again), **commit** (empty while uncommitted).
   CodeGen out-of-memory runs (affected: that was this bug). The
   transformations' zaps, without data splitting, can do the same on a
   smaller scale.
-* **Commit:**
+* **Commit:** `bff0d10243`
 
 ### Data splitting: the "useful splits" pass kept the first pass alive (2026-10-14)
 * **Found by:** the self-host build (early-ulsl, after the list fix
