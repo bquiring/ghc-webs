@@ -78,6 +78,7 @@ import GHC.Tc.Utils.Monad      ( initIfaceCheck )
 import GHC.Iface.Errors.Ppr
 
 import GHC.Driver.Session.Mode
+import GHC.WebCore.Chunk ( chunkMake )
 import GHC.Driver.Session.Lint
 import GHC.Driver.Session.Units
 
@@ -322,9 +323,13 @@ doMake units targets = do
     [] -> return ()
     _  -> do
       targets' <- mapM (\(src, uid, phase) -> GHC.guessTarget src uid phase) hs_srcs
-      GHC.setTargets targets'
-      ok_flag <- GHC.load LoadAllTargets
-      when (failed ok_flag) (liftIO $ exitWith (ExitFailure 1))
+      dflags <- getDynFlags
+      if gopt Opt_CoreWebsChunk dflags
+        then chunkMake targets'   -- Note [Chunks] in GHC.WebCore.Chunk
+        else do
+          GHC.setTargets targets'
+          ok_flag <- GHC.load LoadAllTargets
+          when (failed ok_flag) (liftIO $ exitWith (ExitFailure 1))
 
 -- ---------------------------------------------------------------------------
 -- Various banners and verbosity output.

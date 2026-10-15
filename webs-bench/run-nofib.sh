@@ -29,7 +29,7 @@
 # exit-code (124) and the dumps collected so far are kept.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GHC=$ROOT/webs-bench/ghc-timeout.sh
+GHC=${WEBS_NOFIB_HC:-$ROOT/webs-bench/ghc-timeout.sh}   # e.g. ghc-chunk.sh
 CONFIG_TIMEOUT=${WEBS_CONFIG_TIMEOUT:-3600}
 RUN_TIMEOUT=${WEBS_RUN_TIMEOUT:-5}
 NAME=$1

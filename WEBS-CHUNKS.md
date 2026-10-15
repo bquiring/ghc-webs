@@ -88,7 +88,13 @@ constructors' helpers of other architectures), without webs. So cutting
 unused exports gains little; within a chunk, nearly all exports are used
 only inside it, which is what §3 is for.
 
-A two-pass version would be simple if wanted: build once, collect usages
+Implemented (2026-10-14): -fcore-webs-unused-exports=FILE (Note [Unused
+exports] in GHC.WebCore.Pipeline), lists from webs-bench/unused-exports.py,
+nofib through webs-bench/run-unused.sh. The listed binders are no longer
+exported, so their webs may be internal, the boundary split leaves them
+alone, and the dead ones are deleted.
+
+The two-pass version, as designed: build once, collect usages
 (within a package; across packages with `-ddump-minimal-imports`), and
 rebuild with the list of unused exports treated as internal by keptIds.
 Sound because importers are recompiled against the new interfaces.
@@ -134,6 +140,41 @@ round trip through interfaces, and the early run could see the merged
 program before worker/wrapper. More GHC driver work (the `--make` pipeline
 generates code module by module).
 
+### 3.2a Implemented: capture and merge (-fcore-webs-chunk)
+
+2026-10-14, Note [Chunks] in GHC.WebCore.Chunk. A variant of §3.2 that
+needs no new driver: `ghc --make -fcore-webs-chunk` runs the ordinary
+`--make` load once, one module at a time, with a static plugin that replaces
+the Core pipeline by a pass recording each module's desugared ModGuts
+(objects and interfaces go to <odir>/webs-chunk-modules). The captured
+modules are then merged: the occurrences of other modules' binders (global
+Ids from their interfaces, with the binders' uniques) become the binders,
+everything but Main.main and :Main.main is no longer exported, and the
+merged program goes through the full pipeline (the early run included) with
+the command line's flags, Tidy and the code generator, into one object,
+which is linked. Since the merge happens before the first simplifier, the
+early run sees the whole program; the per-module types are the
+typechecker's, so nothing outside needs to agree.
+
+Limits (for now): executables only (the result has no interfaces for
+other packages), the command line's flags for every module, no foreign
+exports outside Main, no hs-boot cycles, no HPC/profiling. nofib's driver:
+webs-bench/ghc-chunk.sh turns the link step into the chunk compile.
+
+First results (copies of nofib programs, `-O2` with early-ulsl's options,
+instructions on CPU 2):
+
+| program | per module | chunk | without webs: chunk vs per module |
+|---|---|---|---|
+| real/infer | 8.82 G | 7.74 G (−12.2%; alloc −20.5%) | −12.3% |
+| real/parser | 5.05 G | 4.62 G (−8.5%; alloc −10.2%) | |
+
+The gain is GHC's: without webs the chunk gains as much. Lambda classes
+internal: infer 54% -> 93%, parser 54% -> 90%; but the simplifier, which
+now sees the whole program before the early run, leaves fewer webs (infer
+654 -> 161) and the passes fire as rarely as before (inline 1 -> 0,
+defunc 3 -> 1, useless 4 -> 3).
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
@@ -159,6 +200,33 @@ generates code module by module).
    ShellCheck or hledger), then module clusters of GHC.
 3. Choose between §3.1 and §3.2 by what the prototype shows about the
    early versus late run.
+
+### 3.5 Choosing chunks
+
+First chunks are packages (user, 2026-10-14): a package's modules are
+written together, so most of the higher-order traffic is between them, and
+only what other packages import stays exposed.
+
+**From types** (user, 2026-10-14): a graph analysis can choose chunks
+instead. Nodes are modules (or top-level binders); an edge joins a
+definition to each module that uses it, weighted by what exposure would cost
+there: the arrows in its type (function arguments and results, data types
+with function or data-split fields, class dictionaries), counted from the
+interface, and the number of call sites. Exposure then happens only at the
+cut, so a chunking is a partition that cuts little weight within a memory
+bound (each chunk's size). A balanced min-cut heuristic (e.g. greedy
+merging of the heaviest edges until the size bound) is enough to start.
+A first-order edge (Int -> Int) weighs nothing and can be cut freely.
+
+**Shared modules** (user, 2026-10-14): a module may belong to several
+chunks, e.g. small utilities (variables, maps, sets) that every chunk calls
+with its own functions. Each chunk then compiles its own copy: the
+original keeps its types for the modules outside (and is what they link
+against), and each chunk's copy is internal, renamed (a suffix per chunk,
+as data splitting names its copies) so that the copies and the original
+link together. It is code duplication, as specialisation is; the graph
+analysis decides it where a module's uses fall into separate heavy groups
+and the module is small.
 
 ## 4. Open questions
 
