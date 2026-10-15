@@ -66,7 +66,13 @@ web (WEBS-CHUNKS.md).  It works in two steps:
    needs its compulsory unfoldings inlined: levity-polymorphic code panics
    in code generation otherwise; nofib real/cacheprof, puzzle).  Their objects and interfaces go to
    <odir>/webs-chunk-modules, out of the way; -fforce-recomp makes every
-   module go through the pipeline.
+   module go through the pipeline.  Their interfaces carry no unfoldings
+   (-fomit-interface-pragmas): the desugarer's simple optimiser would
+   otherwise look through another module's unfolding, e.g. resolve a record
+   update of a constructor-valued binder, and bring in binders that only
+   that module's own compilation made up (ShellCheck: newFormatterOptions1,
+   floated out of ShellCheck.Interface's newFormatterOptions by the last
+   simplifier pass), which the merged program does not define.
 
 2. Merge and compile.  The bindings of all the modules become one program
    in dependency order.  A module refers to another's binder through a
@@ -108,7 +114,8 @@ chunkMake targets = do
       flat t = case t of { CoreDoPasses ts -> concatMap flat ts; _ -> [t] }
       plugin  = defaultPlugin { installCoreToDos = \_ todos -> return (capture : lastSimpl todos)
                               , pluginRecompile  = impurePlugin }
-      cap_dflags = (dflags0 `gopt_set` Opt_ForceRecomp)
+      cap_dflags = (dflags0 `gopt_set` Opt_ForceRecomp `gopt_set` Opt_OmitInterfacePragmas
+                            `gopt_unset` Opt_ExposeAllUnfoldings)
                      { objectDir    = Just capdir
                      , hiDir        = Just capdir
                      , stubDir      = Just capdir

@@ -88,6 +88,17 @@ constructors' helpers of other architectures), without webs. So cutting
 unused exports gains little; within a chunk, nearly all exports are used
 only inside it, which is what §3 is for.
 
+Result (nofib, 2026-10-14, early-unused against early-ulsl7, the same
+compiler without the lists): −5.93% instructions against base instead of
+−4.18% (108 benchmarks). 2,004 exports are no longer exported; useless
+elimination fires 697 times instead of 441, const-prop 62 instead of 34,
+result raising 32 instead of 14, strictness 89 instead of 58. Better by
+0.5% or more on 13 benchmarks (grep −48%, expert −41%, last-piece −28%,
+sphere −23%, mandel2 −7%, multiplier −3%), worse on one: spectral/power
++2.4% (one module, all 17 exports internal: the boundary split no longer
+makes local copies of toList and takePs, and the specialiser ends
+elsewhere).
+
 Implemented (2026-10-14): -fcore-webs-unused-exports=FILE (Note [Unused
 exports] in GHC.WebCore.Pipeline), lists from webs-bench/unused-exports.py,
 nofib through webs-bench/run-unused.sh. The listed binders are no longer
@@ -174,6 +185,41 @@ internal: infer 54% -> 93%, parser 54% -> 90%; but the simplifier, which
 now sees the whole program before the early run, leaves fewer webs (infer
 654 -> 161) and the passes fire as rarely as before (inline 1 -> 0,
 defunc 3 -> 1, useless 4 -> 3).
+
+**nofib** (run-chunk.sh, 2026-10-14; instructions against base,
+geomean over the 100 benchmarks the four configurations ran, without
+CSD and bspt; see below):
+
+| config | instructions |
+|---|---|
+| early-ulsl (per module, webs) | −4.50% |
+| chunk-base (chunk, no webs) | −3.49% |
+| chunk-ulsl (chunk, early-ulsl's options) | −8.66% |
+
+Webs gain −5.36% within chunks (chunk-ulsl against chunk-base), against
+−4.5% per module: best integrate −77%, integer −60%, paraffins −46%,
+solid −22%, cryptarithm2 −22%, queens −20%, sphere −19%, pic −16%; worst
+multiplier +4.1%, power +2.4%. Benchmark artifacts in both chunk
+configurations: real/eff/CSD and real/bspt run −98% (the whole program lets
+full laziness share the work that the repetitions are meant to redo), and
+spectral/minimax times out (the opposite: `prog` ignores its argument;
+per module its body is floated to a constant, in the chunk it is inlined
+into the IO loop first and recomputed every iteration; same output). Not
+built: spectral/puzzle, simple, real/cacheprof, hpg, scs panicked in the
+capture build before the last-simplifier fix (now compile).
+
+**ShellCheck** (webs-hackage-bench/chunk.py: the library's and the
+executable's modules as one chunk, against the configuration's
+dependencies; instructions and allocation on the benchmark workload,
+against base per module; same output):
+
+| build | instructions | allocation | compile |
+|---|---|---|---|
+| ulsl2, per module | −7.7% | −0.3% | |
+| chunk, no webs | −10.5% | −13.1% | 122 s, 1.9 GB |
+| chunk, ulsl2's options | −9.1% | −13.9% | 208 s, 5.2 GB |
+
+Here the webs lose 1.6% within the chunk; not yet looked at.
 
 ### 3.3 What is hard
 
