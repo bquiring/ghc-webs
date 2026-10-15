@@ -572,3 +572,11 @@ test('lint_flag001', [grep_errmsg(r'^(\*\*\* Core Linted result of [^:]*|!!! Web
 # unfoldings; the specialisation $sinsert keeps only its wrapper exposed
 test('boundary_kept001', [grep_errmsg(r'^Exposed lambda classes only by: (kept binder[^:]*: [^:]*):', [1])],
      compile_and_run, [early_opts + ' -fcore-webs-boundary -fcore-webs-boundary-kept -ddump-webs-stats'])
+# unused001: an export listed by -fcore-webs-unused-exports is no longer
+# exported and is deleted (Note [Unused exports] in GHC.WebCore.Pipeline)
+test('unused001', [extra_files(['unused001.hs', 'Unused001L.hs', 'unused001.txt'])],
+     makefile_test, ['unused001'])
+# chunk001: --make -fcore-webs-chunk compiles the program as one Core
+# program (Note [Chunks] in GHC.WebCore.Chunk)
+test('chunk001', [extra_files(['chunk001.hs', 'Chunk001L.hs'])],
+     makefile_test, ['chunk001'])

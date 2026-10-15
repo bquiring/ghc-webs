@@ -674,6 +674,7 @@ data GeneralFlag
    | Opt_CoreWebsDataLintPairs  -- ^ (checking) data splitting's pairs from Data Lint, not by unification
    | Opt_CoreWebsDataInferCheck -- ^ (checking) unification and Data Lint must give the same classes
    | Opt_CoreWebsInternalMainExports -- ^ The main module's exports other than main are internal: Note [Main's exports]
+   | Opt_CoreWebsChunk        -- ^ --make compiles the program as one Core program: Note [Chunks]
    | Opt_CoreWebsUncurryKnown -- ^ Uncurry webs with only known calls too
    | Opt_CoreWebsOneShot      -- ^ One-shot lambdas from webs
    | Opt_CoreWebsEarly      -- ^ Also run the web pipeline after demand analysis,
@@ -974,6 +975,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDataLintPairs
    , Opt_CoreWebsDataInferCheck
    , Opt_CoreWebsInternalMainExports
+   , Opt_CoreWebsChunk
    , Opt_CoreWebsUncurryKnown
    , Opt_CoreWebsOneShot
    , Opt_CoreWebsEarly

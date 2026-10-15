@@ -407,6 +407,7 @@ data DynFlags = DynFlags {
   websMaxUnboxSize      :: Int,   -- ^ -fcore-webs-max-unbox-size: a cell's unboxed size, as a multiple of its original
   websUnboxRounds       :: Int,   -- ^ -fcore-webs-unbox-rounds: flattening rounds (Note [Flattening fields])
   websPasses            :: Int,   -- ^ -fcore-webs-passes: passes of the web transformations (Note [Repeating the transformations])
+  websUnusedExports     :: Maybe FilePath, -- ^ -fcore-webs-unused-exports=FILE: exports no other module uses (Note [Unused exports])
   maxForcedSpecArgs     :: Int,
 
   ghciHistSize          :: Int,
@@ -701,6 +702,7 @@ defaultDynFlags mySettings =
         websMaxUnboxSize = 4,
         websUnboxRounds = 3,
         websPasses = 1,
+        websUnusedExports = Nothing,
         maxForcedSpecArgs = 333,
         -- 333 is fairly arbitrary, see Note [Forcing specialisation]:FS5
 

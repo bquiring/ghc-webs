@@ -29,15 +29,17 @@ import GHC.Types.Unique.Supply ( mkSplitUniqSupply, splitUniqSupply )
 import GHC.Types.Web
 
 import GHC.Unit.Module.ModGuts
-import GHC.Unit.Module ( Module, moduleName )
+import GHC.Unit.Module ( Module, moduleName, moduleNameString )
+import qualified Data.Set as Set
+import System.Directory ( doesFileExist )
 import GHC.Types.Name ( getOccString )
 import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
                        , isFamInstTyCon )
 import GHC.Core.FamInstEnv ( famInstRHS )
 import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dataConWrapId_maybe, dataConTyCon )
-import GHC.Types.Avail ( availsToNameSet )
+import GHC.Types.Avail ( AvailInfo(..), availsToNameSet )
 import GHC.Types.FieldLabel ( flSelector )
-import GHC.Types.Name.Set ( elemNameSet, emptyNameSet )
+import GHC.Types.Name.Set ( elemNameSet, emptyNameSet, mkNameSet )
 import GHC.Types.Id.Info ( ruleInfoRules )
 import GHC.Types.Unique ( getUnique )
 
@@ -129,14 +131,25 @@ webPass early guts
 
        ; us0    <- liftIO (mkSplitUniqSupply webUniqueTag)
 
+         -- Exports no other module uses are not exported
+         -- See Note [Unused exports]
+       ; unused <- if early || not (gopt Opt_CoreWebsEarly dflags)
+                   then liftIO (readUnusedExports dflags (mg_module guts))
+                   else return Set.empty
+       ; let (binds_in, unexported) = unexportUnused unused (mg_binds guts)
+       ; unless (null unexported) $
+           dump logger Opt_D_dump_webs_stats "Webs: unused exports" $
+             text "Not exported:" <+> int (length unexported)
+             $$ pprWithCommas ppr (sortBy (comparing getOccString) unexported)
+
          -- Split data types (early run only)
          -- See Note [Splitting data types] in GHC.WebCore.DataSplit
        ; (binds_d, split_tcs) <-
            -- In the early run, or in the late run if there is no early one
            -- (Note [Unboxing in the late run] in GHC.WebCore.DataFlatten)
            if gopt Opt_CoreWebsDataSplit dflags && (early || not (gopt Opt_CoreWebsEarly dflags))
-           then runDataSplit "_s" early logger dflags (mg_module guts) (mg_rules guts) (mg_binds guts)
-           else return (mg_binds guts, [])
+           then runDataSplit "_s" early logger dflags (mg_module guts) (mg_rules guts) binds_in
+           else return (binds_in, [])
 
        ; let -- 0. Split exposed webs at the module boundary (early run only)
              -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
@@ -280,6 +293,7 @@ webPass early guts
                     | otherwise = binds5
 
        ; return (guts { mg_binds = binds6
+                      , mg_exports = dropExports unexported (mg_exports guts)
                       , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
 
 {- Note [Restoring vanilla unfoldings]
@@ -354,6 +368,60 @@ restoreUnfoldings opts had binds
       Cast x co        -> Cast (expr x) co
       Tick t x         -> Tick t (expr x)
       _                -> e
+
+{- Note [Unused exports]
+~~~~~~~~~~~~~~~~~~~~~~~~
+An exported binder that no other module uses is kept only because the
+module cannot know that.  With -fcore-webs-unused-exports=FILE, the build
+tells it: FILE lists, one per line, "Module occurrence" for exported values
+that no module outside their own uses (webs-bench/unused-exports.py
+computes it from a first build's interfaces; a missing FILE lists nothing: their usages name every
+entity a module uses from another module of its package).  At the start of
+the early run (or of the late run, if there is no early one), the listed
+top-level binders of this module are no longer exported: their webs may be
+internal (keptIds), the boundary split leaves them alone, and the
+simplifier deletes those that are dead.
+
+They leave the export list too (mg_exports, which the interface's comes
+from): an exported name without a declaration makes every importer's
+renamer panic (lookupGREInfo), even one that does not use it.  Sound as
+long as the list is right: a module that does use one fails to compile
+("Module M does not export f"), rather than running wrongly; so does one
+that names it in an import list without using it.  Usages come from the renamer, so a first build at -O0
+with -fno-code gives the same list.  What the usages miss: other packages
+record only the module, so the list must leave out every module that
+another package imports, and Template Haskell's reified names.
+-}
+
+-- | The exports of this module that no other module uses (Note [Unused exports])
+readUnusedExports :: DynFlags -> Module -> IO (Set.Set String)
+readUnusedExports dflags m = case websUnusedExports dflags of
+  Nothing -> return Set.empty
+  Just f  -> do { ok  <- doesFileExist f   -- none: nothing is unused
+                ; txt <- if ok then readFile f else return ""
+                ; let me = moduleNameString (moduleName m)
+                ; return $! Set.fromList [ occ | [md, occ] <- map words (lines txt), md == me ] }
+
+-- | Stop exporting the listed top-level binders; also the binders changed
+unexportUnused :: Set.Set String -> CoreProgram -> (CoreProgram, [Id])
+unexportUnused unused binds
+  | Set.null unused || null changed = (binds, [])
+  | otherwise                       = (syncOccurrences (map bind binds), changed)
+  where
+    listed b = isExportedId b && getOccString b `Set.member` unused
+    changed  = filter listed (bindersOfBinds binds)
+    fix b | listed b  = setIdNotExported b
+          | otherwise = b
+    bind (NonRec b e) = NonRec (fix b) e
+    bind (Rec prs)    = Rec [ (fix b, e) | (b, e) <- prs ]
+
+-- | The export list without the binders no longer exported
+dropExports :: [Id] -> [AvailInfo] -> [AvailInfo]
+dropExports [] avails = avails
+dropExports ids avails = [ a | a <- avails, keep a ]
+  where gone = mkNameSet (map idName ids)
+        keep (Avail n) = not (n `elemNameSet` gone)
+        keep _         = True
 
 -- | Make every occurrence the binder's own Id (with its current IdInfo).
 -- Data splitting rewrites binders (types, zapped unfoldings) but not every

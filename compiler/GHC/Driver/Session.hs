@@ -1882,6 +1882,8 @@ dynamic_flags_deps = [
       (intSuffix (\n d -> d {websUnboxRounds = n}))
   , make_ord_flag defFlag "fcore-webs-passes"
       (intSuffix (\n d -> d {websPasses = n}))
+  , make_ord_flag defFlag "fcore-webs-unused-exports"
+      (hasArg (\f d -> d {websUnusedExports = Just (dropWhile (== '=') f)}))
   , make_ord_flag defFlag "fmax-worker-args"
       (intSuffix (\n d -> d {maxWorkerArgs = n}))
   , make_ord_flag defFlag "fmax-forced-spec-args"
@@ -2581,6 +2583,7 @@ fFlagsDeps = [
   flagSpec "core-webs-data-lint-pairs"        Opt_CoreWebsDataLintPairs,
   flagSpec "core-webs-data-infer-check"       Opt_CoreWebsDataInferCheck,
   flagSpec "core-webs-internal-main-exports"  Opt_CoreWebsInternalMainExports,
+  flagSpec "core-webs-chunk"                  Opt_CoreWebsChunk,
   flagSpec "core-webs-uncurry-known"          Opt_CoreWebsUncurryKnown,
   flagSpec "core-webs-one-shot"               Opt_CoreWebsOneShot,
   flagSpec "core-webs-early"                  Opt_CoreWebsEarly,
