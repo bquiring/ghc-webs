@@ -244,6 +244,41 @@ difference: the chunk without webs against ulsl2's is within 0.04%):
 For large programs, total instructions mix the code's quality with GC
 timing; the mutator's instructions (by symbol) separate them.
 
+### 3.2b Libraries (2026-10-14)
+
+`-fcore-webs-chunk-modules=FILE` makes a chunk of some of a program's
+modules; the others compile normally against the chunk's interfaces and
+link with its object. Without a Main (a library: Cabal's `--make
+-no-link`) the chunk's object replaces its first module's object and the
+others are empty, so Cabal's archive holds the chunk: setting
+`-fcore-webs-chunk` in a package's ghc-options builds it as one chunk.
+
+The roots are the chunk's exports (but those -fcore-webs-unused-exports
+lists) and instances. The chunk's interfaces are then written again from
+the merged program (Note [Interfaces of a chunk]): final types, IdInfo and
+unfoldings, the merged object's CAF and tag information. Every non-root
+binder loses its module in the merge, so that the binders Tidy exposes
+all belong to the merged module, whose interface is written first
+(fingerprinting cannot handle interfaces that refer to each other both
+ways). Rules are left out for now.
+
+ShellCheck through Cabal, its library a chunk without webs, dependencies
+as base (instructions and allocation against base, same output):
+
+| library chunk | instructions | allocation |
+|---|---|---|
+| interfaces without pragmas, every export a root | +1.8% | −1.7% |
+| interfaces from the merged program, every export a root | +1.8% | −1.7% |
+| + exports the executable does not use cut (302 of 322) | −8.8% | −3.0% |
+| (library and executable as one chunk, for comparison) | −10.5% | −13.1% |
+
+The roots decide it: the executable gains nothing from the library's
+unfoldings here, but a library chunk whose every export stays exported
+loses. The list for a library comes from its dependents: their interfaces
+record only the modules they use from another package, so the names come
+from -ddump-minimal-imports (webs-bench/unused-exports.py
+--chunk-modules counts only uses from outside the chunk).
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's

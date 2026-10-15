@@ -29,14 +29,21 @@ import GHC.Driver.Errors.Types ()
 import GHC.Core
 import GHC.Core.FVs ( mkRuleInfo )
 import GHC.Core.Opt.Pipeline.Types ( CoreToDo(..) )
-import GHC.Core.InstEnv ( emptyInstEnv )
+import GHC.Core.InstEnv ( emptyInstEnv, filterInstEnv, is_dfun )
+import GHC.Core.FamInstEnv ( famInstAxiom )
+import GHC.Iface.Make ( mkPartialIface, mkFullIface )
+import GHC.Iface.Load ( writeIface, flagsToIfCompression )
+
+import GHC.Stg.EnforceEpt.TagSig ( StgCgInfos )
+import GHC.StgToCmm.Types ( CmmCgInfos )
+import GHC.Types.Name ( getName )
 import GHC.Core.FamInstEnv ( extendFamInstEnvList, emptyFamInstEnv )
 
 import GHC.Linker.Static ( linkBinary )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Name ( getOccString, nameModule_maybe )
+import GHC.Types.Name ( getOccString, nameModule_maybe, localiseName )
 import GHC.Types.Var.Env
 import GHC.Types.ForeignStubs
 import GHC.Types.Basic ( failed )
@@ -47,7 +54,8 @@ import GHC.Unit.Module.ModSummary ( ModSummary(..), ms_location, ms_mod_name, is
 import GHC.Unit.Module.Location ( ModLocation(..) )
 import GHC.Unit.Module.ModDetails ( ModDetails(..) )
 import GHC.Unit.Home.ModInfo ( HomeModInfo(..) )
-import GHC.Unit.Home.PackageTable ( hptInternalTableRef, hptCollectDependencies )
+import GHC.Unit.Home.PackageTable ( hptInternalTableRef, hptCollectDependencies, lookupHpt, addHomeModInfoToHpt )
+import GHC.Unit.Module.ModIface ( ModIface )
 
 import GHC.Utils.Logger
 import GHC.Utils.Outputable
@@ -206,11 +214,24 @@ chunkMake targets = do
            , text "Bindings:" <+> int (length (bindersOfBinds (mg_binds merged)))
            , text "Exported:" <+> int (length [ b | b <- bindersOfBinds (mg_binds merged), isExportedId b ]) ]
     simpl <- hscSimplify hsc_env [] merged
-    (cgguts, _) <- hscTidy hsc_env simpl
+    (cgguts, details) <- hscTidy hsc_env simpl
     let location = ms_location ms
         base     = odir </> "WebsChunk"
-    (asm, mb_stub, foreign_files, _, _) <-
+    (asm, mb_stub, foreign_files, stg_infos, cmm_infos) <-
       hscGenHardCode hsc_env cgguts location (base <.> "s")
+    -- The chunk's modules' interfaces, from the merged program (Note
+    -- [Interfaces of a chunk])
+    -- The merged module's first: the others' unfoldings mention the
+    -- binders Tidy made external there, and fingerprinting them looks them
+    -- up in its interface in the home package table
+    unless whole $
+      forM_ (base_guts : filter ((/= mg_module base_guts) . mg_module) gutss) $ \g ->
+        case [ m | m <- summaries, ms_mod_name m == moduleName (mg_module g) ] of
+          m : _ -> do
+            iface <- writeChunkIface hsc_env details stg_infos cmm_infos (mergedExports dflags0 unused g) m g
+            mb <- lookupHpt hpt (moduleName (mg_module g))
+            forM_ mb $ \hmi -> addHomeModInfoToHpt (hmi { hm_iface = iface }) hpt
+          []    -> return ()
     unless (null foreign_files) $
       throwGhcExceptionIO (CmdLineError "-fcore-webs-chunk: foreign files are not supported")
     let compile src o = do
@@ -242,6 +263,70 @@ chunkMake targets = do
           mapM_ (copyFile empty) rest
         [] -> return ()
 
+{- Note [Interfaces of a chunk]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The capture's interfaces of the chunk's modules carry no pragmas (Note
+[Chunks]), so a module outside cannot inline anything of the chunk, nor
+know an export's arity: ShellCheck's library as a chunk, used by its
+executable, ran 1.8% more instructions than without chunks.  So once the
+merged program is compiled, every chunk module M gets its interface again,
+from the merged program: mkIface_ keeps the declarations of the names of
+M, so the merged program's tidied ModDetails (all its types and
+externally visible Ids, with their final types, IdInfo and unfoldings) is
+given whole, with the instances whose dictionary function is M's and M's
+exports; the code generator's information (CAF, LFInfo) is the merged
+object's.
+
+Interfaces that refer to each other's names both ways cannot be
+fingerprinted one at a time: fingerprinting a declaration looks up the
+names it mentions in their modules' interfaces in the home package table.
+So the merged program has no external names but the roots: every other
+top-level binder loses its module in the merge (localiseName; ShellCheck:
+an unfolding exposed ShellCheck.Analytics.verify, not exported, and
+fingerprinting another module's interface looked for it in Analytics's
+capture interface: lookupVers1).  The binders Tidy makes external for the
+unfoldings, and the data types data splitting made, then all belong to the
+merged module (the chunk's last module, or Main), whose interface
+declares them.  The usages and
+dependencies are the capture's of M.  Rules are left out for now (an
+importer loses the chunk's SPECIALISE rules).  The merged module's
+interface is written first, and replaces the capture's in the home package
+table: the others' unfoldings mention its binders, and fingerprinting
+them looks them up there (lookupVers1 panicked); its own declarations
+mention the other modules' exports only, which the capture's interfaces
+have.
+
+The modules outside the chunk compiled in the same --make were compiled
+against the capture's interfaces; the new ones are for later builds (a
+library's dependents).
+-}
+
+-- | Write a chunk module's interface from the merged program (Note
+-- [Interfaces of a chunk]); also returns it
+writeChunkIface :: HscEnv -> ModDetails -> Maybe StgCgInfos -> Maybe CmmCgInfos
+                -> [AvailInfo] -> ModSummary -> ModGuts -> IO ModIface
+writeChunkIface hsc_env details stg_infos cmm_infos exports ms g = do
+  let this    = mg_module g
+      ours n  = nameModule_maybe n == Just this
+      det     = details { md_exports   = exports
+                        , md_insts     = filterInstEnv (ours . getName . is_dfun) (md_insts details)
+                        , md_fam_insts = filter (ours . getName . famInstAxiom) (md_fam_insts details)
+                        , md_rules     = []
+                        , md_anns      = []
+                        , md_complete_matches = mg_complete_matches g }
+      dflags  = hsc_dflags hsc_env
+  partial <- mkPartialIface hsc_env [] det ms [] g
+  iface   <- mkFullIface hsc_env partial stg_infos cmm_infos NoStubs []
+  writeIface (hsc_logger hsc_env) (targetProfile dflags) (flagsToIfCompression dflags)
+             (ml_hi_file (ms_location ms)) iface
+  return iface
+
+-- | A chunk module's exports, but the unused ones (Note [Chunks])
+mergedExports :: DynFlags -> Set.Set (String, String) -> ModGuts -> [AvailInfo]
+mergedExports _ unused g = [ a | a <- mg_exports g, keep a ]
+  where keep (Avail n) = (moduleNameString (moduleName (mg_module g)), getOccString n) `Set.notMember` unused
+        keep _         = True
+
 -- | One object from several (the chunk's and its stub's)
 joinObjs :: HscEnv -> [FilePath] -> FilePath -> IO ()
 joinObjs _ [o] out = copyFile o out
@@ -262,7 +347,7 @@ mergeGuts dflags whole unused main_guts gutss
   = main_guts { mg_binds        = map bind (concatMap mg_binds gutss)
               , mg_exports      = exports
               , mg_tcs          = concatMap mg_tcs gutss
-              , mg_insts        = []
+              , mg_insts        = if whole then [] else concatMap mg_insts gutss
               , mg_inst_env     = emptyInstEnv
               , mg_fam_insts    = fam_insts
               , mg_fam_inst_env = extendFamInstEnvList emptyFamInstEnv fam_insts
@@ -294,10 +379,15 @@ mergeGuts dflags whole unused main_guts gutss
     top   = [ b | g <- gutss, b <- bindersOfBinds (mg_binds g) ]
     env   = mkVarEnv [ (b, unexport b) | b <- top ]
     unexport b
-      | isLocalId b, isExportedId b, not (root b) = setIdNotExported b
-      | otherwise                                 = b
+      | isLocalId b, not (root b) = localise (if isExportedId b then setIdNotExported b else b)
+      | otherwise                 = b
+    -- Not in the whole program: a binder that is not a root loses its
+    -- module (Note [Interfaces of a chunk]); Tidy gives the merged
+    -- module the ones it exposes
+    localise b | whole     = b
+               | otherwise = setIdName b (localiseName (idName b))
     root b | whole     = entry b
-           | otherwise = not (cut_name (idName b))
+           | otherwise = isExportedId b && not (cut_name (idName b))
     -- main, and GHC's :Main.main wrapper (in the module :Main)
     entry b = case nameModule_maybe (idName b) of
       Just m -> (m == main_mod && getOccString b == fromMaybe "main" (mainFunIs dflags))

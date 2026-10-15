@@ -2,7 +2,8 @@
 """Exported values that no other module uses, for -fcore-webs-unused-exports
 (Note [Unused exports] in GHC.WebCore.Pipeline).
 
-    python3 webs-bench/unused-exports.py GHC DIR [--out FILE] [--keep-module M ...]
+    python3 webs-bench/unused-exports.py GHC DIR[,DIR..] [--out FILE] [--keep-module M ...]
+        [--warnings LOG] [--chunk-modules FILE]
 
 Reads every interface (*.hi) under DIR with GHC --show-iface: the usages of
 each module name every entity it uses from the other modules of its package
@@ -60,13 +61,20 @@ def main():
     ap.add_argument('--out')
     ap.add_argument('--keep-module', action='append', default=[])
     ap.add_argument('--warnings')
+    # a chunk (Note [Chunks] in GHC.WebCore.Chunk): only the uses by
+    # modules outside it count, and only its modules are listed
+    ap.add_argument('--chunk-modules')
     a = ap.parse_args()
-    his = sorted(os.path.join(r, f) for r, _, fs in os.walk(a.dir) for f in fs if f.endswith('.hi'))
+    chunk = set(open(a.chunk_modules).read().split()) if a.chunk_modules else None
+    his = sorted(os.path.join(r, f) for d in a.dir.split(',') for r, _, fs in os.walk(d)
+                 for f in fs if f.endswith('.hi'))
     exports = {}
     used = collections.defaultdict(set)
     for h in his:
         mod, vals, u = parse(iface(a.ghc, h))
         exports[mod] = vals
+        if chunk is not None and mod in chunk:
+            continue
         for m, ns in u.items():
             used[m] |= ns
     # "The import of ‘a, b’ from module ‘M’ is redundant" (possibly wrapped)
@@ -81,10 +89,10 @@ def main():
         whole = set(re.findall(r'The import of \u2018([A-Z][\w.]*)\u2019 is redundant', txt))
     else:
         whole = set()
-    out = a.out or os.path.join(a.dir, 'webs-unused.txt')
+    out = a.out or os.path.join(a.dir.split(',')[0], 'webs-unused.txt')
     lines = []
     for mod in sorted(exports):
-        if mod in a.keep_module or mod in whole:
+        if mod in a.keep_module or mod in whole or (chunk is not None and mod not in chunk):
             continue
         lines += ['%s %s' % (mod, v) for v in exports[mod] if v != 'main' and v not in used[mod]]
     with open(out, 'w') as f:
