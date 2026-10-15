@@ -32,7 +32,7 @@ import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module ( Module, moduleName, moduleNameString )
 import qualified Data.Set as Set
 import System.Directory ( doesFileExist )
-import GHC.Types.Name ( getOccString )
+import GHC.Types.Name ( getOccString, nameIsLocalOrFrom )
 import GHC.Core.TyCon ( TyCon, tyConName, tyConDataCons, isAlgTyCon, isNewTyCon, isClassTyCon
                        , isFamInstTyCon )
 import GHC.Core.FamInstEnv ( famInstRHS )
@@ -136,7 +136,7 @@ webPass early guts
        ; unused <- if early || not (gopt Opt_CoreWebsEarly dflags)
                    then liftIO (readUnusedExports dflags (mg_module guts))
                    else return Set.empty
-       ; let (binds_in, unexported) = unexportUnused unused (mg_binds guts)
+       ; let (binds_in, unexported) = unexportUnused (mg_module guts) unused (mg_binds guts)
        ; unless (null unexported) $
            dump logger Opt_D_dump_webs_stats "Webs: unused exports" $
              text "Not exported:" <+> int (length unexported)
@@ -403,12 +403,17 @@ readUnusedExports dflags m = case websUnusedExports dflags of
                 ; return $! Set.fromList [ occ | [md, occ] <- map words (lines txt), md == me ] }
 
 -- | Stop exporting the listed top-level binders; also the binders changed
-unexportUnused :: Set.Set String -> CoreProgram -> (CoreProgram, [Id])
-unexportUnused unused binds
+unexportUnused :: Module -> Set.Set String -> CoreProgram -> (CoreProgram, [Id])
+unexportUnused this_mod unused binds
   | Set.null unused || null changed = (binds, [])
   | otherwise                       = (syncOccurrences (map bind binds), changed)
   where
-    listed b = isExportedId b && getOccString b `Set.member` unused
+    -- this module's own binders: a chunk's merged program (Note [Chunks]
+    -- in GHC.WebCore.Chunk) has binders of many modules, and another's of
+    -- the same name (dhall: Dhall.Util's record selector command, against
+    -- Dhall.Main's function command) must keep its export
+    listed b = isLocalId b && isExportedId b && nameIsLocalOrFrom this_mod (idName b)
+               && getOccString b `Set.member` unused
     changed  = filter listed (bindersOfBinds binds)
     fix b | listed b  = setIdNotExported b
           | otherwise = b

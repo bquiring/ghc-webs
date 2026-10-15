@@ -440,7 +440,14 @@ cprFix orig_env orig_pairs
     -- If fixed-point iteration does not yield a result we use this instead
     -- See Note [Safe abortion in the fixed-point iteration]
     abort :: (AnalEnv, [(Id,CoreExpr)])
-    abort = step (nonVirgin orig_env) [(setIdCprSig id topCprSig, rhs) | (id, rhs) <- orig_pairs ]
+    abort = step (nonVirgin (extendSigEnvFromIds orig_env (map fst top_pairs))) top_pairs
+    -- The environment must give every binder of the group its (top)
+    -- signature: orig_env has none of them, and an occurrence of a binder
+    -- that comes later in the group would otherwise reach the assertion in
+    -- cprTransform (a local Id without a signature); a group of a chunk's
+    -- merged program (webs, GHC.WebCore.Chunk) needed more than 10
+    -- iterations
+    top_pairs = [(setIdCprSig id topCprSig, rhs) | (id, rhs) <- orig_pairs ]
 
     -- The fixed-point varies the idCprSig field of the binders and and their
     -- entries in the AnalEnv, and terminates if that annotation does not change

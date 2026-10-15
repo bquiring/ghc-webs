@@ -36,6 +36,70 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: the unused-exports list unexported another module's binder of the same name (2026-10-15)
+* **Found by:** dhall's library as a chunk with webs (WEBS-CHUNKS.md).
+* **Symptom:** `urk! lookup local fingerprint command` writing the
+  interfaces: Dhall.Util's data declaration `MultipleCheckFailed` names its
+  field `command`, whose selector was gone.
+* **Cause:** the web pipeline's `-fcore-webs-unused-exports` step reads the
+  entries of its module (`mg_module`) and unexported every binder with a
+  listed name. In a chunk's merged program the module is the chunk's last
+  (Dhall.Main, which lists its function `command`), and the binders come
+  from every module: Dhall.Util's record selector `command` lost its export
+  and the simplifier deleted it.
+* **Fix:** the step only unexports the module's own binders
+  (`unexportUnused` in GHC.WebCore.Pipeline); the merge applies each
+  module's entries itself.
+* **Guard:** `chunk002` (a record field of one chunk module with the name
+  of the merged module's cut export, used by Main).
+* **Commit:** (next)
+
+### CPR analysis: the abort path of a long fixpoint misses the group's binders (2026-10-15)
+* **Found by:** dhall's library as a chunk with defunctionalisation.
+* **Symptom:** `ASSERT failed! $sdiff_s4x83` in CPR analysis
+  (CprAnal.hs:357), after `cprFix aborts` for a recursive group of 30-odd
+  specialisations.
+* **Cause:** GHC's `cprFix`: when the fixpoint takes more than 10
+  iterations it analyses the group once more with top signatures, but from
+  `orig_env`, which has none of the group's binders; an occurrence of a
+  later one is a local Id without a signature, which cprTransform asserts
+  cannot happen. A release compiler (no assertions) gives it top CPR
+  anyway: only the debug compiler stops. Defunctionalisation of a chunk's
+  merged program made the first group that needed more than 10 iterations.
+* **Fix:** the abort path's environment gives every binder of the group its
+  top signature (GHC.Core.Opt.CprAnal).
+* **Guard:** the dhall chunk build; a small program whose fixpoint takes
+  more than 10 iterations was not found (chains of 12-14 functions in either
+  order converge in fewer: GHC orders the group and the CPR lattice is
+  short).
+* **Commit:** (next)
+
+### Chunks: merging modules (2026-10-14/15)
+Found building ShellCheck, hledger-lib, hledger and dhall as chunks; all
+in GHC.WebCore.Chunk, Notes [Chunks], [Merging the chunk's modules],
+[Interfaces of a chunk]; guards `chunk001`-`003` and those builds.
+* **Captured program vs interface:** binders that a capture's later
+  simplifier pass or Tidy made (ShellCheck's `newFormatterOptions1`,
+  hledger-lib's `$dmaccount_types_$caccount_types` through a compulsory
+  unfolding) were not in the captured program. Fix: capture after one
+  initial-phase simplifier pass, interfaces without pragmas, and Tidy keeps
+  a local binder's unique when it externalises it in a capture
+  (`-fcore-webs-chunk-capture`).
+* **Repeated uniques across modules:** the simplifier's uniques repeat from
+  module to module; occurrences were resolved by unique alone (one module's
+  function applied to another's arguments: `applyTypeToArgs`), and local
+  binders then shadowed each other across former module boundaries (a web
+  pass failed Lint). Fix: fresh uniques for non-root top-level binders,
+  resolution per module (unit included: two `Paths_hledger`), every local
+  binder cloned.
+* **Fresh uniques from a wired-in tag:** the merge's supply used `'k'`, the
+  tag of constraint-tuple type constructors (a binder printed as a 60-tuple).
+  Fix: the web passes' tag.
+* **Interfaces that refer to each other both ways** could not be
+  fingerprinted (`lookupVers1`). Fix: non-root binders lose their module, so
+  exposed helpers all belong to the merged module, written first.
+* **Commit:** `beb31e7f90` and (next)
+
 ### Type synonyms kept their types' fields exposed: constraints +15% (2026-10-13)
 * **Found by:** comparing the fixed baseline (`early-ulsl2`, after the list
   fix below) per benchmark against `early-ulsl`: the only loss of ≥0.5%

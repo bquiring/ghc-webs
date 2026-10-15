@@ -1,4 +1,4 @@
-module Chunk002A (Shape(..), area, mapShapes, Scale(..), helperA) where
+module Chunk002A (Shape(..), area, mapShapes, Scale(..), helperA, Cfg(..)) where
 -- exported constructors: outside modules match on them, so the merged
 -- program must keep their representation
 data Shape = Circle Double | Rect Double Double
@@ -18,3 +18,5 @@ instance Scale Shape where
 helperA :: (Int -> Int) -> Int -> Int
 helperA g x = g (g x)
 {-# NOINLINE helperA #-}
+-- a record field, used by Main, with the name of Chunk002B's cut export
+data Cfg = Cfg { label :: String }

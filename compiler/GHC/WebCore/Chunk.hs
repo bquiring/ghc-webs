@@ -52,6 +52,13 @@ import GHC.Linker.Static ( linkBinary )
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name ( getOccString, nameModule_maybe, localiseName )
+import GHC.Types.Name.Set ( mkNameSet, elemNameSet, nameSetElemsStable )
+import GHC.Iface.Syntax ( ifName, ifaceDeclImplicitBndrs, freeNamesIfDecl )
+import GHC.Unit.Module.ModIface ( mi_decls )
+import GHC.Types.Name.Occurrence ( occNameString )
+import GHC.Types.TypeEnv ( typeEnvElts )
+import GHC.Types.TyThing ( TyThing(..) )
+import GHC.Core.Utils ()
 import GHC.Types.Var.Env
 import GHC.Types.ForeignStubs
 import GHC.Types.Basic ( failed )
@@ -76,8 +83,11 @@ import Control.Monad
 import Data.IORef
 import qualified Data.Set as Set
 import qualified Data.Map as Map
-import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply )
+import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply, splitUniqSupply, listSplitUniqSupply, uniqFromSupply )
+import GHC.Core.Subst ( Subst, mkEmptySubst, lookupIdSubst, cloneBndr, cloneBndrs, cloneIdBndr, cloneRecIdBndrs, substTyUnchecked, substCo, substTickish )
+import GHC.Types.Var.Env ( mkInScopeSet )
 import GHC.Types.Var ( setVarUnique )
+import GHC.Types.Web ( webUniqueTag )
 import GHC.Types.Unique ( getUnique, getKey )
 import System.Exit
 import System.FilePath
@@ -238,8 +248,10 @@ chunkMake targets = do
       outside = [ ms | ms <- summaries, not (in_chunk (ms_mod_name ms)) ]
   unused <- liftIO $ readUnusedExportsAll dflags0
   ms <- getModSummary (mg_module base_guts)
-  us_merge <- liftIO (mkSplitUniqSupply 'k')
-  let merged = mergeGuts us_merge dflags0 whole unused base_guts gutss
+  us_merge <- liftIO (mkSplitUniqSupply webUniqueTag)
+  us_clone <- liftIO (mkSplitUniqSupply webUniqueTag)
+  let merged0 = mergeGuts us_merge dflags0 whole unused base_guts gutss
+      merged  = merged0 { mg_binds = cloneLocals us_clone (mg_binds merged0) }
   liftIO $ do
     putDumpFileMaybe logger Opt_D_dump_webs_stats "Webs chunk: modules" FormatText $
       vcat [ text "Modules:" <+> int (length gutss)
@@ -334,7 +346,12 @@ binder, looked up by module and unique.  By module, unit included: hledger's
 executable and library both have a module Paths_hledger, and the
 executable's chunk took the library's Paths_hledger.main_main (a binder
 the library chunk's interface exposes) for one of its own.  Local binders may still repeat
-uniques across modules; their scopes are disjoint.
+uniques across modules: their scopes are disjoint, but once the merged
+program's simplifier inlines across what were module boundaries, one
+shadows another, which the web passes did not survive (dhall: Data.Data's
+gmapMp for Dhall.Syntax.Import's File applied a variable eta_B0 of
+another module's).  So every local binder gets a fresh unique too
+(cloneLocals).
 -}
 
 {- Note [Interfaces of a chunk]
@@ -389,7 +406,25 @@ writeChunkIface hsc_env details stg_infos cmm_infos exports ms g = do
                         , md_anns      = []
                         , md_complete_matches = mg_complete_matches g }
       dflags  = hsc_dflags hsc_env
+  -- Every name of this module that a declaration's unfolding mentions
+  -- must be declared too, or fingerprinting panics; say which
+  let declared = mkNameSet [ getName t | t <- typeEnvElts (md_types det), ours (getName t) ]
+      undeclared = [ (getName v, n)
+                   | AnId v <- typeEnvElts (md_types det), ours (getName v)
+                   , Just tmpl <- [maybeUnfoldingTemplate (realIdUnfolding v)]
+                   , w <- nonDetEltsUniqSet (exprsSomeFreeVars isId [tmpl])
+                   , let n = idName w, ours n, not (n `elemNameSet` declared) ]
+  unless (null undeclared) $
+    pprPanic "-fcore-webs-chunk: an interface mentions undeclared names" (ppr this <+> ppr undeclared)
   partial <- mkPartialIface hsc_env [] det ms [] g
+  let decls   = mi_decls partial
+      known   = Set.fromList (map (getOccString . ifName) decls
+                              ++ map occNameString (concatMap ifaceDeclImplicitBndrs decls))
+      missing = [ (ifName d, n) | d <- decls, n <- nameSetElemsStable (freeNamesIfDecl d)
+                , ours n, getOccString n `Set.notMember` known ]
+  unless (null missing) $
+    pprPanic "-fcore-webs-chunk: interface declarations mention undeclared names"
+      (ppr this <+> ppr missing)
   iface   <- mkFullIface hsc_env partial stg_infos cmm_infos NoStubs []
   writeIface (hsc_logger hsc_env) (targetProfile dflags) (flagsToIfCompression dflags)
              (ml_hi_file (ms_location ms)) iface
@@ -400,6 +435,46 @@ mergedExports :: DynFlags -> Set.Set (String, String) -> ModGuts -> [AvailInfo]
 mergedExports _ unused g = [ a | a <- mg_exports g, keep a ]
   where keep (Avail n) = (moduleNameString (moduleName (mg_module g)), getOccString n) `Set.notMember` unused
         keep _         = True
+
+-- | Every local binder gets a fresh unique (Note [Merging the chunk's
+-- modules]); the top-level binders stay as they are
+cloneLocals :: UniqSupply -> CoreProgram -> CoreProgram
+cloneLocals us0 binds = zipWith top (listSplitUniqSupply us0) binds
+  where
+    subst0 = mkEmptySubst (mkInScopeSet (mkVarSet (bindersOfBinds binds)))
+    top us (NonRec b e) = NonRec b (clone subst0 us e)
+    top us (Rec prs)    = Rec [ (b, clone subst0 u e) | ((b, e), u) <- zip prs (listSplitUniqSupply us) ]
+
+    clone :: Subst -> UniqSupply -> CoreExpr -> CoreExpr
+    clone s us e = case e of
+      Var v       -> lookupIdSubst s v
+      Lit l       -> Lit l
+      App f a     -> let (u1, u2) = splitUniqSupply us in App (clone s u1 f) (clone s u2 a)
+      Lam b x     -> let (u1, u2) = splitUniqSupply us
+                         (s', b') = cloneBndr s (uniqFromSupply u1) b
+                     in Lam b' (clone s' u2 x)
+      Let (NonRec b r) x ->
+        let (u1, u23) = splitUniqSupply us; (u2, u3) = splitUniqSupply u23
+            (s', b')  = cloneIdBndr s u1 b
+        in Let (NonRec b' (clone s u2 r)) (clone s' u3 x)
+      Let (Rec prs) x ->
+        let (u1, u23) = splitUniqSupply us; (u2, u3) = splitUniqSupply u23
+            (s', bs') = cloneRecIdBndrs s u1 (map fst prs)
+        in Let (Rec [ (b', clone s' u r) | (b', (_, r), u) <- zip3 bs' prs (listSplitUniqSupply u2) ])
+               (clone s' u3 x)
+      Case x b t alts ->
+        let (u1, u23) = splitUniqSupply us; (u2, u3) = splitUniqSupply u23
+            (s', b')  = cloneIdBndr s u1 b
+            alt (Alt c bs r) u = let (ua, ub) = splitUniqSupply u
+                                     (s'', bs') = cloneBndrs s' ua bs
+                                 in Alt c bs' (clone s'' ub r)
+        in Case (clone s u2 x) b' (substTyUnchecked s t) (zipWith alt alts (listSplitUniqSupply u3))
+      Cast x co   -> Cast (clone s us x) (substCo s co)
+      Tick t x    -> Tick (substTickish s t) (clone s us x)
+      Type t      -> Type (substTyUnchecked s t)
+      Coercion co -> Coercion (substCo s co)
+      WebLam {}   -> pprPanic "cloneLocals: WebLam" (ppr e)
+      WebApp {}   -> pprPanic "cloneLocals: WebApp" (ppr e)
 
 -- | One object from several (the chunk's and its stub's)
 joinObjs :: HscEnv -> [FilePath] -> FilePath -> IO ()

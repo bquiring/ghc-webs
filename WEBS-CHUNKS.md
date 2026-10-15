@@ -279,6 +279,35 @@ record only the modules they use from another package, so the names come
 from -ddump-minimal-imports (webs-bench/unused-exports.py
 --chunk-modules counts only uses from outside the chunk).
 
+### 3.2c The large programs' own packages (2026-10-15)
+
+hledger-lib, hledger (library and executable) and dhall (library and
+executable), each package one chunk through Cabal (`package` stanzas with
+`-fcore-webs-chunk`), dependencies as base. The exports a package's
+dependents do not use are cut: names from a first build's
+`-ddump-minimal-imports` (webs-hackage-bench/imported-names.py), lists from
+`unused-exports.py --chunk-modules --used-names`. hledger uses most of
+hledger-lib (56 of 1,192 exports cut); hledger's executable uses only
+`Hledger.Cli.main` (220 of 221 cut), dhall's only `Dhall.Main.main` (564 of
+565). Building them found eight bugs (WEBS-BUGS.md, 2026-10-14/15). With
+webs, the build takes 501 s and 6.2 GB at most.
+
+Instructions against base, all with the same output (CPU 2):
+
+| program | build | total | total, `-F3` |
+|---|---|---|---|
+| hledger | ulsl2 per module | +0.9% | +2.5% |
+| hledger | chunks | +1.5% | +2.3% |
+| hledger | chunks + ulsl2's webs | +0.9% | +2.1% |
+| dhall | ulsl2 per module | −0.1% | −0.7% |
+| dhall | chunks | −0.8% | −1.9% |
+| dhall | chunks + ulsl2's webs | −2.5% | −3.2% |
+
+dhall's mutator (by symbol): 1.88 G base, 1.85 G chunks, 1.81 G chunks with
+webs (−3.7%). hledger gains nothing either way (and 12-14% of its samples
+have no symbol, so its mutator split is not reliable); hledger-lib's
+exports nearly all stay, and the chunk interfaces carry no rules yet.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's

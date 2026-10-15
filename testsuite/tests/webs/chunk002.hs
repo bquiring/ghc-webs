@@ -4,10 +4,11 @@
 -- matches on Chunk002A's constructors and uses its instance.
 module Main (main) where
 import Chunk002A
-import Chunk002B
+import Chunk002B (total, twiceAll)
 main :: IO ()
 main = do
   let ss = mapShapes (scale 2) [Circle 1, Rect 2 3]
   print ss
   print (total ss, [ r | Circle r <- ss ])
   print (twiceAll [1, 2, 3])
+  putStrLn (label (Cfg "cfg"))
