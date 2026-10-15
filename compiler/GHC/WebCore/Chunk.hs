@@ -27,7 +27,7 @@ import GHC.Driver.Plugins
 import GHC.Driver.Errors.Types ()
 
 import GHC.Core
-import GHC.Core.FVs ( mkRuleInfo, exprsSomeFreeVars )
+import GHC.Core.FVs ( mkRuleInfo, exprsSomeFreeVars, orphNamesOfExprs )
 import GHC.Core.Lint ( displayLintResults )
 import GHC.Driver.Config.Core.Lint ( lintCoreBindings )
 import GHC.Core.Ppr ( pprCoreBindings )
@@ -52,7 +52,7 @@ import GHC.Linker.Static ( linkBinary )
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name ( getOccString, nameModule_maybe, localiseName )
-import GHC.Types.Name.Set ( mkNameSet, elemNameSet, nameSetElemsStable )
+import GHC.Types.Name.Set ( mkNameSet, elemNameSet, nameSetElemsStable, filterNameSet, extendNameSet )
 import GHC.Iface.Syntax ( ifName, ifaceDeclImplicitBndrs, freeNamesIfDecl )
 import GHC.Unit.Module.ModIface ( mi_decls )
 import GHC.Types.Name.Occurrence ( occNameString )
@@ -81,6 +81,7 @@ import GHC.Types.Unique.DFM ( mapUDFM )
 
 import Control.Monad
 import Data.IORef
+import Data.List ( sortOn )
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply, splitUniqSupply, listSplitUniqSupply, uniqFromSupply )
@@ -292,11 +293,14 @@ chunkMake targets = do
     -- The merged module's first: the others' unfoldings mention the
     -- binders Tidy made external there, and fingerprinting them looks them
     -- up in its interface in the home package table
+    let homedRules = map (homeRule (Set.fromList (map mg_module gutss)) (mg_module base_guts))
+                         (md_rules details)
     unless whole $
       forM_ (base_guts : filter ((/= mg_module base_guts) . mg_module) gutss) $ \g ->
         case [ m | m <- summaries, ms_mod_name m == moduleName (mg_module g) ] of
           m : _ -> do
-            iface <- writeChunkIface hsc_env details stg_infos cmm_infos (mergedExports dflags0 unused g) m g
+            let rules = [ r | r <- homedRules, ru_origin r == mg_module g ]
+            iface <- writeChunkIface hsc_env details rules stg_infos cmm_infos (mergedExports dflags0 unused g) m g
             mb <- lookupHpt hpt (moduleName (mg_module g))
             forM_ mb $ \hmi -> addHomeModInfoToHpt (hmi { hm_iface = iface }) hpt
           []    -> return ()
@@ -379,8 +383,18 @@ capture interface: lookupVers1).  The binders Tidy makes external for the
 unfoldings, and the data types data splitting made, then all belong to the
 merged module (the chunk's last module, or Main), whose interface
 declares them.  The usages and
-dependencies are the capture's of M.  Rules are left out for now (an
-importer loses the chunk's SPECIALISE rules).  The merged module's
+dependencies are the capture's of M.
+
+The merged program's rules (Tidy's: those whose left-hand side mentions
+external names only, SPECIALISE and specialiser rules among them) go to
+the interfaces too, or an importer loses the chunk's specialisations
+(homeRule).  A rule goes where an importer that can use it has loaded the
+interface anyway: the module of its function if a chunk module's (a root),
+else of a chunk module's name on its left-hand side (a type: a
+specialisation of an imported function), and only else the module that
+made it, or the merged module.  Its orphanhood is recomputed for that
+module: an orphan is only seen by importers that list the module as an
+orphan module.  The merged module's
 interface is written first, and replaces the capture's in the home package
 table: the others' unfoldings mention its binders, and fingerprinting
 them looks them up there (lookupVers1 panicked); its own declarations
@@ -394,15 +408,15 @@ library's dependents).
 
 -- | Write a chunk module's interface from the merged program (Note
 -- [Interfaces of a chunk]); also returns it
-writeChunkIface :: HscEnv -> ModDetails -> Maybe StgCgInfos -> Maybe CmmCgInfos
+writeChunkIface :: HscEnv -> ModDetails -> [CoreRule] -> Maybe StgCgInfos -> Maybe CmmCgInfos
                 -> [AvailInfo] -> ModSummary -> ModGuts -> IO ModIface
-writeChunkIface hsc_env details stg_infos cmm_infos exports ms g = do
+writeChunkIface hsc_env details rules stg_infos cmm_infos exports ms g = do
   let this    = mg_module g
       ours n  = nameModule_maybe n == Just this
       det     = details { md_exports   = exports
                         , md_insts     = filterInstEnv (ours . getName . is_dfun) (md_insts details)
                         , md_fam_insts = filter (ours . getName . famInstAxiom) (md_fam_insts details)
-                        , md_rules     = []
+                        , md_rules     = rules
                         , md_anns      = []
                         , md_complete_matches = mg_complete_matches g }
       dflags  = hsc_dflags hsc_env
@@ -429,6 +443,25 @@ writeChunkIface hsc_env details stg_infos cmm_infos exports ms g = do
   writeIface (hsc_logger hsc_env) (targetProfile dflags) (flagsToIfCompression dflags)
              (ml_hi_file (ms_location ms)) iface
   return iface
+
+-- | The chunk module whose interface carries a rule of the merged
+-- program, and the rule's orphanhood there (Note [Interfaces of a chunk]):
+-- the module of its function if a chunk module's, else of the least name
+-- of a chunk module on its left-hand side, else where it was made if a
+-- chunk module, else the merged module
+homeRule :: Set.Set Module -> Module -> CoreRule -> CoreRule
+homeRule _ _ r@BuiltinRule {} = r
+homeRule chunk base r@Rule { ru_fn = fn, ru_args = args, ru_origin = origin } =
+  r { ru_origin = home, ru_orphan = chooseOrphanAnchor (filterNameSet ((== Just home) . nameModule_maybe) lhs) }
+  where
+    lhs  = extendNameSet (orphNamesOfExprs args) fn
+    ofChunk n = [ m | Just m <- [nameModule_maybe n], m `Set.member` chunk ]
+    home = case ofChunk fn of
+      m : _ -> m
+      []    -> case sortOn (\(m, n) -> (moduleNameString (moduleName m), getOccString n))
+                       [ (m, n) | n <- nameSetElemsStable lhs, m <- ofChunk n ] of
+        (m, _) : _ -> m
+        []         -> if origin `Set.member` chunk then origin else base
 
 -- | A chunk module's exports, but the unused ones (Note [Chunks])
 mergedExports :: DynFlags -> Set.Set (String, String) -> ModGuts -> [AvailInfo]

@@ -39,3 +39,14 @@ chunk003:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk003lib/out chunk003.hs -o chunk003.o
 	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk003.o chunk003lib/out/Chunk003A.o chunk003lib/out/Chunk003B.o -o chunk003
 	./chunk003
+
+# chunk004: a library chunk's SPECIALISE rule fires in an importer (Note
+# [Interfaces of a chunk] in GHC.WebCore.Chunk)
+.PHONY: chunk004
+chunk004:
+	cd chunk004lib && '$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -fcore-webs-chunk -O -fcore-webs-early \
+	  -fcore-webs-boundary -fcore-webs-useless -fcore-webs-defunc -fcore-webs-data-split -fcore-webs-data-unbox \
+	  -dcore-lint -v0 Chunk004A Chunk004B -outputdir out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk004lib/out -ddump-rule-firings chunk004.hs -o chunk004.o | grep -o 'Rule fired: USPEC total @Int'
+	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk004.o chunk004lib/out/Chunk004A.o chunk004lib/out/Chunk004B.o -o chunk004
+	./chunk004

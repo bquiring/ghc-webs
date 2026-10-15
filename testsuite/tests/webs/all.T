@@ -588,3 +588,8 @@ test('chunk002', [extra_files(['chunk002.hs', 'Chunk002A.hs', 'Chunk002B.hs', 'c
 # (Note [Chunks] in GHC.WebCore.Chunk)
 test('chunk003', [extra_files(['chunk003.hs', 'chunk003lib/'])],
      makefile_test, ['chunk003'])
+
+# chunk004: a library chunk's SPECIALISE rule fires in an importer (Note
+# [Interfaces of a chunk] in GHC.WebCore.Chunk)
+test('chunk004', [extra_files(['chunk004.hs', 'chunk004lib/'])],
+     makefile_test, ['chunk004'])
