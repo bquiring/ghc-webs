@@ -126,7 +126,11 @@ allocateGlobalBinder nc mod occ loc
               let new_cache = extendOrigNameCache cache0 mod occ name
               pure (new_cache, name)
 
--- | 'allocateGlobalBinder', but a new Name gets the given unique
+-- | 'allocateGlobalBinder', but the Name has the given unique: a cached
+-- Name with another unique is replaced.  For a chunk module's capture (Note
+-- [Chunks] in GHC.WebCore.Chunk), whose binders must keep their uniques even
+-- when an earlier build's interface of the module put its names in the
+-- cache (hledger rebuilt into its output directory)
 allocateGlobalBinderWith
   :: NameCache
   -> Module -> OccName -> SrcSpan -> Unique
@@ -134,7 +138,7 @@ allocateGlobalBinderWith
 allocateGlobalBinderWith nc mod occ loc uniq
   = updateNameCache nc mod occ $ \cache0 ->
       case lookupOrigNameCache cache0 mod occ of
-        Just name -> pure (cache0, name)
+        Just name | nameUnique name == uniq -> pure (cache0, name)
         _ -> do
               let name      = mkExternalName uniq mod occ loc
                   new_cache = extendOrigNameCache cache0 mod occ name

@@ -28,6 +28,17 @@ chunk006:
 	  -v0 chunk006.hs -outputdir chunk006.out -o chunk006
 	./chunk006
 
+# chunk007: a chunk built twice into one output directory: the second
+# capture's Tidy keeps its uniques although the first build's interfaces put
+# the names in the name cache (allocateGlobalBinderWith in GHC.Iface.Env;
+# hledger's generated lenses)
+.PHONY: chunk007
+chunk007:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -fcore-webs-chunk -O -dcore-lint -v0 chunk007.hs -outputdir chunk007.out -o chunk007
+	./chunk007
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -fcore-webs-chunk -O -dcore-lint -v0 chunk007.hs -outputdir chunk007.out -o chunk007
+	./chunk007
+
 # chunk002: a chunk of two modules inside a program; Main outside it
 # (Note [Chunks] in GHC.WebCore.Chunk)
 .PHONY: chunk002

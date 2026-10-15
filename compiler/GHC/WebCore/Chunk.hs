@@ -81,7 +81,7 @@ import GHC.Types.Unique.DFM ( mapUDFM )
 
 import Control.Monad
 import Data.IORef
-import Data.List ( sortOn )
+import Data.List ( sortOn, isSuffixOf )
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply, splitUniqSupply, listSplitUniqSupply, uniqFromSupply )
@@ -126,7 +126,10 @@ modules are compiled as usual.  It works in two steps:
    have compulsory unfoldings that mention the instance methods of its own
    instance, which Tidy made external as $dmaccount_types_$caccount_types;
    the other modules' instances inlined them, and their occurrences had the
-   fresh unique, which no captured binder had.
+   fresh unique, which no captured binder had.  The kept unique wins over a
+   name already in the name cache, which an earlier build's interface of
+   the module put there (the chunk rebuilt into its output directory;
+   allocateGlobalBinderWith in GHC.Iface.Env, chunk007).
 
    The chunk's modules' interfaces carry no pragmas
    (-fomit-interface-pragmas, set in their summaries): no unfoldings, and no
@@ -281,8 +284,13 @@ chunkMake targets = do
       let strays = mkVarSet stray
           holders = [ (b, nameModule_maybe (idName b)) | (b, e) <- flattenBinds (mg_binds merged)
                     , not (isEmptyUniqSet (exprsSomeFreeVars (`elemVarSet` strays) (e : unfOf b))) ]
+          -- the captured binders of the same name, with their uniques
+          same_occ v = [ (b, getUnique b) | b <- bindersOfBinds (mg_binds merged0)
+                       , getOccString b == getOccString v
+                         || ('_' : getOccString b) `isSuffixOf` getOccString v ]
       in pprPanic "-fcore-webs-chunk: occurrences the merge missed"
-           (ppr [ (v, nameModule_maybe (idName v)) | v <- stray ] $$ text "in" <+> ppr holders)
+           (ppr [ (v, getUnique v, nameModule_maybe (idName v), same_occ v) | v <- stray ]
+            $$ text "in" <+> ppr holders)
     -- Core Lint on the merged program, before the pipeline, with -dcore-lint
     when (gopt Opt_DoCoreLinting dflags0) $
       displayLintResults logger True (text "the merged program (-fcore-webs-chunk)")

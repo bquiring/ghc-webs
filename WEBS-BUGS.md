@@ -36,6 +36,25 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: a chunk rebuilt into its output directory lost Tidy's kept uniques (2026-10-15)
+* **Found by:** hledger and hledger-lib as one whole-program chunk, built a
+  second time into the same output directory.
+* **Symptom:** `-fcore-webs-chunk: occurrences the merge missed`:
+  `$dmaccount_types_$caccount_types` and the other generated lenses of
+  hledger-lib (with or without webs).
+* **Cause:** the capture's Tidy keeps a binder's unique when it makes it
+  external (`allocateGlobalBinderWith`), but returned a Name already in
+  the name cache, with that Name's unique; an earlier build's interface of
+  the module had put the tidied names there. The other modules inline the
+  default methods' compulsory unfoldings and get the cached unique, which
+  no captured binder has.
+* **Fix:** a cached Name with another unique is replaced (Note [Chunks]).
+  The panic now lists the captured binders of the same name and their
+  uniques.
+* **Guard:** `chunk007` (makeClassy-style lenses, built twice into one
+  directory).
+* **Commit:**
+
 ### Chunks: a split newtype's class built from a copy with another TyCon's type variables (2026-10-15)
 * **Found by:** dhall's whole program as a chunk, defunctionalisation plus
   data splitting (WEBS-CHUNKS.md, pass pairs).

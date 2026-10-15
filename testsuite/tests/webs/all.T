@@ -602,3 +602,7 @@ test('chunk005', [extra_files(['chunk005.hs', 'chunk005lib/'])],
 # one newtype from two TyCons] in GHC.WebCore.DataSplit; dhall)
 test('chunk006', [extra_files(['chunk006.hs', 'Chunk006A.hs', 'Chunk006B.hs'])],
      makefile_test, ['chunk006'])
+# chunk007: a chunk rebuilt into its output directory (Note [Chunks] in
+# GHC.WebCore.Chunk; hledger)
+test('chunk007', [extra_files(['chunk007.hs', 'Chunk007A.hs', 'Chunk007B.hs'])],
+     makefile_test, ['chunk007'])
