@@ -250,6 +250,18 @@ Specialisation and flattening do not rebuild newtypes yet, so the data
 types a split newtype's representation reaches are left out of them.
 -}
 
+{- Note [Copies of one newtype from two TyCons]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In a chunk (Note [Chunks] in GHC.WebCore.Chunk) the program's Core mentions
+two TyCon objects for a newtype N of a chunk module: N's own module has the
+typechecker's, the modules importing it the one rebuilt from its interface.
+They are equal (one Name), but their type variables differ.  A copy of N
+takes the type variables of the TyCon it was copied from, so the copies in
+one class of N can have different ones, and the class's new newtype is built
+from one member's representation for orig's type variables: it is renamed
+to them first (a member's variables would be out of scope; chunk006).
+-}
+
 ------------------------------------------------------------------
 --      Copies
 ------------------------------------------------------------------
@@ -876,13 +888,17 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
                           , not (isNewTyCon orig)
                           , length cons < length (tyConDataCons orig) ])
         -- A newtype class: its representation, from one member, with the
-        -- children mapped to their classes' types (lazily)
+        -- children mapped to their classes' types (lazily).  The member's
+        -- type variables are those of the TyCon it was copied from, which in
+        -- a chunk can be another TyCon for orig (Note [Copies of one newtype
+        -- from two TyCons])
         mk_split_nt n us_n orig ms = Split tc []
           where
             member = head [ m | m <- ms, is_copy m ]
+            to_orig = substTy (zipTvSubst (tyConTyVars member) (mkTyVarTys (tyConTyVars orig)))
             tc = mkNewtypeCopy us_n (\u occ -> mkExternalName u this_mod occ noSrcSpan)
                                (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
-                               orig (evalState (rw_ty (snd (newTyConRhs member))) ())
+                               orig (to_orig (evalState (rw_ty (snd (newTyConRhs member))) ()))
         fate_of :: UniqFM TyCon Fate      -- every member of a class
         fate_of = listToUFM [ (m, f) | (ms, _, f, _, _) <- fates, m <- ms ]
 

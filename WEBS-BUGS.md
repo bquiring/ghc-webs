@@ -36,6 +36,23 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: a split newtype's class built from a copy with another TyCon's type variables (2026-10-15)
+* **Found by:** dhall's whole program as a chunk, defunctionalisation plus
+  data splitting (WEBS-CHUNKS.md, pass pairs).
+* **Symptom:** `ASSERT failed` in `substTy` (`mkNewtypeCopy`): dhall's
+  `Parser a` newtype, representation `ParsecT_s714 Void Text Identity a`
+  with a type variable out of scope.
+* **Cause:** a chunk's Core has two TyCons for a newtype of a chunk module:
+  the typechecker's (its own module) and the one rebuilt from the interface
+  (its importers), with different type variables. Copies take the type
+  variables of the TyCon copied; the class's new newtype was built from a
+  member's representation as if it used orig's.
+* **Fix:** rename the member's representation to orig's type variables
+  (Note [Copies of one newtype from two TyCons] in GHC.WebCore.DataSplit).
+* **Guard:** `chunk006` (datasplit011's newtypes in one chunk module,
+  split by their use in another).
+* **Commit:**
+
 ### Chunks: the unused-exports list unexported another module's binder of the same name (2026-10-15)
 * **Found by:** dhall's library as a chunk with webs (WEBS-CHUNKS.md).
 * **Symptom:** `urk! lookup local fingerprint command` writing the

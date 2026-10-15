@@ -19,6 +19,15 @@ chunk001:
 	  -v0 chunk001.hs -outputdir chunk001.out -o chunk001
 	./chunk001
 
+# chunk006: a chunk splitting newtypes of one module in another: their
+# copies come from two TyCons with different type variables (Note [Copies of
+# one newtype from two TyCons] in GHC.WebCore.DataSplit)
+.PHONY: chunk006
+chunk006:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -fcore-webs-chunk -O -fcore-webs-early -fcore-webs-data-split -dcore-lint \
+	  -v0 chunk006.hs -outputdir chunk006.out -o chunk006
+	./chunk006
+
 # chunk002: a chunk of two modules inside a program; Main outside it
 # (Note [Chunks] in GHC.WebCore.Chunk)
 .PHONY: chunk002

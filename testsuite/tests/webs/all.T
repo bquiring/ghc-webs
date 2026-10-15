@@ -598,3 +598,7 @@ test('chunk004', [extra_files(['chunk004.hs', 'chunk004lib/'])],
 # in GHC.WebCore.Chunk)
 test('chunk005', [extra_files(['chunk005.hs', 'chunk005lib/'])],
      makefile_test, ['chunk005'])
+# chunk006: newtypes of one chunk module split in another (Note [Copies of
+# one newtype from two TyCons] in GHC.WebCore.DataSplit; dhall)
+test('chunk006', [extra_files(['chunk006.hs', 'Chunk006A.hs', 'Chunk006B.hs'])],
+     makefile_test, ['chunk006'])
