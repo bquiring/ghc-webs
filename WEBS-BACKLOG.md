@@ -127,6 +127,16 @@ webs as newtypes (the occurs check never fires on nofib).
     each time (e.g. defunctionalisation's types `D_w a b`, specialised when
     a most general unifier exists).
 
+- **Unswitching loops on a defunctionalised value** (2026-10-15,
+  WEBS-CHUNKS.md §3.2h): a loop that passes a defunctionalised value
+  unchanged and dispatches on it per iteration (megaparsec's `takeWhile1P`
+  predicate in dhall) gets the case lifted out, one loop copy per
+  constructor (bounded by constructor count and loop size). Today GHC's
+  liberate case does it only when the case lies lexically on the path to
+  the recursive call; strictness or arity raising move the jump into a join
+  point outside the case and the gain is lost (dhall −5.46% → −3.85%).
+  Alternative: liberate case that looks through join points (GHC's pass).
+
 - **Data webs, phases 2–4** (`WEBS-DATA.md`): splitting into local types;
   strict, unpacked and dead fields; congruence for nested fields.
 - **Hidden fields** (done, 2026-10-09; Note [Hidden fields] in
@@ -525,6 +535,11 @@ webs as newtypes (the occurs check never fires on nofib).
 - In `norm` mode, nofib's harness fails `fasta`, `k-nucleotide` and `awards`
   under every configuration (expected output, input file). They are
   dropped from timing.
+
+- **Timer off for instruction counts**: `+RTS -V0` makes a program's
+  instruction count repeat exactly (dhall: 40 instructions apart, against
+  7 M with the timer; GC instructions ±15%). Programs that use threads or
+  timeouts may need the timer.
 
 ## Done
 
