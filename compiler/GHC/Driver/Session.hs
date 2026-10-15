@@ -1884,6 +1884,8 @@ dynamic_flags_deps = [
       (intSuffix (\n d -> d {websPasses = n}))
   , make_ord_flag defFlag "fcore-webs-unused-exports"
       (hasArg (\f d -> d {websUnusedExports = Just (dropWhile (== '=') f)}))
+  , make_ord_flag defFlag "fcore-webs-chunk-modules"
+      (hasArg (\f d -> d {websChunkModules = Just (dropWhile (== '=') f)}))
   , make_ord_flag defFlag "fmax-worker-args"
       (intSuffix (\n d -> d {maxWorkerArgs = n}))
   , make_ord_flag defFlag "fmax-forced-spec-args"

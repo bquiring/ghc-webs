@@ -580,3 +580,7 @@ test('unused001', [extra_files(['unused001.hs', 'Unused001L.hs', 'unused001.txt'
 # program (Note [Chunks] in GHC.WebCore.Chunk)
 test('chunk001', [extra_files(['chunk001.hs', 'Chunk001L.hs'])],
      makefile_test, ['chunk001'])
+# chunk002: a chunk of two modules inside a program, Main outside it
+# (Note [Chunks] in GHC.WebCore.Chunk)
+test('chunk002', [extra_files(['chunk002.hs', 'Chunk002A.hs', 'Chunk002B.hs', 'chunk002.modules', 'chunk002.unused'])],
+     makefile_test, ['chunk002'])
