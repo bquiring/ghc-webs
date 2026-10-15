@@ -584,3 +584,7 @@ test('chunk001', [extra_files(['chunk001.hs', 'Chunk001L.hs'])],
 # (Note [Chunks] in GHC.WebCore.Chunk)
 test('chunk002', [extra_files(['chunk002.hs', 'Chunk002A.hs', 'Chunk002B.hs', 'chunk002.modules', 'chunk002.unused'])],
      makefile_test, ['chunk002'])
+# chunk003: a library built as a chunk, then used as Cabal would use it
+# (Note [Chunks] in GHC.WebCore.Chunk)
+test('chunk003', [extra_files(['chunk003.hs', 'chunk003lib/'])],
+     makefile_test, ['chunk003'])

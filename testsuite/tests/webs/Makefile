@@ -28,3 +28,14 @@ chunk002:
 	  -fcore-webs-defunc -fcore-webs-data-split -fcore-webs-data-unbox -dcore-lint \
 	  -v0 chunk002.hs -outputdir chunk002.out -o chunk002
 	./chunk002
+
+# chunk003: a library built as a chunk, then used as Cabal would use it
+# (Note [Chunks] in GHC.WebCore.Chunk)
+.PHONY: chunk003
+chunk003:
+	cd chunk003lib && '$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -fcore-webs-chunk -O -fcore-webs-early \
+	  -fcore-webs-boundary -fcore-webs-useless -fcore-webs-defunc -fcore-webs-data-split -fcore-webs-data-unbox \
+	  -dcore-lint -v0 Chunk003A Chunk003B -outputdir out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk003lib/out chunk003.hs -o chunk003.o
+	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk003.o chunk003lib/out/Chunk003A.o chunk003lib/out/Chunk003B.o -o chunk003
+	./chunk003

@@ -15,13 +15,14 @@ import GHC.Types.Error ( mkUnknownDiagnostic )
 import GHC.Core.Opt.Monad ( getModule )
 import GHC.Unit.Module.Graph ( mapMG, mgModSummaries )
 import GHC.Types.Avail ( AvailInfo(..) )
-import System.Directory ( doesFileExist )
+import System.Directory ( doesFileExist, copyFile )
 import GHC.Driver.DynFlags
 import GHC.Driver.Env
 import GHC.Driver.Main ( hscSimplify, hscTidy, hscGenHardCode )
 import GHC.Driver.Monad
 import GHC.Driver.Phases ( StopPhase(..) )
 import GHC.Driver.Pipeline ( compileFile )
+import GHC.Driver.Pipeline.Execute ( joinObjectFiles )
 import GHC.Driver.Plugins
 import GHC.Driver.Errors.Types ()
 
@@ -112,8 +113,10 @@ modules are compiled as usual.  It works in two steps:
    line's flags (webs included), Tidy and code generation, into one object
    (<odir>/WebsChunk.o).  A program is linked from it and the objects of
    the modules outside the chunk; the chunk's modules' own objects are not
-   used.  For a library, the chunk's interfaces and WebsChunk.o are the
-   result.
+   used.  For a library, the chunk's object replaces its first module's
+   object and the other modules' objects are empty, so that whatever
+   collects the modules' objects (Cabal's archive) gets the chunk's code;
+   the interfaces are the capture's.
 
 The home package table still describes the captured modules; their rules
 are removed from it, or the pipeline would see them twice, once with the
@@ -219,11 +222,30 @@ chunkMake targets = do
     objs <- case mb_stub of
       Nothing   -> return [obj]
       Just stub -> do { s <- compile stub (base ++ "_stub" <.> "o"); return [obj, s] }
+    let program = ghcLink dflags0 == LinkBinary && any ((== main_name) . ms_mod_name) summaries
     -- A program: the chunk's object instead of its modules' objects
-    when (ghcLink dflags0 == LinkBinary && any ((== main_name) . ms_mod_name) summaries) $ do
+    when program $ do
       pkgs <- map snd . Set.toList <$> hptCollectDependencies hpt
       let others = [ ml_obj_file (ms_location m) | m <- outside ]
       linkBinary logger (hsc_tmpfs hsc_env) dflags0 (hsc_unit_env hsc_env) (objs ++ others) pkgs
+    -- A library: the chunk's object becomes its first module's, and the
+    -- other modules' objects are empty, so that whatever collects the
+    -- modules' objects (Cabal's archive) collects the chunk's code
+    unless program $ do
+      let chunk_objs = [ ml_obj_file (ms_location m) | m <- summaries, in_chunk (ms_mod_name m) ]
+          empty_s    = base ++ "_empty" <.> "s"
+      writeFile empty_s ""
+      empty <- compile empty_s (base ++ "_empty" <.> "o")
+      case chunk_objs of
+        first : rest -> do
+          joinObjs hsc_env objs first
+          mapM_ (copyFile empty) rest
+        [] -> return ()
+
+-- | One object from several (the chunk's and its stub's)
+joinObjs :: HscEnv -> [FilePath] -> FilePath -> IO ()
+joinObjs _ [o] out = copyFile o out
+joinObjs hsc_env os out = joinObjectFiles hsc_env os out
 
 -- | Every module's unused exports (Note [Unused exports] in
 -- GHC.WebCore.Pipeline), by module name
