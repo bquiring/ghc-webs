@@ -64,6 +64,9 @@ def main():
     # a chunk (Note [Chunks] in GHC.WebCore.Chunk): only the uses by
     # modules outside it count, and only its modules are listed
     ap.add_argument('--chunk-modules')
+    # names other packages use (from -ddump-minimal-imports: their
+    # interfaces name only the modules), used in every module
+    ap.add_argument('--used-names')
     a = ap.parse_args()
     chunk = set(open(a.chunk_modules).read().split()) if a.chunk_modules else None
     his = sorted(os.path.join(r, f) for d in a.dir.split(',') for r, _, fs in os.walk(d)
@@ -89,12 +92,14 @@ def main():
         whole = set(re.findall(r'The import of \u2018([A-Z][\w.]*)\u2019 is redundant', txt))
     else:
         whole = set()
+    extra = set(open(a.used_names).read().split()) if a.used_names else set()
     out = a.out or os.path.join(a.dir.split(',')[0], 'webs-unused.txt')
     lines = []
     for mod in sorted(exports):
         if mod in a.keep_module or mod in whole or (chunk is not None and mod not in chunk):
             continue
-        lines += ['%s %s' % (mod, v) for v in exports[mod] if v != 'main' and v not in used[mod]]
+        lines += ['%s %s' % (mod, v) for v in exports[mod]
+                  if v != 'main' and v not in used[mod] and v not in extra]
     with open(out, 'w') as f:
         f.write(''.join(l + '\n' for l in lines))
     print('%s: %d modules, %d exported values, %d unused' %

@@ -18,7 +18,7 @@ module GHC.Iface.Env (
         trace_if, trace_hi_diffs, trace_hi_diffs_io,
 
         -- Name-cache stuff
-        allocateGlobalBinder,
+        allocateGlobalBinder, allocateGlobalBinderWith,
    ) where
 
 import GHC.Prelude
@@ -41,6 +41,7 @@ import GHC.Types.Name
 import GHC.Types.Avail
 import GHC.Types.Name.Cache
 import GHC.Types.Unique.Supply
+import GHC.Types.Unique ( Unique )
 import GHC.Types.SrcLoc
 
 import GHC.Utils.Outputable
@@ -123,6 +124,20 @@ allocateGlobalBinder nc mod occ loc
               uniq <- takeUniqFromNameCache nc
               let name      = mkExternalName uniq mod occ loc
               let new_cache = extendOrigNameCache cache0 mod occ name
+              pure (new_cache, name)
+
+-- | 'allocateGlobalBinder', but a new Name gets the given unique
+allocateGlobalBinderWith
+  :: NameCache
+  -> Module -> OccName -> SrcSpan -> Unique
+  -> IO Name
+allocateGlobalBinderWith nc mod occ loc uniq
+  = updateNameCache nc mod occ $ \cache0 ->
+      case lookupOrigNameCache cache0 mod occ of
+        Just name -> pure (cache0, name)
+        _ -> do
+              let name      = mkExternalName uniq mod occ loc
+                  new_cache = extendOrigNameCache cache0 mod occ name
               pure (new_cache, name)
 
 ifaceExportNames :: [IfaceExport] -> TcRnIf gbl lcl [AvailInfo]

@@ -389,6 +389,9 @@ data TidyOpts = TidyOpts
   , opt_static_ptr_opts :: !(Maybe StaticPtrOpts)
       -- ^ Options for generated static pointers, if enabled (/= Nothing).
   , opt_keep_auto_rules :: !Bool
+  , opt_keep_uniques :: !Bool
+      -- ^ A currently-local binder made external keeps its unique (a
+      -- chunk module's capture: Note [Chunks] in GHC.WebCore.Chunk)
   }
 
 tidyProgram :: TidyOpts -> ModGuts -> IO (CgGuts, ModDetails)
@@ -764,7 +767,7 @@ chooseExternalIds opts mod binds imp_id_rules
   search ((idocc,referrer) : rest) unfold_env occ_env
     | idocc `elemVarEnv` unfold_env = search rest unfold_env occ_env
     | otherwise = do
-      (occ_env', name') <- tidyTopName mod name_cache (Just referrer) occ_env idocc
+      (occ_env', name') <- tidyTopName (opt_keep_uniques opts) mod name_cache (Just referrer) occ_env idocc
       let
           (new_ids, show_unfold) = addExternal opts refined_id
 
@@ -784,7 +787,7 @@ chooseExternalIds opts mod binds imp_id_rules
                 -> IO (UnfoldEnv, TidyOccEnv)
   tidy_internal []       unfold_env occ_env = return (unfold_env,occ_env)
   tidy_internal (id:ids) unfold_env occ_env = do
-      (occ_env', name') <- tidyTopName mod name_cache Nothing occ_env id
+      (occ_env', name') <- tidyTopName (opt_keep_uniques opts) mod name_cache Nothing occ_env id
       let unfold_env' = extendVarEnv unfold_env id (name',False)
       tidy_internal ids unfold_env' occ_env'
 
@@ -1176,9 +1179,9 @@ was previously local, we have to give it a unique occurrence name if
 we intend to externalise it.
 -}
 
-tidyTopName :: Module -> NameCache -> Maybe Id -> TidyOccEnv
+tidyTopName :: Bool -> Module -> NameCache -> Maybe Id -> TidyOccEnv
             -> Id -> IO (TidyOccEnv, Name)
-tidyTopName mod name_cache maybe_ref occ_env id
+tidyTopName keep_uniq mod name_cache maybe_ref occ_env id
   | global && internal = return (occ_env, localiseName name)
 
   | global && external = return (occ_env, name)
@@ -1196,6 +1199,14 @@ tidyTopName mod name_cache maybe_ref occ_env id
         -- Even local, internal names must get a unique occurrence.
         -- This is necessary because the byte-code generator the byte-code
         -- generator builds a system-wide Name->BCO symbol table.
+
+  | local  && external, keep_uniq
+                       = do new_external_name <- allocateGlobalBinderWith name_cache mod occ' loc (nameUnique name)
+                            return (occ_env', new_external_name)
+        -- A chunk module's capture (Note [Chunks] in GHC.WebCore.Chunk): the
+        -- binder keeps its unique, so that the occurrences the other modules
+        -- of the chunk get from this module's interface (by inlining a
+        -- compulsory unfolding) are occurrences of the captured binder
 
   | local  && external = do new_external_name <- allocateGlobalBinder name_cache mod occ' loc
                             return (occ_env', new_external_name)

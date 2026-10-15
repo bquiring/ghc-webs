@@ -27,8 +27,16 @@ import GHC.Driver.Plugins
 import GHC.Driver.Errors.Types ()
 
 import GHC.Core
-import GHC.Core.FVs ( mkRuleInfo )
+import GHC.Core.FVs ( mkRuleInfo, exprsSomeFreeVars )
+import GHC.Core.Lint ( displayLintResults )
+import GHC.Driver.Config.Core.Lint ( lintCoreBindings )
+import GHC.Core.Ppr ( pprCoreBindings )
+import GHC.Types.Var.Set ( mkVarSet, elemVarSet )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet, isEmptyUniqSet )
 import GHC.Core.Opt.Pipeline.Types ( CoreToDo(..) )
+import GHC.Core.Opt.Simplify ( SimplifyOpts(..) )
+import GHC.Core.Opt.Simplify.Env ( SimplMode(..) )
+import GHC.Types.Basic ( CompilerPhase(..) )
 import GHC.Core.InstEnv ( emptyInstEnv, filterInstEnv, is_dfun )
 import GHC.Core.FamInstEnv ( famInstAxiom )
 import GHC.Iface.Make ( mkPartialIface, mkFullIface )
@@ -67,6 +75,10 @@ import GHC.Types.Unique.DFM ( mapUDFM )
 import Control.Monad
 import Data.IORef
 import qualified Data.Set as Set
+import qualified Data.Map as Map
+import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply )
+import GHC.Types.Var ( setVarUnique )
+import GHC.Types.Unique ( getUnique, getKey )
 import System.Exit
 import System.FilePath
 
@@ -80,12 +92,27 @@ modules are compiled as usual.  It works in two steps:
 
 1. Capture.  The modules are compiled as usual, one at a time in dependency
    order, but with a static plugin that, for the chunk's modules, replaces
-   the Core pipeline by a pass that records the ModGuts as the desugarer
-   left it, followed by the pipeline's last simplifier pass alone (the
+   the Core pipeline by one simplifier pass in the initial phase (the
    module's own object still needs its compulsory unfoldings inlined:
-   levity-polymorphic code panics in code generation otherwise; nofib
-   real/cacheprof, puzzle).  -fforce-recomp makes every module go through
+   levity-polymorphic code panics in code generation otherwise, nofib
+   real/cacheprof, puzzle; the initial phase, so that no rule of a later
+   phase fires before the merged program's pipeline; a pass without
+   case-of-case or inlining left Core that CorePrep cannot compile, an
+   argument applied to a join point's let: hledger) and a pass that
+   records the ModGuts.  -fforce-recomp makes every module go through
    the pipeline.
+
+   The captured program must be the one the module's interface describes,
+   since the other chunk modules refer to it through the interface: so
+   the capture comes after the simplifier, and Tidy, when it makes a local
+   binder external, keeps its unique (-fcore-webs-chunk-capture,
+   opt_keep_uniques in GHC.Iface.Tidy) instead of a fresh one from the name
+   cache.  An interface always exposes compulsory unfoldings: in
+   hledger-lib, Hledger.Data.Balancing's default methods (generated lenses)
+   have compulsory unfoldings that mention the instance methods of its own
+   instance, which Tidy made external as $dmaccount_types_$caccount_types;
+   the other modules' instances inlined them, and their occurrences had the
+   fresh unique, which no captured binder had.
 
    The chunk's modules' interfaces carry no pragmas
    (-fomit-interface-pragmas, set in their summaries): no unfoldings, and no
@@ -155,13 +182,17 @@ chunkMake targets = do
                   do { liftIO (modifyIORef' ref (g :)); return g }
       -- the module's own code still needs the compulsory unfoldings
       -- inlined (levity-polymorphic code cannot be compiled otherwise):
-      -- one simplifier pass, the pipeline's last
-      lastSimpl todos = take 1 (reverse [ t | t@CoreDoSimplify {} <- concatMap flat todos ])
+      -- one simplifier pass in the initial phase, before the capture, so
+      -- that the captured program is the one the module's interface
+      -- describes
+      lastSimpl todos = [ CoreDoSimplify (gentle o)
+                        | CoreDoSimplify o <- take 1 (reverse [ t | t@CoreDoSimplify {} <- concatMap flat todos ]) ]
+      gentle o = o { so_mode = (so_mode o) { sm_phase = InitialPhase, sm_names = ["Chunk capture"] } }
       flat t = case t of { CoreDoPasses ts -> concatMap flat ts; _ -> [t] }
       plugin  = defaultPlugin
         { installCoreToDos = \_ todos -> do
             { m <- getModule
-            ; return (if in_chunk (moduleName m) then capture : lastSimpl todos else todos) }
+            ; return (if in_chunk (moduleName m) then lastSimpl todos ++ [capture] else todos) }
         , pluginRecompile  = impurePlugin }
       cap_dflags = (dflags0 `gopt_set` Opt_ForceRecomp)
                      { outputFile_  = Nothing
@@ -169,7 +200,8 @@ chunkMake targets = do
                      , parMakeCount = Just (ParMakeThisMany 1) }
       -- the chunk's modules: interfaces without pragmas (Note [Chunks]),
       -- their dumps out of the way
-      chunk_flags d = (d `gopt_set` Opt_OmitInterfacePragmas `gopt_unset` Opt_ExposeAllUnfoldings)
+      chunk_flags d = (d `gopt_set` Opt_OmitInterfacePragmas `gopt_set` Opt_CoreWebsChunkCapture
+                         `gopt_unset` Opt_ExposeAllUnfoldings)
                         { dumpDir = Just capdir }
   _ <- setSessionDynFlags cap_dflags
   modifySession $ \e ->
@@ -206,13 +238,37 @@ chunkMake targets = do
       outside = [ ms | ms <- summaries, not (in_chunk (ms_mod_name ms)) ]
   unused <- liftIO $ readUnusedExportsAll dflags0
   ms <- getModSummary (mg_module base_guts)
-  let merged = mergeGuts dflags0 whole unused base_guts gutss
+  us_merge <- liftIO (mkSplitUniqSupply 'k')
+  let merged = mergeGuts us_merge dflags0 whole unused base_guts gutss
   liftIO $ do
     putDumpFileMaybe logger Opt_D_dump_webs_stats "Webs chunk: modules" FormatText $
       vcat [ text "Modules:" <+> int (length gutss)
            , text "Outside the chunk:" <+> int (length outside)
            , text "Bindings:" <+> int (length (bindersOfBinds (mg_binds merged)))
            , text "Exported:" <+> int (length [ b | b <- bindersOfBinds (mg_binds merged), isExportedId b ]) ]
+    -- Occurrences the merge did not reach: global Ids of the chunk's
+    -- modules that are not one of its binders
+    let bound   = mkVarSet (bindersOfBinds (mg_binds merged))
+        chunk_m = Set.fromList (map mg_module gutss)
+        stray   = [ v | v <- nonDetEltsUniqSet (exprsSomeFreeVars isId (concatMap rhssOfBind (mg_binds merged)
+                                                   ++ concatMap unfOf (bindersOfBinds (mg_binds merged))))
+                      , isGlobalId v, not (isImplicitId v), not (v `elemVarSet` bound)
+                      , Just m <- [nameModule_maybe (idName v)], m `Set.member` chunk_m ]
+        unfOf b = case realIdUnfolding b of
+                    CoreUnfolding { uf_tmpl = t } -> [t]
+                    DFunUnfolding { df_args = as } -> as
+                    _ -> []
+    unless (null stray) $
+      let strays = mkVarSet stray
+          holders = [ (b, nameModule_maybe (idName b)) | (b, e) <- flattenBinds (mg_binds merged)
+                    , not (isEmptyUniqSet (exprsSomeFreeVars (`elemVarSet` strays) (e : unfOf b))) ]
+      in pprPanic "-fcore-webs-chunk: occurrences the merge missed"
+           (ppr [ (v, nameModule_maybe (idName v)) | v <- stray ] $$ text "in" <+> ppr holders)
+    -- Core Lint on the merged program, before the pipeline, with -dcore-lint
+    when (gopt Opt_DoCoreLinting dflags0) $
+      displayLintResults logger True (text "the merged program (-fcore-webs-chunk)")
+        (pprCoreBindings (mg_binds merged))
+        (lintCoreBindings dflags0 (CoreDoPluginPass "webs chunk: merge" return) [] (mg_binds merged))
     simpl <- hscSimplify hsc_env [] merged
     (cgguts, details) <- hscTidy hsc_env simpl
     let location = ms_location ms
@@ -262,6 +318,24 @@ chunkMake targets = do
           joinObjs hsc_env objs first
           mapM_ (copyFile empty) rest
         [] -> return ()
+
+{- Note [Merging the chunk's modules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The captured modules' programs come after a simplifier pass (Note
+[Chunks]), and the binders the simplifier makes have uniques that repeat
+from one module to the next (hledger-lib: Core Lint saw f_X1, v_B3, ... in
+many modules, and the merged program's first simplifier pass applied one
+module's function to another's arguments: applyTypeToArgs).  So in the
+merge every top-level binder but the roots (whose uniques are the
+renamer's, unique in the program) gets a fresh unique, and occurrences are
+resolved per module: a local Id is the module's own binder, looked up in
+its own table; a global Id with a chunk module's name is that module's
+binder, looked up by module and unique.  By module, unit included: hledger's
+executable and library both have a module Paths_hledger, and the
+executable's chunk took the library's Paths_hledger.main_main (a binder
+the library chunk's interface exposes) for one of its own.  Local binders may still repeat
+uniques across modules; their scopes are disjoint.
+-}
 
 {- Note [Interfaces of a chunk]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -342,9 +416,9 @@ readUnusedExportsAll dflags = case websUnusedExports dflags of
                 ; return $! Set.fromList [ (m, o) | [m, o] <- map words (lines txt) ] }
 
 -- | One program from the captured modules (in dependency order)
-mergeGuts :: DynFlags -> Bool -> Set.Set (String, String) -> ModGuts -> [ModGuts] -> ModGuts
-mergeGuts dflags whole unused main_guts gutss
-  = main_guts { mg_binds        = map bind (concatMap mg_binds gutss)
+mergeGuts :: UniqSupply -> DynFlags -> Bool -> Set.Set (String, String) -> ModGuts -> [ModGuts] -> ModGuts
+mergeGuts us dflags whole unused main_guts gutss
+  = main_guts { mg_binds        = concat [ map (bind g) (mg_binds g) | g <- gutss ]
               , mg_exports      = exports
               , mg_tcs          = concatMap mg_tcs gutss
               , mg_insts        = if whole then [] else concatMap mg_insts gutss
@@ -352,7 +426,7 @@ mergeGuts dflags whole unused main_guts gutss
               , mg_fam_insts    = fam_insts
               , mg_fam_inst_env = extendFamInstEnvList emptyFamInstEnv fam_insts
               , mg_patsyns      = concatMap mg_patsyns gutss
-              , mg_rules        = map rule (concatMap mg_rules gutss)
+              , mg_rules        = concat [ map (rule g) (mg_rules g) | g <- gutss ]
               , mg_foreign      = foldr (plusStubs . mg_foreign) NoStubs gutss
               , mg_foreign_files = concatMap mg_foreign_files gutss
               , mg_anns         = concatMap mg_anns gutss
@@ -371,16 +445,27 @@ mergeGuts dflags whole unused main_guts gutss
       Just m  -> (moduleNameString (moduleName m), getOccString n) `Set.member` unused
       Nothing -> False
 
-    -- Every top-level binder, by unique: not exported unless a root.
-    -- Occurrences become these; the binders also get their unfoldings and
-    -- rules rewritten, whose occurrences are these too (not the rewritten
-    -- binders: no knot), and the simplifier's substitution makes every
-    -- occurrence its binder.
-    top   = [ b | g <- gutss, b <- bindersOfBinds (mg_binds g) ]
-    env   = mkVarEnv [ (b, unexport b) | b <- top ]
-    unexport b
-      | isLocalId b, not (root b) = localise (if isExportedId b then setIdNotExported b else b)
+    -- Every top-level binder as it will be: not exported unless a root,
+    -- and, unless a root, with a fresh unique (Note [Merging the chunk's
+    -- modules]).  Occurrences become these; the binders also get their
+    -- unfoldings and rules rewritten, whose occurrences are these too (not
+    -- the rewritten binders: no knot), and the simplifier's substitution
+    -- makes every occurrence its binder.
+    tops   = [ (mg_module g, b) | g <- gutss, b <- bindersOfBinds (mg_binds g) ]
+    finals = zipWith final tops (uniqsFromSupply us)
+    final (_, b) u
+      | isLocalId b, not (root b) = localise (if isExportedId b then setIdNotExported b else b) `setVarUnique` u
       | otherwise                 = b
+    -- a module's own binders, by unique; another module's, by module and unique
+    own   = Map.fromListWith (++) [ (m, [(b, f)]) | ((m, b), f) <- zip tops finals ]
+    owns  = Map.map mkVarEnv own
+    cross = Map.fromList [ ((m, getKey (getUnique b)), f) | ((m, b), f) <- zip tops finals ]
+    resolve g v
+      | isGlobalId v, Just m <- nameModule_maybe (idName v)
+      = Map.lookup (m, getKey (getUnique v)) cross
+      | otherwise
+      = Map.lookup (mg_module g) owns >>= \e -> lookupVarEnv e v
+
     -- Not in the whole program: a binder that is not a root loses its
     -- module (Note [Interfaces of a chunk]); Tidy gives the merged
     -- module the ones it exposes
@@ -394,41 +479,43 @@ mergeGuts dflags whole unused main_guts gutss
                 || take 1 (moduleNameString (moduleName m)) == ":"
       Nothing -> False
 
-    info b = b `setIdUnfolding` unf (realIdUnfolding b)
-               `setIdSpecialisation` mkRuleInfo (map rule (ruleInfoRules (idSpecialisation b)))
-    unf u = case u of
-      CoreUnfolding { uf_tmpl = t } | isStableUnfolding u -> u { uf_tmpl = expr t }
+    info g b = b `setIdUnfolding` unf g (realIdUnfolding b)
+                 `setIdSpecialisation` mkRuleInfo (map (rule g) (ruleInfoRules (idSpecialisation b)))
+    unf g u = case u of
+      CoreUnfolding { uf_tmpl = t } | isStableUnfolding u -> u { uf_tmpl = expr g t }
                                     | otherwise           -> noUnfolding
-      DFunUnfolding { df_args = as } -> u { df_args = map expr as }
+      DFunUnfolding { df_args = as } -> u { df_args = map (expr g) as }
       _                              -> u
-    rule r = case r of
-      Rule { ru_args = as, ru_rhs = rhs } -> r { ru_args = map expr as, ru_rhs = expr rhs }
+    rule g r = case r of
+      Rule { ru_args = as, ru_rhs = rhs } -> r { ru_args = map (expr g) as, ru_rhs = expr g rhs }
       BuiltinRule {}                      -> r
 
-    top_bndr b = info (fromMaybe b (lookupVarEnv env b))
-    bind (NonRec b e) = NonRec (top_bndr b) (expr e)
-    bind (Rec prs)    = Rec [ (top_bndr b, expr e) | (b, e) <- prs ]
+    top_bndr g b = info g (fromMaybe b (resolve g b))
+    bind g (NonRec b e) = NonRec (top_bndr g b) (expr g e)
+    bind g (Rec prs)    = Rec [ (top_bndr g b, expr g e) | (b, e) <- prs ]
 
     -- Occurrences of the top-level binders become the binders
-    expr = \case
-      Var v | isId v, Just v' <- lookupVarEnv env v -> Var v'
-      Var v          -> Var v
-      Lit l          -> Lit l
-      App f a        -> App (expr f) (expr a)
-      Lam b x        -> Lam (local b) (expr x)
-      Let bd x       -> Let (lbind bd) (expr x)
-      Case x b t as  -> Case (expr x) b t [ Alt c bs (expr r) | Alt c bs r <- as ]
-      Cast x co      -> Cast (expr x) co
-      Tick t x       -> Tick t (expr x)
-      Type t         -> Type t
-      Coercion co    -> Coercion co
-      WebLam w b x   -> WebLam w (local b) (expr x)
-      WebApp w f a   -> WebApp w (expr f) (expr a)
-    lbind (NonRec b e) = NonRec (local b) (expr e)
-    lbind (Rec prs)    = Rec [ (local b, expr e) | (b, e) <- prs ]
-    -- a local binder's stable unfolding may mention them too
-    local b | isId b    = b `setIdUnfolding` unf (realIdUnfolding b)
-            | otherwise = b
+    expr g = go
+      where
+        go = \case
+          Var v | isId v, Just v' <- resolve g v -> Var v'
+          Var v          -> Var v
+          Lit l          -> Lit l
+          App f a        -> App (go f) (go a)
+          Lam b x        -> Lam (local b) (go x)
+          Let bd x       -> Let (lbind bd) (go x)
+          Case x b t as  -> Case (go x) b t [ Alt c bs (go r) | Alt c bs r <- as ]
+          Cast x co      -> Cast (go x) co
+          Tick t x       -> Tick t (go x)
+          Type t         -> Type t
+          Coercion co    -> Coercion co
+          WebLam w b x   -> WebLam w (local b) (go x)
+          WebApp w f a   -> WebApp w (go f) (go a)
+        lbind (NonRec b e) = NonRec (local b) (go e)
+        lbind (Rec prs)    = Rec [ (local b, go e) | (b, e) <- prs ]
+        -- a local binder's stable unfolding may mention them too
+        local b | isId b    = b `setIdUnfolding` unf g (realIdUnfolding b)
+                | otherwise = b
 
     plusStubs NoStubs s = s
     plusStubs s NoStubs = s
