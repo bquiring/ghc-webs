@@ -52,7 +52,7 @@ would catch it again), **commit** (empty while uncommitted).
   module's entries itself.
 * **Guard:** `chunk002` (a record field of one chunk module with the name
   of the merged module's cut export, used by Main).
-* **Commit:** (next)
+* **Commit:** `79489d2473`
 
 ### CPR analysis: the abort path of a long fixpoint misses the group's binders (2026-10-15)
 * **Found by:** dhall's library as a chunk with defunctionalisation.
@@ -72,7 +72,7 @@ would catch it again), **commit** (empty while uncommitted).
   more than 10 iterations was not found (chains of 12-14 functions in either
   order converge in fewer: GHC orders the group and the CPR lattice is
   short).
-* **Commit:** (next)
+* **Commit:** `79489d2473`
 
 ### Chunks: merging modules (2026-10-14/15)
 Found building ShellCheck, hledger-lib, hledger and dhall as chunks; all
@@ -98,7 +98,7 @@ in GHC.WebCore.Chunk, Notes [Chunks], [Merging the chunk's modules],
 * **Interfaces that refer to each other both ways** could not be
   fingerprinted (`lookupVers1`). Fix: non-root binders lose their module, so
   exposed helpers all belong to the merged module, written first.
-* **Commit:** `beb31e7f90` and (next)
+* **Commit:** `beb31e7f90` and `79489d2473`
 
 ### Type synonyms kept their types' fields exposed: constraints +15% (2026-10-13)
 * **Found by:** comparing the fixed baseline (`early-ulsl2`, after the list
