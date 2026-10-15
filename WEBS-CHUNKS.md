@@ -219,7 +219,30 @@ against base per module; same output):
 | chunk, no webs | −10.5% | −13.1% | 122 s, 1.9 GB |
 | chunk, ulsl2's options | −9.1% | −13.9% | 208 s, 5.2 GB |
 
-Here the webs lose 1.6% within the chunk; not yet looked at.
+Here the webs lose within the chunk. Why (2026-10-14; chunks against base's
+dependencies, so only the chunk's options differ; the dependencies make no
+difference: the chunk without webs against ulsl2's is within 0.04%):
+
+* The webs make the program better and the collector worse. By symbol
+  (perf record), the mutator runs 28.69 G instructions instead of 29.00 G
+  (−1.1%) and allocates 0.8% less; the collector (evacuate, scavenge, ...)
+  runs 32.13 G instead of 30.30 G (+6.0%): it copies 5.30 GB instead of
+  5.05 GB.
+* Nothing more is retained: heap profiles by closure type (-hT) peak at
+  the same 1,642 MB, without a closure type that grows (ShellCheck's
+  CFGAnalysis.VariableValue alone is 484 MB). The workload's heap grows
+  steeply, and with 16 major collections, when each falls decides how much
+  it copies.
+* So the sign depends on the collector's settings: webs against no webs,
+  instructions: default +2.1%, -A16m +4.2%, -A64m +1.4%, -F3 −1.7%,
+  -F1.5 −0.7%.
+* Ablation: without data splitting (−0.18%) or without useless elimination
+  (−0.39%) the loss goes; without unboxing (+1.6%) or strictness (+1.55%)
+  it stays. Together they change the allocation pattern that sets the
+  major collections' timing.
+
+For large programs, total instructions mix the code's quality with GC
+timing; the mutator's instructions (by symbol) separate them.
 
 ### 3.3 What is hard
 
