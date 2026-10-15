@@ -308,6 +308,112 @@ webs (−3.7%). hledger gains nothing either way (and 12-14% of its samples
 have no symbol, so its mutator split is not reliable); hledger-lib's
 exports nearly all stay, and the chunk interfaces carry no rules yet.
 
+### 3.2d Rules in the chunk interfaces (2026-10-15)
+
+The chunk modules' interfaces now carry the merged program's rules (Note
+[Interfaces of a chunk]): each rule goes to the chunk module of its
+function, else of a chunk module's name on its left-hand side, else where
+it was made; its orphanhood is recomputed there. Test chunk004: a library
+chunk's SPECIALISE rule fires in an importer. hledger-lib's interfaces
+have 313 rules (base 139, chunks before 0), dhall's 274 (base 357).
+
+No effect: hledger chunks + webs +0.92% against base without rules, +0.93%
+with; dhall −2.40% and −2.48%. hledger's loss is not the missing rules.
+
+### 3.2e Chunks in hadrian (2026-10-15)
+
+`HADRIAN_WEBS_CHUNKS=FILE`, lines `STAGE PACKAGE MODULES-FILE` (e.g.
+`stage0 ghc /path/simpl.modules`): a chunk module's `.o`/`.hi` need the
+package's `build/webs-chunk.stamp`, whose rule (hadrian
+src/Rules/Compile.hs, `websChunkStamp`) builds the modules the chunk
+imports, one by one as usual, then runs one `ghc --make -no-link
+-fcore-webs-chunk -fcore-webs-chunk-modules=FILE` over the chunk's sources
+with the arguments of compiling one of them (`-c`, `-o` dropped). Only
+the chunk's modules are forced to recompile, so the modules outside it
+that hadrian built are not compiled again. The vanilla way only (no
+`-dynamic-too`); stage 0 builds `ghc` vanilla only.
+
+A chunk must be convex: no module outside it both imports a chunk module
+and is imported by one (hadrian would need it before and after the
+chunk). `webs-bench/chunk-convex.py DEPENDENCIES BUILDDIR SEED...` closes
+seed modules (or prefixes `GHC.Core.Opt.Simplify.`) under that; an
+`{-# SOURCE #-}` import is no edge, and a module with an hs-boot file can
+be in a chunk (test chunk005). In GHC most larger seeds pull in hs-boot
+modules (GHC.Core.Opt.OccurAnal brings GHC.Core.Opt.ConstantFold,
+GHC.Core.SimpleOpt, GHC.Types.Id.Make).
+
+First use: the self-host (~/projects/ghc-selfhost) with the simplifier's
+six modules (GHC.Core.Opt.Simplify and GHC.Core.Opt.Simplify.*) as a chunk
+of the stage-1 compiler, no webs options.
+
+### 3.2f Do the transforms fire in a chunk? ShellCheck (2026-10-15)
+
+ShellCheck's library and executable merged (chunk.py), ulsl2's webs
+options, every verdict dump. The merged program: 28 modules, 15,959
+bindings, 2 exported; 182,608 webs, 9,467 after renaming, 506 exposed
+webs even though only main is exported (exposed by imported functions and
+by newtypes and classes of the dependencies: ParsecT 9, RWST, StateT,
+ReaderT, Builder, C:Ord 14, C:Show 6, C:Eq 4).
+
+| pass | done | main rejections |
+|---|---|---|
+| super-beta inlining | 3 | captures local variables 3,351; join point 1,714; loop breaker 1,301; exposed 506 |
+| constant propagation | ~0 (unused parameters only) | not constant 6,687 |
+| arity raising | 14 | only known calls (early: left to worker/wrapper) 6,722 |
+| result raising | 3 | only known calls (early) 5,008; join point 1,714 |
+| strictness | 22 deeper | mostly no change |
+| defunctionalisation | 15 | no unknown calls 4,906; exposed 526 |
+| useless elimination | 254 deleted, 50 unit, 5 dead fields | used parameter 6,559 |
+
+So the passes fire, but on few webs, and where the time goes they cannot
+act: by symbol, 48% of the instructions are GC, 14% ghc-internal (10%
+`compare` on lists, the String keys of Data.Map, 2.6% eqString), 5%
+containers, and ShellCheck's own code (Main_*) 3% (plus ~5% without a
+symbol). Webs: mutator −0.7%, GC +3.7%, total +1.7% against the merged
+program without webs.
+
+The GC rise: max live +10% (1.12 → 1.23 GB), copied +4%; without data
+splitting (1.10 GB) or without useless elimination (1.12 GB) it is back
+at base. Not a leak: the heap profile (-hT) peaks are equal (1.644 GB
+both), and the heap over time (mean × samples) is the same; the webs
+program reaches it with less mutator time, and GC is triggered by
+allocation, not time, so its major GCs come at different points (with
+-F3 the sign flips, §3.2a). ShellCheck has no room for webs: the hot code
+is first-order library code.
+
+### 3.2g dhall: which pass gains (2026-10-15)
+
+**Measurement fix.** lg-run.sh ran dhall with XDG_CACHE_HOME=/nonexistent:
+dhall then prints 394 KB of cache warnings to unbuffered stderr, one
+write(2) per character (381,873 writes, 383,408 polls), ~390 M of the 2.35 G
+instructions. With a fresh empty cache directory per run (dh-run2.sh) there
+are no warnings, the same output, and 1.96 G instructions. The dhall
+numbers in §3.2c/§3.2d include that noise.
+
+dhall's library and executable merged into one program (chunk.py, only
+main a root; built in 94 s without webs, 147 s with): 18% of the lambda
+classes exposed (1,237 of 6,970) against 41% in the library chunk, where
+every instance is a root and the early run keeps the binders that stable
+unfoldings mention (3,891 classes "in an unfolding or rule"). The passes
+fire about as often either way.
+
+Instructions with a fresh cache directory (base: Cabal, per module):
+
+| build | instructions | `-F3` |
+|---|---|---|
+| base | 1963.3 M | 1935.0 M |
+| whole program, no webs | +0.04% | −0.31% |
+| whole program, ulsl2's webs | −2.55% | −3.13% |
+| whole program, only defunctionalisation | **−4.44%** | −4.89% |
+| whole program, only arity raising | −2.68% | −3.29% |
+| whole program, the early run with no pass | −0.15% | −0.24% |
+
+Without the noise, dropping any single pass from ulsl2's set kept −2.3 to
+−2.6% (old measurement: useless, defunc, data split, inline, boundary,
+strictness, arity raising each), and alone useless elimination and
+super-beta inlining do nothing. Defunctionalisation alone beats the whole
+set by 1.9 points: the other passes take away some of its gain.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
