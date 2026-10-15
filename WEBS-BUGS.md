@@ -53,7 +53,7 @@ would catch it again), **commit** (empty while uncommitted).
   uniques.
 * **Guard:** `chunk007` (makeClassy-style lenses, built twice into one
   directory).
-* **Commit:**
+* **Commit:** `8d48f4cfc9`
 
 ### Chunks: a split newtype's class built from a copy with another TyCon's type variables (2026-10-15)
 * **Found by:** dhall's whole program as a chunk, defunctionalisation plus
