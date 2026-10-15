@@ -438,6 +438,16 @@ Instructions with `-V0` (whole program, against no webs, 1955.5 M):
 | ulsl2 without defunc | −3.99% |
 | only useless, only inline, early run alone | 0.00% |
 
+Allocation (`-V0`, exact; no webs 1495.6 MB allocated, 52.3 MB copied):
+ulsl2's webs −3.93% (copied −8.5%), only defunctionalisation −3.46%
+(−10.8%), defunc + strictness −3.83% (−6.9%), defunc + arity raising
+−3.81% (−9.0%), only arity raising −3.81%, ulsl2 without defunc −3.85%.
+Result raising, const prop, boundary and inline change nothing next to
+defunc (identical allocation); useless elimination, inline and the early
+run alone change nothing either. So the passes that cost
+defunctionalisation instructions allocate slightly *less*: the loss is
+mutator work, not allocation.
+
 Strictness and arity raising each take defunctionalisation's gain (and the
 data-split pair compiled in 11 minutes against 2.5: compile cost, not
 looked at). Both lose it in megaparsec's `takeWhile1P` at dhall's
