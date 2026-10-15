@@ -414,6 +414,46 @@ strictness, arity raising each), and alone useless elimination and
 super-beta inlining do nothing. Defunctionalisation alone beats the whole
 set by 1.9 points: the other passes take away some of its gain.
 
+### 3.2h dhall: what takes defunctionalisation's gain (2026-10-15)
+
+**Measurement fix 2: `+RTS -V0`.** With the RTS timer on, the same binary
+varies by ~0.5% in instructions (7 M) and its GC instructions by ±15%
+from run to run: GC comparisons between single runs are noise (the "GC
+saving" of only-defunctionalisation first seen was). With `-V0` the count
+repeats to 40 instructions (dh-run4.sh). Cycles still drift ~3% between
+sessions (base 1,017 / 1,030 / 1,053 M), so instructions decide.
+
+Instructions with `-V0` (whole program, against no webs, 1955.5 M):
+
+| build | instructions |
+|---|---|
+| ulsl2's webs | −4.24% |
+| only defunctionalisation | −5.46% |
+| defunc + result raising, const prop, boundary, inline (each) | −5.46% |
+| defunc + data split | −5.74% |
+| defunc + useless | −4.98% |
+| defunc + arity raising | −4.32% |
+| only arity raising | −4.37% |
+| defunc + strictness | −3.85% |
+| ulsl2 without defunc | −3.99% |
+| only useless, only inline, early run alone | 0.00% |
+
+Strictness and arity raising each take defunctionalisation's gain (and the
+data-split pair compiled in 11 minutes against 2.5: compile cost, not
+looked at). Both lose it in megaparsec's `takeWhile1P` at dhall's
+whitespace parsers (`$wtakeWhile1` 27.5 M → 41.0 M with strictness, 48.8 M
+with arity raising). Defunctionalisation makes its predicate a `Defun9`
+value with two constructors. With defunctionalisation alone, liberate case
+unrolls the character loop on `case predicate1` (on the path to the
+recursive call) and the simplifier makes one loop per constructor, the
+predicate's test inlined. With strictness the recursive jump sits in a join
+point bound outside the `case predicate1` (`join $j19 = jump $wloop1 ..
+in case predicate1 of ..`), so liberate case does not see the case on its
+path, and the one loop dispatches on the predicate per character.
+Defunctionalisation's best gain thus rests on liberate case finding the
+case: an unswitched loop (the case on a defunctionalised value lifted out of
+the loop that passes it unchanged) would not depend on it.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
