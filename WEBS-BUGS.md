@@ -51,7 +51,7 @@ would catch it again), **commit** (empty while uncommitted).
   (Note [Copies of one newtype from two TyCons] in GHC.WebCore.DataSplit).
 * **Guard:** `chunk006` (datasplit011's newtypes in one chunk module,
   split by their use in another).
-* **Commit:**
+* **Commit:** `c7051479f3`
 
 ### Chunks: the unused-exports list unexported another module's binder of the same name (2026-10-15)
 * **Found by:** dhall's library as a chunk with webs (WEBS-CHUNKS.md).
