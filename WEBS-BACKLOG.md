@@ -541,6 +541,11 @@ webs as newtypes (the occurs check never fires on nofib).
   7 M with the timer; GC instructions ±15%). Programs that use threads or
   timeouts may need the timer.
 
+- **perf sampling here**: the kernel allows 20,000 samples/s; `-c 20000`
+  on GHC programs (~10 G instructions/s) is throttled to ~7% of samples.
+  Use `-c 1000003` (or larger), add up runs, and resolve IPs with `nm -n`
+  (perf's own resolution is 2 MB off for these non-PIE binaries).
+
 ## Done
 
 - Defunctionalisation fixes (tests `defunc007`, `defunc008`, and `_lifted`

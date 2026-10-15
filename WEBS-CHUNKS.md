@@ -464,6 +464,50 @@ Defunctionalisation's best gain thus rests on liberate case finding the
 case: an unswitched loop (the case on a defunctionalised value lifted out of
 the loop that passes it unchanged) would not depend on it.
 
+### 3.2i The other programs as whole-program chunks (2026-10-15)
+
+chunk.py now takes several packages (hledger,hledger-lib; happy,happy-lib
+with its internal libraries) and executable-only packages (Paths_ of happy
+and alex). hledger with hledger-lib in one chunk runs out of 13 GB at -O2
+even without webs (SpecConstr), so it is built at -O1 (134 s and 2.8 GB
+without webs, 245 s and 5.8 GB with). Building it found a bug (WEBS-BUGS.md:
+a chunk rebuilt into its output directory lost Tidy's kept uniques).
+
+Instructions with `+RTS -V0`, each program's output identical; "chunk" is
+the whole program without webs, the other columns against it:
+
+| program | chunk vs Cabal | ulsl2's webs | only defunc | webs: allocation |
+|---|---|---|---|---|
+| hledger (-O1 chunk; Cabal -O2) | +1.77% | −0.52% | +0.15% | −0.65% |
+| happy | −1.04% | +0.34% | +0.56% | −1.87% |
+| alex | −11.54% | +0.16% | +0.13% | −0.38% |
+| cpphs | +0.21% | +0.60% | 0.00% | +0.03% |
+| dhall (§3.2h) | +0.04% | −4.24% | −5.46% | −3.93% |
+
+Compiling the whole program as one unit gains alex 11.5% (happy 1%)
+without any web pass. The webs add little beyond dhall: hledger −0.5%, the
+others +0.2 to +0.6%.
+
+cpphs: every pass alone and every pass dropped from the set (22 builds):
+useless elimination alone gives the whole +0.67%; dropping it alone gives
+0.00%; no other pass changes cpphs at all. It deletes 46 unboxed-unit
+arguments of the desugarer's `fail` join points; Core and STG are otherwise
+the same up to names (exit join points that only jumped to `fail` go,
+`$cshowsPrec` replaces its worker at 22 calls), ticky entry counts are
+identical (59,527,442), allocation +0.06%, Main's code smaller everywhere,
+and with GC off (`-A1g`) the mutator still runs +42 M instructions. The
+profile moves into library code (`eqString` +64 M, `reverse` −55 M,
+`stg_upd` +31 M), which ticky does not count. Not resolved.
+
+**Profiling fix.** perf's per-symbol numbers before this point were
+unreliable: `kernel.perf_event_max_sample_rate` is 20,000/s, and
+`-c 20000` asked for ~500,000/s, so perf kept ~7% of the samples
+(throttling, uneven); and perf resolves these binaries' addresses 2 MB off
+(`stg_upd_frame_info+0xffffffffffdff090`). Sample with a period that stays
+under the rate (`-c 1000003` at ~10 G instructions/s), add up several runs,
+and resolve the raw IPs against `nm -n` (scratchpad resolve.py). The dhall
+conclusion (§3.2h) stands on the Core, not the profile.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
