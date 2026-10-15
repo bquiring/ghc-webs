@@ -50,3 +50,13 @@ chunk004:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk004lib/out -ddump-rule-firings chunk004.hs -o chunk004.o | grep -o 'Rule fired: USPEC total @Int'
 	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk004.o chunk004lib/out/Chunk004A.o chunk004lib/out/Chunk004B.o -o chunk004
 	./chunk004
+
+# chunk005: a chunk with a module that has an hs-boot file (Note [Chunks]
+# in GHC.WebCore.Chunk)
+.PHONY: chunk005
+chunk005:
+	cd chunk005lib && '$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -fcore-webs-chunk -fcore-webs-chunk-modules=chunk.modules \
+	  -O -fcore-webs-early -fcore-webs-boundary -fcore-webs-useless -fcore-webs-defunc -dcore-lint -v0 Chunk005A Chunk005B -outputdir out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk005lib/out chunk005.hs -o chunk005.o
+	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk005.o chunk005lib/out/Chunk005A.o chunk005lib/out/Chunk005B.o -o chunk005
+	./chunk005

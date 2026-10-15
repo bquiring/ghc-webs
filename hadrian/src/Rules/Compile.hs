@@ -15,6 +15,7 @@ import Target
 import Utilities
 
 import qualified Text.Parsec as Parsec
+import qualified Hadrian.Builder as H
 
 -- * Rules for building objects and Haskell interface files
 
@@ -80,6 +81,9 @@ compilePackage rs = do
                   _  -> pure ()
 
             else compileHsObjectAndHi rs dyn_o
+
+      -- A webs chunk's modules, compiled together (websChunkStamp)
+      root -/- "**/build/webs-chunk.stamp" %> websChunkStamp rs
 
       forM_ ((,) <$> hsExts <*> wayPats) $ \ ((oExt, hiExt), wayPat) ->
         (  (root -/- "**/build/**/*." ++ wayPat ++ oExt)
@@ -216,22 +220,82 @@ compileHsObjectAndHi rs objpath = do
   let ctx = objectContext b
       way = C.way ctx
   ctxPath <- contextPath ctx
-  (src, deps) <- lookupDependencies (ctxPath -/- ".dependencies") objpath
-  need (src:deps)
-  -- The .conf file is needed when template-haskell is implicitly added as a dependency
-  -- when a module in the template-haskell package is compiled. (See #24737)
-  when  (isLibrary (C.package ctx)) (need . (:[]) =<< pkgConfFile ctx)
+  chunk <- websChunk ctx
+  bpath <- buildPath ctx
+  let BuildPath _ _ _ obj = b
+      isChunkModule = case (chunk, obj) of
+        (Just (_, mods), Hs (HsObject _ (Extension _ suf))) | suf `elem` [O, Hi] ->
+          map (\c -> if c == '/' then '.' else c) (dropExtension (makeRelative bpath objpath))
+            `elem` mods
+        _ -> False
+  -- A webs chunk's module: built with its chunk (websChunkStamp)
+  if isChunkModule then need [bpath -/- "webs-chunk.stamp"] else do
+    (src, deps) <- lookupDependencies (ctxPath -/- ".dependencies") objpath
+    need (src:deps)
+    -- The .conf file is needed when template-haskell is implicitly added as a dependency
+    -- when a module in the template-haskell package is compiled. (See #24737)
+    when  (isLibrary (C.package ctx)) (need . (:[]) =<< pkgConfFile ctx)
 
-  -- The .dependencies file lists indicating inputs. ghc will
-  -- generally read more *.hi and *.hi-boot files (direct inputs).
-  -- Allow such reads (see https://gitlab.haskell.org/ghc/ghc/wikis/Developing-Hadrian#haskell-object-files-and-hi-inputs)
-  -- Note that this may allow too many *.hi and *.hi-boot files, but
-  -- calculating the exact set of direct inputs is not feasible.
-  trackAllow [ "**/*." ++ hisuf     way
-             , "**/*." ++ hibootsuf way
-             ]
+    -- The .dependencies file lists indicating inputs. ghc will
+    -- generally read more *.hi and *.hi-boot files (direct inputs).
+    -- Allow such reads (see https://gitlab.haskell.org/ghc/ghc/wikis/Developing-Hadrian#haskell-object-files-and-hi-inputs)
+    -- Note that this may allow too many *.hi and *.hi-boot files, but
+    -- calculating the exact set of direct inputs is not feasible.
+    trackAllow [ "**/*." ++ hisuf     way
+               , "**/*." ++ hibootsuf way
+               ]
 
-  buildWithResources rs $ target ctx (Ghc CompileHs stage) [src] [objpath]
+    buildWithResources rs $ target ctx (Ghc CompileHs stage) [src] [objpath]
+
+-- | The webs chunk of a context (Note [Chunks] in GHC.WebCore.Chunk): the
+-- file listing its modules, and the modules.  HADRIAN_WEBS_CHUNKS names a
+-- file of lines @STAGE PACKAGE MODULES-FILE@ (e.g. @stage0 ghc
+-- /path/ghc.chunk@); the vanilla way only
+websChunk :: Context -> Action (Maybe (FilePath, [String]))
+websChunk ctx
+  | C.way ctx /= vanilla = return Nothing
+  | otherwise = do
+      mb <- getEnv "HADRIAN_WEBS_CHUNKS"
+      case mb of
+        Nothing -> return Nothing
+        Just f  -> do
+          ls <- map words . lines <$> readFile' f
+          case [ m | [s, p, m] <- ls, s == stageString (C.stage ctx)
+                   , p == pkgName (C.package ctx) ] of
+            m : _ -> Just . (,) m . concatMap words . lines <$> readFile' m
+            []    -> return Nothing
+
+-- | A webs chunk's modules (websChunk), compiled together by one --make
+-- with -fcore-webs-chunk, with the arguments of compiling one of them; the
+-- modules they import outside the chunk are built first, one by one.  The
+-- chunk's object becomes its first module's, the others' are empty (Note
+-- [Chunks]); its modules' interfaces are those of the merged program
+websChunkStamp :: [(Resource, Int)] -> FilePath -> Action ()
+websChunkStamp rs stamp = do
+  root <- buildRoot
+  BuildPath _ stage pkgpath _ <-
+    parsePath (parseBuildPath root (Parsec.string "webs-chunk.stamp")) "<webs chunk stamp parser>" stamp
+  let ctx = Context stage (unsafeFindPackageByPath pkgpath) vanilla Inplace
+  ctxPath <- contextPath ctx
+  bpath   <- buildPath ctx
+  (mfile, mods) <- fromMaybe (error ("No webs chunk for " ++ quote stamp)) <$> websChunk ctx
+  let file m e = bpath -/- map (\c -> if c == '.' then '/' else c) m <.> e
+      ours     = [ file m e | m <- mods, e <- ["o", "hi"] ]
+  srcdeps <- mapM (lookupDependencies (ctxPath -/- ".dependencies") . flip file "o") mods
+  let srcs = map fst srcdeps
+  need (srcs ++ nubOrd [ d | (_, ds) <- srcdeps, d <- ds, d `notElem` ours ])
+  when (isLibrary (C.package ctx)) (need . (:[]) =<< pkgConfFile ctx)
+  trackAllow [ "**/*.hi", "**/*.hi-boot" ]
+  let make as
+        | "-dynamic-too" `elem` as = error "Webs chunks: the vanilla way only, no -dynamic-too"
+        | otherwise = "--make" : "-no-link" : "-fcore-webs-chunk"
+                    : ("-fcore-webs-chunk-modules=" ++ mfile) : drop_c_o as
+      drop_c_o ("-c" : xs)     = drop_c_o xs
+      drop_c_o ("-o" : _ : xs) = drop_c_o xs
+      drop_c_o (x : xs)        = x : drop_c_o xs
+      drop_c_o []              = []
+  H.buildWithResources rs (target ctx (Ghc CompileHs stage) srcs [stamp]) (make <$> getArgs)
+  writeFile' stamp (unlines mods)
 
 compileNonHsObject :: [(Resource, Int)] -> SourceLang -> FilePath -> Action ()
 compileNonHsObject rs lang path = do

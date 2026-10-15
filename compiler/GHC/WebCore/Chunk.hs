@@ -110,8 +110,11 @@ modules are compiled as usual.  It works in two steps:
    phase fires before the merged program's pipeline; a pass without
    case-of-case or inlining left Core that CorePrep cannot compile, an
    argument applied to a join point's let: hledger) and a pass that
-   records the ModGuts.  -fforce-recomp makes every module go through
-   the pipeline.
+   records the ModGuts.  -fforce-recomp makes every chunk module go
+   through the pipeline; a module outside the chunk is compiled only when
+   out of date, so a build system that compiles one module at a time
+   (hadrian) builds those itself and runs --make on the chunk's modules
+   only.
 
    The captured program must be the one the module's interface describes,
    since the other chunk modules refer to it through the interface: so
@@ -204,14 +207,17 @@ chunkMake targets = do
         { installCoreToDos = \_ todos -> do
             { m <- getModule
             ; return (if in_chunk (moduleName m) then lastSimpl todos ++ [capture] else todos) }
-        , pluginRecompile  = impurePlugin }
-      cap_dflags = (dflags0 `gopt_set` Opt_ForceRecomp)
+        , pluginRecompile  = purePlugin }
+      cap_dflags = dflags0
                      { outputFile_  = Nothing
                      , ghcLink      = NoLink
                      , parMakeCount = Just (ParMakeThisMany 1) }
-      -- the chunk's modules: interfaces without pragmas (Note [Chunks]),
-      -- their dumps out of the way
-      chunk_flags d = (d `gopt_set` Opt_OmitInterfacePragmas `gopt_set` Opt_CoreWebsChunkCapture
+      -- the chunk's modules: compiled again (to be captured), interfaces
+      -- without pragmas (Note [Chunks]), their dumps out of the way; the
+      -- modules outside the chunk only when out of date (a build system's,
+      -- hadrian's, already built)
+      chunk_flags d = (d `gopt_set` Opt_ForceRecomp
+                         `gopt_set` Opt_OmitInterfacePragmas `gopt_set` Opt_CoreWebsChunkCapture
                          `gopt_unset` Opt_ExposeAllUnfoldings)
                         { dumpDir = Just capdir }
   _ <- setSessionDynFlags cap_dflags

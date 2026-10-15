@@ -593,3 +593,8 @@ test('chunk003', [extra_files(['chunk003.hs', 'chunk003lib/'])],
 # [Interfaces of a chunk] in GHC.WebCore.Chunk)
 test('chunk004', [extra_files(['chunk004.hs', 'chunk004lib/'])],
      makefile_test, ['chunk004'])
+
+# chunk005: a chunk with a module that has an hs-boot file (Note [Chunks]
+# in GHC.WebCore.Chunk)
+test('chunk005', [extra_files(['chunk005.hs', 'chunk005lib/'])],
+     makefile_test, ['chunk005'])
