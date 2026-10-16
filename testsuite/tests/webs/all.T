@@ -621,6 +621,11 @@ test('chunk009', [extra_files(['chunk009.hs', 'Chunk009C.hs', 'Chunk009D.hs', 'C
 test('chunk010', [extra_files(['chunk010.hs', 'Chunk010C.hs', 'Chunk010X.hs', 'Chunk010M.hs',
                                'Chunk010M.hs-boot', 'chunk010.modules'])],
      makefile_test, ['chunk010'])
+# chunk012: instances derived via a chunk module's (Note [Occurrences carry
+# the binders' IdInfo] in GHC.WebCore.Chunk)
+test('chunk012', [extra_files(['chunk012.hs', 'Chunk012A.hs', 'Chunk012B.hs', 'chunk012.modules',
+                               'chunk012.unused'])],
+     makefile_test, ['chunk012'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

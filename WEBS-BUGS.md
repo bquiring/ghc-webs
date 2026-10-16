@@ -36,6 +36,31 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: an occurrence's own unfolding named a captured binder (2026-10-16)
+* **Found by:** building GHC with chunks: the chunk of
+  GHC.Utils.Monad.Codensity and GHC.Tc.Zonk.Env (whose ZonkBndrT derives
+  Functor, Applicative, Monad, MonadIO and MonadFix via Codensity), with or
+  without webs.
+* **Symptom:** `panic! refineFromInScope ... $c>>=_a5E4` in the merged
+  program's first simplifier pass, right after the class-op rule for
+  `>>=` fired.
+* **Cause:** the merge makes occurrences the final binders as they were
+  before their unfoldings and rules were rewritten (no knot), so an
+  occurrence's own DFun unfolding still named the captured module's
+  method binders; the class-op rule took it from the occurrence. Neither
+  Core Lint nor the merge's stray-occurrence check sees occurrences' IdInfo.
+* **Fix:** after the merge, every occurrence -- in the right-hand sides,
+  and in the top-level binders' unfoldings and rules -- becomes the binder
+  itself, through a lazy knot (syncTop; Note [Occurrences carry the
+  binders' IdInfo] in GHC.WebCore.Chunk). The stray-occurrence check now
+  also reports local Ids no binder binds, and looks at rules. Also: each
+  instance's dictionary function in the merged mg_insts is the merged
+  binder. `-ddump-ds` dumps the merged program.
+* **Guard:** `chunk012` (Codensity copied, instances derived via it, exports
+  cut). It did not fail before the fix: the panic needed more of
+  Zonk.Env; GHC's chunk is the reproducer.
+* **Commit:** (this commit)
+
 ### Chunks: a chunk's session compiled other modules again (2026-10-16)
 * **Found by:** building GHC with chunks of the `ghc` package (hadrian),
   in five steps, each exposing the next.

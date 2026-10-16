@@ -75,6 +75,19 @@ chunk010:
 	  chunk010.out/Chunk010M.o -o chunk010 -v0
 	./chunk010
 
+# chunk012: a chunk of GHC.Utils.Monad.Codensity (copied) and instances derived
+# via it, exports cut; every occurrence carries its binder's merged IdInfo
+# (Note [Occurrences carry the binders' IdInfo] in GHC.WebCore.Chunk)
+.PHONY: chunk012
+chunk012:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -XGHC2021 -XMonoLocalBinds -fcore-webs-chunk \
+	  -fcore-webs-chunk-modules=chunk012.modules -fcore-webs-unused-exports=chunk012.unused \
+	  -dcore-lint -v0 Chunk012A.hs Chunk012B.hs -outputdir chunk012.out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c chunk012.hs -outputdir chunk012.out -i./chunk012.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) chunk012.out/Main.o chunk012.out/Chunk012A.o chunk012.out/Chunk012B.o \
+	  -o chunk012 -v0
+	./chunk012
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change

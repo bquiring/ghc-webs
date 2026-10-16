@@ -46,7 +46,7 @@ import GHC.Core.Opt.Pipeline.Types ( CoreToDo(..) )
 import GHC.Core.Opt.Simplify ( SimplifyOpts(..) )
 import GHC.Core.Opt.Simplify.Env ( SimplMode(..) )
 import GHC.Types.Basic ( CompilerPhase(..) )
-import GHC.Core.InstEnv ( emptyInstEnv, filterInstEnv, is_dfun )
+import GHC.Core.InstEnv ( emptyInstEnv, filterInstEnv, ClsInst(..) )
 import GHC.Core.FamInstEnv ( famInstAxiom )
 import GHC.Iface.Make ( mkPartialIface, mkFullIface )
 import GHC.Iface.Load ( writeIface, flagsToIfCompression )
@@ -94,7 +94,8 @@ import Data.List ( sortOn, isSuffixOf )
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, uniqsFromSupply, splitUniqSupply, listSplitUniqSupply, uniqFromSupply )
-import GHC.Core.Subst ( Subst, mkEmptySubst, lookupIdSubst, cloneBndr, cloneBndrs, cloneIdBndr, cloneRecIdBndrs, substTyUnchecked, substCo, substTickish )
+import GHC.Core.Subst ( Subst, mkEmptySubst, lookupIdSubst, cloneBndr, cloneBndrs, cloneIdBndr, cloneRecIdBndrs, substTyUnchecked, substCo, substTickish
+                       , substExpr, substUnfolding, substRuleInfo )
 import GHC.Types.Var.Env ( mkInScopeSet )
 import GHC.Types.Var ( setVarUnique )
 import GHC.Types.Web ( webUniqueTag )
@@ -374,7 +375,7 @@ chunkMake targets = do
   us_merge <- liftIO (mkSplitUniqSupply webUniqueTag)
   us_clone <- liftIO (mkSplitUniqSupply webUniqueTag)
   let merged0 = mergeGuts us_merge dflags0 whole unused base_guts gutss
-      merged  = merged0 { mg_binds = cloneLocals us_clone (mg_binds merged0) }
+      merged  = merged0 { mg_binds = syncTop (cloneLocals us_clone (mg_binds merged0)) }
   liftIO $ do
     putDumpFileMaybe logger Opt_D_dump_webs_stats "Webs chunk: modules" FormatText $
       vcat [ text "Modules:" <+> int (length gutss)
@@ -385,14 +386,18 @@ chunkMake targets = do
     -- modules that are not one of its binders
     let bound   = mkVarSet (bindersOfBinds (mg_binds merged))
         chunk_m = Set.fromList (map mg_module gutss)
+        -- (and local Ids no binder binds: in unfoldings and rules too)
         stray   = [ v | v <- nonDetEltsUniqSet (exprsSomeFreeVars isId (concatMap rhssOfBind (mg_binds merged)
                                                    ++ concatMap unfOf (bindersOfBinds (mg_binds merged))))
-                      , isGlobalId v, not (isImplicitId v), not (v `elemVarSet` bound)
-                      , Just m <- [nameModule_maybe (idName v)], m `Set.member` chunk_m ]
-        unfOf b = case realIdUnfolding b of
-                    CoreUnfolding { uf_tmpl = t } -> [t]
-                    DFunUnfolding { df_args = as } -> as
-                    _ -> []
+                      , not (v `elemVarSet` bound)
+                      , isLocalId v || (isGlobalId v && not (isImplicitId v)
+                                        && maybe False (`Set.member` chunk_m) (nameModule_maybe (idName v))) ]
+        unfOf b = (case realIdUnfolding b of
+                     CoreUnfolding { uf_tmpl = t } -> [t]
+                     DFunUnfolding { df_bndrs = bs, df_args = as } -> map (mkLams bs) as
+                     _ -> [])
+                  ++ concat [ [ mkLams bs (mkApps (Var b) as), mkLams bs rhs ]
+                            | Rule { ru_bndrs = bs, ru_args = as, ru_rhs = rhs } <- idCoreRules b ]
     unless (null stray) $
       let strays = mkVarSet stray
           holders = [ (b, nameModule_maybe (idName b)) | (b, e) <- flattenBinds (mg_binds merged)
@@ -404,6 +409,10 @@ chunkMake targets = do
       in pprPanic "-fcore-webs-chunk: occurrences the merge missed"
            (ppr [ (v, getUnique v, nameModule_maybe (idName v), same_occ v) | v <- stray ]
             $$ text "in" <+> ppr holders)
+    -- The merged program, with -ddump-ds (the capture's dumps are the
+    -- modules')
+    liftIO $ putDumpFileMaybe logger Opt_D_dump_ds "Webs chunk: merged program" FormatCore
+               (pprCoreBindings (mg_binds merged))
     -- Core Lint on the merged program, before the pipeline, with -dcore-lint
     when (gopt Opt_DoCoreLinting dflags0) $
       displayLintResults logger True (text "the merged program (-fcore-webs-chunk)")
@@ -461,6 +470,36 @@ chunkMake targets = do
           joinObjs hsc_env objs first
           mapM_ (copyFile empty) rest
         [] -> return ()
+
+-- | Every occurrence, in the right-hand sides and in the top-level
+-- binders' unfoldings and rules, the binder itself, with its rewritten
+-- IdInfo (Note [Occurrences carry the binders' IdInfo])
+syncTop :: CoreProgram -> CoreProgram
+syncTop binds = binds'
+  where
+    -- a knot: the in-scope binders are the synced ones (lazily: only
+    -- their uniques are needed to build the set)
+    binds'  = map sync binds
+    subst   = mkEmptySubst (mkInScopeSet (mkVarSet (bindersOfBinds binds')))
+    sync (NonRec b e) = NonRec (bndr b) (substExpr subst e)
+    sync (Rec prs)    = Rec [ (bndr b, substExpr subst e) | (b, e) <- prs ]
+    bndr b = b `setIdUnfolding` substUnfolding subst (realIdUnfolding b)
+               `setIdSpecialisation` substRuleInfo subst b (idSpecialisation b)
+
+{- Note [Occurrences carry the binders' IdInfo]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The merge makes every occurrence of a chunk module's top-level binder the
+final binder, and rewrites the binders' unfoldings and rules; but the
+occurrences are the final binders before that rewrite (there is no knot),
+so an occurrence's own unfolding still names the captured module's binders.
+The simplifier usually looks an occurrence up in its in-scope set, but not
+everywhere: the class-op rule took a dictionary's DFun unfolding from an
+occurrence and found GHC.Tc.Zonk.Env's method $c>>= with its captured
+unique (refineFromInScope: not in scope; a chunk of GHC.Utils.Monad.Codensity
+and GHC.Tc.Zonk.Env, whose instances are derived via Codensity).  So after
+the merge every occurrence, in the right-hand sides and in the top-level
+binders' unfoldings and rules, becomes the binder itself (syncTop).
+-}
 
 {- Note [Merging the chunk's modules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -656,7 +695,10 @@ mergeGuts us dflags whole unused main_guts gutss
   = main_guts { mg_binds        = concat [ map (bind g) (mg_binds g) | g <- gutss ]
               , mg_exports      = exports
               , mg_tcs          = concatMap mg_tcs gutss
-              , mg_insts        = if whole then [] else concatMap mg_insts gutss
+                -- (each instance's dictionary function the merged binder,
+                -- whose DFun unfolding names the merged methods)
+              , mg_insts        = if whole then [] else
+                                  concat [ map (\i -> i { is_dfun = top_bndr g (is_dfun i) }) (mg_insts g) | g <- gutss ]
               , mg_inst_env     = emptyInstEnv
               , mg_fam_insts    = fam_insts
               , mg_fam_inst_env = extendFamInstEnvList emptyFamInstEnv fam_insts
