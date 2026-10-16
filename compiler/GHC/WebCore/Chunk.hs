@@ -209,7 +209,11 @@ the real module M into it, which the chunk does not need and hadrian has
 not built for it (GHC.Data.Word64Map.Strict again, while another chunk was
 building it): the session keeps only the chunk's modules, the command
 line's other targets, and what those import (not every module above the
-chunk: Strict imports GHC.Prelude, of another chunk).
+chunk: Strict imports GHC.Prelude, of another chunk).  The hs-boot file of
+a chunk module is no part of the chunk: the build system compiled it
+before, and compiling it again would make every module below the chunk
+that imports it {-# SOURCE #-} out of date (GHC.Utils.Outputable, below a
+chunk with GHC.Unit.Types).
 -}
 
 -- | The modules below the chunk that are built: fixed (Note [Modules below a chunk])
@@ -223,7 +227,7 @@ fixBelow in_chunk targets graph = do
   -- a module node: built and not a chunk module; a package: available
   built <- fmap Map.fromList $ forM nodes $ \n -> case n of
     ModuleNode _ (ModuleNodeCompile ms)
-      -> (,) (mkNodeKey n) <$> if in_chunk (ms_mod_name ms) then return False
+      -> (,) (mkNodeKey n) <$> if in_chunk (ms_mod_name ms) && isBootSummary ms == NotBoot then return False
                                else doesFileExist (ml_hi_file (ms_location ms))
     ModuleNode _ (ModuleNodeFixed {}) -> return (mkNodeKey n, True)
     UnitNode {}                       -> return (mkNodeKey n, True)
@@ -333,7 +337,9 @@ chunkMake targets = do
                             : staticPlugins (hsc_plugins e) } }
   setTargets targets
   graph0 <- depanal [] False
-  let graph = mapMG (\ms -> if in_chunk (ms_mod_name ms)
+  -- (a chunk module's hs-boot file is not part of the chunk: Note [Modules
+  -- below a chunk])
+  let graph = mapMG (\ms -> if in_chunk (ms_mod_name ms) && (isNothing listed || isBootSummary ms == NotBoot)
                             then ms { ms_hspp_opts = chunk_flags (ms_hspp_opts ms) } else ms) graph0
       summaries = [ ms | ms <- mgModSummaries graph, isBootSummary ms == NotBoot ]
   -- Note [Modules below a chunk]
