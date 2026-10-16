@@ -113,6 +113,27 @@ webs as newtypes (the occurs check never fires on nofib).
 
 ## Core-to-Core: to implement
 
+- **Constant specialisation of recursive functions** (higher priority, the
+  user 2026-10-16; WEBS-EXPERIMENTS.md §22a). A recursive function whose
+  recursive calls pass a function parameter unchanged, called from
+  outside with known functions (nofib solid's CSGtraverse_2: two call
+  sites, two pairs of functions), gets one copy per known function: every
+  call known, no dispatch (defunctionalisation dispatches per call). Two
+  implementations to compare: keys from the web classes, and keys from
+  the call sites, iterated (chains). Heuristics, to be careful with (the
+  user): recommended, in order of evidence needed --
+  1. only recursive functions with a static function parameter
+     (otherwise inlining and GHC's specialiser already do it);
+  2. the parameter is called in the function (on the recursive path),
+     not only passed on: knowing it must turn a call into a known call;
+  3. a bound on copies times size (SpecConstr's: 3 copies,
+     -fspec-constr-threshold);
+  4. evidence of gain at the call: the known function is small (inlines),
+     or strict in arguments the unknown call passes as thunks (solid's
+     combine (traverse l) op (traverse r)), or has a CPR result;
+  5. prefer specialisations after which the generic copy is dead (no
+     net code growth).
+
 - **Named function types, one per web** (from an earlier implementation):
   analogous to named data types, each web gets a named function type
   constructor, a top-level name for the structural `mu w. A -> B`. Two uses:
