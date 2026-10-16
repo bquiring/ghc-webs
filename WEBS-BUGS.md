@@ -60,7 +60,7 @@ would catch it again), **commit** (empty while uncommitted).
   module below the chunk SOURCE-imports one that is not built: the session
   leaves the real module and its hs-boot node out, and reads the module
   it names through the hs-boot interface: eps_is_boot is set in chunk
-  sessions as in one-shot mode, and before the merge, `(this commit)`;
+  sessions as in one-shot mode, and before the merge, `55433a8ccf`;
   before that, `b8119aab5b`).
 * **Commit:** `88a9da9217`
 
