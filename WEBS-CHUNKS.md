@@ -543,6 +543,52 @@ methods they mention (`$c==`). happy: 13 of its 25 kept binders are
 specialisations, 8 defaults and the methods they call. Instance methods
 stay exposed only in library chunks, where every instance is a root.
 
+### 3.2k Choosing GHC's chunks from types (2026-10-16)
+
+`webs-bench/chunk-graph.py` (§3.5, "From types"): nodes are a package's
+modules (weighted by source size), an edge joins a module to each module it
+uses names from (the interfaces' usages), weighted by what exposing those
+names costs: the arrows nested in a value's type (its own arity's are
+free), its constraints, and one for each of the package's types in it
+whose fields hold a function (SimplM, records of functions); a type,
+constructor or field weighs one if its fields hold a function. Re-export
+modules (no values of their own) add no edges. Greedy merging, heaviest
+edge first, of convex groups (everything on an import path between them
+joins), under size bounds (300 KB of source, 40 modules; modules over
+100 KB stay out). hs-boot files are nodes of their own, which no chunk may
+have between its modules; a module joins a chunk only with the modules it
+SOURCE-imports; modules with hs-boot files stay out of chunks.
+`unused-exports.py` now takes several chunks in one pass and keeps what
+other packages' imported modules re-export. hadrian takes several chunks
+per package (`HADRIAN_WEBS_CHUNKS`, one line each, `webs-chunk-N.stamp`).
+
+On the `ghc` package (854 modules, 4,900 weighted edges, weight 14,486):
+62 chunks covering 372 modules, but 89% of the weight stays between chunks.
+The size bound and convexity (GHC's import graph is deep) keep chunks
+small; 1,694 exports are cut (against 2,482 unused in the whole package).
+
+Building GHC with these chunks (self-host `chunkw`, early-ulsl's options)
+does not get through phase 1 yet. Every chunk is a --make session over
+part of a package whose other modules hadrian built, and each step
+exposed another driver problem (WEBS-BUGS.md, 2026-10-16), fixed with a
+test each: a chunk reads home interfaces outside its session from their
+files (chunk008); the session holds only what it compiles, and every
+built module is read from its file as in one-shot mode, with eps_is_boot
+set (chunk009, chunk010); occurrences carry the merged binders' IdInfo
+(chunk012). Still open: one session compiles several modules, and once a
+module's imports have put a home module's hs-boot interface in the EPS
+(GHC.Core, through GHC.Core.RoughMap), a later module's ordinary import of
+it (GHC.Core.InstEnv) gets the boot interface ("does not export
+IsOrphan"); replacing it in the EPS then broke the renamer's GREInfo
+(lookupGREInfo: NotOrphan). That change is not committed.
+
+The capture-and-merge design (§3.2a) runs the typechecker and desugarer
+in --make sessions; for a whole program that works, for a slice of a
+package with hs-boot cycles around it, one-shot semantics (one module per
+process) are what hadrian's other modules assume. The alternative is
+§3.1: build every module one-shot as usual with -fwrite-if-simplified-core
+and merge the chunk from the interfaces, with no --make session at all.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
