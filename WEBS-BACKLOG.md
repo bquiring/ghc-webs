@@ -149,7 +149,12 @@ webs as newtypes (the occurs check never fires on nofib).
   not dictionaries: class splitting (`-fcore-webs-split-classes`) found
   nothing to split on happy and alex. Dropping or rebuilding those rules
   around the early run would free them.
-- **Unswitching loops on a defunctionalised value** (2026-10-15,
+- **Unswitching loops on a defunctionalised value**: done as liberate case
+  through join points (`-fliberate-case-join-points`, 2026-10-16,
+  WEBS-CHUNKS.md §3.2h'): dhall −4.24% → −5.18% (all webs), nofib −4.17%
+  → −4.24%. Open: puzzle's instruction cache (20 KB more code, cycles
+  +2.5% despite −7.5% instructions); a duplication bound is undecided.
+  Original entry (2026-10-15,
   WEBS-CHUNKS.md §3.2h): a loop that passes a defunctionalised value
   unchanged and dispatches on it per iteration (megaparsec's `takeWhile1P`
   predicate in dhall) gets the case lifted out, one loop copy per

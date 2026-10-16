@@ -464,6 +464,40 @@ Defunctionalisation's best gain thus rests on liberate case finding the
 case: an unswitched loop (the case on a defunctionalised value lifted out of
 the loop that passes it unchanged) would not depend on it.
 
+### 3.2h' Liberate case through join points (2026-10-16)
+
+`-fliberate-case-join-points` (Note [Liberate case through join points] in
+GHC.Core.Opt.LiberateCase): at a jump to a non-recursive join point whose
+right-hand side calls a loop the new case can specialise, the join point's
+right-hand side replaces the jump, and liberate case unrolls the loop under
+the case: one loop per constructor. Only for variables of types with
+several constructors (for products, nofib mandel2's pairs, the copies only
+added SpecConstr call patterns: +39%). Test libcasejoin001.
+
+dhall (instructions with `-V0`, against no webs, 1955.5 M; same output):
+
+| build | instructions | cycles |
+|---|---|---|
+| only defunctionalisation | −5.46% | 981.2 M |
+| defunc + strictness | −3.84% | 990.2 M |
+| defunc + strictness, `-fliberate-case-join-points` | −4.79% | 980.8 M |
+| ulsl2's webs | −4.24% | 982.7 M |
+| ulsl2's webs, `-fliberate-case-join-points` | −5.18% | 969.1 M |
+
+It recovers 0.95 of the 1.6 points strictness took from
+defunctionalisation, and puts the whole set above defunctionalisation
+alone in cycles.
+
+nofib (run-libcase2.sh; 109 benchmarks; instructions): without webs
+−0.08% geomean, with early-ulsl's options −4.24% against −4.17%
+(early-ulsl8, the current compiler). Only two benchmarks move by 0.5% or
+more: puzzle −7.50% without webs, −6.85% with them; mate −1.28% with
+them (time −14.2% against −11.8%). puzzle's cycles go the other way
+(+2.5% without webs, +6.4% against early-ulsl8 with them): its L1
+instruction-cache misses triple (43 M → 127 M; 36 M → 115 M), with 20 KB
+more code, the unswitched copies, in a hot loop nest that no longer fits.
+Not decided: a bound on the code the join-point case may duplicate.
+
 ### 3.2i The other programs as whole-program chunks (2026-10-15)
 
 chunk.py now takes several packages (hledger,hledger-lib; happy,happy-lib
