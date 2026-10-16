@@ -58,7 +58,10 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `chunk009` (the second chunk compiled with other optimisation
   flags; the first cut a name its other module re-exports); `chunk010` (a
   module below the chunk SOURCE-imports one that is not built: the session
-  leaves the real module and its hs-boot node out, `b8119aab5b`).
+  leaves the real module and its hs-boot node out, and reads the module
+  it names through the hs-boot interface: eps_is_boot is set in chunk
+  sessions as in one-shot mode, and before the merge, `(this commit)`;
+  before that, `b8119aab5b`).
 * **Commit:** `88a9da9217`
 
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)

@@ -892,7 +892,12 @@ module: an unfolding in a chunk module's interface can mention a binder of
 that module, which the module importing it need not import (transitively),
 so it is not in the session.  Like one-shot mode, a chunk then reads the
 interface from its file, into the EPS (the module never enters the session's
-HPT); the build (hadrian) has built the other chunk whole before.
+HPT); the build (hadrian) has built the other chunk whole before.  And as in
+one-shot mode, whether to read a home module's hs-boot interface is decided
+by eps_is_boot, which a chunk sets as one-shot mode does (tcRnImports in
+GHC.Tc.Module, and before the merge in GHC.WebCore.Chunk): a module below
+the chunk can import one {-# SOURCE #-} that is not in the session (Note
+[Modules below a chunk] in GHC.WebCore.Chunk).
 -}
 
 findAndReadIface

@@ -494,7 +494,11 @@ tcRnImports hsc_env import_decls
                 -- Record boot-file info in the EPS, so that it's
                 -- visible to loadHiBootInterface in tcRnSrcDecls,
                 -- and any other incrementally-performed imports
-              ; when (isOneShot (ghcMode (hsc_dflags hsc_env))) $ do {
+                -- (and in a webs chunk, which reads home interfaces from
+                -- their files too: Note [Home modules outside a chunk] in
+                -- GHC.Iface.Load)
+              ; when (isOneShot (ghcMode (hsc_dflags hsc_env))
+                      || gopt Opt_CoreWebsChunk (hsc_dflags hsc_env)) $ do {
                   updateEps_ $ \eps  -> eps { eps_is_boot = imp_boot_mods imports }
                }
 

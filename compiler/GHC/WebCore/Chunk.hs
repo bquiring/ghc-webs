@@ -19,6 +19,10 @@ import GHC.Unit.Module.Graph ( ModuleGraph, mapMG, mgModSummaries, mgModSummarie
                               , NodeKey(..), isBootModuleNodeInfo, moduleNodeInfoModNodeKeyWithUid )
 import GHC.Unit.Module.ModNodeKey ( ModNodeKeyWithUid(..) )
 import GHC.Unit.Types ( GenWithIsBoot(..), IsBootInterface(..) )
+import GHC.Unit.External ( ExternalUnitCache(..), ExternalPackageState(..) )
+import GHC.Unit.Env ( UnitEnv(..) )
+import GHC.Unit.Module.Deps ( dep_boot_mods )
+import GHC.Tc.Types ( mkModDeps )
 import GHC.Types.Avail ( AvailInfo(..) )
 import System.Directory ( doesFileExist, copyFile )
 import GHC.Driver.DynFlags
@@ -347,6 +351,12 @@ chunkMake targets = do
   let hpt = hsc_HPT hsc_env1
   liftIO $ modifyIORef' (hptInternalTableRef hpt) $
     mapUDFM (\hmi -> hmi { hm_details = (hm_details hmi) { md_rules = [], md_anns = [] } })
+  -- The merge reads the chunk's interfaces lazily: a home module that a
+  -- chunk module imports {-# SOURCE #-} must be read from its hs-boot
+  -- interface (which the session's graph may not hold: Note [Modules below
+  -- a chunk]), as when typechecking the module itself (eps_is_boot)
+  liftIO $ modifyIORef' (euc_eps (ue_eps (hsc_unit_env hsc_env1))) $ \eps ->
+    eps { eps_is_boot = mkModDeps (Set.unions [ dep_boot_mods (mg_deps g) | g <- gutss ]) }
   let hsc_env = hscSetFlags dflags0 $
                 hsc_env1 { hsc_plugins = hsc_plugins hsc_env0 }
       main_name = mainModuleNameIs dflags0
