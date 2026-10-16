@@ -21,7 +21,9 @@ import GHC.Types.Var.Env
 import GHC.Utils.Misc    ( notNull, lengthExceeds )
 import GHC.Core.Type     ( splitTyConApp_maybe )
 import GHC.Core.TyCon    ( isAlgTyCon, tyConDataCons )
-import GHC.Core.FVs      ( exprsFreeVars, exprSomeFreeVarsList )
+import GHC.Core.FVs      ( exprsFreeVars, exprSomeFreeVarsList, exprFreeVars )
+import GHC.Types.Var.Set ( VarSet, emptyVarSet, elemVarSet, extendVarSetList )
+import GHC.Types.Unique.FM ( nonDetEltsUFM, listToUFM )
 import GHC.Core.Subst    ( mkEmptySubst, substExpr, substBndr, extendTvSubst, extendCvSubst )
 import GHC.Core.Utils    ( bindNonRec )
 import GHC.Types.Var     ( isTyVar, isCoVar )
@@ -126,6 +128,7 @@ initLiberateCaseEnv opts = LibCaseEnv
    , lc_lvl_env   = emptyVarEnv
    , lc_rec_env   = emptyVarEnv
    , lc_joins     = emptyVarEnv
+   , lc_copies    = emptyVarSet
    , lc_scruts    = []
    }
 
@@ -262,15 +265,47 @@ libCase env (Let bind body)
       _ -> env_body
 
 libCase env (Case scrut bndr ty alts)
-  = Case (libCase env scrut) bndr ty (map (libCaseAlt env_alts) alts)
+  = Case (libCase env scrut) bndr ty (map (libCaseAlt env_alts copies) alts)
   where
     env_alts = addBinders (mk_alt_env scrut) [bndr]
     mk_alt_env (Var scrut_var) = addScrutedVar env scrut_var
     mk_alt_env (Cast scrut _)  = mk_alt_env scrut       -- Note [Scrutinee with cast]
     mk_alt_env _               = env
+    -- Note [One copy per alternative]: the recursive groups this case
+    -- lets us specialise, unrolled once per alternative
+    copies
+      | lco_join_points (lc_opts env)
+      , (new@(x, _, _) : _) <- lc_scruts env_alts
+      , length (lc_scruts env_alts) > length (lc_scruts env)
+      , isSumTyped x
+      = [ bind | bind <- groups
+               , any (\f -> notNull (freeScrutsIn [new] (lookupLevel env f))) (bindersOf bind) ]
+      | otherwise
+      = []
+    groups = nubByFirst (nonDetEltsUFM (lc_rec_env env))
+    nubByFirst bs = nonDetEltsUFM (listToUFM [ (b, bind) | bind <- bs, b : _ <- [bindersOf bind] ])
 
-libCaseAlt :: LibCaseEnv -> Alt CoreBndr -> Alt CoreBndr
-libCaseAlt env (Alt con args rhs) = Alt con args (libCase (addBinders env args) rhs)
+libCaseAlt :: LibCaseEnv -> [CoreBind] -> Alt CoreBndr -> Alt CoreBndr
+libCaseAlt env copies (Alt con args rhs) = Alt con args (wrap rhs')
+  where
+    env' = (addBinders env args) { lc_copies = lc_copies env `extendVarSetList` concatMap bindersOf copies }
+    rhs' = libCase env' rhs
+    fvs  = exprFreeVars rhs'
+    wrap e = foldr (\bind e -> if any (`elemVarSet` fvs) (bindersOf bind) then Let bind e else e) e copies
+
+{- Note [One copy per alternative]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Liberate case unrolls a recursive group at each call in a case's scope:
+with two calls of loop under one alternative (two jumps to the join point
+of Note [Liberate case through join points], say) it makes two copies of
+loop, both specialised alike.  With -fliberate-case-join-points, a case on
+a variable of a type with several constructors instead binds each group it
+lets us specialise once, at the head of each alternative that calls it, and
+the calls inside refer to that copy (lc_copies): one loop per constructor.
+(nofib puzzle: one copy per call made 20 KB more code, and the hot loop
+nest no longer fit in the instruction cache: cycles +2.5% for 7.5% fewer
+instructions.)
+-}
 
 {-
 Ids
@@ -304,6 +339,7 @@ libCaseApp env v args
 
   | Just the_bind <- lookupRecId env v  -- It's a use of a recursive thing
   , notNull free_scruts                 -- with free vars scrutinised in RHS
+  , not (v `elemVarSet` lc_copies env)  -- not unrolled already (Note [One copy per alternative])
   = Let the_bind expr'
 
   | otherwise
@@ -530,6 +566,11 @@ data LibCaseEnv
         lc_rec_env :: IdEnv CoreBind,
                 -- ^ Binds *only* recursively defined ids, to their own
                 -- binding group, and *only* in their own RHSs
+
+        lc_copies :: VarSet,
+                -- ^ Recursive binders unrolled at the head of an
+                -- enclosing case alternative: calls refer to that copy
+                -- (Note [One copy per alternative])
 
         lc_joins :: IdEnv (CoreExpr, Int),
                 -- ^ The non-recursive join points in scope, with their

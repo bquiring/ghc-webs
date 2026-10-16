@@ -90,7 +90,8 @@ chunk012:
 
 # libcasejoin001: liberate case through a join point (Note [Liberate case
 # through join points] in GHC.Core.Opt.LiberateCase): the loops in the final
-# Core, one per constructor of the defunctionalised predicate and jump site
+# Core, one per constructor of the defunctionalised predicate (Note [One copy
+# per alternative])
 .PHONY: libcasejoin001
 libcasejoin001:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -XBangPatterns -fcore-webs-early -fcore-webs-defunc \
