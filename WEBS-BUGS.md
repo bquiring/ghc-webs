@@ -57,7 +57,7 @@ would catch it again), **commit** (empty while uncommitted).
   modules it SOURCE-imports (`f2f4e6d2dc`).
 * **Guard:** `chunk009` (the second chunk compiled with other optimisation
   flags; the first cut a name its other module re-exports).
-* **Commit:** (this commit)
+* **Commit:** `88a9da9217`
 
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
 * **Found by:** building GHC with 65 chunks of the `ghc` package (hadrian,
