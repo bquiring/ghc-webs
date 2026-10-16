@@ -70,7 +70,7 @@ would catch it again), **commit** (empty while uncommitted).
   module below the chunk SOURCE-imports one that is not built, and the
   chunk uses a type of it).
 * **Commit:** `88a9da9217`, `b8119aab5b`, `8577191673`, `55433a8ccf`,
-  `fe96ad2a69`, (this commit)
+  `fe96ad2a69`, `fd2ba44a46`
 
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
 * **Found by:** building GHC with 65 chunks of the `ghc` package (hadrian,
