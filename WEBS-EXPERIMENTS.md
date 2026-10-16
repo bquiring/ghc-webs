@@ -806,6 +806,56 @@ the round limit (Cabal-syntax ran out of memory), and defunctionalisation's
 and arity raising's analyses keeping a list entry per arrow occurrence
 (haskell-src-exts's happy-generated parser: 13 GB, now 0.92 GB).
 
+## 21. Where defunctionalisation's gains come from (2026-10-16)
+
+nofib, early-ulsl8 (the current compiler, early-ulsl's options) against the
+same without `-fcore-webs-defunc` (run-nodefunc.sh): −4.17% against
+−2.68% instructions, geomean over 109. Eight benchmarks move by 0.5% or
+more. Counters (`branch-counters.py`, medians of 3; `ticky-compare.py`,
+-ticky builds), defunctionalisation's change:
+
+| benchmark | instr | cycles | indirect branches | indirect mispredicts | cond. mispredicts | unknown calls | allocation |
+|---|---|---|---|---|---|---|---|
+| integrate | −76.2% | −68.8% | −78.7% | −49.1% | −70.3% | | −80.6% |
+| solid | −13.8% | −7.1% | −3.7% | −11.3% | −4.9% | −78.2% | −38.1% (thunks −45%) |
+| mate | −4.4% | −5.6% | −10.1% | −15.5% | −6.0% | −73.5% | −6.3% (thunks −12%) |
+| hpg | −2.9% | −5.0% | −0.7% | +0.9% | +0.3% | +1.5% | −1.1% (PAPs −60%, very slow calls gone) |
+| ida | −2.5% | −4.3% | −6.6% | −13.0% | +0.2% | −99.9% | +0.1% (closures → constructors) |
+| simple | −1.2% | −2.0% | −0.6% | −9.0% | −1.0% | | −0.1% (icache misses +45%) |
+| veritas | +0.6% | +4.2% | +0.6% | +3.0% | +5.7% | −4.7% | +0.7% (constructors +5%) |
+| multiplier | +1.2% | +3.3% | +0.1% | −0.9% | +4.6% | −99.9% | +2.3% (known calls −39%) |
+
+Three mechanisms:
+
+* **Inlining at the dispatch, and what it enables** (integrate, solid):
+  the big wins. A call `f x` becomes `case f of K fvs -> body`, the
+  lambda's body inlined with its captured variables as fields. In
+  integrate, `\x -> x*y` becomes `*##` on unboxed doubles, and the inner
+  `integrate1D` is specialised on the constructor: no `D#` boxing at the
+  nine calls per integration, no closures, allocation −81%. In solid the
+  known code is strict where the unknown call was lazy: thunk allocation
+  −45%.
+* **Branch prediction** (ida, mate): unknown calls become a conditional
+  branch and a known call; indirect mispredictions −13% and −16%, and
+  cycles fall more than instructions. In ida allocation is unchanged:
+  every function closure becomes a constructor of the same size.
+* **Closure representation** (hpg): partial applications −60% and
+  GHC's very slow calls (an unknown call whose arity does not match)
+  gone.
+
+The losses: the dispatch costs where it replaces little. multiplier's
+unknown calls all go, but its conditional branches rise 3% and their
+mispredictions 4.6%; veritas allocates 5% more in constructors than it
+did in closures, with more mispredictions too.
+
+integrate without defunctionalisation: the web of `f` (both lambdas of
+`integrate2D` and `zark`'s) is not arity-raised, "lazy in its argument"
+(`\y -> integrate1D l1 u1 (\x -> f x y)` uses y only inside a closure),
+and not result-raised, "a tail does not construct the result" (that
+lambda's tail is a call of `integrate1D`). Yet every call passes an
+evaluated `D# e` and every lambda's result is a `D#` (through
+integrate1D's own result).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
