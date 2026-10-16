@@ -173,6 +173,26 @@ A product with no components still becomes one (# #) argument, so that a
 function never loses its last lambda (and its work is not shared).
 -}
 
+{- Note [Raised lambdas are one-shot]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The first component's lambda is applied as often as the product's lambda
+was, and keeps its one-shot mark.  The later components' lambdas are
+one-shot: their webs are fresh, and the only calls in them are the raised
+calls, which pass all the components at once, so each partial application
+is applied once, by the call that made it.
+
+Without the marks the simplifier cannot float work into them.  The
+boundary wrapper of a parameter of type  x -> Env -> Answer  (Note
+[Eta-expanding parameters at the boundary] in GHC.WebCore.Boundary) is
+
+    \p -> let r = g p in \e -> r e        -- \e one-shot
+
+and raising Env (8 fields) gave  \p -> let r = g p in \x1 .. x8 -> r (MkEnv
+x1 .. x8)  with no marks; the simplifier could move r only under \x1.  Every
+call passed all nine arguments to a function of arity 2, through the
+generic apply (nofib real/hpg: Env.upto, 1.0M slow calls).
+-}
+
 {- Note [Component demands]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A raised lambda's components are fresh binders, and arity raising decides
@@ -770,10 +790,14 @@ rewriteProgram fields todo inner pol binds
                    n :* sd | Just (_, ds) <- viewProd (length comp_tys) sd
                            -> map (multDmd n) ds
                    _       -> map (const topDmd) comp_tys
-           ; xs <- mapM (\(ty, d) -> do { u <- getUniqueM
-                                        ; return (mkSysLocal (fsLit "x") u ManyTy ty
-                                                    `setIdDemandInfo` d) })
-                        (zip comp_tys comp_dmds)
+           ; xs0 <- mapM (\(ty, d) -> do { u <- getUniqueM
+                                         ; return (mkSysLocal (fsLit "x") u ManyTy ty
+                                                     `setIdDemandInfo` d) })
+                         (zip comp_tys comp_dmds)
+             -- Note [Raised lambdas are one-shot]
+           ; let xs = zipWith (\i x -> if i == (0 :: Int) then x `setIdOneShotInfo` idOneShotInfo p
+                                                         else setOneShotLambda x)
+                              [0..] xs0
            ; e1 <- rw env1 e
              -- Unpack under any further lambdas; see splitLeadingLams
            ; let (lams, body) = splitLeadingLams e1
@@ -785,6 +809,7 @@ rewriteProgram fields todo inner pol binds
            ; case xs of
                [] -> do { u <- getUniqueM
                         ; let t = mkSysLocal (fsLit "ut") u ManyTy tup_ty
+                                    `setIdOneShotInfo` idOneShotInfo p
                         ; wild <- mkWild tup_ty
                         ; return (WebLam w t (lams (Case (Var t) wild (exprType e3)
                                                      [Alt (DataAlt (tupleDataCon Unboxed 0)) [] e3]))) }

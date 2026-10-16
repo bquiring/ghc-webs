@@ -19,6 +19,11 @@ would catch it again), **commit** (empty while uncommitted).
   kept, and their continuation parameters eta-expanded in the wrappers.
   Without defunctionalisation +6.1%, so the cost is in the split itself.
   Next: an ablation flag for the parameter eta-expansion, then ticky.
+  **Part found and fixed (2026-10-16):** arity raising dropped the one-shot
+  mark of the wrapper's inner lambda (see "Raised lambdas lost their
+  one-shot marks" below). Without defunc hpg went +6.1% → +5.7%; what
+  remains is the 9-argument unknown call to `nc` in `Env.$w$eupto` (past
+  the 6-argument apply patterns), which defunc makes known. Open.
 
 * **rewrite also fails under `early-cur`** (2026-10-09, nofib binaries
   built before the fix below): fixed; rewrite builds and runs right in the
@@ -1207,6 +1212,24 @@ in GHC.WebCore.Chunk, Notes [Chunks], [Merging the chunk's modules],
 * **Fix:** Note [SpecConstr and reflexive coercions]. constraints +1.4% →
   −0.02%, solid −18.8%.
 * **Commit:** `5c9eac86b8`
+
+### Raised lambdas lost their one-shot marks: hpg's boundary wrapper (2026-10-16)
+
+**Symptom.** nofib real/hpg without defunctionalisation: 1.0M generic
+applies of 9 arguments to a closure of arity 2 in `Env.$w$eupto`.
+**Cause.** The boundary wrapper of `choose`'s parameter `xc :: x -> Env ->
+Answer` is `\p -> let r = xc p in \e -> r e`, with `\e` one-shot (Note
+[Eta-expanding parameters at the boundary]). Arity raising split `\e` into
+eight curried component lambdas with fresh binders and no one-shot marks,
+so the simplifier could float `r` under the first only:
+`\x1 eta2 -> let r = ... in \x2 .. x8 -> r (MkEnv ...)`.
+**Fix.** The first component's binder keeps the product binder's one-shot
+mark; the later ones are one-shot (their webs are fresh and only raised
+calls, which pass all components at once, apply them): Note [Raised
+lambdas are one-shot] in GHC.WebCore.Transform.ArityRaise. Now `nc` has
+arity 9. **Effect** (`run-oneshot.sh`): hpg −0.4% instructions without
+defunc; no other benchmark moves by 0.5%; geomeans unchanged.
+**Guard.** The Note; webs testsuite (728 passed).
 
 ### Uncurrying known calls: late run's big regressions (2026-10-08)
 * **Found by:** `late-fix`: +2.68% geomean, 57 worse; binary-trees +34%,
