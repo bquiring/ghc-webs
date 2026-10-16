@@ -14,6 +14,73 @@ a heuristic.
 
 ## Now
 
+### Where we are (2026-10-16, handoff)
+
+Nothing pushed (branch `webs`, ~45 commits ahead of origin). 726 webs tests
+pass. Baselines: nofib `base` and `early-ulsl8` (early-ulsl's options,
+current compiler; bins in webs-bench/results, -4.17% instructions vs base),
+`early-ulsl8-nod` (same without defunctionalisation, -2.68%).
+
+Done today (all flags off by default):
+* `-fcore-webs-split-classes` (class dictionaries split like data): no
+  gain on whole programs; the specialiser removes dictionaries first
+  (WEBS-CHUNKS.md §3.2j).
+* `-fliberate-case-join-points` (liberate case through join points, one
+  unrolled copy per alternative, sum types only): dhall −4.24% → −5.18%;
+  nofib a wash (puzzle's icache) (§3.2h').
+* `-fcore-webs-drop-rules`: frees 516 lambda classes in dhall, gains
+  ~0.1 point (§3.2l).
+* Where defunctionalisation's gains come from (WEBS-EXPERIMENTS.md §21):
+  inlining at the dispatch and what it enables (integrate, solid),
+  branch prediction (ida, mate), closure representation (hpg).
+  Scripts: webs-bench/branch-counters.py, webs-bench/ticky-compare.py.
+* Moving constructors across webs (§22): `-fcore-webs-raise-through-calls`
+  (result raising as a group through tail calls; CPR-signature calls and
+  eta-expansions taken apart, an eta-expansion alone is no reason) and
+  `-fcore-webs-evald-args` (constructor applications whatever their fields,
+  case binders, let-bound values are values at a call). integrate without
+  defunc −50% instructions, −76% allocation; nofib no-defunc −2.68% →
+  −3.21%. Tests raisecall001/002, evaldarg001.
+* GHC in chunks: paused at a --make/hs-boot driver problem (below).
+
+The user's hypothesis (2026-10-16): most of what defunctionalisation's
+inlining gains, a web transformation can get without inlining; branch
+prediction is out of our control. Keep it in mind while going through
+defunc's wins.
+
+**Next (agreed, not started):** constant specialisation (the item at the
+top of "Core-to-Core: to implement"; solid's CSGtraverse_2, §22a), two
+implementations behind two flags to compare, one shared transformation at
+the end of the early run (after erasure; GHC's later passes see the known
+calls):
+* shared: top-level recursive f; static function parameters (every
+  recursive call passes the parameter unchanged, every occurrence of f a
+  saturated call with the same type arguments) that f calls; one copy per
+  key (type arguments + one known top-level function per static
+  parameter), type variables instantiated, static parameters substituted
+  and removed, recursive calls to the copy; calls passing the key
+  syntactically (Var g) redirected; at most 4 keys per function, a size
+  bound; copies appended, then reorderTopBinds;
+* `-fcore-webs-spec-webs`: a key g is admitted for parameter x only if
+  g's first lambda is in the web class of x's arrow and that class has
+  at most 4 lambdas (computed from the solved, renamed program before
+  erasure, keyed by the parameter binder's unique); one round;
+* `-fcore-webs-spec-calls`: keys from the calls alone, repeated rounds (up
+  to 3) so that chains work (a copy that now passes a known function);
+* then: solid, nofib against early-ulsl8 and early-ulsl8-nod, and the
+  heuristics in that backlog item (the user wants them careful).
+Then the remaining defunc wins: mate (allocation moves between functions,
+moveLine allocates more with defunc), hpg (partial applications −60%,
+very slow calls gone: arity?), ida (branch prediction only).
+
+Still open from before: GHC chunks (decision: keep fixing --make, or merge
+from -fwrite-if-simplified-core interfaces, WEBS-CHUNKS.md §3.2k); a code
+bound for liberate case through join points; cpphs's useless-elimination
+regression (unexplained); the next Hackage benchmarks (cabal-install,
+Futhark, PureScript, Koka).
+
+### Plan of 2026-10-09/10 (older)
+
 Plan (end of 2026-10-09, updated 2026-10-10; branch `webs`, instrumentation on
 `exposure-stats`):
 
