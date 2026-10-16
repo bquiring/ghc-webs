@@ -127,6 +127,28 @@ webs as newtypes (the occurs check never fires on nofib).
     each time (e.g. defunctionalisation's types `D_w a b`, specialised when
     a most general unifier exists).
 
+- **GHC in chunks: paused, decision pending** (2026-10-16; WEBS-CHUNKS.md
+  §3.2k). chunk-graph.py chooses 62 chunks of the `ghc` package from the
+  types of the names modules use from each other (89% of the edge weight
+  still between chunks); hadrian builds several chunks per package. The
+  chunked self-host (`~/projects/ghc-selfhost`, root `_build-chunkw`,
+  `run-chunkw.sh`, chunks in `chunks/graph1`) stops in phase 1: a chunk's
+  --make session compiles several modules, and once one module's imports
+  put GHC.Core's hs-boot interface in the EPS, a later module's ordinary
+  import of GHC.Core gets it (GHC.Core.InstEnv: "does not export
+  IsOrphan"); replacing it broke the renamer (lookupGREInfo: NotOrphan;
+  reverted, not committed). Seven earlier driver problems are fixed
+  (chunk008-chunk012). Options: keep fixing the --make path, or merge
+  chunks from interfaces written one-shot with -fwrite-if-simplified-core
+  (§3.1), with no --make session. Also open: bigger chunks for GHC's
+  dense clusters (a memory measurement first).
+- **Specialisations pin binders in whole programs** (idea, 2026-10-16;
+  WEBS-CHUNKS.md §3.2j). In a whole-program chunk the binders kept
+  exposed are the specialiser's `$s` functions (named by the rules it made
+  for imported functions) and INLINE default methods with what they call,
+  not dictionaries: class splitting (`-fcore-webs-split-classes`) found
+  nothing to split on happy and alex. Dropping or rebuilding those rules
+  around the early run would free them.
 - **Unswitching loops on a defunctionalised value** (2026-10-15,
   WEBS-CHUNKS.md §3.2h): a loop that passes a defunctionalised value
   unchanged and dispatches on it per iteration (megaparsec's `takeWhile1P`
