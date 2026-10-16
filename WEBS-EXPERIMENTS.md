@@ -856,6 +856,43 @@ lambda's tail is a call of `integrate1D`). Yet every call passes an
 evaluated `D# e` and every lambda's result is a `D#` (through
 integrate1D's own result).
 
+## 22. Moving constructors across webs (2026-10-16)
+
+The user's direction: what defunctionalisation gains by inlining, a web
+transformation can often get by moving a constructor, from the arguments
+into the parameters (arity raising of constructed arguments) or from the
+results to around the calls (result raising), here through calls between
+webs. Two flags (Note [Raising through tail calls] in
+GHC.WebCore.Transform.ResultRaise, Note [Evaluated arguments] in
+GHC.WebCore.Transform.ArityRaise): `-fcore-webs-raise-through-calls`
+raises webs as a group when a tail calls another web, and takes apart
+tails that call a function whose CPR signature constructs (imported
+`timesDouble`) and eta-expansions (the boundary wrapper's);
+`-fcore-webs-evald-args` takes a saturated constructor application
+(whatever its fields' arguments: `D# (y +## x)` is no exprIsHNF), a case
+binder or a let-bound value as a value at a call.
+
+integrate (no defunctionalisation): instructions 30.3 M → 15.2 M (−50%),
+allocation 16.9 → 4.1 MB; defunctionalisation reaches 7.1 M, 3.3 MB.
+
+nofib (run-movecons.sh), instructions, geomean over 109:
+
+| config | instructions |
+|---|---|
+| early-ulsl8 (with defunc) | −4.17% |
+| early-ulsl8 + flags | −4.18% |
+| early-ulsl8-nod (no defunc) | −2.68% |
+| early-ulsl8-nod + flags | −3.21% |
+
+Without defunctionalisation integrate −46.6%; with it −2.8% more. The
+regressions of that run were webs of the boundary wrapper's
+eta-expansions alone (cse: twelve, +1.7% instructions, +3.1% allocation;
+veritas +0.7%): taken apart and rebuilt. An eta-expansion now allows
+raising but is no reason for it; cse and veritas back to baseline (±0.04%).
+Tests raisecall001, raisecall002 (undefined lazy fields: nothing more is
+forced), evaldarg001 (a lambda that keeps the box rebuilds it; here the
+program still allocates less: 40.9 → 40.1 MB).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

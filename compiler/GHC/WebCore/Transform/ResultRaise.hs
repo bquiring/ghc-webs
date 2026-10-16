@@ -94,7 +94,10 @@ saturated call of a function whose CPR signature says it constructs its
 result (imported: GHC.Internal.Float.timesDouble in integrate's \x -> x*y),
 and the call in an eta-expansion \p -> x p (the boundary wrapper's, of the
 function an exported function is given: only calls from outside go
-through it).
+through it).  An eta-expansion counts as no construction: a web of
+eta-expansions alone is not raised (nofib cse: twelve such webs, whose
+wrappers its other modules call, cost +1.7% instructions and +3.1%
+allocation, results taken apart and rebuilt).
 
 nofib imaginary/integrate: integrate2D's lambda \y -> integrate1D l1 u1
 (\x -> f x y) returns integrate1D's result, a D# integrate1D constructs:
@@ -312,7 +315,9 @@ analyse through fields binds = foldr go_bind emptyUFM binds
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc
       = go_bndr p $ go e $
-        let (n, bad, tws) | through, isEtaCall p e = (1, False, emptyUniqSet)
+        -- (an eta-expansion allows raising, but is no reason for it: a web
+        -- of eta-expansions only would take results apart and rebuild them)
+        let (n, bad, tws) | through, isEtaCall p e = (0, False, emptyUniqSet)
                           | otherwise              = tailInfo through w e
         in note w (noInfo { i_lams = [p], i_bad_tail = bad, i_con_tails = n, i_tail_webs = tws }) acc
     go (Let bind body) acc = go_bind bind (go body acc)
