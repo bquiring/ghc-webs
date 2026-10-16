@@ -641,6 +641,40 @@ process) are what hadrian's other modules assume. The alternative is
 §3.1: build every module one-shot as usual with -fwrite-if-simplified-core
 and merge the chunk from the interfaces, with no --make session at all.
 
+### 3.2l Rules in whole programs (2026-10-16)
+
+Exposed lambda classes by the kept binder they come from (the dump now
+names the root a binder in an unfolding or rule comes from), ulsl2's
+webs, whole-program chunks:
+
+| program | lambda classes | exposed | through rules | through stable unfoldings |
+|---|---|---|---|---|
+| happy | 1,237 | 93 | 33 | 24 |
+| alex | 951 | 112 | 21 | 23 |
+| dhall | 6,970 | 1,237 | 712 | 332 |
+| hledger | 18,452 | 960 | 381 | 436 |
+
+The rules are the specialiser's: specialisations of imported functions
+(free in the module's rules) and of the program's overloaded functions (on
+the binders). `-fcore-webs-drop-rules` (Note [Dropping rules in a whole
+program] in GHC.WebCore.Pipeline) drops them at the start of the early
+run: internal lambda classes +18 (happy), +19 (alex), +516 (dhall), +250
+(hledger). Instructions (`-V0`, same outputs):
+
+| program | no webs | rules dropped | ulsl2's webs | webs, rules dropped |
+|---|---|---|---|---|
+| happy | 35,359 M | −0.32% | +0.34% | +0.02% |
+| alex | 1,345.9 M | 0.00% | +0.16% | +0.16% |
+| hledger (-O1) | 42,181 M | −0.09% | −0.37% | −0.59% |
+| dhall | 1,955.2 M | −0.12% | −4.22% | −4.34% |
+
+Dropping the rules costs nothing: by the early run they have done their
+work, and dropping them gains a little by itself. But the webs gain
+almost nothing from the freed classes: against the build that only drops
+rules, webs give −4.22% on dhall (the same as without dropping) and
+−0.50% on hledger (against −0.37%). The freed classes are, like most
+internal ones, first-order or unknown-call-free (§1.1).
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's

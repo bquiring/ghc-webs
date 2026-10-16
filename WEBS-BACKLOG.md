@@ -147,8 +147,11 @@ webs as newtypes (the occurs check never fires on nofib).
   exposed are the specialiser's `$s` functions (named by the rules it made
   for imported functions) and INLINE default methods with what they call,
   not dictionaries: class splitting (`-fcore-webs-split-classes`) found
-  nothing to split on happy and alex. Dropping or rebuilding those rules
-  around the early run would free them.
+  nothing to split on happy and alex. Dropping those rules around the
+  early run (`-fcore-webs-drop-rules`, 2026-10-16, WEBS-CHUNKS.md §3.2l)
+  frees 516 lambda classes in dhall and 250 in hledger, costs nothing,
+  and gains little: dhall −4.22% → −4.34%, hledger −0.37% → −0.59%.
+  Stable unfoldings (dhall 332, hledger 436 classes) not tried.
 - **Unswitching loops on a defunctionalised value**: done as liberate case
   through join points (`-fliberate-case-join-points`, 2026-10-16,
   WEBS-CHUNKS.md §3.2h'): dhall −4.24% → −5.18% (all webs), nofib −4.17%

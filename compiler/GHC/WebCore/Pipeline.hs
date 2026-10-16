@@ -40,7 +40,7 @@ import GHC.Core.DataCon ( dataConName, dataConFieldLabels, isVanillaDataCon, dat
 import GHC.Types.Avail ( AvailInfo(..), availsToNameSet )
 import GHC.Types.FieldLabel ( flSelector )
 import GHC.Types.Name.Set ( elemNameSet, emptyNameSet, mkNameSet )
-import GHC.Types.Id.Info ( ruleInfoRules )
+import GHC.Types.Id.Info ( ruleInfoRules, emptyRuleInfo )
 import GHC.Types.Unique ( getUnique )
 
 import GHC.Data.Bag
@@ -124,8 +124,11 @@ equal types, and alpha-equivalent right-hand sides, and must contain no webs.
 -- | Run the web pipeline.  The Bool says whether this is the early run,
 -- before worker/wrapper (-fcore-webs-early); see Note [Early webs].
 webPass :: Bool -> ModGuts -> CoreM ModGuts
-webPass early guts
+webPass early guts_in
   = do { dflags <- getDynFlags
+         -- Note [Dropping rules in a whole program]
+       ; let guts | early && gopt Opt_CoreWebsDropRules dflags = dropRules guts_in
+                  | otherwise                                    = guts_in
        ; logger <- getLogger
        ; us     <- liftIO (mkSplitUniqSupply webUniqueTag)
 
@@ -585,6 +588,39 @@ mainExportsInternal dflags guts
 isMainEntry :: DynFlags -> Id -> Bool
 isMainEntry dflags b = occ == fromMaybe "main" (mainFunIs dflags) || take 1 occ == ":"
   where occ = getOccString b
+
+{- Note [Dropping rules in a whole program]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A rule is Core the web passes do not rewrite: the binders it mentions keep
+their types (keptIds in GHC.WebCore.Annotate; pinnedIds in
+GHC.WebCore.DataSplit), with what their unfoldings mention.  In a whole
+program (a chunk, Note [Chunks] in GHC.WebCore.Chunk) the rules are
+mostly the specialiser's: specialisations of imported functions (free in
+the module's rules) and of the program's overloaded functions (on the
+binders).  By the early run the specialiser has run, and most of them have
+fired; in dhall they keep 712 of the 1,237 exposed lambda classes.  With
+-fcore-webs-drop-rules (an experiment, for whole programs: nothing imports
+their rules) the early run drops the module's rules and the rules of the
+binders that are not exported, before anything else.
+-}
+
+-- | Drop the module's rules and those of the binders that are not exported
+-- (Note [Dropping rules in a whole program])
+dropRules :: ModGuts -> ModGuts
+dropRules guts = guts { mg_rules = [], mg_binds = map bind (mg_binds guts) }
+  where
+    bind (NonRec b e) = NonRec (bndr b) (expr e)
+    bind (Rec prs)    = Rec [ (bndr b, expr e) | (b, e) <- prs ]
+    bndr b | isId b, not (isExportedId b) = b `setIdSpecialisation` emptyRuleInfo
+           | otherwise                    = b
+    expr e = case e of
+      Lam b x       -> Lam (bndr b) (expr x)
+      Let b x       -> Let (bind b) (expr x)
+      App f a       -> App (expr f) (expr a)
+      Case s b t as -> Case (expr s) b t [ Alt c bs (expr r) | Alt c bs r <- as ]
+      Cast x co     -> Cast (expr x) co
+      Tick t x      -> Tick t (expr x)
+      _             -> e
 
 -- | The classes data splitting made (Note [Splitting classes] in
 -- GHC.WebCore.DataSplit)

@@ -2578,6 +2578,7 @@ fFlagsDeps = [
   flagSpec "core-webs-data-split"             Opt_CoreWebsDataSplit,
   flagSpec "liberate-case-join-points"        Opt_LiberateCaseJoins,
   flagSpec "core-webs-split-classes"          Opt_CoreWebsSplitClasses,
+  flagSpec "core-webs-drop-rules"             Opt_CoreWebsDropRules,
   flagSpec "core-webs-data-unbox"             Opt_CoreWebsDataUnbox,
   flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
   flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,

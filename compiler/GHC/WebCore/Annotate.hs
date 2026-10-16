@@ -8,6 +8,7 @@ module GHC.WebCore.Annotate
   ) where
 
 import GHC.Prelude
+import Data.List ( stripPrefix )
 
 import GHC.Core
 import GHC.Core.Coercion.Axiom
@@ -159,7 +160,12 @@ keptIds keep_stable exported wrapper hidden rules binds = go emptyVarEnv roots
       | v `elemVarEnv` acc = go acc vs
       | otherwise
       = go (extendVarEnv acc v (v, if wrapper v then why ++ " (boundary wrapper)" else why))
-           ([ (d, "in an unfolding or rule") | d <- deps v, isLocalId d ] ++ vs)
+           ([ (d, "in an unfolding or rule, from: " ++ root_why why) | d <- deps v, isLocalId d ] ++ vs)
+
+    -- the reason of the root a binder in an unfolding or rule comes from
+    root_why why = case stripPrefix "in an unfolding or rule, from: " why of
+      Just r  -> r
+      Nothing -> why
 
     -- The free variables of the binder's rules and stable unfolding,
     -- recomputed from the rules (the cached ruleInfoFreeVars can be stale)
