@@ -88,6 +88,17 @@ chunk012:
 	  -o chunk012 -v0
 	./chunk012
 
+# libcasejoin001: liberate case through a join point (Note [Liberate case
+# through join points] in GHC.Core.Opt.LiberateCase): the loops in the final
+# Core, one per constructor of the defunctionalised predicate and jump site
+.PHONY: libcasejoin001
+libcasejoin001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -XBangPatterns -fcore-webs-early -fcore-webs-defunc \
+	  -fliberate-case-join-points -dcore-lint -ddump-simpl -dsuppress-all -ddump-to-file \
+	  -outputdir libcasejoin001.out -v0 libcasejoin001.hs -o libcasejoin001
+	grep -c joinrec libcasejoin001.out/libcasejoin001.dump-simpl
+	./libcasejoin001
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change

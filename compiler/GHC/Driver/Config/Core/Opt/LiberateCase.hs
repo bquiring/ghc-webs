@@ -12,4 +12,5 @@ initLiberateCaseOpts :: DynFlags -> LibCaseOpts
 initLiberateCaseOpts dflags = LibCaseOpts
   { lco_threshold = liberateCaseThreshold dflags
   , lco_unfolding_opts = unfoldingOpts dflags
+  , lco_join_points = gopt Opt_LiberateCaseJoins dflags
   }

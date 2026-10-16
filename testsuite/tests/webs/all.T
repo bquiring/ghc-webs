@@ -626,6 +626,9 @@ test('chunk010', [extra_files(['chunk010.hs', 'Chunk010C.hs', 'Chunk010X.hs', 'C
 test('chunk012', [extra_files(['chunk012.hs', 'Chunk012A.hs', 'Chunk012B.hs', 'chunk012.modules',
                                'chunk012.unused'])],
      makefile_test, ['chunk012'])
+# libcasejoin001: liberate case through join points (Note [Liberate case
+# through join points] in GHC.Core.Opt.LiberateCase)
+test('libcasejoin001', [extra_files(['libcasejoin001.hs'])], makefile_test, ['libcasejoin001'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

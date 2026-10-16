@@ -19,6 +19,11 @@ import GHC.Builtin.Types ( unitDataConId )
 import GHC.Types.Id
 import GHC.Types.Var.Env
 import GHC.Utils.Misc    ( notNull )
+import GHC.Core.FVs      ( exprsFreeVars, exprSomeFreeVarsList )
+import GHC.Core.Subst    ( mkEmptySubst, substExpr, substBndr, extendTvSubst, extendCvSubst )
+import GHC.Core.Utils    ( bindNonRec )
+import GHC.Types.Var     ( isTyVar, isCoVar )
+import GHC.Types.Basic   ( JoinPointHood(..) )
 
 {-
 The liberate-case transformation
@@ -118,6 +123,7 @@ initLiberateCaseEnv opts = LibCaseEnv
    , lc_lvl       = 0
    , lc_lvl_env   = emptyVarEnv
    , lc_rec_env   = emptyVarEnv
+   , lc_joins     = emptyVarEnv
    , lc_scruts    = []
    }
 
@@ -244,9 +250,14 @@ libCase env (Lam binder body)
   = Lam binder (libCase (addBinders env [binder]) body)
 
 libCase env (Let bind body)
-  = Let bind' (libCase env_body body)
+  = Let bind' (libCase env_body' body)
   where
     (env_body, bind') = libCaseBind env bind
+    -- Note [Liberate case through join points]
+    env_body' = case bind of
+      NonRec j rhs | lco_join_points (lc_opts env), isJoinId j
+        -> env_body { lc_joins = extendVarEnv (lc_joins env_body) j (rhs, length (lc_scruts env)) }
+      _ -> env_body
 
 libCase env (Case scrut bndr ty alts)
   = Case (libCase env scrut) bndr ty (map (libCaseAlt env_alts) alts)
@@ -276,6 +287,18 @@ whole jump instead:
 
 libCaseApp :: LibCaseEnv -> Id -> [CoreExpr] -> CoreExpr
 libCaseApp env v args
+  -- A jump to a join point that calls a recursive function, after a case
+  -- on a variable it can be specialised for: the join point's right-hand
+  -- side here, under the case (Note [Liberate case through join points])
+  | Just (rhs, n_scruts) <- lookupVarEnv (lc_joins env) v
+  , length args == joinArity
+  , let new_scruts = take (length (lc_scruts env) - n_scruts) (lc_scruts env)
+  , notNull new_scruts
+  , any (\f -> notNull (freeScrutsIn new_scruts (lookupLevel env f)))
+        (exprSomeFreeVarsList (\f -> isId f && f `elemVarEnv` lc_rec_env env) rhs)
+  , small rhs
+  = libCase env (instantiateJoin rhs args)
+
   | Just the_bind <- lookupRecId env v  -- It's a use of a recursive thing
   , notNull free_scruts                 -- with free vars scrutinised in RHS
   = Let the_bind expr'
@@ -287,6 +310,57 @@ libCaseApp env v args
     rec_id_level = lookupLevel env v
     free_scruts  = freeScruts env rec_id_level
     expr'        = mkApps (Var v) (map (libCase env) args)
+    joinArity    = case idJoinPointHood v of
+                     JoinPoint n -> n
+                     NotJoinPoint -> -1
+    small e      = case lc_threshold env of
+                     Nothing   -> True
+                     Just size -> couldBeSmallEnoughToInline (lc_uf_opts env) size e
+
+{- Note [Liberate case through join points]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fliberate-case-join-points.  Liberate case unrolls a recursive
+function at a recursive call that lies inside a case on one of its free
+variables.  The simplifier often puts the call in a join point bound
+outside the case instead:
+
+  joinrec loop n xs = case xs of
+    [] -> ...
+    c : cs -> join j = jump loop (n +# 1#) cs in
+              case p of { K1 -> ... jump j ...; K2 -> ... jump j ... }
+
+(a defunctionalised predicate p, tested once per character: megaparsec's
+takeWhile1P in dhall, WEBS-CHUNKS.md section 3.2h).  The jump to j is in
+the case's scope, the call to loop is not, and the loop dispatches on p
+in every iteration.  So at a jump to a non-recursive join point, when a
+variable has been scrutinised since the join point was bound, and the join
+point's right-hand side calls a recursive function that the new case could
+specialise (a free variable of it scrutinised at a deeper level), the
+right-hand side, applied to the jump's arguments, replaces the jump (if it
+is small: the liberate-case threshold).  Its call to loop is then in the
+case's scope, and loop is unrolled there as usual: one loop per
+constructor of p, each its own.
+-}
+
+-- | A join point's right-hand side applied to a jump's arguments
+-- (Note [Liberate case through join points])
+instantiateJoin :: CoreExpr -> [CoreExpr] -> CoreExpr
+instantiateJoin rhs args = go (mkEmptySubst (mkInScopeSet (exprsFreeVars (rhs : args)))) rhs args
+  where
+    go subst (Lam b body) (a : as)
+      | isTyVar b, Type t <- a     = go (extendTvSubst subst b t) body as
+      | isCoVar b, Coercion c <- a = go (extendCvSubst subst b c) body as
+      | otherwise                  = let (subst', b') = substBndr subst b
+                                     in bindNonRec b' a (go subst' body as)
+    go subst e as = mkApps (substExpr subst e) as
+
+-- | The scrutinised variables among the given ones that a recursive
+-- function bound at the given level can be specialised for ('freeScruts')
+freeScrutsIn :: [(Id, LibCaseLevel, LibCaseLevel)] -> LibCaseLevel -> [Id]
+freeScrutsIn scruts rec_bind_lvl
+  = [v | (v, scrut_bind_lvl, scrut_at_lvl) <- scruts
+       , scrut_bind_lvl <= rec_bind_lvl
+       , scrut_at_lvl > rec_bind_lvl]
 
 freeScruts :: LibCaseEnv
            -> LibCaseLevel      -- Level of the recursive Id
@@ -402,6 +476,8 @@ data LibCaseOpts = LibCaseOpts
     lco_threshold :: !(Maybe Int)
   -- | Unfolding options
   , lco_unfolding_opts :: !UnfoldingOpts
+  -- | Look through join points: Note [Liberate case through join points]
+  , lco_join_points :: !Bool
   }
 
 {-
@@ -440,6 +516,11 @@ data LibCaseEnv
         lc_rec_env :: IdEnv CoreBind,
                 -- ^ Binds *only* recursively defined ids, to their own
                 -- binding group, and *only* in their own RHSs
+
+        lc_joins :: IdEnv (CoreExpr, Int),
+                -- ^ The non-recursive join points in scope, with their
+                -- right-hand sides and the length of lc_scruts where
+                -- they are bound: Note [Liberate case through join points]
 
         lc_scruts :: [(Id, LibCaseLevel, LibCaseLevel)]
                 -- ^ Each of these Ids was scrutinised by an enclosing

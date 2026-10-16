@@ -664,6 +664,7 @@ data GeneralFlag
    | Opt_CoreWebsInline     -- ^ Web pipeline: super-beta inlining
    | Opt_CoreWebsDefunc     -- ^ Web pipeline: defunctionalisation
    | Opt_CoreWebsDefuncLifted -- ^ Defunctionalisation: lift the lambdas' bodies, no apply function
+   | Opt_LiberateCaseJoins    -- ^ Liberate case looks through join points: Note [Liberate case through join points]
    | Opt_CoreWebsDataSplit    -- ^ Split data types by data flow (copies)
    | Opt_CoreWebsSplitClasses -- ^ ... and class dictionaries: Note [Splitting classes]
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
@@ -967,6 +968,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsInline
    , Opt_CoreWebsDefunc
    , Opt_CoreWebsDefuncLifted
+   , Opt_LiberateCaseJoins
    , Opt_CoreWebsDataSplit
    , Opt_CoreWebsSplitClasses
    , Opt_CoreWebsDataUnbox
