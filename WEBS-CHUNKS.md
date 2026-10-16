@@ -496,7 +496,25 @@ them (time −14.2% against −11.8%). puzzle's cycles go the other way
 (+2.5% without webs, +6.4% against early-ulsl8 with them): its L1
 instruction-cache misses triple (43 M → 127 M; 36 M → 115 M), with 20 KB
 more code, the unswitched copies, in a hot loop nest that no longer fits.
-Not decided: a bound on the code the join-point case may duplicate.
+Then (the user, 2026-10-16) one unrolled copy per alternative (Note [One
+copy per alternative]): a case binds each group it can specialise once,
+at the head of each alternative that calls it. puzzle: 8 KB more code
+instead of 20 KB. dhall keeps its gain (ulsl2's webs with the flag:
+1854.1 M instructions, as before). nofib (run-libcase3.sh, 109
+benchmarks):
+
+| config | instructions | cycles |
+|---|---|---|
+| base + flag | −0.05% | +0.08% |
+| early-ulsl8 | −4.17% | −4.21% |
+| early-ulsl8 + flag | −4.22% | −4.03% |
+
+Only mate and puzzle move by 0.5% or more in instructions. mate: −0.78%
+instructions, −1.34% cycles (with webs). puzzle: −5.62% instructions,
++0.32% cycles without webs; −5.17% instructions, +4.19% cycles with them
+(L1 instruction-cache misses still about twice base's). The flag stays off
+by default: it pays on dhall's defunctionalised loops and costs on
+puzzle's cache.
 
 ### 3.2i The other programs as whole-program chunks (2026-10-15)
 
