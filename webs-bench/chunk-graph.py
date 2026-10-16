@@ -46,14 +46,23 @@ def mod(path, ext):
     return path[len(build):-len(ext)].replace('/', '.')
 
 # --- the import graph and the sources
-imports, src = {}, {}
+# An hs-boot file is a node of its own (M@boot): a {-# SOURCE #-} import
+# needs its interface, which needs what the hs-boot file imports, so a chunk
+# must not have an hs-boot file between two of its modules either (hadrian
+# would need the chunk to build it, and it to build the chunk)
+imports, src, boot_imports = {}, {}, {}
 for line in open(a.deps):
     ws = line.split()
-    if len(ws) < 2 or not ws[0].startswith(build) or not ws[0].endswith('.o'):
+    if len(ws) < 2 or not ws[0].startswith(build):
         continue
-    m = mod(ws[0], '.o')
-    src[m] = ws[1]
-    imports[m] = {mod(d, '.hi') for d in ws[2:] if d.startswith(build) and d.endswith('.hi')}
+    deps = ({mod(d, '.hi') for d in ws[2:] if d.startswith(build) and d.endswith('.hi')} |
+            {mod(d, '.hi-boot') + '@boot' for d in ws[2:] if d.startswith(build) and d.endswith('.hi-boot')})
+    if ws[0].endswith('.o'):
+        m = mod(ws[0], '.o')
+        src[m] = ws[1]
+        imports[m] = deps
+    elif ws[0].endswith('.o-boot'):
+        boot_imports[mod(ws[0], '.o-boot') + '@boot'] = deps
 mods = sorted(imports)
 size = {m: os.path.getsize(src[m]) if os.path.exists(src[m]) else 0 for m in mods}
 
@@ -206,6 +215,11 @@ group = {m: m for m in mods}          # module -> group id
 members = {m: {m} for m in mods}
 gsize = {m: size[m] for m in mods}
 gimports = {m: set(imports[m]) for m in mods}   # group -> groups it imports
+gimports.update({b: set(ds) for b, ds in boot_imports.items()})
+for b in list(gimports):
+    for d in gimports[b]:
+        gimports.setdefault(d, set())
+boots = {g for g in gimports if g.endswith('@boot')}
 def g_of(x): return group[x]
 def importers_of():
     r = defaultdict(set)
@@ -237,7 +251,7 @@ while heap:
     down = closure([gp, gq], imps)
     up = closure([gp, gq], impd)
     between = (down & up) | {gp, gq}
-    if any(m in big for g in between for m in members[g]):
+    if between & boots or any(m in big for g in between for m in members[g]):
         continue
     nb = sum(gsize[g] for g in between)
     nm = sum(len(members[g]) for g in between)
