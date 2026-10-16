@@ -36,6 +36,29 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: a chunk's session compiled another chunk's module again (2026-10-16)
+* **Found by:** building GHC with chunks of the `ghc` package (hadrian).
+* **Symptom:** `GHC/Data/Word64Map/Strict.hs: Not in scope: 'singleton'`
+  (and every other name it re-exports from
+  GHC.Data.Word64Map.Strict.Internal), in another chunk's compile.
+* **Cause:** a chunk's --make session also holds the modules below the
+  chunk, which hadrian built with its own command lines; the session's
+  flags differ, so the recompilation check compiled them again ("Flags
+  changed"). A module of another chunk then met that chunk's interfaces,
+  written from its merged program without the exports the chunk cut
+  (-fcore-webs-unused-exports): Strict re-exports names that Strict.Internal
+  no longer exports. (Before chunks cut exports, compiling them again was
+  only wasted work.) Separately, a {-# SOURCE #-} import brings the real
+  module into the session, though hadrian has not built it for the chunk.
+* **Fix:** the modules below a chunk whose interfaces exist, and all of
+  whose imports are such modules, are fixed nodes of the module graph:
+  loaded, never compiled (Note [Modules below a chunk] in
+  GHC.WebCore.Chunk). chunk-graph.py puts a module in a chunk only with the
+  modules it SOURCE-imports (`f2f4e6d2dc`).
+* **Guard:** `chunk009` (the second chunk compiled with other optimisation
+  flags; the first cut a name its other module re-exports).
+* **Commit:** (this commit)
+
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
 * **Found by:** building GHC with 65 chunks of the `ghc` package (hadrian,
   chunk-graph.py), early-ulsl's options.

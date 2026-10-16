@@ -13,7 +13,8 @@ import GHC.Driver.Make ( depanal, load', noIfaceCache )
 import GHC.Driver.Messager ( batchMsg )
 import GHC.Types.Error ( mkUnknownDiagnostic )
 import GHC.Core.Opt.Monad ( getModule )
-import GHC.Unit.Module.Graph ( mapMG, mgModSummaries )
+import GHC.Unit.Module.Graph ( ModuleGraph, mapMG, mgModSummaries, mgModSummaries', mkModuleGraph, mkNodeKey
+                              , ModuleGraphNode(..), ModuleNodeInfo(..), ModuleNodeEdge(..), msKey )
 import GHC.Types.Avail ( AvailInfo(..) )
 import System.Directory ( doesFileExist, copyFile )
 import GHC.Driver.DynFlags
@@ -180,6 +181,52 @@ modules other than Main, hs-boot cycles, per-module OPTIONS_GHC (the
 command line's flags apply to the whole chunk), HPC and profiling.
 -}
 
+{- Note [Modules below a chunk]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The --make session of a chunk that -fcore-webs-chunk-modules lists also
+holds the modules the chunk imports, and the modules they import.  A build
+system (hadrian) has built them, one by one or as other chunks, with its
+own command lines; the session's flags differ (--make, the chunk's), so
+the recompilation check would compile them again ("Flags changed").  That
+is wasted work at best; and a module of another chunk compiled again
+against that chunk's interfaces, written from its merged program without
+the exports it cut (-fcore-webs-unused-exports), fails (GHC's
+GHC.Data.Word64Map.Strict re-exports what GHC.Data.Word64Map.Strict.Internal
+no longer exports).  So the modules below the chunk whose interfaces exist,
+and all of whose imports are such modules, are fixed nodes of the module
+graph: their interfaces are loaded, never compiled.  Modules above the
+chunk (a Main outside it, chunk002) and modules not built yet are compiled
+as before.
+-}
+
+-- | The modules below the chunk that are built: fixed (Note [Modules below a chunk])
+fixBelow :: (ModuleName -> Bool) -> ModuleGraph -> IO ModuleGraph
+fixBelow in_chunk graph = do
+  let nodes = mgModSummaries' graph
+      edges n = case n of
+        ModuleNode es _ -> map edgeTargetKey es
+        _               -> []
+      by_key = Map.fromList [ (mkNodeKey n, n) | n <- nodes ]
+  -- a module node: built and not a chunk module; a package: available
+  built <- fmap Map.fromList $ forM nodes $ \n -> case n of
+    ModuleNode _ (ModuleNodeCompile ms)
+      -> (,) (mkNodeKey n) <$> if in_chunk (ms_mod_name ms) then return False
+                               else doesFileExist (ml_hi_file (ms_location ms))
+    ModuleNode _ (ModuleNodeFixed {}) -> return (mkNodeKey n, True)
+    UnitNode {}                       -> return (mkNodeKey n, True)
+    _                                 -> return (mkNodeKey n, False)
+  let -- fixable: built, and so is everything below it (the graph with its
+      -- boot nodes is acyclic; the map is its own memo)
+      fixable = Map.mapWithKey (\k n -> Map.findWithDefault False k built
+                                       && all (\d -> Map.findWithDefault True d fixable) (edges n))
+                               by_key
+      fix n = case n of
+        ModuleNode es (ModuleNodeCompile ms)
+          | Map.findWithDefault False (mkNodeKey n) fixable
+          -> ModuleNode es (ModuleNodeFixed (msKey ms) (ms_location ms))
+        _ -> n
+  return (mkModuleGraph (map fix nodes))
+
 -- | --make with -fcore-webs-chunk: see Note [Chunks]
 chunkMake :: [Target] -> Ghc ()
 chunkMake targets = do
@@ -233,8 +280,10 @@ chunkMake targets = do
   let graph = mapMG (\ms -> if in_chunk (ms_mod_name ms)
                             then ms { ms_hspp_opts = chunk_flags (ms_hspp_opts ms) } else ms) graph0
       summaries = [ ms | ms <- mgModSummaries graph, isBootSummary ms == NotBoot ]
+  -- Note [Modules below a chunk]
+  fixed_graph <- liftIO $ if isNothing listed then return graph else fixBelow in_chunk graph
   ok <- withTiming logger (text "Webs chunk: capture") (const ()) $
-          load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just batchMsg) graph
+          load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just batchMsg) fixed_graph
   when (failed ok) $ liftIO (exitWith (ExitFailure 1))
   gutss <- reverse <$> liftIO (readIORef ref)
   when (null gutss) $

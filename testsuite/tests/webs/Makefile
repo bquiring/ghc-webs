@@ -44,6 +44,22 @@ chunk008:
 	  chunk008.out/Chunk008C.o -o chunk008 -v0
 	./chunk008
 
+# chunk009: the second chunk's session, with other optimisation flags, must
+# not compile the first chunk's modules again: Chunk009D re-exports f, which
+# the first chunk cut from Chunk009E (Note [Modules below a chunk] in
+# GHC.WebCore.Chunk)
+.PHONY: chunk009
+chunk009:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fcore-webs-chunk -fcore-webs-chunk-modules=chunk009a.modules \
+	  -fcore-webs-unused-exports=chunk009.unused -dcore-lint -v0 Chunk009D.hs Chunk009E.hs -outputdir chunk009.out
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fno-full-laziness -fcore-webs-chunk \
+	  -fcore-webs-chunk-modules=chunk009c.modules -fcore-webs-unused-exports=chunk009.unused \
+	  -dcore-lint -v0 Chunk009C.hs -outputdir chunk009.out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c chunk009.hs -outputdir chunk009.out -i./chunk009.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) chunk009.out/Main.o chunk009.out/Chunk009C.o chunk009.out/Chunk009D.o \
+	  chunk009.out/Chunk009E.o -o chunk009 -v0
+	./chunk009
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change
