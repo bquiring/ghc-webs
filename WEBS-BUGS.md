@@ -59,7 +59,7 @@ would catch it again), **commit** (empty while uncommitted).
 * **Guard:** `chunk012` (Codensity copied, instances derived via it, exports
   cut). It did not fail before the fix: the panic needed more of
   Zonk.Env; GHC's chunk is the reproducer.
-* **Commit:** (this commit)
+* **Commit:** `a1a2d4b07d`
 
 ### Chunks: a chunk's session compiled other modules again (2026-10-16)
 * **Found by:** building GHC with chunks of the `ghc` package (hadrian),
