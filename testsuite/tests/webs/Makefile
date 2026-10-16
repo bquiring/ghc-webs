@@ -75,19 +75,6 @@ chunk010:
 	  chunk010.out/Chunk010M.o -o chunk010 -v0
 	./chunk010
 
-# chunk011: Chunk011B, below the chunk {Chunk011A}, SOURCE-imports it: the
-# session compiles neither the hs-boot file again nor Chunk011B (Note
-# [Modules below a chunk] in GHC.WebCore.Chunk)
-.PHONY: chunk011
-chunk011:
-	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c Chunk011A.hs-boot -outputdir chunk011.out -v0
-	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c Chunk011B.hs -outputdir chunk011.out -i./chunk011.out -v0
-	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fcore-webs-chunk -fcore-webs-chunk-modules=chunk011.modules \
-	  -dcore-lint -v1 Chunk011A.hs -outputdir chunk011.out 2>&1 | grep Compiling | awk '{ print $$5 }'
-	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c chunk011.hs -outputdir chunk011.out -i./chunk011.out -v0
-	'$(TEST_HC)' $(TEST_HC_OPTS) chunk011.out/Main.o chunk011.out/Chunk011A.o chunk011.out/Chunk011B.o -o chunk011 -v0
-	./chunk011
-
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change

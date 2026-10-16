@@ -237,7 +237,12 @@ def closure(start, edges):
                 seen.add(y); todo.append(y)
     return seen
 
-big = {m for m in mods if size[m] > a.max_module_bytes}
+# A module with an hs-boot file stays out of chunks: a module below the chunk
+# that imports it {-# SOURCE #-} is read from its interface in the chunk's
+# session, and its unfoldings would name the chunk module's binders as
+# global Ids (Note [Modules below a chunk] in GHC.WebCore.Chunk)
+has_boot = {b[:-len('@boot')] for b in boot_imports}
+big = {m for m in mods if size[m] > a.max_module_bytes} | has_boot
 heap = [(-x, sorted(e)) for e, x in w.items() if x >= a.min_weight]
 heapq.heapify(heap)
 merges = 0

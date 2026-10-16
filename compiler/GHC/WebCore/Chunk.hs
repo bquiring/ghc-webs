@@ -16,7 +16,7 @@ import GHC.Types.Error ( mkUnknownDiagnostic )
 import GHC.Core.Opt.Monad ( getModule )
 import GHC.Unit.Module.Graph ( ModuleGraph, mapMG, mgModSummaries, mgModSummaries', mkModuleGraph, mkNodeKey
                               , ModuleGraphNode(..), ModuleNodeInfo(..), ModuleNodeEdge(..), msKey
-                              , NodeKey(..), isBootModuleNodeInfo, moduleNodeInfoModNodeKeyWithUid )
+                              , NodeKey(..), isBootModuleNodeInfo, moduleNodeInfoModNodeKeyWithUid, moduleNodeInfoModuleName )
 import GHC.Unit.Module.ModNodeKey ( ModNodeKeyWithUid(..) )
 import GHC.Unit.Types ( GenWithIsBoot(..), IsBootInterface(..) )
 import GHC.Unit.External ( ExternalUnitCache(..), ExternalPackageState(..) )
@@ -191,34 +191,43 @@ command line's flags apply to the whole chunk), HPC and profiling.
 
 {- Note [Modules below a chunk]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The --make session of a chunk that -fcore-webs-chunk-modules lists also
-holds the modules the chunk imports, and the modules they import.  A build
-system (hadrian) has built them, one by one or as other chunks, with its
-own command lines; the session's flags differ (--make, the chunk's), so
+The --make session of a chunk that -fcore-webs-chunk-modules lists would
+also hold the modules the chunk imports, and the modules they import.  A
+build system (hadrian) has built them, one by one or as other chunks, with
+its own command lines; the session's flags differ (--make, the chunk's), so
 the recompilation check would compile them again ("Flags changed").  That
 is wasted work at best; and a module of another chunk compiled again
 against that chunk's interfaces, written from its merged program without
 the exports it cut (-fcore-webs-unused-exports), fails (GHC's
 GHC.Data.Word64Map.Strict re-exports what GHC.Data.Word64Map.Strict.Internal
-no longer exports).  So the modules below the chunk whose interfaces exist,
-and all of whose imports are such modules, are fixed nodes of the module
-graph: their interfaces are loaded, never compiled.  Modules above the
-chunk (a Main outside it, chunk002) and modules not built yet are compiled
-as before.  And a {-# SOURCE #-} import of M anywhere in the session brings
-the real module M into it, which the chunk does not need and hadrian has
-not built for it (GHC.Data.Word64Map.Strict again, while another chunk was
-building it): the session keeps only the chunk's modules, the command
-line's other targets, and what those import (not every module above the
-chunk: Strict imports GHC.Prelude, of another chunk).  The hs-boot file of
-a chunk module is no part of the chunk: the build system compiled it
-before, and compiling it again would make every module below the chunk
-that imports it {-# SOURCE #-} out of date (GHC.Utils.Outputable, below a
-chunk with GHC.Unit.Types).
+no longer exports).
+
+So the session holds only what it compiles: the chunk's modules, the
+command line's other targets (a Main above the chunk, chunk002), and the
+modules they import that are not built yet.  Every module that is built,
+and all of whose imports are, is left out of the module graph, and its
+interface is read from its file as in one-shot mode (Note [Home modules
+outside a chunk] in GHC.Iface.Load), hs-boot files included (a chunk
+module's hs-boot file too: the build system compiled it before).  None may
+stay in the session's HPT: an interface read from its file (another chunk's
+merged module, say) is typechecked without the HPT (dontLeakTheHUG), so a
+module it mentions must be in the EPS too, never in both ("Overlapping
+instances for Uniquable ModuleName", both from GHC.Types.Unique, when
+GHC.Types.Unique was a fixed node of the session).  This also leaves out
+the real module that a {-# SOURCE #-} import brings into a --make session,
+which the chunk does not need and hadrian has not built for it.
+
+Not handled: a chunk module with an hs-boot file that a module below the
+chunk imports {-# SOURCE #-}.  That module is read from its file, and an
+unfolding of it that names the chunk module's binders names them as global
+Ids (Core Lint: "Occurrence is GlobalId, but binding is LocalId"); --make
+ties that knot only for the modules of its session.  chunk-graph.py keeps
+modules with hs-boot files out of chunks.
 -}
 
--- | The modules below the chunk that are built: fixed (Note [Modules below a chunk])
-fixBelow :: (ModuleName -> Bool) -> [Target] -> ModuleGraph -> IO ModuleGraph
-fixBelow in_chunk targets graph = do
+-- | Only what a chunk's session compiles (Note [Modules below a chunk])
+chunkSession :: (ModuleName -> Bool) -> [Target] -> ModuleGraph -> IO ModuleGraph
+chunkSession in_chunk targets graph = do
   let nodes = mgModSummaries' graph
       edges n = case n of
         ModuleNode es _ -> map edgeTargetKey es
@@ -232,60 +241,39 @@ fixBelow in_chunk targets graph = do
     ModuleNode _ (ModuleNodeFixed {}) -> return (mkNodeKey n, True)
     UnitNode {}                       -> return (mkNodeKey n, True)
     _                                 -> return (mkNodeKey n, False)
-  let -- fixable: built, and so is everything below it (the graph with its
-      -- boot nodes is acyclic; the map is its own memo)
-      fixable = Map.mapWithKey (\k n -> Map.findWithDefault False k built
-                                       && all (\d -> Map.findWithDefault True d fixable) (edges n))
-                               by_key
-      fix n = case n of
-        ModuleNode es (ModuleNodeCompile ms)
-          | Map.findWithDefault False (mkNodeKey n) fixable
-          -> ModuleNode es (ModuleNodeFixed (msKey ms) (ms_location ms))
-        _ -> n
-      -- Only what the chunk needs: its modules, the command line's other
-      -- targets (a Main above the chunk), and what those import.  A
-      -- {-# SOURCE #-} import anywhere brings the real module into the
-      -- session, which nothing here needs and the build system has not
-      -- built for the chunk
-      -- (an hs-boot node only with its module: the build plan wants both;
-      -- a module loaded from its interface reads the boot interface it
-      -- imports from the file, as in one-shot mode)
+  let -- read from its file: built, and so is everything below it (the graph
+      -- with its boot nodes is acyclic; the map is its own memo)
+      readable = Map.mapWithKey (\k n -> Map.findWithDefault False k built
+                                        && all (\d -> Map.findWithDefault True d readable) (edges n))
+                                by_key
       target_files = Set.fromList [ normalise f | Target { targetId = TargetFile f _ } <- targets ]
       target_mods  = Set.fromList [ m | Target { targetId = TargetModule m } <- targets ]
       root n = case n of
         ModuleNode _ (ModuleNodeCompile ms)
-          -> in_chunk (ms_mod_name ms) || ms_mod_name ms `Set.member` target_mods
+          -> (in_chunk (ms_mod_name ms) && isBootSummary ms == NotBoot)
+             || ms_mod_name ms `Set.member` target_mods
              || maybe False ((`Set.member` target_files) . normalise) (ml_hs_file (ms_location ms))
         _ -> False
-      roots = [ k | (k, n) <- Map.toList by_key, root n ]
-      needed0 = close Set.empty roots
+      unread k = not (Map.findWithDefault False k readable)
+      -- the roots, and what they import that is not read from its file
+      kept = close Set.empty [ k | (k, n) <- Map.toList by_key, root n ]
       close seen [] = seen
       close seen (k : ks)
         | k `Set.member` seen = close seen ks
-        | otherwise = close (Set.insert k seen) (filter (not . is_boot) (maybe [] edges (Map.lookup k by_key)) ++ ks)
-      is_boot k = case Map.lookup k by_key of
-        Just (ModuleNode _ mi) -> isBootModuleNodeInfo mi == IsBoot
-        _                      -> False
-      real_of k = case Map.lookup k by_key of
-        Just (ModuleNode _ mi) -> Just (NodeKey_Module ((moduleNodeInfoModNodeKeyWithUid mi)
-                                     { mnkModuleName = (mnkModuleName (moduleNodeInfoModNodeKeyWithUid mi)) { gwib_isBoot = NotBoot } }))
-        _                      -> Nothing
-      needed = needed0 `Set.union`
-               Set.fromList [ k | k <- Map.keys by_key, is_boot k
-                                , Just r <- [real_of k], r `Set.member` needed0 ]
-      keep n = case n of
-        ModuleNode {} -> mkNodeKey n `Set.member` needed
-        _             -> True
-      -- and no edges to what is left out
-      prune n = case n of
-        ModuleNode es mi -> ModuleNode [ e | e <- es, edgeTargetKey e `Set.member` needed
-                                                     || not (Map.member (edgeTargetKey e) by_key)
-                                                     || not (is_module (edgeTargetKey e)) ] mi
-        _                -> n
+        | otherwise = close (Set.insert k seen)
+                            (filter (\d -> is_module d && unread d) (maybe [] edges (Map.lookup k by_key)) ++ ks)
       is_module k = case Map.lookup k by_key of
         Just (ModuleNode {}) -> True
         _                    -> False
-  return (mkModuleGraph (map (prune . fix) (filter keep nodes)))
+      keep n = case n of
+        ModuleNode {} -> mkNodeKey n `Set.member` kept
+        _             -> True
+      -- no edges to what is left out
+      prune n = case n of
+        ModuleNode es mi -> ModuleNode [ e | e <- es, edgeTargetKey e `Set.member` kept
+                                                     || not (is_module (edgeTargetKey e)) ] mi
+        _                -> n
+  return (mkModuleGraph (map prune (filter keep nodes)))
 
 -- | --make with -fcore-webs-chunk: see Note [Chunks]
 chunkMake :: [Target] -> Ghc ()
@@ -343,7 +331,15 @@ chunkMake targets = do
                             then ms { ms_hspp_opts = chunk_flags (ms_hspp_opts ms) } else ms) graph0
       summaries = [ ms | ms <- mgModSummaries graph, isBootSummary ms == NotBoot ]
   -- Note [Modules below a chunk]
-  fixed_graph <- liftIO $ if isNothing listed then return graph else fixBelow in_chunk targets graph
+  fixed_graph0 <- liftIO $ if isNothing listed then return graph else chunkSession in_chunk targets graph
+  -- The modules the session holds; the others are read from their
+  -- interfaces (Note [Home modules outside a chunk] in GHC.Iface.Load)
+  let session = Just [ moduleNameString (moduleNodeInfoModuleName mi)
+                       ++ (if isBootModuleNodeInfo mi == IsBoot then "[boot]" else "")
+                     | ModuleNode _ mi <- mgModSummaries' fixed_graph0 ]
+      with_session d = d { websChunkSession = session }
+      fixed_graph = mapMG (\ms -> ms { ms_hspp_opts = with_session (ms_hspp_opts ms) }) fixed_graph0
+  modifySession (hscUpdateFlags with_session)
   ok <- withTiming logger (text "Webs chunk: capture") (const ()) $
           load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just batchMsg) fixed_graph
   when (failed ok) $ liftIO (exitWith (ExitFailure 1))
@@ -363,7 +359,7 @@ chunkMake targets = do
   -- a chunk]), as when typechecking the module itself (eps_is_boot)
   liftIO $ modifyIORef' (euc_eps (ue_eps (hsc_unit_env hsc_env1))) $ \eps ->
     eps { eps_is_boot = mkModDeps (Set.unions [ dep_boot_mods (mg_deps g) | g <- gutss ]) }
-  let hsc_env = hscSetFlags dflags0 $
+  let hsc_env = hscSetFlags (with_session dflags0) $
                 hsc_env1 { hsc_plugins = hsc_plugins hsc_env0 }
       main_name = mainModuleNameIs dflags0
       main_guts = [ g | g <- gutss, moduleName (mg_module g) == main_name ]

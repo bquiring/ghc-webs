@@ -36,36 +36,41 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
-### Chunks: a chunk's session compiled another chunk's module again (2026-10-16)
-* **Found by:** building GHC with chunks of the `ghc` package (hadrian).
-* **Symptom:** `GHC/Data/Word64Map/Strict.hs: Not in scope: 'singleton'`
-  (and every other name it re-exports from
-  GHC.Data.Word64Map.Strict.Internal), in another chunk's compile.
-* **Cause:** a chunk's --make session also holds the modules below the
-  chunk, which hadrian built with its own command lines; the session's
-  flags differ, so the recompilation check compiled them again ("Flags
-  changed"). A module of another chunk then met that chunk's interfaces,
-  written from its merged program without the exports the chunk cut
-  (-fcore-webs-unused-exports): Strict re-exports names that Strict.Internal
-  no longer exports. (Before chunks cut exports, compiling them again was
-  only wasted work.) Separately, a {-# SOURCE #-} import brings the real
-  module into the session, though hadrian has not built it for the chunk.
-* **Fix:** the modules below a chunk whose interfaces exist, and all of
-  whose imports are such modules, are fixed nodes of the module graph:
-  loaded, never compiled (Note [Modules below a chunk] in
-  GHC.WebCore.Chunk). chunk-graph.py puts a module in a chunk only with the
-  modules it SOURCE-imports (`f2f4e6d2dc`).
+### Chunks: a chunk's session compiled other modules again (2026-10-16)
+* **Found by:** building GHC with chunks of the `ghc` package (hadrian),
+  in five steps, each exposing the next.
+* **Symptoms:** `Not in scope: 'singleton'` in GHC.Data.Word64Map.Strict
+  (another chunk's module, compiled again in this chunk's session);
+  GHC.Data.Word64Map.Strict compiled while its own chunk was building it;
+  `Cannot continue after interface file error` (GHC.Unit.Types read as a
+  `.hi`, not its `.hi-boot`); `Duplicate instance declarations` for
+  GHC.Utils.Outputable's instances; `Overlapping instances for Uniquable
+  ModuleName`, both from GHC.Types.Unique.
+* **Cause:** a chunk's --make session held every module the chunk imports.
+  hadrian had built them with other flags, so the recompilation check
+  compiled them again, against other chunks' interfaces, which lack the
+  exports those chunks cut. A {-# SOURCE #-} import brought in real modules
+  hadrian had not built for the chunk. Keeping the built modules as fixed
+  nodes of the session put them in the HPT, while interfaces read from
+  their files (other chunks' merged modules) are typechecked without the
+  HPT (dontLeakTheHUG) and loaded second copies into the EPS.
+* **Fix:** the session holds only what it compiles: the chunk's modules,
+  the command line's targets, and unbuilt modules they import. Every
+  built module is read from its file, as in one-shot mode (Note [Modules
+  below a chunk] in GHC.WebCore.Chunk, Note [Home modules outside a chunk]
+  in GHC.Iface.Load): the driver records the session's modules
+  (websChunkSession) for the interface loader, and sets eps_is_boot in
+  chunk sessions as one-shot mode does (tcRnImports) and before the merge.
+  Not handled: a chunk module with an hs-boot file that a module below the
+  chunk SOURCE-imports (its unfoldings name the chunk module's binders as
+  global Ids); chunk-graph.py keeps modules with hs-boot files out of
+  chunks, and a module only with the modules it SOURCE-imports.
 * **Guard:** `chunk009` (the second chunk compiled with other optimisation
   flags; the first cut a name its other module re-exports); `chunk010` (a
-  module below the chunk SOURCE-imports one that is not built: the session
-  leaves the real module and its hs-boot node out, and reads the module
-  it names through the hs-boot interface: eps_is_boot is set in chunk
-  sessions as in one-shot mode, and before the merge, `55433a8ccf`;
-  `chunk011` (a module below the chunk SOURCE-imports a chunk module: the
-  chunk no longer compiles the hs-boot file again, which made
-  GHC.Utils.Outputable out of date below a chunk with GHC.Unit.Types,
-  `fe96ad2a69`); before that, `b8119aab5b`).
-* **Commit:** `88a9da9217`
+  module below the chunk SOURCE-imports one that is not built, and the
+  chunk uses a type of it).
+* **Commit:** `88a9da9217`, `b8119aab5b`, `8577191673`, `55433a8ccf`,
+  `fe96ad2a69`, (this commit)
 
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
 * **Found by:** building GHC with 65 chunks of the `ghc` package (hadrian,

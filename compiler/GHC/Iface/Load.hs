@@ -120,6 +120,7 @@ import {-# source #-} GHC.Driver.Main (loadIfaceByteCode)
 import GHC.Iface.Errors.Types
 import Data.Function ((&))
 import GHC.Unit.Module.Graph
+import GHC.Unit.Module.ModNodeKey ( ModNodeKeyWithUid(..) )
 import qualified GHC.Unit.Home.Graph as HUG
 
 {-
@@ -890,7 +891,10 @@ as other chunks.  A chunk's interfaces are written from its merged program,
 in which the binders that are not exported belong to the chunk's last
 module: an unfolding in a chunk module's interface can mention a binder of
 that module, which the module importing it need not import (transitively),
-so it is not in the session.  Like one-shot mode, a chunk then reads the
+so it is not in the session.  (Only a module outside the session's module
+graph: reading one that is in it would put a second copy of its instances
+in the EPS -- "Overlapping instances for Uniquable ModuleName", both from
+GHC.Types.Unique.)  Like one-shot mode, a chunk then reads the
 interface from its file, into the EPS (the module never enters the session's
 HPT); the build (hadrian) has built the other chunk whole before.  And as in
 one-shot mode, whether to read a home module's hs-boot interface is decided
@@ -917,6 +921,12 @@ findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
       mhome_unit  = hsc_home_unit_maybe hsc_env
       dflags     = hsc_dflags hsc_env
       logger     = hsc_logger hsc_env
+      -- Note [Home modules outside a chunk]: only a module the session
+      -- does not hold (one it holds is in the HPT once it is loaded)
+      in_graph   = case websChunkSession dflags of
+                     Just ms -> (moduleNameString (moduleName mod)
+                                  ++ (if hi_boot_file == IsBoot then "[boot]" else "")) `elem` ms
+                     Nothing -> True
 
 
   trace_if logger (sep [hsep [text "Reading",
@@ -943,7 +953,7 @@ findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
                   -- (and Note [Home modules outside a chunk])
                   if HUG.memberHugUnitId (moduleUnit mod) (hsc_HUG hsc_env)
                       && not (isOneShot (ghcMode dflags))
-                      && not (gopt Opt_CoreWebsChunk dflags)
+                      && in_graph
                     then return (Failed (HomeModError mod loc))
                     else do
                         r <- read_file logger name_cache unit_state dflags wanted_mod (ml_hi_file loc)

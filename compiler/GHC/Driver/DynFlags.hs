@@ -409,6 +409,8 @@ data DynFlags = DynFlags {
   websPasses            :: Int,   -- ^ -fcore-webs-passes: passes of the web transformations (Note [Repeating the transformations])
   websUnusedExports     :: Maybe FilePath, -- ^ -fcore-webs-unused-exports=FILE: exports no other module uses (Note [Unused exports])
   websChunkModules      :: Maybe FilePath, -- ^ -fcore-webs-chunk-modules=FILE: the modules of the chunk (Note [Chunks])
+  websChunkSession      :: Maybe [String], -- ^ (internal) the home modules a chunk's session holds (M[boot] for an hs-boot file)
+                                           --   (Note [Home modules outside a chunk] in GHC.Iface.Load)
   maxForcedSpecArgs     :: Int,
 
   ghciHistSize          :: Int,
@@ -705,6 +707,7 @@ defaultDynFlags mySettings =
         websPasses = 1,
         websUnusedExports = Nothing,
         websChunkModules = Nothing,
+        websChunkSession = Nothing,
         maxForcedSpecArgs = 333,
         -- 333 is fairly arbitrary, see Note [Forcing specialisation]:FS5
 

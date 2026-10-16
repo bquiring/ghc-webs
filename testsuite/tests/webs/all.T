@@ -621,11 +621,6 @@ test('chunk009', [extra_files(['chunk009.hs', 'Chunk009C.hs', 'Chunk009D.hs', 'C
 test('chunk010', [extra_files(['chunk010.hs', 'Chunk010C.hs', 'Chunk010X.hs', 'Chunk010M.hs',
                                'Chunk010M.hs-boot', 'chunk010.modules'])],
      makefile_test, ['chunk010'])
-# chunk011: a chunk's session does not compile its module's hs-boot file again
-# (Note [Modules below a chunk] in GHC.WebCore.Chunk)
-test('chunk011', [extra_files(['chunk011.hs', 'Chunk011A.hs', 'Chunk011A.hs-boot', 'Chunk011B.hs',
-                               'chunk011.modules'])],
-     makefile_test, ['chunk011'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],
