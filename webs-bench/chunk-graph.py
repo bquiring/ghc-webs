@@ -253,6 +253,12 @@ while heap:
     between = (down & up) | {gp, gq}
     if between & boots or any(m in big for g in between for m in members[g]):
         continue
+    # A {-# SOURCE #-} import of M brings M itself (and what it imports)
+    # into the chunk's --make session, which hadrian has not built for it:
+    # M must be in the chunk too
+    ms_ = set().union(*(members[g] for g in between))
+    if any(b[:-len('@boot')] not in ms_ for x in ms_ for b in imports[x] if b.endswith('@boot')):
+        continue
     nb = sum(gsize[g] for g in between)
     nm = sum(len(members[g]) for g in between)
     if nb > a.max_bytes or nm > a.max_modules:
