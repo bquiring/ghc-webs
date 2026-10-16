@@ -729,7 +729,9 @@ liftLambdas us cand_env binds = (binds' ++ [ NonRec l r | (l, r) <- lifted ], li
       , not (any (\x -> isFunTy (idType x) && calledIn x arg) ids)
       = do { u   <- getUniqueM
            ; us' <- getUniqueSupplyM
-           ; let bndrs = tvs ++ ids
+             -- A free case binder has an OtherCon unfolding, which a
+             -- lambda binder must not have
+           ; let bndrs = tvs ++ map (`setIdUnfolding` noUnfolding) ids
                  in_scope = mkInScopeSet (exprFreeVars arg `unionVarSet` mkVarSet bndrs)
                  (subst, bndrs') = cloneBndrs (mkEmptySubst in_scope) us' bndrs
                  rhs  = mkLams bndrs' (substExpr subst arg)

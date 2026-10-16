@@ -1,9 +1,12 @@
 app_cs1
 app_cs2
+filt_cs1
+filt_cs2
 integ_cs1
 integ_cs2
 Lifted: app_ll (a key)
 Lifted: app_ll (a key)
+Lifted: filt_ll (a key)
 Lifted: integ_ll (a key)
 Lifted: integ_ll (a key)
 Lifted: loop_ll (a key)
@@ -23,3 +26,4 @@ search_cs1
 48
 10240
 ("xx",[True,True,True])
+([3,50,700],10)

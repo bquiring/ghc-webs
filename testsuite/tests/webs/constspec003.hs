@@ -13,7 +13,9 @@ module Main (main) where
 --  * once (not recursive, calls f once, not in a loop) is no candidate;
 --  * a lambda that calls a free variable is not lifted;
 --  * more lambdas than keys: the fifth is put back;
---  * a polymorphic lambda, with a free type variable.
+--  * a polymorphic lambda, with a free type variable;
+--  * a lambda over a case binder, whose OtherCon unfolding must not go
+--    with it to the lifted function's lambda binder (nofib real/gg).
 
 integ :: Double -> Double -> (Double -> Double) -> Double
 integ l u f = let h = (u - l) / 2 in h * (f l + 2 * f (l + h) + f u)
@@ -39,6 +41,17 @@ once :: (Int -> Int) -> Int -> Int
 once f n = f n + n
 {-# NOINLINE once #-}
 
+filt :: (Int -> Bool) -> [Int] -> [Int]
+filt _ [] = []
+filt f (x : xs) | f x       = x : filt f xs
+                | otherwise = filt f xs
+{-# NOINLINE filt #-}
+
+pick :: [Int] -> [Int] -> [Int]
+pick [] = filt (const True)
+pick ks = filt (\x -> elem x ks)
+{-# NOINLINE pick #-}
+
 app :: (a -> [a]) -> a -> Int -> [a]
 app f x 0 = f x
 app f x n = app f x (n - 1)
@@ -61,3 +74,5 @@ main = do
   print (loop (\a -> g a + 1) 10)
   -- a polymorphic lambda
   print (app (\v -> [v, v]) 'x' 3, app (\v -> replicate 3 v) True 2)
+  -- a lambda over a case binder
+  print (pick cuts [1 .. 1000], length (pick [] [1 .. 10]))

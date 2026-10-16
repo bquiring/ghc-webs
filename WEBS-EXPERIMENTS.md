@@ -1026,6 +1026,41 @@ arguments). mate needs non-recursive candidates whose static parameter is
 called in a local loop, and more keys (or one copy dispatching, which is
 defunctionalisation). hpg needs the boundary wrapper fixed.
 
+## 25. One-shot raised lambdas; specialising on lambdas (2026-10-16)
+
+Two changes, measured on full nofib against base (instructions and time
+over 108 benchmarks, `timing-speclams.md`; allocation over 113):
+
+1. **Raised lambdas keep one-shot marks** (Note [Raised lambdas are
+   one-shot], WEBS-BUGS.md). `run-oneshot.sh`: early-ulsl8-os (with
+   defunc) and early-ulsl8-sco (spec-calls, no defunc). Only hpg moves by
+   0.5% or more (−0.4% instructions without defunc).
+2. **`-fcore-webs-spec-lambdas`** (Note [Specialising on lambdas]):
+   partial applications and lambda-lifted lambdas as keys of constant
+   specialisation; non-recursive candidates whose parameter is called twice
+   or in a loop. `run-speclams.sh`: early-ulsl8-scl.
+
+| config | instructions | time | allocation | text (geomean) |
+|---|---|---|---|---|
+| early-ulsl8-os (defunc) | −4.20% | −4.06% | −4.88% | +1.48% |
+| early-ulsl8-sco (spec-calls) | −3.16% | −2.89% | −3.59% | +0.91% |
+| early-ulsl8-scl (spec-calls + spec-lambdas) | **−4.61%** | **−4.59%** | −5.11%* | +1.30% |
+
+\* over 112: gg failed to build in that run (Core Lint, fixed afterwards
+and checked by hand: 0.0% instructions against sco, expected output).
+
+scl against sco, by 0.5% or more in instructions: integrate −76.9% (now
+−77.1% against base, defunc −76.4%), ida −10.7%, simple −4.6%, fft +0.6%.
+fft: `tabulate` is specialised on `\i -> a_ar ! (a_index ! i)`, and the
+array element GHC then stores per index is a thunk of the inlined body,
+holding both arrays, instead of `f i` (allocation +0.3%, GC copying +2.6%).
+mate does not change: its eight direction functions need eight keys
+(`specMaxKeys` is 4).
+
+Without defunctionalisation, spec-lambdas now beats it on the geomean.
+Worst against base: hpg +5.7% (the 9-argument unknown call to `nc`,
+WEBS-BUGS.md Open) and event +5.3% (GC scheduling, §23).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

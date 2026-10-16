@@ -41,6 +41,18 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Specialising on lambdas: a lifted case binder kept its OtherCon unfolding (2026-10-16)
+
+**Symptom.** nofib real/gg with `-fcore-webs-spec-lambdas`: Core Lint,
+"Lambda binder with value or OtherCon unfolding" in `aux'_ll`.
+**Cause.** `getSp pes = aux' (\x -> elem x pes)` in the non-empty branch:
+the lambda's free variable is the case binder (unfolding OtherCon [[]]),
+and lambda lifting made it a lambda binder of the lifted function with
+its IdInfo, unfolding included.
+**Fix.** The abstracted variables lose their unfoldings before they are
+cloned (liftLambdas in GHC.WebCore.Transform.ConstSpec).
+**Guard.** constspec003 (`pick`/`filt`, gg's shape).
+
 ### Chunks: an occurrence's own unfolding named a captured binder (2026-10-16)
 * **Found by:** building GHC with chunks: the chunk of
   GHC.Utils.Monad.Codensity and GHC.Tc.Zonk.Env (whose ZonkBndrT derives
