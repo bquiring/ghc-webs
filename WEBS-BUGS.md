@@ -64,7 +64,7 @@ would catch it again), **commit** (empty while uncommitted).
   `chunk011` (a module below the chunk SOURCE-imports a chunk module: the
   chunk no longer compiles the hs-boot file again, which made
   GHC.Utils.Outputable out of date below a chunk with GHC.Unit.Types,
-  `(this commit)`); before that, `b8119aab5b`).
+  `fe96ad2a69`); before that, `b8119aab5b`).
 * **Commit:** `88a9da9217`
 
 ### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
