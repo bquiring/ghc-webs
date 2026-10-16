@@ -60,6 +60,21 @@ chunk009:
 	  chunk009.out/Chunk009E.o -o chunk009 -v0
 	./chunk009
 
+# chunk010: Chunk010X, below the chunk {Chunk010C}, SOURCE-imports Chunk010M,
+# which is not built yet: the chunk's session compiles only Chunk010C, not
+# Chunk010M (Note [Modules below a chunk] in GHC.WebCore.Chunk)
+.PHONY: chunk010
+chunk010:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c Chunk010M.hs-boot -outputdir chunk010.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c Chunk010X.hs -outputdir chunk010.out -i./chunk010.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fcore-webs-chunk -fcore-webs-chunk-modules=chunk010.modules \
+	  -dcore-lint -v1 Chunk010C.hs -outputdir chunk010.out 2>&1 | grep Compiling | awk '{ print $$5 }'
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c Chunk010M.hs -outputdir chunk010.out -i./chunk010.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c chunk010.hs -outputdir chunk010.out -i./chunk010.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) chunk010.out/Main.o chunk010.out/Chunk010C.o chunk010.out/Chunk010X.o \
+	  chunk010.out/Chunk010M.o -o chunk010 -v0
+	./chunk010
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change

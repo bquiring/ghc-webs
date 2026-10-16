@@ -14,7 +14,10 @@ import GHC.Driver.Messager ( batchMsg )
 import GHC.Types.Error ( mkUnknownDiagnostic )
 import GHC.Core.Opt.Monad ( getModule )
 import GHC.Unit.Module.Graph ( ModuleGraph, mapMG, mgModSummaries, mgModSummaries', mkModuleGraph, mkNodeKey
-                              , ModuleGraphNode(..), ModuleNodeInfo(..), ModuleNodeEdge(..), msKey )
+                              , ModuleGraphNode(..), ModuleNodeInfo(..), ModuleNodeEdge(..), msKey
+                              , NodeKey(..), isBootModuleNodeInfo, moduleNodeInfoModNodeKeyWithUid )
+import GHC.Unit.Module.ModNodeKey ( ModNodeKeyWithUid(..) )
+import GHC.Unit.Types ( GenWithIsBoot(..), IsBootInterface(..) )
 import GHC.Types.Avail ( AvailInfo(..) )
 import System.Directory ( doesFileExist, copyFile )
 import GHC.Driver.DynFlags
@@ -196,7 +199,11 @@ no longer exports).  So the modules below the chunk whose interfaces exist,
 and all of whose imports are such modules, are fixed nodes of the module
 graph: their interfaces are loaded, never compiled.  Modules above the
 chunk (a Main outside it, chunk002) and modules not built yet are compiled
-as before.
+as before.  And a {-# SOURCE #-} import of M anywhere in the session brings
+the real module M into it, which the chunk does not need and hadrian has
+not built for it (GHC.Data.Word64Map.Strict again, while another chunk was
+building it): the session keeps only the chunk's modules, the modules above
+them, and what those import.
 -}
 
 -- | The modules below the chunk that are built: fixed (Note [Modules below a chunk])
@@ -225,7 +232,47 @@ fixBelow in_chunk graph = do
           | Map.findWithDefault False (mkNodeKey n) fixable
           -> ModuleNode es (ModuleNodeFixed (msKey ms) (ms_location ms))
         _ -> n
-  return (mkModuleGraph (map fix nodes))
+      -- Only what the chunk needs: its modules, the modules above them,
+      -- and what those import.  A {-# SOURCE #-} import anywhere brings
+      -- the real module into the session, which nothing here needs and the
+      -- build system has not built for the chunk
+      chunk_key n = case n of
+        ModuleNode _ (ModuleNodeCompile ms) -> in_chunk (ms_mod_name ms)
+        _                                   -> False
+      above = Map.mapWithKey (\k n -> chunk_key n || any (\d -> Map.findWithDefault False d above) (edges n))
+                             by_key
+      -- (an hs-boot node only with its module: the build plan wants both;
+      -- a module loaded from its interface reads the boot interface it
+      -- imports from the file, as in one-shot mode)
+      roots = [ k | (k, True) <- Map.toList above ]
+      needed0 = close Set.empty roots
+      close seen [] = seen
+      close seen (k : ks)
+        | k `Set.member` seen = close seen ks
+        | otherwise = close (Set.insert k seen) (filter (not . is_boot) (maybe [] edges (Map.lookup k by_key)) ++ ks)
+      is_boot k = case Map.lookup k by_key of
+        Just (ModuleNode _ mi) -> isBootModuleNodeInfo mi == IsBoot
+        _                      -> False
+      real_of k = case Map.lookup k by_key of
+        Just (ModuleNode _ mi) -> Just (NodeKey_Module ((moduleNodeInfoModNodeKeyWithUid mi)
+                                     { mnkModuleName = (mnkModuleName (moduleNodeInfoModNodeKeyWithUid mi)) { gwib_isBoot = NotBoot } }))
+        _                      -> Nothing
+      needed = needed0 `Set.union`
+               Set.fromList [ k | k <- Map.keys by_key, is_boot k
+                                , Just r <- [real_of k], r `Set.member` needed0 ]
+      keep n = case n of
+        ModuleNode {} -> mkNodeKey n `Set.member` needed
+        _             -> True
+      -- and no edges to what is left out
+      prune n = case n of
+        ModuleNode es mi -> ModuleNode [ e | e <- es, edgeTargetKey e `Set.member` needed
+                                                     || not (Map.member (edgeTargetKey e) by_key)
+                                                     || not (is_module (edgeTargetKey e)) ] mi
+        _                -> n
+      is_module k = case Map.lookup k by_key of
+        Just (ModuleNode {}) -> True
+        _                    -> False
+  return (mkModuleGraph (map (prune . fix) (filter keep nodes)))
 
 -- | --make with -fcore-webs-chunk: see Note [Chunks]
 chunkMake :: [Target] -> Ghc ()
