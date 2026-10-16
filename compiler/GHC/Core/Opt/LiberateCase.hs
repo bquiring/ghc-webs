@@ -18,7 +18,9 @@ import GHC.Core.Opt.Simplify.Inline
 import GHC.Builtin.Types ( unitDataConId )
 import GHC.Types.Id
 import GHC.Types.Var.Env
-import GHC.Utils.Misc    ( notNull )
+import GHC.Utils.Misc    ( notNull, lengthExceeds )
+import GHC.Core.Type     ( splitTyConApp_maybe )
+import GHC.Core.TyCon    ( isAlgTyCon, tyConDataCons )
 import GHC.Core.FVs      ( exprsFreeVars, exprSomeFreeVarsList )
 import GHC.Core.Subst    ( mkEmptySubst, substExpr, substBndr, extendTvSubst, extendCvSubst )
 import GHC.Core.Utils    ( bindNonRec )
@@ -292,7 +294,8 @@ libCaseApp env v args
   -- side here, under the case (Note [Liberate case through join points])
   | Just (rhs, n_scruts) <- lookupVarEnv (lc_joins env) v
   , length args == joinArity
-  , let new_scruts = take (length (lc_scruts env) - n_scruts) (lc_scruts env)
+  , let new_scruts = filter (\(x, _, _) -> isSumTyped x)
+                            (take (length (lc_scruts env) - n_scruts) (lc_scruts env))
   , notNull new_scruts
   , any (\f -> notNull (freeScrutsIn new_scruts (lookupLevel env f)))
         (exprSomeFreeVarsList (\f -> isId f && f `elemVarEnv` lc_rec_env env) rhs)
@@ -337,10 +340,21 @@ variable has been scrutinised since the join point was bound, and the join
 point's right-hand side calls a recursive function that the new case could
 specialise (a free variable of it scrutinised at a deeper level), the
 right-hand side, applied to the jump's arguments, replaces the jump (if it
-is small: the liberate-case threshold).  Its call to loop is then in the
+is small: the liberate-case threshold).  Only for a variable of a type
+with several constructors (isSumTyped): for a product (nofib's mandel2
+scrutinises pairs) the unrolled copies only add call patterns, and
+SpecConstr, past its limit, specialised neither copy (+39% instructions).  Its call to loop is then in the
 case's scope, and loop is unrolled there as usual: one loop per
 constructor of p, each its own.
 -}
+
+-- | A variable of a type with several constructors: unrolling a loop for
+-- it gives one loop per constructor (Note [Liberate case through join
+-- points]); for a product, unrolling only duplicates the loop
+isSumTyped :: Id -> Bool
+isSumTyped x = case splitTyConApp_maybe (idType x) of
+  Just (tc, _) -> isAlgTyCon tc && lengthExceeds (tyConDataCons tc) 1
+  Nothing      -> False
 
 -- | A join point's right-hand side applied to a jump's arguments
 -- (Note [Liberate case through join points])
