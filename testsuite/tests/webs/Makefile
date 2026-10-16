@@ -199,3 +199,24 @@ chunk005:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -c -O -v0 -ichunk005lib/out chunk005.hs -o chunk005.o
 	'$(TEST_HC)' $(TEST_HC_OPTS) -v0 chunk005.o chunk005lib/out/Chunk005A.o chunk005lib/out/Chunk005B.o -o chunk005
 	./chunk005
+
+# constspec001, constspec002: constant specialisation (Note [Constant
+# specialisation] in GHC.WebCore.Transform.ConstSpec), keys from web classes
+# and from calls; the copies made, per function
+CONSTSPEC_OPTS = -O2 -fcore-webs-early -fcore-webs-inline -fcore-webs-const-prop -fcore-webs-arity-raise \
+  -fcore-webs-result-raise -fcore-webs-strictness -dcore-lint -ddump-webs-spec -ddump-to-file
+.PHONY: constspec001
+constspec001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-webs -outputdir constspec001.w -v0 constspec001.hs -o constspec001w
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -outputdir constspec001.c -v0 constspec001.hs -o constspec001c
+	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec001.$$d/*.dump-webs-spec | sed 's/ //g' | sort; done
+	./constspec001w
+	./constspec001c
+
+.PHONY: constspec002
+constspec002:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-webs -outputdir constspec002.w -v0 constspec002.hs -o constspec002w
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -outputdir constspec002.c -v0 constspec002.hs -o constspec002c
+	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec002.$$d/*.dump-webs-spec | sed 's/ //g' | sort; done
+	./constspec002w
+	./constspec002c

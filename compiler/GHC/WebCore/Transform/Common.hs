@@ -4,7 +4,7 @@
 module GHC.WebCore.Transform.Common
   ( programOccurrences, exprOccurrences
   , complexCoWebs
-  , fixBinderInfo, ArgFate(..), argFates, reshapeArity
+  , fixBinderInfo, ArgFate(..), argFates, reshapeArity, reshapeDmdSig, reshapeUsage, reshapeCallArity
   , UnfoldingPolicy(..), changedBinders, fixUnfolding
   , pprWebVerdicts
   , mkWild

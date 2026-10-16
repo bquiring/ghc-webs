@@ -1552,6 +1552,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_data)
   , make_ord_flag defGhcFlag "ddump-webs-one-shot"
         (setDumpFlag Opt_D_dump_webs_one_shot)
+  , make_ord_flag defGhcFlag "ddump-webs-spec"
+        (setDumpFlag Opt_D_dump_webs_spec)
   , make_ord_flag defGhcFlag "ddump-first-class-stats"
         (setDumpFlag Opt_D_dump_first_class_stats)
   , make_ord_flag defGhcFlag "ddump-stg-from-core"
@@ -2581,6 +2583,8 @@ fFlagsDeps = [
   flagSpec "core-webs-drop-rules"             Opt_CoreWebsDropRules,
   flagSpec "core-webs-raise-through-calls"    Opt_CoreWebsRaiseThroughCalls,
   flagSpec "core-webs-evald-args"             Opt_CoreWebsEvaldArgs,
+  flagSpec "core-webs-spec-webs"              Opt_CoreWebsSpecWebs,
+  flagSpec "core-webs-spec-calls"             Opt_CoreWebsSpecCalls,
   flagSpec "core-webs-data-unbox"             Opt_CoreWebsDataUnbox,
   flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
   flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,

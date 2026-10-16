@@ -496,6 +496,7 @@ data DumpFlag
    | Opt_D_dump_webs_defunc      -- ^ Web pipeline: defunctionalisation verdicts
    | Opt_D_dump_webs_data        -- ^ Web pipeline: data type splitting
    | Opt_D_dump_webs_one_shot    -- ^ Web pipeline: one-shot lambda verdicts
+   | Opt_D_dump_webs_spec        -- ^ Web pipeline: constant specialisation verdicts
    | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and
                                   --   after the Core pipeline
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
@@ -670,6 +671,8 @@ data GeneralFlag
    | Opt_CoreWebsDropRules    -- ^ The early run drops rules: Note [Dropping rules in a whole program]
    | Opt_CoreWebsRaiseThroughCalls -- ^ Result raising through tail calls: Note [Raising through tail calls]
    | Opt_CoreWebsEvaldArgs    -- ^ Arity raising: case binders are values: Note [Evaluated arguments]
+   | Opt_CoreWebsSpecWebs     -- ^ Constant specialisation, keys from web classes: Note [Constant specialisation]
+   | Opt_CoreWebsSpecCalls    -- ^ Constant specialisation, keys from call sites: Note [Constant specialisation]
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
@@ -977,6 +980,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDropRules
    , Opt_CoreWebsRaiseThroughCalls
    , Opt_CoreWebsEvaldArgs
+   , Opt_CoreWebsSpecWebs
+   , Opt_CoreWebsSpecCalls
    , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested

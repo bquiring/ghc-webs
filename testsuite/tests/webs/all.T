@@ -634,6 +634,10 @@ test('libcasejoin001', [extra_files(['libcasejoin001.hs'])], makefile_test, ['li
 test('raisecall001', [extra_files(['raisecall001.hs'])], makefile_test, ['raisecall001'])
 test('raisecall002', [extra_files(['raisecall002.hs'])], makefile_test, ['raisecall002'])
 test('evaldarg001', [extra_files(['evaldarg001.hs'])], makefile_test, ['evaldarg001'])
+# constspec001, constspec002: constant specialisation (Note [Constant
+# specialisation] in GHC.WebCore.Transform.ConstSpec)
+test('constspec001', [extra_files(['constspec001.hs'])], makefile_test, ['constspec001'])
+test('constspec002', [extra_files(['constspec002.hs'])], makefile_test, ['constspec002'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

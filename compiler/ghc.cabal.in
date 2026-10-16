@@ -1049,6 +1049,7 @@ Library
         GHC.WebCore.Transform.Forced
         GHC.WebCore.Transform.OneShot
         GHC.WebCore.Transform.SpecIndex
+        GHC.WebCore.Transform.ConstSpec
         GHC.WebCore.Transform.Inline
         GHC.WebCore.Transform.ResultRaise
         GHC.WebCore.Transform.Strictness

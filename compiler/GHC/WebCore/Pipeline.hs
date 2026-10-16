@@ -59,6 +59,7 @@ import GHC.Core.DataCon ( dataConRepArgTys, dataConRepArity )
 import GHC.WebCore.DataCopy ( UnboxOpts(..) )
 import qualified GHC.WebCore.DataLint as DL
 import GHC.WebCore.Erase
+import GHC.WebCore.Transform.ConstSpec ( SpecOpts(..), specWebsInfo, constSpecProgram )
 import GHC.WebCore.HiddenFields
 import GHC.WebCore.Lint
 import GHC.WebCore.Rename
@@ -303,11 +304,26 @@ webPass early guts_in
                    ; return (syncOccurrences (reorderTopBinds bs), tcs) }
            else return (binds4, [])
 
+         -- Constant specialisation (early run only)
+         -- See Note [Constant specialisation] in GHC.WebCore.Transform.ConstSpec
+       ; us_cs <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let spec_webs  = gopt Opt_CoreWebsSpecWebs dflags
+             spec_calls = gopt Opt_CoreWebsSpecCalls dflags
+             spec_opts  = SpecOpts { so_webs   = if spec_webs
+                                                 then Just (specWebsInfo (ws_exposed sigs_t) binds_t)
+                                                 else Nothing
+                                   , so_rounds = if spec_calls then 3 else 1 }
+             (binds5s, spec_dump)
+               | early && (spec_webs || spec_calls) = constSpecProgram spec_opts us_cs binds5
+               | otherwise                          = (binds5, empty)
+       ; _ <- withTiming logger (text "Webs: constant specialisation") seqBinds (return binds5s)
+       ; dump logger Opt_D_dump_webs_spec "Webs: constant specialisation" spec_dump
+
          -- Note [Restoring vanilla unfoldings]
        ; let binds6 | early, not (gopt Opt_CoreWebsNoRestoreUnfoldings dflags)
                                 = restoreUnfoldings (unfoldingOpts dflags)
-                                                    (vanillaUnfolded (mg_binds guts)) binds5
-                    | otherwise = binds5
+                                                    (vanillaUnfolded (mg_binds guts)) binds5s
+                    | otherwise = binds5s
              -- Note [Rebuilding DFun unfoldings]
              binds7 = rebuildDFunUnfoldings dfuns binds6
        ; when split_classes $
