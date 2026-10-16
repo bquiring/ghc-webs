@@ -8,7 +8,8 @@ module GHC.WebCore.Chunk
 
 import GHC.Prelude
 
-import GHC ( Target, setTargets, LoadHowMuch(..), getModSummary, setSessionDynFlags )
+import GHC ( setTargets, LoadHowMuch(..), getModSummary, setSessionDynFlags )
+import GHC.Types.Target ( Target(..), TargetId(..) )
 import GHC.Driver.Make ( depanal, load', noIfaceCache )
 import GHC.Driver.Messager ( batchMsg )
 import GHC.Types.Error ( mkUnknownDiagnostic )
@@ -202,13 +203,14 @@ chunk (a Main outside it, chunk002) and modules not built yet are compiled
 as before.  And a {-# SOURCE #-} import of M anywhere in the session brings
 the real module M into it, which the chunk does not need and hadrian has
 not built for it (GHC.Data.Word64Map.Strict again, while another chunk was
-building it): the session keeps only the chunk's modules, the modules above
-them, and what those import.
+building it): the session keeps only the chunk's modules, the command
+line's other targets, and what those import (not every module above the
+chunk: Strict imports GHC.Prelude, of another chunk).
 -}
 
 -- | The modules below the chunk that are built: fixed (Note [Modules below a chunk])
-fixBelow :: (ModuleName -> Bool) -> ModuleGraph -> IO ModuleGraph
-fixBelow in_chunk graph = do
+fixBelow :: (ModuleName -> Bool) -> [Target] -> ModuleGraph -> IO ModuleGraph
+fixBelow in_chunk targets graph = do
   let nodes = mgModSummaries' graph
       edges n = case n of
         ModuleNode es _ -> map edgeTargetKey es
@@ -232,19 +234,22 @@ fixBelow in_chunk graph = do
           | Map.findWithDefault False (mkNodeKey n) fixable
           -> ModuleNode es (ModuleNodeFixed (msKey ms) (ms_location ms))
         _ -> n
-      -- Only what the chunk needs: its modules, the modules above them,
-      -- and what those import.  A {-# SOURCE #-} import anywhere brings
-      -- the real module into the session, which nothing here needs and the
-      -- build system has not built for the chunk
-      chunk_key n = case n of
-        ModuleNode _ (ModuleNodeCompile ms) -> in_chunk (ms_mod_name ms)
-        _                                   -> False
-      above = Map.mapWithKey (\k n -> chunk_key n || any (\d -> Map.findWithDefault False d above) (edges n))
-                             by_key
+      -- Only what the chunk needs: its modules, the command line's other
+      -- targets (a Main above the chunk), and what those import.  A
+      -- {-# SOURCE #-} import anywhere brings the real module into the
+      -- session, which nothing here needs and the build system has not
+      -- built for the chunk
       -- (an hs-boot node only with its module: the build plan wants both;
       -- a module loaded from its interface reads the boot interface it
       -- imports from the file, as in one-shot mode)
-      roots = [ k | (k, True) <- Map.toList above ]
+      target_files = Set.fromList [ normalise f | Target { targetId = TargetFile f _ } <- targets ]
+      target_mods  = Set.fromList [ m | Target { targetId = TargetModule m } <- targets ]
+      root n = case n of
+        ModuleNode _ (ModuleNodeCompile ms)
+          -> in_chunk (ms_mod_name ms) || ms_mod_name ms `Set.member` target_mods
+             || maybe False ((`Set.member` target_files) . normalise) (ml_hs_file (ms_location ms))
+        _ -> False
+      roots = [ k | (k, n) <- Map.toList by_key, root n ]
       needed0 = close Set.empty roots
       close seen [] = seen
       close seen (k : ks)
@@ -328,7 +333,7 @@ chunkMake targets = do
                             then ms { ms_hspp_opts = chunk_flags (ms_hspp_opts ms) } else ms) graph0
       summaries = [ ms | ms <- mgModSummaries graph, isBootSummary ms == NotBoot ]
   -- Note [Modules below a chunk]
-  fixed_graph <- liftIO $ if isNothing listed then return graph else fixBelow in_chunk graph
+  fixed_graph <- liftIO $ if isNothing listed then return graph else fixBelow in_chunk targets graph
   ok <- withTiming logger (text "Webs chunk: capture") (const ()) $
           load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just batchMsg) fixed_graph
   when (failed ok) $ liftIO (exitWith (ExitFailure 1))
