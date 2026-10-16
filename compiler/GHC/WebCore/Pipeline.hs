@@ -312,7 +312,10 @@ webPass early guts_in
              spec_opts  = SpecOpts { so_webs   = if spec_webs
                                                  then Just (specWebsInfo (ws_exposed sigs_t) binds_t)
                                                  else Nothing
-                                   , so_rounds = if spec_calls then 3 else 1 }
+                                   , so_rounds = if spec_calls then 3 else 1
+                                     -- Note [Specialising on lambdas]: keys from calls only
+                                   , so_lams   = spec_calls && not spec_webs
+                                                 && gopt Opt_CoreWebsSpecLambdas dflags }
              (binds5s, spec_dump)
                | early && (spec_webs || spec_calls) = constSpecProgram spec_opts us_cs binds5
                | otherwise                          = (binds5, empty)

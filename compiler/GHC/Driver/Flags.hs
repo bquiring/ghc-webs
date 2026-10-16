@@ -673,6 +673,7 @@ data GeneralFlag
    | Opt_CoreWebsEvaldArgs    -- ^ Arity raising: case binders are values: Note [Evaluated arguments]
    | Opt_CoreWebsSpecWebs     -- ^ Constant specialisation, keys from web classes: Note [Constant specialisation]
    | Opt_CoreWebsSpecCalls    -- ^ Constant specialisation, keys from call sites: Note [Constant specialisation]
+   | Opt_CoreWebsSpecLambdas  -- ^ ... keys also partial applications and lambdas: Note [Specialising on lambdas]
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
@@ -982,6 +983,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsEvaldArgs
    , Opt_CoreWebsSpecWebs
    , Opt_CoreWebsSpecCalls
+   , Opt_CoreWebsSpecLambdas
    , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested

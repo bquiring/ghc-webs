@@ -638,6 +638,9 @@ test('evaldarg001', [extra_files(['evaldarg001.hs'])], makefile_test, ['evaldarg
 # specialisation] in GHC.WebCore.Transform.ConstSpec)
 test('constspec001', [extra_files(['constspec001.hs'])], makefile_test, ['constspec001'])
 test('constspec002', [extra_files(['constspec002.hs'])], makefile_test, ['constspec002'])
+# constspec003: partial applications and lambdas as keys (Note [Specialising
+# on lambdas] in GHC.WebCore.Transform.ConstSpec)
+test('constspec003', [extra_files(['constspec003.hs'])], makefile_test, ['constspec003'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

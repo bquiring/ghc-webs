@@ -220,3 +220,11 @@ constspec002:
 	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec002.$$d/*.dump-webs-spec | sed 's/ //g' | sort; done
 	./constspec002w
 	./constspec002c
+
+# constspec003: Note [Specialising on lambdas]; the copies and the lifted
+# functions, which are keys and which are put back
+.PHONY: constspec003
+constspec003:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -fcore-webs-spec-lambdas -outputdir constspec003.l -v0 constspec003.hs -o constspec003l
+	grep -ho "^ *[A-Za-z]*_cs[0-9]*\|^Lifted: [A-Za-z]*_ll.*\|^Not specialised: .*" constspec003.l/*.dump-webs-spec | sed 's/^ *//; s/_ll_[A-Za-z0-9]*/_ll/' | sort
+	./constspec003l

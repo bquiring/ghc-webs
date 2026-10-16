@@ -1,0 +1,25 @@
+app_cs1
+app_cs2
+integ_cs1
+integ_cs2
+Lifted: app_ll (a key)
+Lifted: app_ll (a key)
+Lifted: integ_ll (a key)
+Lifted: integ_ll (a key)
+Lifted: loop_ll (a key)
+Lifted: loop_ll (a key)
+Lifted: loop_ll (a key)
+Lifted: loop_ll (a key)
+Lifted: loop_ll (not a key: put back)
+Lifted: loop_ll (not a key: put back)
+loop_cs1
+loop_cs2
+loop_cs3
+loop_cs4
+search_cs1
+1.50752656354625e11
+[3,1225,244650]
+[-5772612871378291323,6595298472802795973]
+48
+10240
+("xx",[True,True,True])

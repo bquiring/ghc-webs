@@ -2585,6 +2585,7 @@ fFlagsDeps = [
   flagSpec "core-webs-evald-args"             Opt_CoreWebsEvaldArgs,
   flagSpec "core-webs-spec-webs"              Opt_CoreWebsSpecWebs,
   flagSpec "core-webs-spec-calls"             Opt_CoreWebsSpecCalls,
+  flagSpec "core-webs-spec-lambdas"           Opt_CoreWebsSpecLambdas,
   flagSpec "core-webs-data-unbox"             Opt_CoreWebsDataUnbox,
   flagSpec "core-webs-data-unbox-eager"       Opt_CoreWebsDataUnboxEager,
   flagSpec "core-webs-unbox-nested"           Opt_CoreWebsUnboxNested,
