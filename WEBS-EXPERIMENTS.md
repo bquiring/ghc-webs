@@ -966,6 +966,66 @@ Against `nod` (instructions, at least 0.5%):
 * Not yet measured: spec-calls together with defunctionalisation, or with
   `-fcore-webs-raise-through-calls -fcore-webs-evald-args` (§22).
 
+## 24. What defunctionalisation still wins over the best web setup (2026-10-16)
+
+Best setup without defunc: early-ulsl8-nod + `-fcore-webs-raise-through-calls
+-fcore-webs-evald-args -fcore-webs-spec-calls` (`early-ulsl8-best`, built for
+these four only). Instructions against `nod` (branch-counters.py, medians
+of 3):
+
+| benchmark | defunc | best |
+|---|---|---|
+| integrate | −76.2% | −46.6% |
+| mate | −4.4% | 0.0% |
+| hpg | −2.9% | +0.4% |
+| ida | −2.5% | +0.2% |
+
+* **integrate: specialisation on a lambda with free variables.** In the
+  best setup `integrate1D_$e` already takes `f :: Double# -> (# Double# #)`;
+  what is left are the nine unknown calls per integration, of two call-site
+  lambdas, `\x1 -> (# x1 *## x #)` (free x) and
+  `\x -> integrate1D_$e l1 ipv (...)` (free ipv). With defunc, SpecConstr
+  specialises `$w$eintegrate1D` on the constructor `K ipv` and the whole
+  9×9 integration becomes one straight-line function
+  (`integrate1D_$s$w$eintegrate1D1`). Constant specialisation does not
+  apply: integrate1D is not recursive, and its keys are lambdas with free
+  variables, not top-level functions.
+* **mate: a non-recursive function with a local loop, eight keys.**
+  `moveLine bd c sq inc cont` calls `inc` in its local `joinrec ml`; the
+  eight calls (bishopmoves, rookmoves) pass eight closed lambdas, floated
+  to top-level `lvl`s by the time the early run sees them. Constant
+  specialisation requires a top-level recursive function and allows four
+  keys. Defunc makes one 8-constructor type and dispatches in the loop
+  (one copy of the code; the dispatch predicts well: indirect mispredicts
+  −15%).
+* **hpg: our own boundary split, repaired by defunc.** The 1,002,100 very
+  slow calls are exactly the entries of `Env.$w$eupto`: it calls its
+  continuation `nc` with nine arguments (x and Env's eight fields, after
+  arity raising), but two of the web's three lambdas take two: `choose`
+  passes the boundary wrapper of its exported parameter `xc`,
+  `\p -> let r = eta p in \x1..x8 -> r (MkEnv x1..x8)`, and `choosew` a
+  partial application `f eta`. Before the early run `choose` passed
+  `\n -> xc (xs !! n)`. Every call of the web passes all nine arguments, so
+  the inner lambda is one-shot and the wrapper could be
+  `\p x1..x8 -> eta p (MkEnv ...)`. `-fcore-webs-one-shot` does not fire
+  (its webs are exposed; and it asks whether each value is applied at
+  most once, not whether the partial application is). This is the open
+  hpg +3% (WEBS-BUGS.md, boundary split).
+* **ida: a partial application with a local argument.** `f_func_split`
+  (recursive, static `a_func`) gets a copy for its cold call (`lvl_s5jA`,
+  closed) but not for the hot one, `f_func_split (f_prune a_cut_off) ...`
+  in `f_branch`: a known function applied to a local variable. The 18.5 M
+  unknown calls stay.
+
+One extension of constant specialisation would cover integrate and ida:
+keys that are partial applications of known functions, `g @ts e1..ek`, the
+arguments becoming parameters of the copy (let-bound first, so sharing is
+kept; the recursive calls pass the parameter on), and lambda arguments
+lambda-lifted into such partial applications (their free variables the
+arguments). mate needs non-recursive candidates whose static parameter is
+called in a local loop, and more keys (or one copy dispatching, which is
+defunctionalisation). hpg needs the boundary wrapper fixed.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
