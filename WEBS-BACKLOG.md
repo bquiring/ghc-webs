@@ -16,7 +16,7 @@ a heuristic.
 
 ### Where we are (2026-10-16, handoff)
 
-Nothing pushed (branch `webs`, ~45 commits ahead of origin). 726 webs tests
+Nothing pushed (branch `webs`, 51 commits ahead of origin). 726 webs tests
 pass. Baselines: nofib `base` and `early-ulsl8` (early-ulsl's options,
 current compiler; bins in webs-bench/results, -4.17% instructions vs base),
 `early-ulsl8-nod` (same without defunctionalisation, -2.68%).
