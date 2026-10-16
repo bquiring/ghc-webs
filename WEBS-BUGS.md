@@ -53,7 +53,7 @@ would catch it again), **commit** (empty while uncommitted).
   GHC.Iface.Load); the debug compiler's assertion against home interfaces
   in the EPS allows it too.
 * **Guard:** `chunk008` (two chunks built one after the other).
-* **Commit:** (this commit)
+* **Commit:** `0fc5e0f9a1`
 
 ### Chunks: a chunk rebuilt into its output directory lost Tidy's kept uniques (2026-10-15)
 * **Found by:** hledger and hledger-lib as one whole-program chunk, built a
