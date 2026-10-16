@@ -606,6 +606,11 @@ test('chunk006', [extra_files(['chunk006.hs', 'Chunk006A.hs', 'Chunk006B.hs'])],
 # GHC.WebCore.Chunk; hledger)
 test('chunk007', [extra_files(['chunk007.hs', 'Chunk007A.hs', 'Chunk007B.hs'])],
      makefile_test, ['chunk007'])
+# chunk008: a chunk reading an interface of a home module outside its session
+# (Note [Home modules outside a chunk] in GHC.Iface.Load)
+test('chunk008', [extra_files(['chunk008.hs', 'Chunk008A.hs', 'Chunk008B.hs', 'Chunk008C.hs',
+                               'chunk008a.modules', 'chunk008c.modules'])],
+     makefile_test, ['chunk008'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

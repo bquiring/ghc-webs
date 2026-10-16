@@ -36,6 +36,25 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Chunks: a chunk needs an interface of a module outside its session (2026-10-16)
+* **Found by:** building GHC with 65 chunks of the `ghc` package (hadrian,
+  chunk-graph.py), early-ulsl's options.
+* **Symptom:** a chunk's compile stopped in `typecheckIface` (unfolding of
+  `mapAndUnzip`): `attempting to use module 'GHC.Utils.Ppr' which is not
+  loaded`.
+* **Cause:** a chunk's interfaces come from its merged program, whose
+  binders that are not exported belong to the chunk's last module. An
+  unfolding in one chunk module's interface then names a binder of that
+  module, which a module of a later chunk need not import, so it is not
+  in the later chunk's --make session, and --make refuses to read a home
+  module's interface from its file (Note [Home module load error]).
+* **Fix:** with -fcore-webs-chunk, such an interface is read from its file
+  into the EPS, as in one-shot mode (Note [Home modules outside a chunk] in
+  GHC.Iface.Load); the debug compiler's assertion against home interfaces
+  in the EPS allows it too.
+* **Guard:** `chunk008` (two chunks built one after the other).
+* **Commit:** (this commit)
+
 ### Chunks: a chunk rebuilt into its output directory lost Tidy's kept uniques (2026-10-15)
 * **Found by:** hledger and hledger-lib as one whole-program chunk, built a
   second time into the same output directory.

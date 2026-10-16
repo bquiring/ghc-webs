@@ -505,6 +505,9 @@ loadInterface doc_str mod from
         -- overlapping instances.
         ; massertPpr
               ((isOneShot (ghcMode (hsc_dflags hsc_env)))
+                -- Note [Home modules outside a chunk]: such a module is
+                -- never in the HPT of the chunk's session
+                || gopt Opt_CoreWebsChunk (hsc_dflags hsc_env)
                 || moduleUnitId mod `notElem` hsc_all_home_unit_ids hsc_env
                 || mod == gHC_PRIM)
                 (text "Attempting to load home package interface into the EPS" $$ ppr (HUG.allUnits hug) $$ doc_str $$ ppr mod $$ ppr (moduleUnitId mod))
@@ -878,6 +881,20 @@ This actually happened with P=base, Q=ghc-prim, via the AMP warnings.
 See #8320.
 -}
 
+{-
+Note [Home modules outside a chunk]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A webs chunk (Note [Chunks] in GHC.WebCore.Chunk) is a --make session over
+some of a package's modules; the others were built before it, one by one or
+as other chunks.  A chunk's interfaces are written from its merged program,
+in which the binders that are not exported belong to the chunk's last
+module: an unfolding in a chunk module's interface can mention a binder of
+that module, which the module importing it need not import (transitively),
+so it is not in the session.  Like one-shot mode, a chunk then reads the
+interface from its file, into the EPS (the module never enters the session's
+HPT); the build (hadrian) has built the other chunk whole before.
+-}
+
 findAndReadIface
   :: HscEnv
   -> SDoc            -- ^ Reason for loading the iface (used for tracing)
@@ -918,8 +935,10 @@ findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
           case mb_found of
               InstalledFound loc -> do
                   -- See Note [Home module load error]
+                  -- (and Note [Home modules outside a chunk])
                   if HUG.memberHugUnitId (moduleUnit mod) (hsc_HUG hsc_env)
                       && not (isOneShot (ghcMode dflags))
+                      && not (gopt Opt_CoreWebsChunk dflags)
                     then return (Failed (HomeModError mod loc))
                     else do
                         r <- read_file logger name_cache unit_state dflags wanted_mod (ml_hi_file loc)

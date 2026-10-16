@@ -28,6 +28,22 @@ chunk006:
 	  -v0 chunk006.hs -outputdir chunk006.out -o chunk006
 	./chunk006
 
+# chunk008: two chunks of one program built one after the other, as hadrian
+# builds a package's chunks: Chunk008B's unfolding mentions a binder that the
+# first chunk's merge moved to Chunk008A, which Chunk008C (the second chunk)
+# does not import; the second chunk reads its interface from the file
+# (Note [Home modules outside a chunk] in GHC.Iface.Load)
+.PHONY: chunk008
+chunk008:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fcore-webs-chunk -fcore-webs-chunk-modules=chunk008a.modules \
+	  -dcore-lint -v0 Chunk008A.hs Chunk008B.hs -outputdir chunk008.out
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -no-link -O -fcore-webs-chunk -fcore-webs-chunk-modules=chunk008c.modules \
+	  -dcore-lint -v0 Chunk008C.hs -outputdir chunk008.out
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -c chunk008.hs -outputdir chunk008.out -i./chunk008.out -v0
+	'$(TEST_HC)' $(TEST_HC_OPTS) chunk008.out/Main.o chunk008.out/Chunk008A.o chunk008.out/Chunk008B.o \
+	  chunk008.out/Chunk008C.o -o chunk008 -v0
+	./chunk008
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change
