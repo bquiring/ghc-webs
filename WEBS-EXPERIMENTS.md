@@ -893,6 +893,29 @@ Tests raisecall001, raisecall002 (undefined lazy fields: nothing more is
 forced), evaldarg001 (a lambda that keeps the box rebuilds it; here the
 program still allocates less: 40.9 → 40.1 MB).
 
+### 22a. solid: what defunctionalisation does there (2026-10-16)
+
+ticky, early-ulsl8 without and with defunctionalisation:
+`f_f_Csg_CSGtraverse_2` allocates 755 MB without, 96 MB with (the same
+21.5 M entries), and `f_f_main_prune_hs` (142 MB, 9.7 M entries)
+disappears. CSGtraverse_2 is a polymorphic recursive traversal taking
+`solve` and `combine` functions and passing them unchanged to its
+recursive calls; it is called from two places, at two instantiations,
+with two different pairs of known top-level functions
+(`f_main_prune_hs`/`f_main_merge_subtrees` and another pair). Without
+defunctionalisation the calls of solve and combine are unknown:
+`combine (traverse l) op (traverse r)` builds two thunks per node.
+Defunctionalisation makes each a two-constructor type; SpecConstr then
+specialises CSGtraverse_2 per constructor, the calls become known,
+merge_subtrees' strictness applies and prune_hs inlines.
+
+Web constant propagation does not fire: the web of `solve` gets two
+different constants (one per call site), and the recursive calls pass the
+parameter, not a constant. The web transformation that would do it:
+constant specialisation, one copy of the function per distinct constant
+that its external calls pass for a parameter the recursive calls pass
+unchanged; every call known, with no dispatch at all.
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
