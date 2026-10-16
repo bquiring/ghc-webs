@@ -29,7 +29,7 @@ def iface(ghc, path):
 def parse(txt):
     m = re.search(r'^interface (\S+)', txt, re.M)
     mod = m.group(1)
-    vals = []
+    vals, reexports = [], []
     ex = re.search(r'^exports:\n(.*?)^\S', txt, re.M | re.S)
     for line in (ex.group(1).splitlines() if ex else []):
         name = line.strip().split('{')[0].split('|')[0].strip()
@@ -37,6 +37,8 @@ def parse(txt):
         if name and (name[0].islower() or name[0] == '_' or not (name[0].isalpha() or name[0] == ':')):
             # an imported entity re-exported is qualified (M.f): not ours
             if '.' in name.rstrip('.') and name[0].isalpha():
+                q, _, occ = name.rpartition('.')
+                reexports.append((q, occ))
                 continue
             vals.append(name)
     used = collections.defaultdict(set)
@@ -51,7 +53,7 @@ def parse(txt):
         mm = re.match(r'\s+(\S+) [0-9a-f]{32}[,\]]?$', line)
         if mm and cur and cur != mod:
             used[cur].add(mm.group(1))
-    return mod, vals, used
+    return mod, vals, used, reexports
 
 
 def main():
@@ -63,24 +65,28 @@ def main():
     ap.add_argument('--warnings')
     # a chunk (Note [Chunks] in GHC.WebCore.Chunk): only the uses by
     # modules outside it count, and only its modules are listed
-    ap.add_argument('--chunk-modules')
+    # (repeatable: several chunks, each against the uses from outside it)
+    ap.add_argument('--chunk-modules', action='append', default=[])
     # names other packages use (from -ddump-minimal-imports: their
     # interfaces name only the modules), used in every module
     ap.add_argument('--used-names')
     a = ap.parse_args()
-    chunk = set(open(a.chunk_modules).read().split()) if a.chunk_modules else None
+    chunks = [set(open(f).read().split()) for f in a.chunk_modules] or [None]
     his = sorted(os.path.join(r, f) for d in a.dir.split(',') for r, _, fs in os.walk(d)
                  for f in fs if f.endswith('.hi'))
     exports = {}
-    used = collections.defaultdict(set)
+    kept = collections.defaultdict(set)      # used from other packages
+    uses = {}                                # module -> its uses
     for h in his:
-        mod, vals, u = parse(iface(a.ghc, h))
+        mod, vals, u, rx = parse(iface(a.ghc, h))
         exports[mod] = vals
-        if chunk is not None and mod in chunk:
-            continue
-        for m, ns in u.items():
-            used[m] |= ns
+        uses[mod] = u
+        # what a module other packages import re-exports is used
+        if mod in a.keep_module:
+            for q, occ in rx:
+                kept[q].add(occ)
     # "The import of ‘a, b’ from module ‘M’ is redundant" (possibly wrapped)
+    used = warned = collections.defaultdict(set)
     if a.warnings and os.path.exists(a.warnings):
         txt = ' '.join(open(a.warnings, errors='replace').read().split())
         for names, mod in re.findall(r'The import of \u2018(.*?)\u2019 from module \u2018(\S+?)\u2019 is redundant', txt):
@@ -95,11 +101,19 @@ def main():
     extra = set(open(a.used_names).read().split()) if a.used_names else set()
     out = a.out or os.path.join(a.dir.split(',')[0], 'webs-unused.txt')
     lines = []
-    for mod in sorted(exports):
-        if mod in a.keep_module or mod in whole or (chunk is not None and mod not in chunk):
-            continue
-        lines += ['%s %s' % (mod, v) for v in exports[mod]
-                  if v != 'main' and v not in used[mod] and v not in extra]
+    for chunk in chunks:
+        used = collections.defaultdict(set, {m: set(ns) for m, ns in kept.items()})
+        used.update({m: used[m] | ns for m, ns in warned.items()})
+        for mod, u in uses.items():
+            if chunk is not None and mod in chunk:
+                continue
+            for m, ns in u.items():
+                used[m] |= ns
+        for mod in sorted(exports):
+            if mod in a.keep_module or mod in whole or (chunk is not None and mod not in chunk):
+                continue
+            lines += ['%s %s' % (mod, v) for v in exports[mod]
+                      if v != 'main' and v not in used[mod] and v not in extra]
     with open(out, 'w') as f:
         f.write(''.join(l + '\n' for l in lines))
     print('%s: %d modules, %d exported values, %d unused' %

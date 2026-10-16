@@ -83,7 +83,7 @@ compilePackage rs = do
             else compileHsObjectAndHi rs dyn_o
 
       -- A webs chunk's modules, compiled together (websChunkStamp)
-      root -/- "**/build/webs-chunk.stamp" %> websChunkStamp rs
+      root -/- "**/build/webs-chunk-*.stamp" %> websChunkStamp rs
 
       forM_ ((,) <$> hsExts <*> wayPats) $ \ ((oExt, hiExt), wayPat) ->
         (  (root -/- "**/build/**/*." ++ wayPat ++ oExt)
@@ -220,16 +220,16 @@ compileHsObjectAndHi rs objpath = do
   let ctx = objectContext b
       way = C.way ctx
   ctxPath <- contextPath ctx
-  chunk <- websChunk ctx
+  chunks <- websChunks ctx
   bpath <- buildPath ctx
   let BuildPath _ _ _ obj = b
-      isChunkModule = case (chunk, obj) of
-        (Just (_, mods), Hs (HsObject _ (Extension _ suf))) | suf `elem` [O, Hi] ->
-          map (\c -> if c == '/' then '.' else c) (dropExtension (makeRelative bpath objpath))
-            `elem` mods
-        _ -> False
+      this = map (\c -> if c == '/' then '.' else c) (dropExtension (makeRelative bpath objpath))
+      chunkOf = case obj of
+        Hs (HsObject _ (Extension _ suf)) | suf `elem` [O, Hi] ->
+          listToMaybe [ i | (i, (_, mods)) <- zip [0 :: Int ..] chunks, this `elem` mods ]
+        _ -> Nothing
   -- A webs chunk's module: built with its chunk (websChunkStamp)
-  if isChunkModule then need [bpath -/- "webs-chunk.stamp"] else do
+  if isJust chunkOf then need [bpath -/- websChunkStampName (fromJust chunkOf)] else do
     (src, deps) <- lookupDependencies (ctxPath -/- ".dependencies") objpath
     need (src:deps)
     -- The .conf file is needed when template-haskell is implicitly added as a dependency
@@ -247,23 +247,27 @@ compileHsObjectAndHi rs objpath = do
 
     buildWithResources rs $ target ctx (Ghc CompileHs stage) [src] [objpath]
 
--- | The webs chunk of a context (Note [Chunks] in GHC.WebCore.Chunk): the
--- file listing its modules, and the modules.  HADRIAN_WEBS_CHUNKS names a
--- file of lines @STAGE PACKAGE MODULES-FILE@ (e.g. @stage0 ghc
--- /path/ghc.chunk@); the vanilla way only
-websChunk :: Context -> Action (Maybe (FilePath, [String]))
-websChunk ctx
-  | C.way ctx /= vanilla = return Nothing
+-- | The webs chunks of a context (Note [Chunks] in GHC.WebCore.Chunk): for
+-- each, the file listing its modules, and the modules.  HADRIAN_WEBS_CHUNKS
+-- names a file of lines @STAGE PACKAGE MODULES-FILE@ (e.g. @stage0 ghc
+-- /path/ghc.chunk@), several for a package with several chunks (chunk N is
+-- its Nth line); the vanilla way only
+websChunks :: Context -> Action [(FilePath, [String])]
+websChunks ctx
+  | C.way ctx /= vanilla = return []
   | otherwise = do
       mb <- getEnv "HADRIAN_WEBS_CHUNKS"
       case mb of
-        Nothing -> return Nothing
+        Nothing -> return []
         Just f  -> do
           ls <- map words . lines <$> readFile' f
-          case [ m | [s, p, m] <- ls, s == stageString (C.stage ctx)
-                   , p == pkgName (C.package ctx) ] of
-            m : _ -> Just . (,) m . concatMap words . lines <$> readFile' m
-            []    -> return Nothing
+          forM [ m | [s, p, m] <- ls, s == stageString (C.stage ctx)
+                   , p == pkgName (C.package ctx) ] $ \m ->
+            (,) m . concatMap words . lines <$> readFile' m
+
+-- | The stamp file of a package's Nth chunk, in its build directory
+websChunkStampName :: Int -> FilePath
+websChunkStampName i = "webs-chunk-" ++ show i ++ ".stamp"
 
 -- | A webs chunk's modules (websChunk), compiled together by one --make
 -- with -fcore-webs-chunk, with the arguments of compiling one of them; the
@@ -273,12 +277,17 @@ websChunk ctx
 websChunkStamp :: [(Resource, Int)] -> FilePath -> Action ()
 websChunkStamp rs stamp = do
   root <- buildRoot
-  BuildPath _ stage pkgpath _ <-
-    parsePath (parseBuildPath root (Parsec.string "webs-chunk.stamp")) "<webs chunk stamp parser>" stamp
+  BuildPath _ stage pkgpath i <-
+    parsePath (parseBuildPath root (Parsec.string "webs-chunk-" *> (read <$> Parsec.many1 Parsec.digit)
+                                     <* Parsec.string ".stamp"))
+              "<webs chunk stamp parser>" stamp
   let ctx = Context stage (unsafeFindPackageByPath pkgpath) vanilla Inplace
   ctxPath <- contextPath ctx
   bpath   <- buildPath ctx
-  (mfile, mods) <- fromMaybe (error ("No webs chunk for " ++ quote stamp)) <$> websChunk ctx
+  chunks  <- websChunks ctx
+  let (mfile, mods) = case drop i chunks of
+        c : _ -> c
+        []    -> error ("No webs chunk for " ++ quote stamp)
   let file m e = bpath -/- map (\c -> if c == '.' then '/' else c) m <.> e
       ours     = [ file m e | m <- mods, e <- ["o", "hi"] ]
   srcdeps <- mapM (lookupDependencies (ctxPath -/- ".dependencies") . flip file "o") mods
