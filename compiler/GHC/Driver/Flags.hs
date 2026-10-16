@@ -665,6 +665,7 @@ data GeneralFlag
    | Opt_CoreWebsDefunc     -- ^ Web pipeline: defunctionalisation
    | Opt_CoreWebsDefuncLifted -- ^ Defunctionalisation: lift the lambdas' bodies, no apply function
    | Opt_CoreWebsDataSplit    -- ^ Split data types by data flow (copies)
+   | Opt_CoreWebsSplitClasses -- ^ ... and class dictionaries: Note [Splitting classes]
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
@@ -967,6 +968,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDefunc
    , Opt_CoreWebsDefuncLifted
    , Opt_CoreWebsDataSplit
+   , Opt_CoreWebsSplitClasses
    , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested

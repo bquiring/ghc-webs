@@ -28,6 +28,19 @@ chunk006:
 	  -v0 chunk006.hs -outputdir chunk006.out -o chunk006
 	./chunk006
 
+# splitclass001: a class of the program's own, its dictionary not
+# specialised away, split in a chunk (Note [Splitting classes] in
+# GHC.WebCore.DataSplit); useless elimination and arity raising then change
+# its methods
+.PHONY: splitclass001
+splitclass001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) --make -fcore-webs-chunk -O -fno-specialise -fcore-webs-early \
+	  -fcore-webs-data-split -fcore-webs-split-classes -fcore-webs-useless -fcore-webs-arity-raise \
+	  -dcore-lint -dcore-webs-lint -ddump-webs-data -ddump-to-file \
+	  -v0 splitclass001.hs -outputdir splitclass001.out -o splitclass001
+	grep -h "dictionaries of SplitClass001A.Shape" splitclass001.out/non-module.dump-webs-data | sed 's/ as .*//'
+	./splitclass001
+
 # chunk007: a chunk built twice into one output directory: the second
 # capture's Tidy keeps its uniques although the first build's interfaces put
 # the names in the name cache (allocateGlobalBinderWith in GHC.Iface.Env;

@@ -9,13 +9,18 @@ module GHC.WebCore.DataSplit
   , mapTyCons
   , mapTyConsCo
   , nonParametric
+  , eligibleClass
+  , mkClassCopy
   ) where
 
 import GHC.Prelude
 import Data.List ( isPrefixOf )
 
 import GHC.Core
+import GHC.Core.Class ( mkClass, classTyCon, classAllSelIds, classATs, classSCTheta
+                      , classTvsFds, classTyVars )
 import GHC.Core.DataCon
+import GHC.Core.Make ( mkSingleAltCase )
 import GHC.Core.FVs ( rulesFreeVars, idRuleVars, idUnfoldingVars )
 import GHC.Core.SimpleOpt ( simpleOptExpr, defaultSimpleOpts )
 import GHC.Core.Multiplicity ( Scaled(..), scaledThing )
@@ -33,8 +38,10 @@ import GHC.Core.Seq ( seqBinds )
 import GHC.Data.Bag
 
 import GHC.Types.Id
+import GHC.Data.FastString ( fsLit )
+import Language.Haskell.Syntax.BooleanFormula ( mkTrue )
 import GHC.Builtin.PrimOps ( PrimOp(AtomicModifyMutVar2Op, DataToTagSmallOp, DataToTagLargeOp, TagToEnumOp) )
-import GHC.Types.Id.Make ( mkDataConWorkId )
+import GHC.Types.Id.Make ( mkDataConWorkId, mkDictSelId, mkDictSelRhs )
 import GHC.Types.Name
 import GHC.Types.Name.Env ( emptyNameEnv )
 import GHC.Types.SourceText ( SourceText(..) )
@@ -177,6 +184,72 @@ eligibleNewtype tc
 copyable :: TyCon -> Bool
 copyable tc = eligible tc || eligibleNewtype tc
 
+-- | A class whose dictionaries are copied, with -fcore-webs-split-classes
+-- (Note [Splitting classes]): a class with a data constructor (not a
+-- single-method newtype class), no associated types, not a constraint
+-- tuple, whose methods do not mention the class itself, and whose type
+-- variables have closed kinds (no poly-kinded classes)
+eligibleClass :: TyCon -> Bool
+eligibleClass tc
+  | Just cls <- tyConClass_maybe tc
+  , not (isNewTyCon tc), not (isTupleTyCon tc)
+  , [dc] <- tyConDataCons tc
+  = null (classATs cls)
+    && isVanillaDataCon dc && null (dataConTheta dc) && isNothing (dataConWrapId_maybe dc)
+    && all ok_binder (tyConBinders tc)
+    && not (any (\(Scaled _ t) -> tc `elementOfUniqSet` tyConsOfType t) (dataConOrigArgTys dc))
+  | otherwise
+  = False
+  where
+    ok_binder b = not (isNamedTyConBinder b) && noFreeVarsOfType (tyVarKind (binderVar b))
+
+{- Note [Splitting classes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-split-classes (and data splitting), class dictionaries are
+copied like data types.  An instance's methods are stored in the class's
+dictionary constructor, whose fields have the class's types, so every
+method's webs are exposed (by the constructor), even in a whole program
+(a chunk) where nothing outside uses them.  A class of dictionary copies
+that never meets code outside the program becomes a class of its own,
+C_s<n>, whose fields are hidden (Note [Hidden fields] in GHC.WebCore.Sigs):
+its methods' webs are internal.
+
+  * Copies.  A dictionary's type is copied like a data type's: binders,
+    type arguments, the dictionary constructor (the instance's dictionary
+    function builds it).  A copy is an ordinary type constructor of kind
+    Constraint, so the arrows that take dictionaries stay invisible.
+
+  * Selectors.  A method or superclass selector is an imported function of
+    the class's type.  Each occurrence instead gets a fresh copy of the
+    class in its type, as a constructor worker does, so a selection
+    exposes nothing by itself.  An exposed class gets the original
+    selector back; for a split class, the selection becomes a case on the
+    dictionary (selectSplit), so that the method is read from a field like
+    any other.  (The new class has selectors of its own, which Tidy gives
+    bindings to; the program does not use them.)
+
+  * The new class is a real class (mkClassCopy): the specialiser and the
+    simplifier treat its dictionaries as dictionaries (isDictTy).  Its
+    methods have no default methods and its minimal definition is empty:
+    only the typechecker reads them.
+
+  * Dictionary functions.  A dictionary function's DFun unfolding is a
+    stable unfolding, which pins the dictionary function and the methods
+    it mentions.  With the flag, the early run removes the DFun unfoldings
+    of the dictionary functions that are not exported, and puts them back
+    at its end, rebuilt from the right-hand sides (Note [Rebuilding DFun
+    unfoldings] in GHC.WebCore.Pipeline).
+
+What exposes a class: a dictionary passed to an imported function -- an
+overloaded function, a default method ($dm...), an imported dictionary
+function's argument -- or returned by one (an imported instance), and
+exported dictionary functions.
+
+Classes are not specialised or flattened (DataSpec, DataFlatten), and every
+split class counts as useful (Note [Keeping only useful splits]): what a
+split gains is the methods' internal webs, which only the web passes use.
+-}
+
 {- Note [Copies keep strictness]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A constructor with strict fields of a type variable needs no wrapper (its
@@ -310,6 +383,94 @@ mkNewtypeCopy us mk_name tc_occ tc rhs = tycon
            [Scaled mult field] (mkTyConApp tycon (mkTyVarTys univs))
            NoPromInfo tycon 1 [] (mkDataConWorkId wk_name dc) NoDataConRep
 
+-- | A class like the given one, with its own names and the given fields (in
+-- terms of the original constructor's universal type variables; the
+-- class's own occurrences are the new class, though eligible classes have
+-- none).  Note [Splitting classes]
+mkClassCopy :: Name -> Name -> Name -> [Name]   -- ^ class, constructor, worker, selectors
+            -> TyCon -> [Scaled Type] -> TyCon
+mkClassCopy tc_name dc_name wk_name sel_names orig fields = tycon
+  where
+    cls0  = fromMaybe (pprPanic "mkClassCopy" (ppr orig)) (tyConClass_maybe orig)
+    odc   = case tyConDataCons orig of
+              [dc'] -> dc'
+              _     -> pprPanic "mkClassCopy" (ppr orig)
+    univs = dataConUnivTyVars odc
+    -- the class's type variables are its constructor's (buildClass)
+    to_univs = substTy (zipTvSubst (classTyVars cls0) (mkTyVarTys univs))
+    (_, fds) = classTvsFds cls0
+    rename_tv tv = case [ u | (c, u) <- zip (classTyVars cls0) univs, c == tv ] of
+                     (u : _) -> u
+                     []      -> tv
+    fds'  = [ (map rename_tv as, map rename_tv bs) | (as, bs) <- fds ]
+    n_sc  = length (classSCTheta cls0)
+    (sc_names, op_names) = splitAt n_sc sel_names
+    clas  = mkClass tc_name univs fds' (map to_univs (classSCTheta cls0)) sc_sels []
+                    [ (sel, Nothing) | sel <- op_sels ] mkTrue tycon
+    sc_sels = [ mkDictSelId n clas | n <- sc_names ]
+    op_sels = [ mkDictSelId n clas | n <- op_names ]
+    tycon = mkClassTyCon tc_name (tyConBinders orig) (tyConRoles orig) (mkDataTyConRhs [dc]) clas
+                         (mkPrelTyConRepName tc_name)
+    self ty = runIdentity (mapTyCons (== orig) (\_ -> return tycon) ty)
+    dc = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
+           (dataConSrcBangs odc) (dataConImplBangs odc) (dataConRepStrictness odc)
+           [] univs [] emptyNameEnv (dataConUserTyVarBinders odc) [] []
+           [ Scaled m (self t) | Scaled m t <- fields ] (mkTyConApp tycon (mkTyVarTys univs))
+           NoPromInfo tycon 1 [] (mkDataConWorkId wk_name dc) NoDataConRep
+
+-- | Selections from the dictionaries of split classes become cases on them
+-- (Note [Splitting classes]); the other selectors stay
+selectSplit :: UniqSupply -> (TyCon -> Bool) -> CoreProgram -> CoreProgram
+selectSplit us0 is_split binds = evalState (mapM bind binds) us0
+  where
+    bind (NonRec b e) = NonRec b <$> expr e
+    bind (Rec prs)    = Rec <$> mapM (\(b, e) -> (,) b <$> expr e) prs
+
+    fresh :: State UniqSupply Unique
+    fresh = state takeUniqFromSupply
+
+    expr :: CoreExpr -> State UniqSupply CoreExpr
+    expr e = case e of
+      _ | (Var v, args) <- collectArgs e
+        , Just cls <- isClassOpId_maybe v
+        , is_split (classTyCon cls)
+        -> do { args' <- mapM expr args; select cls v args' }
+      App f a       -> App <$> expr f <*> expr a
+      Lam b x       -> Lam b <$> expr x
+      Let b x       -> Let <$> bind b <*> expr x
+      Case s b t as -> (\s' as' -> Case s' b t as') <$> expr s
+                         <*> mapM (\(Alt c bs r) -> Alt c bs <$> expr r) as
+      Cast x co     -> (\x' -> Cast x' co) <$> expr x
+      Tick t x      -> Tick t <$> expr x
+      _             -> return e
+
+    select cls v args
+      | (ty_args, rest) <- splitAt n_tys args
+      , length ty_args == n_tys
+      , all isTypeArg ty_args
+      = do { let tys = [ t | Type t <- ty_args ]
+                 field_tys = map scaledThing (dataConInstArgTys dc tys)
+           ; fs <- mapM (\t -> do { u <- fresh; return (mkSysLocal (fsLit "m") u ManyTy t) })
+                        field_tys
+           ; u <- fresh
+           ; let d = mkSysLocal (fsLit "dict") u ManyTy (mkTyConApp (classTyCon cls) tys)
+                 sel_case dict_e = mkSingleAltCase dict_e d (DataAlt dc) fs (Var (fs !! idx))
+           ; case rest of
+               (dict_e : more) -> return (mkApps (sel_case dict_e) more)
+               []              -> do { u' <- fresh
+                                     ; let x = mkSysLocal (fsLit "dict") u' ManyTy (idType d)
+                                     ; return (Lam x (sel_case (Var x))) } }
+      | otherwise   -- not even applied to its types: rare
+      = return (mkApps (mkDictSelRhs cls idx) args)
+      where
+        dc    = case tyConDataCons (classTyCon cls) of
+                  [dc'] -> dc'
+                  _     -> pprPanic "selectSplit" (ppr cls)
+        n_tys = length (dataConUnivTyVars dc)
+        idx   = case [ i | (i, s) <- zip [0 ..] (classAllSelIds cls), getUnique s == getUnique v ] of
+                  (i : _) -> i
+                  []      -> pprPanic "selectSplit: selector" (ppr v)
+
 -- | A copy of a data type with some of its constructors (by tag, in order).
 -- Every occurrence of the type in the constructors' fields is the copy.
 mkCopy :: UniqSupply -> (Unique -> OccName -> Name) -> OccName -> (DataCon -> Int -> OccName)
@@ -376,7 +537,9 @@ data Mapper m = Mapper
   , m_bndr :: Id -> m Id
   , m_con  :: DataCon -> m Id
   , m_alt  :: Id -> DataCon -> m (Maybe DataCon)
-  , m_co   :: Coercion -> m Coercion }
+  , m_co   :: Coercion -> m Coercion
+  , m_sel  :: Id -> m Id }       -- ^ a class's method or superclass selector
+                                 --   (Note [Splitting classes])
 
 mapProgram :: forall m. Monad m => Mapper m -> CoreProgram -> m CoreProgram
 mapProgram mp binds
@@ -404,6 +567,7 @@ mapProgram mp binds
     go env expr = case expr of
       Var v
         | Just dc <- isDataConWorkId_maybe v -> Var <$> m_con mp dc
+        | isClassOpId v                      -> Var <$> m_sel mp v
         | otherwise                          -> return (Var (lk env v))
       Lit {}      -> return expr
       Type t      -> Type <$> m_ty mp t
@@ -713,8 +877,8 @@ newDataCopy tc = do
   ; put s { as_us = us2, as_copies = addToUFM (as_copies s) c tc, as_all = c : as_all s }
   ; return c }
 
-annMapper :: VarSet -> (TyCon -> Bool) -> Mapper AnnM
-annMapper pinned kinded = Mapper
+annMapper :: Bool -> VarSet -> (TyCon -> Bool) -> Mapper AnnM
+annMapper classes pinned kinded = Mapper
   { m_ty   = ann_ty
   , m_bndr = \b -> if b `elemVarSet` pinned || isCoVar b then return (zap b)
                    else do { t <- ann_ty (idType b); return (zap (setIdType b t)) }
@@ -728,11 +892,18 @@ annMapper pinned kinded = Mapper
         -> do { modify (\s -> s { as_matched = (c, dataConTag dc) : as_matched s })
               ; return (Just (con c dc)) }
       _ -> return (Just dc)
-  , m_co   = mapTyConsCo copyable' newCopy }    -- Note [Copies in coercions]
+  , m_co   = mapTyConsCo copyable' newCopy     -- Note [Copies in coercions]
+    -- A selector's class is a fresh copy (Note [Splitting classes])
+  , m_sel  = \v -> case isClassOpId_maybe v of
+      Just cls | let tc = classTyCon cls, class_ok tc
+        -> do { c <- newCopy tc
+              ; return (setIdType v (runIdentity (mapTyCons (== tc) (\_ -> return c) (idType v)))) }
+      _ -> return v }
   where
     -- Note [Types used as kinds]
-    copyable' t = copyable t && not (kinded t)
-    eligible' t = eligible t && not (kinded t)
+    copyable' t = (copyable t || class_ok t) && not (kinded t)
+    eligible' t = (eligible t || class_ok t) && not (kinded t)
+    class_ok t  = classes && eligibleClass t && not (kinded t)
     ann_ty = mapTyCons copyable' newCopy
     con c dc = fromMaybe (pprPanic "DataSplit: constructor" (ppr dc)) (conWithTag c (dataConTag dc))
     -- Vanilla unfoldings may mention binders whose types change; the
@@ -810,7 +981,8 @@ data PairSource
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
-splitDataTypes :: String          -- ^ The copies' suffix, before their class number
+splitDataTypes :: Bool            -- ^ split classes too (Note [Splitting classes])
+               -> String          -- ^ The copies' suffix, before their class number
                -> PairSource
                -> Maybe UnboxOpts -> LintConfig -> Module -> UniqSupply -> [CoreRule]
                -> CoreProgram
@@ -819,7 +991,7 @@ splitDataTypes :: String          -- ^ The copies' suffix, before their class nu
 -- Annotation, the pairs and the classes do not depend on which classes are
 -- kept: applied to all but the last argument, it computes them once for
 -- both passes (Note [Keeping only useful splits])
-splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
+splitDataTypes split_cls sfx source unbox cfg this_mod us rules binds = split_with
   where
     split_with keep = DataSplitResult
         { dsr_binds   = final_binds
@@ -830,7 +1002,12 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
         , dsr_useful  = useful
         , dsr_stages  = stages }
       where
-        split_binds = evalState (mapProgram rwMapper ann_binds) ()
+        split_binds0 = evalState (mapProgram rwMapper ann_binds) ()
+        -- Note [Splitting classes]
+        split_binds | null class_tcs = split_binds0
+                    | otherwise      = selectSplit us_sel (`elementOfUniqSet` mkUniqSet class_tcs)
+                                                   split_binds0
+        class_tcs = [ tc | tc <- new_tcs, isClassTyCon tc ]
         -- Unbox fields of the new types (Note [Flattening fields] in
         -- GHC.WebCore.DataFlatten)
         (final_binds, final_tcs, flat_dump, flat_rebuilt, flat_stages)
@@ -852,6 +1029,7 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
                            | not (kept n ms)        = Bottom   -- back to the original
                            | isNewTyCon orig        = mk_split_nt n us_n orig ms
                            | null bs                = Bottom
+                           | isClassTyCon orig      = mk_split_class n us_n orig
                            | otherwise              = mk_split n us_n orig bs ]
 
         -- Note [Keeping only useful splits]: in the second pass, a data class is
@@ -886,7 +1064,10 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
                           , Just n <- [split_number sp] ] ++
                       [ n | (n, (_, orig, Split _ cons, _, _)) <- zip [1 :: Int ..] fates
                           , not (isNewTyCon orig)
-                          , length cons < length (tyConDataCons orig) ])
+                          , length cons < length (tyConDataCons orig) ] ++
+                      -- Note [Splitting classes]: every split class
+                      [ n | (n, (_, orig, Split {}, _, _)) <- zip [1 :: Int ..] fates
+                          , isClassTyCon orig ])
         -- A newtype class: its representation, from one member, with the
         -- children mapped to their classes' types (lazily).  The member's
         -- type variables are those of the TyCon it was copied from, which in
@@ -918,8 +1099,11 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
           | isNewTyCon t = nonDetEltsUniqSet (tyConsOfType (snd (newTyConRhs t)))
           | otherwise    = [ t' | dc <- tyConDataCons t, Scaled _ ft <- dataConOrigArgTys dc
                                 , t' <- nonDetEltsUniqSet (tyConsOfType ft) ]
-        data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), not (tc `elementOfUniqSet` nt_reach) ]
-        kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || tc `elementOfUniqSet` nt_reach ]
+        -- (nor classes: Note [Splitting classes])
+        data_tcs = [ tc | tc <- new_tcs, not (isNewTyCon tc), not (isClassTyCon tc)
+                        , not (tc `elementOfUniqSet` nt_reach) ]
+        kept_tcs = [ tc | tc <- new_tcs, isNewTyCon tc || isClassTyCon tc
+                        || tc `elementOfUniqSet` nt_reach ]
         changed = ok && not (null new_tcs)
 
         -- The type constructor a copy becomes, and a constructor (by original tag)
@@ -943,8 +1127,25 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
           , m_alt  = \_ dc -> let tc = dataConTyCon dc in
                               if is_copy tc then return (final_con tc (dataConTag dc))
                               else return (Just dc)
-          , m_co   = mapTyConsCo is_copy (return . final) }
+          , m_co   = mapTyConsCo is_copy (return . final)
+            -- the selector of the class's new class, or the original
+          , m_sel  = \v -> return (final_sel v) }
         rw_ty = mapTyCons is_copy (return . final)
+
+        final_sel v
+          | Just cls <- isClassOpId_maybe v
+          , (_, body) <- splitForAllTyCoVars (idType v)
+          , Just (_, _, arg, _) <- splitFunTy_maybe body
+          , Just (c, _) <- splitTyConApp_maybe arg
+          , is_copy c
+          = let sels = classAllSelIds cls
+                i    = length (takeWhile (\s -> getUnique s /= getUnique v) sels)
+                tc   = final c
+            in case tyConClass_maybe tc of
+                 Just cls' | i < length sels -> classAllSelIds cls' !! i
+                 _                           -> pprPanic "DataSplit: selector" (ppr v <+> ppr tc)
+          | otherwise
+          = v
 
         -- Each stage forces what the next one needs, and no more (forcing an
         -- annotated program does not build its copies' constructors: Data Lint
@@ -992,11 +1193,17 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
               | (ms, orig, f, _, _) <- fates, isNewTyCon orig ]
           , vcat [ ppr tc <+> text "= newtype" <+> ppr orig <+> text "~R#"
                    <+> ppr (snd (newTyConRhs tc))
-                 | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ] ]
+                 | (_, orig, Split tc _, _, _) <- fates, isNewTyCon orig ]
+            -- Note [Splitting classes]
+          , vcat [ text "dictionaries of" <+> ppr orig <> colon <+> pp_fate_short f
+                   <+> parens (int (length ms) <+> text "copies" <> comma
+                               <+> text "built" <+> ppr bs <> comma <+> text "matched" <+> ppr mts)
+                 | (ms, orig, f, bs, mts) <- fates, isClassTyCon orig ] ]
 
     (us1, us23) = splitUniqSupply us
     (us2, us3)  = splitUniqSupply us23
-    (us4, us5) = splitUniqSupply us3
+    (us4, us56) = splitUniqSupply us3
+    (us5, us_sel) = splitUniqSupply us56
     -- Each round unpacks one more level (Note [Flattening fields])
     -- (the last component: each round's two steps, for -dshow-passes)
     flatten_rounds _ 0 _ tcs bs = (bs, tcs, empty, [], [])
@@ -1024,7 +1231,7 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
     simple_bind (NonRec b e) = NonRec b (simpleOptExpr defaultSimpleOpts e)
     simple_bind (Rec prs)    = Rec [ (b, simpleOptExpr defaultSimpleOpts e) | (b, e) <- prs ]
     pinned = pinnedIds rules binds
-    (ann_binds, st) = runState (mapProgram (annMapper pinned kinded) binds)
+    (ann_binds, st) = runState (mapProgram (annMapper split_cls pinned kinded) binds)
                                (AnnState this_mod us1 emptyUFM [] emptyUFM [] [] kinded)
     kinded_set = usedAsKinds binds
     kinded tc = tc `elemUFM` kinded_set
@@ -1158,6 +1365,24 @@ splitDataTypes sfx source unbox cfg this_mod us rules binds = split_with
       str | (ds@(_ : _), rest) <- span isDigit str
           , reverse sfx `isPrefixOf` rest -> Just (read (reverse ds))
       _ -> Nothing
+    -- A class's new class (Note [Splitting classes]); its selectors are
+    -- named after the original's
+    mk_split_class n us_n orig = Split tc (zip [1] (tyConDataCons tc))
+      where
+        tag = sfx ++ show n
+        nm u occ = mkExternalName u this_mod occ noSrcSpan
+        odc = head (tyConDataCons orig)
+        sels = classAllSelIds (fromMaybe (pprPanic "mk_split_class" (ppr orig)) (tyConClass_maybe orig))
+        us_all = uniqsFromSupply us_n
+        (u_tc, u_dc, u_wk) = case us_all of
+                               (a : b : c : _) -> (a, b, c)
+                               _               -> panic "mk_split_class"
+        u_sels = drop 3 us_all
+        tc = mkClassCopy (nm u_tc (mkClsOcc (occNameString (getOccName orig) ++ tag)))
+                         (nm u_dc (mkDataOcc (occNameString (getOccName odc) ++ tag)))
+                         (nm u_wk (mkDataConWorkerOcc (mkDataOcc (occNameString (getOccName odc) ++ tag))))
+                         [ nm u (mkVarOcc (occNameString (getOccName s) ++ tag)) | (s, u) <- zip sels u_sels ]
+                         orig (dataConOrigArgTys odc)
     mk_split n us_n orig tags = Split tc (zip tags (tyConDataCons tc))
       where
         tc = mkCopy us_n

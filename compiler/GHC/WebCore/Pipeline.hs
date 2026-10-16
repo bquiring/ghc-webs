@@ -16,9 +16,9 @@ import GHC.Core.Opt.Monad
 import GHC.Core.Ppr ( pprCoreBindings )
 import GHC.Core.Subst ( mkEmptySubst, substExpr )
 import GHC.Types.Var.Env ( mkInScopeSet )
-import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet )
+import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet, sizeVarSet )
 import GHC.Core.Unfold ( UnfoldingOpts )
-import GHC.Core.Unfold.Make ( mkUnfolding )
+import GHC.Core.Unfold.Make ( mkUnfolding, mkDFunUnfolding )
 import GHC.Core.TyCo.Compare ( eqType )
 
 import GHC.Platform ( Platform )
@@ -55,7 +55,7 @@ import GHC.WebCore.Annotate
 import GHC.WebCore.Boundary ( splitBoundary, contractBoundary )
 import GHC.WebCore.DataSplit ( DataSplitResult(..), PairSource(..), splitDataTypes, nonParametric )
 import GHC.Core.TyCo.FVs ( tyConsOfType )
-import GHC.Core.DataCon ( dataConRepArgTys )
+import GHC.Core.DataCon ( dataConRepArgTys, dataConRepArity )
 import GHC.WebCore.DataCopy ( UnboxOpts(..) )
 import qualified GHC.WebCore.DataLint as DL
 import GHC.WebCore.Erase
@@ -142,14 +142,23 @@ webPass early guts
              text "Not exported:" <+> int (length unexported)
              $$ pprWithCommas ppr (sortBy (comparing getOccString) unexported)
 
+         -- With -fcore-webs-split-classes, the internal dictionary functions
+         -- lose their DFun unfoldings until the end of the early run
+         -- (Note [Rebuilding DFun unfoldings])
+       ; let split_classes = early && gopt Opt_CoreWebsSplitClasses dflags
+                                   && gopt Opt_CoreWebsDataSplit dflags
+             (binds_dfun, dfuns) | split_classes = dropDFunUnfoldings binds_in
+                                 | otherwise     = (binds_in, emptyVarSet)
+
          -- Split data types (early run only)
          -- See Note [Splitting data types] in GHC.WebCore.DataSplit
        ; (binds_d, split_tcs) <-
            -- In the early run, or in the late run if there is no early one
            -- (Note [Unboxing in the late run] in GHC.WebCore.DataFlatten)
            if gopt Opt_CoreWebsDataSplit dflags && (early || not (gopt Opt_CoreWebsEarly dflags))
-           then runDataSplit "_s" early logger dflags (mg_module guts) (mg_rules guts) binds_in
-           else return (binds_in, [])
+           then runDataSplit (gopt Opt_CoreWebsSplitClasses dflags) "_s" early logger dflags
+                             (mg_module guts) (mg_rules guts) binds_dfun
+           else return (binds_dfun, [])
 
        ; let -- 0. Split exposed webs at the module boundary (early run only)
              -- See Note [Splitting webs at the boundary] in GHC.WebCore.Boundary
@@ -173,6 +182,10 @@ webPass early guts
              wrappers = mkVarSet (map fst split_fns)
              (binds1, sigs1) = annotateProgram early exported (`elemVarSet` wrappers) hidden us
                                                (mg_rules guts) binds0
+
+       ; dump logger Opt_D_dump_webs_stats "Webs: kept binders" $
+           let kept = sortBy (comparing (\(b, w) -> (w, getOccString b))) (nonDetEltsUFM (ws_kept_why sigs1))
+           in vcat [ text w <> colon <+> ppr b <+> dcolon <+> ppr (idType b) | (b, w) <- kept ]
 
        ; dump logger Opt_D_dump_webs "Webs: annotated program" $
            pprCoreBindings binds1 $$ blankLine $$ pprWebSigs sigs1
@@ -240,7 +253,8 @@ webPass early guts
        ; let binds3a | transformed = reorderTopBinds (eraseProgram sigs_t binds_t)
                      | otherwise   = eraseProgram sigs_t binds_t
              -- Types whose hidden fields changed are rebuilt in place
-             (binds3, rebuilt) = rebuildHiddenTypes sigs_t (mg_tcs guts ++ split_tcs) binds3a
+             (binds3, rebuilt) = rebuildHiddenTypes (splitClass split_tcs) sigs_t
+                                                    (mg_tcs guts ++ split_tcs) binds3a
              replace tc = maybe tc id (lookup tc rebuilt)
 
          -- If a transformation changed the program, it is not the original;
@@ -279,7 +293,7 @@ webPass early guts
          -- See Note [Data splitting again]
        ; (binds5, again_tcs) <-
            if early && gopt Opt_CoreWebsDataAgain dflags && gopt Opt_CoreWebsDataSplit dflags
-           then do { (bs, tcs) <- runDataSplit "_r" early logger dflags (mg_module guts) (mg_rules guts) binds4
+           then do { (bs, tcs) <- runDataSplit False "_r" early logger dflags (mg_module guts) (mg_rules guts) binds4
                      -- splitting can change the dependencies between top-level
                      -- bindings (Note [Top-level binding order] in
                      -- GHC.WebCore.Transform.Common; CPR analysis asserts it)
@@ -291,8 +305,15 @@ webPass early guts
                                 = restoreUnfoldings (unfoldingOpts dflags)
                                                     (vanillaUnfolded (mg_binds guts)) binds5
                     | otherwise = binds5
+             -- Note [Rebuilding DFun unfoldings]
+             binds7 = rebuildDFunUnfoldings dfuns binds6
+       ; when split_classes $
+           dump logger Opt_D_dump_webs_stats "Webs: DFun unfoldings" $
+             text "Removed:" <+> int (sizeVarSet dfuns) <> comma
+             <+> text "rebuilt:" <+> int (length [ () | b <- bindersOfBinds binds7, b `elemVarSet` dfuns
+                                                     , isDFunUnfolding (realIdUnfolding b) ])
 
-       ; return (guts { mg_binds = binds6
+       ; return (guts { mg_binds = binds7
                       , mg_exports = dropExports unexported (mg_exports guts)
                       , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
 
@@ -565,6 +586,65 @@ isMainEntry :: DynFlags -> Id -> Bool
 isMainEntry dflags b = occ == fromMaybe "main" (mainFunIs dflags) || take 1 occ == ":"
   where occ = getOccString b
 
+-- | The classes data splitting made (Note [Splitting classes] in
+-- GHC.WebCore.DataSplit)
+splitClass :: [TyCon] -> TyCon -> Bool
+splitClass split_tcs = \tc -> isClassTyCon tc && getUnique tc `elementOfUniqSet` set
+  where set = mkUniqSet [ getUnique t | t <- split_tcs, isClassTyCon t ]
+
+{- Note [Rebuilding DFun unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dictionary function's DFun unfolding (the dictionary constructor and its
+arguments) is a stable unfolding: the early run keeps the binders it
+mentions, the instance's methods, with their types, and data splitting
+keeps the dictionary function's type.  With -fcore-webs-split-classes
+(Note [Splitting classes] in GHC.WebCore.DataSplit), the dictionary
+functions that are not exported lose their DFun unfoldings at the start of
+the early run, and get them back at its end, rebuilt from their right-hand
+sides: the type and dictionary lambdas, then a saturated application of a
+class's constructor (the original class's or a split one's), as the
+desugarer makes them.  A right-hand side of another shape gets none (the
+simplifier gives it an ordinary unfolding); -ddump-webs-stats counts them.
+Nothing outside sees a dictionary function that is not exported, and the
+simplifier's class-op and case-of-known-constructor rules work from either
+unfolding.
+-}
+
+isDFunUnfolding :: Unfolding -> Bool
+isDFunUnfolding (DFunUnfolding {}) = True
+isDFunUnfolding _                  = False
+
+-- | Remove the DFun unfoldings of the dictionary functions that are not
+-- exported (Note [Rebuilding DFun unfoldings]); and those binders
+dropDFunUnfoldings :: CoreProgram -> (CoreProgram, VarSet)
+dropDFunUnfoldings binds = (map bind binds, mkVarSet [ b | b <- bindersOfBinds binds, dropped b ])
+  where
+    dropped b = isDFunId b && not (isExportedId b) && isDFunUnfolding (realIdUnfolding b)
+    zap b | dropped b = setIdUnfolding b noUnfolding
+          | otherwise = b
+    bind (NonRec b e) = NonRec (zap b) e
+    bind (Rec prs)    = Rec [ (zap b, e) | (b, e) <- prs ]
+
+-- | Give the dictionary functions back DFun unfoldings, from their
+-- right-hand sides (Note [Rebuilding DFun unfoldings])
+rebuildDFunUnfoldings :: VarSet -> CoreProgram -> CoreProgram
+rebuildDFunUnfoldings dfuns binds
+  | isEmptyVarSet dfuns = binds
+  | otherwise           = map bind binds
+  where
+    bind (NonRec b e) = NonRec (rebuild b e) e
+    bind (Rec prs)    = Rec [ (rebuild b e, e) | (b, e) <- prs ]
+    rebuild b e
+      | b `elemVarSet` dfuns
+      , (bndrs, body) <- collectBinders e
+      , (Var con, args) <- collectArgs body
+      , Just dc <- isDataConWorkId_maybe con
+      , isClassTyCon (dataConTyCon dc)
+      , length (filter isValArg args) == dataConRepArity dc
+      = b `setIdUnfolding` mkDFunUnfolding bndrs dc args
+      | otherwise
+      = b
+
 -- | The types defined here whose fields other modules cannot see
 -- See Note [Hidden fields] in GHC.WebCore.Sigs
 hiddenFields :: Bool -> ModGuts -> [TyCon] -> CoreProgram -> TyCon -> Bool
@@ -592,8 +672,9 @@ data Why = HiddenFields | Pinned | UnsafeCo | NewtypeTc | FamInst | Existential 
 classifyTyCon :: Bool -> ModGuts -> [TyCon] -> CoreProgram -> TyCon -> TyConClass
 classifyTyCon main_only guts split_tcs binds = classify
   where
+    split_cls = splitClass split_tcs
     classify t
-      | not (isAlgTyCon t) || isClassTyCon t || null dcs = NotData
+      | not (isAlgTyCon t) || (isClassTyCon t && not (split_cls t)) || null dcs = NotData
       | any visible dcs = ExportedRep
       | otherwise       = Internal (tyConName t `elemNameSet` exported) why
       where
@@ -632,7 +713,7 @@ classifyTyCon main_only guts split_tcs binds = classify
     local_tcs  = mg_tcs guts ++ split_tcs
     local      = mkUniqSet (map getUnique local_tcs)
     referenced = reach emptyUniqSet (concat (
-                   [ fieldTyCons t | t <- local_tcs, not (rebuildableTyCon t) ] ++
+                   [ fieldTyCons t | t <- local_tcs, not (rebuildableTyCon split_cls t) ] ++
                    [ nonDetEltsUniqSet (tyConsOfType (famInstRHS fi)) | fi <- mg_fam_insts guts ]))
     reach acc [] = acc
     reach acc (t : ts)
@@ -697,9 +778,9 @@ exprUnsafeTyCons e = case e of
 
 -- | Split data types (Note [Splitting data types] in GHC.WebCore.DataSplit);
 -- stop if Data Lint finds a type error in the annotated program
-runDataSplit :: String -> Bool -> Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
+runDataSplit :: Bool -> String -> Bool -> Logger -> DynFlags -> Module -> [CoreRule] -> CoreProgram
              -> CoreM (CoreProgram, [TyCon])
-runDataSplit sfx early logger dflags this_mod rules binds
+runDataSplit classes sfx early logger dflags this_mod rules binds
   = do { us <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let unbox | gopt Opt_CoreWebsDataUnbox dflags
                    = Just (UnboxOpts { uo_eager      = gopt Opt_CoreWebsDataUnboxEager dflags
@@ -715,7 +796,7 @@ runDataSplit sfx early logger dflags this_mod rules binds
                     | gopt Opt_CoreWebsDataLintPairs dflags  = FromDataLint
                     | otherwise                              = FromInference
              -- annotation, the pairs and the classes, once for both passes
-             split = splitDataTypes sfx source unbox (dataLintConfig dflags) this_mod us rules binds
+             split = splitDataTypes classes sfx source unbox (dataLintConfig dflags) this_mod us rules binds
              -- for -dshow-passes: the first pass's program is not used when
              -- the second runs, so only what decides the second is forced
              force_useful r = dsr_changed r `seq` length (dsr_useful r) `seq` ()

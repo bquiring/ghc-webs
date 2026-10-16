@@ -508,6 +508,41 @@ under the rate (`-c 1000003` at ~10 G instructions/s), add up several runs,
 and resolve the raw IPs against `nm -n` (scratchpad resolve.py). The dhall
 conclusion (§3.2h) stands on the Core, not the profile.
 
+### 3.2j Splitting classes (2026-10-16)
+
+`-fcore-webs-split-classes` (with data splitting; Note [Splitting
+classes] in GHC.WebCore.DataSplit) copies class dictionaries like data
+types. Method and superclass selectors take a fresh copy of the class at
+each occurrence, as constructors do. A class of copies that meets nothing
+outside the program becomes a class of its own (a real class, so the
+specialiser still sees dictionaries), whose selections become cases and
+whose fields are hidden, so its methods' webs are internal and the web
+passes may change them (rebuilt with the class, HiddenFields). The
+dictionary functions that are not exported lose their DFun unfoldings
+during the early run, which would otherwise pin them and the methods, and
+get them back, rebuilt from the right-hand side, at its end (Note
+[Rebuilding DFun unfoldings] in GHC.WebCore.Pipeline). Test
+splitclass001: a class of the program's own, not specialised away, splits;
+arity raising passes a method's pair as two arguments and useless
+elimination drops another method's unused pair (internal lambda classes
+7 -> 13).
+
+On real programs it does nothing. happy and alex as whole-program chunks,
+ulsl2's options with and without it: the same instructions (within 100)
+and allocation. The early run comes after the specialiser, which has
+already resolved nearly every dictionary: in happy only Eq's and Show's
+dictionaries are left (10 and 20 copies), and both reach base functions
+(derived Show code, list functions), so both stay exposed; alex removes
+and rebuilds 10 DFun unfoldings and splits no class.
+
+What does keep binders exposed in a whole program (`-ddump-webs-stats`,
+"Webs: kept binders", new): the specialiser's specialisations, mentioned
+by the rules it made (`$sinsert`, `$sunion`, `$s$c==`: "free in rules"),
+and the INLINE default methods (`$c/=`, "stable unfolding") with the
+methods they mention (`$c==`). happy: 13 of its 25 kept binders are
+specialisations, 8 defaults and the methods they call. Instance methods
+stay exposed only in library chunks, where every instance is a root.
+
 ### 3.3 What is hard
 
 * **Memory and time.** The merged program is the chunk. GHC's
@@ -567,7 +602,8 @@ and the module is small.
   run (§3.2)?
 * Instance methods (the unfolding closure) stay exposed even in a whole
   program: their types are the class's. Splitting class dictionaries like
-  data types (WEBS-DATA.md) would be the next step.
+  data types: done (§3.2j), but by the early run the specialiser has
+  removed nearly every dictionary of a whole program.
 
 ## 5. GHC with -fcore-webs-boundary-kept
 

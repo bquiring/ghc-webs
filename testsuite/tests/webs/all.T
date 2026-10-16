@@ -606,3 +606,7 @@ test('chunk006', [extra_files(['chunk006.hs', 'Chunk006A.hs', 'Chunk006B.hs'])],
 # GHC.WebCore.Chunk; hledger)
 test('chunk007', [extra_files(['chunk007.hs', 'Chunk007A.hs', 'Chunk007B.hs'])],
      makefile_test, ['chunk007'])
+# splitclass001: a class split in a chunk (Note [Splitting classes] in
+# GHC.WebCore.DataSplit)
+test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],
+     makefile_test, ['splitclass001'])

@@ -37,7 +37,8 @@ import GHC.Types.Web
 import GHC.Utils.Outputable
 import GHC.Utils.Panic ( pprPanic )
 
-import GHC.WebCore.DataSplit ( mapTyCons, mapTyConsCo )
+import GHC.WebCore.DataSplit ( mapTyCons, mapTyConsCo, mkClassCopy )
+import GHC.Core.Class ( classAllSelIds )
 import GHC.WebCore.Sigs
 import GHC.WebCore.Traverse
 
@@ -180,8 +181,9 @@ hiddenFieldWebs sigs
 -- signatures changed, and point the (erased) program at them.  Returns the
 -- program and the replaced type constructors, old and new.
 -- See Note [Signatures follow the transformations]
-rebuildHiddenTypes :: WebSigs -> [TyCon] -> CoreProgram -> (CoreProgram, [(TyCon, TyCon)])
-rebuildHiddenTypes sigs local_tcs binds
+rebuildHiddenTypes :: (TyCon -> Bool)  -- ^ the classes data splitting made
+                   -> WebSigs -> [TyCon] -> CoreProgram -> (CoreProgram, [(TyCon, TyCon)])
+rebuildHiddenTypes split_cls sigs local_tcs binds
   | null changed = (binds, [])
   | otherwise    = (map rw_bind binds, [ (tc, new_tc tc) | tc <- changed ])
   where
@@ -204,7 +206,7 @@ rebuildHiddenTypes sigs local_tcs binds
     close acc
       | null more = acc
       | otherwise = close (acc `unionUniqSets` mkUniqSet more)
-      where more = [ tc | tc <- local_tcs, rebuildableTyCon tc
+      where more = [ tc | tc <- local_tcs, rebuildableTyCon split_cls tc
                         , not (tc `elementOfUniqSet` acc)
                         , any (`elementOfUniqSet` acc) (fieldTyCons tc) ]
     tcs = mkUniqSet [ dataConTyCon dc | (dc, _) <- nonDetEltsUFM (ws_dcs sigs)
@@ -218,6 +220,14 @@ rebuildHiddenTypes sigs local_tcs binds
 
     -- Same names and uniques; the fields mention the rebuilt types (lazily,
     -- as the types are recursive)
+    rebuild tc
+      -- A class data splitting made, with its selectors (Note [Splitting
+      -- classes] in GHC.WebCore.DataSplit)
+      | Just cls <- tyConClass_maybe tc, [dc] <- tyConDataCons tc
+      = let fields = [ Scaled m (ty t) | Scaled m t <- fromMaybe (dataConRepArgTys dc) (new_fields dc) ]
+            tycon  = mkClassCopy (tyConName tc) (dataConName dc) (getName (dataConWorkId dc))
+                                 (map getName (classAllSelIds cls)) tc fields
+        in (tycon, listToUFM (zip [dc] (tyConDataCons tycon)))
     rebuild tc = (tycon, listToUFM [ (dc, dc') | (dc, dc') <- zip dcs dcs' ])
       where
         dcs   = tyConDataCons tc
@@ -292,9 +302,12 @@ rebuildHiddenTypes sigs local_tcs binds
 
 -- | Can a type be rebuilt in place by 'rebuildHiddenTypes'?  It is rebuilt
 -- without constructor wrappers or existentials.
-rebuildableTyCon :: TyCon -> Bool
-rebuildableTyCon tc
-  = isAlgTyCon tc && not (isClassTyCon tc) && not (isNewTyCon tc) && not (isFamInstTyCon tc)
+-- A class only if data splitting made it (the first argument says which).
+rebuildableTyCon :: (TyCon -> Bool) -> TyCon -> Bool
+rebuildableTyCon split_cls tc
+  | isClassTyCon tc = split_cls tc
+  | otherwise
+  = isAlgTyCon tc && not (isNewTyCon tc) && not (isFamInstTyCon tc)
     && not (null dcs) && all isVanillaDataCon dcs && all (null . dataConWrapId_maybe) dcs
   where dcs = tyConDataCons tc
 
