@@ -916,6 +916,56 @@ constant specialisation, one copy of the function per distinct constant
 that its external calls pass for a parameter the recursive calls pass
 unchanged; every call known, with no dispatch at all.
 
+## 23. Constant specialisation (2026-10-16)
+
+`-fcore-webs-spec-webs` and `-fcore-webs-spec-calls` (Note [Constant
+specialisation] in GHC.WebCore.Transform.ConstSpec; commit `6f958ccb02`):
+one copy of a recursive function per key of known top-level functions
+passed for its static function parameters, at the end of the early run.
+nofib, early-ulsl's options without defunctionalisation
+(`run-constspec.sh`; instructions against base, 109 benchmarks):
+
+| config | instructions | time | program allocation | object text vs base |
+|---|---|---|---|---|
+| early-ulsl8 (with defunc) | −4.17% | −4.39% | −4.88% | +0.9% |
+| early-ulsl8-nod | −2.68% | −2.84% | −2.26% | +0.1% |
+| early-ulsl8-sw (spec-webs) | −2.91% | −3.31% | −3.51% | +0.2% |
+| early-ulsl8-sc (spec-calls) | −3.17% | −3.30% | −3.58% | +0.4% |
+
+Against `nod` (instructions, at least 0.5%):
+
+| benchmark | defunc | spec-webs | spec-calls |
+|---|---|---|---|
+| solid | −13.8% | −25.9% | −25.9% |
+| genfft | +0.1% | −0.4% | −6.9% |
+| gg | 0 | 0 | −5.2% |
+| comp_lab_zift | 0 | 0 | −4.4% |
+| parstof | −0.1% | −0.7% | −2.6% |
+| multiplier | +1.2% | 0 | −2.5% |
+| typecheck | 0 | 0 | −2.4% |
+| wang | 0 | 0 | −1.5% |
+| fft | −0.1% | 0 | −1.3% |
+| rewrite, nucleic2 | 0 | −0.7% | −0.7% |
+| event | 0 | +6.5% | +6.5% |
+| integrate | −76.2% | 0 | 0 |
+| mate | −4.4% | 0 | 0 |
+| hpg | −2.9% | 0 | 0 |
+| ida | −2.5% | +0.2% | +0.2% |
+
+* solid: both variants make CSGtraverse_2's two copies (prune_hs and
+  merge_subtrees, classify_prim and combine_classifications); every call
+  known, no dispatch: twice what defunctionalisation gains there.
+* Keys from calls find more than keys from web classes: the web classes
+  admit at most four lambdas and only top-level functions of the module
+  (not imported ones such as `++`), and spec-calls' later rounds follow
+  chains.
+* event: the copy is better code; the loss is the GC's major collections
+  (WEBS-BUGS.md, "Constant specialisation: event's major collections").
+* What only defunctionalisation still gets: integrate (raising after
+  defunc; §21), mate, hpg, ida (branch prediction; §21).
+* Not yet measured: spec-calls together with defunctionalisation, or with
+  `-fcore-webs-raise-through-calls -fcore-webs-evald-args` (§22).
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each

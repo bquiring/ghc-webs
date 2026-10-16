@@ -1175,6 +1175,19 @@ in GHC.WebCore.Chunk, Notes [Chunks], [Merging the chunk's modules],
 
 ## Performance (heuristics and regressions)
 
+### Constant specialisation: event's major collections (2026-10-16)
+* **Found by:** nofib instructions, `early-ulsl8-sw` and `early-ulsl8-sc`
+  against `early-ulsl8-nod`: event +6.5% (the only loss of at least 0.5%).
+* **Cause:** not the code. The copy `merge_cmp_cs1` (merge with
+  `event_cmp`, inlined: no unknown call, no `I#` box) runs fewer mutator
+  instructions; the program allocates 0.9% less and its maximum residency
+  halves (2.5 → 1.3 MB). With the default 4 MB nursery the old generation's
+  threshold follows the live data, so major collections go from 159 to
+  201 and bytes copied +11%. With `+RTS -A64m` the copy is −1.1%
+  instructions against `nod`. Probably also what event's +6.4% under
+  defunctionalisation was (below).
+* **Fix:** none (a GC scheduling effect); left open as explained.
+
 ### Unarise loses component types: uncurrying parked, arity raising curried (2026-10-09)
 * **Found by:** late run without the uncurrying gate: nucleic2 +15.1%,
   wheel-sieve1 +16.6%, sched, boyer, queens +11-12%.

@@ -16,7 +16,7 @@ a heuristic.
 
 ### Where we are (2026-10-16, handoff)
 
-Nothing pushed (branch `webs`, 51 commits ahead of origin). 726 webs tests
+Nothing pushed (branch `webs`, 51 commits ahead of origin at the handoff). 726 webs tests
 pass. Baselines: nofib `base` and `early-ulsl8` (early-ulsl's options,
 current compiler; bins in webs-bench/results, -4.17% instructions vs base),
 `early-ulsl8-nod` (same without defunctionalisation, -2.68%).
@@ -48,27 +48,15 @@ inlining gains, a web transformation can get without inlining; branch
 prediction is out of our control. Keep it in mind while going through
 defunc's wins.
 
-**Next (agreed, not started):** constant specialisation (the item at the
-top of "Core-to-Core: to implement"; solid's CSGtraverse_2, §22a), two
-implementations behind two flags to compare, one shared transformation at
-the end of the early run (after erasure; GHC's later passes see the known
-calls):
-* shared: top-level recursive f; static function parameters (every
-  recursive call passes the parameter unchanged, every occurrence of f a
-  saturated call with the same type arguments) that f calls; one copy per
-  key (type arguments + one known top-level function per static
-  parameter), type variables instantiated, static parameters substituted
-  and removed, recursive calls to the copy; calls passing the key
-  syntactically (Var g) redirected; at most 4 keys per function, a size
-  bound; copies appended, then reorderTopBinds;
-* `-fcore-webs-spec-webs`: a key g is admitted for parameter x only if
-  g's first lambda is in the web class of x's arrow and that class has
-  at most 4 lambdas (computed from the solved, renamed program before
-  erasure, keyed by the parameter binder's unique); one round;
-* `-fcore-webs-spec-calls`: keys from the calls alone, repeated rounds (up
-  to 3) so that chains work (a copy that now passes a known function);
-* then: solid, nofib against early-ulsl8 and early-ulsl8-nod, and the
-  heuristics in that backlog item (the user wants them careful).
+**Constant specialisation: done** (2026-10-16, after the handoff;
+`6f958ccb02`, WEBS-EXPERIMENTS.md §23). Both variants implemented as
+planned (copies abstract over the caller's free type variables; calls go
+to a copy whose key matches). nofib without defunc: spec-webs −2.91%,
+spec-calls −3.17% (nod −2.68%, with defunc −4.17%); solid −25.9% against
+nod (defunc −13.8%); one loss, event +6.5%, the GC's major collections
+(WEBS-BUGS.md). 728 webs tests pass (constspec001, constspec002).
+**Next:** decide with the user: the heuristics (backlog item below),
+spec-calls with defunc and with the §22 flags; then:
 Then the remaining defunc wins: mate (allocation moves between functions,
 moveLine allocates more with defunc), hpg (partial applications −60%,
 very slow calls gone: arity?), ida (branch prediction only).
