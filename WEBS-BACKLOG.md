@@ -131,7 +131,7 @@ webs as newtypes (the occurs check never fires on nofib).
   §3.2k). chunk-graph.py chooses 62 chunks of the `ghc` package from the
   types of the names modules use from each other (89% of the edge weight
   still between chunks); hadrian builds several chunks per package. The
-  chunked self-host (`~/projects/ghc-selfhost`, root `_build-chunkw`,
+  chunked self-host (`~/projects/ghc-selfhost`, root `_build-chunkw`, removed 2026-10-16,
   `run-chunkw.sh`, chunks in `chunks/graph1`) stops in phase 1: a chunk's
   --make session compiles several modules, and once one module's imports
   put GHC.Core's hs-boot interface in the EPS, a later module's ordinary
