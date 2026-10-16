@@ -668,6 +668,8 @@ data GeneralFlag
    | Opt_CoreWebsDataSplit    -- ^ Split data types by data flow (copies)
    | Opt_CoreWebsSplitClasses -- ^ ... and class dictionaries: Note [Splitting classes]
    | Opt_CoreWebsDropRules    -- ^ The early run drops rules: Note [Dropping rules in a whole program]
+   | Opt_CoreWebsRaiseThroughCalls -- ^ Result raising through tail calls: Note [Raising through tail calls]
+   | Opt_CoreWebsEvaldArgs    -- ^ Arity raising: case binders are values: Note [Evaluated arguments]
    | Opt_CoreWebsDataUnbox    -- ^ Unbox fields of split data types
    | Opt_CoreWebsDataUnboxEager -- ^ ... evaluating thunks early if every match is strict
    | Opt_CoreWebsUnboxNested  -- ^ ... depending on the unboxing of other data structures
@@ -973,6 +975,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDataSplit
    , Opt_CoreWebsSplitClasses
    , Opt_CoreWebsDropRules
+   , Opt_CoreWebsRaiseThroughCalls
+   , Opt_CoreWebsEvaldArgs
    , Opt_CoreWebsDataUnbox
    , Opt_CoreWebsDataUnboxEager
    , Opt_CoreWebsUnboxNested

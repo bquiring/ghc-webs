@@ -26,6 +26,7 @@ import GHC.Types.Basic ( Boxity(..) )
 import GHC.Types.Id
 import GHC.Types.Tickish
 import GHC.Types.Unique ( getKey )
+import GHC.Types.Cpr ( CprSig(..), CprType(..), asConCpr )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
@@ -74,6 +75,34 @@ Laziness: none.  Returning the components unboxed evaluates nothing (they
 stay lazy in the tuple), and a call in a lazy position stays lazy (the case
 that re-boxes it is inside the thunk).  Webs of join-point lambdas are
 rejected: their calls are jumps, which cannot be scrutinised.
+-}
+
+{- Note [Raising through tail calls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-raise-through-calls.  A tail that calls another web w'
+(a function, typically known) no longer rejects w: if w' is raised too,
+the call already returns the tuple, as a tail call of w itself does.  So
+the webs are raised as a group: the candidates are the webs that pass
+every other test, and a candidate whose tails call a web outside the
+candidates leaves them, until nothing changes.  In the early run, a web
+with only known calls (left to worker/wrapper, Note [Early result
+raising]) is raised only when a raised web with an unknown call reaches it
+through tail calls.
+
+Two more tails are taken apart (case call of K ys -> (# ys #)): a
+saturated call of a function whose CPR signature says it constructs its
+result (imported: GHC.Internal.Float.timesDouble in integrate's \x -> x*y),
+and the call in an eta-expansion \p -> x p (the boundary wrapper's, of the
+function an exported function is given: only calls from outside go
+through it).
+
+nofib imaginary/integrate: integrate2D's lambda \y -> integrate1D l1 u1
+(\x -> f x y) returns integrate1D's result, a D# integrate1D constructs:
+the D# moves from the end of integrate1D to the lambda, and from the
+lambda to the calls of f, which no longer box the result.  Moving a
+constructor never changes what is evaluated (the components stay as lazy
+as they were in the constructor); a call that needs the box rebuilds it,
+which the callee did before.
 -}
 
 {- Note [Early result raising]
@@ -126,10 +155,11 @@ data Info = Info
   , i_bad_tail  :: Bool
   , i_con_tails :: Int
   , i_unknown   :: Bool     -- Some call of the web is not a known call
-  , i_comp_webs :: WebSet } -- The webs in the result's components
+  , i_comp_webs :: WebSet   -- The webs in the result's components
+  , i_tail_webs :: WebSet } -- Other webs a tail calls (Note [Raising through tail calls])
 
 noInfo :: Info
-noInfo = Info [] False False [] False False False 0 False emptyUniqSet
+noInfo = Info [] False False [] False False False 0 False emptyUniqSet emptyUniqSet
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
@@ -141,7 +171,8 @@ plusInfo a b = Info { i_lams      = i_lams a ++ i_lams b
                     , i_bad_tail  = i_bad_tail a || i_bad_tail b
                     , i_con_tails = i_con_tails a + i_con_tails b
                     , i_unknown   = i_unknown a  || i_unknown b
-                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
+                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b
+                    , i_tail_webs = i_tail_webs a `unionUniqSets` i_tail_webs b }
 
 type Infos = UniqFM WebId Info
 
@@ -174,9 +205,11 @@ conApp e = case collectWebArgs e of
 
 -- | Classify the tails of a lambda of web w: (number of constructed tails,
 -- whether some tail is neither constructed, a dead end, a jump to a join
--- point bound in tail position, nor a tail call of w)
-tailInfo :: WebId -> CoreExpr -> (Int, Bool)
-tailInfo w = go emptyVarSet
+-- point bound in tail position, nor a tail call of w; and, with the first
+-- argument, the other webs tail-called, which no longer make a tail bad:
+-- Note [Raising through tail calls])
+tailInfo :: Bool -> WebId -> CoreExpr -> (Int, Bool, WebSet)
+tailInfo through w = go emptyVarSet
   where
     go joins expr = case expr of
       Let (NonRec j rhs) body
@@ -186,15 +219,57 @@ tailInfo w = go emptyVarSet
         -> let joins' = extendVarSetList joins (map fst prs)
            in foldr (plus . go joins' . joinBody . snd) (go joins' body) prs
       Let _ body -> go joins body
-      Case _ _ _ alts -> foldr (plus . (\(Alt _ _ rhs) -> go joins rhs)) (0, False) alts
+      Case _ _ _ alts -> foldr (plus . (\(Alt _ _ rhs) -> go joins rhs)) (0, False, emptyUniqSet) alts
       Tick _ e -> go joins e
-      _ | isJust (conApp expr)                 -> (1, False)
-        | exprIsDeadEnd (stripWebForms expr)   -> (0, False)
-        | Just j <- jumpTo expr, j `elemVarSet` joins -> (0, False)
-        | spineWeb expr == Just w              -> (0, False)
-        | otherwise                            -> (0, True)
+      _ | isJust (conApp expr)                 -> (1, False, emptyUniqSet)
+        | exprIsDeadEnd (stripWebForms expr)   -> (0, False, emptyUniqSet)
+        | Just j <- jumpTo expr, j `elemVarSet` joins -> (0, False, emptyUniqSet)
+        | spineWeb expr == Just w              -> (0, False, emptyUniqSet)
+        | through, cprCall expr                -> (1, False, emptyUniqSet)
+        | through, Just w' <- spineWeb expr    -> (0, False, unitUniqSet w')
+        | otherwise                            -> (0, True, emptyUniqSet)
 
-    plus (a, b) (c, d) = (a + c, b || d)
+    plus (a, b, c) (d, e, f) = (a + d, b || e, c `unionUniqSets` f)
+
+-- | A saturated call of a function whose CPR signature says it constructs
+-- its result (an imported one: in the early run CPR analysis has not run
+-- on this module); taken apart, it costs nothing once the function is
+-- inlined or split (Note [Raising through tail calls])
+cprCall :: CoreExpr -> Bool
+cprCall e = case go e 0 of
+  Just (v, n) | CprSig (CprType ar c) <- idCprSig v, ar == n, ar > 0 -> constructed c
+  _ -> False
+  where
+    go (App f a) n | isTypeArg a = go f n
+                   | otherwise   = go f (n + 1 :: Int)
+    go (WebApp _ f _) n = go f (n + 1)
+    go (Tick _ f) n     = go f n
+    go (Var v) n        = Just (v, n)
+    go _ _              = Nothing
+    constructed c = isJust (asConCpr c)
+
+-- | An eta-expansion  \p -> x p  (the boundary wrapper's, of a function it
+-- is given): its call's result may be taken apart (Note [Raising through
+-- tail calls])
+isEtaCall :: Id -> CoreExpr -> Bool
+isEtaCall p = go [p]
+  where
+    -- leading lets rebuild the parameter's box (after arity raising:
+    -- let y = D# p in x y), and the call passes only those
+    go ok e = case e of
+      Let (NonRec y rhs) body | isJust (conApp rhs) -> go (y : ok) body
+      Tick _ e'                                     -> go ok e'
+      _ -> case spine e [] of
+             Just (x, args@(_ : _)) -> x `notElem` ok && all (arg ok) args
+             _                      -> False
+    arg ok a = case a of
+      Var v                 -> v `elem` ok
+      _ | Just (_, _, vs) <- conApp a -> all (arg ok) vs
+      _                     -> False
+    spine e as = case e of
+      WebApp _ f a -> spine f (a : as)
+      Var x        -> Just (x, as)
+      _            -> Nothing
 
 -- | The body of a join point's right-hand side, after its lambdas
 joinBody :: CoreExpr -> CoreExpr
@@ -211,8 +286,8 @@ jumpTo e = case e of
   Var v | isJoinId v -> Just v
   _            -> Nothing
 
-analyse :: FieldTys -> CoreProgram -> Infos
-analyse fields binds = foldr go_bind emptyUFM binds
+analyse :: Bool -> FieldTys -> CoreProgram -> Infos
+analyse through fields binds = foldr go_bind emptyUFM binds
   where
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
@@ -237,8 +312,9 @@ analyse fields binds = foldr go_bind emptyUFM binds
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc
       = go_bndr p $ go e $
-        let (n, bad) = tailInfo w e
-        in note w (noInfo { i_lams = [p], i_bad_tail = bad, i_con_tails = n }) acc
+        let (n, bad, tws) | through, isEtaCall p e = (1, False, emptyUniqSet)
+                          | otherwise              = tailInfo through w e
+        in note w (noInfo { i_lams = [p], i_bad_tail = bad, i_con_tails = n, i_tail_webs = tws }) acc
     go (Let bind body) acc = go_bind bind (go body acc)
     go (Case scrut b ty alts) acc
       = go scrut $ go_bndr b $ go_ty ty $
@@ -289,18 +365,20 @@ analyse fields binds = foldr go_bind emptyUFM binds
       SubCo c                -> go_co c acc
       _                      -> acc   -- complexCoWebs deals with the others
 
-verdict :: Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict early exposed complex w i
+verdict :: Bool -> Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict through early exposed complex w i
   | w `elementOfUniqSet` exposed  = Rejected Exposed
   | i_join i                      = Rejected JoinLam
-  | early, not (i_unknown i)      = Rejected KnownCalls   -- Note [Early result raising]
+  | not through, early, not (i_unknown i)
+                                  = Rejected KnownCalls   -- Note [Early result raising]
   | w `elementOfUniqSet` complex  = Rejected Coercion'
   | i_coercion i                  = Rejected Coercion'
   | i_not_prod i                  = Rejected NotProduct
   | not (same_tycon (i_tycons i)) = Rejected NotProduct
   | i_rep_poly i                  = Rejected RepPoly
   | i_bad_tail i                  = Rejected Unconstructed
-  | i_con_tails i == 0            = Rejected NoConstruction
+  | i_con_tails i == 0, isEmptyUniqSet (i_tail_webs i)
+                                  = Rejected NoConstruction
   | otherwise                     = Raised
   where
     same_tycon (tc:tcs) = all (== tc) tcs
@@ -312,21 +390,44 @@ verdict early exposed complex w i
 
 -- | Analyse the program and raise the results of the webs that qualify.  A
 -- raised web no longer returns a product, so it is not raised again.
-resultRaiseRound :: FieldTys -> UniqSupply -> WebSet -> UnfoldingPolicy -> WebSet -> CoreProgram
+resultRaiseRound :: Bool  -- ^ through tail calls (Note [Raising through tail calls])
+                 -> FieldTys -> UniqSupply -> WebSet -> UnfoldingPolicy -> WebSet -> CoreProgram
                  -> (Maybe (CoreProgram, WebSet, Type -> Type), [(WebId, SDoc, Bool, [Id])])
-resultRaiseRound fields us exposed pol done binds
+resultRaiseRound through fields us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = ( Just ( initUs_ us (rewriteProgram fields todo pol binds), todo
                                  , raiseType fields todo )
                           , dump )
   where
-    infos    = analyse fields binds
+    infos    = analyse through fields binds
     complex  = complexCoWebs binds
-    verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
-                | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
-                , let w = mkWebId u
-                , not (null (i_lams i))
-                , not (w `elementOfUniqSet` done) ]
+    verdicts00 = [ (w, verdict through (up_early pol) exposed complex w i, i)
+                 | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
+                 , let w = mkWebId u
+                 , not (null (i_lams i))
+                 , not (w `elementOfUniqSet` done) ]
+    -- Note [Raising through tail calls]: a web whose tails call other webs
+    -- is raised with them, or not at all (a greatest fixpoint); a web with
+    -- only known calls only for a web with an unknown call (early run)
+    verdicts0
+      | not through = verdicts00
+      | otherwise   = [ (w, v', i) | (w, v, i) <- verdicts00
+                                   , let v' = case v of
+                                                Raised | not (w `elementOfUniqSet` group) ->
+                                                  Rejected (if w `elementOfUniqSet` ok then KnownCalls else Unconstructed)
+                                                _ -> v ]
+    ok0   = mkUniqSet [ w | (w, Raised, _) <- verdicts00 ]
+    ok    = shrink ok0
+    shrink s = let s' = filterUniqSet (\w -> all (`elementOfUniqSet` s) (deps w)) s
+               in if sizeUniqSet s' == sizeUniqSet s then s else shrink s'
+    deps w = maybe [] (nonDetEltsUniqSet . i_tail_webs) (lookupUFM infos w)
+    unknown w = maybe False i_unknown (lookupUFM infos w)
+    roots = [ w | w <- nonDetEltsUniqSet ok, unknown w || not (up_early pol) ]
+    group = reach emptyUniqSet roots
+    reach seen [] = seen
+    reach seen (w : ws)
+      | w `elementOfUniqSet` seen = reach seen ws
+      | otherwise = reach (addOneToUniqSet seen w) (filter (`elementOfUniqSet` ok) (deps w) ++ ws)
     -- Note [Recursive products] in GHC.WebCore.Transform.ArityRaise
     candidates = mkUniqSet [ w | (w, Raised, _) <- verdicts0 ]
     verdicts = [ (w, v', i)

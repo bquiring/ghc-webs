@@ -629,6 +629,11 @@ test('chunk012', [extra_files(['chunk012.hs', 'Chunk012A.hs', 'Chunk012B.hs', 'c
 # libcasejoin001: liberate case through join points (Note [Liberate case
 # through join points] in GHC.Core.Opt.LiberateCase)
 test('libcasejoin001', [extra_files(['libcasejoin001.hs'])], makefile_test, ['libcasejoin001'])
+# raisecall001, raisecall002, evaldarg001: moving constructors across webs
+# (Note [Raising through tail calls], Note [Evaluated arguments])
+test('raisecall001', [extra_files(['raisecall001.hs'])], makefile_test, ['raisecall001'])
+test('raisecall002', [extra_files(['raisecall002.hs'])], makefile_test, ['raisecall002'])
+test('evaldarg001', [extra_files(['evaldarg001.hs'])], makefile_test, ['evaldarg001'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],

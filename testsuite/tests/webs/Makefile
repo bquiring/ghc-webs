@@ -100,6 +100,40 @@ libcasejoin001:
 	grep -c joinrec libcasejoin001.out/libcasejoin001.dump-simpl
 	./libcasejoin001
 
+# raisecall001: nofib integrate; both webs raised (Note [Raising through tail
+# calls] in GHC.WebCore.Transform.ResultRaise, Note [Evaluated arguments] in
+# GHC.WebCore.Transform.ArityRaise)
+RAISECALL_OPTS = -O2 -fcore-webs-early -fcore-webs-arity-raise -fcore-webs-result-raise \
+	-fcore-webs-boundary -fcore-webs-raise-through-calls -fcore-webs-evald-args -dcore-lint -dcore-webs-lint
+.PHONY: raisecall001
+raisecall001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(RAISECALL_OPTS) -ddump-webs-result-raise -ddump-webs-arity-raise \
+	  -ddump-to-file -outputdir raisecall001.out -v0 raisecall001.hs -o raisecall001
+	grep -h "^raised" raisecall001.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | sort
+	./raisecall001
+
+# raisecall002: moving a constructor evaluates nothing new (undefined lazy fields)
+.PHONY: raisecall002
+raisecall002:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(RAISECALL_OPTS) -ddump-webs-result-raise -ddump-webs-arity-raise \
+	  -ddump-to-file -outputdir raisecall002.out -v0 raisecall002.hs -o raisecall002
+	grep -h "^raised" raisecall002.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | sort
+	./raisecall002
+
+# evaldarg001: the allocation raising an evaluated argument can cost: a lambda
+# that keeps the box rebuilds it (Note [Evaluated arguments]); without arity
+# raising against with it
+.PHONY: evaldarg001
+evaldarg001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -rtsopts -fcore-webs-early -dcore-lint \
+	  -outputdir evaldarg001.a -v0 evaldarg001.hs -o evaldarg001a
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -rtsopts -fcore-webs-early -fcore-webs-arity-raise -fcore-webs-evald-args \
+	  -dcore-lint -outputdir evaldarg001.b -v0 evaldarg001.hs -o evaldarg001b
+	./evaldarg001a +RTS -tevaldarg001a.t --machine-readable -RTS
+	./evaldarg001b +RTS -tevaldarg001b.t --machine-readable -RTS > /dev/null
+	a=$$(grep "bytes allocated" evaldarg001a.t | grep -o "[0-9]*"); b=$$(grep "bytes allocated" evaldarg001b.t | grep -o "[0-9]*"); \
+	  if [ $$b -gt $$a ]; then echo "raised: more allocation"; elif [ $$b -lt $$a ]; then echo "raised: less allocation"; else echo "raised: same allocation"; fi
+
 # splitclass001: a class of the program's own, its dictionary not
 # specialised away, split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit); useless elimination and arity raising then change

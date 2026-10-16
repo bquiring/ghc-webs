@@ -112,6 +112,41 @@ fields: a constructor's worker takes its strict fields evaluated, which the
 unboxed tuple's components are not known to be.
 -}
 
+{- Note [Evaluated arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fcore-webs-evald-args, a call passes a value (for constructed
+arguments, Note [Arity raising]) when its argument is a saturated
+constructor application whatever the arguments of its fields (exprIsHNF
+wants D# (y +## x)'s unlifted argument to be a value too, but the caller
+computes it in either case), or a variable bound to a
+value: a case binder, or let-bound to a value (exprIsHNF), which the
+binder's evaluatedness no longer shows once data splitting or annotation
+zapped its unfolding.  nofib imaginary/integrate: integrate1D calls f on
+`wild1`, the case binder of `case l of wild1 { D# y -> .. }`.  A lambda
+that needs the box rebuilds it, where the caller passed one it already had:
+an allocation the original did not make (Note [Raising through tail calls]
+in GHC.WebCore.Transform.ResultRaise has the dual).
+-}
+
+-- | Variables bound to values: case binders, and let binders whose
+-- right-hand side is a value (Note [Evaluated arguments])
+evaluatedVars :: CoreProgram -> VarSet
+evaluatedVars binds = foldr bind emptyVarSet binds
+  where
+    bind b acc = foldr (\(x, e) a -> pair x e (expr e a)) acc (flattenBinds [b])
+    pair x e acc | isId x, exprIsHNF (stripWebForms e) = extendVarSet acc x
+                 | otherwise                           = acc
+    expr e acc = case e of
+      App f a        -> expr f (expr a acc)
+      WebApp _ f a   -> expr f (expr a acc)
+      Lam _ x        -> expr x acc
+      WebLam _ _ x   -> expr x acc
+      Let b x        -> bind b (expr x acc)
+      Case s cb _ as -> expr s (extendVarSet (foldr (\(Alt _ _ r) -> expr r) acc as) cb)
+      Cast x _       -> expr x acc
+      Tick _ x       -> expr x acc
+      _              -> acc
+
 {- Note [Raised arguments are curried]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A raised product argument becomes its components as separate, curried
@@ -279,9 +314,19 @@ note w i infos
       Nothing  -> addToUFM infos w i
       Just old -> let !new = plusInfo old i in addToUFM infos w new
 
-analyse :: FieldTys -> WebSet -> CoreProgram -> Infos
-analyse fields saturated binds = foldr go_bind emptyUFM binds
+analyse :: Bool -> FieldTys -> WebSet -> CoreProgram -> Infos
+analyse evald fields saturated binds = foldr go_bind emptyUFM binds
   where
+    -- Note [Evaluated arguments]
+    values = if evald then evaluatedVars binds else emptyVarSet
+    is_value a = case stripWebForms a of
+      Var v | v `elemVarSet` values -> True
+      a' | evald, (Var v, args) <- collectArgs a'
+         , Just dc <- isDataConWorkId_maybe v
+         , length (filter isValArg args) == dataConRepArity dc
+                                    -> True   -- whatever its fields' arguments
+         | otherwise                -> exprIsHNF a'
+
     go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
     go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
 
@@ -320,7 +365,7 @@ analyse fields saturated binds = foldr go_bind emptyUFM binds
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
     go (WebApp w f a) acc
-      = note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (exprIsHNF (stripWebForms a)) })
+      = note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (is_value a) })
              (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc = go_lam True w p e (go e acc)
@@ -457,7 +502,8 @@ verdict early exposed complex w i
 -- | Analyse the program and raise the webs that qualify.  Each raised web
 -- loses its product arrows, so one round is enough; webs in 'done' have
 -- already been raised and are not considered again.
-arityRaiseRound :: FieldTys    -- ^ Components' types (Note [Signatures follow
+arityRaiseRound :: Bool        -- ^ Note [Evaluated arguments]
+                -> FieldTys    -- ^ Components' types (Note [Signatures follow
                                --   the transformations] in GHC.WebCore.HiddenFields)
                 -> WebSet      -- ^ Webs never partially applied (components' arrows)
                 -> UniqSupply
@@ -467,14 +513,14 @@ arityRaiseRound :: FieldTys    -- ^ Components' types (Note [Signatures follow
                 -> CoreProgram
                 -> ( Maybe (CoreProgram, WebSet, Type -> Type, WebSet)
                    , [(WebId, SDoc, Bool, [Id])] )
-arityRaiseRound fields saturated us exposed pol done binds
+arityRaiseRound evald fields saturated us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = ( Just ( initUs_ us1 (rewriteProgram fields todo inner pol binds), todo
                                  , raiseType fields todo inner
                                  , new_saturated )
                           , dump )
   where
-    infos   = analyse fields saturated binds
+    infos   = analyse evald fields saturated binds
     complex = complexCoWebs binds
     verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
                 | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)

@@ -1043,7 +1043,7 @@ runTransforms early logger dflags cfg sigs0 binds0
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
         , \_ us done b -> same (constPropRound us exposed done b) )
       , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
-        , \sigs us done b -> case arityRaiseRound (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
+        , \sigs us done b -> case arityRaiseRound (gopt Opt_CoreWebsEvaldArgs dflags) (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
                                (r, vs) -> (r, vs) )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
         , \_ us done b -> case deadParamsRound us exposed keep done b of
@@ -1053,7 +1053,7 @@ runTransforms early logger dflags cfg sigs0 binds0
         , \_ us _ b -> case uncurryRound (gopt Opt_CoreWebsUncurryKnown dflags) us exposed keep b of
                          (r, vs) -> (fmap (\(b', rw) -> (b', emptyUniqSet, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsResultRaise, "result raising", Opt_D_dump_webs_result_raise
-        , \sigs us done b -> case resultRaiseRound (fieldTys sigs) us exposed keep done b of
+        , \sigs us done b -> case resultRaiseRound (gopt Opt_CoreWebsRaiseThroughCalls dflags) (fieldTys sigs) us exposed keep done b of
                                (r, vs) -> (fmap (\(b', ws, rw) -> (b', ws, rw, emptyUniqSet)) r, vs) )
       , ( Opt_CoreWebsUseless, "useless elimination", Opt_D_dump_webs_useless
         , \sigs us done b -> case uselessRound (ws_hidden_fields sigs) us exposed keep done b of
