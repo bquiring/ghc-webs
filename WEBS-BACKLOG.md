@@ -16,7 +16,7 @@ a heuristic.
 
 ### Where we are (2026-10-16, handoff)
 
-Nothing pushed (branch `webs`, 51 commits ahead of origin at the handoff). 726 webs tests
+Pushed 2026-10-16 (branch `webs`). 726 webs tests
 pass. Baselines: nofib `base` and `early-ulsl8` (early-ulsl's options,
 current compiler; bins in webs-bench/results, -4.17% instructions vs base),
 `early-ulsl8-nod` (same without defunctionalisation, -2.68%).
@@ -55,11 +55,18 @@ to a copy whose key matches). nofib without defunc: spec-webs −2.91%,
 spec-calls −3.17% (nod −2.68%, with defunc −4.17%); solid −25.9% against
 nod (defunc −13.8%); one loss, event +6.5%, the GC's major collections
 (WEBS-BUGS.md). 728 webs tests pass (constspec001, constspec002).
-**Next:** decide with the user: the heuristics (backlog item below),
-spec-calls with defunc and with the §22 flags; then:
-Then the remaining defunc wins: mate (allocation moves between functions,
-moveLine allocates more with defunc), hpg (partial applications −60%,
-very slow calls gone: arity?), ida (branch prediction only).
+**Specialising on lambdas: done** (2026-10-16; WEBS-EXPERIMENTS.md §24,
+§25). `-fcore-webs-spec-lambdas` (with spec-calls): partial applications
+and lambda-lifted lambdas as keys, non-recursive candidates called twice
+or in a loop. nofib without defunc **−4.61% instructions, −4.59% time**
+(defunc −4.20%, −4.06%); integrate −77%, ida −10.7%. Also: raised lambdas
+keep one-shot marks (hpg −0.4%). 729 webs tests pass (constspec003).
+
+**Next:** decide with the user: `specMaxKeys` 4 → 8 (mate's eight
+directions); no arity raising past 6 arguments in unknown-call webs (hpg's
+9-argument call to `nc`); the heuristics for constant specialisation
+(backlog item below); spec-lambdas with defunc and with the §22 flags;
+eliza/listcopy/simple time-only losses (no instruction change).
 
 Still open from before: GHC chunks (decision: keep fixing --make, or merge
 from -fwrite-if-simplified-core interfaces, WEBS-CHUNKS.md §3.2k); a code
