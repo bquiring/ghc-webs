@@ -1421,3 +1421,48 @@ So a bound on keys alone (step A) cannot remove most of the copies: the
 cost is breadth (every function with an unfolding, copied once or twice),
 not a few functions with many keys. Selecting by use (step B: a hot
 selector call) or by package is the likelier bound.
+
+## 36. Proposal 8: boot libraries with exposed unfoldings (2026-10-23)
+
+A second compiler tree, `_build-xu`: the same sources and flavour as
+`_build`, with `-fexpose-all-unfoldings` for the stage-1 libraries that
+programs use (`_build-xu/hadrian.settings`; 22 min to build). Base's `lookup`
+now has an unfolding (a loop-breaker unfolding).
+
+The Hackage programs were built against it in their own store (`store-xu`):
+- xu-base: -O2;
+- xu-agg: -O2 and -fspecialise-aggressively -fexpose-all-unfoldings, as agg.
+
+Run with webs-hackage-bench `run-p8.sh` and `run-p8b.sh`. Instructions
+against base (base22 for the small group), 3 rounds:
+
+| program | agg | xu-base | xu-agg |
+|---|---|---|---|
+| happy | +0.0% | 0.0% | **−31.4%** |
+| alex | −12.5% | 0.0% | −12.5% |
+| cpphs | −0.5% | 0.0% | −0.5% |
+| skylighting | −26.0% | 0.0% | −26.0% |
+| cabal | −4.9% | +0.0% | **−6.8%** (allocation −10.2%) |
+| futhark | −34.2% | −0.1% | −34.2% |
+| purs | −34.0% | −0.0% | −34.8% |
+| koka | −1.7% | +0.1% | −1.8% |
+| geomean, small group | −10.4% | 0.0% | −18.5% |
+| geomean, compilers | −20.2% | 0.0% | −20.9% |
+
+- **Exposure alone does nothing.** The gain needs the specialiser.
+- **happy:** boot code falls from 24.5G to 1.3G instructions. What remains is
+  `$slookup` in Happy.Tabular.First (13.5G). In the hand-written variant,
+  the local `lookup` was inlined into mkFirst's loop, with the key free and
+  unboxed once (9.6G). `$slookup` takes the key as an argument and unboxes
+  it on every element: it is not strict in the key (empty list), so it gets
+  no worker. That accounts for the gap to the oracle's −42.3% (3.9G of
+  24.5G). It is static-argument work: the specialised copy is made after
+  the static argument transformation would run.
+- **cabal:** its boot-package parsers (Cabal-syntax, parsec) gain 1.9 points.
+- **Cost:** compiling purs with xu-agg needs 9.9 GB (max RSS; 1 job; out of
+  memory at a 14 GB virtual limit). agg needed 8.8 GB.
+
+Tooling fixes: `build.sh` takes `BENCH_STORE` and records each
+configuration's store in results/CONFIG/store. `time.py` and trace-apply
+read that per configuration; before, the lookup silently ran the wrong
+binary for another store.

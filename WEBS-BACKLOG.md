@@ -276,7 +276,14 @@ Being implemented (large):
 - **8 (boot libraries), with 3.** On happy, an oracle (a local `lookup`
   specialised to Int) gives −42.3% (35.8G → 20.7G). base's `lookup` has
   no unfolding, so -fexpose-all-unfoldings on the program cannot reach
-  it. Needs a second build tree with exposed boot-library unfoldings.
+  it.
+  - **Measured (§36):** with a second tree whose boot libraries expose
+    their unfoldings, plus agg: happy −31.4%, cabal −6.8% (agg alone
+    −4.9%), others as agg. Exposure without specialisation gives 0.
+  - **The rest of happy's gap** (to −42%) is the static key argument of
+    the specialised `$slookup`: it is unboxed once per element. Running
+    the static argument transformation (or arity-raising-style key
+    hoisting) on specialisations would close it.
 - **6 (data representation).** By hand on shellcheck (VariableValue and
   VariableState strict, enumerations and the nested record unpacked):
   −9.0%, GC time −18%, allocation −5.1%. koka's `Range` unpacked: −0.3%,
