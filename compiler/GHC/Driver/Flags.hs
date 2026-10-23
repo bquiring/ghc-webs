@@ -695,6 +695,9 @@ data GeneralFlag
                             --   module boundary by eta-expansion
    | Opt_CoreWebsBoundaryKept -- ^ ... and split the binders kept for unfoldings
                               --   and rules too: Note [Splitting kept binders]
+   | Opt_CoreWebsRuleCopies -- ^ Web pipeline (early run): copy the functions rules
+                            --   mention: Note [Copying the binders of rules]
+   | Opt_CoreWebsInstanceCopies -- ^ ... and the instances: Note [Copying the binders of rules]
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
@@ -1003,6 +1006,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsEarly
    , Opt_CoreWebsBoundary
    , Opt_CoreWebsBoundaryKept
+   , Opt_CoreWebsRuleCopies
+   , Opt_CoreWebsInstanceCopies
    , Opt_Specialise
    , Opt_SpecialiseAggressively
    , Opt_CrossModuleSpecialise

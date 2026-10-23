@@ -83,6 +83,14 @@ test('arityraise015', [], compile_and_run, [kl_opts])
 test('arityraise015_dump', [extra_files(['arityraise015.hs'])], multimod_compile,
      ['arityraise015', kl_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
 
+# rulecopy001: the program's own copy of a function a SPEC rule mentions
+# (Note [Copying the binders of rules] in GHC.WebCore.Boundary)
+rc_opts = kl_opts + ' -fcore-webs-rule-copies'
+test('rulecopy001', [extra_files(['RuleCopy001A.hs'])], multimod_compile_and_run,
+     ['rulecopy001', rc_opts])
+test('rulecopy001_dump', [extra_files(['RuleCopy001A.hs', 'rulecopy001.hs'])], multimod_compile,
+     ['rulecopy001', rc_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
+
 # All the transformations together
 test('alltransforms001', [], compile_and_run,
      [webs_opts + ' -fcore-webs-arity-raise -fcore-webs-dead-params -fcore-webs-uncurry'])
@@ -672,3 +680,15 @@ test('specmax001', [extra_files(['specmax001.hs', 'SpecMax001A.hs'])],
 # GHC.WebCore.DataSplit)
 test('dataexpose001', [extra_files(['dataexpose001.hs'])],
      multimod_compile, ['dataexpose001', ds_opts + ' -ddump-webs-data-exposure -dsuppress-uniques'])
+
+# dataunpack001: data splitting with unpacked fields (Note [Copies of
+# unpacked fields] in GHC.WebCore.DataSplit)
+test('dataunpack001', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+test('dataunpack001_dump', [extra_files(['dataunpack001.hs'])], multimod_compile,
+     ['dataunpack001', ds_opts + ' -ddump-webs-data-exposure -dsuppress-uniques'])
+
+# instcopy001: the program's own copy of an instance (Note [Copying the
+# binders of rules] in GHC.WebCore.Boundary)
+test('instcopy001', [], compile_and_run, [ds_opts + ' -fcore-webs-instance-copies'])
+test('instcopy001_dump', [extra_files(['instcopy001.hs'])], multimod_compile,
+     ['instcopy001', ds_opts + ' -fcore-webs-instance-copies -ddump-webs-data-exposure -dsuppress-uniques'])

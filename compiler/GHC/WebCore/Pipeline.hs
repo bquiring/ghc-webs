@@ -16,7 +16,7 @@ import GHC.Core.Opt.Monad
 import GHC.Core.Ppr ( pprCoreBindings )
 import GHC.Core.Subst ( mkEmptySubst, substExpr )
 import GHC.Types.Var.Env ( mkInScopeSet )
-import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet, sizeVarSet )
+import GHC.Types.Var.Set ( VarSet, mkVarSet, elemVarSet, emptyVarSet, extendVarSet, isEmptyVarSet, sizeVarSet, minusVarSet )
 import GHC.Core.Unfold ( UnfoldingOpts )
 import GHC.Core.Unfold.Make ( mkUnfolding, mkDFunUnfolding )
 import GHC.Core.TyCo.Compare ( eqType )
@@ -52,7 +52,7 @@ import GHC.Utils.Panic
 import GHC.Types.SrcLoc ( noSrcSpan )
 
 import GHC.WebCore.Annotate
-import GHC.WebCore.Boundary ( splitBoundary, contractBoundary )
+import GHC.WebCore.Boundary ( splitBoundary, contractBoundary, copyRuleBinders )
 import GHC.WebCore.DataSplit ( DataSplitResult(..), PairSource(..), splitDataTypes, nonParametric )
 import GHC.Core.TyCo.FVs ( tyConsOfType )
 import GHC.Core.DataCon ( dataConRepArgTys, dataConRepArity )
@@ -151,8 +151,20 @@ webPass early guts_in
          -- (Note [Rebuilding DFun unfoldings])
        ; let split_classes = early && gopt Opt_CoreWebsSplitClasses dflags
                                    && gopt Opt_CoreWebsDataSplit dflags
-             (binds_dfun, dfuns) | split_classes = dropDFunUnfoldings binds_in
-                                 | otherwise     = (binds_in, emptyVarSet)
+             (binds_dfun0, dfuns) | split_classes = dropDFunUnfoldings binds_in
+                                  | otherwise     = (binds_in, emptyVarSet)
+
+         -- Give the program its own copies of the functions the rules
+         -- mention (early run only)
+         -- See Note [Copying the binders of rules] in GHC.WebCore.Boundary
+       ; us_rc <- liftIO (mkSplitUniqSupply webUniqueTag)
+       ; let copy_rules     = gopt Opt_CoreWebsRuleCopies dflags
+             copy_instances = gopt Opt_CoreWebsInstanceCopies dflags
+             rule_copy = early && (copy_rules || copy_instances)
+             (binds_dfun, rule_copies)
+               | rule_copy = copyRuleBinders copy_rules copy_instances us_rc (mg_rules guts) binds_dfun0
+               | otherwise = (binds_dfun0, [])
+             copied = mkVarSet (map fst rule_copies)
 
          -- Split data types (early run only)
          -- See Note [Splitting data types] in GHC.WebCore.DataSplit
@@ -171,6 +183,7 @@ webPass early guts_in
              kept0  | gopt Opt_CoreWebsBoundaryKept dflags
                     = mkVarSet (map fst (nonDetEltsUFM
                         (keptIds early isExportedId (const False) (const False) (mg_rules guts) binds_d)))
+                      `minusVarSet` copied   -- only the rules use the originals
                     | otherwise = emptyVarSet
              (binds0, split_fns)
                     | boundary  = splitBoundary us0 (mg_rules guts) kept0 binds_d
@@ -283,12 +296,27 @@ webPass early guts_in
                          (let done = mkVarSet contracted
                           in [ f | (f, _) <- split_fns, not (f `elemVarSet` done) ])) ]
 
+         -- Undo the copies of the functions the rules mention where the
+         -- copy is unchanged
+         -- See Note [Copying the binders of rules] in GHC.WebCore.Boundary
+       ; let (binds3r, uncopied)
+               | rule_copy = contractBoundary rule_copies binds_dfun binds3c
+               | otherwise = (binds3c, [])
+       ; when rule_copy $
+           dump logger Opt_D_dump_webs_stats "Webs: rule copies" $
+             vcat [ text "Copied:"     <+> int (length rule_copies)
+                  , text "Contracted:" <+> int (length uncopied)
+                  , text "Kept:" <+> pprWithCommas ppr
+                      (sortBy (comparing getOccString)
+                         (let done = mkVarSet uncopied
+                          in [ f | (f, _) <- rule_copies, not (f `elemVarSet` done) ])) ]
+
          -- Specialise the new types to their uses
          -- See Note [Specialising indexed types] in GHC.WebCore.Transform.SpecIndex
        ; us_s <- liftIO (mkSplitUniqSupply webUniqueTag)
        ; let (binds4, replaced, spec_dump)
-               | null new_ixs = (binds3c, [], [])
-               | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3c
+               | null new_ixs = (binds3r, [], [])
+               | otherwise    = specialiseIndexed us_s [ Indexed tc ap | (tc, ap) <- new_ixs ] binds3r
              new_tcs = [ maybe tc id (lookup tc replaced) | (tc, _) <- new_ixs ]
        ; _ <- withTiming logger (text "Webs: specialising indexed types") seqBinds (return binds4)
        ; unless (null spec_dump) $

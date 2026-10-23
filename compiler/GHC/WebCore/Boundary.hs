@@ -7,12 +7,13 @@
 module GHC.WebCore.Boundary
   ( splitBoundary
   , contractBoundary
+  , copyRuleBinders
   ) where
 
 import GHC.Prelude
 
 import GHC.Core
-import GHC.Core.FVs ( rulesFreeVars, ruleLhsFreeIds )
+import GHC.Core.FVs ( rulesFreeVars, ruleLhsFreeIds, exprsSomeFreeVars )
 import GHC.Core.Opt.Arity ( etaExpand )
 import GHC.Core.Utils ( exprIsTrivial )
 import GHC.Core.Map.Expr ( eqCoreExpr )
@@ -262,12 +263,119 @@ splitBoundary us rules kept binds
       | otherwise
       = a
 
+{- Note [Copying the binders of rules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A rule is Core the web passes do not rewrite, so the local Ids free in its
+right-hand side keep their types, and their webs are exposed (keptIds in
+GHC.WebCore.Annotate).  Specialise makes such Ids: the RULE
+
+    "SPEC lookup @Int"  forall @b.  lookup @Int @b $fEqInt = $slookup @b
+
+exposes $slookup, Specialise's copy of an imported lookup, although the
+program's own calls of $slookup are all known (happy's hottest function,
+WEBS-DICT-SPEC.md §5).  Splitting it like an exported function (Note
+[Splitting kept binders]) does not help: the wrapper's call of the local
+copy passes the wrapper's exposed parameters, so the copy's parameter webs
+are exposed again.
+
+With -fcore-webs-rule-copies (early run only, before data splitting), the
+program gets its own copy instead:
+
+    $c$slookup = \ @b key ds -> <the right-hand side, its occurrences
+                                  redirected to the copies>
+    $slookup   = \ @b key ds -> <the right-hand side, unchanged>
+
+Every occurrence in the program, except in the originals, goes to the copy.
+The original is reached only from the rules (and from stable unfoldings),
+and shares no web with the copy, which the transformations, and data
+splitting, may change like any local function.  The rules still rewrite to
+the original, which is correct: it is the function they were written for.
+Specialise's rules for imported functions are auto rules, which Tidy drops
+unless what they mention is exposed, so an original that only a rule
+mentions is dead after Tidy.
+
+A recursive group is copied whole, and only if every binder in it can be:
+not exported, a function (copying a thunk would duplicate its work), with
+no rules or INLINE unfolding of its own (its occurrences, redirected to the
+copy, would lose them), and not on a rule's left-hand side (where a rule
+must see it to fire).  A copy no transformation changed is contracted as
+in Note [Contracting the boundary split]: the original is dropped and the
+copy takes its Id back.
+
+Instances are the same (-fcore-webs-instance-copies).  A DFun and the
+methods its unfolding mentions are pinned (pinnedIds in
+GHC.WebCore.DataSplit): the instance is in the interface.  So a data type
+with a derived Eq or Ord, used at that instance inside the program (a
+Data.Map of it compared with ==), is exposed, and data splitting leaves it
+alone (shellcheck's VariableState, WEBS-BACKLOG.md proposal 6).  With the
+flag, the module's DFuns and the local methods they mention are copied too:
+the program's dictionaries are ordinary local bindings, which data
+splitting may give the split type, while the instance keeps the original
+DFun.  A DFun is exported, and its copy is not.  A DFun without a context
+is a constructor application, not a function; copying it duplicates no
+work, as its arguments are variables.
+-}
+
+-- | Give the program its own copy of each function the right-hand sides of
+-- the rules mention (the first Bool), and of each instance (the second).
+-- Returns the program and, for each copied function, its original and its
+-- copy (for 'contractBoundary').
+-- See Note [Copying the binders of rules]
+copyRuleBinders :: Bool -> Bool -> UniqSupply -> [CoreRule] -> CoreProgram
+                -> (CoreProgram, [(Id, Id)])
+copyRuleBinders copy_rules copy_instances us rules binds
+  | null pairs = (binds, [])
+  | otherwise  = (concatMap copy_bind binds, pairs)
+  where
+    all_rules = rules ++ concatMap idCoreRules (bindersOfBinds binds)
+    rule_fvs  = rulesFreeVars all_rules
+    lhs_fvs   = unionVarSets (map ruleLhsFreeIds all_rules)
+    -- the local methods the module's instances mention
+    dfun_fvs  = exprsSomeFreeVars isLocalId [ rhs | (f, rhs) <- flattenBinds binds, isDFunId f ]
+
+    wanted f = (copy_rules && f `elemVarSet` rule_fvs && not (f `elemVarSet` lhs_fvs))
+               || (copy_instances && (isDFunId f || f `elemVarSet` dfun_fvs))
+    copyable (f, rhs) = (not (isExportedId f) || (copy_instances && isDFunId f))
+                        && not (isJoinId f)
+                        && isEmptyRuleInfo (idSpecialisation f)
+                        && not (isInlineUnfolding (realIdUnfolding f))
+                        && not (f `elemVarSet` lhs_fvs)
+                        && (any isId (fst (collectBinders rhs)) || is_con_app rhs)
+
+    is_con_app rhs
+      | (Var dc, args) <- collectArgs (snd (collectTyBinders rhs))
+      = isDataConWorkId dc && all exprIsTrivial args
+      | otherwise
+      = False
+
+    groups = [ prs | bind <- binds, let prs = flattenBinds [bind]
+                   , any (wanted . fst) prs, all copyable prs ]
+    pairs  = initUs_ us (sequence [ do { u <- getUniqueM; return (f, mkCopy "$c" u f) }
+                                  | prs <- groups, (f, _) <- prs ])
+    env    = mkVarEnv pairs   -- each original to its copy
+
+    copy_of  = lookupVarEnv env
+    redirect = renameVars env
+
+    copy_bind (NonRec f rhs)
+      | Just f_c <- copy_of f = [NonRec f_c (redirect rhs), NonRec f rhs]
+      | otherwise             = [NonRec f (redirect rhs)]
+    copy_bind (Rec prs)
+      | ((f, _) : _) <- prs, Just _ <- copy_of f
+      = [ Rec [ (b_c, redirect rhs) | (b, rhs) <- prs, Just b_c <- [copy_of b] ]
+        , Rec prs ]
+      | otherwise
+      = [Rec [ (b, redirect rhs) | (b, rhs) <- prs ]]
+
 -- | The local copy of an exported function: same type and analysis
 -- results, not exported, no unfolding or rules
 mkLocalCopy :: Unique -> Id -> Id
-mkLocalCopy u f = mkLocalIdWithInfo name ManyTy (idType f) info
+mkLocalCopy = mkCopy "$e"
+
+mkCopy :: String -> Unique -> Id -> Id
+mkCopy prefix u f = mkLocalIdWithInfo name ManyTy (idType f) info
   where
-    name = mkDerivedInternalName (\occ -> mkVarOccFS (fsLit "$e" `appendFS` occNameFS occ))
+    name = mkDerivedInternalName (\occ -> mkVarOccFS (fsLit prefix `appendFS` occNameFS occ))
                                  u (idName f)
     info = idInfo f `setUnfoldingInfo` noUnfolding
                     `setRuleInfo` emptyRuleInfo
@@ -380,14 +488,22 @@ contractBoundary split before after
     contract_bind (NonRec b rhs)
       | b `elemVarSet` dropped = []
       | otherwise              = [NonRec (bndr b) (subst rhs)]
-    contract_bind (Rec prs)    = [Rec [ (bndr b, subst rhs) | (b, rhs) <- prs
-                                      , not (b `elemVarSet` dropped) ]]
+    -- a group of originals (Note [Copying the binders of rules]) can go
+    -- entirely
+    contract_bind (Rec prs)    = [ Rec prs' | let prs' = [ (bndr b, subst rhs) | (b, rhs) <- prs
+                                                         , not (b `elemVarSet` dropped) ]
+                                            , not (null prs') ]
 
     bndr b = lookupVarEnv sub b `orElse` b
+    subst  = renameVars sub
 
-    subst :: CoreExpr -> CoreExpr
+-- | Rename the occurrences of some top-level Ids (whose Uniques nothing
+-- shadows)
+renameVars :: IdEnv Id -> CoreExpr -> CoreExpr
+renameVars sub = subst
+  where
     subst expr = case expr of
-      Var v            -> Var (bndr v)
+      Var v            -> Var (lookupVarEnv sub v `orElse` v)
       App f a          -> App (subst f) (subst a)
       Lam b e          -> Lam b (subst e)
       Let bind body    -> Let (sub_bind bind) (subst body)

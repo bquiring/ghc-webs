@@ -68,7 +68,7 @@ import GHC.WebCore.DataSpec ( specialiseSplit )
 import Control.Monad ( forM )
 import Control.Monad.Trans.State.Strict
 import Data.Char ( isUpper, isDigit )
-import Data.List ( sortOn, nub )
+import Data.List ( sortOn, nub, zip4 )
 import Data.Maybe ( isNothing, isJust, catMaybes, fromMaybe )
 import qualified Data.Set as Set
 import qualified Data.IntSet as IntSet
@@ -127,7 +127,30 @@ Eligible types: algebraic data types with at least one constructor and some
 field, not newtypes, classes, unboxed tuples or sums, family instances,
 enumerations, or boxes of primitives (Int, Char, Double: one constructor,
 all fields unlifted); every constructor vanilla (no existentials or equalities),
-with no wrapper (so no strict or unpacked fields, for now); kinds closed.
+with no wrapper, or one that only unpacks fields (Note [Copies of unpacked
+fields]); kinds closed.
+-}
+
+{- Note [Copies of unpacked fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A constructor with strict fields needs no wrapper (its worker evaluates
+them: Note [Data-con worker strictness] in GHC.Core.DataCon), but one with
+unpacked fields (UNPACK, -funbox-strict-fields, -funbox-small-strict-fields)
+has one: $WPos takes the fields, and the worker Pos takes their components,
+e.g. Int# for an !Int.  koka builds its Range, Pos and Source with
+-funbox-strict-fields; purs's CST SourcePos unpacks its Ints.
+
+After the simplifier, Core builds such a value with the worker, applied to
+the components, and matches it with patterns binding the components.  So a
+copy's constructor takes the original's worker fields (repFields), with no
+wrapper and nothing unpacked: the worker applications and patterns of the
+original carry over field for field, and so do the strictness marks of the
+components (a strict field of an unpacked product stays strict).  A wrapper
+left in the program (unsaturated, say) is an imported Id at the original
+type, so it exposes its class.  Only wrappers that do nothing but unpack are
+allowed: the constructor is vanilla, its type is not a family instance, and
+its user-written type variables are its universal ones (no GADT-syntax
+reordering).
 -}
 
 -- | The result of splitting
@@ -154,13 +177,14 @@ eligible tc
   && not (isClassTyCon tc) && not (isFamInstTyCon tc) && not (isTypeDataTyCon tc)
   && not (isEnumerationTyCon tc)
   && not prim_box
-  && not (null dcs) && any (not . null . dataConOrigArgTys) dcs
+  && not (null dcs) && any (not . null . dataConRepArgTys) dcs
   && all ok_dc dcs
   && all ok_binder (tyConBinders tc)
   where
     dcs = tyConDataCons tc
+    -- Note [Copies of unpacked fields]
     ok_dc dc = isVanillaDataCon dc && null (dataConTheta dc)
-               && isNothing (dataConWrapId_maybe dc)
+               && (isNothing (dataConWrapId_maybe dc) || unpacksOnly dc)
     ok_binder b = not (isNamedTyConBinder b) && noFreeVarsOfType (tyVarKind (binderVar b))
     -- A box of primitives (Int, Char, Double, ...): a copy gains nothing
     -- (fields of this type are unboxed through the original anyway), and
@@ -168,7 +192,7 @@ eligible tc
     -- small-Int closures): nofib spectral/multiplier, which splits only
     -- Ints, ran 10% more instructions
     prim_box = case dcs of
-      [dc] -> all (isUnliftedType . scaledThing) (dataConOrigArgTys dc)
+      [dc] -> all (isUnliftedType . scaledThing) (dataConRepArgTys dc)
       _    -> False
 
 -- | A newtype whose representation mentions a type we copy
@@ -504,14 +528,35 @@ mkCopy us mk_name tc_occ dc_occ tc dcs = tycon
         occ     = dc_occ dc tag
         dc_name = mk_name u_dc occ
         wk_name = mk_name u_wk (mkDataConWorkerOcc occ)
-        arg_tys = [ Scaled m (self t) | Scaled m t <- dataConOrigArgTys dc ]
+        -- The worker's fields (Note [Copies of unpacked fields]), as strict
+        -- as the original's (Note [Copies keep strictness])
+        fields  = repFields dc
+        arg_tys = [ Scaled m (self t) | (Scaled m t, _, _, _) <- fields ]
         univs   = dataConUnivTyVars dc
-        -- The copy is as strict as the original (Note [Copies keep strictness])
         dc' = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
-                (dataConSrcBangs dc) (dataConImplBangs dc) (dataConRepStrictness dc)
+                [ sb | (_, sb, _, _) <- fields ] [ ib | (_, _, ib, _) <- fields ]
+                [ sm | (_, _, _, sm) <- fields ]
                 [] univs [] emptyNameEnv (dataConUserTyVarBinders dc) [] []
                 arg_tys (mkTyConApp tycon (mkTyVarTys univs))
                 NoPromInfo tycon tag [] (mkDataConWorkId wk_name dc') NoDataConRep
+
+-- | A constructor's fields as its worker takes them, with their source and
+-- implementation bangs and strictness marks: an unpacked field's components
+-- in its place (Note [Copies of unpacked fields])
+repFields :: DataCon -> [(Scaled Type, HsSrcBang, HsImplBang, StrictnessMark)]
+repFields dc
+  | isNothing (dataConWrapId_maybe dc)
+  = zip4 (dataConOrigArgTys dc) (dataConSrcBangs dc) (dataConImplBangs dc) (dataConRepStrictness dc)
+  | otherwise
+  = [ (t, HsSrcBang NoSourceText NoSrcUnpack src, impl, sm)
+    | (t, sm) <- zip (dataConRepArgTys dc) (dataConRepStrictness dc)
+    , let (src, impl) | isMarkedStrict sm = (SrcStrict, HsStrict False)
+                      | otherwise         = (NoSrcStrict, HsLazy) ]
+
+-- | A wrapper that only unpacks fields (Note [Copies of unpacked fields])
+unpacksOnly :: DataCon -> Bool
+unpacksOnly dc = any isUnpacked (dataConImplBangs dc)
+                 && dataConUserTyVars dc == dataConUnivTyVars dc
 
 -- | A constructor of a type with a given original tag.  The constructor at
 -- position tag-1 first: in originals and annotation copies it is the one,
@@ -1005,7 +1050,10 @@ head of either side that has the original type:
   imported  an imported Id
 
 A class with no such site met the original through newtype congruence
-(Note [Solving copy classes online] in GHC.WebCore.DataInfer).  The reasons
+(Note [Solving copy classes online] in GHC.WebCore.DataInfer).  Each type
+gets a count of its reasons by kind ("other": a site with no such
+variable, e.g. a local function), then at most ten reasons, those a
+boundary split could not remove (imported) first.  The reasons
 are for proposal 6 of WEBS-BACKLOG.md, a boundary split for data types:
 a hot type exposed only by instances and exported functions can be kept
 internal behind conversions at those sites.
@@ -1310,9 +1358,23 @@ splitDataTypes split_cls sfx source unbox cfg this_mod us rules binds = split_wi
     -- for each reason, how many of them it exposes
     exposure_dump = vcat
       [ ppr orig <> colon <+> int (length cls) <+> text "exposed"
-        $$ nest 2 (vcat [ int k <+> pp_reason r | (r, k) <- take 10 (sortOn (negate . snd) (Map.toList counts)) ])
+        $$ nest 2 (text "by kind:" <+> hsep (punctuate comma [ text (kind_name k) <+> int n
+                                                              | (k, n) <- Map.toList kinds ])
+                   $$ vcat [ int k <+> pp_reason r
+                           | (r, k) <- take 10 (sortOn (\(Reason _ kd _, n) -> (kind_rank kd, negate n))
+                                                       (Map.toList counts)) ])
       | (orig, cls) <- sortOn (\(o, cls) -> (negate (length cls), getOccString o)) (Map.elems by_orig)
-      , let counts = Map.fromListWith (+) [ (r, 1 :: Int) | c <- cls, r <- reasons c ] ]
+      , let counts = Map.fromListWith (+) [ (r, 1 :: Int) | c <- cls, r <- reasons c ]
+            kinds  = Map.fromListWith (+) [ (kd, n) | (Reason _ kd _, n) <- Map.toList counts ] ]
+    -- the reasons a data boundary split could not remove come first
+    kind_rank :: String -> Int
+    kind_rank kd = case kd of
+      "imported" -> 0
+      "exported" -> 1
+      "pinned"   -> 2
+      "instance" -> 3
+      _          -> 4
+    kind_name kd = if null kd then "other" else kd
     by_orig = Map.fromListWith (\(o, a) (_, b) -> (o, a ++ b))
                 [ (getKey (getUnique orig), (orig, [rep m0]))
                 | (orig, ms@(m0 : _), _, _) <- classes, any (not . is_copy) ms ]
