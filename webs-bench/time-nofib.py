@@ -251,7 +251,9 @@ def report(data, out):
         rs = [val(sc, k) / val(sb, k) for sb, sc in zip(per[base], per[c]) if val(sb, k) > 0]
         return rs
 
-    keys = ['time'] + counters
+    # allocation: deterministic, and the one exact measure where there are
+    # no counters (WSL2)
+    keys = ['time'] + counters + ['alloc']
     geo = {(c, k): [] for c in configs[1:] for k in keys}
     wins = {c: [] for c in configs[1:]}
     losses = {c: [] for c in configs[1:]}
