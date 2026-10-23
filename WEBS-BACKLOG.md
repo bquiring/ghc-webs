@@ -209,6 +209,7 @@ Ordered by evidence over effort.
      10% of futhark. GHC's aggressive specialisation with all unfoldings
      exposed gives skylighting −26% and alex −12.5% (webs alone: 0), at a
      code and compile-time cost not yet measured on Hackage.
+   - **Design:** WEBS-DICT-SPEC.md (2026-10-23).
    - **First step:** measure the aggressive settings on the large and
      compilers groups (purs, futhark): gain, code size, compile time.
 4. **Specialising on constructed records of functions (constructor keys).**
