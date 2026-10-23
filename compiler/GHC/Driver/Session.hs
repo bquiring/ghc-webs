@@ -1550,6 +1550,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_webs_defunc)
   , make_ord_flag defGhcFlag "ddump-webs-data"
         (setDumpFlag Opt_D_dump_webs_data)
+  , make_ord_flag defGhcFlag "ddump-webs-data-exposure"
+        (setDumpFlag Opt_D_dump_webs_data_exposure)
   , make_ord_flag defGhcFlag "ddump-webs-one-shot"
         (setDumpFlag Opt_D_dump_webs_one_shot)
   , make_ord_flag defGhcFlag "ddump-webs-spec"

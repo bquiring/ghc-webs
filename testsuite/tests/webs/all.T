@@ -662,3 +662,7 @@ test('roundtrip002', [], compile_and_run, ['-O2 -fcore-webs-early -dcore-lint'])
 # specialisation] in GHC.Core.Opt.Specialise)
 test('specmax001', [extra_files(['specmax001.hs', 'SpecMax001A.hs'])],
      makefile_test, ['specmax001'])
+# dataexpose001: why data classes are exposed (Note [Exposure reasons] in
+# GHC.WebCore.DataSplit)
+test('dataexpose001', [extra_files(['dataexpose001.hs'])],
+     multimod_compile, ['dataexpose001', ds_opts + ' -ddump-webs-data-exposure -dsuppress-uniques'])

@@ -1,10 +1,12 @@
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE BangPatterns, ScopedTypeVariables #-}
 -- | Inferring which copies of a data type must be the same, by unification:
 -- the pairs that Data Lint records, without type-checking the program.
 --
 -- See Note [Inferring copy pairs].
 module GHC.WebCore.DataInfer
   ( inferCopyPairs
+  , PairSite(..)
+  , siteCopyPairs
   , solveCopies
   ) where
 
@@ -18,7 +20,7 @@ import GHC.Core.Type
 import GHC.Core.Utils ( mkLamType )
 import GHC.Core.TyCon ( TyCon )
 
-import GHC.Types.Id ( idType )
+import GHC.Types.Id ( Id, idType )
 import GHC.Types.Literal ( literalType )
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
@@ -70,18 +72,36 @@ the data-splitting tests, 2026-10-14).
 -- | The pairs of type constructors (copies, or a copy and its original)
 -- that the program forces to be the same.  Note [Inferring copy pairs]
 inferCopyPairs :: Copies -> CoreProgram -> Bag (TyCon, TyCon)
-inferCopyPairs copies binds = foldl' (flip bind) emptyBag binds
-  where
-    unify :: Type -> Type -> Bag (TyCon, TyCon) -> Bag (TyCon, TyCon)
-    unify t1 t2 !acc = copyPairs copies t1 t2 `unionBags` acc
+inferCopyPairs copies = walkPairs (\_ t1 t2 acc -> copyPairs copies t1 t2 `unionBags` acc) emptyBag
 
-    bind :: CoreBind -> Bag (TyCon, TyCon) -> Bag (TyCon, TyCon)
-    bind (NonRec b e) acc = let (t, acc') = expr e acc in unify (idType b) t acc'
-    bind (Rec prs)    acc = foldl' (\a (b, e) -> let (t, a') = expr e a in unify (idType b) t a')
+-- | Where a pair comes from: what Data Lint compares there, and the
+-- variables at the heads of the two sides (a binder or function, and the
+-- expression), for -ddump-webs-data-exposure (Note [Exposure reasons] in
+-- GHC.WebCore.DataSplit)
+data PairSite = PairSite { ps_what :: String, ps_ids :: [Id] }
+
+-- | The pairs with the site of each
+siteCopyPairs :: Copies -> CoreProgram -> Bag ((TyCon, TyCon), PairSite)
+siteCopyPairs copies
+  = walkPairs (\s t1 t2 acc -> mapBag (\p -> (p, s)) (copyPairs copies t1 t2) `unionBags` acc) emptyBag
+
+-- | Fold over the places Data Lint compares two types, with their sites
+walkPairs :: forall a. (PairSite -> Type -> Type -> a -> a) -> a -> CoreProgram -> a
+{-# INLINE walkPairs #-}
+walkPairs unify0 acc0 binds = foldl' (flip bind) acc0 binds
+  where
+    unify :: PairSite -> Type -> Type -> a -> a
+    unify s t1 t2 !acc = unify0 s t1 t2 acc
+
+    bind :: CoreBind -> a -> a
+    bind (NonRec b e) acc = let (t, acc') = expr e acc in unify (site "binding" [b] e) (idType b) t acc'
+    bind (Rec prs)    acc = foldl' (\a (b, e) -> let (t, a') = expr e a in unify (site "binding" [b] e) (idType b) t a')
                                    acc prs
 
+    site what vs e = PairSite what (vs ++ heads e)
+
     -- The expression's type, and the pairs so far
-    expr :: CoreExpr -> Bag (TyCon, TyCon) -> (Type, Bag (TyCon, TyCon))
+    expr :: CoreExpr -> a -> (Type, a)
     expr e !acc = case e of
       Var v       -> (idType v, acc)
       Lit l       -> (literalType l, acc)
@@ -92,11 +112,11 @@ inferCopyPairs copies binds = foldl' (flip bind) emptyBag binds
       Let b body  -> expr body (bind b acc)
       Case scrut b ty alts
         -> let (st, acc1) = expr scrut acc
-               acc2       = unify (idType b) st acc1
+               acc2       = unify (site "case" [] scrut) (idType b) st acc1
            in (ty, foldl' (\a al -> alt b st ty al a) acc2 alts)
       Cast x co
         -> let (t, acc1) = expr x acc
-           in (coercionRKind co, unify (coercionLKind co) t (coercion co acc1))
+           in (coercionRKind co, unify (PairSite "cast" (heads x)) (coercionLKind co) t (coercion co acc1))
       Tick _ x    -> expr x acc
       WebLam {}   -> (webForm, acc)
       WebApp {}   -> (webForm, acc)
@@ -113,38 +133,39 @@ inferCopyPairs copies binds = foldl' (flip bind) emptyBag binds
         go (ft, a) (arg : rest)
           = let (at, a1) = expr arg a
             in case splitFunTy_maybe ft of
-                 Just (_, _, arg_ty, res_ty) -> go (res_ty, unify arg_ty at a1) rest
+                 Just (_, _, arg_ty, res_ty) -> go (res_ty, unify (site "argument" (heads f) arg) arg_ty at a1) rest
                  Nothing -> go (piResultTy ft at, a1) rest   -- a coercion argument
                                                               -- to a forall over it
 
     -- A case alternative (Data Lint: lintCoreAlt, lintAltBinders)
     alt case_bndr scrut_ty ty (Alt con bs rhs) acc
       = let (rt, acc1) = expr rhs acc
-            acc2       = unify rt ty acc1
+            acc2       = unify (site "alternative" [] rhs) rt ty acc1
         in case con of
              DataAlt dc
                | Just (_, tc_args) <- splitTyConApp_maybe (idType case_bndr)
                -> pattern (piResultTys (dataConRepType dc) tc_args) bs acc2
              _ -> acc2
       where
-        pattern con_ty [] a = unify con_ty scrut_ty a
+        pat_site = PairSite "pattern" []
+        pattern con_ty [] a = unify pat_site con_ty scrut_ty a
         pattern con_ty (v : vs) a
           | isTyVar v = pattern (piResultTy con_ty (mkTyVarTy v)) vs a
           | Just (_, _, arg_ty, res_ty) <- splitFunTy_maybe con_ty
-          = pattern res_ty vs (unify arg_ty (varType v) a)
+          = pattern res_ty vs (unify pat_site arg_ty (varType v) a)
           | otherwise   -- a coercion binder of a forall
           = pattern (piResultTy con_ty (mkCoercionTy (CoVarCo v))) vs a
 
     -- Inside a coercion (Data Lint: lintCoercion)
-    coercion :: Coercion -> Bag (TyCon, TyCon) -> Bag (TyCon, TyCon)
+    coercion :: Coercion -> a -> a
     coercion co !acc = case co of
       Refl {}                 -> acc
       GRefl _ _ MRefl         -> acc
-      GRefl _ t (MCo kco)     -> unify (typeKind t) (coercionLKind kco) (coercion kco acc)
+      GRefl _ t (MCo kco)     -> unify co_site (typeKind t) (coercionLKind kco) (coercion kco acc)
       TyConAppCo _ _ cos      -> foldl' (flip coercion) acc cos
       AppCo c1 c2             -> coercion c2 (coercion c1 acc)
       ForAllCo { fco_tcv = tcv, fco_kind = kco, fco_body = body }
-                              -> unify (varType tcv) (coercionLKind kco)
+                              -> unify co_site (varType tcv) (coercionLKind kco)
                                        (coercion body (coercion kco acc))
       FunCo { fco_mult = m, fco_arg = a, fco_res = r }
                               -> coercion r (coercion a (coercion m acc))
@@ -152,7 +173,7 @@ inferCopyPairs copies binds = foldl' (flip bind) emptyBag binds
       AxiomCo _ cos           -> foldl' (flip coercion) acc cos
       UnivCo { uco_deps = cos } -> foldl' (flip coercion) acc cos
       SymCo c                 -> coercion c acc
-      TransCo c1 c2           -> unify (coercionRKind c1) (coercionLKind c2)
+      TransCo c1 c2           -> unify co_site (coercionRKind c1) (coercionLKind c2)
                                        (coercion c2 (coercion c1 acc))
       SelCo _ c               -> coercion c acc
       LRCo _ c                -> coercion c acc
@@ -160,6 +181,17 @@ inferCopyPairs copies binds = foldl' (flip bind) emptyBag binds
       KindCo c                -> coercion c acc
       SubCo c                 -> coercion c acc
       HoleCo {}               -> acc
+    co_site = PairSite "coercion" []
+
+-- | The variable at the head of an expression, if any
+heads :: CoreExpr -> [Id]
+heads e = case e of
+  Var v      -> [v]
+  App f _    -> heads f
+  Tick _ x   -> heads x
+  Cast x _   -> heads x
+  Let _ x    -> heads x
+  _          -> []
 
 {- Note [Solving copy classes online]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

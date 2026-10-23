@@ -495,6 +495,7 @@ data DumpFlag
    | Opt_D_dump_webs_inline      -- ^ Web pipeline: super-beta inlining verdicts
    | Opt_D_dump_webs_defunc      -- ^ Web pipeline: defunctionalisation verdicts
    | Opt_D_dump_webs_data        -- ^ Web pipeline: data type splitting
+   | Opt_D_dump_webs_data_exposure -- ^ Web pipeline: why data classes are exposed
    | Opt_D_dump_webs_one_shot    -- ^ Web pipeline: one-shot lambda verdicts
    | Opt_D_dump_webs_spec        -- ^ Web pipeline: constant specialisation verdicts
    | Opt_D_dump_first_class_stats -- ^ First-class function statistics, before and

@@ -888,6 +888,7 @@ runDataSplit classes sfx early logger dflags this_mod rules binds
                        , pprMessageBag errs ]
               ; ghcExit logger 1 }
        ; dump logger Opt_D_dump_webs_data "Webs: splitting data types" (dsr_dump res)
+       ; dump logger Opt_D_dump_webs_data_exposure "Webs: exposed data classes" (dsr_exposure res)
        ; return (dsr_binds res, dsr_tycons res) }
 
 dataLintConfig :: DynFlags -> DL.LintConfig

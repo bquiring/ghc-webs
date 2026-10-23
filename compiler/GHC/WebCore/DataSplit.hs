@@ -61,7 +61,7 @@ import GHC.Utils.Panic ( panic, pprPanic )
 
 import GHC.WebCore.DataCopy
 import GHC.WebCore.DataLint ( LintConfig, DataLintResult(..), lintDataProgram )
-import GHC.WebCore.DataInfer ( inferCopyPairs, solveCopies )
+import GHC.WebCore.DataInfer ( inferCopyPairs, solveCopies, PairSite(..), siteCopyPairs )
 import {-# SOURCE #-} GHC.WebCore.DataFlatten ( flattenFields )
 import GHC.WebCore.DataSpec ( specialiseSplit )
 
@@ -72,6 +72,7 @@ import Data.List ( sortOn, nub )
 import Data.Maybe ( isNothing, isJust, catMaybes, fromMaybe )
 import qualified Data.Set as Set
 import qualified Data.IntSet as IntSet
+import qualified Data.Map.Strict as Map
 import GHC.WebCore.Transform.ArityRaise ( productCon )
 
 {- Note [Splitting data types]
@@ -134,6 +135,7 @@ data DataSplitResult = DataSplitResult
   { dsr_binds   :: CoreProgram        -- ^ the new program
   , dsr_tycons  :: [TyCon]            -- ^ the new types
   , dsr_dump    :: SDoc               -- ^ for -ddump-webs-data
+  , dsr_exposure :: SDoc              -- ^ for -ddump-webs-data-exposure (Note [Exposure reasons])
   , dsr_lint    :: DataLintResult     -- ^ Data Lint on the annotated program
   , dsr_changed :: Bool
   , dsr_useful  :: [Int]              -- ^ the classes whose split changed something
@@ -981,6 +983,34 @@ data PairSource
 -- constructors the class builds (by original tag)
 data Fate = Exposed | Bottom | Split TyCon [(Int, DataCon)]
 
+-- | Why a class is exposed: where a copy in it meets an original, and the
+-- variable that brings the original, with its kind (Note [Exposure reasons])
+data Reason = Reason String String (Maybe Id)
+  deriving (Eq, Ord)
+
+{- Note [Exposure reasons]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+A class is exposed when it contains an original type constructor (Note
+[Splitting data types]).  -ddump-webs-data-exposure says why, per original
+type: how many of its classes are exposed, and how many of those each
+reason exposes.  A reason is a site where a copy meets the original
+(siteCopyPairs in GHC.WebCore.DataInfer: a binding, an argument, a case,
+an alternative, a pattern, a cast or a coercion), with the variable at the
+head of either side that has the original type:
+
+  instance  a DFun (derived Show, Generic, NFData, ...)
+  exported  an exported Id
+  pinned    a binder kept by its unfolding or rules, or by a DFun's
+            unfolding (instance methods: pinnedIds)
+  imported  an imported Id
+
+A class with no such site met the original through newtype congruence
+(Note [Solving copy classes online] in GHC.WebCore.DataInfer).  The reasons
+are for proposal 6 of WEBS-BACKLOG.md, a boundary split for data types:
+a hot type exposed only by instances and exported functions can be kept
+internal behind conversions at those sites.
+-}
+
 splitDataTypes :: Bool            -- ^ split classes too (Note [Splitting classes])
                -> String          -- ^ The copies' suffix, before their class number
                -> PairSource
@@ -997,6 +1027,7 @@ splitDataTypes split_cls sfx source unbox cfg this_mod us rules binds = split_wi
         { dsr_binds   = final_binds
         , dsr_tycons  = final_tcs
         , dsr_dump    = dump $$ flat_dump
+        , dsr_exposure = exposure_dump
         , dsr_lint    = lint_res
         , dsr_changed = changed
         , dsr_useful  = useful
@@ -1274,6 +1305,40 @@ splitDataTypes split_cls sfx source unbox cfg this_mod us rules binds = split_wi
     rep_nc c = lookupWithDefaultUFM rep_nc_of c c
     nc_exposed = mkUniqSet [ rep_nc o | (a, b) <- pairs, o <- [a, b], not (is_copy o) ]
     exposed_by_cast ms = not (any (\m -> rep_nc m `elementOfUniqSet` nc_exposed) ms)
+
+    -- Note [Exposure reasons]: per original type, its exposed classes and,
+    -- for each reason, how many of them it exposes
+    exposure_dump = vcat
+      [ ppr orig <> colon <+> int (length cls) <+> text "exposed"
+        $$ nest 2 (vcat [ int k <+> pp_reason r | (r, k) <- take 10 (sortOn (negate . snd) (Map.toList counts)) ])
+      | (orig, cls) <- sortOn (\(o, cls) -> (negate (length cls), getOccString o)) (Map.elems by_orig)
+      , let counts = Map.fromListWith (+) [ (r, 1 :: Int) | c <- cls, r <- reasons c ] ]
+    by_orig = Map.fromListWith (\(o, a) (_, b) -> (o, a ++ b))
+                [ (getKey (getUnique orig), (orig, [rep m0]))
+                | (orig, ms@(m0 : _), _, _) <- classes, any (not . is_copy) ms ]
+    -- each class (by representative) to the sites where a copy in it meets
+    -- an original, once per reason
+    reasons c = case lookupUFM site_reasons c of
+      Just rs -> Set.toList rs
+      Nothing -> [Reason "newtype congruence" "" Nothing]
+    site_reasons :: UniqFM TyCon (Set.Set Reason)
+    site_reasons = foldl' (\m (c, r) -> addToUFM_C Set.union m (rep c) (Set.singleton r)) emptyUFM
+                     [ (c, reason s) | ((a, b), s) <- bagToList (siteCopyPairs copies ann_binds)
+                                     , (c, o) <- [(a, b), (b, a)], is_copy c, not (is_copy o) ]
+    -- the most specific variable: show @T $fShowT x is exposed by the
+    -- instance, not by the imported show
+    reason (PairSite what vs) = case sortOn fst [ (rank, (k, v)) | v <- vs, Just (rank, k) <- [culprit v] ] of
+      (_, (k, v)) : _ -> Reason what k (Just v)
+      []              -> Reason what "" Nothing
+    -- (a constructor brings no original: annotation gave it its copy's)
+    culprit v
+      | isDFunId v            = Just (0 :: Int, "instance")
+      | isDataConId v         = Nothing
+      | not (isLocalId v)     = Just (3, "imported")
+      | isExportedId v        = Just (1, "exported")
+      | v `elemVarSet` pinned = Just (2, "pinned")
+      | otherwise             = Nothing
+    pp_reason (Reason what k mv) = text what <+> text k <+> maybe empty ppr mv
 
     -- Classes: representative -> members, with congruence for newtype
     -- copies' children (Note [Splitting newtypes]), by an online union-find
