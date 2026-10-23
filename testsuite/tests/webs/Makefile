@@ -109,7 +109,7 @@ RAISECALL_OPTS = -O2 -fcore-webs-early -fcore-webs-arity-raise -fcore-webs-resul
 raisecall001:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(RAISECALL_OPTS) -ddump-webs-result-raise -ddump-webs-arity-raise \
 	  -ddump-to-file -outputdir raisecall001.out -v0 raisecall001.hs -o raisecall001
-	grep -h "^raised" raisecall001.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | sort
+	grep -h "^raised" raisecall001.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | LC_ALL=C sort
 	./raisecall001
 
 # raisecall002: moving a constructor evaluates nothing new (undefined lazy fields)
@@ -117,7 +117,7 @@ raisecall001:
 raisecall002:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(RAISECALL_OPTS) -ddump-webs-result-raise -ddump-webs-arity-raise \
 	  -ddump-to-file -outputdir raisecall002.out -v0 raisecall002.hs -o raisecall002
-	grep -h "^raised" raisecall002.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | sort
+	grep -h "^raised" raisecall002.out/*.dump-webs-*-raise | sed 's/_[A-Za-z0-9]*//g' | LC_ALL=C sort
 	./raisecall002
 
 # evaldarg001: the allocation raising an evaluated argument can cost: a lambda
@@ -209,7 +209,7 @@ CONSTSPEC_OPTS = -O2 -fcore-webs-early -fcore-webs-inline -fcore-webs-const-prop
 constspec001:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-webs -outputdir constspec001.w -v0 constspec001.hs -o constspec001w
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -outputdir constspec001.c -v0 constspec001.hs -o constspec001c
-	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec001.$$d/*.dump-webs-spec | sed 's/ //g' | sort; done
+	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec001.$$d/*.dump-webs-spec | sed 's/ //g' | LC_ALL=C sort; done
 	./constspec001w
 	./constspec001c
 
@@ -217,7 +217,7 @@ constspec001:
 constspec002:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-webs -outputdir constspec002.w -v0 constspec002.hs -o constspec002w
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -outputdir constspec002.c -v0 constspec002.hs -o constspec002c
-	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec002.$$d/*.dump-webs-spec | sed 's/ //g' | sort; done
+	for d in w c; do echo $$d; grep -ho "^ *[A-Za-z]*_cs[0-9]*" constspec002.$$d/*.dump-webs-spec | sed 's/ //g' | LC_ALL=C sort; done
 	./constspec002w
 	./constspec002c
 
@@ -226,7 +226,7 @@ constspec002:
 .PHONY: constspec003
 constspec003:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -fcore-webs-spec-lambdas -outputdir constspec003.l -v0 constspec003.hs -o constspec003l
-	grep -ho "^ *[A-Za-z]*_cs[0-9]*\|^Lifted: [A-Za-z]*_ll.*\|^Not specialised: .*" constspec003.l/*.dump-webs-spec | sed 's/^ *//; s/_ll_[A-Za-z0-9]*/_ll/' | sort
+	grep -ho "^ *[A-Za-z]*_cs[0-9]*\|^Lifted: [A-Za-z]*_ll.*\|^Not specialised: .*" constspec003.l/*.dump-webs-spec | sed 's/^ *//; s/_ll_[A-Za-z0-9]*/_ll/' | LC_ALL=C sort
 	./constspec003l
 
 # constspec004: lifted lambdas inside lifted lambdas, all put back (no keys
@@ -234,7 +234,7 @@ constspec003:
 .PHONY: constspec004
 constspec004:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -fcore-webs-spec-lambdas -fcore-webs-spec-max-keys=0 -outputdir constspec004.l -v0 constspec004.hs -o constspec004l
-	grep -ho "^Lifted: [A-Za-z]*_ll.*" constspec004.l/*.dump-webs-spec | sed 's/_ll_[A-Za-z0-9]*/_ll/' | sort
+	grep -ho "^Lifted: [A-Za-z]*_ll.*" constspec004.l/*.dump-webs-spec | sed 's/_ll_[A-Za-z0-9]*/_ll/' | LC_ALL=C sort
 	./constspec004l
 
 # roundtrip001: Note [Occurrences after the round trip]; the web pass with
