@@ -1,0 +1,42 @@
+[1 of 2] Compiling Main             ( dataexpose001.hs, dataexpose001.o )
+
+==================== Webs: exposed data classes ====================
+GHC.Internal.Types.IO: 1 exposed
+  1 argument imported GHC.Internal.TopHandler.runMainIO1
+  1 binding exported :Main.main
+  1 binding exported Main.main
+[]: 1 exposed
+  1 alternative imported GHC.Internal.Show.itos
+  1 argument 
+  1 argument imported GHC.Internal.CString.unpackAppendCString#
+  1 argument imported GHC.Internal.Show.showList__
+  1 argument imported GHC.Internal.Show.$fShowCallStack_itos'
+  1 argument imported GHC.Internal.Show.itos
+  1 argument imported GHC.Internal.IO.Handle.Text.hPutStr2
+  1 argument pinned $cshowsPrec
+  1 binding 
+  1 binding pinned $cshowsPrec
+GHC.Internal.Types.Module: 1 exposed
+  1 binding exported Main.$trModule
+Main.Result: 1 exposed
+  1 binding exported Main.result
+Main.Shown: 1 exposed
+  1 argument pinned $cshowsPrec
+  1 argument pinned $cshow
+  1 argument pinned $cshowList
+  1 binding instance Main.$fShowShown
+  1 binding pinned $cshowsPrec
+  1 binding pinned $cshow
+  1 binding pinned $cshowList
+GHC.Internal.Types.TrName: 1 exposed
+  1 argument 
+GHC.Internal.Types.TyCon: 1 exposed
+  1 binding exported Main.$tc'Shown
+  1 binding exported Main.$tcShown
+  1 binding exported Main.$tc'Result
+  1 binding exported Main.$tcResult
+  1 binding exported Main.$tc'Local
+  1 binding exported Main.$tcLocal
+
+
+[2 of 2] Linking dataexpose001
