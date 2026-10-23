@@ -47,6 +47,8 @@ RESULTS = os.path.join(ROOT, 'webs-bench', 'results')
 
 GHC_TIMING = re.compile(r'<<ghc: (\d+) bytes.*?([\d.]+) MUT \(([\d.]+) elapsed\), '
                         r'([\d.]+) GC \(([\d.]+) elapsed\)')
+GC_MEMORY = re.compile(r'<<ghc: \d+ bytes, \d+ GCs?[^,]*, \d+/(\d+) avg/max bytes residency'
+                       r' \(\d+ samples?\),[^<]*?(\d+)M in use')
 
 
 def read_runs(config):
@@ -144,6 +146,11 @@ def run_once(config, d, cmd, cpu, use_perf, timeout):
         return {'error': 'no timing line: ' + out[-300:]}
     s = {'alloc': int(m.group(1)), 'mut': float(m.group(3)), 'gc': float(m.group(5)),
          'wall': wall}
+    # Peak memory: max residency (sampled at major GCs) and memory in use
+    mr = GC_MEMORY.search(out)
+    if mr:
+        s['maxres'] = int(mr.group(1))
+        s['inuse'] = int(mr.group(2))
     if perf_out:
         with open(perf_out) as f:
             for line in f:

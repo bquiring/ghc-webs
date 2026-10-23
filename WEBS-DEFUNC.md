@@ -16,7 +16,7 @@ specialise. A non-exposed web lists every lambda that can reach its calls.
 So the web's function values can be replaced by the values of a data type,
 one constructor per lambda, and its calls by a call of one apply function
 that cases on the constructor. This is Reynolds' defunctionalisation,
-applied web by web, as in the paper.
+applied web by web.
 
 ## The transformation
 

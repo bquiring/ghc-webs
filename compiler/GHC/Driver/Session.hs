@@ -1882,6 +1882,10 @@ dynamic_flags_deps = [
       (intSuffix (\n d -> d {websMaxUnboxSize = n}))
   , make_ord_flag defFlag "fcore-webs-unbox-rounds"
       (intSuffix (\n d -> d {websUnboxRounds = n}))
+  , make_ord_flag defFlag "fcore-webs-spec-max-keys"
+      (intSuffix (\n d -> d {websSpecMaxKeys = n}))
+  , make_ord_flag defFlag "fcore-webs-raise-max-args"
+      (intSuffix (\n d -> d {websRaiseMaxArgs = n}))
   , make_ord_flag defFlag "fcore-webs-passes"
       (intSuffix (\n d -> d {websPasses = n}))
   , make_ord_flag defFlag "fcore-webs-unused-exports"

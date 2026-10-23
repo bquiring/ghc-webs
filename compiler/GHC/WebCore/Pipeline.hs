@@ -254,8 +254,9 @@ webPass early guts_in
            $$ pprTypeStats guts split_tcs binds0
 
          -- 4. Erasure
-       ; let binds3a | transformed = reorderTopBinds (eraseProgram sigs_t binds_t)
-                     | otherwise   = eraseProgram sigs_t binds_t
+         -- Note [Occurrences after the round trip] in GHC.WebCore.Erase
+       ; let binds3a | transformed = reorderTopBinds (restoreOccurrences binds0 (eraseProgram sigs_t binds_t))
+                     | otherwise   = restoreOccurrences binds0 (eraseProgram sigs_t binds_t)
              -- Types whose hidden fields changed are rebuilt in place
              (binds3, rebuilt) = rebuildHiddenTypes (splitClass split_tcs) sigs_t
                                                     (mg_tcs guts ++ split_tcs) binds3a
@@ -301,7 +302,9 @@ webPass early guts_in
                      -- splitting can change the dependencies between top-level
                      -- bindings (Note [Top-level binding order] in
                      -- GHC.WebCore.Transform.Common; CPR analysis asserts it)
-                   ; return (syncOccurrences (reorderTopBinds bs), tcs) }
+                     -- and the input's occurrences back (Note [Occurrences
+                     -- after the round trip] in GHC.WebCore.Erase)
+                   ; return (restoreOccurrences binds4 (syncOccurrences (reorderTopBinds bs)), tcs) }
            else return (binds4, [])
 
          -- Constant specialisation (early run only)
@@ -315,7 +318,8 @@ webPass early guts_in
                                    , so_rounds = if spec_calls then 3 else 1
                                      -- Note [Specialising on lambdas]: keys from calls only
                                    , so_lams   = spec_calls && not spec_webs
-                                                 && gopt Opt_CoreWebsSpecLambdas dflags }
+                                                 && gopt Opt_CoreWebsSpecLambdas dflags
+                                   , so_max_keys = websSpecMaxKeys dflags }
              (binds5s, spec_dump)
                | early && (spec_webs || spec_calls) = constSpecProgram spec_opts us_cs binds5
                | otherwise                          = (binds5, empty)
@@ -1062,7 +1066,7 @@ runTransforms early logger dflags cfg sigs0 binds0
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
         , \_ us done b -> same (constPropRound us exposed done b) )
       , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
-        , \sigs us done b -> case arityRaiseRound (gopt Opt_CoreWebsEvaldArgs dflags) (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
+        , \sigs us done b -> case arityRaiseRound (gopt Opt_CoreWebsEvaldArgs dflags) (websRaiseMaxArgs dflags) (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
                                (r, vs) -> (r, vs) )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
         , \_ us done b -> case deadParamsRound us exposed keep done b of

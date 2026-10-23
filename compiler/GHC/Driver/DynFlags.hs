@@ -406,6 +406,8 @@ data DynFlags = DynFlags {
   maxWorkerArgs         :: Int,
   websMaxUnboxSize      :: Int,   -- ^ -fcore-webs-max-unbox-size: a cell's unboxed size, as a multiple of its original
   websUnboxRounds       :: Int,   -- ^ -fcore-webs-unbox-rounds: flattening rounds (Note [Flattening fields])
+  websSpecMaxKeys       :: Int,   -- ^ -fcore-webs-spec-max-keys: copies per function (Note [Constant specialisation])
+  websRaiseMaxArgs      :: Int,   -- ^ -fcore-webs-raise-max-args: arguments at an unknown call, 0 = no bound
   websPasses            :: Int,   -- ^ -fcore-webs-passes: passes of the web transformations (Note [Repeating the transformations])
   websUnusedExports     :: Maybe FilePath, -- ^ -fcore-webs-unused-exports=FILE: exports no other module uses (Note [Unused exports])
   websChunkModules      :: Maybe FilePath, -- ^ -fcore-webs-chunk-modules=FILE: the modules of the chunk (Note [Chunks])
@@ -704,6 +706,8 @@ defaultDynFlags mySettings =
         maxWorkerArgs = 10,
         websMaxUnboxSize = 4,
         websUnboxRounds = 3,
+        websSpecMaxKeys = 4,
+        websRaiseMaxArgs = 0,
         websPasses = 1,
         websUnusedExports = Nothing,
         websChunkModules = Nothing,

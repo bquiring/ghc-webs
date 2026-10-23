@@ -41,6 +41,80 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Restoring occurrences by unique: a repeated unique got another binder's IdInfo (2026-10-22)
+
+* **Found by:** the Hackage small group with constant specialisation alone
+  (spec22): happy-lib's Happy.Frontend.Mangler,
+  "ASSERT failed! z_a6xp" in CprAnal (cprTransform, isDataStructure).
+  The full configuration (webs22) compiled the module: data splitting
+  changed its shape.
+* **Symptom:** the same with `-fcore-webs-early` alone; Core Lint passes.
+* **Cause:** foldr inlined twice into one top-level binding (from
+  `concat (map getTerm dirs) ++ [eofName]` and a second `++`) keeps the
+  same uniques for its locals in both disjoint scopes; both z_a6xp are let
+  binders of type [[Char]], one a data structure (`[eofName]`, evaluated
+  unfolding), one not. restoreOccurrences (the fix below) kept one input
+  occurrence per unique per binding, and checked consistency against the
+  first binder of the right type in the whole program, so an occurrence
+  of the second z got the first's evaluated unfolding. Beyond the
+  assertion, an occurrence that claims to be evaluated when its binder is
+  a thunk can let the simplifier skip an evaluation.
+* **Fix:** a unique bound more than once in one top-level binding (input
+  or output) is not restored there; binders are looked up per top-level
+  binding (Note [Occurrences after the round trip]).
+* **Guard:** `roundtrip002` (17 lines, the Mangler's shape; panicked
+  before the fix with -fcore-webs-early alone).
+* **Commit:** (uncommitted)
+
+### The round trip changed occurrences' IdInfo: cpstak +17% with nothing transformed (2026-10-22)
+
+* **Found by:** the SML suite (cpstak +17% instructions under webs22);
+  the user suggested an uncontracted eta-expansion.
+* **Symptom:** the same +17% with `-fcore-webs-early` alone, no
+  transformation. The program printed identically (even with -dppr-debug)
+  through CPR analysis; the simplifier after worker/wrapper then made
+  different choices (the boxed case binder wild1 passed instead of
+  I# sc), boxity analysis kept tak's x and z boxed, no unboxed worker.
+  Not unique noise (-dinitial-unique left both builds unchanged). Bisected
+  with a temporary environment switch in webPass: returning the input
+  binds at the end gave base's code, returning the erased binds did not.
+* **Cause:** annotation replaces each occurrence with its annotated binder
+  (Note [Initial annotation]), so after erasure occurrences carry the
+  binders' current IdInfo (demand, signature, call arity, a case binder's
+  evaluated unfolding) instead of the copies the simplifier left there.
+  `syncOccurrences` after data-splitting-again does the same.
+* **Fix:** restoreOccurrences (GHC.WebCore.Erase, Note [Occurrences after
+  the round trip]), after erasure and after data splitting again: per
+  top-level binding, each occurrence gets back the input binding's Id for
+  its unique, when the type is unchanged, its unfolding's free variables
+  are bound, and a let-bound occurrence agrees with its binder on CPR's
+  isDataStructure (dsedge015_size1, useless019 asserted otherwise). Two
+  detours on the way: a whole-program table (unique clash: Core Lint on
+  nofib hidden, exact-reals, mate), and an exact occurrence check in
+  checkRoundTrip (100 tests failed: one variable's occurrences differ in
+  the input); both dropped.
+* **Guard:** `roundtrip001` (cpstak's shape: -ddump-simpl with and
+  without -fcore-webs-early must agree; checked to fail with the restore
+  disabled); dsedge015_size1, useless019; nofib with -dcore-lint.
+* **Commit:** (uncommitted)
+
+### Specialising on lambdas: putting back nested lifted lambdas lost an in-scope binder (2026-10-22)
+
+* **Found by:** the Hackage small group with the full configuration
+  (webs22): QuickCheck-2.19's Test.QuickCheck.Property, "panic!
+  lookupIdSubst expectFailureError" from unliftProgram's substExpr.
+* **Cause:** a lambda inside a lambda passed to a candidate (Rose's fmap)
+  is lifted too; when neither is a key, both are put back. Putting back the
+  outer one substitutes into its body with the inner one already put back,
+  but the in-scope set was computed from the body before, which did not
+  mention the inner right-hand side's free top-level binders.
+* **Fix:** the in-scope set comes from the rewritten body (beta in
+  unliftProgram, GHC.WebCore.Transform.ConstSpec).
+* **Guard:** `constspec004` (nested lifted lambdas, all put back with
+  `-fcore-webs-spec-max-keys=0`); not checked against the unfixed
+  compiler, but QuickCheck builds with the fix.
+* **Commit:** (uncommitted)
+
 ### Specialising on lambdas: a lifted case binder kept its OtherCon unfolding (2026-10-16)
 
 **Symptom.** nofib real/gg with `-fcore-webs-spec-lambdas`: Core Lint,

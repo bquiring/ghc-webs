@@ -1,0 +1,18 @@
+[1 of 2] Compiling Main             ( arityraise014.hs, arityraise014.o )
+
+==================== Webs: arity raising ====================
+raised (constructed arguments): n
+raised: ds ds
+rejected (argument not a product): k
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (argument not a product): x x
+rejected (curried: may be partially applied): i i
+rejected (exposed): s
+
+
+[2 of 2] Linking arityraise014

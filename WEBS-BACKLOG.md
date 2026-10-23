@@ -173,6 +173,141 @@ fields at most), strictness feeding raising (no change on nofib), known-call
 conversion for top-level single-lambda webs (28 calls over nofib), recursive
 webs as newtypes (the occurs check never fires on nofib).
 
+### Proposals from the Hackage profiles (2026-10-23)
+
+Evidence: WEBS-EXPERIMENTS.md §32-33. On the Hackage programs:
+- the unknown calls that remain come from dictionaries, continuation-passing
+  parser monads and lazily computed functions, mostly across module and
+  package boundaries;
+- the unknown calls webs can handle today are at most 2.4% of any program;
+- GC is 30-50% of instructions in half the programs.
+
+Ordered by evidence over effort.
+
+1. **Newtype splitting.** An imported newtype's axiom (attoparsec's
+   N:Parser, transformers' N:StateT) currently exposes every web under it
+   (H1). Instead, give each *use* of an axiom its own web copy, as data
+   splitting gives each occurrence of a data type its own copy. Expose a
+   copy only when a value at that newtype reaches the interface.
+   - **Evidence:** in skylighting's regex compiler under aggressive
+     specialisation, 14 lambda classes are exposed by N:Parser (5 by it
+     alone).
+   - **First step:** count axiom-only exposure across the Hackage builds.
+2. **Rules are code, not interface.** Binders free in the specialiser's
+   own RULES are kept exposed (18 classes in that module). A rule for an
+   imported function is written to the interface, but its right-hand side
+   is Core we can rewrite with the binder. Transform the rule like any
+   other occurrence; expose only what a rule's left-hand side pins.
+3. **Flow-directed dictionary specialisation ("dictionary webs").**
+   Dictionaries are data in Core. Data webs say which dictionary values
+   reach each dictionary parameter. Where a parameter's class receives one
+   or a few known dictionaries, run constant specialisation with
+   dictionary keys, including on imported functions with unfoldings.
+   - **Bounded:** unlike -fspecialise-aggressively, it specialises only
+     where webs prove few keys.
+   - **Evidence:** dictionary calls are 21% of purs, 11% of skylighting and
+     10% of futhark. GHC's aggressive specialisation with all unfoldings
+     exposed gives skylighting −26% and alex −12.5% (webs alone: 0), at a
+     code and compile-time cost not yet measured on Hackage.
+   - **First step:** measure the aggressive settings on the large and
+     compilers groups (purs, futhark): gain, code size, compile time.
+4. **Specialising on constructed records of functions (constructor keys).**
+   Extend constant specialisation's keys to saturated constructor
+   applications whose fields are known functions or lambdas: futhark's
+   `ASTMapper m` (17% of its live heap, its traversals 6% of samples),
+   mtl-style records, skylighting's `MatchChar` predicates. Data splitting
+   gives each such record class its own type, so fields get their own
+   webs and per-class constant propagation turns `mapOnExp tv e` into a
+   known call. The record allocation disappears.
+5. **Package-level webs (web summaries in interface files).** Record, per
+   exported function, which parameter webs it only calls, never storing
+   or returning them, and which lambdas its unfoldings pass on. A caller
+   in another module of the same package can then keep its lambda's web
+   internal. Alternatively, compile a package's modules as one unit.
+   - **Evidence:** about 30 classes in skylighting's regex compiler are
+     exposed by attoparsec internals the continuations are passed to.
+     dhall's parser spans Combinators, Token and Expression; futhark's
+     ASTMapper spans modules.
+6. **A boundary split for data types (data worker/wrapper).** Exported
+   types with derived Show, Generic or NFData expose their data webs, so
+   data splitting never touches the hot types of large programs. Keep the
+   exported representation at the boundary, but give internal uses a
+   split copy with a better representation, converting at exported
+   functions as the function boundary split does:
+   - dead fields dropped (shellcheck's debug `literalValue`);
+   - enumeration fields packed into one word;
+   - nested single-constructor records flattened (VariableState in
+     VariableValue);
+   - fields unboxed.
+
+   Evidence: shellcheck has 839 MB live, 95% of it Map nodes and its own
+   two CFG types, with GC at 50% of instructions. koka's `Range` is 25% of
+   its heap; purs's source-position records are about 20% of its heap.
+7. **Thunk elimination from call and field webs.**
+   - **Problem:** live thunks are 13-29% of the heap of futhark, hledger,
+     cabal and purs; update frames are 3-8% of samples; and a lazily
+     computed function that is then applied costs 4-8% in purs,
+     skylighting and futhark.
+   - **Proposal:** use webs to find (a) data fields that every consumer
+     in their class forces, then make them strict (a greatest fixpoint
+     over data webs, the strictness dual applied to fields); and (b)
+     function-valued thunks that every consumer only calls, with cheap or
+     one-shot right-hand sides, then eta-expand them.
+   - **Also:** selector thunks (lazy StateT pairs) fall under (a).
+8. **Boot libraries with webs.** Boot code is 8-68% of instructions
+   (happy 68%: list and comparison code). cabal's parsers live in boot
+   packages (parsec, Cabal-syntax), as do transformers and containers. Build
+   the stage-2 libraries with the web pass; the GHC self-host shows the
+   compiler is robust enough. Needs a second build tree and Hackage
+   rebuilds (disk).
+
+#### Measured impact (2026-10-22; WEBS-EXPERIMENTS.md §34)
+
+Instructions against base (GHC -O2) on each program's benchmark run.
+
+Being implemented (large):
+- **3 (dictionary specialisation).** Measured with GHC's
+  -fspecialise-aggressively -fexpose-all-unfoldings: futhark −34.2%,
+  purs −33.7%, skylighting −26.0%, alex −12.5%, cabal −5.7%, koka −1.6%.
+  Webs add nothing on top (wagg22 −10.1% vs agg22 −10.4% on the small
+  group). The costs: code +10 to +39%; purs needs 8.8 GB to compile.
+  The webs version must keep the gain at a bounded cost.
+- **8 (boot libraries), with 3.** On happy, an oracle (a local `lookup`
+  specialised to Int) gives −42.3% (35.8G → 20.7G). base's `lookup` has
+  no unfolding, so -fexpose-all-unfoldings on the program cannot reach
+  it. Needs a second build tree with exposed boot-library unfoldings.
+- **6 (data representation).** By hand on shellcheck (VariableValue and
+  VariableState strict, enumerations and the nested record unpacked):
+  −9.0%, GC time −18%, allocation −5.1%. koka's `Range` unpacked: −0.3%,
+  peak residency −5%.
+
+Kept in the backlog (small), with what each is expected to give:
+- **1 (newtype splitting): at most 2-4% on skylighting, about 0
+  elsewhere.** After aggressive specialisation, 7.8% generic apply is
+  left in skylighting's Regex.KDE.Compile, behind attoparsec's N:Parser
+  among other causes. purs's StateT calls are specialised away by 3.
+- **2 (rules are code): about 0.2%.** -fcore-webs-drop-rules frees the
+  classes but gains little: dhall −4.22 → −4.34%, hledger −0.37 → −0.59%
+  (WEBS-CHUNKS.md §3.2l).
+- **4 (constructor keys): at most 1% on futhark.** After 3, futhark's
+  generic apply is 5.9% of samples. Only about 0.3-0.5% of that comes
+  from ASTMapper call sites (Monomorphise, Rename, Prop.Names). The record
+  allocation (17% of live heap) is the rest of the possible gain, which
+  would come through GC.
+- **5 (package-level webs): about 1%; dhall about 4%.** Whole-program
+  chunks gain from chunking itself (alex −11.5%); webs on top add about
+  nothing except dhall's −4.2% (WEBS-CHUNKS.md §3.2c, 3.2i).
+- **7 (thunk elimination): about 2% at most.** hledger with a strict
+  `Posting` changes nothing (allocation identical). shellcheck strict-only
+  gives −2.3%, which 6 subsumes. After 3, update frames are 3.4% of purs,
+  1.9% of futhark and 1.8% of cabal; that is the bound for part (b).
+
+Not proposals, for context:
+- Specialisation already removes most dictionary and CPS calls when
+  unfoldings are visible.
+- Webs' remaining opportunity is the exposed continuation and record webs
+  (1, 2, 4, 5) and data representation (6, 7).
+
 ## Core-to-Core: to implement
 
 - **Constant specialisation of recursive functions** (higher priority, the
@@ -566,9 +701,8 @@ webs as newtypes (the occurs check never fires on nofib).
   yet looked at: defunctionalisation of other webs, e.g. Goals'). So also:
   never defunctionalise a web whose lambdas are all wrapper eta lambdas.
 
-- **Improvements without defunctionalisation** (the user, 2026-10-10;
-  eventually, for the paper: a common reviewer criticism is that the gains
-  are just defunctionalisation). Measure `early-ulsl` without
+- **Improvements without defunctionalisation** (the user, 2026-10-10:
+  are the gains just defunctionalisation?). Measure `early-ulsl` without
   `-fcore-webs-defunc` against `base` and against `early-ulsl`, on nofib
   (instructions, time, allocation, top winners), and show which
   transformations carry the gains without it (per-transformation

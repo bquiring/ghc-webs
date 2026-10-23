@@ -175,12 +175,12 @@ to `compiler/`.
 - **Where:** `GHC/Stg/Lift.hs`, `GHC/Stg/Lift/` (`-fstg-lift-lams`).
 - **What:** turns local functions into top-level functions with their free
   variables as extra arguments, to avoid closure allocation.
-- **Web version — defunctionalisation.** The paper's headline example: for a
+- **Web version — defunctionalisation.** For a
   non-exposed web with a small, known set of lambdas, replace the function
   values by a data type with one constructor per lambda (holding its free
   variables), and every call by a case that dispatches to the lambda's body.
   This removes unknown calls entirely.
-- **Status:** not done. **High value** and well-supported by the paper, but
+- **Status:** not done. **High value**, but
   the largest of these to implement.
 
 ## 14. Newtypes and casts

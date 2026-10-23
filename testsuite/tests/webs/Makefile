@@ -228,3 +228,19 @@ constspec003:
 	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -fcore-webs-spec-lambdas -outputdir constspec003.l -v0 constspec003.hs -o constspec003l
 	grep -ho "^ *[A-Za-z]*_cs[0-9]*\|^Lifted: [A-Za-z]*_ll.*\|^Not specialised: .*" constspec003.l/*.dump-webs-spec | sed 's/^ *//; s/_ll_[A-Za-z0-9]*/_ll/' | sort
 	./constspec003l
+
+# constspec004: lifted lambdas inside lifted lambdas, all put back (no keys
+# allowed); the outer one's body gets the inner one's free top-level binder
+.PHONY: constspec004
+constspec004:
+	'$(TEST_HC)' $(TEST_HC_OPTS) $(CONSTSPEC_OPTS) -fcore-webs-spec-calls -fcore-webs-spec-lambdas -fcore-webs-spec-max-keys=0 -outputdir constspec004.l -v0 constspec004.hs -o constspec004l
+	grep -ho "^Lifted: [A-Za-z]*_ll.*" constspec004.l/*.dump-webs-spec | sed 's/_ll_[A-Za-z0-9]*/_ll/' | sort
+	./constspec004l
+
+# roundtrip001: Note [Occurrences after the round trip]; the web pass with
+# nothing transformed leaves the final Core unchanged
+.PHONY: roundtrip001
+roundtrip001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -c roundtrip001.hs -outputdir roundtrip001.b -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds > roundtrip001.base
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -fcore-webs-early -c roundtrip001.hs -outputdir roundtrip001.e -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds > roundtrip001.early
+	diff roundtrip001.base roundtrip001.early

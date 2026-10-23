@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( arityraise014.hs, arityraise014.o )
+
+==================== Webs: arity raising ====================
+raised (constructed arguments): n
+rejected (an unknown call would pass too many arguments): ds ds
+rejected (argument not a product): k
+rejected (curried: may be partially applied): i i
+rejected (exposed): s
+
+
+[2 of 2] Linking arityraise014

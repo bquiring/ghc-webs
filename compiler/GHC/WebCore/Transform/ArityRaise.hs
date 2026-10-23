@@ -58,6 +58,21 @@ cannot help; a web whose calls are all known is left to worker/wrapper.
 spectral/mate.)
 -}
 
+{- Note [Arguments of unknown calls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An unknown call goes through GHC's generic apply (stg_ap_*), which has fast
+paths for spines of a few arguments only.  Raising a web adds the product's
+components to every call spine through it, n - 1 + k arguments for a
+k-field product: nofib real/hpg's continuation nc, called with x and an
+8-field Env, became a 9-argument unknown call to lambdas of arity 2, and
+went through the slow path a million times (WEBS-BUGS.md, boundary split).
+With -fcore-webs-raise-max-args=N (default 0: no bound), a web with an
+unknown call is not raised if some unknown call spine through it would then
+pass more than N value arguments.  The analysis records, per web, the
+longest unknown spine through it (i_spine): every application in the spine
+notes the spine below it, so the outermost one, the whole spine, wins.
+-}
+
 {- Note [Arity raising]
 ~~~~~~~~~~~~~~~~~~~~~~~
 A web w whose arrows all take a product (a single-constructor data type
@@ -234,7 +249,7 @@ raising]).
 data Verdict = Raised | RaisedConstructed | Rejected Reason
 
 data Reason = Exposed | NotProduct | Lazy | Curried | RepPoly | Coercion' | CoVarParam
-            | KnownCalls | BoxNeeded | Recursive
+            | KnownCalls | BoxNeeded | Recursive | TooManyArgs
 
 instance Outputable Verdict where
   ppr Raised       = text "raised"
@@ -252,6 +267,7 @@ instance Outputable Reason where
   ppr KnownCalls = text "only known calls (early: left to worker/wrapper)"
   ppr BoxNeeded  = text "the product is used boxed"
   ppr Recursive  = text "a component mentions a raised web"
+  ppr TooManyArgs = text "an unknown call would pass too many arguments"
 
 -- | The product types we raise: boxed, single-constructor data types without
 -- existentials or constraints, that are not classes
@@ -301,10 +317,13 @@ data Info = Info
   , i_unknown   :: !Bool    -- Some call of the web is not a known call
   , i_boxed     :: !Bool    -- Some lambda needs its parameter boxed
   , i_noncon    :: !Bool    -- Some call's argument is not a value
-  , i_comp_webs :: !WebSet } -- The webs in the product's components
+  , i_comp_webs :: !WebSet   -- The webs in the product's components
+  , i_spine     :: !Int }    -- The most value arguments an unknown call
+                             -- spine through the web passes
+                             -- (Note [Arguments of unknown calls])
 
 noInfo :: Info
-noInfo = Info [] False False False False [] False False False False False emptyUniqSet
+noInfo = Info [] False False False False [] False False False False False emptyUniqSet 0
 
 plusInfo :: Info -> Info -> Info
 plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
@@ -318,7 +337,8 @@ plusInfo a b = Info { i_lams     = i_lams a ++ i_lams b
                     , i_unknown  = i_unknown a  || i_unknown b
                     , i_boxed    = i_boxed a    || i_boxed b
                     , i_noncon   = i_noncon a   || i_noncon b
-                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b }
+                    , i_comp_webs = i_comp_webs a `unionUniqSets` i_comp_webs b
+                    , i_spine    = max (i_spine a) (i_spine b) }
 
   where
     -- the first, and a different one if any (all that the verdict reads)
@@ -374,6 +394,21 @@ analyse evald fields saturated binds = foldr go_bind emptyUFM binds
                        , i_covar   = isCoVar p
                        , i_boxed   = not (onlyScrutinised p e) }) acc
 
+    -- Note [Arguments of unknown calls]: every web of an unknown call's
+    -- spine, with the spine's number of value arguments.  The spine's
+    -- inner applications note shorter spines; plusInfo keeps the longest.
+    note_spine e acc
+      | (hd, ws) <- spine e [], not (knownHead hd)
+      = foldr (\w -> note w (noInfo { i_spine = length ws })) acc ws
+      | otherwise = acc
+    spine (WebApp w f _) ws    = spine f (w : ws)
+    spine (App f a) ws
+      | isTypeArg a            = spine f ws
+      | otherwise              = spine f (placeholderWeb : ws)
+    spine (Cast f _) ws        = spine f ws
+    spine (Tick _ f) ws        = spine f ws
+    spine hd ws                = (hd, ws)
+
     is_lam (Tick _ e)     = is_lam e
     is_lam (Lam {})       = True
     is_lam (WebLam {})    = True
@@ -384,8 +419,9 @@ analyse evald fields saturated binds = foldr go_bind emptyUFM binds
     go (Lit {}) acc = acc
     go (App f (Type t)) acc = go f (go_ty t acc)
     go (App f a) acc = go f (go a acc)
-    go (WebApp w f a) acc
-      = note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (is_value a) })
+    go e@(WebApp w f a) acc
+      = note_spine e $
+        note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (is_value a) })
              (go f (go a acc))
     go (Lam b e) acc = go_bndr b (go e acc)
     go (WebLam w p e) acc = go_lam True w p e (go e acc)
@@ -488,8 +524,8 @@ splitArgCo co = case co of
          -> Just (tc, zipWith mkReflCo (tyConRoleListX r tc) args)
   _ -> Nothing
 
-verdict :: Bool -> WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict early exposed complex w i
+verdict :: Bool -> Int -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict early max_args exposed complex w i
   | w `elementOfUniqSet` exposed = Rejected Exposed
   | early, not (i_unknown i)     = Rejected KnownCalls   -- Note [Early arity raising]
   | i_covar i                    = Rejected CoVarParam
@@ -498,6 +534,7 @@ verdict early exposed complex w i
   | i_not_prod i                 = Rejected NotProduct
   | not (same_tycon (i_tycons i)) = Rejected NotProduct
   | i_rep_poly i                 = Rejected RepPoly
+  | too_many                     = Rejected TooManyArgs
   | i_lazy i || i_curried i || i_boxed i
   , constructed                  = RaisedConstructed
   | i_lazy i                     = Rejected Lazy
@@ -507,6 +544,10 @@ verdict early exposed complex w i
   where
     same_tycon (tc:tcs) = all (== tc) tcs
     same_tycon []       = False
+    -- Note [Arguments of unknown calls]
+    too_many = max_args > 0 && i_unknown i
+               && i_spine i - 1 + sum (map comps (take 1 (i_tycons i))) > max_args
+    comps tc = maybe 1 dataConRepArity (tyConSingleDataCon_maybe tc)
     -- Every call passes a value, and the constructor's fields are lazy
     constructed = not (i_noncon i) && all lazy_fields (take 1 (i_tycons i))
     lazy_fields tc = case tyConSingleDataCon_maybe tc of
@@ -523,6 +564,9 @@ verdict early exposed complex w i
 -- loses its product arrows, so one round is enough; webs in 'done' have
 -- already been raised and are not considered again.
 arityRaiseRound :: Bool        -- ^ Note [Evaluated arguments]
+                -> Int         -- ^ At most this many arguments at an unknown
+                               --   call, 0 for no bound (Note [Arguments of
+                               --   unknown calls])
                 -> FieldTys    -- ^ Components' types (Note [Signatures follow
                                --   the transformations] in GHC.WebCore.HiddenFields)
                 -> WebSet      -- ^ Webs never partially applied (components' arrows)
@@ -533,7 +577,7 @@ arityRaiseRound :: Bool        -- ^ Note [Evaluated arguments]
                 -> CoreProgram
                 -> ( Maybe (CoreProgram, WebSet, Type -> Type, WebSet)
                    , [(WebId, SDoc, Bool, [Id])] )
-arityRaiseRound evald fields saturated us exposed pol done binds
+arityRaiseRound evald max_args fields saturated us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = ( Just ( initUs_ us1 (rewriteProgram fields todo inner pol binds), todo
                                  , raiseType fields todo inner
@@ -542,7 +586,7 @@ arityRaiseRound evald fields saturated us exposed pol done binds
   where
     infos   = analyse evald fields saturated binds
     complex = complexCoWebs binds
-    verdicts0 = [ (w, verdict (up_early pol) exposed complex w i, i)
+    verdicts0 = [ (w, verdict (up_early pol) max_args exposed complex w i, i)
                 | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                 , let w = mkWebId u
                 , not (null (i_lams i))

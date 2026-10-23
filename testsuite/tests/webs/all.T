@@ -71,8 +71,11 @@ def arityraise_test(name):
     test(name + '_dump', [extra_files([name + '.hs'])],
          multimod_compile, [name, ar_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
 
-for n in range(1, 14):
+for n in range(1, 15):
     arityraise_test('arityraise%03d' % n)
+# Note [Arguments of unknown calls]: the same program, bounded
+test('arityraise014_max', [extra_files(['arityraise014.hs'])], multimod_compile,
+     ['arityraise014', ar_opts + ' -fcore-webs-raise-max-args=6 -ddump-webs-arity-raise -dsuppress-uniques'])
 
 # All the transformations together
 test('alltransforms001', [], compile_and_run,
@@ -641,7 +644,16 @@ test('constspec002', [extra_files(['constspec002.hs'])], makefile_test, ['consts
 # constspec003: partial applications and lambdas as keys (Note [Specialising
 # on lambdas] in GHC.WebCore.Transform.ConstSpec)
 test('constspec003', [extra_files(['constspec003.hs'])], makefile_test, ['constspec003'])
+# constspec004: nested lifted lambdas put back (WEBS-BUGS.md, QuickCheck)
+test('constspec004', [extra_files(['constspec004.hs'])], makefile_test, ['constspec004'])
 # splitclass001: a class split in a chunk (Note [Splitting classes] in
 # GHC.WebCore.DataSplit)
 test('splitclass001', [extra_files(['splitclass001.hs', 'SplitClass001A.hs'])],
      makefile_test, ['splitclass001'])
+
+# roundtrip001: the round trip changes no IdInfo the later passes read
+# (Note [Occurrences after the round trip] in GHC.WebCore.Erase)
+test('roundtrip001', [extra_files(['roundtrip001.hs'])], makefile_test, ['roundtrip001'])
+# roundtrip002: a unique bound twice in one binding is not restored (happy's
+# Mangler; WEBS-BUGS.md)
+test('roundtrip002', [], compile_and_run, ['-O2 -fcore-webs-early -dcore-lint'])

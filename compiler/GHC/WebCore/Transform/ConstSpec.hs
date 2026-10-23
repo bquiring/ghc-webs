@@ -85,7 +85,7 @@ positions where y_i is a known function -- a top-level or imported g,
 applied to types only -- make a key: the type arguments ts, and g with its
 type arguments per position.  The free type variables of a key (the
 caller's own, often) are abstracted: a key is a template, and a call uses
-a key's copy if it matches the key (tcMatchTys).  At most specMaxKeys keys
+a key's copy if it matches the key (tcMatchTys).  At most so_max_keys keys
 per function.  A variable that a local binder in scope shadows (Note
 [Constants and shadowing] in GHC.WebCore.Transform.ConstProp) is neither
 a known function nor a call of f.
@@ -118,11 +118,9 @@ data SpecOpts = SpecOpts
   , so_rounds :: Int              -- ^ Rounds of key collection
   , so_lams   :: Bool             -- ^ Keys may be partial applications and lambdas,
                                   --   and candidates non-recursive: Note [Specialising on lambdas]
+  , so_max_keys :: Int            -- ^ At most this many copies per function
+                                  --   (-fcore-webs-spec-max-keys, default 4)
   }
-
--- | At most this many copies per function
-specMaxKeys :: Int
-specMaxKeys = 4
 
 -- | A web class admits its lambdas as keys if it has at most this many
 specMaxClass :: Int
@@ -483,14 +481,14 @@ constSpecProgram opts us_all binds_in
         -- The copies' right-hand sides, with every call redirected
         copies' = [ Rec [(sp_id s, redirect specs' (copyRhs c (sp_key s)))] | (s, c) <- reverse copies ]
 
-    -- New keys, in order, with a unique each, and at most specMaxKeys per
+    -- New keys, in order, with a unique each, and at most so_max_keys per
     -- function in all
     newKeys tops arity us specs binds = go (listSplitUniqSupply us) specs (calls tops arity binds)
       where
         go _ _ [] = []
         go uss env ((c, key) : rest)
           | any (\s -> sameKey (sp_key s) key) old = go uss env rest
-          | length old >= specMaxKeys = go uss env rest
+          | length old >= so_max_keys opts = go uss env rest
           | u1 : u2 : uss' <- uss
           , Just k <- mkKey u1 key
           = (c, k, uniqFromSupply u2) : go uss' (extendVarEnv_C (flip (++)) env (c_fun c) [Spec k (c_fun c)]) rest
@@ -786,9 +784,13 @@ unliftProgram keyed lifted binds
             go_n k acc (Lam b r)  = go_n (k - 1) (b : acc) r
             go_n _ acc r          = (reverse acc, r)
 
-    beta bs args body = substExpr subst (go body)
+    -- The in-scope set comes from the body with the inner lifted functions
+    -- already put back: their right-hand sides bring free variables (other
+    -- top-level binders) that the original body did not mention
+    beta bs args body = substExpr subst body'
       where
-        in_scope = mkInScopeSet (exprsFreeVars args `unionVarSet` exprFreeVars (mkLams bs body))
+        body'    = go body
+        in_scope = mkInScopeSet (exprsFreeVars args `unionVarSet` exprFreeVars (mkLams bs body'))
         subst = foldl add (mkEmptySubst in_scope) (zip bs args)
         add sb (b, Type t) | isTyVar b = extendTvSubst sb b t
         add sb (b, a)                  = extendIdSubst sb b a

@@ -48,7 +48,7 @@ function's last value argument. `(# #) -> B` is still an ordinary lifted
 function type, so it can be passed to polymorphic code.
 
 Every arrow, lambda and call in the web changes the same way, so the program
-stays well-typed. The paper's argument applies directly: a web is exactly the
+stays well-typed: a web is exactly the
 set of places that have to agree on a calling convention. Re-running Web Lint
 after the rewrite checks well-typedness mechanically.
 
@@ -296,5 +296,5 @@ failures, changed output, and changes in allocation or residency (§2d).
    the body is not cheap (`exprIsCheap`)? Then the shared thunk can't hold much more than the
    lambda did, at the cost of fewer transformations.
 3. **Partial deadness.** A web where only *some* lambdas ignore their
-   parameter could be handled by splitting the web, as the paper's later
-   transformations do. That is out of scope for this pass.
+   parameter could be handled by splitting the web, as data splitting
+   does. That is out of scope for this pass.

@@ -1061,6 +1061,289 @@ Without defunctionalisation, spec-lambdas now beats it on the geomean.
 Worst against base: hpg +5.7% (the 9-argument unknown call to `nc`,
 WEBS-BUGS.md Open) and event +5.3% (GC scheduling, §23).
 
+## 26. The final configuration; compile time (2026-10-22)
+
+`run-paper-a.sh`. Against base, timing over 108 benchmarks
+(`timing-paper-a.md`), allocation over 111 (`mem-report.py paper-a`):
+
+| config | instructions | cycles | time | allocation |
+|---|---|---|---|---|
+| early-ulsl8-scl (spec-calls + spec-lambdas, no defunc) | −4.61% | −4.59% | −4.86% | −4.40% |
+| + `-fcore-webs-raise-through-calls -fcore-webs-evald-args` (sclm) | −4.61% | −4.56% | −4.75% | −4.40% |
+| + defunc as well (sclmd) | −4.44% | −4.53% | −4.59% | −4.42% |
+
+* The §22 flags add nothing once lambdas are specialised (integrate is
+  already −77%).
+* Defunctionalisation on top costs: solid −31% → −23%, ida −10.6% →
+  −2.4%. Defunc runs before constant specialisation and turns the static
+  function parameters into constructors, which SpecConstr then
+  specialises with a dispatch per call. early-ulsl8-scl stays the final
+  configuration.
+* eliza: −3.16% instructions but +4.5% cycles in all three (to look at).
+
+Compile time (A2: `ct-base`, `ct-scl`, serial builds, no Lint, no dumps,
+the -O1 stage-2 compiler; `ct-report.py`, `results/compiletime-paper-a.md`),
+117 benchmarks, 469 module compilations:
+
+| | base | scl | total | geomean per benchmark |
+|---|---|---|---|---|
+| compile time (MUT+GC) | 94.6 s | 112.9 s | +19.4% | +15.1% |
+| compiler allocation | 125.2 GB | 154.2 GB | +23.1% | +18.0% |
+| peak residency (summed over benchmarks) | 2.19 GB | 2.42 GB | +10.8% | +8.6% |
+
+Worst: parstof +67% time, rewrite +52%, simple +48%.
+
+## 27. Ablation and inlining thresholds (2026-10-22)
+
+`run-paper-b.sh`. Leave-one-out from early-ulsl8-scl (instructions vs
+base, geomean over 108; programs changing by ≥2% against scl):
+
+| without | instructions | programs |
+|---|---|---|
+| (scl) | −4.61% | |
+| super-beta inlining | −4.49% | constraints +14.7 |
+| const prop | −4.61% | |
+| arity raising | −4.62% | wave4main +4.6; hpg −5.4 |
+| result raising | −4.54% | CS +5.6, mate +2.9 |
+| strictness | −4.58% | ansi +4.1 |
+| data split/unbox/again | −2.85% | integer +143, queens +25, linear +14, cryptarithm2 +13, puzzle +7.7, comp_lab_zift +7.7, treejoin +5.9, ... |
+| boundary split | −4.51% | constraints +16.4; hpg −5.4 |
+| useless | −4.60% | none: data splitting's dead fields (data-again) also give paraffins its 46% (checked by hand: 8.51G → 4.55G with either) |
+| spec-calls + spec-lambdas | −2.71% | integrate +332, solid +35, ida +12, genfft +7.3, simple +4.8, ...; event −6.1 |
+
+hpg's regression is arity raising together with the boundary split
+(either off: −5.4%).
+
+Inlining threshold (`-funfolding-use-threshold`, default 90), 105
+benchmarks, instructions against base at the default; text geomean over 115:
+
+| threshold | base | scl | base text | scl text | scl vs base, same threshold |
+|---|---|---|---|---|---|
+| 90 | | −4.67% | | +1.3% | −4.67% |
+| 45 | +1.36% | −2.97% | −11.4% | −10.6% | −4.27% |
+| 20 | +3.24% | −1.10% | −14.9% | −14.2% | −4.20% |
+| 5 | +7.17% | +2.85% | −18.7% | −18.0% | −4.03% |
+
+The webs' gain barely depends on inlining; scl at 20 beats default base
+with 14% less code. Compiler allocation of the web pass is +20% at every
+threshold (parallel builds with Lint); lower thresholds save base 6–11%
+compile time.
+
+Program memory (`mem-report.py paper-b-abl1`): allocation −4.40%, max
+residency −4.06% (paraffins −86%; fft2 135 KB → 389 KB), memory in use
+−0.86%.
+
+## 28. Two opt-in bounds: spec-max-keys and raise-max-args (2026-10-22)
+
+New flags (defaults unchanged: 4 keys, no bound):
+`-fcore-webs-spec-max-keys=N` (Note [Constant specialisation]) and
+`-fcore-webs-raise-max-args=N` (Note [Arguments of unknown calls] in
+GHC.WebCore.Transform.ArityRaise; test arityraise014/_max). Compiler
+rebuilt; 729 + 3 webs tests pass. `run-paper-d.sh`, instructions against
+base (108), changes ≥0.5% against early-ulsl8-scl:
+
+| config | instructions | changes |
+|---|---|---|
+| scl2 (control, rebuilt compiler) | −4.61% | none |
+| scl-k8 (8 keys) | −4.69% | mate −6.8, multiplier −1.0 |
+| scl-a6 (≤6 arguments) | −4.66% | hpg −5.4 |
+| scl-k8a6 | −4.74% | mate −6.8, hpg −5.4, multiplier −1.0 |
+
+Both are candidates for defaults (the user to decide).
+
+## 29. SML translations with the full configuration (2026-10-22)
+
+~/projects/webs-hackage-bench/sml (`sml/run-paper-c.sh`, results
+`sml/results/timing-paper22.md`): 54 programs, base22 vs webs22
+(= early-ulsl8-scl's flags, -dcore-webs-lint) vs tuned22 (+ spec-max-keys
+8, raise-max-args 6), the compiler of 2026-10-22, 3 rounds. Instructions:
+
+| group | n | webs22 | tuned22 | better/worse (≥0.5%) |
+|---|---|---|---|---|
+| higher-order | 18 | −25.6% | −26.0% | 15/1 |
+| classic (llvm-sml) | 21 | −6.3% | −7.8% | 12/3 |
+| MLton + OCaml | 15 | −3.1% | −3.1% | 9/2 |
+| all | 54 | −12.4% | −13.1% | 36/6 |
+
+Against §19 (early-ulsl, before constant specialisation): cpstak +82% →
++17%, tree-fold-ho +32% → +1%, twenty-four +12.6% → −7.6%, parser-comb
++5.5% → −23% (tuned −44%). Worst now: cpstak +17%, json-decode +2.4%
+(allocation +54%).
+
+## 30. Occurrences after the round trip; stronger GHC baselines (2026-10-22)
+
+cpstak's +17% (SML suite) was the round trip, not a transformation:
+occurrences came back carrying their binders' newest IdInfo (WEBS-BUGS.md;
+Note [Occurrences after the round trip]). With the fix, nofib changes by
+less than 0.5% on every program (experiment E), cpstak = base, test
+roundtrip001.
+
+`run-paper-h.sh` (final compiler, all builds with -dcore-lint, no Lint
+errors), instructions against base over 109 benchmarks; text geomean over
+115:
+
+| config | instructions | time | text |
+|---|---|---|---|
+| occ3 (full configuration) | −4.62% | −4.56% | +2.4% |
+| agg (-fspecialise-aggressively -fexpose-all-unfoldings -fspec-constr-count=6 -fspec-constr-threshold=4000) | −2.97% | −3.48% | +5.8% |
+| inl180 (-funfolding-use-threshold=180) | −2.00% | −1.77% | +23.6% |
+| occ-agg3 (webs + agg) | −7.44% | −8.01% | +8.1% |
+
+webs over agg −1.65%, over inl180 −2.60%; webs on top of agg −4.49% vs agg.
+agg's own outliers: CSD −97%, scs −45%, knights −33%, VSM +535%.
+
+The earlier "+1.3% text" for early-ulsl8-scl was distorted by gg's broken
+build in that run (−75% text); the real figure is +2.4%.
+
+SML suite with the final compiler (`sml/results/timing-paper23.md`):
+higher-order −25.6%, classic −7.0%, MLton/OCaml −3.0%, all −12.6%
+(tuned −13.3%); cpstak 0.0%; worst json-decode +2.4%.
+
+## 31. Attribution, SAT, by suite; release compile time (2026-10-22)
+
+What webs contribute beyond constant specialisation, and GHC's static
+argument transformation as a baseline. `run-paper-i.sh` (builds),
+`run-paper-j.sh` (timing, `timing-paper-j.md`), `suite-report.py`.
+Instructions against base, 109 benchmarks (107 without atom and CSD):
+
+| config | instructions | without atom, CSD | allocation | text (geomean) |
+|---|---|---|---|---|
+| occ3 (full configuration) | −4.62% | −4.71% | −4.47% | +2.43% |
+| spec (spec-calls + spec-lambdas only, no web transformation) | −1.99% | −2.03% | −2.37% | +3.54% |
+| sat (base + `-fstatic-argument-transformation`) | −8.08% | −0.76% | −13.9% | +1.31% |
+| occ-sat | −12.00% | −5.06% | −17.1% | +3.63% |
+
+* Constant specialisation alone (which runs after erasure and uses no
+  webs) gets integrate −76.5%, solid −26.2%, ida −15.4%, typecheck
+  −6.8%. The web transformations without specialisation (nod, §23) are
+  −2.68%; the two compose: 0.973 × 0.980 = 0.954.
+* SAT: atom −99.3% (allocation 3.6 GB → 18 MB, output identical and
+  matching atom.stdout) and CSD −99.0% (also under agg) dominate; it
+  hoists the benchmark's repeated work. Otherwise only solid −27.8%,
+  cichelli −21.6%. Webs add 4.3% on top of SAT.
+* **GHC's SAT fails Core Lint in this snapshot** (37 errors on nofib,
+  "Mismatch in type between binder and occurrence"): `saTransform` clones
+  the static type binders (`setVarUnique`) without substituting the
+  clones into the later binders' types, so the shadow binding's type
+  mentions the old type variables. Upstream code (our only change to
+  StaticArgs.hs is the WebLam/WebApp panics). Stock GHC 9.10.3 fails the
+  same way on `webs-bench/sat-lint-repro.hs` (six lines: two static value
+  arguments and a dictionary), though not on bernouilli. Not yet reported
+  upstream (the user's call). The SAT configurations are built without
+  -dcore-lint; every output is checked.
+* By suite (occ3): imaginary −14.3% (15), spectral −4.5% (56), real
+  −0.8% (33; 7 better, 1 worse), shootout 0 (5).
+* Static unknown calls after -O2 (first-class stats, 115 benchmarks):
+  base 1,393, sat 1,339, spec 1,319, occ3 1,255, occ-sat 1,262.
+
+Release compiler (`_build-rel`: perf flavour, no assertions,
+`hadrian/build --build-root=_build-rel
+--flavour=perf+no_profiled_libs+no_dynamic_libs+no_dynamic_ghc`; unlit
+copied from `_build`, since only `stage2:exe:ghc-bin` was built),
+`run-paper-j2.sh`, `compiletime-paper-j.md`: base 86.1 s, full configuration 103.2 s: **+19.8%** (geomean +14.5%); allocation +25.0%, peak residency +11.5%; parstof +82%. Same ratio as the assertion-enabled compiler (+19.4%, §26): the cost is the pass, not debugging code. Base itself is 9% faster than with the development compiler.
+
+Follow-up runs (`run-paper-k.sh`, `run-paper-l.sh`; the k script was
+stopped after its nofib timing to fix the restoreOccurrences bug found by
+spec22, WEBS-BUGS.md):
+* nod with the current compiler: −2.68% instructions, −2.93% time
+  (timing-paper-k.md, together with occ3, spec, sat and occ-sat; times:
+  −4.45%, −1.86%, −8.88%, −12.95%).
+* occ4 (full configuration, fixed compiler) against occ3: no benchmark
+  moves by 0.5% (timing-paper-l.md; both −4.62%).
+* Hackage small group (timing-paper24.md, 5 rounds): webs22 −0.02%,
+  spec22 (constant specialisation alone) −0.05% instructions.
+* Bootstrap 95% intervals: SML independent group −3.0% [−6.3, −0.7];
+  nofib real −0.81% [−1.8, 0.0]; spectral −4.49% [−8.1, −1.9].
+* Release compile time with -ddump-timings (ct-rel-tim): the web pass is
+  16.4 s of the 17.1 s difference; data splitting 44% of it, useless
+  elimination 17%, strictness 8%, other transformations 13%, annotation +
+  one inference + erasure 19%. Web Lint after each round runs only with
+  -dcore-lint.
+
+## 32. Where the Hackage programs spend their time (2026-10-22)
+
+`~/projects/webs-hackage-bench/profile.py` (run-profile.sh): perf record
+every 1,000,003 user instructions, 5 runs per configuration, addresses
+resolved with nm. Each sample is attributed to the program's own packages,
+its non-boot dependencies (both built with the flags), boot packages (no
+webs), rts/sm (GC), stg_* (generic apply, update frames), other RTS C, or
+C libraries. Configurations: small group base22 vs webs22 (final); large
+and compilers groups base vs ulsl2 (earlier, no constant specialisation).
+Reports: results/profile-small.md, large/results/profile-large.md,
+compilers/results/profile-compilers.md.
+
+| program | own | GC | stg_* | boot | own code change | total change |
+|---|---|---|---|---|---|---|
+| happy | 17% | 7% | 8% | 68% | −0.4% | −0.10% |
+| alex | 25% | 37% | 8% | 30% | −1.3% | −0.39% |
+| cpphs | 43% | 4% | 11% | 43% | −1.7% | +0.62% |
+| skylighting | 40% | 4% | 36% | 8% | −0.5% | −0.18% |
+| shellcheck | 19% | 50% | 10% | 21% | +0.2% | −7.72% |
+| hledger | 24% | 39% | 13% | 14% | +2.5% | +0.94% |
+| dhall | 30% | 15% | 25% | 16% | −5.2% | −0.26% |
+| cabal | 3% | 43% | 18% | 19% | +2.4% | −0.04% |
+| futhark | 20% | 39% | 26% | 11% | +1.3% | −0.05% |
+| purs | 13% | 32% | 43% | 8% | +1.6% | +0.10% |
+| koka | 46% | 23% | 11% | 19% | +0.6% | −0.06% |
+
+* Own code: no consistent improvement (−5.2% to +2.5%).
+* shellcheck's −7.7% (ulsl2; the older ulsl run had −0.35%): all GC, one fewer major collection (16 → 15),
+  deterministic; own code +0.2%.
+* The earlier alex profile (36% GC, 22% boot, 10% own) was
+  wrong (throttled/unresolved); now 37% / 30% / 25%.
+* Generic application (stg_ap_*, stg_PAP_apply) is large in purs (43% stg),
+  skylighting (36%), futhark (26%), dhall (25%): unknown calls that
+  survive. Not yet traced to call sites (which module, exposed or not).
+
+## 33. Why webs do not win on the Hackage programs (2026-10-23)
+
+Tools in ~/projects/webs-hackage-bench: `trace-apply.py` (perf record -b:
+each sample in stg_ap_*/stg_PAP_apply traced through the last-branch
+record to the branch that entered it, and further back to the first own or
+deps code), `apply-patterns.py` (call sites by pattern), heap profiles
+(-hT, closure types).
+
+Generic application, % of all instructions (webs builds), and its call
+sites by pattern:
+
+| program | apply | dictionary selectors + instance methods | CPS parser combinators | thunk result applied | own code (other) |
+|---|---|---|---|---|---|
+| purs | 33.8% | 21.4 | 0 | 8.1 | 2.4 |
+| skylighting | 28.1% | 11.0 | 6.0 | 5.9 | 2.0 |
+| dhall | 17.2% | 0.4 | 9.8 | 0.6 | 0.2 |
+| futhark | 16.7% | 9.9 | 0 | 4.0 | 1.6 |
+| cabal | 12.2% | 3.1 | 5.2 | 2.2 | 0 |
+| shellcheck | 7.2% | 4.4 | 0.6 | 0.9 | 0.5 |
+| others | 1.5-5.4% | | | | |
+
+Unknown calls of the kind webs handle (own code, inside a module) are at
+most 2.4% of any program. Origins: purs Make.Monad and Control.Monad.Supply
+(SupplyT over lazy StateT, derived instances), futhark
+Language.Futhark.Traversals (ASTMapper record of functions + Monad m),
+skylighting attoparsec's CPS Parser, dhall megaparsec, cabal parsec and
+Cabal-syntax (boot).
+
+GHC's -fspecialise-aggressively -fexpose-all-unfoldings (+ SpecConstr
+count 6, threshold 4000) on the small group (`run-agg.sh`,
+timing-agg22.md; instructions vs base22): skylighting −26.0%, alex −12.5%,
+geomean −10.4%; with webs too (wagg22) −10.1%: webs add nothing.
+skylighting's generic application falls 28% → 11%; what remains is in
+Regex.KDE.Compile (9%): specialised attoparsec parsers whose continuation
+webs are exposed: in that module 72 of 445 lambda classes are exposed, by
+imported attoparsec internals the continuations are passed to (≈30), the
+newtype axiom N:Parser (14, 5 only by it) and binders free in the
+specialiser's own RULES (18).
+
+Heap (-hT, average live): shellcheck 839 MB (Map nodes 45%, CFGAnalysis
+VariableValue 29%, VariableState 21%; VariableValue has a debug field
+`literalValue :: Maybe String` marked "remove me"); futhark 20 MB
+(ASTMapper records 17%, thunks 29%, FUN 14%); hledger 149 MB (thunks 25%,
+Posting 14%); purs 114 MB (THUNK_2_0 13%, SourcePos/TokenAnn/SourceRange
+~20%); koka 38 MB (lists 38%, Range 25%); cabal 75 MB (lists 22%, thunks
+24% incl. selector thunks).
+
+Proposals: WEBS-BACKLOG.md, "Proposals from the Hackage profiles".
+
 ## Findings along the way
 
 Running nofib found three performance bugs and one design constraint. Each
@@ -1087,3 +1370,30 @@ The remaining outliers are `wave4main` +13.8% and `dom-lt` +11.6%, against
 ## Next steps
 
 See `WEBS-BACKLOG.md`, which collects what to implement and what to test.
+
+## 34. Measuring the proposals from the Hackage profiles (2026-10-23)
+
+The eight proposals are in WEBS-BACKLOG.md ("Proposals from the Hackage
+profiles"). All figures are instructions against base (GHC -O2) on each
+program's benchmark run, the median of 3 rounds.
+
+| proposal | experiment | result |
+|---|---|---|
+| 3 dictionary specialisation | agg: -fspecialise-aggressively -fexpose-all-unfoldings (hb `run-agg.sh`, `run-p3.sh`, `run-p3b.sh`) | futhark −34.2%, purs −33.7%, skylighting −26.0%, alex −12.5%, cabal −5.7%, koka −1.6%; small-group geomean −10.4%, compilers −20.3% |
+| 3 | wagg22: webs on top of agg | −10.1% (agg22 −10.4%): webs add nothing |
+| 3 cost | text size; compiling purs | futhark +39%, cabal +19%, koka +10%; purs runs out of memory at 8 GB, max RSS 8.8 GB with `BENCH_JOBS=1` |
+| 8 + 3 | happy with a local `lookup` specialised to Int (`happy-lib-2.1.3-v`) | −42.3% (35.78G → 20.66G), same output; base's `lookup` has no unfolding |
+| 6 | shellcheck v2: VariableValue and VariableState strict, enumerations and `variableValue` unpacked | −9.0%, allocation −5.1%, max RSS −5.3%, GC 8.2 → 6.7 s |
+| 6/7 | shellcheck v1: strict fields only | −2.3%, allocation −3.1% |
+| 6 | koka v2: `Range` unpacked | −0.26%, max RSS −5%, GC −6% |
+| 7 | hledger: `Posting` fields strict | 0 (identical allocation) |
+
+Generic application after agg (`trace-apply.py agg`, `apply-patterns.py`):
+- cabal 10.3%: Cabal-syntax's and parsec's parsers, which are boot packages.
+- futhark 5.9%: update frames 1.9%; ASTMapper call sites only about 0.3-0.5%
+  (bounds proposal 4).
+- purs 15.0%: its specialised StateT stack in Command.Compile 5.5%; update
+  frames 3.4%.
+- koka 2.4%.
+
+Expected gains of the proposals not being built are in WEBS-BACKLOG.md.

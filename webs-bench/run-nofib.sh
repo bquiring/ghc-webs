@@ -48,6 +48,10 @@ cd "$ROOT/nofib"
 DIRS_ARG=()
 if [ -n "${NOFIB_DIRS:-}" ]; then DIRS_ARG=("NoFibSubDirs=$NOFIB_DIRS"); fi
 
+# WEBS_NO_DUMPS=1: no dump flags (compile-time measurements)
+DUMPOPTS="-ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats $VERDICTS"
+if [ -n "${WEBS_NO_DUMPS:-}" ]; then DUMPOPTS=""; fi
+
 echo "[$NAME] cleaning"
 make clean "${DIRS_ARG[@]}" > "$OUT/clean.log" 2>&1
 find . -type d -name "webs-dumps-*" -prune -exec rm -rf {} +
@@ -59,7 +63,7 @@ echo "[$NAME] build and run (options: $OPTS)"
 timeout --kill-after=60 "$CONFIG_TIMEOUT" \
 make -k -j"${NOFIB_JOBS:-1}" WithNofibHc="$GHC" mode="$MODE" NoFibRuns=1 "${DIRS_ARG[@]}" \
      RUNTEST="timeout --kill-after=2 $RUN_TIMEOUT $ROOT/nofib/runstdtest/runstdtest" \
-     EXTRA_HC_OPTS="$OPTS -ddump-to-file -dumpdir $DUMPDIR/ -ddump-first-class-stats -ddump-simpl-stats $VERDICTS" \
+     EXTRA_HC_OPTS="$OPTS $DUMPOPTS" \
      > "$OUT/nofib.log" 2>&1
 status=$?
 echo "[$NAME] make exit code: $status" | tee "$OUT/exit-code"
