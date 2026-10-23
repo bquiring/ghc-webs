@@ -33,6 +33,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -118,29 +119,71 @@ def machine_state():
     }
 
 
-def run_once(config, d, cmd, cpu, use_perf, timeout):
+def cachegrind_ok():
+    try:
+        return subprocess.run(['valgrind', '--version'], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def cachegrind_instructions(cg_dir, prog):
+    """The instructions (Ir) of the benchmark's own process: cachegrind
+    writes a file per process (runstdtest's perl, its shell, diff, ...),
+    each with the command line it ran, and only prog's count"""
+    total = None
+    for f in os.listdir(cg_dir):
+        if not f.startswith('cg.'):
+            continue
+        cmd = events = None
+        with open(os.path.join(cg_dir, f)) as h:
+            for line in h:
+                if line.startswith('cmd:'):
+                    cmd = line[4:].split()
+                elif line.startswith('events:'):
+                    events = line.split()[1:]
+                elif line.startswith('summary:') and cmd and events and os.path.basename(cmd[0]) == os.path.basename(prog):
+                    total = (total or 0) + int(line.split()[1 + events.index('Ir')])
+    return total
+
+
+def run_once(config, d, cmd, cpu, counter, timeout):
     """Run one benchmark of one configuration; returns a sample dict, or
-    {'error': ...}"""
+    {'error': ...}.  counter: 'perf', 'cachegrind' or None"""
     argv = shlex.split(cmd)
     # argv: runstdtest ./prog ...; run this configuration's copy of prog
     argv[0] = os.path.join(NOFIB, 'runstdtest', 'runstdtest')
     argv[1] = os.path.join(RESULTS, config, 'bin', d, os.path.basename(argv[1]))
     prefix = ['taskset', '-c', str(cpu)]
-    perf_out = None
-    if use_perf:
+    perf_out = cg_dir = None
+    if counter == 'perf':
         fd, perf_out = tempfile.mkstemp(suffix='.perf')
         os.close(fd)
         prefix += ['perf', 'stat', '-x,', '-o', perf_out, '-e', perf_events()]
+    elif counter == 'cachegrind':
+        # Instructions counted in software, exactly, where perf has no
+        # counters (WSL2).  Valgrind's messages go to log files, not to the
+        # stderr runstdtest compares
+        cg_dir = tempfile.mkdtemp(prefix='cg-')
+        prefix += ['valgrind', '--tool=cachegrind', '--cache-sim=no', '--trace-children=yes',
+                   '--cachegrind-out-file=%s/cg.%%p' % cg_dir, '--log-file=%s/log.%%p' % cg_dir]
     t0 = time.perf_counter()
     try:
         r = subprocess.run(prefix + argv, cwd=os.path.join(NOFIB, d),
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        if cg_dir:
+            shutil.rmtree(cg_dir, ignore_errors=True)
         return {'error': 'timeout'}
     wall = time.perf_counter() - t0
     out = r.stdout + r.stderr
+    ins = None
+    if cg_dir:
+        ins = cachegrind_instructions(cg_dir, argv[1])
+        shutil.rmtree(cg_dir, ignore_errors=True)
     if r.returncode != 0:
         return {'error': 'exit %d: %s' % (r.returncode, out[-300:])}
+    if cg_dir and ins is None:
+        return {'error': 'no cachegrind count for ' + argv[1]}
     m = GHC_TIMING.search(out)
     if not m:
         return {'error': 'no timing line: ' + out[-300:]}
@@ -151,6 +194,8 @@ def run_once(config, d, cmd, cpu, use_perf, timeout):
     if mr:
         s['maxres'] = int(mr.group(1))
         s['inuse'] = int(mr.group(2))
+    if ins is not None:
+        s['instructions'] = ins
     if perf_out:
         with open(perf_out) as f:
             for line in f:
@@ -185,7 +230,11 @@ def report(data, out):
       'if it is at least %.1f%% and every round\'s ratio is on the same side of 1; '
       '"~" marks one that does not.  Time is %s.\n' % (base, 100 * data['min_change'], metric))
     counters = [k for k in ('instructions', 'cycles') if k in data.get('counters', [])]
-    if counters:
+    if data.get('counter') == 'cachegrind':
+        w('Instructions are counted by cachegrind (the benchmark\'s own process, '
+          'exact).  The runs were instrumented, so their times are not the '
+          'programs\' times: read the instructions and allocation, not the time.\n')
+    elif counters:
         w('Instructions and cycles are user-space counts on the pinned performance '
           'core.  Instructions are nearly deterministic: changes of a fraction of a '
           'percent are real.\n')
@@ -300,6 +349,11 @@ def main():
                          'layout only (default 0.005)')
     ap.add_argument('--timeout', type=int, default=10,
                     help='per run, in seconds (the slowest baseline run, fannkuch-redux, takes 3.9s)')
+    ap.add_argument('--cachegrind', action='store_true',
+                    help='count instructions with cachegrind instead of perf (where perf has '
+                         'no counters, as in WSL2): exact, but the runs are 20-50x slower '
+                         '(the timeout is scaled by 60) and their times mean nothing; '
+                         'use with --bench')
     ap.add_argument('--report-only', action='store_true',
                     help='rewrite the report from the saved samples')
     a = ap.parse_args()
@@ -319,26 +373,31 @@ def main():
     dirs = sorted(set.intersection(*(set(r) for r in runs.values())))
     if a.bench:
         dirs = [d for d in dirs if any(b in d for b in a.bench)]
-    use_perf = perf_ok()
+    if a.cachegrind:
+        if not cachegrind_ok():
+            sys.exit('--cachegrind: valgrind is not installed (sudo apt install valgrind)')
+        counter, timeout = 'cachegrind', a.timeout * 60
+    else:
+        counter, timeout = ('perf' if perf_ok() else None), a.timeout
     # nofib's mode is fixed when run-nofib.sh writes the run commands
     mode = built_mode(a.configs[0])
     st = machine_state()
     cpus = [int(c) for c in a.cpus.split(',')] if a.cpus else [a.cpu]
-    print('%d benchmarks x %d configs x %d rounds (+1 warm-up); CPU %s; perf counters: %s'
+    print('%d benchmarks x %d configs x %d rounds (+1 warm-up); CPU %s; instructions: %s'
           % (len(dirs), len(a.configs), a.rounds, ','.join(map(str, cpus)),
-             'yes' if use_perf else 'no'))
+             counter or 'no'))
     print('machine: %s' % st)
     if st['governor'] != 'performance':
         print('note: governor is %s; "sudo cpupower frequency-set -g performance" reduces noise'
               % st['governor'])
-    if not use_perf:
+    if not counter:
         print('note: no perf counters; "sudo sysctl kernel.perf_event_paranoid=1" enables '
-              'instruction counts')
+              'instruction counts where the CPU exposes them; --cachegrind counts them in software')
 
     data = {'configs': a.configs, 'rounds': a.rounds, 'cpu': ','.join(map(str, cpus)), 'machine': st,
             'metric': a.metric, 'min_change': a.min_change, 'layout_ins': a.layout_ins,
-            'mode': mode,
-            'counters': ['instructions', 'cycles'] if use_perf else [],
+            'mode': mode, 'counter': counter,
+            'counters': {'perf': ['instructions', 'cycles'], 'cachegrind': ['instructions']}.get(counter, []),
             'samples': {d: {c: [] for c in a.configs} for d in dirs}, 'errors': {}}
     broken = set()
     t_start = time.time()
@@ -349,7 +408,7 @@ def main():
         got = []
         for c in order:
             _, _, cmd = runs[c][d]
-            s = run_once(c, d, cmd, cpu, use_perf, a.timeout)
+            s = run_once(c, d, cmd, cpu, counter, timeout)
             if 'error' in s:
                 return got, (c, s['error'])
             got.append((c, s))
