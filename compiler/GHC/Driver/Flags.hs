@@ -672,6 +672,7 @@ data GeneralFlag
    | Opt_CoreWebsDropRules    -- ^ The early run drops rules: Note [Dropping rules in a whole program]
    | Opt_CoreWebsRaiseThroughCalls -- ^ Result raising through tail calls: Note [Raising through tail calls]
    | Opt_CoreWebsEvaldArgs    -- ^ Arity raising: case binders are values: Note [Evaluated arguments]
+   | Opt_CoreWebsRaiseKnownLazy -- ^ Arity raising: lazy constructed parameters of known calls: Note [Lazy parameters of known functions]
    | Opt_CoreWebsSpecWebs     -- ^ Constant specialisation, keys from web classes: Note [Constant specialisation]
    | Opt_CoreWebsSpecCalls    -- ^ Constant specialisation, keys from call sites: Note [Constant specialisation]
    | Opt_CoreWebsSpecLambdas  -- ^ ... keys also partial applications and lambdas: Note [Specialising on lambdas]
@@ -982,6 +983,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CoreWebsDropRules
    , Opt_CoreWebsRaiseThroughCalls
    , Opt_CoreWebsEvaldArgs
+   , Opt_CoreWebsRaiseKnownLazy
    , Opt_CoreWebsSpecWebs
    , Opt_CoreWebsSpecCalls
    , Opt_CoreWebsSpecLambdas

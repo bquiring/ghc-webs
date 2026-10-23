@@ -76,6 +76,12 @@ for n in range(1, 15):
 # Note [Arguments of unknown calls]: the same program, bounded
 test('arityraise014_max', [extra_files(['arityraise014.hs'])], multimod_compile,
      ['arityraise014', ar_opts + ' -fcore-webs-raise-max-args=6 -ddump-webs-arity-raise -dsuppress-uniques'])
+# arityraise015: a lazy constructed parameter of a known function, raised in
+# the early run (Note [Lazy parameters of known functions])
+kl_opts = '-O -fcore-webs-early -dcore-lint -fcore-webs-arity-raise -fcore-webs-evald-args -fcore-webs-raise-known-lazy'
+test('arityraise015', [], compile_and_run, [kl_opts])
+test('arityraise015_dump', [extra_files(['arityraise015.hs'])], multimod_compile,
+     ['arityraise015', kl_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
 
 # All the transformations together
 test('alltransforms001', [], compile_and_run,

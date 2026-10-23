@@ -58,6 +58,29 @@ cannot help; a web whose calls are all known is left to worker/wrapper.
 spectral/mate.)
 -}
 
+{- Note [Lazy parameters of known functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Worker/wrapper unboxes only strict parameters.  A parameter that is lazy on
+some path, but receives a constructed value at every call, is unboxed by
+neither: base's lookup, specialised to Int by Specialise (happy's $slookup
+under -fspecialise-aggressively with exposed boot-library unfoldings,
+WEBS-DICT-SPEC.md §5):
+
+    $slookup key xs = case xs of
+      []           -> Nothing
+      (x, y) : xys -> case key of I# k -> ... $slookup key xys
+
+The key is unused on [], so it is lazy, and it is taken apart once per
+element.  Every call passes I# n, or the key's case binder (a value with
+-fcore-webs-evald-args, Note [Evaluated arguments]).  With -fcore-webs-raise-known-lazy,
+the early run raises such a web although its calls are all known (Note
+[Early arity raising]): it is lazy, so worker/wrapper would not, and it is
+constructed at every call, so raising evaluates nothing (constructed
+arguments, Note [Arity raising]).  The key arrives as an Int#.  The web
+must not be exposed, which for a copy Specialise makes needs its rule out
+of the way (-fcore-webs-drop-rules, or proposal 2 of WEBS-BACKLOG.md).
+-}
+
 {- Note [Arguments of unknown calls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 An unknown call goes through GHC's generic apply (stg_ap_*), which has fast
@@ -524,10 +547,12 @@ splitArgCo co = case co of
          -> Just (tc, zipWith mkReflCo (tyConRoleListX r tc) args)
   _ -> Nothing
 
-verdict :: Bool -> Int -> WebSet -> WebSet -> WebId -> Info -> Verdict
-verdict early max_args exposed complex w i
+verdict :: Bool -> Bool -> Int -> WebSet -> WebSet -> WebId -> Info -> Verdict
+verdict early known_lazy max_args exposed complex w i
   | w `elementOfUniqSet` exposed = Rejected Exposed
-  | early, not (i_unknown i)     = Rejected KnownCalls   -- Note [Early arity raising]
+  | early, not (i_unknown i)
+  , not (known_lazy && i_lazy i && constructed)
+                                 = Rejected KnownCalls   -- Note [Early arity raising]
   | i_covar i                    = Rejected CoVarParam
   | w `elementOfUniqSet` complex = Rejected Coercion'
   | i_coercion i                 = Rejected Coercion'
@@ -564,7 +589,8 @@ verdict early max_args exposed complex w i
 -- loses its product arrows, so one round is enough; webs in 'done' have
 -- already been raised and are not considered again.
 arityRaiseRound :: Bool        -- ^ Note [Evaluated arguments]
-                -> Int         -- ^ At most this many arguments at an unknown
+                -> Bool        -- ^ Note [Lazy parameters of known functions]
+                -> Int        -- ^ At most this many arguments at an unknown
                                --   call, 0 for no bound (Note [Arguments of
                                --   unknown calls])
                 -> FieldTys    -- ^ Components' types (Note [Signatures follow
@@ -577,7 +603,7 @@ arityRaiseRound :: Bool        -- ^ Note [Evaluated arguments]
                 -> CoreProgram
                 -> ( Maybe (CoreProgram, WebSet, Type -> Type, WebSet)
                    , [(WebId, SDoc, Bool, [Id])] )
-arityRaiseRound evald max_args fields saturated us exposed pol done binds
+arityRaiseRound evald known_lazy max_args fields saturated us exposed pol done binds
   | isEmptyUniqSet todo = (Nothing, dump)
   | otherwise           = ( Just ( initUs_ us1 (rewriteProgram fields todo inner pol binds), todo
                                  , raiseType fields todo inner
@@ -586,7 +612,7 @@ arityRaiseRound evald max_args fields saturated us exposed pol done binds
   where
     infos   = analyse evald fields saturated binds
     complex = complexCoWebs binds
-    verdicts0 = [ (w, verdict (up_early pol) max_args exposed complex w i, i)
+    verdicts0 = [ (w, verdict (up_early pol) known_lazy max_args exposed complex w i, i)
                 | (u, i) <- sortOn (getKey . fst) (nonDetUFMToList infos)
                 , let w = mkWebId u
                 , not (null (i_lams i))

@@ -1067,7 +1067,7 @@ runTransforms early logger dflags cfg sigs0 binds0
       , ( Opt_CoreWebsConstProp, "constant propagation", Opt_D_dump_webs_const_prop
         , \_ us done b -> same (constPropRound us exposed done b) )
       , ( Opt_CoreWebsArityRaise, "arity raising", Opt_D_dump_webs_arity_raise
-        , \sigs us done b -> case arityRaiseRound (gopt Opt_CoreWebsEvaldArgs dflags) (websRaiseMaxArgs dflags) (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
+        , \sigs us done b -> case arityRaiseRound (gopt Opt_CoreWebsEvaldArgs dflags) (gopt Opt_CoreWebsRaiseKnownLazy dflags) (websRaiseMaxArgs dflags) (fieldTys sigs) (ws_saturated sigs) us exposed keep done b of
                                (r, vs) -> (r, vs) )
       , ( Opt_CoreWebsDeadParams, "dead parameters", Opt_D_dump_webs_dead_params
         , \_ us done b -> case deadParamsRound us exposed keep done b of

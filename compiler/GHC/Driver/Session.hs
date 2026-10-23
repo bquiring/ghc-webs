@@ -2593,6 +2593,7 @@ fFlagsDeps = [
   flagSpec "core-webs-drop-rules"             Opt_CoreWebsDropRules,
   flagSpec "core-webs-raise-through-calls"    Opt_CoreWebsRaiseThroughCalls,
   flagSpec "core-webs-evald-args"             Opt_CoreWebsEvaldArgs,
+  flagSpec "core-webs-raise-known-lazy"       Opt_CoreWebsRaiseKnownLazy,
   flagSpec "core-webs-spec-webs"              Opt_CoreWebsSpecWebs,
   flagSpec "core-webs-spec-calls"             Opt_CoreWebsSpecCalls,
   flagSpec "core-webs-spec-lambdas"           Opt_CoreWebsSpecLambdas,
