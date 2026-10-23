@@ -1466,3 +1466,46 @@ Tooling fixes: `build.sh` takes `BENCH_STORE` and records each
 configuration's store in results/CONFIG/store. `time.py` and trace-apply
 read that per configuration; before, the lookup silently ran the wrong
 binary for another store.
+
+## 37. Aggressive specialisation: the compilers group's copies; which flags matter (2026-10-23, desktop)
+
+**Copies (WEBS-DICT-SPEC.md step 1, compilers group).** agg build with
+`-ddump-rules`, counted with webs-hackage-bench `spec-rules.py`. purs ran out
+of memory (11 GB virtual limit, 2 jobs; §36 has its needs), the rest built.
+All packages dumped into one directory, so same-named modules overwrote each
+other: the counts are a lower bound.
+
+| | small group (§35) | compilers group |
+|---|---|---|
+| SPEC copies | 1,214 of 847 functions | 36,405 of 21,302 functions (35,172 of imported functions) |
+| at most 1 copy per function | −30% copies | −41% |
+| at most 4 copies per function | −11% | −17% |
+
+- Breadth again: most functions get one or two copies, so a bound on keys
+  (step A) removes little.
+- The many-key functions sit in two places:
+  - lsp's message parsing: one module, 2,491 copies of instances indexed by
+    message type (`Language.LSP.Protocol.Message.Parsing`);
+  - futhark's passes: one copy per IR representation (`Futhark.CLI.Dev`
+    1,857, `Futhark.Passes` 1,280, the `IR.*Mem` modules about 500 each).
+    That is likely where futhark's −34% comes from, so a key bound would
+    cut the gain with the cost.
+- So the bound has to be by use, not by count: step B (webs, or a profile
+  saying which copies are hot; the laptop's per-symbol profile gives that
+  oracle).
+
+**Which of agg's four flags matter (§5 of WEBS-DICT-SPEC.md).** agg2 =
+`-fspecialise-aggressively -fexpose-all-unfoldings` only; small group,
+5 rounds, time and allocation against base22 (no perf in WSL):
+
+| program | agg (4 flags) time | allocation | agg2 time | allocation |
+|---|---|---|---|---|
+| happy | +1.5% | +0.2% | −0.6% | −0.0% |
+| alex | −7.8% | −0.2% | −11.2% | −0.2% |
+| cpphs | +1.8% | −0.2% | +1.4% | −0.0% |
+| skylighting | −17.9% | −12.6% | −18.7% | −13.8% |
+| geomean | −6.0% | −3.4% | −7.6% | −3.7% |
+
+The SpecConstr pair (`-fspec-constr-count=6 -fspec-constr-threshold=4000`)
+adds nothing: the gain is the specialiser's. Time differences of a few
+percent are noise here (alex runs 0.11 s); allocation is exact.
