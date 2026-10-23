@@ -657,3 +657,8 @@ test('roundtrip001', [extra_files(['roundtrip001.hs'])], makefile_test, ['roundt
 # roundtrip002: a unique bound twice in one binding is not restored (happy's
 # Mangler; WEBS-BUGS.md)
 test('roundtrip002', [], compile_and_run, ['-O2 -fcore-webs-early -dcore-lint'])
+
+# specmax001: bounded aggressive specialisation (Note [Bounded aggressive
+# specialisation] in GHC.Core.Opt.Specialise)
+test('specmax001', [extra_files(['specmax001.hs', 'SpecMax001A.hs'])],
+     makefile_test, ['specmax001'])

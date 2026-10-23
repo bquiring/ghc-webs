@@ -1896,6 +1896,10 @@ dynamic_flags_deps = [
       (intSuffix (\n d -> d {maxWorkerArgs = n}))
   , make_ord_flag defFlag "fmax-forced-spec-args"
       (intSuffix (\n d -> d {maxForcedSpecArgs = n}))
+  , make_ord_flag defFlag "fspecialise-max-keys"
+      (intSuffix (\n d -> d {specMaxKeys = n}))
+  , make_ord_flag defFlag "fspecialise-max-size"
+      (intSuffix (\n d -> d {specMaxSize = n}))
   , make_ord_flag defGhciFlag "fghci-hist-size"
       (intSuffix (\n d -> d {ghciHistSize = n}))
 

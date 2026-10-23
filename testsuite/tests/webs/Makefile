@@ -244,3 +244,18 @@ roundtrip001:
 	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -c roundtrip001.hs -outputdir roundtrip001.b -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds > roundtrip001.base
 	'$(TEST_HC)' $(TEST_HC_OPTS) -O2 -fcore-webs-early -c roundtrip001.hs -outputdir roundtrip001.e -ddump-simpl -dsuppress-all -dsuppress-uniques -dno-typeable-binds > roundtrip001.early
 	diff roundtrip001.base roundtrip001.early
+
+# specmax001: -fspecialise-max-keys and -fspecialise-max-size bound the
+# copies -fspecialise-aggressively makes of imported functions (Note
+# [Bounded aggressive specialisation] in GHC.Core.Opt.Specialise): copies of
+# total and spread with no bound, at most 2 keys, and a size bound only
+# total fits
+.PHONY: specmax001
+specmax001:
+	'$(TEST_HC)' $(TEST_HC_OPTS) -O -fexpose-all-unfoldings -c SpecMax001A.hs -v0
+	for f in "" -fspecialise-max-keys=2 -fspecialise-max-size=50; do \
+	  '$(TEST_HC)' $(TEST_HC_OPTS) -O -fforce-recomp -fspecialise-aggressively $$f -dcore-lint \
+	    -ddump-spec -dsuppress-all -c specmax001.hs -v0 > specmax001.spec 2>&1 || exit 1; \
+	  echo "$$f: total $$(grep -c '^"SPEC/Main total' specmax001.spec)" \
+	    "spread $$(grep -c '^"SPEC/Main spread' specmax001.spec)"; \
+	done

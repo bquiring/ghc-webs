@@ -61,6 +61,7 @@ import GHC.Utils.Panic
 import GHC.Unit.Module( Module )
 import GHC.Unit.Module.ModGuts
 import GHC.Core.Unfold
+import GHC.Core.Stats     ( exprSize )
 
 import Data.List( partition )
 -- import Data.List.NonEmpty ( NonEmpty (..) )
@@ -840,7 +841,10 @@ spec_import env callers dict_binds cis@(CIS fn _)
   | null good_calls
   = return (env, [], [])
 
-  | Just rhs <- canSpecImport dflags fn
+  | Just (rhs, aggressive) <- canSpecImport dflags fn
+  , let calls | aggressive, specMaxKeys dflags > 0 = take (specMaxKeys dflags) good_calls
+              | otherwise                         = good_calls
+              -- See Note [Bounded aggressive specialisation]
   = do {     -- Get rules from the external package state
              -- We keep doing this in case we "page-fault in"
              -- more rules as we go along
@@ -855,7 +859,7 @@ spec_import env callers dict_binds cis@(CIS fn _)
 --           , text "dict_binds:" <+> ppr dict_binds ])
 
        ; (rules1, spec_pairs, MkUD { ud_binds = dict_binds1, ud_calls = new_calls })
-            <- runSpecM $ specCalls True env (getRules rule_env fn) good_calls fn rhs
+            <- runSpecM $ specCalls True env (getRules rule_env fn) calls fn rhs
 
        ; let spec_binds1 = [NonRec b r | (b,r) <- spec_pairs]
              -- After the rules kick in, via fireRewriteRules, we may get recursion,
@@ -896,7 +900,9 @@ spec_import env callers dict_binds cis@(CIS fn _)
        -- SUPER IMPORTANT!  Drop calls that (directly or indirectly) refer to fn
        -- See Note [Avoiding loops in specImports]
 
-canSpecImport :: DynFlags -> Id -> Maybe CoreExpr
+canSpecImport :: DynFlags -> Id -> Maybe (CoreExpr, Bool)
+-- The unfolding to specialise, and whether only -fspecialise-aggressively
+-- admits it (Note [Bounded aggressive specialisation])
 canSpecImport dflags fn
   | isDataConWrapId fn
   = Nothing   -- Don't specialise data-con wrappers, even if they
@@ -906,16 +912,35 @@ canSpecImport dflags fn
     -- CoreUnfolding: see Note [Specialising imported functions] point (1).
   , isAnyInlinePragma (idInlinePragma fn)
     -- See Note [Specialising imported functions] point (2).
-  = Just rhs
+  = Just (rhs, False)
 
   | gopt Opt_SpecialiseAggressively dflags
-  = maybeUnfoldingTemplate unf
+  , Just rhs <- maybeUnfoldingTemplate unf
     -- With -fspecialise-aggressively, specialise anything
     -- with an unfolding, stable or not, DFun or not
+  , specMaxSize dflags <= 0 || exprSize rhs <= specMaxSize dflags
+  = Just (rhs, True)
 
   | otherwise = Nothing
   where
     unf = realIdUnfolding fn   -- We want to see the unfolding even for loop breakers
+
+{- Note [Bounded aggressive specialisation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fspecialise-aggressively and -fexpose-all-unfoldings on a program and
+its dependencies, every imported overloaded function is specialised at
+every call pattern in the module.  That gains a lot on dictionary-heavy
+programs, and costs a lot of code (WEBS-DICT-SPEC.md).  Two flags bound
+it, for the imports only -fspecialise-aggressively admits (functions with
+an INLINE or INLINABLE pragma are specialised as before):
+
+  -fspecialise-max-size=S  only unfoldings of at most S nodes (exprSize)
+  -fspecialise-max-keys=N  at most N call patterns per function, in the
+                           order of filterCalls, per specialisation of an
+                           import (a cascade from another copy may add N more)
+
+Both are off (0) by default.
+-}
 
 -- | Returns whether or not to show a missed-spec warning.
 -- If -Wall-missed-specializations is on, show the warning.

@@ -413,6 +413,8 @@ data DynFlags = DynFlags {
   websChunkModules      :: Maybe FilePath, -- ^ -fcore-webs-chunk-modules=FILE: the modules of the chunk (Note [Chunks])
   websChunkSession      :: Maybe [String], -- ^ (internal) the home modules a chunk's session holds (M[boot] for an hs-boot file)
                                            --   (Note [Home modules outside a chunk] in GHC.Iface.Load)
+  specMaxKeys           :: Int,   -- ^ -fspecialise-max-keys: copies of an aggressively specialised import, 0 = no bound (Note [Bounded aggressive specialisation])
+  specMaxSize           :: Int,   -- ^ -fspecialise-max-size: unfolding size of an aggressively specialised import, 0 = no bound
   maxForcedSpecArgs     :: Int,
 
   ghciHistSize          :: Int,
@@ -712,6 +714,8 @@ defaultDynFlags mySettings =
         websUnusedExports = Nothing,
         websChunkModules = Nothing,
         websChunkSession = Nothing,
+        specMaxKeys = 0,
+        specMaxSize = 0,
         maxForcedSpecArgs = 333,
         -- 333 is fairly arbitrary, see Note [Forcing specialisation]:FS5
 
