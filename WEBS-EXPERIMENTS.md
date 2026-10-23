@@ -1397,3 +1397,27 @@ Generic application after agg (`trace-apply.py agg`, `apply-patterns.py`):
 - koka 2.4%.
 
 Expected gains of the proposals not being built are in WEBS-BACKLOG.md.
+
+## 35. Where aggressive specialisation's copies go (2026-10-23)
+
+Step 1 of WEBS-DICT-SPEC.md, on the desktop (WSL2, no instruction counts:
+time and allocation, 5 rounds). Small group built with agg's options plus
+`-ddump-rules` (config `aggr`); copies counted from the rules by
+`spec-rules.py` (hb).
+
+- 1214 Specialise copies (1005 of imported functions) of 847 functions in
+  759 modules, plus 485 SpecConstr rules. The copies are spread thin: at
+  most 1 copy per function per module removes 30% of them, at most 4 only
+  11%. The most-copied are in dependencies the benchmarks hardly run
+  (QuickCheck's `shrinkIntegral` 31, `arbitrarySizedBoundedIntegral` 27;
+  skylighting's generic `getSum` 23 and `gput` 16).
+- Text against base22: happy +1.1%, alex +7.6%, cpphs +1.1%, skylighting
+  +2.9%. The large growth of §34 (futhark +39%, cabal +19%) is in the
+  compilers group: step 1 has to be repeated there.
+- Gains reproduce: skylighting −17.6% time (−12.6% allocation), alex
+  −12.0%, geomean −7.5% time, −3.4% allocation.
+
+So a bound on keys alone (step A) cannot remove most of the copies: the
+cost is breadth (every function with an unfolding, copied once or twice),
+not a few functions with many keys. Selecting by use (step B: a hot
+selector call) or by package is the likelier bound.
