@@ -6,9 +6,9 @@ module Main (main) where
 
 import Control.Exception ( ErrorCall, evaluate, try )
 
-data Pos = Pos { posLine :: !Int, posCol :: {-# UNPACK #-} !Int }
+data Pos = Pos !Int {-# UNPACK #-} !Int
 
-data Range = Range { rStart :: !Pos, rEnd :: !Pos, rHidden :: Bool }
+data Range = Range !Pos !Pos Bool
 
 mkRange :: Int -> Range
 mkRange i = Range (Pos i (i * 2)) (Pos (i + 3) 0) (even i)

@@ -1,7 +1,7 @@
 -- Note [Copying the binders of rules] in GHC.WebCore.Boundary: V's derived
 -- Eq instance is used inside the program (nub compares with it), which
 -- exposes V's classes.  With -fcore-webs-instance-copies the program uses
--- its own copy of the instance, and V is no longer exposed
+-- its own copy of the instance, and V is split (its Int unboxed)
 module Main (main) where
 
 import Data.List ( nub )

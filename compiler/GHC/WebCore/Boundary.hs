@@ -39,6 +39,7 @@ import GHC.Types.Var.Set
 
 import GHC.Data.Maybe ( orElse )
 import GHC.Utils.Monad ( mapAccumLM )
+import GHC.WebCore.Transform.Inline ( cloneExpr )
 
 {- Note [Splitting webs at the boundary]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -311,7 +312,12 @@ alone (shellcheck's VariableState, WEBS-BACKLOG.md proposal 6).  With the
 flag, the module's DFuns and the local methods they mention are copied too:
 the program's dictionaries are ordinary local bindings, which data
 splitting may give the split type, while the instance keeps the original
-DFun.  A DFun is exported, and its copy is not.  A DFun without a context
+DFun.  A DFun is exported, and its copy is not.  A method may have an
+INLINE unfolding (derived instances' /= has one): its copy is copied
+anyway, without the unfolding, as otherwise the copied dictionary would
+still mention the original method and share its webs.  The copy is reached
+only through the copied dictionary, and class-op selection inlines a
+small method without the pragma.  A DFun without a context
 is a constructor application, not a function; copying it duplicates no
 work, as its arguments are variables.
 -}
@@ -325,8 +331,9 @@ copyRuleBinders :: Bool -> Bool -> UniqSupply -> [CoreRule] -> CoreProgram
                 -> (CoreProgram, [(Id, Id)])
 copyRuleBinders copy_rules copy_instances us rules binds
   | null pairs = (binds, [])
-  | otherwise  = (concatMap copy_bind binds, pairs)
+  | otherwise  = (concat (initUs_ us_c (mapM copy_bind binds)), pairs)
   where
+    (us_p, us_c) = splitUniqSupply us
     all_rules = rules ++ concatMap idCoreRules (bindersOfBinds binds)
     rule_fvs  = rulesFreeVars all_rules
     lhs_fvs   = unionVarSets (map ruleLhsFreeIds all_rules)
@@ -334,11 +341,12 @@ copyRuleBinders copy_rules copy_instances us rules binds
     dfun_fvs  = exprsSomeFreeVars isLocalId [ rhs | (f, rhs) <- flattenBinds binds, isDFunId f ]
 
     wanted f = (copy_rules && f `elemVarSet` rule_fvs && not (f `elemVarSet` lhs_fvs))
-               || (copy_instances && (isDFunId f || f `elemVarSet` dfun_fvs))
+               || instance_part f
+    instance_part f = copy_instances && (isDFunId f || f `elemVarSet` dfun_fvs)
     copyable (f, rhs) = (not (isExportedId f) || (copy_instances && isDFunId f))
                         && not (isJoinId f)
                         && isEmptyRuleInfo (idSpecialisation f)
-                        && not (isInlineUnfolding (realIdUnfolding f))
+                        && (not (isInlineUnfolding (realIdUnfolding f)) || instance_part f)
                         && not (f `elemVarSet` lhs_fvs)
                         && (any isId (fst (collectBinders rhs)) || is_con_app rhs)
 
@@ -350,22 +358,27 @@ copyRuleBinders copy_rules copy_instances us rules binds
 
     groups = [ prs | bind <- binds, let prs = flattenBinds [bind]
                    , any (wanted . fst) prs, all copyable prs ]
-    pairs  = initUs_ us (sequence [ do { u <- getUniqueM; return (f, mkCopy "$c" u f) }
-                                  | prs <- groups, (f, _) <- prs ])
+    pairs  = initUs_ us_p (sequence [ do { u <- getUniqueM; return (f, mkCopy "$c" u f) }
+                                    | prs <- groups, (f, _) <- prs ])
     env    = mkVarEnv pairs   -- each original to its copy
 
     copy_of  = lookupVarEnv env
     redirect = renameVars env
+    -- The copy's local binders are fresh: the web passes rewrite binders by
+    -- their Uniques, and a rewrite of the copy must not reach the original
+    copy_rhs rhs = cloneExpr (redirect rhs)
 
+    copy_bind :: CoreBind -> UniqSM [CoreBind]
     copy_bind (NonRec f rhs)
-      | Just f_c <- copy_of f = [NonRec f_c (redirect rhs), NonRec f rhs]
-      | otherwise             = [NonRec f (redirect rhs)]
+      | Just f_c <- copy_of f = do { rhs' <- copy_rhs rhs
+                                   ; return [NonRec f_c rhs', NonRec f rhs] }
+      | otherwise             = return [NonRec f (redirect rhs)]
     copy_bind (Rec prs)
       | ((f, _) : _) <- prs, Just _ <- copy_of f
-      = [ Rec [ (b_c, redirect rhs) | (b, rhs) <- prs, Just b_c <- [copy_of b] ]
-        , Rec prs ]
+      = do { prs' <- sequence [ (,) b_c <$> copy_rhs rhs | (b, rhs) <- prs, Just b_c <- [copy_of b] ]
+           ; return [Rec prs', Rec prs] }
       | otherwise
-      = [Rec [ (b, redirect rhs) | (b, rhs) <- prs ]]
+      = return [Rec [ (b, redirect rhs) | (b, rhs) <- prs ]]
 
 -- | The local copy of an exported function: same type and analysis
 -- results, not exported, no unfolding or rules

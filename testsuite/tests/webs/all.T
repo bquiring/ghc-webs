@@ -685,10 +685,11 @@ test('dataexpose001', [extra_files(['dataexpose001.hs'])],
 # unpacked fields] in GHC.WebCore.DataSplit)
 test('dataunpack001', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
 test('dataunpack001_dump', [extra_files(['dataunpack001.hs'])], multimod_compile,
-     ['dataunpack001', ds_opts + ' -ddump-webs-data-exposure -dsuppress-uniques'])
+     ['dataunpack001', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
 
 # instcopy001: the program's own copy of an instance (Note [Copying the
 # binders of rules] in GHC.WebCore.Boundary)
-test('instcopy001', [], compile_and_run, [ds_opts + ' -fcore-webs-instance-copies'])
+ic_opts = ds_opts + ' -fcore-webs-data-unbox -fcore-webs-instance-copies'
+test('instcopy001', [], compile_and_run, [ic_opts])
 test('instcopy001_dump', [extra_files(['instcopy001.hs'])], multimod_compile,
-     ['instcopy001', ds_opts + ' -fcore-webs-instance-copies -ddump-webs-data-exposure -dsuppress-uniques'])
+     ['instcopy001', ic_opts + ' -ddump-webs-data -dsuppress-uniques'])
