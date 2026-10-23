@@ -1509,3 +1509,60 @@ other: the counts are a lower bound.
 The SpecConstr pair (`-fspec-constr-count=6 -fspec-constr-threshold=4000`)
 adds nothing: the gain is the specialiser's. Time differences of a few
 percent are noise here (alex runs 0.11 s); allocation is exact.
+
+## 38. Lazy constructed parameters of known calls: -fcore-webs-raise-known-lazy (2026-10-23, desktop)
+
+**The case** (WEBS-DICT-SPEC.md §5): happy's hot `$slookup`, Specialise's
+Int copy of base's `lookup`, takes its key apart on every element. The key
+is lazy (unused on []), so worker/wrapper leaves it boxed; early arity
+raising leaves all-known-call webs to worker/wrapper (Note [Early arity
+raising]). Neither unboxes it. Reproduced in miniature
+(`lookup` exposed in a second module, a 2000-entry table, aggressive
+specialisation):
+- **GHC alone:** `$slook _key ds = ... case _key of I# x1 -> ...` per element.
+- **All webs flags:** unchanged. `$slook` is the right-hand side of
+  Specialise's SPEC rule, so its webs are exposed (proposal 2).
+- **With -fcore-webs-drop-rules:** data splitting turns the table, a list of
+  `(Int, Int)`, into its own list type with the key's `Int#` in the cell
+  (`Con2_s5 y y1 xys`); the key parameter is still taken apart per element
+  (arity raising: "only known calls, left to worker/wrapper").
+- **With -fcore-webs-raise-known-lazy (+ -fcore-webs-evald-args):** the early
+  run raises a web whose calls are all known if it is lazy and every call
+  passes a constructed value (Note [Lazy parameters of known functions]).
+  `$slook x ds = case ds of Con2_s5 y y1 xys -> case ==# x y of ...`: the
+  hand-written oracle's loop, from function webs (the key) and data webs
+  (the table) together.
+
+**nofib** (dev tree, 3 rounds; occ4ev = occ4 + -fcore-webs-evald-args;
+occ4kl = occ4ev + -fcore-webs-raise-known-lazy, built with -dcore-lint: no
+Lint errors):
+
+| config | geomean time | geomean alloc |
+|---|---|---|
+| occ4 | −4.33% | −4.47% |
+| occ4ev | −4.46% | −4.46% |
+| occ4kl | −5.15% | −4.73% |
+
+Every allocation change of at least 0.5% between occ4ev and occ4kl, with
+instructions from cachegrind (`time-nofib.py --cachegrind`):
+
+| program | instructions | allocation |
+|---|---|---|
+| fish | −23.5% | −17.4% |
+| fulsom | −9.5% | −6.9% |
+| lift | (not counted) | −4.7% |
+| wave4main | | −0.6% |
+| event | | −0.5% |
+| genfft | +1.3% | +1.5% |
+| dom-lt | +0.0% | +0.5% |
+
+- Time-only changes (bspt −11.8%, linear −8.6%, CS −5.6%, atom +3.4%) have
+  0.00% instruction and allocation changes: layout noise.
+- genfft's cost is the one Note [Arity raising] names: a lambda that still
+  needs the box rebuilds it.
+- The three failures are the known harness ones (fasta, k-nucleotide,
+  awards).
+
+**Next:** happy itself needs the _build-xu tree, agg2, webs, and the SPEC
+rules out of the way (-fcore-webs-drop-rules now; proposal 2 properly).
+Asked of the laptop (WEBS-DICT-SPEC.md §6), which has _build-xu and perf.

@@ -185,3 +185,30 @@ small a use-based bound can be. Not yet run.
 Docker's data root is on the laptop's /home; check `docker system df`
 when the disk fills.
 
+
+## 6. Desktop results, and runs asked of the laptop (2026-10-23)
+
+- **The specialiser pair is the gain** (WEBS-EXPERIMENTS.md §37): agg2 =
+  `-fspecialise-aggressively -fexpose-all-unfoldings` matches agg on the
+  small group (allocation −3.7% vs −3.4%; skylighting −13.8% vs −12.6%).
+  The SpecConstr pair can be dropped from agg.
+- **Breadth on the compilers group** (§37): 36,405 copies of 21,302
+  functions; at most 4 copies per function removes only 17%. Many-key
+  functions are futhark's per-representation passes, likely its gain. So
+  step A's key bound cannot be the story; step B (by use) is.
+- **Step A is in** (`-fspecialise-max-keys`, `-fspecialise-max-size`, off by
+  default; test specmax001) as the baseline step B must beat.
+- **happy's `$slookup` is a webs win** (§38): with
+  `-fcore-webs-raise-known-lazy -fcore-webs-evald-args` and the SPEC rules
+  out of the way, function webs unbox the key and data webs flatten the
+  table, giving the oracle's loop in miniature. nofib occ4kl: fish −23.5%,
+  fulsom −9.5% instructions; genfft +1.3%.
+
+**Asked of the laptop** (perf, _build-xu):
+1. happy, small group, against xu-agg: a configuration xu-wagg-kl = agg2 +
+   the webs flags (occ4's B) + `-fcore-webs-drop-rules
+   -fcore-webs-evald-args -fcore-webs-raise-known-lazy`, in store-xu. Does
+   happy go from −31.4% towards the oracle's −42.3%? perf on `$slookup`.
+2. The same configuration without `-fcore-webs-raise-known-lazy`, to
+   attribute.
+3. nofib occ4kl vs occ4ev instructions on the laptop, to confirm §38.
