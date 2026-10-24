@@ -1646,8 +1646,16 @@ At the default -A, webs saves one major collection near the peak; at 16m
 the difference is small and at 64m it reverses. Only the small mutator
 gain (2-6%, noisy without counters) may be webs' own.
 
+**koka** (dxic, with the dumps): Range and Pos are eligible now but split
+nowhere. Range is exposed in 73 of 109 modules, by exported 424, imported
+390, other 243, pinned 171, instance 18; the top imported reasons are
+Common.Range's own API (`rangeNull` 42, `combineRange` 28, `makeRange` 12).
+Range is an abstract type every module uses through that API: the same
+cross-module boundary as shellcheck's and purs's.
+
 **For the story:** per-module data webs cannot reach a type whose values
-cross modules, however the instances are handled. shellcheck's heap is
+cross modules, however the instances are handled.  All three programs'
+hot types are such types. shellcheck's heap is
 such types, so it needs proposal 6 (the boundary split: keep the exported
 representation, convert at exported functions) or proposal 5 (package-level
 webs, or compiling the package as one chunk). Rule copies remain useful
