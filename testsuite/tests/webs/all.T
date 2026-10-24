@@ -687,8 +687,11 @@ test('dataunpack001', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox']
 test('dataunpack001_dump', [extra_files(['dataunpack001.hs'])], multimod_compile,
      ['dataunpack001', ds_opts + ' -fcore-webs-data-unbox -ddump-webs-data -dsuppress-uniques'])
 # dataunpack002: an unpacked field whose constructor has a context (a
-# dictionary among the worker's fields: lsp-types' AString)
-test('dataunpack002', [], compile_and_run, [ds_opts + ' -fcore-webs-data-unbox'])
+# dictionary among the worker's fields: lsp-types' AString).  Without CPR:
+# GHC's own worker/wrapper returns such a constructor's fields as an
+# unboxed tuple with the dictionary in it, a Lint error (GHC 9.10.1 too)
+test('dataunpack002', [], compile_and_run,
+     [ds_opts + ' -fcore-webs-data-unbox -fno-cpr-anal'])
 
 # instcopy001: the program's own copy of an instance (Note [Copying the
 # binders of rules] in GHC.WebCore.Boundary)

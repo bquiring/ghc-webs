@@ -2,7 +2,8 @@
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 -- Note [Copies of unpacked fields] in GHC.WebCore.DataSplit: lsp-types'
 -- records unpack a field whose constructor has a context, so the worker
--- takes a dictionary; such a type is not copied
+-- takes a dictionary; such a type is not copied.  Compiled without CPR
+-- (all.T): GHC's worker/wrapper alone fails Lint on this program
 module Main (main) where
 
 import GHC.TypeLits ( KnownSymbol, Symbol, symbolVal )

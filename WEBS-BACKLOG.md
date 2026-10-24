@@ -288,6 +288,12 @@ Being implemented (large):
   VariableState strict, enumerations and the nested record unpacked):
   −9.0%, GC time −18%, allocation −5.1%. koka's `Range` unpacked: −0.3%,
   peak residency −5%.
+  - **Why the per-module split cannot do it (§39, 2026-10-24):** with
+    instance and rule copies and unpacked fields allowed, shellcheck's
+    hot types are still exposed, now only because CFGAnalysis exports
+    its analysis (ProgramState) to other modules. Its heap is unchanged;
+    the −12% time of webs22 there is one major GC fewer at the default
+    -A, gone at -A16m. So 6 needs the boundary split itself (or 5).
 
 Kept in the backlog (small), with what each is expected to give:
 - **1 (newtype splitting): at most 2-4% on skylighting, about 0

@@ -1566,3 +1566,89 @@ instructions from cachegrind (`time-nofib.py --cachegrind`):
 **Next:** happy itself needs the _build-xu tree, agg2, webs, and the SPEC
 rules out of the way (-fcore-webs-drop-rules now; proposal 2 properly).
 Asked of the laptop (WEBS-DICT-SPEC.md §6), which has _build-xu and perf.
+
+## 39. Why the hot types never split; rule and instance copies (2026-10-24, desktop)
+
+**Question** (proposal 6): data splitting never touches the hot types of the
+large programs. What exposes them? Measured with
+-ddump-webs-data-exposure (dev compiler, webs22 flags), which now
+summarises each class's reasons by kind (imported, exported, pinned,
+instance, other).
+
+**Before (the dumps of 2026-10-23):**
+- **shellcheck:** VariableState, VariableValue and ProgramState
+  (ShellCheck.CFGAnalysis) are exposed by their derived Show/Eq/Ord
+  instances (pinned methods, the DFuns) and by exported functions and
+  record selectors.
+- **koka:** Common.Range.Range and Pos were not even eligible: koka builds
+  with -funbox-strict-fields, and unpacked fields mean constructor wrappers.
+- **purs:** AST SourceSpan is exposed in 117 module dumps, by 1229 reasons:
+  imported 487 (`$bNullSourceAnn`, `declSourceSpan`, `map`), other 364,
+  exported 241, pinned 95, instance 42. Its values come from and go to
+  other purs modules: a package-level matter (proposal 5).
+
+**Implemented** (ghc-webs e73f577e16 .. 8d4876702a):
+1. **Rule copies** (-fcore-webs-rule-copies; Note [Copying the binders of
+   rules] in GHC.WebCore.Boundary). A binder free in a rule's right-hand
+   side, but not its left, gets a program copy: the program calls the copy,
+   whose webs are internal; the rule keeps the original, which Tidy drops
+   with the rule if nothing else needs it. Proposal 2 without
+   -fcore-webs-drop-rules. On §38's `$slookup` miniature the copy's key is
+   raised (the oracle loop); allocation 338 KB → 226 KB.
+2. **Instance copies** (-fcore-webs-instance-copies): the same for DFuns and
+   their methods (derived methods are INLINE, so copied too); the
+   instances stay exported.
+3. **Data splitting of types with unpacked fields** (Note [Copies of
+   unpacked fields] in GHC.WebCore.DataSplit). Strict fields never needed
+   a wrapper (the worker evaluates them); unpacked ones do, and a copy now
+   takes the worker's fields.
+
+Two bugs found building Hackage with these, both with tests:
+- fgl's `LPath` newtype split once its instances were copied; the copy,
+  written to the interface beside the original, kept the constructor's
+  name `LP`, and importers' patterns found it (instcopy002; Note [Names of
+  newtype copies]).
+- lsp-types' records unpack `AString "kind"` (`AString :: KnownSymbol s =>
+  AString s`): the worker's fields include a dictionary, which a copy's
+  field cannot be (dataunpack002).
+
+**shellcheck** (dev compiler, store-dev2; dxb = -O2, dxw = webs22, dxic =
+webs22 + rule and instance copies; 5 rounds):
+
+| config | mut | GC | time | allocation |
+|---|---|---|---|---|
+| dxb | 2.78 s | 3.87 s | | |
+| dxw | −6% | −16% | −12.1% | −0.44% |
+| dxic | −3% | −21% | −13.6% | −0.44% |
+
+With instance copies, CFGAnalysis gets 23 splits (Maybe and Map copies,
+Ctx, FunctionDefinition), but VariableState, VariableValue and
+ProgramState stay exposed: CFGAnalysis exports its analysis
+(`getIncomingState`, `variablesInScope`, the record selectors) to
+AnalyzerLib and the checks, so ProgramState crosses the module boundary
+and its fields go with it. The instances no longer matter.
+
+**The time gain is GC scheduling, not representation.** The heap at its
+peak (-hT) is identical in the three: 1.65 GB, Map nodes 747 MB,
+VariableValue 484 MB, VariableState 363 MB. The RTS's maximum residency
+(sampled at major collections) differs only because the collections fall
+elsewhere. Across allocation-area sizes (one run each; copied MB and major
+collections are deterministic):
+
+| -A | copied MB dxb / dxw / dxic | major GCs |
+|---|---|---|
+| 1m | 5719 / 5138 / 5166 | 19 / 18 / 18 |
+| 4m (default) | 5631 / 4970 / 4782 | 16 / 15 / 15 |
+| 16m | 4619 / 4502 / 4496 | 13 / 12 / 12 |
+| 64m | 4972 / 5081 / 5077 | 10 / 10 / 10 |
+
+At the default -A, webs saves one major collection near the peak; at 16m
+the difference is small and at 64m it reverses. Only the small mutator
+gain (2-6%, noisy without counters) may be webs' own.
+
+**For the story:** per-module data webs cannot reach a type whose values
+cross modules, however the instances are handled. shellcheck's heap is
+such types, so it needs proposal 6 (the boundary split: keep the exported
+representation, convert at exported functions) or proposal 5 (package-level
+webs, or compiling the package as one chunk). Rule copies remain useful
+where the oracle is in one module (happy's `$slookup`, §38).
