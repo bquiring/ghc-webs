@@ -1,0 +1,11 @@
+[1 of 2] Compiling Main             ( instcopy001.hs, instcopy001.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 143 (292 constructors behind them), classes: 8, exposed: 7, split: 1, exposed only by casts: 0, pinned binders: 12
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
+Main.V_s8 = Main.V with Main.V_s8 (built [1], matched [1])
+Main.V_s8 field 0: unboxed
+
+
+[2 of 2] Linking instcopy001

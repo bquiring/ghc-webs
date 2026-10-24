@@ -1,0 +1,25 @@
+[1 of 3] Compiling RuleCopy001A     ( RuleCopy001A.hs, RuleCopy001A.o )
+
+==================== Webs: arity raising ====================
+rejected (exposed): $dEq
+rejected (exposed): _key
+rejected (exposed): ds
+
+
+[2 of 3] Compiling Main             ( rulecopy001.hs, rulecopy001.o )
+
+==================== Webs: arity raising ====================
+raised (constructed arguments): _key
+rejected (argument not a product): y
+rejected (argument not a product): y
+rejected (exposed): _key
+rejected (exposed): ds
+rejected (exposed): eta
+rejected (only known calls (early: left to worker/wrapper)): ds
+rejected (only known calls (early: left to worker/wrapper)): n
+rejected (only known calls (early: left to worker/wrapper)): v
+rejected (only known calls (early: left to worker/wrapper)): x
+rejected (only known calls (early: left to worker/wrapper)): x
+
+
+[3 of 3] Linking rulecopy001

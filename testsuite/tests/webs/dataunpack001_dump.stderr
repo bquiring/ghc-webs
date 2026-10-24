@@ -1,0 +1,10 @@
+[1 of 2] Compiling Main             ( dataunpack001.hs, dataunpack001.o )
+
+==================== Webs: splitting data types ====================
+Data Lint: ok
+copies: 101 (279 constructors behind them), classes: 12, exposed: 10, split: 1, exposed only by casts: 0, pinned binders: 7
+not copied (used as kinds): GHC.Internal.Types.RuntimeRep
+Main.Range_s11 = Main.Range with Main.Range_s11 (built [1], matched [1])
+
+
+[2 of 2] Linking dataunpack001
