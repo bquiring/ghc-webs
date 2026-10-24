@@ -1644,7 +1644,10 @@ collections are deterministic):
 
 At the default -A, webs saves one major collection near the peak; at 16m
 the difference is small and at 64m it reverses. Only the small mutator
-gain (2-6%, noisy without counters) may be webs' own.
+gain (2-6%, noisy without counters) may be webs' own. This is the effect
+WEBS-CHUNKS.md §3.2a and §3.2f found on 2026-10-14/15 (there with the
+opposite sign: −F3 flipped it); shellcheck's totals should always be read
+with an -A sweep.
 
 **koka** (dxic, with the dumps): Range and Pos are eligible now but split
 nowhere. Range is exposed in 73 of 109 modules, by exported 424, imported
@@ -1655,8 +1658,14 @@ cross-module boundary as shellcheck's and purs's.
 
 **For the story:** per-module data webs cannot reach a type whose values
 cross modules, however the instances are handled.  All three programs'
-hot types are such types. shellcheck's heap is
-such types, so it needs proposal 6 (the boundary split: keep the exported
-representation, convert at exported functions) or proposal 5 (package-level
-webs, or compiling the package as one chunk). Rule copies remain useful
-where the oracle is in one module (happy's `$slookup`, §38).
+hot types are such types. Compiling the package as one chunk is not
+enough either: in WEBS-CHUNKS.md §3.2f (ShellCheck's library and
+executable as one chunk) the heap peak is the same 1,644 MB, VariableValue
+still 484 MB, with 506 webs exposed by imported functions and by the
+dependencies' classes and newtypes. Likely (not yet checked in that
+chunk's dumps): the hot values live in Data.Map, whose functions come from
+containers, a package boundary. So proposal 6, the boundary split (keep the
+exported representation, convert where values cross), is the way to these
+types, at package boundaries as well as module ones; proposal 5 alone does
+not reach them. Rule copies remain useful where the oracle is in one module
+(happy's `$slookup`, §38).
