@@ -148,9 +148,13 @@ original carry over field for field, and so do the strictness marks of the
 components (a strict field of an unpacked product stays strict).  A wrapper
 left in the program (unsaturated, say) is an imported Id at the original
 type, so it exposes its class.  Only wrappers that do nothing but unpack are
-allowed: the constructor is vanilla, its type is not a family instance, and
-its user-written type variables are its universal ones (no GADT-syntax
-reordering).
+allowed: the constructor is vanilla, its type is not a family instance, its
+user-written type variables are its universal ones (no GADT-syntax
+reordering), and no component is a dictionary.  An unpacked field of a type
+whose constructor has a context brings the dictionary into the worker's
+fields: lsp-types' records unpack `AString "kind"`, whose constructor is
+`AString :: KnownSymbol s => AString s`, so the worker takes a
+`KnownSymbol "kind"`, which an ordinary field of a copy cannot be.
 -}
 
 -- | The result of splitting
@@ -581,6 +585,7 @@ repFields dc
 unpacksOnly :: DataCon -> Bool
 unpacksOnly dc = any isUnpacked (dataConImplBangs dc)
                  && dataConUserTyVars dc == dataConUnivTyVars dc
+                 && not (any (isConstraintLikeKind . typeKind . scaledThing) (dataConRepArgTys dc))
 
 -- | A constructor of a type with a given original tag.  The constructor at
 -- position tag-1 first: in originals and annotation copies it is the one,
