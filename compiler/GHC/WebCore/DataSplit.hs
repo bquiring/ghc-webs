@@ -361,19 +361,43 @@ from one member's representation for orig's type variables: it is renamed
 to them first (a member's variables would be out of scope; chunk006).
 -}
 
+{- Note [Names of newtype copies]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A split newtype N_s<n> is a type constructor of the module, so Tidy writes
+it to the interface like the module's own types, with its constructor.  The
+constructor must not keep the original's name: a module importing N(..)
+looks its constructors up by name, and could find the copy's (fgl's
+Data.Graph.Inductive.Graph exports LPath(LP); with its Eq and Ord instances
+copied (Note [Copying the binders of rules] in GHC.WebCore.Boundary), LPath
+split, and its importers' patterns `LP []` were given the copy's type).  So
+the constructor is tagged as the type is, LP_s<n>, as data copies'
+constructors are (Con<tag>_s<n> for a symbolic name).
+
+The copies made while annotating keep the original names: they are replaced
+by their classes' types (or the original) before anything is written out.
+-}
+
 ------------------------------------------------------------------
 --      Copies
 ------------------------------------------------------------------
 
 -- | A copy of a newtype with the given representation (in terms of the
--- newtype's own type variables), and its axiom
-mkNewtypeCopy :: UniqSupply -> (Unique -> OccName -> Name) -> OccName -> TyCon -> Type -> TyCon
-mkNewtypeCopy us mk_name tc_occ tc rhs = tycon
+-- newtype's own type variables), and its axiom.  The type and its
+-- constructor are named after the original's with the given tag (Note
+-- [Names of newtype copies])
+mkNewtypeCopy :: UniqSupply -> (Unique -> OccName -> Name) -> String -> TyCon -> Type -> TyCon
+mkNewtypeCopy us mk_name tag tc rhs = tycon
   where
     (u_tc, u_ax, u_dc, u_wk) = case uniqsFromSupply us of
                                  (a : b : c : d : _) -> (a, b, c, d)
                                  _                   -> panic "mkNewtypeCopy"
     tvs     = tyConTyVars tc
+    tc_occ | null tag  = getOccName tc
+           | otherwise = mkTcOcc (occNameString (getOccName tc) ++ tag)
+    dc_occ | null tag  = getOccName odc
+           | otherwise = case occNameString (getOccName odc) of
+                           str@(c : _) | isUpper c -> mkDataOcc (str ++ tag)
+                           _                       -> mkDataOcc ("Con1" ++ tag)
     tc_name = mk_name u_tc tc_occ
     ax_name = mk_name u_ax (mkNewTyCoOcc tc_occ)
     odc     = case tyConDataCons tc of
@@ -401,8 +425,8 @@ mkNewtypeCopy us mk_name tc_occ tc rhs = tycon
                 (Scaled m _ : _) -> m
                 []               -> ManyTy
     no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
-    dc_name = mk_name u_dc (getOccName odc)
-    wk_name = mk_name u_wk (mkDataConWorkerOcc (getOccName odc))
+    dc_name = mk_name u_dc dc_occ
+    wk_name = mk_name u_wk (mkDataConWorkerOcc dc_occ)
     dc = mkDataCon dc_name False (mkPrelTyConRepName dc_name)
            [no_bang] [HsLazy] [NotMarkedStrict]
            [] univs [] emptyNameEnv (dataConUserTyVarBinders odc) [] []
@@ -898,7 +922,7 @@ newNewtypeCopy tc = do
   ; s <- get
   ; let (us1, us2) = splitUniqSupply (as_us s)
         selfTo c' = runIdentity . mapTyCons (== tc) (\_ -> return c')
-        c = mkNewtypeCopy us1 (\u occ -> mkExternalName u (as_mod s) occ noSrcSpan) (getOccName tc)
+        c = mkNewtypeCopy us1 (\u occ -> mkExternalName u (as_mod s) occ noSrcSpan) ""
                           tc (selfTo c rhs0)
         children = [ t | t <- tyConsInOrder rhs0, t `elemUFM` as_copies s ]
   ; put s { as_us = us2, as_copies = addToUFM (as_copies s) c tc, as_all = c : as_all s
@@ -1157,8 +1181,7 @@ splitDataTypes split_cls sfx source unbox cfg this_mod us rules binds = split_wi
             member = head [ m | m <- ms, is_copy m ]
             to_orig = substTy (zipTvSubst (tyConTyVars member) (mkTyVarTys (tyConTyVars orig)))
             tc = mkNewtypeCopy us_n (\u occ -> mkExternalName u this_mod occ noSrcSpan)
-                               (mkTcOcc (occNameString (getOccName orig) ++ sfx ++ show n))
-                               orig (to_orig (evalState (rw_ty (snd (newTyConRhs member))) ()))
+                               (sfx ++ show n) orig (to_orig (evalState (rw_ty (snd (newTyConRhs member))) ()))
         fate_of :: UniqFM TyCon Fate      -- every member of a class
         fate_of = listToUFM [ (m, f) | (ms, _, f, _, _) <- fates, m <- ms ]
 

@@ -693,3 +693,8 @@ ic_opts = ds_opts + ' -fcore-webs-data-unbox -fcore-webs-instance-copies'
 test('instcopy001', [], compile_and_run, [ic_opts])
 test('instcopy001_dump', [extra_files(['instcopy001.hs'])], multimod_compile,
      ['instcopy001', ic_opts + ' -ddump-webs-data -dsuppress-uniques'])
+# instcopy002: a split newtype's copy in the interface does not take the
+# original constructor's name (Note [Names of newtype copies] in
+# GHC.WebCore.DataSplit; fgl's LPath)
+test('instcopy002', [extra_files(['InstCopy002A.hs'])], multimod_compile_and_run,
+     ['instcopy002', ic_opts])
