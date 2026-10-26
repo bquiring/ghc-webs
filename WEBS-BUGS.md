@@ -67,7 +67,7 @@ would catch it again), **commit** (empty while uncommitted).
   fix (nofib occ4ev and occ4kl, the Hackage xu-wagg configuration) may
   have raised such calls; their outputs were right, but the binaries can
   differ from the fixed compiler's.
-* **Commit:** (uncommitted)
+* **Commit:** `5326ccc6ce`
 
 ### Data structures CPR analysis could not read after the early run (2026-10-25)
 
@@ -102,7 +102,7 @@ would catch it again), **commit** (empty while uncommitted).
   change (one in each reproducer); `-ddump-webs-stats` lists them.
 * **Guard:** `roundtrip003` (a two-module reduction of the Mangler;
   panicked before the fix at -O and -O2).
-* **Commit:** (uncommitted)
+* **Commit:** `5326ccc6ce`
 
 ### Restoring occurrences by unique: a repeated unique got another binder's IdInfo (2026-10-22)
 
