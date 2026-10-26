@@ -82,6 +82,9 @@ kl_opts = '-O -fcore-webs-early -dcore-lint -fcore-webs-arity-raise -fcore-webs-
 test('arityraise015', [], compile_and_run, [kl_opts])
 test('arityraise015_dump', [extra_files(['arityraise015.hs'])], multimod_compile,
      ['arityraise015', kl_opts + ' -ddump-webs-arity-raise -dsuppress-uniques'])
+# arityraise016: values follow the scopes (Note [Evaluated arguments]): a
+# generated happy parser, whose stacks start as bottom
+test('arityraise016', [], compile_and_run, [kl_opts])
 
 # rulecopy001: the program's own copy of a function a SPEC rule mentions
 # (Note [Copying the binders of rules] in GHC.WebCore.Boundary)
@@ -671,6 +674,13 @@ test('roundtrip001', [extra_files(['roundtrip001.hs'])], makefile_test, ['roundt
 # roundtrip002: a unique bound twice in one binding is not restored (happy's
 # Mangler; WEBS-BUGS.md)
 test('roundtrip002', [], compile_and_run, ['-O2 -fcore-webs-early -dcore-lint'])
+# roundtrip003: a data structure CPR analysis could not read after the early
+# run (happy's AttrGrammar.Mangler with -fcore-webs-raise-known-lazy;
+# WEBS-BUGS.md)
+test('roundtrip003', [extra_files(['Roundtrip003A.hs'])], multimod_compile_and_run,
+     ['roundtrip003', '-O -fcore-webs-early -dcore-lint -fcore-webs-arity-raise'
+      ' -fcore-webs-data-split -fcore-webs-data-unbox -fcore-webs-evald-args'
+      ' -fcore-webs-raise-known-lazy -fcore-webs-drop-rules -Wno-x-partial'])
 
 # specmax001: bounded aggressive specialisation (Note [Bounded aggressive
 # specialisation] in GHC.Core.Opt.Specialise)

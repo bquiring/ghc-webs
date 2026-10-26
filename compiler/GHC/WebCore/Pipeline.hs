@@ -367,7 +367,14 @@ webPass early guts_in
              <+> text "rebuilt:" <+> int (length [ () | b <- bindersOfBinds binds7, b `elemVarSet` dfuns
                                                      , isDFunUnfolding (realIdUnfolding b) ])
 
-       ; return (guts { mg_binds = binds7
+         -- Note [Data structures CPR analysis cannot read] in GHC.WebCore.Erase
+       ; let (binds8, unreadable) | early     = agreeDataStructures binds7
+                                  | otherwise = (binds7, [])
+       ; unless (null unreadable) $
+           dump logger Opt_D_dump_webs_stats "Webs: data structures CPR analysis could not read" $
+             int (length unreadable) <+> text "binders:" <+> pprWithCommas ppr unreadable
+
+       ; return (guts { mg_binds = binds8
                       , mg_exports = dropExports unexported (mg_exports guts)
                       , mg_tcs = map replace (mg_tcs guts ++ split_tcs) ++ new_tcs ++ again_tcs }) }
 

@@ -164,26 +164,16 @@ zapped its unfolding.  nofib imaginary/integrate: integrate1D calls f on
 that needs the box rebuilds it, where the caller passed one it already had:
 an allocation the original did not make (Note [Raising through tail calls]
 in GHC.WebCore.Transform.ResultRaise has the dual).
--}
 
--- | Variables bound to values: case binders, and let binders whose
--- right-hand side is a value (Note [Evaluated arguments])
-evaluatedVars :: CoreProgram -> VarSet
-evaluatedVars binds = foldr bind emptyVarSet binds
-  where
-    bind b acc = foldr (\(x, e) a -> pair x e (expr e a)) acc (flattenBinds [b])
-    pair x e acc | isId x, exprIsHNF (stripWebForms e) = extendVarSet acc x
-                 | otherwise                           = acc
-    expr e acc = case e of
-      App f a        -> expr f (expr a acc)
-      WebApp _ f a   -> expr f (expr a acc)
-      Lam _ x        -> expr x acc
-      WebLam _ _ x   -> expr x acc
-      Let b x        -> bind b (expr x acc)
-      Case s cb _ as -> expr s (extendVarSet (foldr (\(Alt _ _ r) -> expr r) acc as) cb)
-      Cast x _       -> expr x acc
-      Tick _ x       -> expr x acc
-      _              -> acc
+Which variables are values follows the scopes: the analysis carries the
+value variables in scope down the program.  Local uniques repeat in
+disjoint scopes (eta-expansion's eta_B3 is in many functions), and a
+program-wide set of value binders made a lambda's eta a value because a case
+binder eta_B3 elsewhere was one.  The raised call took it apart, forcing an
+argument the function never forces: happy's generated parser passes its
+state stacks down from notHappyAtAll (bottom) and the raised happyShift
+evaluated it ("Internal Happy parser panic"; arityraise016).
+-}
 
 {- Note [Raised arguments are curried]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -378,32 +368,42 @@ note w i infos
       Just old -> let !new = plusInfo old i in addToUFM infos w new
 
 analyse :: Bool -> FieldTys -> WebSet -> CoreProgram -> Infos
-analyse evald fields saturated binds = foldr go_bind emptyUFM binds
+analyse evald fields saturated binds = foldr (go_bind top_values) emptyUFM binds
   where
-    -- Note [Evaluated arguments]
-    values = if evald then evaluatedVars binds else emptyVarSet
-    is_value a = case stripWebForms a of
-      Var v | v `elemVarSet` values -> True
+    -- Note [Evaluated arguments]: the variables in scope bound to values,
+    -- from the top-level ones down
+    top_values | evald     = mkVarSet [ x | (x, e) <- flattenBinds binds, bound_to_value x e ]
+               | otherwise = emptyVarSet
+    bound_to_value x e = isId x && exprIsHNF (stripWebForms e)
+    let_values vals bnd
+      | evald     = foldr (\(x, e) vs -> if bound_to_value x e then extendVarSet vs x else delVarSet vs x)
+                          vals (flattenBinds [bnd])
+      | otherwise = vals
+    is_value vals a = case stripWebForms a of
+      Var v | v `elemVarSet` vals -> True
       a' | evald, (Var v, args) <- collectArgs a'
          , Just dc <- isDataConWorkId_maybe v
          , length (filter isValArg args) == dataConRepArity dc
                                     -> True   -- whatever its fields' arguments
          | otherwise                -> exprIsHNF a'
 
-    go_bind (NonRec b e) acc = go_bndr b (go_rhs b e acc)
-    go_bind (Rec prs)    acc = foldr (\(b, e) -> go_bndr b . go_rhs b e) acc prs
+    -- 'vals' are the value variables in scope at the binding: a recursive
+    -- group's right-hand sides see its own binders
+    go_bind vals (NonRec b e) acc = go_bndr b (go_rhs vals b e acc)
+    go_bind vals bnd@(Rec prs) acc = let vals' = let_values vals bnd
+                                     in foldr (\(b, e) -> go_bndr b . go_rhs vals' b e) acc prs
 
-    go_rhs b e acc
-      | JoinPoint arity <- idJoinPointHood b = go_join arity e acc
-      | otherwise                            = go e acc
+    go_rhs vals b e acc
+      | JoinPoint arity <- idJoinPointHood b = go_join vals arity e acc
+      | otherwise                            = go vals e acc
 
     -- The first 'arity' lambdas of a join point: jumps are always saturated,
     -- so these lambdas may be curried
-    go_join :: Int -> CoreExpr -> Infos -> Infos
-    go_join 0 e acc = go e acc
-    go_join n (Lam b e) acc = go_bndr b (go_join (n-1) e acc)
-    go_join n (WebLam w p e) acc = go_lam False w p e (go_join (n-1) e acc)
-    go_join _ e acc = go e acc
+    go_join :: VarSet -> Int -> CoreExpr -> Infos -> Infos
+    go_join vals 0 e acc = go vals e acc
+    go_join vals n (Lam b e) acc = go_bndr b (go_join (delVarSet vals b) (n-1) e acc)
+    go_join vals n (WebLam w p e) acc = go_lam False w p e (go_join (delVarSet vals p) (n-1) e acc)
+    go_join vals _ e acc = go vals e acc
 
     -- A lambda that returns another lambda may be partially applied, and
     -- its argument's demand describes full applications only; raising would
@@ -437,25 +437,26 @@ analyse evald fields saturated binds = foldr go_bind emptyUFM binds
     is_lam (WebLam {})    = True
     is_lam _              = False
 
-    go :: CoreExpr -> Infos -> Infos
-    go (Var {}) acc = acc
-    go (Lit {}) acc = acc
-    go (App f (Type t)) acc = go f (go_ty t acc)
-    go (App f a) acc = go f (go a acc)
-    go e@(WebApp w f a) acc
+    go :: VarSet -> CoreExpr -> Infos -> Infos
+    go _    (Var {}) acc = acc
+    go _    (Lit {}) acc = acc
+    go vals (App f (Type t)) acc = go vals f (go_ty t acc)
+    go vals (App f a) acc = go vals f (go vals a acc)
+    go vals e@(WebApp w f a) acc
       = note_spine e $
-        note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (is_value a) })
-             (go f (go a acc))
-    go (Lam b e) acc = go_bndr b (go e acc)
-    go (WebLam w p e) acc = go_lam True w p e (go e acc)
-    go (Let bind body) acc = go_bind bind (go body acc)
-    go (Case scrut b ty alts) acc
-      = go scrut $ go_bndr b $ go_ty ty $
-        foldr (\(Alt _ bs rhs) a -> foldr go_bndr (go rhs a) bs) acc alts
-    go (Cast e co) acc = go e (go_co co acc)
-    go (Tick _ e) acc = go e acc
-    go (Type t) acc = go_ty t acc
-    go (Coercion co) acc = go_co co acc
+        note w (noInfo { i_unknown = not (knownHead f), i_noncon = not (is_value vals a) })
+             (go vals f (go vals a acc))
+    go vals (Lam b e) acc = go_bndr b (go (delVarSet vals b) e acc)
+    go vals (WebLam w p e) acc = go_lam True w p e (go (delVarSet vals p) e acc)
+    go vals (Let bind body) acc = go_bind vals bind (go (let_values vals bind) body acc)
+    go vals (Case scrut b ty alts) acc
+      = go vals scrut $ go_bndr b $ go_ty ty $
+        foldr (\(Alt _ bs rhs) a -> foldr go_bndr (go (alt_vals bs) rhs a) bs) acc alts
+      where alt_vals bs = (if evald then extendVarSet else delVarSet) (delVarSetList vals bs) b
+    go vals (Cast e co) acc = go vals e (go_co co acc)
+    go vals (Tick _ e) acc = go vals e acc
+    go _    (Type t) acc = go_ty t acc
+    go _    (Coercion co) acc = go_co co acc
 
     go_bndr b acc
       | isId b    = go_ty (idType b) acc

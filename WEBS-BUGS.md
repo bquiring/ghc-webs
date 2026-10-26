@@ -41,6 +41,69 @@ would catch it again), **commit** (empty while uncommitted).
 
 ## Correctness
 
+### Evaluated arguments by unique: a lambda's eta was taken for a value (2026-10-25)
+
+* **Found by:** the same builds (xu-wagg-kl, xu-wagg-ic), once they
+  compiled: the happy they built failed on every grammar ("Internal Happy
+  parser panic", pretty-show's parser); happy's own test parsers built with
+  `-O -fcore-webs-early -fcore-webs-arity-raise -fcore-webs-evald-args
+  -fcore-webs-raise-known-lazy` failed the same way.
+* **Symptom:** a miscompilation, no Lint error: happyDoAction's call
+  `happyShift .. eta eta` became `case eta of HappyCons y y -> ..`,
+  forcing a state stack the parser never forces; at the first token it is
+  notHappyAtAll, whose message is the panic.
+* **Cause:** `-fcore-webs-evald-args` counted a variable as a value when
+  any binder with its unique anywhere in the program was a case binder or
+  let-bound to a value (evaluatedVars, one program-wide set). Uniques
+  repeat in disjoint scopes: eta-expansion's eta_B0..B3 are in many
+  functions. With `-fcore-webs-raise-known-lazy` the early run raises known
+  calls whose arguments are all values, so the mistake reached happy's
+  parser; before, only unknown calls were raised there.
+* **Fix:** the analysis carries the value variables in scope down the
+  program (Note [Evaluated arguments] in GHC.WebCore.Transform.ArityRaise).
+* **Guard:** `arityraise016` (happy's generated parser for its
+  AttrGrammar001.y; failed at run time before the fix).
+* **Note:** everything built with `-fcore-webs-evald-args` before this
+  fix (nofib occ4ev and occ4kl, the Hackage xu-wagg configuration) may
+  have raised such calls; their outputs were right, but the binaries can
+  differ from the fixed compiler's.
+* **Commit:** (uncommitted)
+
+### Data structures CPR analysis could not read after the early run (2026-10-25)
+
+* **Found by:** the Hackage small group on the tree with exposed boot
+  unfoldings, aggressive specialisation, the webs flags and
+  `-fcore-webs-raise-known-lazy` (xu-wagg-kl, xu-wagg-ic): happy-lib's
+  Happy.Frontend.AttrGrammar.Mangler, "ASSERT failed! x_aKNB" in CprAnal
+  (cprTransform); alex's Main, "ASSERT failed!
+  $s$fEqAccept_$c$fEqAccept". Without raise-known-lazy (xu-wagg) both
+  built.
+* **Symptom:** CPR analysis, right after the early run, meets a let-bound
+  occurrence it has no signature for that is not a data structure. Core
+  Lint passes: it does not check vanilla unfoldings, and CPR analysis
+  reads them (cprDataStructureUnfolding_maybe).
+* **Cause:** occurrences carry older IdInfo than their binders after the
+  round trip, and several steps change binders without their occurrences.
+  Two shapes seen. (1) Specialise's copies of base's lookup and elem at
+  Int share local uniques (the case on the key, `wild`, `x`); raising
+  lookup's key removed its case, and an occurrence put back from the input
+  had an unfolding `I# x`, x still bound in elem's copy, so
+  restoreOccurrences' "still bound" test passed. (2) In the reduced test,
+  data splitting gave `z = [p]` a split list type; an occurrence of the
+  pair `(n, z)` that CPR analysis expands still mentioned z without its
+  evaluated unfolding, while the binder had one.
+* **Fix:** at the end of the early run, agreeDataStructures walks the
+  program as CPR analysis will (binders in scope, top-level ones in order,
+  into the unfoldings it reads) and drops the vanilla unfolding of each
+  let-bound data structure with an occurrence it could not read; the
+  binder gets an ordinary CPR signature from its constructor right-hand
+  side, and the simplifier rebuilds the unfolding (Note [Data structures
+  CPR analysis cannot read] in GHC.WebCore.Erase). Only those binders
+  change (one in each reproducer); `-ddump-webs-stats` lists them.
+* **Guard:** `roundtrip003` (a two-module reduction of the Mangler;
+  panicked before the fix at -O and -O2).
+* **Commit:** (uncommitted)
+
 ### Restoring occurrences by unique: a repeated unique got another binder's IdInfo (2026-10-22)
 
 * **Found by:** the Hackage small group with constant specialisation alone

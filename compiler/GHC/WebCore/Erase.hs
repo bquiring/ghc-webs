@@ -2,6 +2,7 @@
 module GHC.WebCore.Erase
   ( eraseProgram
   , restoreOccurrences
+  , agreeDataStructures
   ) where
 
 import GHC.Prelude
@@ -14,9 +15,11 @@ import GHC.Core.TyCo.Compare ( eqType )
 import GHC.Types.Id
 import GHC.Types.Var.Env
 import GHC.Types.Unique.FM ( nonDetEltsUFM )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Data.Maybe ( orElse )
 import GHC.Types.Var.Set
 import GHC.Types.Var ( isLocalVar )
+import GHC.Types.Basic ( activeInFinalPhase )
 
 import GHC.Types.Web
 
@@ -198,4 +201,98 @@ restoreOccurrences old new = map restore_top new
       Case s b ty alts -> Case (go env s) b ty [ Alt c bs (go env r) | Alt c bs r <- alts ]
       Cast x co       -> Cast (go env x) co
       Tick t x        -> Tick t (go env x)
+      _               -> e
+
+{- Note [Data structures CPR analysis cannot read]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+CPR analysis runs right after the early run, with no simplifier pass in
+between.  It gives no signature to a let binder that is a data structure
+(isDataStructure in GHC.Core.Opt.CprAnal: arity 0 and an evaluated unfolding);
+at an occurrence of one it reads the occurrence's own unfolding instead, and
+the occurrences in that unfolding in turn.  So it asserts that every
+occurrence of such a binder is a data structure too, and that what the
+unfolding mentions is in scope.  The early run's output can break both:
+occurrences keep older IdInfo than their binders (Note [Occurrences after the
+round trip]; data splitting rewrites binders and their unfoldings separately),
+and Specialise's copies of different functions share local uniques, so an
+unfolding put back in one copy can mention a binder of another
+(roundtrip003, happy's AttrGrammar.Mangler with arity raising of known lazy
+parameters).
+
+Patching each step did not converge, so at the end of the run
+agreeDataStructures walks the program as CPR analysis will (with the binders
+in scope, and into the unfoldings it would read), and for each let-bound data
+structure with an occurrence CPR analysis could not read, it drops the
+binder's vanilla unfolding.  The binder is then an ordinary binding, which CPR
+analysis gives a signature (from its right-hand side, a constructor
+application) and finds at every occurrence.  The simplifier rebuilds the
+unfolding afterwards.  Only such binders change.
+-}
+
+-- | Drop the vanilla unfoldings of the let-bound data structures that have an
+-- occurrence CPR analysis could not read; returns the program and those
+-- binders.  See Note [Data structures CPR analysis cannot read]
+agreeDataStructures :: CoreProgram -> (CoreProgram, [Id])
+agreeDataStructures binds
+  | isEmptyVarSet bad = (binds, [])
+  | otherwise         = (map zap_top binds, nonDetEltsUniqSet bad)
+  where
+    data_structure x = not (isJoinId x) && idArity x == 0 && isEvaldUnfolding (idUnfolding x)  -- as CPR analysis's isDataStructure
+    unf_fvs x = case maybeUnfoldingTemplate (idUnfolding x) of
+      Just t  -> exprFreeVars t
+      Nothing -> emptyVarSet
+
+    -- the binders in scope, each with whether it is let-bound: as in CPR
+    -- analysis, the top-level ones bound before (or in the same group)
+    bad = snd (foldl' step (emptyVarEnv, emptyVarSet) binds)
+    step (env, acc) bnd = let env' = with True (bindersOf bnd) env
+                          in (env', acc `unionVarSet` bind_bad env' bnd)
+
+    -- a data structure's right-hand side is not analysed
+    bind_bad env (NonRec b r) | data_structure b = emptyVarSet
+                              | otherwise        = expr_bad env r
+    bind_bad env (Rec prs)    = unionVarSets [ expr_bad env r | (b, r) <- prs, not (data_structure b) ]
+    with is_let bs env = extendVarEnvList env [ (b, (b, is_let)) | b <- bs ]
+
+    -- The binders of the occurrences in an expression that CPR analysis
+    -- could not read
+    expr_bad :: VarEnv (Var, Bool) -> CoreExpr -> VarSet
+    expr_bad env e = case e of
+      Var v            -> occ_bad env emptyVarSet v
+      App f a          -> expr_bad env f `unionVarSet` expr_bad env a
+      Lam b x          -> expr_bad (with False [b] env) x
+      Let bnd x        -> let env' = with True (bindersOf bnd) env
+                          in bind_bad (case bnd of { NonRec {} -> env; Rec {} -> env' }) bnd
+                             `unionVarSet` expr_bad env' x
+      Case s b _ alts  -> expr_bad env s `unionVarSet`
+                          unionVarSets [ expr_bad (with False (b : bs) env) r | Alt _ bs r <- alts ]
+      Cast x _         -> expr_bad env x
+      Tick _ x         -> expr_bad env x
+      _                -> emptyVarSet
+
+    -- An occurrence: of a let-bound data structure, it must be one itself,
+    -- active in the final phase, with an unfolding whose occurrences CPR
+    -- analysis can read in turn (cprDataStructureUnfolding_maybe)
+    occ_bad env seen v
+      | isId v, isLocalId v, not (v `elemVarSet` seen)
+      , Just (b, True) <- lookupVarEnv env v
+      , data_structure b
+      = if data_structure v && activeInFinalPhase (idInlineActivation v)
+           && allVarSet (in_scope env) (unf_fvs v)
+        then unionVarSets [ occ_bad env (extendVarSet seen v) x | x <- nonDetEltsUniqSet (unf_fvs v) ]
+        else unitVarSet b
+      | otherwise = emptyVarSet
+    in_scope env x = not (isLocalVar x) || x `elemVarEnv` env
+
+    zap b | b `elemVarSet` bad = b `setIdUnfolding` noUnfolding
+          | otherwise          = b
+    zap_top (NonRec b r) = NonRec (zap b) (zap_expr r)
+    zap_top (Rec prs)    = Rec [ (zap b, zap_expr r) | (b, r) <- prs ]
+    zap_expr e = case e of
+      App f a         -> App (zap_expr f) (zap_expr a)
+      Lam b x         -> Lam b (zap_expr x)
+      Let bnd x       -> Let (zap_top bnd) (zap_expr x)
+      Case s b ty alts -> Case (zap_expr s) b ty [ Alt c bs (zap_expr r) | Alt c bs r <- alts ]
+      Cast x co       -> Cast (zap_expr x) co
+      Tick t x        -> Tick t (zap_expr x)
       _               -> e
